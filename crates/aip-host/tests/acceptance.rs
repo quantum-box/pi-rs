@@ -368,8 +368,11 @@ async fn hosted_review_keeps_parent_child_identity_and_recovers_a_cancelled_chil
         system_prompt: "review",
         limits: Limits::default(),
     };
-    let mut parent = Session::with_store(MemoryStore::default()).unwrap();
-    let mut child = Session::with_store(MemoryStore::default()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let parent_path = dir.path().join("parent.jsonl");
+    let child_path = dir.path().join("child.jsonl");
+    let mut parent = Session::open(&parent_path).unwrap();
+    let mut child = Session::open(&child_path).unwrap();
     let extra_profile = HostRegistry::discover(
         &child_scope,
         platform.clone(),
@@ -448,7 +451,42 @@ async fn hosted_review_keeps_parent_child_identity_and_recovers_a_cancelled_chil
             .status,
         pi_rs_review::ReviewStatus::Stopped
     ));
+    assert!(Session::open(&parent_path).is_err());
+    assert!(Session::open(&child_path).is_err());
+    let child_id = child.session_id();
+    drop((parent, child));
+    let mut parent = Session::open(&parent_path).unwrap();
+    let mut child = Session::open(&child_path).unwrap();
+    assert_eq!(child.session_id(), child_id);
     review.resume = true;
+    let changed_run = RunScope {
+        journal_run_id: Uuid::new_v4(),
+        aip_run: "different-review-run".into(),
+        audit_id: "different-audit".into(),
+        ..child_scope.clone()
+    };
+    let changed_registry =
+        HostRegistry::discover(&changed_run, platform.clone(), BTreeSet::new(), vec![])
+            .await
+            .unwrap();
+    let changed_child = HostTurn {
+        scope: &changed_run,
+        registry: &changed_registry,
+        limits: child_turn.limits.clone(),
+        ..child_turn
+    };
+    let changed_review = ManagedReview {
+        child: &changed_child,
+        ..review
+    };
+    let before = (parent.head(), child.head());
+    assert!(matches!(
+        changed_review
+            .run(&mut parent, &mut child, &cancel, &mut ignore)
+            .await,
+        Err(Error::Session(_))
+    ));
+    assert_eq!((parent.head(), child.head()), before);
     assert_eq!(
         review
             .run(&mut parent, &mut child, &cancel, &mut ignore)
@@ -470,6 +508,16 @@ async fn hosted_review_keeps_parent_child_identity_and_recovers_a_cancelled_chil
             .status,
         pi_rs_review::ReviewStatus::Done { .. }
     ));
+    let completed = (parent.head(), child.head());
+    assert_eq!(
+        review
+            .run(&mut parent, &mut child, &cancel, &mut ignore)
+            .await
+            .unwrap(),
+        "done"
+    );
+    assert_eq!((parent.head(), child.head()), completed);
+    assert_eq!(platform.usage.lock().unwrap().len(), 2);
 }
 
 struct References(AtomicBool);

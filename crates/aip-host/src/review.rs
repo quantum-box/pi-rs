@@ -1,4 +1,4 @@
-use pi_rs_core::{CancellationToken, Error, Observer, Result, Session};
+use pi_rs_core::{CancellationToken, Error, Event, Observer, Result, Session};
 use pi_rs_review::{ID, ReviewContext, ReviewLink, ReviewStatus};
 use tokio::sync::mpsc;
 
@@ -25,6 +25,7 @@ impl ManagedReview<'_> {
         let parent_scope = self.parent.scope;
         let child_scope = self.child.scope;
         if child_scope.parent_run.as_deref() != Some(&parent_scope.aip_run)
+            || child_scope.aip_run == parent_scope.aip_run
             || child_scope.tenant != parent_scope.tenant
             || child_scope.actor != parent_scope.actor
             || child_scope.workspace != parent_scope.workspace
@@ -48,8 +49,16 @@ impl ManagedReview<'_> {
                 "invalid scope or permissions for an AIP child review".into(),
             ));
         }
-        self.parent.check_profile(parent)?;
-        self.child.check_profile(child)?;
+        // A child journal belongs to one review run. A second host run ID
+        // must never turn a resume into a fresh submission to the model.
+        if child.records().iter().any(|record| {
+            matches!(&record.event, Event::HostRunBound { run_id, .. }
+                if *run_id != child_scope.journal_run_id)
+        }) {
+            return Err(Error::Session(
+                "child review journal belongs to a different run".into(),
+            ));
+        }
         let child_id = child.session_id();
         let link = match ReviewContext::find(parent, child_id)? {
             Some(link)
@@ -72,6 +81,8 @@ impl ManagedReview<'_> {
             }
             None => return Err(Error::Session("missing AIP child review binding".into())),
         };
+        self.parent.check_profile(parent)?;
+        self.child.check_profile(child)?;
         if let ReviewStatus::Done { answer } = link.status {
             return Ok(answer);
         }
