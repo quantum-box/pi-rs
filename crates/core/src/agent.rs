@@ -15,7 +15,7 @@ use crate::journal::{conversation, ensure_settled};
 use crate::{
     CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind, Invocation,
     Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest, OperationState, Outcome,
-    QueuedInput, Record, RecordedReply, Registry, RequestPurpose, Result, RunState, Session,
+    QueuedMessage, Record, RecordedReply, Registry, RequestPurpose, Result, RunState, Session,
     ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, Usage, UsageReport,
 };
 
@@ -79,7 +79,7 @@ impl Agent<'_> {
 
     /// A repeated initial submission never starts a second run. Passing no
     /// input is an explicit resume request authorized by the host.
-    pub async fn run_correlated<T: Into<QueuedInput> + Send>(
+    pub async fn run_correlated<T: Into<QueuedMessage> + Send>(
         &self,
         session: &mut Session,
         run_id: Uuid,
@@ -119,7 +119,7 @@ impl Agent<'_> {
         result
     }
 
-    async fn run_turns<T: Into<QueuedInput> + Send>(
+    async fn run_turns<T: Into<QueuedMessage> + Send>(
         &self,
         session: &mut Session,
         run_id: Uuid,
@@ -185,7 +185,7 @@ impl Agent<'_> {
         result
     }
 
-    async fn drive<T: Into<QueuedInput> + Send>(
+    async fn drive<T: Into<QueuedMessage> + Send>(
         &self,
         session: &mut Session,
         run_id: Uuid,
@@ -385,6 +385,9 @@ impl Agent<'_> {
                 queue_inputs(session, followups, observer)?;
                 if cancel.is_cancelled() {
                     return Err(Error::Cancelled);
+                }
+                if apply_inputs(session, false, observer)? {
+                    continue;
                 }
                 if !apply_inputs(session, true, observer)? {
                     return Ok(answer);
@@ -1441,7 +1444,7 @@ fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> R
     Ok(())
 }
 
-fn queue_inputs<T: Into<QueuedInput>>(
+fn queue_inputs<T: Into<QueuedMessage>>(
     session: &mut Session,
     followups: &mut mpsc::Receiver<T>,
     observer: &mut Observer<'_>,
@@ -1451,14 +1454,15 @@ fn queue_inputs<T: Into<QueuedInput>>(
         let Ok(input) = followups.try_recv() else {
             break;
         };
-        let input = input.into();
-        if input.content.trim().is_empty() {
+        let input: QueuedMessage = input.into();
+        if input.input.content.trim().is_empty() && input.images.is_empty() {
             continue;
         }
+        input.validate()?;
         if session
             .records()
             .iter()
-            .any(|record| record.run_id == Some(input.id))
+            .any(|record| record.run_id == Some(input.input.id))
         {
             return Err(Error::Config("queued input ID is reserved by a run".into()));
         }
@@ -1466,17 +1470,31 @@ fn queue_inputs<T: Into<QueuedInput>>(
             .records()
             .iter()
             .find_map(|record| match &record.event {
-                Event::InputQueued { input: existing } if existing.id == input.id => Some(existing),
+                Event::InputQueued { input: existing } if existing.id == input.input.id => {
+                    Some(QueuedMessage::from(existing.clone()))
+                }
+                Event::InputQueuedWithImages { input: existing }
+                    if existing.input.id == input.input.id =>
+                {
+                    Some(existing.clone())
+                }
                 _ => None,
             });
         match existing {
-            Some(existing) if *existing == input => continue,
+            Some(existing) if existing == input => continue,
             Some(_) => {
                 return Err(Error::Config(
                     "input ID already exists with different content or kind".into(),
                 ));
             }
-            None => commit(session, Event::InputQueued { input }, observer)?,
+            None => {
+                let event = if input.images.is_empty() {
+                    Event::InputQueued { input: input.input }
+                } else {
+                    Event::InputQueuedWithImages { input }
+                };
+                commit(session, event, observer)?;
+            }
         }
     }
     Ok(())
@@ -1495,28 +1513,34 @@ fn apply_inputs(
             _ => None,
         })
         .collect();
-    let pending: Vec<_> = branch
+    let pending: Vec<QueuedMessage> = branch
         .iter()
         .filter_map(|record| match &record.event {
-            Event::InputQueued { input }
-                if !consumed.contains(&input.id)
-                    && (include_followups || input.kind == InputKind::Steer) =>
-            {
-                Some(input.clone())
-            }
+            Event::InputQueued { input } => Some(input.clone().into()),
+            Event::InputQueuedWithImages { input } => Some(input.clone()),
             _ => None,
+        })
+        .filter(|message: &QueuedMessage| {
+            !consumed.contains(&message.input.id)
+                && (include_followups || message.input.kind == InputKind::Steer)
         })
         .collect();
     let accepted = !pending.is_empty();
-    for input in pending {
-        commit(
-            session,
+    for message in pending {
+        message.validate()?;
+        let event = if message.images.is_empty() {
             Event::User {
-                content: input.content,
-                input_id: Some(input.id),
-            },
-            observer,
-        )?;
+                content: message.input.content,
+                input_id: Some(message.input.id),
+            }
+        } else {
+            Event::UserWithImages {
+                content: message.input.content,
+                input_id: Some(message.input.id),
+                images: message.images,
+            }
+        };
+        commit(session, event, observer)?;
     }
     Ok(accepted)
 }

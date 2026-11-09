@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::{
     Agent, CancellationToken, Compaction, Error, Extension, InputKind, Limits, MemoryStore,
-    Message, Model, ModelRequest, Notification, Observer, QueuedInput, Record, Registry, Result,
-    Session,
+    Message, Model, ModelRequest, Notification, Observer, QueuedInput, QueuedMessage, Record,
+    Registry, Result, Session,
 };
 
 /// Owned notifications. Request and record payloads can include private context.
@@ -24,23 +24,47 @@ pub enum SessionEvent {
 
 #[derive(Clone)]
 pub struct SessionControl {
-    input: mpsc::Sender<QueuedInput>,
+    input: mpsc::Sender<QueuedMessage>,
     active: Arc<Mutex<Option<CancellationToken>>>,
 }
 impl SessionControl {
     pub async fn steer(&self, content: impl Into<String>) -> Result<Uuid> {
-        self.enqueue(InputKind::Steer, content.into()).await
+        self.enqueue(InputKind::Steer, content.into(), Vec::new())
+            .await
     }
     pub async fn follow_up(&self, content: impl Into<String>) -> Result<Uuid> {
-        self.enqueue(InputKind::FollowUp, content.into()).await
+        self.enqueue(InputKind::FollowUp, content.into(), Vec::new())
+            .await
     }
-    async fn enqueue(&self, kind: InputKind, content: String) -> Result<Uuid> {
-        if content.trim().is_empty() {
-            return Err(Error::Config("queued input is empty".into()));
-        }
+    pub async fn steer_with_images(
+        &self,
+        content: impl Into<String>,
+        images: Vec<crate::ImageContent>,
+    ) -> Result<Uuid> {
+        self.enqueue(InputKind::Steer, content.into(), images).await
+    }
+    pub async fn follow_up_with_images(
+        &self,
+        content: impl Into<String>,
+        images: Vec<crate::ImageContent>,
+    ) -> Result<Uuid> {
+        self.enqueue(InputKind::FollowUp, content.into(), images)
+            .await
+    }
+    async fn enqueue(
+        &self,
+        kind: InputKind,
+        content: String,
+        images: Vec<crate::ImageContent>,
+    ) -> Result<Uuid> {
         let id = Uuid::new_v4();
+        let message = QueuedMessage {
+            input: QueuedInput { id, kind, content },
+            images,
+        };
+        message.validate()?;
         self.input
-            .send(QueuedInput { id, kind, content })
+            .send(message)
             .await
             .map_err(|_| Error::Config("session is closed".into()))?;
         Ok(id)
@@ -145,7 +169,7 @@ pub struct AgentSession {
     registry: Arc<Registry>,
     limits: Limits,
     session: Session,
-    input: mpsc::Receiver<QueuedInput>,
+    input: mpsc::Receiver<QueuedMessage>,
     control: SessionControl,
     events: Option<broadcast::Sender<SessionEvent>>,
     closed: bool,
@@ -1158,6 +1182,129 @@ mod tests {
         );
         assert_eq!(session.journal().records().len(), count);
         fork.close().await.unwrap();
+        session.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn queued_images_survive_cancellation_and_reopening_without_duplicate_consumption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queued.jsonl");
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let input_id = control
+            .follow_up_with_images(
+                "queued image",
+                vec![crate::ImageContent {
+                    data: "aW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let mut events = session.subscribe();
+        let abort = async move {
+            while let Ok(event) = events.recv().await {
+                if matches!(event, SessionEvent::Request(_)) {
+                    control.abort();
+                    break;
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(session.prompt("initial"), abort);
+        assert!(matches!(result, Err(Error::Cancelled)));
+        session.export_jsonl(&path).unwrap();
+        session.close().await.unwrap();
+        let mut reopened = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .open(path)
+            .unwrap();
+        assert_eq!(reopened.resume().await.unwrap(), "answer 2");
+        assert_eq!(reopened.resume().await.unwrap(), "answer 2");
+        assert_eq!(reopened.journal().records().iter().filter(|record| matches!(&record.event, crate::Event::InputQueuedWithImages { input } if input.input.id == input_id)).count(), 1);
+        assert_eq!(reopened.journal().records().iter().filter(|record| matches!(&record.event, crate::Event::UserWithImages { input_id: Some(id), .. } if *id == input_id)).count(), 1);
+        reopened.close().await.unwrap();
+    }
+    struct PriorityModel {
+        release: Arc<tokio::sync::Notify>,
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    #[async_trait::async_trait]
+    impl Model for PriorityModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            use futures_util::StreamExt;
+            let messages = request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User { content } | Message::UserWithImages { content, .. } => {
+                        Some(content.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let count = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(messages);
+                seen.len()
+            };
+            let release = self.release.clone();
+            let text = futures_util::stream::once(async move {
+                if count == 1 {
+                    release.notified().await;
+                }
+                Ok(ModelEvent::Text(format!("answer {count}")))
+            });
+            Ok(Box::pin(text.chain(futures_util::stream::iter([Ok(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )]))))
+        }
+    }
+    #[tokio::test]
+    async fn image_steering_precedes_followups_queued_during_a_response() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(
+            Arc::new(PriorityModel {
+                release: release.clone(),
+                seen: seen.clone(),
+            }),
+            "priority",
+        )
+        .in_memory()
+        .unwrap();
+        let control = session.controls();
+        let mut events = session.subscribe();
+        let producer = async move {
+            while let Ok(event) = events.recv().await {
+                if matches!(event, SessionEvent::Request(_)) {
+                    let images = vec![crate::ImageContent {
+                        data: "aW1hZ2U=".into(),
+                        mime_type: "image/png".into(),
+                    }];
+                    control
+                        .follow_up_with_images("follow", images.clone())
+                        .await
+                        .unwrap();
+                    control.steer_with_images("steer", images).await.unwrap();
+                    release.notify_one();
+                    break;
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(session.prompt("initial"), producer);
+        assert_eq!(result.unwrap(), "answer 3");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                vec!["initial"],
+                vec!["initial", "steer"],
+                vec!["initial", "steer", "follow"]
+            ]
+        );
         session.close().await.unwrap();
     }
 }

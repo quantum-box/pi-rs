@@ -96,6 +96,9 @@ pub enum Event {
     UserImages {
         images: Vec<crate::ImageContent>,
     },
+    InputQueuedWithImages {
+        input: crate::QueuedMessage,
+    },
     InputQueued {
         input: QueuedInput,
     },

@@ -106,14 +106,12 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()?
                 .unwrap_or_default();
+            for image in &images {
+                image.validate()?;
+            }
             let message = request["message"].as_str().unwrap_or_default();
             if message.is_empty() && images.is_empty() {
                 return Err(Error::Config("message or images are required".into()));
-            }
-            if busy(worker) && !images.is_empty() {
-                return Err(Error::Config(
-                    "image inputs cannot currently be queued".into(),
-                ));
             }
             if let Some(active) = worker.as_mut().filter(|worker| worker.busy) {
                 let kind = match name {
@@ -129,7 +127,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                         }
                     },
                 };
-                active.send(json!({"type":kind,"content":message}))?;
+                active.send(json!({"type":kind,"content":message,"images":images}))?;
                 Ok(Some(json!({"disposition":"queued"})))
             } else {
                 Worker::submit(

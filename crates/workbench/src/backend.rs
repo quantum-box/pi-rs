@@ -6,7 +6,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use pi_rs::{CancellationToken, Compaction, Error, InputKind, QueuedInput, Result, Session};
+use pi_rs::{
+    CancellationToken, Compaction, Error, InputKind, QueuedInput, QueuedMessage, Result, Session,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -38,9 +40,13 @@ enum Request {
     },
     Steer {
         content: String,
+        #[serde(default)]
+        images: Vec<pi_rs::ImageContent>,
     },
     Followup {
         content: String,
+        #[serde(default)]
+        images: Vec<pi_rs::ImageContent>,
     },
     Review {
         child: PathBuf,
@@ -84,7 +90,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
         let (request, scheduled) = tokio::select! {
             _ = stop_notify.notified() => break,
             request = requests.recv() => match request { Some(request) => (request, true), None => break },
-            input = queued.recv() => match input { Some(input) => (Request::Prompt { content: Some(input.content), images: Vec::new() }, false), None => break },
+            input = queued.recv() => match input { Some(input) => (Request::Prompt { content: Some(input.input.content), images: input.images }, false), None => break },
         };
         if stopping.load(Ordering::SeqCst) {
             break;
@@ -219,7 +225,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
 }
 fn read_requests(
     commands: mpsc::Sender<Request>,
-    inputs: mpsc::Sender<QueuedInput>,
+    inputs: mpsc::Sender<QueuedMessage>,
     active: Arc<Mutex<ControlState>>,
     stopping: Arc<AtomicBool>,
 ) {
@@ -237,20 +243,23 @@ fn read_requests(
             };
             let steering = matches!(&request, Request::Steer { .. });
             match request {
-                Request::Steer { content } | Request::Followup { content } => {
+                Request::Steer { content, images } | Request::Followup { content, images } => {
                     let kind = if steering {
                         InputKind::Steer
                     } else {
                         InputKind::FollowUp
                     };
-                    if inputs
-                        .try_send(QueuedInput {
+                    let message = QueuedMessage {
+                        input: QueuedInput {
                             id: Uuid::new_v4(),
                             kind,
                             content,
-                        })
-                        .is_err()
-                    {
+                        },
+                        images,
+                    };
+                    if let Err(error) = message.validate() {
+                        output(json!({"type":"input_rejected","reason":error.to_string()}));
+                    } else if inputs.try_send(message).is_err() {
                         output(json!({"type":"input_rejected","reason":"follow-up queue is full"}));
                     }
                 }

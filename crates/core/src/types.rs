@@ -55,6 +55,37 @@ impl From<String> for QueuedInput {
     }
 }
 
+/// A queued message extends the existing text input without changing its shape.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct QueuedMessage {
+    #[serde(flatten)]
+    pub input: QueuedInput,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageContent>,
+}
+impl QueuedMessage {
+    pub fn validate(&self) -> Result<()> {
+        if self.input.content.trim().is_empty() && self.images.is_empty() {
+            return Err(Error::Config("queued input is empty".into()));
+        }
+        for image in &self.images {
+            image.validate()?;
+        }
+        if !self.images.is_empty() && serde_json::to_vec(self)?.len() > 8 * 1024 * 1024 {
+            return Err(Error::Config("queued input exceeds size limit".into()));
+        }
+        Ok(())
+    }
+}
+impl<T: Into<QueuedInput>> From<T> for QueuedMessage {
+    fn from(input: T) -> Self {
+        Self {
+            input: input.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     pub id: String,

@@ -359,5 +359,13 @@ The owned SDK exposes `prompt_with_images`. Idle RPC `prompt` requests accept
 image blocks, including image-only input. Image-bearing input is committed as
 one journal entry, restored across sessions and preserved in forks. Invalid
 image encodings and oversized input are rejected before that entry is written.
-Queued image input remains pending parity work, as does inline terminal image
-rendering. CLI, RPC and a real terminal fixture verify the new input paths.
+Inline terminal image rendering remains pending. CLI, RPC and a real terminal
+fixture verify the new input paths.
+
+Image-bearing steering and follow-up messages now use the same durable queue as
+text input. The owned SDK exposes `steer_with_images` and
+`follow_up_with_images`; RPC accepts images while a response is running.
+Steering is applied before follow-ups at the next response boundary. Queued
+images survive cancellation and reopening, and their IDs prevent duplicate
+consumption. Existing text-only `QueuedInput` callers continue through the
+extended queue representation.

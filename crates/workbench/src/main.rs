@@ -910,6 +910,9 @@ fn metadata(record: &pi_rs::Record) -> Value {
             input_id, images, ..
         } => json!({"event":"user","input_id":input_id,"images":images.len()}),
         Event::User { input_id, .. } => json!({"event": "user", "input_id": input_id}),
+        Event::InputQueuedWithImages { input } => {
+            json!({"event":"input_queued","input_id":input.input.id,"kind":input.input.kind,"images":input.images.len()})
+        }
         Event::InputQueued { input } => {
             json!({"event": "input_queued", "input_id": input.id, "kind": input.kind})
         }
