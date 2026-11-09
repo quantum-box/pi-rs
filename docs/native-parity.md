@@ -25,7 +25,7 @@ remaining acceptance work for that surface.
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools and resources; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior, elicitation and task polling |
 | Codemode | Core tool invocation APIs | Sandboxed code execution and dynamic tool search |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
-| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory forks, compaction and lifecycle shutdown | Complete resource/model/auth factories, persistent fork/export helpers and remaining Pi SDK equivalents |
+| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Published-crate resource bundles and complete source/filter compatibility |
 
 ## Current RPC subset
@@ -212,3 +212,9 @@ Markdown tables now calculate Unicode-aware column widths, preserve alignment,
 wrap cells, and use a stacked layout when a terminal cannot fit the columns.
 Link destinations and strikethrough formatting are rendered. Table tests cover
 Japanese text and narrow terminal widths.
+
+The core Session and owned SDK also support no-overwrite JSONL export and
+persistent branch forks. Forks receive a fresh session identity and can be
+reopened independently. CLI import/export/fork now use the same atomic snapshot
+publication path. Tests verify independent continuation and refusal to replace
+existing files.

@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use pi_rs::{Error, Event, Record, Result, Session};
+use pi_rs::{Error, Event, Result, Session};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -43,27 +43,12 @@ pub fn summary(path: &Path, session: &Session) -> SessionSummary {
 }
 
 pub fn fork(session: &Session, target: u64, destination: &Path, workspace: &Path) -> Result<()> {
-    let records = session.fork_records(target)?;
-    // Build and validate the complete copy before publishing its path.
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let temporary = tempfile::NamedTempFile::new_in(parent)?;
-    write_records(temporary.path(), &records)?;
-    {
-        let mut copy = Session::open(temporary.path())?;
-        copy.set_working_directory(workspace)?;
-        if let Some(name) = session.name() {
-            copy.set_name(name)?;
-        }
+    let mut copy = Session::from_records(session.fork_records(target)?)?;
+    copy.set_working_directory(workspace)?;
+    if let Some(name) = session.name() {
+        copy.set_name(name)?;
     }
-    temporary
-        .persist_noclobber(destination)
-        .map_err(|error| Error::Io(error.error))?;
-    sync_directory(parent)?;
-    Ok(())
+    copy.export_jsonl(destination)
 }
 
 pub fn import(source: &Path, destination: &Path) -> Result<()> {
@@ -76,20 +61,16 @@ pub fn import(source: &Path, destination: &Path) -> Result<()> {
             "managed sessions must be imported by their host".into(),
         ));
     }
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let temporary = tempfile::NamedTempFile::new_in(parent)?;
-    write_records(temporary.path(), source.records())?;
-    temporary
-        .persist_noclobber(destination)
-        .map_err(|error| Error::Io(error.error))?;
-    sync_directory(parent)
+    source.export_jsonl(destination)
 }
 
 pub fn export(session: &Session, destination: &Path) -> Result<()> {
+    if destination
+        .extension()
+        .is_some_and(|extension| extension == "jsonl")
+    {
+        return session.export_jsonl(destination);
+    }
     if destination.exists() {
         return Err(Error::Config("export destination already exists".into()));
     }
@@ -103,7 +84,6 @@ pub fn export(session: &Session, destination: &Path) -> Result<()> {
         .extension()
         .and_then(|extension| extension.to_str())
     {
-        Some("jsonl") => write_records(temporary.path(), session.records())?,
         Some("html" | "htm") => {
             temporary.write_all(html(session).as_bytes())?;
             temporary.as_file().sync_all()?;
@@ -118,18 +98,6 @@ pub fn export(session: &Session, destination: &Path) -> Result<()> {
         .persist_noclobber(destination)
         .map_err(|error| Error::Io(error.error))?;
     sync_directory(parent)
-}
-fn write_records(path: &Path, records: &[Record]) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    for record in records {
-        serde_json::to_writer(&mut file, record)?;
-        writeln!(file)?;
-    }
-    file.sync_all()?;
-    Ok(())
 }
 fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]

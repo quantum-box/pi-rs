@@ -1,3 +1,6 @@
 The theme definitions and theme schema are from Pi v1.5.0,
 https://github.com/earendil-works/pi/tree/f9a26365568127461c47a07a37dcb42c140a3ac5
 and are used under its MIT license in PI-LICENSE.
+
+The default coding-assistant preamble, skill guidance and edit/write guidance
+in src/resources.rs and src/main.rs are adapted from that same Pi release.

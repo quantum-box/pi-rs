@@ -485,6 +485,23 @@ impl Session {
         Ok(records)
     }
 
+    /// Publish a complete local journal without replacing an existing file.
+    pub fn export_jsonl(&self, destination: impl AsRef<Path>) -> Result<()> {
+        if self.host_binding().is_some() {
+            return Err(Error::Session(
+                "managed sessions must be exported by their host".into(),
+            ));
+        }
+        publish_snapshot(&self.records, destination.as_ref())
+    }
+
+    /// Create and open an independent, persistent branch with fresh session identity.
+    pub fn fork_to(&self, target: u64, destination: impl AsRef<Path>) -> Result<Self> {
+        let records = self.fork_records(target)?;
+        publish_snapshot(&records, destination.as_ref())?;
+        Self::open(destination)
+    }
+
     /// Fork from an existing record. The abandoned branch stays available by ID.
     pub fn checkout(&mut self, target: u64) -> Result<()> {
         if target == 0
@@ -566,6 +583,27 @@ impl Session {
         self.records.push(record);
         Ok(self.records.last().unwrap())
     }
+}
+
+fn publish_snapshot(records: &[Record], destination: &Path) -> Result<()> {
+    validated_head(records)?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    for record in records {
+        serde_json::to_writer(&mut temporary, record)?;
+        writeln!(temporary)?;
+    }
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(destination)
+        .map_err(|error| Error::Io(error.error))?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn validated_head(records: &[Record]) -> Result<u64> {

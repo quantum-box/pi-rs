@@ -80,7 +80,7 @@ impl SessionBuilder {
         Self {
             model,
             model_name: model_name.into(),
-            system_prompt: "You are an expert coding assistant.".into(),
+            system_prompt: "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.".into(),
             registry: Registry::default(),
             limits: Limits::default(),
         }
@@ -231,6 +231,17 @@ impl AgentSession {
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
         let session = Session::from_records(self.session.fork_records(record)?)?;
+        self.fork_session(session)
+    }
+    pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
+        self.ensure_open()?;
+        self.fork_session(self.session.fork_to(record, destination)?)
+    }
+    pub fn export_jsonl(&self, destination: impl AsRef<Path>) -> Result<()> {
+        self.ensure_open()?;
+        self.session.export_jsonl(destination)
+    }
+    fn fork_session(&self, session: Session) -> Result<Self> {
         let model_name = session
             .model_selection()
             .map(|selection| selection.0)
@@ -484,6 +495,31 @@ mod tests {
         ));
         assert!(session.prompt("after close").await.is_err());
         assert!(session.controls().steer("after close").await.is_err());
+    }
+    #[tokio::test]
+    async fn persistent_fork_and_export_reopen_without_overwriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model, "echo").in_memory().unwrap();
+        session.prompt("first").await.unwrap();
+        let export = directory.path().join("export.jsonl");
+        session.export_jsonl(&export).unwrap();
+        assert!(session.export_jsonl(&export).is_err());
+        let reopened = Session::open(&export).unwrap();
+        assert_eq!(
+            reopened.conversation_at(reopened.head()).unwrap(),
+            session.messages().unwrap()
+        );
+        let path = directory.path().join("fork.jsonl");
+        let mut fork = session.fork_to(session.journal().head(), &path).unwrap();
+        assert_ne!(fork.journal().session_id(), session.journal().session_id());
+        assert!(session.fork_to(session.journal().head(), &path).is_err());
+        fork.prompt("second").await.unwrap();
+        fork.close().await.unwrap();
+        drop(fork);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.conversation_at(reopened.head()).unwrap().len(), 4);
+        assert_eq!(session.messages().unwrap().len(), 2);
     }
     #[tokio::test]
     async fn shared_extensions_close_only_after_the_last_fork() {
