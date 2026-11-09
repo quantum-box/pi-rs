@@ -48,7 +48,7 @@ process-wrap = { version = "10", features = ["tokio1"] }
 rmcp = { version = "3.9", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
 tempfile = "3"

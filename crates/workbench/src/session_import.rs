@@ -372,7 +372,57 @@ fn convert(
                     content: required(message, "summary")?.into(),
                     input_id: None,
                 }),
-                "system" => {}
+                "system" => {
+                    let sections = message
+                        .get("sections")
+                        .map(|value| {
+                            value
+                                .as_object()
+                                .ok_or_else(|| Error::Session("invalid system sections".into()))?
+                                .iter()
+                                .map(|(name, value)| {
+                                    let value = if value.is_null() {
+                                        None
+                                    } else {
+                                        Some(
+                                            value
+                                                .as_str()
+                                                .ok_or_else(|| {
+                                                    Error::Session("invalid system section".into())
+                                                })?
+                                                .to_owned(),
+                                        )
+                                    };
+                                    Ok((name.clone(), value))
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+                    let tools_added = message
+                        .get("toolsAdded")
+                        .map(|value| serde_json::from_value(value.clone()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let tools_removed = message
+                        .get("toolsRemoved")
+                        .map(|value| {
+                            value
+                                .as_array()
+                                .ok_or_else(|| Error::Session("invalid removed tools".into()))?
+                                .iter()
+                                .map(|tool| required(tool, "name").map(str::to_owned))
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+                    events.push(Event::SystemCheckpoint {
+                        content: content(&message["content"])?,
+                        sections,
+                        tools_added,
+                        tools_removed,
+                    });
+                }
                 role => {
                     return Err(Error::Session(format!(
                         "unsupported imported message role {role}"
@@ -499,6 +549,36 @@ mod tests {
     use super::*;
     use pi_rs::Message;
     use serde_json::json;
+    #[test]
+    fn imports_ordered_system_sections_and_tool_changes() {
+        let entry: Value = serde_json::from_str(r#"{"type":"message","id":"system","parentId":null,"message":{"role":"system","content":[{"type":"text","text":"base"}],"sections":{"z":"first","a":"second","removed":null},"toolsAdded":[{"name":"read","description":"Read","parameters":{"type":"object"}}],"toolsRemoved":[{"name":"old"}]}}"#).unwrap();
+        let session = import_pi(vec![json!({"type":"session","version":3}), entry]).unwrap();
+        let checkpoint = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SystemCheckpoint {
+                    content,
+                    sections,
+                    tools_added,
+                    tools_removed,
+                } => Some((content, sections, tools_added, tools_removed)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(checkpoint.0, "base");
+        assert_eq!(
+            checkpoint.1,
+            &vec![
+                ("z".into(), Some("first".into())),
+                ("a".into(), Some("second".into())),
+                ("removed".into(), None)
+            ]
+        );
+        assert_eq!(checkpoint.2[0].name, "read");
+        assert_eq!(checkpoint.3, &["old"]);
+    }
+
     #[test]
     fn imports_branches_and_settled_tools_without_replaying_effects() {
         let entries = vec![

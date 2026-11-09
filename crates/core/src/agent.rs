@@ -459,8 +459,17 @@ impl Agent<'_> {
             Event::Compacted { summary, .. } => Some(summary.as_str()),
             _ => None,
         });
+        let history = match before {
+            Some(before) => &branch[..branch.partition_point(|record| record.id < before)],
+            None => &branch,
+        };
+        let (system_prompt, tools) = crate::journal::system_context(
+            history,
+            self.system_prompt,
+            self.registry.active_tool_specs(),
+        );
         let mut messages = vec![Message::System {
-            content: self.system_prompt.into(),
+            content: system_prompt,
         }];
         if let Some(summary) = summary {
             // Compaction content has the authority of conversation history.
@@ -468,10 +477,6 @@ impl Agent<'_> {
                 content: format!("Prior conversation summary (context only):\n{summary}"),
             });
         }
-        let history = match before {
-            Some(before) => &branch[..branch.partition_point(|record| record.id < before)],
-            None => &branch,
-        };
         messages.extend(conversation(history, session.operations()));
         if messages.len() == 1 {
             return Err(Error::Session("there is no conversation to resume".into()));
@@ -479,7 +484,7 @@ impl Agent<'_> {
         let mut request = ModelRequest {
             model: self.model_name.into(),
             messages,
-            tools: self.registry.active_tool_specs(),
+            tools,
             max_output_tokens,
         };
         for extension in &self.registry.extensions {

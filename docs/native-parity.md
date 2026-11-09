@@ -942,3 +942,19 @@ call used the current definition, with one server process throughout. Existing
 reconnection and form-elicitation fixtures passed after the change. Workspace
 tests and all-target Clippy passed on Rust 1.89. Changes during an active model
 turn are applied at the next prompt boundary.
+
+### Imported system-instruction checkpoint
+
+Upstream system messages now become typed journal checkpoints. Resuming replays
+added instruction text, ordered named-section replacements and removals, and
+tool-set changes on the selected branch, including across compaction. JSON
+object order is preserved during import so named sections retain their declared
+order. Tool declarations resolve to current enabled native implementations and
+schemas. An imported declaration cannot enable an unavailable or disabled tool.
+
+Tests cover branch restoration, section order, replacement/removal, current tool
+schemas and permission boundaries. A CLI import-and-resume fixture verified the
+actual model request and retained the original source file. Workspace tests and
+all-target Clippy passed on Rust 1.89, along with direct/deferred live MCP updates
+and form elicitation after the serialization change. A local qwen3.5:4b CLI call
+also returned the requested `OK` response.

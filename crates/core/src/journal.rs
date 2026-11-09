@@ -49,6 +49,16 @@ pub enum Event {
         target: u64,
         replacement: Option<crate::ContextContent>,
     },
+    /// Imported transcript instructions and ordered section/tool updates.
+    SystemCheckpoint {
+        content: String,
+        #[serde(default)]
+        sections: Vec<(String, Option<String>)>,
+        #[serde(default)]
+        tools_added: Vec<crate::ToolSpec>,
+        #[serde(default)]
+        tools_removed: Vec<String>,
+    },
     Created {
         session_id: Uuid,
     },
@@ -1023,6 +1033,63 @@ pub(crate) fn ensure_settled(ops: Vec<(Invocation, OperationState)>) -> Result<(
     Ok(())
 }
 
+pub(crate) fn system_context(
+    path: &[&Record],
+    fallback: &str,
+    available: Vec<crate::ToolSpec>,
+) -> (String, Vec<crate::ToolSpec>) {
+    let mut content = Vec::new();
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut tools = Vec::new();
+    let mut found = false;
+    for record in path {
+        let Event::SystemCheckpoint {
+            content: text,
+            sections: changes,
+            tools_added,
+            tools_removed,
+        } = &record.event
+        else {
+            continue;
+        };
+        found = true;
+        if !text.is_empty() {
+            content.push(text.clone());
+        }
+        for (name, value) in changes {
+            match (sections.iter().position(|(key, _)| key == name), value) {
+                (Some(index), Some(value)) => sections[index].1 = value.clone(),
+                (Some(index), None) => {
+                    sections.remove(index);
+                }
+                (None, Some(value)) => sections.push((name.clone(), value.clone())),
+                (None, None) => {}
+            }
+        }
+        tools.retain(|tool: &crate::ToolSpec| !tools_removed.contains(&tool.name));
+        for declared in tools_added {
+            // Imported declarations select current native implementations and schemas.
+            if let Some(registered) = available.iter().find(|tool| tool.name == declared.name) {
+                if let Some(index) = tools.iter().position(|tool| tool.name == declared.name) {
+                    tools[index] = registered.clone();
+                } else {
+                    tools.push(registered.clone());
+                }
+            }
+        }
+    }
+    if !found {
+        return (fallback.into(), available);
+    }
+    content.extend(
+        sections
+            .into_iter()
+            .map(|(_, text)| text)
+            .filter(|text| !text.is_empty()),
+    );
+    (content.join("\n\n"), tools)
+}
+
 pub(crate) fn conversation(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
@@ -1516,6 +1583,70 @@ mod shell_tests {
                 .filter(|record| matches!(record.event, Event::BashExecution { .. }))
                 .count(),
             2
+        );
+    }
+}
+
+#[cfg(test)]
+mod system_checkpoint_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn system_updates_follow_branch_history_and_current_tool_permissions() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let tool = crate::ToolSpec {
+            name: "read".into(),
+            description: "Current native tool".into(),
+            parameters: json!({"type":"object"}),
+        };
+        assert_eq!(
+            system_context(&session.branch(), "fallback", vec![tool.clone()]),
+            ("fallback".into(), vec![tool.clone()])
+        );
+        session
+            .append(Event::SystemCheckpoint {
+                content: "base".into(),
+                sections: vec![
+                    ("z".into(), Some("first".into())),
+                    ("a".into(), Some("second".into())),
+                ],
+                tools_added: vec![crate::ToolSpec {
+                    description: "Outdated declaration".into(),
+                    ..tool.clone()
+                }],
+                tools_removed: vec![],
+            })
+            .unwrap();
+        let initial = session.head();
+        session
+            .append(Event::SystemCheckpoint {
+                content: "addition".into(),
+                sections: vec![
+                    ("z".into(), Some("replacement".into())),
+                    ("a".into(), None),
+                    ("last".into(), Some("last section".into())),
+                ],
+                tools_added: vec![],
+                tools_removed: vec!["read".into()],
+            })
+            .unwrap();
+        assert_eq!(
+            system_context(&session.branch(), "fallback", vec![tool.clone()]),
+            (
+                "base\n\naddition\n\nreplacement\n\nlast section".into(),
+                vec![]
+            )
+        );
+        session.checkout(initial).unwrap();
+        assert_eq!(
+            system_context(&session.branch(), "fallback", vec![tool.clone()]),
+            ("base\n\nfirst\n\nsecond".into(), vec![tool])
+        );
+        assert!(
+            system_context(&session.branch(), "fallback", vec![])
+                .1
+                .is_empty()
         );
     }
 }

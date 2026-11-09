@@ -1047,6 +1047,14 @@ fn metadata(record: &pi_rs::Record) -> Value {
         }
         Event::UserImages { images } => json!({"event":"user_images","images":images.len()}),
         Event::SourceEntry { format, .. } => json!({"event":"source_entry","format":format}),
+        Event::SystemCheckpoint {
+            sections,
+            tools_added,
+            tools_removed,
+            ..
+        } => {
+            json!({"event":"system_checkpoint","sections":sections.len(),"tools_added":tools_added.len(),"tools_removed":tools_removed.len()})
+        }
         Event::ExtensionStates { states } => {
             let versions: Vec<_> = states
                 .iter()
