@@ -274,3 +274,14 @@ Workflow の承認と評価設定に完全な Git コミットIDを指定する�
 AIP 統合16件は並列で3回、評価設定7件、Workflow の HTTP 呼出し9件、模擬操作を
 有効にした pi-rs のワークスペース試験25件が通過した。
 [Field 模擬プロファイルと受入試験](https://github.com/quantum-box/tachyon-apps/commit/94e09ca9f5d611433ddb0fb111584d5ef0b32d52)
+
+
+### AIP の Anthropic ストリーム終了とキャッシュ使用量
+
+模擬 HTTP サーバーから、既存 Anthropic アダプターと Model Gateway 経由で
+ハーネスに SSE を送った。ツール引数と途中の使用量が到着しても、完了通知がない
+場合はツール呼出しを渡さなかった。完了時は入力20とキャッシュ18を合わせた38を
+予算に計上し、Payment 用の入力20とキャッシュ内訳を保持した。
+AIP 統合18件が通過した。Anthropic の全ライブラリ試験は環境の HTTP プロキシを
+外すと74件が通過し、4件はスキップされた。
+[Anthropic 経路の実装と検証](https://github.com/quantum-box/tachyon-apps/commit/cde7dd60db7ff81075d9c39a8d2d63d284bc174b)
