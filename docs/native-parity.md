@@ -697,3 +697,23 @@ multiline editing, cancellation and request timeouts. PTY fixtures cover both
 terminal modes and restoration. Existing image, Markdown, diff, session,
 resource and native host-call fixtures continue to pass. Custom terminal
 components and the remaining extension events are still tracked above.
+
+### Settings validation and editing checkpoint
+
+`/settings` offers the existing display toggles and a native multiline JSON
+editor for implemented model defaults, resource lists, native packages, tool
+selection, trust defaults, terminal mode and codemode settings. Ctrl+S validates
+and saves, Escape discards the edit. Invalid values keep the editor open and
+show the failing settings path. Unrecognized extension-owned keys survive
+updates. Runtime/resource changes take effect on reload or the next startup,
+and theme changes apply immediately.
+
+The local settings editor remains open when an outstanding model response
+finishes. Settings, theme and hotkey commands are handled before streaming
+input is queued. Tests cover schema diagnostics and dialog error layout.
+Remaining upstream settings and specialized selector behavior are still open.
+
+A real PTY fixture covered both modes while a model response was outstanding,
+then exercised invalid input, correction, cancellation and preservation of an
+extension-owned setting. The existing native-dialog and resource fixtures also
+passed after the settings changes.

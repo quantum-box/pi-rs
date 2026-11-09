@@ -15,6 +15,7 @@ pub enum Selection {
     Trust(bool),
     Thinking(String),
     Setting(String, serde_json::Value),
+    EditSetting(String),
 }
 pub struct Item {
     pub label: String,

@@ -15,6 +15,7 @@ pub struct Dialog {
     request: UiRequest,
     editor: Editor,
     selected: usize,
+    error: Option<String>,
 }
 impl Dialog {
     pub fn new(id: Uuid, request: UiRequest) -> Self {
@@ -29,7 +30,11 @@ impl Dialog {
             request,
             editor,
             selected: 0,
+            error: None,
         }
+    }
+    pub fn set_error(&mut self, error: String) {
+        self.error = Some(error);
     }
     pub fn paste(&mut self, text: &str) {
         if matches!(
@@ -107,6 +112,17 @@ impl Dialog {
             _ => "Extension",
         }
     }
+    fn heading(&self) -> &str {
+        self.error.as_deref().unwrap_or_else(|| self.title())
+    }
+    fn heading_height(&self, width: usize, height: usize) -> usize {
+        wrap(
+            &[Span::new(self.heading(), crossterm::style::Color::Reset)],
+            width,
+        )
+        .len()
+        .min(height.saturating_sub(2).clamp(1, 4))
+    }
     pub fn cursor(&self, width: usize, height: usize) -> Option<(usize, usize)> {
         if !matches!(
             self.request,
@@ -121,7 +137,10 @@ impl Dialog {
             )],
             width,
         );
-        let offset = prefix.len().saturating_sub(height.saturating_sub(2).max(1));
+        let heading_height = self.heading_height(width, height);
+        let offset = prefix
+            .len()
+            .saturating_sub(height.saturating_sub(heading_height + 1).max(1));
         let column = prefix
             .last()
             .map_or(0, |line| {
@@ -132,13 +151,14 @@ impl Dialog {
             })
             .min(width.saturating_sub(1));
         Some((
-            1 + prefix.len().saturating_sub(1).saturating_sub(offset),
+            heading_height + prefix.len().saturating_sub(1).saturating_sub(offset),
             column,
         ))
     }
     pub fn render(&self, theme: &Theme, width: usize, height: usize) -> Vec<Line> {
-        let mut lines = vec![Line::plain(self.title(), theme.color("accent"))];
-        let available = height.saturating_sub(2).max(1);
+        let mut lines = wrap(&[Span::new(self.heading(), theme.color("accent"))], width);
+        lines.truncate(self.heading_height(width, height));
+        let available = height.saturating_sub(lines.len() + 1).max(1);
         match &self.request {
             UiRequest::Select { options, .. } => {
                 let start = self.selected.saturating_sub(available.saturating_sub(1));
@@ -208,6 +228,25 @@ impl Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn error_headers_wrap_without_hiding_the_editor_cursor() {
+        let mut dialog = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Editor {
+                title: "Edit setting".into(),
+                initial_value: Some("first\nsecond".into()),
+                timeout: None,
+            },
+        );
+        dialog.set_error("Invalid value for this setting".into());
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let lines = dialog.render(&theme, 12, 8);
+        let (row, column) = dialog.cursor(12, 8).unwrap();
+        assert!(row >= 2 && row < lines.len());
+        assert_eq!(column, 6);
+        assert!(lines.len() <= 8);
+    }
+
     #[test]
     fn dialogs_accept_selection_text_multiline_and_cancellation() {
         let keys = Keys::default();

@@ -130,6 +130,7 @@ struct View {
     regular: RegularState,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
+    setting_editor: Option<(String, crate::ui::dialog::Dialog)>,
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: std::collections::BTreeMap<String, (Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
@@ -155,6 +156,12 @@ struct View {
     phase: Option<&'static str>,
 }
 impl View {
+    fn dialog(&self) -> Option<&crate::ui::dialog::Dialog> {
+        self.setting_editor
+            .as_ref()
+            .map(|(_, dialog)| dialog)
+            .or_else(|| self.dialogs.front())
+    }
     fn ui_request(&mut self, value: &Value) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
         let id: uuid::Uuid = serde_json::from_value(value["id"].clone())?;
         let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
@@ -320,6 +327,7 @@ impl View {
         self.draft_images.clear();
         self.clipboard = None;
         self.dialogs.clear();
+        self.setting_editor = None;
         self.ui_status.clear();
         self.widgets.clear();
         self.history.clear();
@@ -586,7 +594,7 @@ impl View {
         let prompt_height = prompt.len().clamp(1, 6).min(height.saturating_sub(5));
         let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
         below.truncate(height.saturating_sub(prompt_height + 6));
-        if !self.dialogs.is_empty() {
+        if self.dialog().is_some() {
             below.clear();
         }
         let body_height = height.saturating_sub(prompt_height + 5 + below.len());
@@ -610,7 +618,7 @@ impl View {
         if let Some(picker) = &self.picker {
             lines = picker.render(theme, body_height);
         }
-        if let Some(dialog) = self.dialogs.front() {
+        if let Some(dialog) = self.dialog() {
             lines = dialog.render(theme, width, body_height);
         } else {
             lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
@@ -701,7 +709,7 @@ impl View {
             .last()
             .map_or(0, |line| UnicodeWidthStr::width(line.as_str()))
             .min(width - 1);
-        if let Some(dialog) = self.dialogs.front() {
+        if let Some(dialog) = self.dialog() {
             if let Some((row, column)) = dialog.cursor(width, body_height) {
                 queue!(out, MoveTo(column as u16, (row + 1) as u16), Show)?;
             } else {
@@ -758,7 +766,7 @@ impl View {
         let prompt_height = prompt.len().clamp(1, 6).min(height - 5);
         let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
         below.truncate(height.saturating_sub(prompt_height + 6));
-        if !self.dialogs.is_empty() {
+        if self.dialog().is_some() {
             below.clear();
         }
         let mut out = std::io::stdout().lock();
@@ -799,7 +807,7 @@ impl View {
             }
         }
         let mut active = Vec::new();
-        if !busy && self.picker.is_none() && self.dialogs.is_empty() && self.scroll == 0 {
+        if !busy && self.picker.is_none() && self.dialog().is_none() && self.scroll == 0 {
             for entry in &self.lines[self.regular.committed..] {
                 for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
                     line.draw(&mut out, width)?;
@@ -839,7 +847,7 @@ impl View {
                 .collect();
             active.reverse();
         }
-        if let Some(dialog) = self.dialogs.front() {
+        if let Some(dialog) = self.dialog() {
             active = dialog.render(theme, width, height - prompt_height - 4 - below.len());
         } else {
             let available = height - prompt_height - 4 - below.len();
@@ -912,7 +920,7 @@ impl View {
             .last()
             .map_or(0, |line| UnicodeWidthStr::width(line.as_str()))
             .min(width - 1);
-        let (column, show_cursor) = if let Some(dialog) = self.dialogs.front() {
+        let (column, show_cursor) = if let Some(dialog) = self.dialog() {
             let position = dialog.cursor(width, height - prompt_height - 4 - below.len());
             self.regular.cursor_row = position.map_or(0, |(row, _)| row);
             (position.map_or(0, |(_, column)| column), position.is_some())
@@ -1536,7 +1544,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
             Event::Paste(text) => {
-                if let Some(dialog) = view.dialogs.front_mut() {
+                if let Some((_, dialog)) = view.setting_editor.as_mut() {
+                    dialog.paste(&text);
+                } else if let Some(dialog) = view.dialogs.front_mut() {
                     dialog.paste(&text);
                 } else {
                     view.editor.insert(&text);
@@ -1545,6 +1555,32 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
+                if let Some((name, mut dialog)) = view.setting_editor.take() {
+                    match dialog.input(key, &keys) {
+                        Some(pi_rs::UiResponse::Text(text)) => {
+                            let result = serde_json::from_str(&text).map_err(Error::from).and_then(
+                                |value| {
+                                    select(
+                                        Selection::Setting(name.clone(), value),
+                                        &mut args,
+                                        &mut view,
+                                        &mut theme,
+                                    )
+                                },
+                            );
+                            match result {
+                                Ok(()) => view.append("Setting saved"),
+                                Err(error) => {
+                                    dialog.set_error(error.to_string());
+                                    view.setting_editor = Some((name, dialog));
+                                }
+                            }
+                        }
+                        Some(_) => {}
+                        None => view.setting_editor = Some((name, dialog)),
+                    }
+                    continue;
+                }
                 if let Some(dialog) = view.dialogs.front_mut() {
                     if let Some(value) = dialog.input(key, &keys) {
                         let id = dialog.id;
@@ -1687,19 +1723,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         view.scroll = 0;
                         view.history.push(input.clone());
                         view.history_index = None;
-                        if let Some(active) = worker.as_mut().filter(|active| active.busy) {
-                            let kind = if action == "app.message.followUp" {
-                                "followup"
-                            } else {
-                                "steer"
-                            };
-                            match active.send(
-                                json!({"type":kind,"content":input,"images":view.draft_images}),
-                            ) {
-                                Ok(()) => view.draft_images.clear(),
-                                Err(error) => view.append(&error.to_string()),
-                            }
-                        } else if input.trim() == "/theme" {
+                        if input.trim() == "/theme" {
                             let names = Theme::discover(
                                 &args.theme_paths,
                                 &args.workspace,
@@ -1739,6 +1763,97 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 }
                                 Err(error) => view.append(&error.to_string()),
                             }
+                        } else if input.trim() == "/hotkeys" {
+                            view.append(&keys.describe());
+                        } else if input.trim() == "/settings" {
+                            let mut items = vec![
+                                Item {
+                                    label: format!(
+                                        "Tool output · {} (toggle)",
+                                        if view.expand_tools {
+                                            "expanded"
+                                        } else {
+                                            "collapsed"
+                                        }
+                                    ),
+                                    selection: Selection::Setting(
+                                        "expandTools".into(),
+                                        json!(!view.expand_tools),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
+                                        "Thinking blocks · {} (toggle)",
+                                        if view.hide_thinking {
+                                            "hidden"
+                                        } else {
+                                            "shown"
+                                        }
+                                    ),
+                                    selection: Selection::Setting(
+                                        "hideThinkingBlock".into(),
+                                        json!(!view.hide_thinking),
+                                    ),
+                                },
+                                Item {
+                                    label: format!("Save default model · {}", args.model),
+                                    selection: Selection::Setting(
+                                        "defaultModel".into(),
+                                        json!(args.model),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
+                                        "Save default thinking · {}",
+                                        args.thinking.as_deref().unwrap_or("model default")
+                                    ),
+                                    selection: Selection::Setting(
+                                        "defaultThinkingLevel".into(),
+                                        json!(args.thinking),
+                                    ),
+                                },
+                            ];
+                            for name in [
+                                "theme",
+                                "defaultModel",
+                                "defaultThinkingLevel",
+                                "modelThinkingLevels",
+                                "tuiMode",
+                                "sessionDir",
+                                "defaultProjectTrust",
+                                "defaultTools",
+                                "extensions",
+                                "skills",
+                                "prompts",
+                                "themes",
+                                "packages",
+                                "codemode",
+                            ] {
+                                items.push(Item {
+                                    label: format!(
+                                        "Edit {name} · {}",
+                                        args.settings
+                                            .value()
+                                            .get(name)
+                                            .map(Value::to_string)
+                                            .unwrap_or_else(|| "default".into())
+                                    ),
+                                    selection: Selection::EditSetting(name.into()),
+                                });
+                            }
+                            view.picker = Some(Picker::new("Settings", items));
+                        } else if let Some(active) = worker.as_mut().filter(|active| active.busy) {
+                            let kind = if action == "app.message.followUp" {
+                                "followup"
+                            } else {
+                                "steer"
+                            };
+                            match active.send(
+                                json!({"type":kind,"content":input,"images":view.draft_images}),
+                            ) {
+                                Ok(()) => view.draft_images.clear(),
+                                Err(error) => view.append(&error.to_string()),
+                            }
                         } else if input.trim() == "/reload" {
                             worker.take();
                             view.dialogs.clear();
@@ -1764,59 +1879,6 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 Err(error) => view.append(&error.to_string()),
                             }
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
-                        } else if input.trim() == "/hotkeys" {
-                            view.append(&keys.describe());
-                        } else if input.trim() == "/settings" {
-                            view.picker = Some(Picker::new(
-                                "Settings",
-                                vec![
-                                    Item {
-                                        label: format!(
-                                            "Tool output · {} (toggle)",
-                                            if view.expand_tools {
-                                                "expanded"
-                                            } else {
-                                                "collapsed"
-                                            }
-                                        ),
-                                        selection: Selection::Setting(
-                                            "expandTools".into(),
-                                            json!(!view.expand_tools),
-                                        ),
-                                    },
-                                    Item {
-                                        label: format!(
-                                            "Thinking blocks · {} (toggle)",
-                                            if view.hide_thinking {
-                                                "hidden"
-                                            } else {
-                                                "shown"
-                                            }
-                                        ),
-                                        selection: Selection::Setting(
-                                            "hideThinkingBlock".into(),
-                                            json!(!view.hide_thinking),
-                                        ),
-                                    },
-                                    Item {
-                                        label: format!("Save default model · {}", args.model),
-                                        selection: Selection::Setting(
-                                            "defaultModel".into(),
-                                            json!(args.model),
-                                        ),
-                                    },
-                                    Item {
-                                        label: format!(
-                                            "Save default thinking · {}",
-                                            args.thinking.as_deref().unwrap_or("model default")
-                                        ),
-                                        selection: Selection::Setting(
-                                            "defaultThinkingLevel".into(),
-                                            json!(args.thinking),
-                                        ),
-                                    },
-                                ],
-                            ));
                         } else if input.starts_with('/') {
                             match slash(&input, &mut args, &mut view) {
                                 Ok(Some(next)) => worker = Some(next),
@@ -2031,8 +2093,55 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
             args.thinking = Some(thinking);
             Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
         }
+        Selection::EditSetting(key) => {
+            let default = match key.as_str() {
+                "theme" => json!(args.use_theme.as_deref().unwrap_or("system")),
+                "defaultModel" => json!(args.model),
+                "defaultThinkingLevel" => json!(args.thinking.as_deref().unwrap_or("off")),
+                "tuiMode" => json!(if args.tui_mode == Some(TuiMode::Regular) {
+                    "regular"
+                } else {
+                    "fullscreen"
+                }),
+                "sessionDir" => json!(
+                    args.session_dir
+                        .as_deref()
+                        .unwrap_or_else(|| std::path::Path::new(""))
+                ),
+                "defaultProjectTrust" => json!("ask"),
+                "defaultTools" => json!(["read", "bash", "edit", "write"]),
+                "modelThinkingLevels" => json!({}),
+                "codemode" => json!({"mode":"on", "inlineBudget":3000}),
+                _ => json!([]),
+            };
+            let value = args.settings.value().get(&key).unwrap_or(&default);
+            let dialog = crate::ui::dialog::Dialog::new(
+                uuid::Uuid::new_v4(),
+                pi_rs::UiRequest::Editor {
+                    title: format!("Edit {key} as JSON · applies on reload/startup"),
+                    initial_value: Some(serde_json::to_string_pretty(value)?),
+                    timeout: None,
+                },
+            );
+            view.setting_editor = Some((key, dialog));
+        }
         Selection::Setting(key, value) => {
-            args.settings.set_user(&key, value.clone())?;
+            if key == "theme" {
+                let next = Theme::load(
+                    value
+                        .as_str()
+                        .ok_or_else(|| Error::Config("theme must be a string".into()))?,
+                    &args.theme_paths,
+                    &args.workspace,
+                    args.trusted,
+                    false,
+                )?;
+                args.settings.set_user(&key, value.clone())?;
+                args.use_theme = value.as_str().map(str::to_owned);
+                *theme = next;
+            } else {
+                args.settings.set_user(&key, value.clone())?;
+            }
             match key.as_str() {
                 "expandTools" => view.expand_tools = value.as_bool().unwrap_or(false),
                 "hideThinkingBlock" => view.hide_thinking = value.as_bool().unwrap_or(false),

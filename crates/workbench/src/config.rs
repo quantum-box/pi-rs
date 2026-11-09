@@ -23,14 +23,18 @@ pub struct Settings {
 }
 impl Settings {
     pub fn load(workspace: &Path, trusted: bool) -> Result<Self> {
-        let mut value = read_object(&agent_dir().join("settings.json"))?;
+        let user_path = agent_dir().join("settings.json");
+        let mut value = read_object(&user_path)?;
+        validate_settings(&value, &user_path)?;
         let mut resource_layers = vec![(agent_dir(), value.clone())];
         if trusted {
-            let mut project = read_object(&workspace.join(".pi/settings.json"))?;
+            let project_path = workspace.join(".pi/settings.json");
+            let mut project = read_object(&project_path)?;
             project
                 .as_object_mut()
                 .expect("object")
                 .remove("defaultProjectTrust");
+            validate_settings(&project, &project_path)?;
             resource_layers.push((workspace.join(".pi"), project.clone()));
             merge(&mut value, project);
         }
@@ -98,6 +102,7 @@ impl Settings {
             .as_object_mut()
             .expect("validated settings object")
             .insert(key.into(), value.clone());
+        validate_settings(&settings, &path)?;
         write_json(&path, &settings)?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
@@ -114,6 +119,24 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// Validate implemented settings while retaining extension-owned and future keys.
+pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
+    static SCHEMA: std::sync::LazyLock<jsonschema::Validator> = std::sync::LazyLock::new(|| {
+        let schema: Value = serde_json::from_str(include_str!("../assets/settings.schema.json"))
+            .expect("bundled settings schema");
+        jsonschema::validator_for(&schema).expect("valid settings schema")
+    });
+    if let Some(error) = SCHEMA.iter_errors(value).next() {
+        return Err(Error::Config(format!(
+            "{}{}: {}",
+            path.display(),
+            error.instance_path,
+            error
+        )));
+    }
+    Ok(())
 }
 
 pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<bool>> {
@@ -346,6 +369,23 @@ mod tests {
         );
         assert_eq!(base["skills"], json!(["first", "second"]));
     }
+    #[test]
+    fn settings_validation_identifies_bad_values_and_keeps_extension_keys() {
+        let path = Path::new("settings.json");
+        validate_settings(&json!({"codemode":{"mode":"only","inlineBudget":0},"myExtension":{"option":true},"defaultThinkingLevel":null}), path).unwrap();
+        for invalid in [
+            json!({"codemode":{"mode":"invalid"}}),
+            json!({"codemode":{"inlineBudget":-1}}),
+            json!({"hideThinkingBlock":"false"}),
+            json!({"packages":[{"extensions":[]}]}),
+            json!({"modelThinkingLevels":{"model":"unknown"}}),
+            json!({"skills":[false]}),
+        ] {
+            let error = validate_settings(&invalid, path).unwrap_err().to_string();
+            assert!(error.contains("settings.json/"), "{error}");
+        }
+    }
+
     #[test]
     fn atomic_setting_write_roundtrips_without_temporary_files() {
         let dir = tempfile::tempdir().unwrap();

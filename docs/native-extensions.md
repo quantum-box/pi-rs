@@ -155,3 +155,21 @@ omitting their schemas from the initial model request.
 Stateful native tools may implement `invoke_with_state` to receive their owning
 extension's current branch state. The default delegates to `invoke`, preserving
 existing tools. The executable protocol forwards the same optional state.
+
+## Native interaction
+
+Tools can inspect `host.has_ui()` and call `host.ui(request).await` inside
+`invoke_with_host`. `UiRequest` supports selection, confirmation, text input,
+multiline editing, notifications, status entries, positioned widgets, window
+titles and editor text. Dialog requests can carry an optional millisecond
+`timeout`. Cancelled dialogs return `UiResponse::Cancelled`.
+
+```sh
+cargo build --locked -p pi-rs-extensions --example interactive_review
+pi -e ./target/debug/examples/interactive_review
+```
+
+Ask the agent to call `interactive_review` to exercise the dialogs. The native
+executable exchanges correlated UI frames with the host. RPC clients receive
+`extension_ui_request` and answer with `extension_ui_response`. Embedded Rust
+applications install their own `ExtensionUi` on `SessionBuilder` or `Registry`.
