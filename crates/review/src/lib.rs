@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use pi_rs_core::{
-    Agent, CancellationToken, Error, Event, Extension, ExtensionResult, ExtensionState, Message,
-    ModelRequest, Observer, Result, RunState, Session, UsageReport,
+    Agent, AgentInput, CancellationToken, Error, Event, Extension, ExtensionResult, ExtensionState,
+    Message, ModelRequest, Observer, Result, RunState, Session, UsageReport,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -109,6 +109,11 @@ pub struct Review<'a> {
     pub resume: bool,
 }
 
+pub struct ReviewControls<'input, 'observer, T> {
+    pub inputs: &'input mut tokio::sync::mpsc::Receiver<T>,
+    pub observer: &'input mut Observer<'observer>,
+}
+
 impl Review<'_> {
     pub async fn run(
         &self,
@@ -117,6 +122,19 @@ impl Review<'_> {
         child: &mut Session,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
+    ) -> Result<String> {
+        self.run_with_controls::<AgentInput>(agent, parent, child, cancel, observer, None)
+            .await
+    }
+
+    pub async fn run_with_controls<T: Into<AgentInput> + Send>(
+        &self,
+        agent: &Agent<'_>,
+        parent: &mut Session,
+        child: &mut Session,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        mut controls: Option<ReviewControls<'_, '_, T>>,
     ) -> Result<String> {
         if self.timeout.is_zero()
             || self.output_budget == 0
@@ -242,9 +260,41 @@ impl Review<'_> {
             .iter()
             .any(|record| record.run_id == Some(child_id)))
         .then_some(prompt);
-        let result = reviewer
-            .run_correlated(child, child_id, input, &mut inputs, &token, observer)
-            .await;
+        let mut result = {
+            let running =
+                reviewer.run_correlated(child, child_id, input, &mut inputs, &token, observer);
+            tokio::pin!(running);
+            loop {
+                tokio::select! {
+                    result = &mut running => break result,
+                    Some(input) = async {
+                        match controls.as_mut() {
+                            Some(controls) => controls.inputs.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Err(error) = input.into().apply(parent, controls.as_mut().expect("active review controls").observer) {
+                            token.cancel();
+                            let _ = running.await;
+                            break Err(error);
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(controls) = controls {
+            for _ in 0..controls.inputs.max_capacity() {
+                let Ok(input) = controls.inputs.try_recv() else {
+                    break;
+                };
+                if let Err(error) = input.into().apply(parent, controls.observer) {
+                    if result.is_ok() {
+                        result = Err(error);
+                    }
+                    break;
+                }
+            }
+        }
         timer.abort();
         let status = match &result {
             Ok(answer) => ReviewStatus::Done {

@@ -154,6 +154,10 @@ pub async fn run(mut args: Cli) -> Result<()> {
             runtime.set_thinking(args.thinking.as_deref());
             continue;
         }
+        let resume_queued = matches!(
+            &request,
+            Request::Prompt { .. } | Request::Compact { .. } | Request::Review { .. }
+        );
         let cancel = CancellationToken::new();
         {
             let mut state = active.lock().expect("worker control");
@@ -279,7 +283,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
                             output(event);
                         }
                     };
-                    let answer = review.run(&agent, &mut session, &mut child, &cancel, &mut child_observer).await?;
+                    let answer = review.run_with_controls(&agent, &mut session, &mut child, &cancel, &mut child_observer, Some(pi_rs_review::ReviewControls { inputs: &mut queued, observer: &mut observer })).await?;
                     output(json!({"type":"review_answer","content":answer,"child_session":child.session_id(),"parent_session":session.session_id()}));
                 }
                 _ => return Err(Error::Config("invalid worker operation".into())),
@@ -288,7 +292,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
         }
         .await;
         active.lock().expect("worker control").token = None;
-        if matches!(&result, Err(Error::Cancelled)) {
+        if resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled))) {
             continue_queue = Session::open(&args.session)
                 .is_ok_and(|session| !session.queued_inputs().is_empty());
         }

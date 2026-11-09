@@ -831,8 +831,7 @@ behavior unless configured otherwise.
 Alt+Up restores queued messages in the TUI, with Alt+Q on Windows/WSL. Escape
 restores the queue before stopping the active run. An RPC abort retains queued
 messages and continues them without repeating the interrupted request first.
-Compaction queue handling is covered below. Review operations still require
-their separate queue handling.
+Compaction queue handling is covered below. Review queue handling is covered below.
 
 RPC fixtures verify acknowledgements while HTTP/model and shell-tool execution
 are pending, one-at-a-time delivery, persisted defaults on a new session and
@@ -849,3 +848,15 @@ callers of `Agent::summarize` keep the original interface.
 SDK and RPC fixtures verify clearing pending input during a blocked summary,
 cancelling that summary, and completing a later compaction without restoring the
 removed message. Workspace tests and all-target Clippy pass.
+
+### Review queue checkpoint
+
+Independent child reviews accept parent queue controls while the reviewer is
+waiting. Input and removals stay in the parent journal and do not enter the
+reviewer's frozen snapshot. Cancelling and resuming a review retains its existing
+identity and budget. Pending parent messages continue after a successful review
+or compaction, in addition to the existing continuation after an abort.
+
+A native worker fixture verifies parent-only queue records, prompt isolation,
+review cancellation/resume and follow-up execution on the parent. Workspace
+tests and all-target Clippy pass.
