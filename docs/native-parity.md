@@ -1328,3 +1328,24 @@ Pi distribution, which returned the same 254 retained lines and notices. A
 second fixture verifies 256 entries ending exactly at the byte boundary. This
 covers listing limits; complete locale collation, structured tool details and
 other local-tool output/error parity remain open.
+
+### Grep context and line-limit checkpoint
+
+Grep now emits a separate context block for each match, including repeated lines
+where adjacent matches overlap. The matching marker belongs to that block's
+center; a neighboring match uses the context marker. Pending blocks flush at EOF,
+including the final empty line when the file ends with a newline. The streaming
+implementation retains a bounded context window and bounded output.
+
+Long lines use Pi's 500 UTF-16-unit cutoff. A split surrogate is rendered as a
+replacement character in native UTF-8 text. Match counting continues after the
+50 KB output limit, so combined match, byte and long-line notices reflect the
+same selected matches as the reference. Notice wording also matches Pi.
+
+Regression tests cover overlapping blocks, the final selected match's context,
+EOF with and without a trailing newline, surrogate boundaries, and combined
+limits. Direct execution of the pinned Pi tool confirmed the context output and
+the 101-line, 51,098-byte combined-limit result. A loopback CLI test also verified
+that invoking the native grep tool delivers those per-match context blocks to
+the next model request. Workspace tests and all-target Clippy passed. Other local-tool differences,
+including structured result details and find traversal, remain open.

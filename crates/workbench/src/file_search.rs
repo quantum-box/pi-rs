@@ -1,8 +1,11 @@
 //! Bounded, streaming grep with matching and context line markers.
+use std::collections::VecDeque;
 use std::path::Path;
 
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
+use grep_searcher::{
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch,
+};
 use pi_rs::{Error, Result};
 use serde_json::Value;
 
@@ -52,9 +55,11 @@ impl Grep {
                 output: &mut self.output,
                 context: self.context as u64,
                 stop_after: None,
+                lines: VecDeque::new(),
+                pending: VecDeque::new(),
             },
         )?;
-        Ok(self.output.matches < self.output.limit && !self.output.byte_limit)
+        Ok(self.output.matches < self.output.limit)
     }
     pub fn finish(self) -> String {
         if self.output.matches == 0 && self.output.lines.is_empty() && !self.output.byte_limit {
@@ -70,10 +75,11 @@ impl Grep {
             ));
         }
         if self.output.byte_limit {
-            notices.push("50 KiB limit reached".into());
+            notices.push("50.0KB limit reached".into());
         }
         if self.output.long_lines {
-            notices.push("Some lines truncated to 500 chars. Use read to see full lines".into());
+            notices
+                .push("Some lines truncated to 500 chars. Use read tool to see full lines".into());
         }
         if !notices.is_empty() {
             text.push_str(&format!("\n\n[{}]", notices.join(". ")));
@@ -92,15 +98,13 @@ struct Output {
     long_lines: bool,
 }
 impl Output {
-    fn line(&mut self, display: &str, number: u64, bytes: &[u8], matched: bool) -> bool {
-        let text = String::from_utf8_lossy(bytes).replace('\r', "");
-        let text = text.trim_end_matches('\n');
-        let mut characters = text.chars();
-        let mut text: String = characters.by_ref().take(500).collect();
-        if characters.next().is_some() {
-            self.long_lines = true;
-            text.push_str("... [truncated]");
+    fn line(&mut self, display: &str, line: &ContextLine, matched: bool) {
+        self.long_lines |= line.truncated;
+        if self.byte_limit {
+            return;
         }
+        let number = line.number;
+        let text = &line.text;
         let line = if matched {
             format!("{display}:{number}: {text}")
         } else {
@@ -109,45 +113,123 @@ impl Output {
         let added = line.len() + usize::from(!self.lines.is_empty());
         if self.bytes + added > 50 * 1024 {
             self.byte_limit = true;
-            return false;
+            return;
         }
         self.bytes += added;
         self.lines.push(line);
-        true
     }
 }
+
+struct ContextLine {
+    number: u64,
+    text: String,
+    truncated: bool,
+    terminated: bool,
+}
+impl ContextLine {
+    fn new(number: u64, bytes: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(bytes).replace('\r', "");
+        let text = text.trim_end_matches('\n');
+        let mut units = text.encode_utf16();
+        let prefix: Vec<_> = units.by_ref().take(500).collect();
+        let truncated = units.next().is_some();
+        let mut text = String::from_utf16_lossy(&prefix);
+        if truncated {
+            text.push_str("... [truncated]");
+        }
+        Self {
+            number,
+            text,
+            truncated,
+            terminated: bytes.ends_with(b"\n"),
+        }
+    }
+}
+
 struct FileSink<'a> {
     display: &'a str,
     output: &'a mut Output,
     context: u64,
     stop_after: Option<u64>,
+    lines: VecDeque<ContextLine>,
+    pending: VecDeque<u64>,
 }
-impl Sink for FileSink<'_> {
-    type Error = std::io::Error;
-    fn matched(&mut self, _: &Searcher, found: &SinkMatch<'_>) -> std::io::Result<bool> {
-        let number = found.line_number().expect("line numbers enabled");
-        let matched = self.output.matches < self.output.limit;
-        if matched {
+impl FileSink<'_> {
+    fn flush(&mut self, through: u64) {
+        while self
+            .pending
+            .front()
+            .is_some_and(|center| center.saturating_add(self.context) <= through)
+        {
+            let center = self.pending.pop_front().expect("pending match");
+            let start = center.saturating_sub(self.context);
+            let end = center.saturating_add(self.context);
+            for line in self
+                .lines
+                .iter()
+                .filter(|line| line.number >= start && line.number <= end)
+            {
+                self.output.line(self.display, line, line.number == center);
+            }
+        }
+    }
+
+    fn accept(&mut self, number: u64, bytes: &[u8], matched: bool) -> bool {
+        if self.stop_after.is_some_and(|last| number > last) {
+            return false;
+        }
+        if matched && self.output.matches < self.output.limit {
             self.output.matches += 1;
+            self.pending.push_back(number);
             if self.output.matches == self.output.limit {
                 self.stop_after = Some(number.saturating_add(self.context));
             }
         }
-        if self.stop_after.is_some_and(|last| number > last) {
-            return Ok(false);
+        self.lines.push_back(ContextLine::new(number, bytes));
+        self.flush(number);
+        // Keep the preceding context for the next match and any unfinished block.
+        let keep_from = self
+            .pending
+            .front()
+            .copied()
+            .unwrap_or(number)
+            .saturating_sub(self.context);
+        while self
+            .lines
+            .front()
+            .is_some_and(|line| line.number < keep_from)
+        {
+            self.lines.pop_front();
         }
-        Ok(self
-            .output
-            .line(self.display, number, found.bytes(), matched)
-            && self.stop_after.is_none_or(|last| number < last))
+        self.stop_after.is_none_or(|last| number < last)
+    }
+}
+impl Sink for FileSink<'_> {
+    type Error = std::io::Error;
+    fn matched(&mut self, _: &Searcher, found: &SinkMatch<'_>) -> std::io::Result<bool> {
+        Ok(self.accept(
+            found.line_number().expect("line numbers enabled"),
+            found.bytes(),
+            true,
+        ))
     }
     fn context(&mut self, _: &Searcher, line: &SinkContext<'_>) -> std::io::Result<bool> {
-        let number = line.line_number().expect("line numbers enabled");
-        if self.stop_after.is_some_and(|last| number > last) {
-            return Ok(false);
+        Ok(self.accept(
+            line.line_number().expect("line numbers enabled"),
+            line.bytes(),
+            false,
+        ))
+    }
+    fn finish(&mut self, _: &Searcher, _: &SinkFinish) -> std::io::Result<()> {
+        // Pi's context view includes the final empty line after a trailing newline.
+        if !self.pending.is_empty()
+            && let Some(line) = self.lines.back().filter(|line| line.terminated)
+        {
+            self.lines
+                .push_back(ContextLine::new(line.number.saturating_add(1), b""));
         }
-        Ok(self.output.line(self.display, number, line.bytes(), false)
-            && self.stop_after.is_none_or(|last| number < last))
+        self.flush(u64::MAX);
+        Ok(())
     }
 }
 
@@ -155,6 +237,83 @@ impl Sink for FileSink<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn overlapping_context_is_repeated_for_each_matching_line() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "before\nmatch one\nmatch two\nafter\n").unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100).unwrap();
+        assert!(grep.search(file.path(), "text").unwrap());
+        assert_eq!(
+            grep.finish(),
+            "text-1- before\ntext:2: match one\ntext-3- match two\ntext-2- match one\ntext:3: match two\ntext-4- after"
+        );
+        let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 1).unwrap();
+        assert!(!grep.search(file.path(), "text").unwrap());
+        assert_eq!(
+            grep.finish(),
+            "text-1- before\ntext:2: match one\ntext-3- match two\n\n[1 matches limit reached. Use limit=2 for more, or refine pattern]"
+        );
+    }
+
+    #[test]
+    fn context_is_flushed_at_end_of_file_and_gaps() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "match first\nafter\ngap\ngap\nbefore\nmatch last",
+        )
+        .unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100).unwrap();
+        assert!(grep.search(file.path(), "text").unwrap());
+        assert_eq!(
+            grep.finish(),
+            "text:1: match first\ntext-2- after\ntext-5- before\ntext:6: match last"
+        );
+    }
+
+    #[test]
+    fn context_includes_the_final_empty_line_after_a_trailing_newline() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "before\nmatch last\n").unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100).unwrap();
+        assert!(grep.search(file.path(), "text").unwrap());
+        assert_eq!(
+            grep.finish(),
+            "text-1- before\ntext:2: match last\ntext-3- "
+        );
+    }
+
+    #[test]
+    fn line_limit_counts_utf16_units_including_surrogate_boundaries() {
+        let line = ContextLine::new(1, "🦀".repeat(251).as_bytes());
+        assert!(line.truncated);
+        assert_eq!(line.text, format!("{}... [truncated]", "🦀".repeat(250)));
+        let line = ContextLine::new(1, format!("{}🦀", "x".repeat(499)).as_bytes());
+        assert!(line.truncated);
+        assert_eq!(line.text, format!("{}�... [truncated]", "x".repeat(499)));
+    }
+
+    #[test]
+    fn byte_limited_output_still_counts_matches_and_long_lines() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                "{}match {}\n",
+                format!("match {}\n", "x".repeat(490)).repeat(110),
+                "x".repeat(600)
+            ),
+        )
+        .unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"match"}), 111).unwrap();
+        assert!(!grep.search(file.path(), "text").unwrap());
+        let output = grep.finish();
+        assert!(output.ends_with("[111 matches limit reached. Use limit=222 for more, or refine pattern. 50.0KB limit reached. Some lines truncated to 500 chars. Use read tool to see full lines]"));
+        let body = output.split("\n\n").next().unwrap();
+        assert_eq!(body.len(), 51098);
+        assert_eq!(body.lines().count(), 101);
+    }
+
     #[test]
     fn streams_large_files_and_preserves_the_last_matches_context() {
         let file = tempfile::NamedTempFile::new().unwrap();
