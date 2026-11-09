@@ -190,3 +190,13 @@ Workflow に紐づけ、子は既存の子予算で精算する。統合試験12
 実行できた。通常の Builder 呼出しは従来の起動順を維持する。
 実環境の承認元との接続と、Root・AIP を揃えた運用受入は残っている。
 [Workspace 起動前の確認と試験](https://github.com/quantum-box/tachyon-apps/commit/bf830ca75cf4728125554a333f1b9a77f6cb037d)
+
+### Workflow レビューの承認を一度だけ使う
+
+既存のレビュー承認ユースケースで保存した値を、同じ Run の承認済みレビューから
+読み直す。Workspace、リポジトリ、ブランチ、対象版、指示が一致する操作に限り、
+既存の Agent 実行状態に一度だけ紐づける。隔離 TiDB で異なる操作 ID の要求を
+競合させ、承認取得は1件だった。同じ操作の再送では既存のジョブ参照を保持し、
+Run 取消後の承認は拒否した。評価用 Workflow の起動設定と、外部ジョブの停止・
+再開への配線が残っている。
+[承認の単回利用と試験](https://github.com/quantum-box/tachyon-apps/commit/67491c7108ec6f8f4bc22c3fec2f64f1e954dcdb)
