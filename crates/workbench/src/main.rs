@@ -19,6 +19,7 @@ use uuid::Uuid;
 mod config;
 mod interactive;
 mod process;
+mod resources;
 mod rpc;
 mod sessions;
 mod ui;
@@ -28,11 +29,21 @@ static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a workspace assistant. Use tools when needed and answer accurately.";
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "pi-rs", version, about)]
 struct Cli {
     #[arg(skip)]
     settings: config::Settings,
+    #[arg(skip)]
+    trusted: bool,
+    #[arg(skip)]
+    trust_pending: bool,
+    /// Load this project's executable configuration.
+    #[arg(long, global = true, conflicts_with = "no_trust")]
+    trust: bool,
+    /// Ignore this project's executable configuration.
+    #[arg(long, global = true)]
+    no_trust: bool,
     /// Path to the private append-only session journal.
     #[arg(long, default_value_os_t = interactive::new_session_path())]
     session: PathBuf,
@@ -142,7 +153,7 @@ enum OutputMode {
     Rpc,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Command {
     /// Open the interactive terminal interface.
     Interactive,
@@ -226,7 +237,19 @@ async fn main() {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
-        args.settings = config::Settings::load(&args.workspace, args.project.is_some())?;
+        let decision = config::project_trust(
+            &args.workspace,
+            if args.no_trust {
+                Some(false)
+            } else if args.trust || args.project.is_some() {
+                Some(true)
+            } else {
+                None
+            },
+        )?;
+        args.trusted = decision.unwrap_or(false);
+        args.trust_pending = decision.is_none();
+        args.settings = config::Settings::load(&args.workspace, args.trusted)?;
         if matches.value_source("model") != Some(clap::parser::ValueSource::CommandLine)
             && let Some(model) = args.settings.string("defaultModel")
         {
@@ -306,7 +329,7 @@ async fn execute(mut args: Cli) -> Result<()> {
         args.print || args.mode == Some(OutputMode::Text),
         Ordering::Relaxed,
     );
-    let command = args.command.take().unwrap_or(Command::Interactive);
+    let mut command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
         return interactive::run(args);
     }
@@ -346,6 +369,21 @@ async fn execute(mut args: Cli) -> Result<()> {
             | Command::Share
     ) {
         session.set_working_directory(&args.workspace)?;
+    }
+    if args.workspace != requested_workspace {
+        let decision = config::project_trust(
+            &args.workspace,
+            if args.no_trust {
+                Some(false)
+            } else if args.trust || args.project.is_some() {
+                Some(true)
+            } else {
+                None
+            },
+        )?;
+        args.trusted = decision.unwrap_or(false);
+        args.trust_pending = decision.is_none();
+        args.settings = config::Settings::load(&args.workspace, args.trusted)?;
     }
     if let Some(name) = &args.name {
         session.set_name(name)?;
@@ -441,12 +479,27 @@ async fn execute(mut args: Cli) -> Result<()> {
         }
         _ => {}
     }
-    let system_prompt = args
+    let local_resources = resources::Resources::load(&args)?;
+    for warning in &local_resources.warnings {
+        eprintln!("{warning}");
+    }
+    if let Command::Run { prompt } = &mut command
+        && let Some(expanded) = local_resources.expand(prompt)?
+    {
+        *prompt = expanded;
+    }
+    let mut system_prompt = args
         .system_prompt
         .as_ref()
         .map(std::fs::read_to_string)
         .transpose()?
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into());
+    if args.system_prompt.is_some() {
+        system_prompt.push_str(&local_resources.append_system);
+        system_prompt.push_str(&local_resources.instructions);
+    } else {
+        system_prompt = local_resources.system_prompt(&system_prompt);
+    }
     let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
     if let Some(project) = &args.project {
         extensions.push(Arc::new(ProjectInstructions {
@@ -487,7 +540,7 @@ async fn execute(mut args: Cli) -> Result<()> {
         .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
     registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
     if args.coding_tools {
-        registry.register(Arc::new(pi_rs_workbench::coding::CodingTools::new(
+        registry.register(Arc::new(pi_rs_workbench::coding::CodingTools::local(
             &args.workspace,
         )?))?;
     }

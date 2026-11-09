@@ -21,7 +21,7 @@ remaining acceptance work for that surface.
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector | Full provider catalog, provider-native adapters, thinking controls, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading | Full Pi event and interactive UI surface, explicit hot reload, scaffolding and package distribution |
-| Project resources | Explicit AGENTS.md and named skill loading, user/trusted-project settings merge and atomic user updates | Trust persistence, full resource discovery, prompt templates, complete settings UI and resource reload |
+| Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, resource reload | Settings editor UI, package resource integration, resource globs and complete validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration | Local CLI server configuration, discovery, authentication, resource tools, exposure controls |
 | Codemode | Core tool invocation APIs | Sandboxed code execution and dynamic tool search |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload` | Automatic system appearance notifications, live file-watch reload |
@@ -89,3 +89,17 @@ of the upstream TypeScript Pi format remains unimplemented.
 The checkpoint passed 63 workspace tests. Its PTY fixture exercised streamed
 reasoning, a local read tool, theme and session-name persistence, native branch
 cloning, HTML/JSONL exports, model discovery/selection and terminal restoration.
+
+### Resources checkpoint
+
+Project configuration follows a stored trust decision, with an interactive
+trust selector and explicit `--trust` / `--no-trust` overrides. Context files
+remain readable independently of project trust. `/skills`, `/prompts`,
+`/skill:name`, prompt argument expansion and `/reload` are available.
+
+The local CLI's coding profile can read and write absolute paths, including
+personal skill files outside the working directory. Embedded users of
+`CodingTools::new` retain the existing workspace-scoped profile; the CLI selects
+`CodingTools::local`. A regression test covers that distinction. The resource
+PTY check covered granting project trust, advertising a discovered skill and
+expanding a quoted prompt argument before the model request.

@@ -10,6 +10,7 @@ pub enum Selection {
     Fork(u64),
     Model(String),
     Theme(String),
+    Trust(bool),
 }
 pub struct Item {
     pub label: String,

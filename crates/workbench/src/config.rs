@@ -79,6 +79,61 @@ impl Settings {
     }
 }
 
+pub fn project_trust(workspace: &Path, explicit: Option<bool>) -> Result<Option<bool>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    let workspace = workspace.canonicalize()?;
+    let decisions = read_object(&agent_dir().join("trust.json"))?;
+    for directory in workspace.ancestors() {
+        if let Some(decision) = decisions
+            .get(directory.to_string_lossy().as_ref())
+            .and_then(Value::as_bool)
+        {
+            return Ok(Some(decision));
+        }
+    }
+    let settings = read_object(&agent_dir().join("settings.json"))?;
+    match settings["defaultProjectTrust"].as_str() {
+        Some("always") => Ok(Some(true)),
+        Some("never") => Ok(Some(false)),
+        _ if ![
+            "settings.json",
+            "mcp.json",
+            "extensions",
+            "skills",
+            "prompts",
+            "themes",
+            "SYSTEM.md",
+            "APPEND_SYSTEM.md",
+        ]
+        .iter()
+        .any(|name| workspace.join(".pi").join(name).exists()) =>
+        {
+            Ok(Some(true))
+        }
+        _ => Ok(None),
+    }
+}
+
+pub fn save_trust(workspace: &Path, decision: bool) -> Result<()> {
+    let path = agent_dir().join("trust.json");
+    std::fs::create_dir_all(agent_dir())?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
+    let mut value = read_object(&path)?;
+    value.as_object_mut().expect("object").insert(
+        workspace.canonicalize()?.to_string_lossy().into_owned(),
+        Value::Bool(decision),
+    );
+    write_json(&path, &value)
+}
+
 pub fn read_object(path: &Path) -> Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => {

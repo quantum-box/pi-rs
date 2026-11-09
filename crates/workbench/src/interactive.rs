@@ -105,6 +105,7 @@ struct View {
     lines: Vec<Entry>,
     picker: Option<Picker>,
     session_name: Option<String>,
+    resources: super::resources::Resources,
     model_list: Option<std::sync::mpsc::Receiver<Result<Vec<String>>>>,
     thinking: String,
     expand_tools: bool,
@@ -513,9 +514,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 args.workspace.join(source)
             };
             sessions::import(&source, &destination)?;
-            args.session = destination;
-            restore_workspace(args)?;
-            view.restore(args)?;
+            switch_session(args, view, destination)?;
         }
         "/copy" => {
             sessions::copy_last(&Session::open(&args.session)?)?;
@@ -583,15 +582,39 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             if !path.is_file() {
                 return Err(Error::Config("session file not found".into()));
             }
-            let prior = std::mem::replace(&mut args.session, path);
-            let prior_workspace = args.workspace.clone();
-            if let Err(error) = restore_workspace(args).and_then(|()| view.restore(args)) {
-                args.session = prior;
-                args.workspace = prior_workspace;
-                return Err(error);
-            }
+            switch_session(args, view, path)?;
         }
         "/compact" => return Worker::start(args, &["compact"]).map(Some),
+        "/trust" => {
+            view.picker = Some(Picker::new(
+                "Load project configuration?",
+                vec![
+                    Item {
+                        label: "Trust this project".into(),
+                        selection: Selection::Trust(true),
+                    },
+                    Item {
+                        label: "Skip project configuration".into(),
+                        selection: Selection::Trust(false),
+                    },
+                ],
+            ));
+        }
+        "/prompts" => {
+            for (name, prompt) in &view.resources.prompts {
+                view.lines
+                    .push(Entry::Notice(format!("/{name} · {}", prompt.description)));
+            }
+        }
+        "/skills" => {
+            for (name, skill) in &view.resources.skills {
+                view.lines.push(Entry::Notice(format!(
+                    "{name} · {} · {}",
+                    skill.description.trim(),
+                    skill.path.display()
+                )));
+            }
+        }
         "/extensions" => view.append(&format!(
             "Native extensions › plan-mode, branch-review, {}",
             args.extensions.join(", ")
@@ -677,7 +700,13 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             session.checkout(id)?;
             view.restore(args)?;
         }
-        _ => view.append("Unknown command. Use /help."),
+        _ => {
+            if let Some(expanded) = view.resources.expand(input)? {
+                view.lines.push(Entry::User(expanded.clone()));
+                return Worker::start(args, &["run", input]).map(Some);
+            }
+            view.append("Unknown command. Use /help.");
+        }
     }
     Ok(None)
 }
@@ -708,7 +737,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         args.use_theme.as_deref().unwrap_or("system"),
         &args.themes,
         &args.workspace,
-        args.project.is_some(),
+        args.trusted,
     )?;
     let mut view = View {
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
@@ -716,6 +745,10 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         ..View::default()
     };
     view.restore(&args)?;
+    view.resources = super::resources::Resources::load(&args)?;
+    if args.trust_pending {
+        slash("/trust", &mut args, &mut view)?;
+    }
     if args
         .resume_session
         .as_ref()
@@ -869,11 +902,8 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                                 view.append(&error.to_string());
                             }
                         } else if input.trim() == "/theme" {
-                            let names = Theme::discover(
-                                &args.themes,
-                                &args.workspace,
-                                args.project.is_some(),
-                            );
+                            let names =
+                                Theme::discover(&args.themes, &args.workspace, args.trusted);
                             let title = format!(
                                 "Select theme · {}",
                                 theme
@@ -897,7 +927,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                                 name.trim(),
                                 &args.themes,
                                 &args.workspace,
-                                args.project.is_some(),
+                                args.trusted,
                             ) {
                                 Ok(next) => {
                                     args.settings.set_user("theme", json!(name.trim()))?;
@@ -907,6 +937,9 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                                 Err(error) => view.append(&error.to_string()),
                             }
                         } else if input.trim() == "/reload" {
+                            args.settings =
+                                crate::config::Settings::load(&args.workspace, args.trusted)?;
+                            view.resources = super::resources::Resources::load(&args)?;
                             match Keys::load() {
                                 Ok(next) => keys = next,
                                 Err(error) => view.append(&error.to_string()),
@@ -915,12 +948,12 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                                 args.use_theme.as_deref().unwrap_or("system"),
                                 &args.themes,
                                 &args.workspace,
-                                args.project.is_some(),
+                                args.trusted,
                             ) {
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
                             }
-                            view.append("Reloaded keybindings and theme");
+                            view.append("Reloaded settings, context, skills, prompts, keybindings and theme");
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
                         } else if input.trim() == "/settings" {
@@ -1029,12 +1062,38 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
         Selection::Model(model) => {
             args.model = model;
         }
+        Selection::Trust(decision) => {
+            crate::config::save_trust(&args.workspace, decision)?;
+            args.trusted = decision;
+            args.trust_pending = false;
+            args.settings = crate::config::Settings::load(&args.workspace, decision)?;
+            view.resources = super::resources::Resources::load(args)?;
+            view.append(if decision {
+                "Project configuration trusted"
+            } else {
+                "Project configuration skipped"
+            });
+        }
         Selection::Theme(name) => {
-            let next = Theme::load(&name, &args.themes, &args.workspace, args.project.is_some())?;
+            let next = Theme::load(&name, &args.themes, &args.workspace, args.trusted)?;
             args.settings.set_user("theme", json!(name))?;
             args.use_theme = Some(name);
             *theme = next;
         }
+    }
+    Ok(())
+}
+
+fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
+    let mut next = args.clone();
+    next.session = path;
+    restore_workspace(&mut next)?;
+    let resources = super::resources::Resources::load(&next)?;
+    view.restore(&next)?;
+    view.resources = resources;
+    *args = next;
+    if args.trust_pending {
+        slash("/trust", args, view)?;
     }
     Ok(())
 }
@@ -1065,6 +1124,19 @@ fn restore_workspace(args: &mut Cli) -> Result<()> {
         }
         args.workspace = path;
     }
+    let decision = crate::config::project_trust(
+        &args.workspace,
+        if args.no_trust {
+            Some(false)
+        } else if args.trust || args.project.is_some() {
+            Some(true)
+        } else {
+            None
+        },
+    )?;
+    args.trusted = decision.unwrap_or(false);
+    args.trust_pending = decision.is_none();
+    args.settings = crate::config::Settings::load(&args.workspace, args.trusted)?;
     Ok(())
 }
 
@@ -1121,7 +1193,7 @@ fn complete_input(args: &Cli, view: &mut View) {
         .rfind(char::is_whitespace)
         .map_or(0, |index| index + 1);
     let word = &prefix[start..];
-    let candidates = if start == 0 && word.starts_with('/') {
+    let mut candidates = if start == 0 && word.starts_with('/') {
         [
             "/help",
             "/hotkeys",
@@ -1188,6 +1260,23 @@ fn complete_input(args: &Cli, view: &mut View) {
             .take(100)
             .collect::<Vec<_>>()
     };
+    if start == 0 && word.starts_with('/') {
+        candidates.extend(
+            view.resources
+                .prompts
+                .keys()
+                .map(|name| format!("/{name}"))
+                .chain(
+                    view.resources
+                        .skills
+                        .keys()
+                        .map(|name| format!("/skill:{name}")),
+                )
+                .filter(|name| name.starts_with(word)),
+        );
+        candidates.sort();
+        candidates.dedup();
+    }
     if candidates.len() == 1 {
         let end = view.editor.cursor;
         let mut text = view.editor.text.clone();

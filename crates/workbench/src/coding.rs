@@ -14,6 +14,7 @@ const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 
 pub struct CodingTools {
     root: PathBuf,
+    unrestricted: bool,
 }
 
 impl CodingTools {
@@ -22,7 +23,16 @@ impl CodingTools {
         if !root.is_dir() {
             return Err(Error::Config("workspace root must be a directory".into()));
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            unrestricted: false,
+        })
+    }
+    /// Local Pi profile, with paths resolved from the workspace and access to user resources.
+    pub fn local(root: &Path) -> Result<Self> {
+        let mut tools = Self::new(root)?;
+        tools.unrestricted = true;
+        Ok(tools)
     }
 }
 
@@ -45,6 +55,7 @@ impl Extension for CodingTools {
         .map(|kind| {
             Arc::new(CodingTool {
                 root: self.root.clone(),
+                unrestricted: self.unrestricted,
                 kind,
             }) as Arc<dyn Tool>
         })
@@ -65,13 +76,14 @@ enum Kind {
 
 struct CodingTool {
     root: PathBuf,
+    unrestricted: bool,
     kind: Kind,
 }
 
 #[async_trait::async_trait]
 impl Tool for CodingTool {
     fn spec(&self) -> ToolSpec {
-        let path = json!({"type":"string","description":"Path relative to the workspace, or an absolute path inside it"});
+        let path = json!({"type":"string","description":if self.unrestricted { "Absolute path or path relative to the workspace" } else { "Path relative to the workspace, or an absolute path inside it" }});
         let (name, description, properties, required) = match self.kind {
             Kind::Read => (
                 "read",
@@ -149,9 +161,10 @@ impl Tool for CodingTool {
 impl CodingTool {
     fn path(&self, value: &str) -> Result<PathBuf> {
         let input = Path::new(value);
-        if input
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
+        if !self.unrestricted
+            && input
+                .components()
+                .any(|part| matches!(part, Component::ParentDir))
         {
             return Err(Error::Config("parent traversal is not supported".into()));
         }
@@ -161,7 +174,7 @@ impl CodingTool {
             self.root.join(input)
         };
         let resolved = path.canonicalize()?;
-        if !resolved.starts_with(&self.root) {
+        if !self.unrestricted && !resolved.starts_with(&self.root) {
             return Err(Error::Config("path is outside the workspace".into()));
         }
         Ok(resolved)
@@ -203,10 +216,11 @@ impl CodingTool {
         } else {
             self.root.join(input)
         };
-        if !target.starts_with(&self.root)
-            || input
-                .components()
-                .any(|part| matches!(part, Component::ParentDir))
+        if !self.unrestricted
+            && (!target.starts_with(&self.root)
+                || input
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir)))
         {
             return Err(Error::Config("path is outside the workspace".into()));
         }
@@ -518,11 +532,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_profile_can_read_personal_skills_while_scoped_profile_cannot() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let skill = directory.path().join("SKILL.md");
+        std::fs::write(&skill, "personal skill").unwrap();
+        let scoped = CodingTool {
+            root: workspace.clone(),
+            unrestricted: false,
+            kind: Kind::Read,
+        };
+        assert!(scoped.path(skill.to_str().unwrap()).is_err());
+        let local = CodingTool {
+            root: workspace,
+            unrestricted: true,
+            kind: Kind::Read,
+        };
+        assert_eq!(
+            local.read(&json!({"path":skill})).unwrap(),
+            "personal skill"
+        );
+    }
+
+    #[test]
     fn edits_match_original_and_reject_overlap_without_writing() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("a.txt");
         std::fs::write(&path, "alpha beta gamma").unwrap();
         let tool = CodingTool {
+            unrestricted: false,
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Edit,
         };
@@ -536,6 +575,7 @@ mod tests {
     fn write_creates_parents_and_read_pages_utf8() {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
+            unrestricted: false,
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Write,
         };
@@ -557,6 +597,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
         let tool = CodingTool {
+            unrestricted: false,
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Find,
         };
@@ -565,6 +606,7 @@ mod tests {
             "main.rs"
         );
         let tool = CodingTool {
+            unrestricted: false,
             kind: Kind::Grep,
             ..tool
         };
@@ -579,6 +621,7 @@ mod tests {
     async fn shell_drains_both_streams_and_reports_failure() {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
+            unrestricted: false,
             root: root.path().to_path_buf(),
             kind: Kind::Bash,
         };
