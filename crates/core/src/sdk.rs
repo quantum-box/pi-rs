@@ -22,10 +22,15 @@ pub enum SessionEvent {
     RunEnded { run_id: Uuid, succeeded: bool },
 }
 
+struct CurrentRun {
+    token: CancellationToken,
+    queue_controls: bool,
+}
+
 #[derive(Clone)]
 pub struct SessionControl {
-    input: mpsc::Sender<QueuedMessage>,
-    active: Arc<Mutex<Option<CancellationToken>>>,
+    input: mpsc::Sender<crate::AgentInput>,
+    active: Arc<Mutex<Option<CurrentRun>>>,
 }
 impl SessionControl {
     pub async fn steer(&self, content: impl Into<String>) -> Result<Uuid> {
@@ -64,14 +69,53 @@ impl SessionControl {
         };
         message.validate()?;
         self.input
-            .send(message)
+            .send(message.into())
             .await
             .map_err(|_| Error::Config("session is closed".into()))?;
         Ok(id)
     }
+    /// Clear a running prompt's queue. Use the owned session method while idle.
+    pub async fn clear_queued_inputs(&self) -> Result<Vec<QueuedMessage>> {
+        self.queue_control(|reply| crate::AgentInput::ClearQueue { reply })
+            .await
+    }
+    pub async fn set_queue_mode(&self, kind: InputKind, mode: crate::QueueMode) -> Result<()> {
+        self.queue_control(|reply| crate::AgentInput::SetQueueMode { kind, mode, reply })
+            .await
+    }
+    async fn queue_control<T>(
+        &self,
+        input: impl FnOnce(tokio::sync::oneshot::Sender<Result<T>>) -> crate::AgentInput,
+    ) -> Result<T> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        let token = {
+            let state = self.active.lock().expect("session control");
+            let active = state
+                .as_ref()
+                .filter(|active| active.queue_controls)
+                .ok_or_else(|| {
+                    Error::Config(
+                        "queue controls require an active prompt; use the owned session while idle"
+                            .into(),
+                    )
+                })?;
+            if active.token.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            self.input
+                .try_send(input(reply))
+                .map_err(|_| Error::Config("queue control channel is unavailable".into()))?;
+            active.token.clone()
+        };
+        tokio::select! {
+            biased;
+            result = receiver => result.map_err(|_| Error::Config("queue control response was lost".into()))?,
+            _ = token.cancelled() => Err(Error::Cancelled),
+        }
+    }
     pub fn abort(&self) {
-        if let Some(token) = self.active.lock().expect("session control").as_ref() {
-            token.cancel();
+        if let Some(active) = self.active.lock().expect("session control").as_ref() {
+            active.token.cancel();
         }
     }
 }
@@ -173,7 +217,7 @@ pub struct AgentSession {
     registry: Arc<Registry>,
     limits: Limits,
     session: Session,
-    input: mpsc::Receiver<QueuedMessage>,
+    input: mpsc::Receiver<crate::AgentInput>,
     control: SessionControl,
     events: Option<broadcast::Sender<SessionEvent>>,
     closed: bool,
@@ -362,7 +406,7 @@ impl AgentSession {
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         self.ensure_open()?;
-        let active = self.begin_run();
+        let active = self.begin_run(true);
         let events = self.events.as_ref().expect("open session").clone();
         let _ = events.send(SessionEvent::RunStarted { run_id });
         let mut observe = |event: Notification<'_>| {
@@ -376,7 +420,7 @@ impl AgentSession {
             system_prompt: &self.system_prompt,
             limits: self.limits.clone(),
         };
-        let result = async {
+        let mut result = async {
             if let Some(images) = images {
                 self.session.append_user_with_images(
                     input.take().unwrap_or_default(),
@@ -402,6 +446,21 @@ impl AgentSession {
                 .await
         }
         .await;
+        let first_record = self.session.records().len();
+        let final_inputs = {
+            // Serialize the final drain with new control submissions.
+            let mut state = active.state.lock().expect("session control");
+            *state = None;
+            crate::agent::queue_inputs(&mut self.session, &mut self.input, &mut |_| {})
+        };
+        for record in &self.session.records()[first_record..] {
+            observe(Notification::Committed(record));
+        }
+        if result.is_ok()
+            && let Err(error) = final_inputs
+        {
+            result = Err(error);
+        }
         let _ = events.send(SessionEvent::RunEnded {
             run_id,
             succeeded: result.is_ok(),
@@ -447,7 +506,7 @@ impl AgentSession {
     }
     pub async fn summarize(&mut self, keep_turns: usize) -> Result<()> {
         self.ensure_open()?;
-        let active = self.begin_run();
+        let active = self.begin_run(false);
         let events = self.events.as_ref().expect("open session").clone();
         let agent = Agent {
             model: self.model.as_ref(),
@@ -493,9 +552,12 @@ impl AgentSession {
             Ok(())
         }
     }
-    fn begin_run(&self) -> ActiveRun {
+    fn begin_run(&self, queue_controls: bool) -> ActiveRun {
         let token = CancellationToken::new();
-        *self.control.active.lock().expect("session control") = Some(token.clone());
+        *self.control.active.lock().expect("session control") = Some(CurrentRun {
+            token: token.clone(),
+            queue_controls,
+        });
         ActiveRun {
             token,
             state: self.control.active.clone(),
@@ -509,7 +571,7 @@ impl Drop for AgentSession {
 }
 struct ActiveRun {
     token: CancellationToken,
-    state: Arc<Mutex<Option<CancellationToken>>>,
+    state: Arc<Mutex<Option<CurrentRun>>>,
 }
 impl Drop for ActiveRun {
     fn drop(&mut self) {
@@ -1231,6 +1293,41 @@ mod tests {
         assert!(session.journal().records().iter().any(|record| matches!(&record.event, crate::Event::ToolFinished { states, outcome: crate::Outcome::Succeeded(_), .. } if states.contains_key("stateful"))));
         session.close().await.unwrap();
     }
+    #[tokio::test]
+    async fn active_controls_clear_and_change_mode_before_the_model_finishes() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "waiting")
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        control.follow_up("pending").await.unwrap();
+        let mut events = session.subscribe();
+        let driver = async {
+            while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
+            let removed = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                control.clear_queued_inputs(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(removed[0].input.content, "pending");
+            control
+                .set_queue_mode(InputKind::FollowUp, crate::QueueMode::OneAtATime)
+                .await
+                .unwrap();
+            control.abort();
+        };
+        let (result, ()) = tokio::join!(session.prompt("start"), driver);
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(session.pending_inputs(), 0);
+        assert_eq!(
+            session.journal().queue_mode(InputKind::FollowUp),
+            crate::QueueMode::OneAtATime
+        );
+        assert!(control.clear_queued_inputs().await.is_err());
+        session.close().await.unwrap();
+    }
+
     struct WaitingModel;
     #[async_trait::async_trait]
     impl Model for WaitingModel {

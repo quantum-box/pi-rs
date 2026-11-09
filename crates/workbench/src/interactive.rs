@@ -182,6 +182,7 @@ struct View {
     history_index: Option<usize>,
     request_started: Option<Instant>,
     phase: Option<&'static str>,
+    restoring_queue: bool,
 }
 impl View {
     fn dialog(&self) -> Option<&crate::ui::dialog::Dialog> {
@@ -379,6 +380,7 @@ impl View {
         self.clipboard = None;
         self.dialogs.clear();
         self.setting_editor = None;
+        self.restoring_queue = false;
         self.ui_status.clear();
         self.widgets.clear();
         self.history.clear();
@@ -540,6 +542,19 @@ impl View {
     }
     fn receive(&mut self, value: Value) {
         match value["type"].as_str() {
+            Some("response") if value["command"] == "clear_queue" && self.restoring_queue => {
+                self.restoring_queue = false;
+                if value["success"] == true {
+                    if let Ok(messages) = serde_json::from_value::<Vec<pi_rs::QueuedMessage>>(value["data"]["messages"].clone()) {
+                        let mut text: Vec<_> = messages.iter().map(|message| message.input.content.clone()).filter(|text| !text.is_empty()).collect();
+                        if !self.editor.text.is_empty() { text.push(self.editor.text.clone()); }
+                        self.editor.replace(text.join("\n\n"));
+                        let mut images: Vec<_> = messages.into_iter().flat_map(|message| message.images).collect();
+                        images.append(&mut self.draft_images);
+                        self.draft_images = images;
+                    }
+                } else { self.append(value["error"].as_str().unwrap_or("Queue restore failed")); }
+            }
             Some("bash_execution_start") => {
                 self.phase = Some("コマンド実行中");
                 self.lines.push(Entry::Tool {
@@ -1758,7 +1773,20 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }
+                    "app.message.dequeue" => {
+                        match Worker::control(&mut worker, &args, json!({"type":"clear_queue"})) {
+                            Ok(()) => view.restoring_queue = true,
+                            Err(error) => view.append(&error.to_string()),
+                        }
+                    }
                     "app.interrupt" if is_busy(&worker) => {
+                        if let Err(error) =
+                            Worker::control(&mut worker, &args, json!({"type":"clear_queue"}))
+                        {
+                            view.append(&error.to_string());
+                        } else {
+                            view.restoring_queue = true;
+                        }
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
                         }
@@ -1945,6 +1973,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 "defaultModel",
                                 "defaultThinkingLevel",
                                 "modelThinkingLevels",
+                                "steeringMode",
+                                "followUpMode",
                                 "tuiMode",
                                 "sessionDir",
                                 "defaultProjectTrust",
@@ -2246,6 +2276,7 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
                 "defaultProjectTrust" => json!("ask"),
                 "defaultTools" => json!(["read", "bash", "edit", "write"]),
                 "modelThinkingLevels" => json!({}),
+                "steeringMode" | "followUpMode" => json!("one-at-a-time"),
                 "codemode" => json!({"mode":"on", "inlineBudget":3000}),
                 _ => json!([]),
             };
@@ -2253,7 +2284,14 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
             let dialog = crate::ui::dialog::Dialog::new(
                 uuid::Uuid::new_v4(),
                 pi_rs::UiRequest::Editor {
-                    title: format!("Edit {key} as JSON · applies on reload/startup"),
+                    title: format!(
+                        "Edit {key} as JSON · {}",
+                        if matches!(key.as_str(), "steeringMode" | "followUpMode") {
+                            "default for new sessions"
+                        } else {
+                            "applies on reload/startup"
+                        }
+                    ),
                     initial_value: Some(serde_json::to_string_pretty(value)?),
                     timeout: None,
                 },

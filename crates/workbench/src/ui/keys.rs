@@ -67,6 +67,14 @@ impl Keys {
                     &["alt+enter"]
                 },
             ),
+            (
+                "app.message.dequeue",
+                if windows_keybindings() {
+                    &["alt+q"]
+                } else {
+                    &["alt+up"]
+                },
+            ),
             ("app.model.select", &["ctrl+l"]),
             ("app.model.cycleForward", &["ctrl+p"]),
             (

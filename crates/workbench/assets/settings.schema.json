@@ -149,6 +149,18 @@
           }
         ]
       }
+    },
+    "steeringMode": {
+      "enum": [
+        "all",
+        "one-at-a-time"
+      ]
+    },
+    "followUpMode": {
+      "enum": [
+        "all",
+        "one-at-a-time"
+      ]
     }
   }
 }

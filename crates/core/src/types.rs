@@ -64,6 +64,24 @@ impl From<String> for QueuedInput {
     }
 }
 
+/// Messages and acknowledged queue controls accepted during an agent run.
+pub enum AgentInput {
+    Message(QueuedMessage),
+    ClearQueue {
+        reply: tokio::sync::oneshot::Sender<Result<Vec<QueuedMessage>>>,
+    },
+    SetQueueMode {
+        kind: InputKind,
+        mode: QueueMode,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+}
+impl<T: Into<QueuedMessage>> From<T> for AgentInput {
+    fn from(message: T) -> Self {
+        Self::Message(message.into())
+    }
+}
+
 /// A queued message extends the existing text input without changing its shape.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct QueuedMessage {

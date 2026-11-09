@@ -29,6 +29,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     if session.working_directory().is_none() {
         session.set_working_directory(&args.workspace)?;
     }
+    super::backend::initialize_queue_modes(&mut session, &args)?;
     drop(session);
     interactive::restore_workspace(&mut args)?;
     let (sender, receiver) = mpsc::channel();
@@ -110,6 +111,40 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 active.send(
                     json!({"type":"extension_ui_response","id":request["id"],"value":value}),
                 )?;
+            }
+            continue;
+        }
+        if matches!(
+            request["type"].as_str(),
+            Some("clear_queue" | "set_steering_mode" | "set_follow_up_mode")
+        ) {
+            let result = (|| {
+                let command = request["type"].as_str().expect("queue command");
+                let control = if command == "clear_queue" {
+                    json!({"type":"clear_queue","id":request.get("id")})
+                } else {
+                    let mode: pi_rs::QueueMode = serde_json::from_value(request["mode"].clone())?;
+                    let kind = if command == "set_steering_mode" {
+                        pi_rs::InputKind::Steer
+                    } else {
+                        pi_rs::InputKind::FollowUp
+                    };
+                    json!({"type":"set_queue_mode","kind":kind,"mode":mode,"id":request.get("id")})
+                };
+                Worker::control(&mut worker, &args, control)?;
+                if command != "clear_queue" {
+                    let mode: pi_rs::QueueMode = serde_json::from_value(request["mode"].clone())?;
+                    let active = worker.as_mut().expect("control worker");
+                    if command == "set_steering_mode" {
+                        active.steering_mode = mode;
+                    } else {
+                        active.follow_up_mode = mode;
+                    }
+                }
+                Ok::<_, Error>(())
+            })();
+            if let Err(error) = result {
+                response(&request, Err(error))?;
             }
             continue;
         }
@@ -210,8 +245,22 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         "abort" | "abort_bash" => Ok(None),
         "get_state" => {
             let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+            state["steeringMode"] = json!(
+                worker
+                    .as_ref()
+                    .map(|worker| worker.steering_mode)
+                    .unwrap_or(super::backend::configured_queue_mode(args, "steeringMode")?)
+            );
+            state["followUpMode"] = json!(
+                worker
+                    .as_ref()
+                    .map(|worker| worker.follow_up_mode)
+                    .unwrap_or(super::backend::configured_queue_mode(args, "followUpMode")?)
+            );
             if !busy(worker) {
                 let session = Session::open(&args.session)?;
+                state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
+                state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
                 state["sessionId"] = json!(session.session_id());
                 state["sessionName"] = json!(session.name());
                 state["messageCount"] = json!(session.conversation_at(session.head())?.len());
@@ -361,6 +410,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             }
             let mut session = Session::open(&args.session)?;
             session.set_working_directory(&args.workspace)?;
+            super::backend::initialize_queue_modes(&mut session, args)?;
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" if !busy(worker) => {

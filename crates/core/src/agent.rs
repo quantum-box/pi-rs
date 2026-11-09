@@ -13,10 +13,11 @@ use uuid::Uuid;
 use crate::extension::{RegisteredTool, hook};
 use crate::journal::{conversation, ensure_settled};
 use crate::{
-    CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind, Invocation,
-    Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest, OperationState, Outcome,
-    QueuedMessage, Record, RecordedReply, Registry, RequestPurpose, Result, RunState, Session,
-    ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, Usage, UsageReport,
+    AgentInput, CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind,
+    Invocation, Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest,
+    OperationState, Outcome, QueuedMessage, Record, RecordedReply, Registry, RequestPurpose,
+    Result, RunState, Session, ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, Usage,
+    UsageReport,
 };
 
 #[derive(Clone, Debug)]
@@ -77,9 +78,19 @@ impl Agent<'_> {
             .await
     }
 
+    /// Move queued input into a settled session before starting a queued continuation.
+    pub fn apply_queued_inputs(
+        &self,
+        session: &mut Session,
+        observer: &mut Observer<'_>,
+    ) -> Result<bool> {
+        ensure_settled(session.operations())?;
+        apply_inputs(session, true, observer)
+    }
+
     /// A repeated initial submission never starts a second run. Passing no
     /// input is an explicit resume request authorized by the host.
-    pub async fn run_correlated<T: Into<QueuedMessage> + Send>(
+    pub async fn run_correlated<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         run_id: Uuid,
@@ -119,7 +130,7 @@ impl Agent<'_> {
         result
     }
 
-    async fn run_turns<T: Into<QueuedMessage> + Send>(
+    async fn run_turns<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         run_id: Uuid,
@@ -185,7 +196,7 @@ impl Agent<'_> {
         result
     }
 
-    async fn drive<T: Into<QueuedMessage> + Send>(
+    async fn drive<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         run_id: Uuid,
@@ -336,7 +347,9 @@ impl Agent<'_> {
                     let advertised: HashSet<_> =
                         request.tools.iter().map(|spec| spec.name.clone()).collect();
                     let allowance = request.max_output_tokens;
-                    let reply = self.reply(session, request, true, cancel, observer).await?;
+                    let reply = self
+                        .reply(session, request, true, cancel, observer, Some(followups))
+                        .await?;
                     (reply, advertised, allowance)
                 };
             let finished = reply.invocations.is_empty();
@@ -365,13 +378,14 @@ impl Agent<'_> {
                     session,
                     &invocations,
                     &DispatchScope {
+                        cancellation: cancel,
                         advertised: &advertised,
                         depth: 0,
                         call_count: Arc::new(AtomicUsize::new(0)),
                     },
                     &mut states,
-                    cancel,
                     observer,
+                    Some(followups),
                 )
                 .await
             {
@@ -473,13 +487,14 @@ impl Agent<'_> {
         Ok(request)
     }
 
-    async fn reply(
+    async fn reply<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         request: ModelRequest,
         retain_reply: bool,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<Reply> {
         let request_id = Uuid::new_v4();
         let allowance = request.max_output_tokens;
@@ -505,8 +520,25 @@ impl Agent<'_> {
         let mut content = String::new();
         let mut metadata = ModelMetadata::default();
         let collect = async {
-            let mut stream = self.model.stream_with_id(request_id, request).await?;
-            while let Some(event) = stream.next().await {
+            let opening = self.model.stream_with_id(request_id, request);
+            tokio::pin!(opening);
+            let mut stream = loop {
+                tokio::select! {
+                    opened = &mut opening => break opened?,
+                    Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
+                }
+            };
+            loop {
+                let event = tokio::select! {
+                    event = stream.next() => event,
+                    Some(input) = receive_input(&mut inputs) => {
+                        queue_input(session, input.into(), observer)?;
+                        continue;
+                    }
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 match event? {
                     ModelEvent::Text(delta) => {
                         if content.len() + delta.len() > MAX_RESPONSE_BYTES {
@@ -610,15 +642,16 @@ impl Agent<'_> {
         .map_err(|_| Error::RetryableModel("model usage settlement timed out".into()))?
     }
 
-    async fn tool_batch(
+    async fn tool_batch<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         invocations: &[Invocation],
         scope: &DispatchScope<'_>,
         states: &mut ExtensionStates,
-        cancel: &CancellationToken,
         observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<()> {
+        let cancel = scope.cancellation;
         let parallel = |inv: &Invocation| {
             self.registry
                 .tools
@@ -636,10 +669,15 @@ impl Agent<'_> {
             let (group, next) = remaining.split_at(count);
             let mut prepared = Vec::with_capacity(count);
             for invocation in group {
-                prepared.push(
-                    self.prepare_tool(invocation, scope.advertised, states, cancel)
-                        .await?,
-                );
+                let preparation = self.prepare_tool(invocation, scope.advertised, states, cancel);
+                tokio::pin!(preparation);
+                let preparation = loop {
+                    tokio::select! {
+                        result = &mut preparation => break result?,
+                        Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
+                    }
+                };
+                prepared.push(preparation);
             }
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -698,6 +736,7 @@ impl Agent<'_> {
             let outcomes = loop {
                 tokio::select! {
                     completed = &mut outcomes => break completed,
+                    Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
                     Some(request) = async {
                         if pending_requests.is_empty() {
                             pending_requests.extend(incoming.recv().await?);
@@ -720,7 +759,7 @@ impl Agent<'_> {
                             }
                             batch.push(request);
                         }
-                        let nested = self.nested_tools(session, batch, states, observer);
+                        let nested = self.nested_tools(session, batch, states, observer, inputs.as_deref_mut());
                         tokio::pin!(nested);
                         tokio::select! {
                             result = &mut nested => {
@@ -760,12 +799,13 @@ impl Agent<'_> {
         Ok(())
     }
 
-    async fn nested_tools(
+    async fn nested_tools<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         requests: Vec<NestedRequest>,
         states: &mut ExtensionStates,
         observer: &mut Observer<'_>,
+        inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<()> {
         let invocations: Vec<_> = requests
             .iter()
@@ -797,13 +837,14 @@ impl Agent<'_> {
                 session,
                 &invocations,
                 &DispatchScope {
+                    cancellation: &requests[0].cancellation,
                     advertised: &advertised,
                     depth: requests[0].depth,
                     call_count: requests[0].call_count.clone(),
                 },
                 states,
-                &requests[0].cancellation,
                 observer,
+                inputs,
             ))
             .await
         }
@@ -1241,7 +1282,7 @@ impl Agent<'_> {
         }
         let allowance = request.max_output_tokens;
         let reply = self
-            .reply(session, request, false, cancel, observer)
+            .reply::<AgentInput>(session, request, false, cancel, observer, None)
             .await?;
         if !reply.invocations.is_empty() {
             return Err(Error::Model(
@@ -1371,6 +1412,7 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
 }
 
 struct DispatchScope<'a> {
+    cancellation: &'a CancellationToken,
     advertised: &'a HashSet<String>,
     depth: usize,
     call_count: Arc<AtomicUsize>,
@@ -1525,60 +1567,110 @@ fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> R
     Ok(())
 }
 
-pub(crate) fn queue_inputs<T: Into<QueuedMessage>>(
+async fn receive_input<T>(inputs: &mut Option<&mut mpsc::Receiver<T>>) -> Option<T> {
+    match inputs {
+        Some(inputs) => inputs.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+pub(crate) fn queue_inputs<T: Into<AgentInput>>(
     session: &mut Session,
     followups: &mut mpsc::Receiver<T>,
     observer: &mut Observer<'_>,
 ) -> Result<()> {
-    // Bound the drain so a continuous producer cannot starve the model loop.
     for _ in 0..followups.max_capacity() {
         let Ok(input) = followups.try_recv() else {
             break;
         };
-        let input: QueuedMessage = input.into();
-        if input.input.content.trim().is_empty() && input.images.is_empty() {
-            continue;
-        }
-        input.validate()?;
-        if session
-            .records()
-            .iter()
-            .any(|record| record.run_id == Some(input.input.id))
-        {
-            return Err(Error::Config("queued input ID is reserved by a run".into()));
-        }
-        let existing = session
-            .records()
-            .iter()
-            .find_map(|record| match &record.event {
-                Event::InputQueued { input: existing } if existing.id == input.input.id => {
-                    Some(QueuedMessage::from(existing.clone()))
-                }
-                Event::InputQueuedWithImages { input: existing }
-                    if existing.input.id == input.input.id =>
-                {
-                    Some(existing.clone())
-                }
-                _ => None,
-            });
-        match existing {
-            Some(existing) if existing == input => continue,
-            Some(_) => {
-                return Err(Error::Config(
-                    "input ID already exists with different content or kind".into(),
-                ));
-            }
-            None => {
-                let event = if input.images.is_empty() {
-                    Event::InputQueued { input: input.input }
-                } else {
-                    Event::InputQueuedWithImages { input }
-                };
-                commit(session, event, observer)?;
-            }
-        }
+        queue_input(session, input.into(), observer)?;
     }
     Ok(())
+}
+
+fn reply_to_control<T>(result: Result<T>, reply: oneshot::Sender<Result<T>>) -> Result<()> {
+    match result {
+        Ok(value) => {
+            let _ = reply.send(Ok(value));
+            Ok(())
+        }
+        Err(error) => {
+            let _ = reply.send(Err(Error::Session(error.to_string())));
+            Err(error)
+        }
+    }
+}
+impl AgentInput {
+    /// Apply one message or queue control from an embedding application's event loop.
+    pub fn apply(self, session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
+        queue_input(session, self, observer)
+    }
+}
+
+fn queue_input(
+    session: &mut Session,
+    input: AgentInput,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    let input = match input {
+        AgentInput::Message(message) => message,
+        AgentInput::ClearQueue { reply } => {
+            let count = session.records().len();
+            let result = session.clear_queued_inputs();
+            for record in &session.records()[count..] {
+                observer(Notification::Committed(record));
+            }
+            return reply_to_control(result, reply);
+        }
+        AgentInput::SetQueueMode { kind, mode, reply } => {
+            let count = session.records().len();
+            let result = session.set_queue_mode(kind, mode);
+            for record in &session.records()[count..] {
+                observer(Notification::Committed(record));
+            }
+            return reply_to_control(result, reply);
+        }
+    };
+    if input.input.content.trim().is_empty() && input.images.is_empty() {
+        return Ok(());
+    }
+    input.validate()?;
+    if session
+        .records()
+        .iter()
+        .any(|record| record.run_id == Some(input.input.id))
+    {
+        return Err(Error::Config("queued input ID is reserved by a run".into()));
+    }
+    let existing = session
+        .records()
+        .iter()
+        .find_map(|record| match &record.event {
+            Event::InputQueued { input: existing } if existing.id == input.input.id => {
+                Some(QueuedMessage::from(existing.clone()))
+            }
+            Event::InputQueuedWithImages { input: existing }
+                if existing.input.id == input.input.id =>
+            {
+                Some(existing.clone())
+            }
+            _ => None,
+        });
+    match existing {
+        Some(existing) if existing == input => return Ok(()),
+        Some(_) => {
+            return Err(Error::Config(
+                "input ID already exists with different content or kind".into(),
+            ));
+        }
+        None => {}
+    }
+    let event = if input.images.is_empty() {
+        Event::InputQueued { input: input.input }
+    } else {
+        Event::InputQueuedWithImages { input }
+    };
+    commit(session, event, observer)
 }
 
 fn apply_inputs(
@@ -1703,6 +1795,86 @@ mod nested_host_tests {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    struct WaitingModel(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Model for WaitingModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+    #[tokio::test]
+    async fn queue_controls_are_acknowledged_while_a_model_request_is_waiting() {
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let model = WaitingModel(ready.clone());
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "waiting",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let (sender, mut inputs) = mpsc::channel::<AgentInput>(4);
+        sender
+            .send(
+                QueuedMessage::from(crate::QueuedInput {
+                    id: Uuid::new_v4(),
+                    kind: InputKind::FollowUp,
+                    content: "later".into(),
+                })
+                .into(),
+            )
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let driver = async {
+            ready.notified().await;
+            let (reply, result) = oneshot::channel();
+            sender
+                .send(AgentInput::SetQueueMode {
+                    kind: InputKind::FollowUp,
+                    mode: crate::QueueMode::OneAtATime,
+                    reply,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), result)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let (reply, result) = oneshot::channel();
+            sender.send(AgentInput::ClearQueue { reply }).await.unwrap();
+            let removed = tokio::time::timeout(Duration::from_secs(1), result)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(removed[0].input.content, "later");
+            cancellation.cancel();
+        };
+        let mut observer = |_: Notification<'_>| {};
+        let (result, ()) = tokio::join!(
+            agent.run_correlated(
+                &mut session,
+                Uuid::new_v4(),
+                Some("start".into()),
+                &mut inputs,
+                &cancellation,
+                &mut observer
+            ),
+            driver
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(session.queued_inputs().is_empty());
+        assert_eq!(
+            session.queue_mode(InputKind::FollowUp),
+            crate::QueueMode::OneAtATime
+        );
+    }
+
     #[test]
     fn text_only_queued_messages_obey_the_same_size_limit() {
         let message = QueuedMessage::from("x".repeat(8 * 1024 * 1024));

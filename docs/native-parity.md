@@ -36,7 +36,8 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `cycle_model`, `set_thinking_level`, `cycle_thinking_level`,
 `get_available_thinking_levels`, `switch_session`, `fork`, `clone`,
 `get_fork_messages`, `get_entries`, `get_tree`, `get_last_assistant_text`,
-`edit_context`, `bash`, `abort_bash`, and `shutdown`. Responses carry the request ID and a
+`edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
+`set_follow_up_mode`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance is separate from completion; wait for
 `agent_settled`. The interface emits native journal events plus text updates.
 Additional Pi RPC commands and complete event-schema parity remain in progress.
@@ -812,4 +813,27 @@ counts both buffered and journaled pending inputs. Text-only queued messages
 now use the same size bound as image-bearing messages.
 
 Tests cover one-at-a-time consumption, cleared messages, historical forks and
-SDK queue removal. Active TUI/RPC queue controls remain to be connected.
+SDK queue removal. Active controls are covered in the following checkpoint.
+
+### Active queue controls checkpoint
+
+The core accepts `AgentInput` messages and acknowledged queue controls while a
+model connection, response stream or tool execution is waiting. The owned SDK
+exposes these controls on `SessionControl` during a prompt and on `AgentSession`
+while idle. Its final input drain is synchronized with late control submissions.
+
+RPC supports queue clearing and steering/follow-up mode changes during a run.
+Clearing returns the removed text and native image-bearing messages. Mode
+changes update the active branch and user defaults. New native frontend sessions
+default to one-at-a-time delivery. Existing core embeddings retain all-at-once
+behavior unless configured otherwise.
+
+Alt+Up restores queued messages in the TUI, with Alt+Q on Windows/WSL. Escape
+restores the queue before stopping the active run. An RPC abort retains queued
+messages and continues them without repeating the interrupted request first.
+Compaction and review operations still require their separate queue handling.
+
+RPC fixtures verify acknowledgements while HTTP/model and shell-tool execution
+are pending, one-at-a-time delivery, persisted defaults on a new session and
+continuation after abort. Both terminal modes pass queue-restoration checks.
+Core and SDK tests cover active controls, branch history and idle operations.

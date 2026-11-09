@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 pub(super) struct Worker {
     pub(super) compacting: bool,
     pub(super) bashing: bool,
+    pub(super) steering_mode: pi_rs::QueueMode,
+    pub(super) follow_up_mode: pi_rs::QueueMode,
+    session: std::path::PathBuf,
     pub(super) busy: bool,
     persistent: bool,
     configuration: Value,
@@ -21,6 +24,8 @@ pub(super) struct Worker {
 }
 impl Worker {
     pub(super) fn start(args: &Cli, operation: &[&str]) -> Result<Self> {
+        let steering_mode = super::backend::configured_queue_mode(args, "steeringMode")?;
+        let follow_up_mode = super::backend::configured_queue_mode(args, "followUpMode")?;
         let mut command = Command::new(std::env::current_exe()?);
         if let Some(token) = args.model_token() {
             command.env("PI_RS_MODEL_TOKEN", token);
@@ -153,6 +158,9 @@ impl Worker {
         Ok(Self {
             compacting: operation.first() == Some(&"compact"),
             bashing: false,
+            steering_mode,
+            follow_up_mode,
+            session: args.session.clone(),
             busy: !persistent,
             persistent,
             configuration: configuration(args),
@@ -179,6 +187,21 @@ impl Worker {
             Ok(())
         }
     }
+    pub(super) fn control(slot: &mut Option<Self>, args: &Cli, request: Value) -> Result<()> {
+        if slot
+            .as_ref()
+            .is_none_or(|worker| !worker.matches(args) || worker.session != args.session)
+        {
+            if slot.as_ref().is_some_and(|worker| worker.busy) {
+                return Err(Error::Config(
+                    "cannot redirect controls for an active session".into(),
+                ));
+            }
+            slot.take();
+            *slot = Some(Self::start(args, &["serve"])?);
+        }
+        slot.as_mut().expect("queue worker").send(request)
+    }
     pub(super) fn matches(&self, args: &Cli) -> bool {
         self.persistent && self.configuration == configuration(args)
     }
@@ -187,6 +210,7 @@ impl Worker {
         self.compacting = request["type"] == "compact";
         self.bashing = request["type"] == "bash";
         self.send(request)?;
+        self.session = args.session.clone();
         self.busy = true;
         Ok(())
     }

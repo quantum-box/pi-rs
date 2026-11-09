@@ -7,7 +7,8 @@ use std::sync::{
 };
 
 use pi_rs::{
-    CancellationToken, Compaction, Error, InputKind, QueuedInput, QueuedMessage, Result, Session,
+    AgentInput, CancellationToken, Compaction, Error, InputKind, QueueMode, QueuedInput,
+    QueuedMessage, Result, Session,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -26,6 +27,8 @@ enum Request {
     },
     Prompt {
         content: Option<String>,
+        #[serde(default)]
+        queued_only: bool,
         #[serde(default)]
         images: Vec<pi_rs::ImageContent>,
     },
@@ -65,6 +68,14 @@ enum Request {
         id: Uuid,
         value: pi_rs::UiResponse,
     },
+    ClearQueue {
+        id: Option<serde_json::Value>,
+    },
+    SetQueueMode {
+        kind: InputKind,
+        mode: QueueMode,
+        id: Option<serde_json::Value>,
+    },
     Cancel,
     Shutdown,
 }
@@ -98,12 +109,36 @@ pub async fn run(mut args: Cli) -> Result<()> {
         }
     });
     output(json!({"type":"backend_ready"}));
+    let mut continue_queue = false;
     while !stopping.load(Ordering::SeqCst) {
         let (request, scheduled) = tokio::select! {
             _ = stop_notify.notified() => break,
             request = requests.recv() => match request { Some(request) => (request, true), None => break },
-            input = queued.recv() => match input { Some(input) => (Request::Prompt { content: Some(input.input.content), images: input.images }, false), None => break },
+            input = queued.recv() => match input {
+                Some(input) => {
+                    let mut starts_run = matches!(input, AgentInput::Message(_));
+                    let result = Session::open(&args.session).and_then(|mut session| {
+                        if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
+                        let mut observer = |event: pi_rs::Notification<'_>| observe(event, args.trace);
+                        input.apply(&mut session, &mut observer)?;
+                        for _ in 0..queued.max_capacity() {
+                            let Ok(input) = queued.try_recv() else { break; };
+                            starts_run |= matches!(input, AgentInput::Message(_));
+                            input.apply(&mut session, &mut observer)?;
+                        }
+                        Ok(starts_run && !session.queued_inputs().is_empty())
+                    });
+                    match result {
+                        Ok(true) => (Request::Prompt { content: None, images: vec![], queued_only: true }, false),
+                        Ok(false) => continue,
+                        Err(error) => { output(json!({"type":"error","message":error.to_string()})); continue; }
+                    }
+                }
+                None => break,
+            },
+            _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true }, false),
         };
+        continue_queue = false;
         if stopping.load(Ordering::SeqCst) {
             break;
         }
@@ -142,10 +177,12 @@ pub async fn run(mut args: Cli) -> Result<()> {
                 session.set_working_directory(&args.workspace)?;
             }
             session.select_model(&args.model, args.thinking.as_deref())?;
+            initialize_queue_modes(&mut session, &args)?;
             let agent = runtime.agent(&args);
             let mut observer = |event: pi_rs::Notification<'_>| observe(event, args.trace);
             match request {
-                Request::Prompt { content, images } => {
+                Request::Prompt { content, images, queued_only } => {
+                    if queued_only && !agent.apply_queued_inputs(&mut session, &mut observer)? { return Ok(()); }
                     let mut content = content
                         .map(|input| {
                             runtime
@@ -251,6 +288,10 @@ pub async fn run(mut args: Cli) -> Result<()> {
         }
         .await;
         active.lock().expect("worker control").token = None;
+        if matches!(&result, Err(Error::Cancelled)) {
+            continue_queue = Session::open(&args.session)
+                .is_ok_and(|session| !session.queued_inputs().is_empty());
+        }
         if let Err(error) = &result {
             output(json!({"type":"error","message":error.to_string()}));
         }
@@ -260,11 +301,12 @@ pub async fn run(mut args: Cli) -> Result<()> {
 }
 fn read_requests(
     commands: mpsc::Sender<Request>,
-    inputs: mpsc::Sender<QueuedMessage>,
+    inputs: mpsc::Sender<AgentInput>,
     active: Arc<Mutex<ControlState>>,
     stopping: Arc<AtomicBool>,
     ui: Arc<super::extension_ui::Broker>,
 ) {
+    let runtime = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else {
@@ -295,11 +337,61 @@ fn read_requests(
                     };
                     if let Err(error) = message.validate() {
                         output(json!({"type":"input_rejected","reason":error.to_string()}));
-                    } else if inputs.try_send(message).is_err() {
+                    } else if inputs.try_send(message.into()).is_err() {
                         output(json!({"type":"input_rejected","reason":"follow-up queue is full"}));
                     }
                 }
                 Request::ExtensionUiResponse { id, value } => ui.resolve(id, value),
+                Request::ClearQueue { id } => {
+                    let (reply, receiver) = tokio::sync::oneshot::channel();
+                    let _ = inputs.try_send(AgentInput::ClearQueue { reply });
+                    runtime.spawn(async move {
+                        let result = receiver.await.map_err(|_| Error::Config("queue control channel closed".into())).and_then(|result| result).map(|messages| {
+                            let steering: Vec<_> = messages.iter().filter(|message| message.input.kind == InputKind::Steer).map(|message| message.input.content.clone()).collect();
+                            let follow_up: Vec<_> = messages.iter().filter(|message| message.input.kind == InputKind::FollowUp).map(|message| message.input.content.clone()).collect();
+                            json!({"steering":steering,"followUp":follow_up,"messages":messages})
+                        });
+                        control_response("clear_queue", id, result);
+                    });
+                }
+                Request::SetQueueMode { kind, mode, id } => {
+                    let (reply, receiver) = tokio::sync::oneshot::channel();
+                    let _ = inputs.try_send(AgentInput::SetQueueMode { kind, mode, reply });
+                    runtime.spawn(async move {
+                        let result = async {
+                            receiver.await.map_err(|_| {
+                                Error::Config("queue control channel closed".into())
+                            })??;
+                            tokio::task::spawn_blocking(move || {
+                                let key = if kind == InputKind::Steer {
+                                    "steeringMode"
+                                } else {
+                                    "followUpMode"
+                                };
+                                super::config::update_object(
+                                    &super::config::agent_dir().join("settings.json"),
+                                    |settings| {
+                                        settings.insert(key.into(), json!(mode));
+                                        Ok(())
+                                    },
+                                )
+                            })
+                            .await
+                            .map_err(|error| Error::Config(error.to_string()))??;
+                            Ok(json!({"mode":mode}))
+                        }
+                        .await;
+                        control_response(
+                            if kind == InputKind::Steer {
+                                "set_steering_mode"
+                            } else {
+                                "set_follow_up_mode"
+                            },
+                            id,
+                            result,
+                        );
+                    });
+                }
                 Request::Cancel => {
                     let mut state = active.lock().expect("worker control");
                     if let Some(cancel) = &state.token {
@@ -331,4 +423,43 @@ fn read_requests(
             cancel.cancel();
         }
     });
+}
+
+fn control_response(
+    command: &str,
+    id: Option<serde_json::Value>,
+    result: Result<serde_json::Value>,
+) {
+    let mut response = json!({"type":"response","command":command,"success":result.is_ok()});
+    if let Some(id) = id {
+        response["id"] = id;
+    }
+    match result {
+        Ok(data) => response["data"] = data,
+        Err(error) => response["error"] = json!(error.to_string()),
+    }
+    output(response);
+}
+
+pub(super) fn configured_queue_mode(args: &Cli, key: &str) -> Result<QueueMode> {
+    Ok(serde_json::from_value(
+        args.settings
+            .value()
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| json!("one-at-a-time")),
+    )?)
+}
+pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Result<()> {
+    let settings = super::config::Settings::load(&args.workspace, args.trusted)?;
+    for (kind, key) in [
+        (InputKind::Steer, "steeringMode"),
+        (InputKind::FollowUp, "followUpMode"),
+    ] {
+        if !session.branch().iter().any(|record| matches!(record.event, pi_rs::Event::QueueModeSelected { kind: selected, .. } if selected == kind)) {
+            let mode = settings.value().get(key).cloned().unwrap_or_else(|| json!("one-at-a-time"));
+            session.set_queue_mode(kind, serde_json::from_value(mode)?)?;
+        }
+    }
+    Ok(())
 }
