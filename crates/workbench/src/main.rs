@@ -235,6 +235,19 @@ impl Cli {
             .clone()
             .or_else(|| std::env::var("PI_RS_MODEL_TOKEN").ok())
     }
+    fn apply_model_thinking_defaults(&mut self) {
+        self.thinking = self
+            .model_scope
+            .iter()
+            .find(|choice| choice.model == self.model)
+            .and_then(|choice| choice.thinking.clone())
+            .or_else(|| {
+                self.settings
+                    .thinking_for_model(&self.model)
+                    .map(str::to_owned)
+            })
+            .or_else(|| self.thinking.clone());
+    }
     fn restore_model_selection(&mut self, model: String, thinking: Option<String>) {
         if !self.model_explicit
             && (self.model_scope.is_empty()
@@ -243,21 +256,18 @@ impl Cli {
             self.model = model.clone();
         }
         if !self.thinking_explicit {
-            if self.model_scope.is_empty() {
-                self.thinking = thinking;
-            } else if let Some(choice) = self
+            self.thinking = self
                 .model_scope
                 .iter()
                 .find(|choice| choice.model == self.model)
-            {
-                self.thinking = choice.thinking.clone().or_else(|| {
-                    if self.model == model {
-                        thinking
-                    } else {
-                        self.thinking.clone()
-                    }
-                });
-            }
+                .and_then(|choice| choice.thinking.clone())
+                .or_else(|| (self.model == model).then_some(thinking).flatten())
+                .or_else(|| {
+                    self.settings
+                        .thinking_for_model(&self.model)
+                        .map(str::to_owned)
+                })
+                .or_else(|| self.thinking.clone());
         }
     }
 }
@@ -489,6 +499,10 @@ async fn execute(mut args: Cli) -> Result<()> {
                 }
             }
         }
+    }
+
+    if !args.thinking_explicit {
+        args.apply_model_thinking_defaults();
     }
 
     if let Some(Command::Package(command)) = args.command.as_ref() {

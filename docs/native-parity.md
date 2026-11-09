@@ -765,3 +765,14 @@ project declaration still replaces the matching user selection.
 Unit and CLI fixtures cover standalone explicit selection, exclusions, ordered
 re-inclusion, inherited user filters and an ordinary empty-array replacement.
 The existing Git revision, transient reload and offline-cache fixture passes.
+
+### Per-model thinking defaults checkpoint
+
+Model-specific `modelThinkingLevels` settings apply at startup and during TUI
+and RPC model changes. Explicit command-line thinking and scoped-model suffixes
+retain their precedence. Restoring a session for a different explicitly chosen
+model uses the chosen model's default. Matching saved session selections remain
+intact. The native `max` level remains valid in settings.
+
+CLI/RPC fixtures cover default selection, explicit overrides, model scopes,
+session restoration and model switching. Settings-editor regressions pass.

@@ -231,14 +231,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .position(|model| *model == args.model)
                 .map_or(0, |index| (index + 1) % available.len());
             args.model = available[next].clone();
-            if let Some(choice) = args
-                .model_scope
-                .iter()
-                .find(|choice| choice.model == args.model)
-                && choice.thinking.is_some()
-            {
-                args.thinking = choice.thinking.clone();
-            }
+            args.apply_model_thinking_defaults();
             Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
             Ok(Some(
                 json!({"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
@@ -384,6 +377,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| Error::Config("modelId is required".into()))?;
             args.model = model.to_owned();
+            args.apply_model_thinking_defaults();
             Session::open(&args.session)?.select_model(model, args.thinking.as_deref())?;
             Ok(Some(model_value(model)))
         }

@@ -2037,14 +2037,7 @@ fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Res
 }
 
 fn apply_scoped_thinking(args: &mut Cli) {
-    if let Some(choice) = args
-        .model_scope
-        .iter()
-        .find(|choice| choice.model == args.model)
-        && choice.thinking.is_some()
-    {
-        args.thinking = choice.thinking.clone();
-    }
+    args.apply_model_thinking_defaults();
 }
 
 fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {

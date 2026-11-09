@@ -46,6 +46,14 @@ impl Settings {
     pub fn string(&self, key: &str) -> Option<&str> {
         self.value.get(key)?.as_str()
     }
+    pub fn thinking_for_model(&self, model: &str) -> Option<&str> {
+        let levels = self.value.get("modelThinkingLevels");
+        levels
+            .and_then(|levels| levels.get(format!("ollama/{model}")))
+            .or_else(|| levels.and_then(|levels| levels.get(model)))
+            .and_then(Value::as_str)
+            .or_else(|| self.string("defaultThinkingLevel"))
+    }
     pub fn boolean(&self, key: &str) -> Option<bool> {
         self.value.get(key)?.as_bool()
     }
@@ -369,6 +377,18 @@ mod tests {
         );
         assert_eq!(base["skills"], json!(["first", "second"]));
     }
+    #[test]
+    fn model_thinking_defaults_prefer_the_provider_key_then_global_default() {
+        let settings = Settings {
+            value: json!({"defaultThinkingLevel":"low", "modelThinkingLevels":{"ollama/a":"high", "a":"medium", "b":"max"}}),
+            ..Settings::default()
+        };
+        assert_eq!(settings.thinking_for_model("a"), Some("high"));
+        assert_eq!(settings.thinking_for_model("b"), Some("max"));
+        assert_eq!(settings.thinking_for_model("c"), Some("low"));
+        validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+    }
+
     #[test]
     fn settings_validation_identifies_bad_values_and_keeps_extension_keys() {
         let path = Path::new("settings.json");
