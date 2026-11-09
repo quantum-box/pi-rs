@@ -228,7 +228,7 @@ impl Tool for CodingTool {
             ),
             Kind::Find => (
                 "find",
-                "Find workspace files matching a glob. Respects ignore files.",
+                "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).",
                 json!({"pattern":{"type":"string"},"path":path,"limit":{"type":"integer","minimum":1,"maximum":100000}}),
                 vec!["pattern"],
             ),
@@ -535,32 +535,55 @@ impl CodingTool {
             .min(100_000) as usize;
         let pattern = string(args, "pattern")?;
         let glob = if is_find {
-            Some(pattern)
+            let pattern = if pattern.contains('/')
+                && !pattern.starts_with('/')
+                && !pattern.starts_with("**/")
+            {
+                format!("**/{pattern}")
+            } else {
+                pattern.to_owned()
+            };
+            Some(
+                globset::GlobBuilder::new(&pattern)
+                    .case_insensitive(!pattern.chars().any(char::is_uppercase))
+                    .literal_separator(true)
+                    .build()
+                    .map_err(|error| Error::Config(error.to_string()))?
+                    .compile_matcher(),
+            )
         } else {
-            args["glob"].as_str()
-        }
-        .map(globset::Glob::new)
-        .transpose()
-        .map_err(|error| Error::Config(error.to_string()))?
-        .map(|glob| glob.compile_matcher());
+            args["glob"]
+                .as_str()
+                .map(globset::Glob::new)
+                .transpose()
+                .map_err(|error| Error::Config(error.to_string()))?
+                .map(|glob| glob.compile_matcher())
+        };
         let mut grep = if is_find {
             None
         } else {
             Some(crate::file_search::Grep::new(args, limit)?)
         };
         let mut results = Vec::new();
-        for entry in ignore::WalkBuilder::new(&base)
-            .hidden(false)
-            .filter_entry(move |entry| {
-                entry.depth() == 0
-                    || !is_find
-                    || !entry.file_type().is_some_and(|kind| kind.is_dir())
-                    || !matches!(entry.file_name().to_str(), Some("node_modules" | ".git"))
-            })
-            .build()
-        {
+        let mut walker = ignore::WalkBuilder::new(&base);
+        walker.hidden(false);
+        if is_find {
+            if !base.is_dir() {
+                return Err(Error::Config(format!(
+                    "Not a directory: {}",
+                    base.display()
+                )));
+            }
+            let inside_git = base.ancestors().any(|path| path.join(".git").exists());
+            walker
+                .require_git(inside_git)
+                .sort_by_file_path(std::path::Path::cmp);
+        }
+        for entry in walker.build() {
             let entry = entry.map_err(|error| Error::Config(error.to_string()))?;
-            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            if (is_find && entry.depth() == 0)
+                || (!is_find && !entry.file_type().is_some_and(|kind| kind.is_file()))
+            {
                 continue;
             }
             let relative = entry
@@ -569,10 +592,16 @@ impl CodingTool {
                 .ok()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new(entry.file_name()));
-            if glob
-                .as_ref()
-                .is_some_and(|glob| !glob.is_match(relative) && !glob.is_match(entry.file_name()))
-            {
+            let match_path = if is_find && pattern.contains('/') {
+                entry.path()
+            } else if is_find {
+                Path::new(entry.file_name())
+            } else {
+                relative
+            };
+            if glob.as_ref().is_some_and(|glob| {
+                !glob.is_match(match_path) && (is_find || !glob.is_match(entry.file_name()))
+            }) {
                 continue;
             }
             if let Some(grep) = &mut grep {
@@ -580,7 +609,13 @@ impl CodingTool {
                     break;
                 }
             } else {
-                results.push(relative.display().to_string());
+                let mut path = relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    path.push('/');
+                }
+                results.push(path);
                 if results.len() >= limit {
                     break;
                 }
@@ -592,13 +627,29 @@ impl CodingTool {
                 if results.is_empty() {
                     return Ok("No files found matching pattern".into());
                 }
+                results.sort();
                 let reached = results.len() >= limit;
-                let mut output = bounded(results.join("\n"));
+                let mut output = results.join("\n");
+                let byte_limit = output.len() > MAX_OUTPUT_BYTES;
+                if byte_limit {
+                    let end = output.as_bytes()[..=MAX_OUTPUT_BYTES]
+                        .iter()
+                        .rposition(|byte| *byte == b'\n')
+                        .unwrap_or(0);
+                    output.truncate(end);
+                }
+                let mut notices = Vec::new();
                 if reached {
-                    output.push_str(&format!(
-                        "\n\n[{limit} results limit reached. Use limit={} for more.]",
+                    notices.push(format!(
+                        "{limit} results limit reached. Use limit={} for more, or refine pattern",
                         limit.saturating_mul(2)
                     ));
+                }
+                if byte_limit {
+                    notices.push("50.0KB limit reached".into());
+                }
+                if !notices.is_empty() {
+                    output.push_str(&format!("\n\n[{}]", notices.join(". ")));
                 }
                 output
             }
@@ -1216,6 +1267,17 @@ mod tests {
                 .to_string()
                 .contains("Not a directory:")
         );
+        let find = CodingTool {
+            kind: Kind::Find,
+            ..tool
+        };
+        let output = find.search(&json!({"pattern":"*", "limit":300})).unwrap();
+        let (body, notice) = output.rsplit_once("\n\n").unwrap();
+        assert_eq!(body.lines().collect::<Vec<_>>(), names[..254]);
+        assert_eq!(
+            notice,
+            "[300 results limit reached. Use limit=600 for more, or refine pattern. 50.0KB limit reached]"
+        );
     }
 
     #[test]
@@ -1245,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn find_excludes_dependency_and_git_metadata_directories() {
+    fn find_uses_ignore_rules_instead_of_excluding_named_directories() {
         let root = tempfile::tempdir().unwrap();
         for directory in ["node_modules/nested", ".git/objects", "src"] {
             std::fs::create_dir_all(root.path().join(directory)).unwrap();
@@ -1258,12 +1320,89 @@ mod tests {
         };
         assert_eq!(
             tool.search(&json!({"pattern":"**/*.rs"})).unwrap(),
-            Path::new("src").join("sample.rs").display().to_string()
+            ".git/objects/sample.rs\nnode_modules/nested/sample.rs\nsrc/sample.rs"
         );
         assert_eq!(
             tool.search(&json!({"pattern":"**/*.rs", "path":"node_modules"}))
                 .unwrap(),
-            Path::new("nested").join("sample.rs").display().to_string()
+            "nested/sample.rs"
+        );
+    }
+
+    #[test]
+    fn find_matches_directories_smart_case_and_path_globs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
+        std::fs::write(root.path().join("src/sample.rs"), "").unwrap();
+        std::fs::write(root.path().join("src/nested/Upper.RS"), "").unwrap();
+        std::fs::write(root.path().join(".hidden"), "").unwrap();
+        let tool = CodingTool {
+            unrestricted: false,
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Find,
+        };
+        assert_eq!(
+            tool.search(&json!({"pattern":"*.rs"})).unwrap(),
+            "src/nested/Upper.RS\nsrc/sample.rs"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"*.RS"})).unwrap(),
+            "src/nested/Upper.RS"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"src/**/*.rs"})).unwrap(),
+            "src/nested/Upper.RS\nsrc/sample.rs"
+        );
+        assert_eq!(tool.search(&json!({"pattern":"src"})).unwrap(), "src/");
+        assert_eq!(
+            tool.search(&json!({"pattern":"*"})).unwrap(),
+            ".hidden\nsrc/\nsrc/nested/\nsrc/nested/Upper.RS\nsrc/sample.rs"
+        );
+        assert!(
+            tool.search(&json!({"pattern":"*","path":".hidden"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn find_respects_gitignore_outside_a_repository_and_reports_limits() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("node_modules")).unwrap();
+        std::fs::write(root.path().join("node_modules/dependency.rs"), "").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(root.path().join("a.rs"), "").unwrap();
+        std::fs::write(root.path().join("b.rs"), "").unwrap();
+        let tool = CodingTool {
+            unrestricted: false,
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Find,
+        };
+        assert_eq!(
+            tool.search(&json!({"pattern":"*.rs"})).unwrap(),
+            "a.rs\nb.rs"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"*.rs","limit":1})).unwrap(),
+            "a.rs\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_lists_symlinks_without_traversing_their_targets() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/a.rs"), "").unwrap();
+        std::os::unix::fs::symlink("src", root.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink("missing", root.path().join("broken")).unwrap();
+        let tool = CodingTool {
+            unrestricted: false,
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Find,
+        };
+        assert_eq!(
+            tool.search(&json!({"pattern":"*"})).unwrap(),
+            "alias\nbroken\nsrc/\nsrc/a.rs"
         );
     }
 

@@ -1349,3 +1349,20 @@ the 101-line, 51,098-byte combined-limit result. A loopback CLI test also verifi
 that invoking the native grep tool delivers those per-match context blocks to
 the next model request. Workspace tests and all-target Clippy passed. Other local-tool differences,
 including structured result details and find traversal, remain open.
+
+### Find traversal and glob checkpoint
+
+Native `find` now includes directory matches (with a trailing slash), hidden
+entries and symlinks without following symlink targets. It follows the reference
+CLI's ignore-file behavior instead of unconditionally excluding `node_modules`
+and `.git`. Git ignore rules also apply outside repositories. Basename patterns
+use smart case; patterns containing a slash match full paths with the reference's
+implicit `**/` prefix. Results use forward slashes and sorted output.
+
+Result and byte limits use the reference CLI's combined notices and complete-line
+50 KB cutoff. Tests cover directories, case-sensitive uppercase patterns,
+case-insensitive lowercase patterns, path globs, ignored dependencies outside a
+repository, symlinks and result-limit notices. A six-call CLI model/tool/model
+round trip produced exactly the same results as the pinned Pi tool for the same
+fixture. Workspace tests and all-target Clippy passed. Full structured tool details and
+remaining native search edge cases still require acceptance work.
