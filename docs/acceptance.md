@@ -298,3 +298,26 @@ Workspace の進捗送信を保留し、コマンド終了後に Coding Job を�
 元の操作 ID に停止確認が付き、後続操作の起動は0件だった。Workspace の
 試験252件が通過し、5件はスキップされた。
 [終了済み Workspace 操作の停止確認試験](https://github.com/quantum-box/tachyon-apps/commit/8feae539722e6f380d5329d61863c797820baebd)
+
+### TACHYON Field の Linear 読み取り（PLT-6383、PLT-6387）
+
+2026-11-09 に、既存の Linear OAuth 接続を使う隔離 AIP 環境で、レビュー承認から
+Rust Harness の Goal 完了まで実行した。Workflow Run
+`wfr_01m70bjb5v8ww58csdp1tf050z` は1ターンで `completed` になった。
+読み取り専用 `get_issue` の結果と Workflow 出力で PLT-6383 のキーとタイトルが一致した。
+
+| 記録 | 確認値 |
+| --- | --- |
+| Goal | `ag_01m70bjjb95p1nem07pdfwevsh` |
+| 監査 ID | `workflow-goal:ag_01m70bjjb95p1nem07pdfwevsh:1` |
+| Harness セッション | `67aa7a26-026e-4fc0-9aee-4b56d6aef9ed` |
+| 読み取り操作 | `92344372-7d76-4737-9a2a-958cceaa293d`。開始と成功が各1件 |
+| Run 予算 | モデル2回とツール1回、6,300トークン、0.020196 USD を精算。保留と未確定は0 |
+
+旧 SDK では初期化応答のアイコンサイズ配列を解析できず、モデル・ツールの
+呼び出し前に停止した。SDK 修正後の試行では、取得済み結果をモデルへ渡す
+呼び出しの予約が12,000トークンの上限を超えるため、予算が拒否した。成功 Run は同じ
+0.20 USD の上限内で24,000トークンを許可した。
+定義と Run は専用 TiDB に保存し、公開 AIP の一覧3種が HTTP 200、
+公開側からの評価 Run 取得が HTTP 404 であることを確認した。評価タスクは停止した。
+[SDK 互換性修正](https://github.com/quantum-box/tachyon-apps/pull/13326)
