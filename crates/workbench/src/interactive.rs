@@ -319,6 +319,29 @@ impl View {
         };
         match result {
             Ok(super::clipboard::Content::Text(text)) => self.editor.insert(&text),
+            Ok(super::clipboard::Content::Files(paths)) => {
+                match super::clipboard::file_text(
+                    &paths,
+                    self.editor.text.trim_start().starts_with('!'),
+                ) {
+                    Ok(text) => {
+                        let before = self.editor.text[..self.editor.cursor].chars().next_back();
+                        let after = self.editor.text[self.editor.cursor..].chars().next();
+                        let leading = if before.is_some_and(|value| !value.is_whitespace()) {
+                            " "
+                        } else {
+                            ""
+                        };
+                        let trailing = if after.is_some_and(|value| !value.is_whitespace()) {
+                            " "
+                        } else {
+                            ""
+                        };
+                        self.editor.insert(&format!("{leading}{text}{trailing}"));
+                    }
+                    Err(error) => self.append(&error.to_string()),
+                }
+            }
             Ok(super::clipboard::Content::Image(image)) => {
                 self.draft_images.push(image);
                 if let Err(error) = self.draft_message(&self.editor.text).validate() {
@@ -2576,6 +2599,33 @@ mod tests {
             .unwrap();
         assert!(view.poll_clipboard());
         assert_eq!(view.draft_images.len(), 1);
+    }
+
+    #[test]
+    fn pasted_file_paths_preserve_surrounding_draft_text() {
+        let mut view = View::default();
+        view.editor.replace("leftRIGHT".into());
+        view.editor.cursor = 4;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        view.clipboard = Some(receiver);
+        sender
+            .send(Ok(super::super::clipboard::Content::Files(vec![
+                "/tmp/one file".into(),
+                "/tmp/two".into(),
+            ])))
+            .unwrap();
+        view.poll_clipboard();
+        assert_eq!(view.editor.text, "left /tmp/one file\n/tmp/two RIGHT");
+        view.editor.replace("!cat ".into());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        view.clipboard = Some(receiver);
+        sender
+            .send(Ok(super::super::clipboard::Content::Files(vec![
+                "/tmp/one file".into(),
+            ])))
+            .unwrap();
+        view.poll_clipboard();
+        assert_eq!(view.editor.text, "!cat '/tmp/one file'");
     }
 
     #[test]

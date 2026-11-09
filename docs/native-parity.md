@@ -788,3 +788,15 @@ bindings. Unix suspension remains available on WSL.
 A committed isolated-process-group PTY test covers resize input and suspension.
 A separate fixture covers both screen modes, SIGINT while suspended, resumed
 draft contents and terminal restoration on exit.
+
+### Clipboard file-list checkpoint
+
+File lists on the clipboard take precedence over image/text representations.
+Pasting inserts one path per line into an ordinary draft and shell-quoted paths
+into a `!`/`!!` command, with whitespace around adjacent text. Paths with control
+characters and oversized lists are rejected before insertion. Windows uses
+PowerShell quoting, and Unix uses POSIX shell quoting.
+
+Tests cover file-list insertion, surrounding text, shell quoting, validation and
+existing image/text draft behavior. A populated system file-list clipboard has
+not been exercised in this environment.

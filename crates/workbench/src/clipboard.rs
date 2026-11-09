@@ -5,20 +5,57 @@ use pi_rs::{Error, ImageContent, Result};
 #[derive(Debug)]
 pub enum Content {
     Text(String),
+    Files(Vec<std::path::PathBuf>),
     Image(ImageContent),
 }
 pub fn read() -> Result<Content> {
     let mut clipboard = arboard::Clipboard::new()
         .map_err(|error| Error::Config(format!("clipboard unavailable: {error}")))?;
+    if let Ok(paths) = clipboard.get().file_list()
+        && !paths.is_empty()
+    {
+        file_text(&paths, false)?;
+        return Ok(Content::Files(paths));
+    }
     match clipboard.get_image() {
         Ok(image) => Ok(Content::Image(prepare(image)?)),
         Err(_) => clipboard.get_text().map(Content::Text).map_err(|error| {
             Error::Config(format!(
-                "clipboard contains no readable image or text: {error}"
+                "clipboard contains no readable files, image or text: {error}"
             ))
         }),
     }
 }
+pub fn file_text(paths: &[std::path::PathBuf], shell: bool) -> Result<String> {
+    let mut formatted = Vec::with_capacity(paths.len());
+    let mut bytes = 0usize;
+    for path in paths {
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error::Config("clipboard path is not UTF-8".into()))?;
+        if path.chars().any(char::is_control) {
+            return Err(Error::Config(
+                "clipboard path contains control characters".into(),
+            ));
+        }
+        let path = if shell {
+            if cfg!(windows) {
+                format!("'{}'", path.replace('\'', "''"))
+            } else {
+                shell_words::quote(path).into_owned()
+            }
+        } else {
+            path.to_owned()
+        };
+        bytes = bytes.saturating_add(path.len()).saturating_add(1);
+        if bytes > 1024 * 1024 {
+            return Err(Error::Config("clipboard file list exceeds 1 MiB".into()));
+        }
+        formatted.push(path);
+    }
+    Ok(formatted.join(if shell { " " } else { "\n" }))
+}
+
 fn prepare(image: arboard::ImageData<'_>) -> Result<ImageContent> {
     let size = image
         .width
@@ -46,6 +83,26 @@ fn prepare(image: arboard::ImageData<'_>) -> Result<ImageContent> {
 mod tests {
     use super::*;
     use std::borrow::Cow;
+    #[test]
+    fn clipboard_file_paths_are_bounded_and_shell_quoted() {
+        let paths = vec!["/tmp/one file".into(), "/tmp/two'file".into()];
+        assert_eq!(
+            file_text(&paths, false).unwrap(),
+            "/tmp/one file\n/tmp/two'file"
+        );
+        let quoted = file_text(&paths, true).unwrap();
+        if cfg!(windows) {
+            assert_eq!(quoted, "'/tmp/one file' '/tmp/two''file'");
+        } else {
+            assert_eq!(
+                shell_words::split(&quoted).unwrap(),
+                vec!["/tmp/one file", "/tmp/two'file"]
+            );
+        }
+        assert!(file_text(&["/tmp/line\ncommand".into()], false).is_err());
+        assert!(file_text(&["x".repeat(1024 * 1024).into()], true).is_err());
+    }
+
     #[test]
     fn clipboard_pixels_preserve_alpha_and_validate_dimensions() {
         let image = prepare(arboard::ImageData {
