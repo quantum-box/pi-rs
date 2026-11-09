@@ -41,6 +41,21 @@ cargo run --locked -p aip-composition --features pi-rs-evaluation --example pi_r
 
 [AIP 評価例の実装](https://github.com/quantum-box/tachyon-apps/pull/13288)
 
+## 参照メモリの有効・無効比較
+
+AIP の作業状態から、承認済みのリリースコードを参照する1課題を別に測った。隔離 TiDB に既存の AIP 経路で作業状態を保存し、同じモデルへ渡す入力を参照メモリの有効・無効で比較した。固定モデル・温度0・seed 123で各3回、実行順を交互にした。
+
+| 参照メモリ | 正答 | 入力トークン | 出力トークン |
+| --- | ---: | ---: | ---: |
+| 無効 | 0/3 | 38 | 2 |
+| 有効 | 3/3 | 97 | 6 |
+
+無効時は3回とも `UNKNOWN` と回答した。有効時は全試行でコードを復元し、入力は59トークン、出力は4トークン増えた。この結果は1つの合成課題の計測値。 [固定入力](../evaluation/reference-effect-input.json) · [実測結果](../evaluation/reference-effect-results.json) · [AIP保存・認可の試験](https://github.com/quantum-box/tachyon-apps/pull/13288)
+
+```sh
+node evaluation/reference-effect.mjs evaluation/reference-effect-input.json
+```
+
 ## 拡張追加と復帰
 
 AI が `pi-rs-fixture-tools` を独立crateとして追加し、合成のコード修正と注文の操作、版付きの実行回数を実装した。ホストの機能指定で組み込む。評価用の拡張を有効にするコード変更はワークベンチの合成部に閉じている。 [サンプル拡張](../crates/fixture-tools/src/lib.rs)

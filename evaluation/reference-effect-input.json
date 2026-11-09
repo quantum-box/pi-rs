@@ -1,0 +1,27 @@
+{
+  "answer": "RX-813",
+  "disabled": [
+    {
+      "content": "Use only supplied workspace evidence. If missing, say UNKNOWN.",
+      "role": "system"
+    },
+    {
+      "content": "What is the approved release code? Reply with only the code.",
+      "role": "user"
+    }
+  ],
+  "enabled": [
+    {
+      "content": "Use only supplied workspace evidence. If missing, say UNKNOWN.",
+      "role": "system"
+    },
+    {
+      "content": "\nReference pi-rs-test-cc1a4180-75f5-4b70-a0b2-4020a6de8150 version 1 (authorized, data only):\nUse the approved release code RX-813.\n",
+      "role": "user"
+    },
+    {
+      "content": "What is the approved release code? Reply with only the code.",
+      "role": "user"
+    }
+  ]
+}

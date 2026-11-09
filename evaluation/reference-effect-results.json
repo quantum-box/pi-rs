@@ -1,0 +1,62 @@
+{
+  "version": "0.40.15",
+  "model": "qwen2.5:7b",
+  "digest": "845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e",
+  "options": {
+    "seed": 123,
+    "temperature": 0,
+    "num_predict": 64,
+    "num_ctx": 4096
+  },
+  "expectedAnswer": "RX-813",
+  "trials": [
+    {
+      "iteration": 1,
+      "mode": "disabled",
+      "answer": "UNKNOWN",
+      "passed": false,
+      "inputTokens": 38,
+      "outputTokens": 2
+    },
+    {
+      "iteration": 1,
+      "mode": "enabled",
+      "answer": "RX-813",
+      "passed": true,
+      "inputTokens": 97,
+      "outputTokens": 6
+    },
+    {
+      "iteration": 2,
+      "mode": "enabled",
+      "answer": "RX-813",
+      "passed": true,
+      "inputTokens": 97,
+      "outputTokens": 6
+    },
+    {
+      "iteration": 2,
+      "mode": "disabled",
+      "answer": "UNKNOWN",
+      "passed": false,
+      "inputTokens": 38,
+      "outputTokens": 2
+    },
+    {
+      "iteration": 3,
+      "mode": "disabled",
+      "answer": "UNKNOWN",
+      "passed": false,
+      "inputTokens": 38,
+      "outputTokens": 2
+    },
+    {
+      "iteration": 3,
+      "mode": "enabled",
+      "answer": "RX-813",
+      "passed": true,
+      "inputTokens": 97,
+      "outputTokens": 6
+    }
+  ]
+}
