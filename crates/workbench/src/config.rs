@@ -5,15 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub fn agent_dir() -> PathBuf {
-    std::env::var_os("PI_RS_HOME")
-        .or_else(|| std::env::var_os("PI_CODING_AGENT_DIR"))
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(|home| PathBuf::from(home).join(".pi-rs"))
-        })
-        .unwrap_or_else(|| std::env::temp_dir().join("pi-rs"))
+    pi_rs_workbench::agent_dir()
 }
 
 #[derive(Clone, Default)]

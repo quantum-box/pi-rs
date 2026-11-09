@@ -39,6 +39,7 @@ pub struct ServerConfig {
     pub description: Option<String>,
     pub enabled: Option<bool>,
     pub exposure: Option<String>,
+    pub oauth: Option<bool>,
     #[serde(default)]
     pub tool_exposure: BTreeMap<String, String>,
 }
@@ -186,36 +187,9 @@ async fn elicit_url(
         }
         _ => return Ok(ElicitResult::new(ElicitationAction::Cancel)),
     }
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("open");
-        command.arg("--").arg(&url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("rundll32");
-        command.arg("url.dll,FileProtocolHandler").arg(&url);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut command = {
-        let mut command = tokio::process::Command::new("xdg-open");
-        command.arg(&url);
-        command
-    };
-    command
-        .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let status = tokio::time::timeout(Duration::from_secs(10), command.status())
+    open_browser(&url)
         .await
-        .map_err(|_| ErrorData::internal_error("browser launch timed out", None))?
         .map_err(|_| ErrorData::internal_error("could not launch browser", None))?;
-    if !status.success() {
-        return Err(ErrorData::internal_error("could not launch browser", None));
-    }
     let answer = interaction
         .host
         .ui(pi_rs::UiRequest::Confirm {
@@ -228,6 +202,40 @@ async fn elicit_url(
         Ok(pi_rs::UiResponse::Confirmed(true)) => ElicitationAction::Accept,
         _ => ElicitationAction::Cancel,
     }))
+}
+
+pub(crate) async fn open_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("open");
+        command.arg("--").arg(url);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler").arg(url);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = tokio::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let status = tokio::time::timeout(Duration::from_secs(10), command.status())
+        .await
+        .map_err(|_| Error::Config("browser launch timed out".into()))?
+        .map_err(|_| Error::Config("could not launch browser".into()))?;
+    if !status.success() {
+        return Err(Error::Config("could not launch browser".into()));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -320,6 +328,9 @@ impl McpExtension {
                 "MCP exposure must be direct, deferred, codemode, or hidden".into(),
             ));
         }
+        if config.oauth == Some(true) && config.command.is_some() {
+            return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
+        }
         let timeout = Duration::from_secs(config.timeout.unwrap_or(60).clamp(1, 3600));
         let mut identity = connection_identity(name, config, workspace)?;
         let service = if let Some(command) = &config.command {
@@ -401,17 +412,46 @@ impl McpExtension {
                 .connect_timeout(Duration::from_secs(10))
                 .build()
                 .map_err(|error| Error::Config(error.to_string()))?;
-            let transport = StreamableHttpClientTransport::with_client(
-                client,
-                StreamableHttpClientTransportConfig::with_uri(url.clone()).custom_headers(headers),
-            );
-            tokio::time::timeout(
-                timeout.min(Duration::from_secs(10)),
-                NativeClient::default().serve(transport),
-            )
-            .await
-            .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
-            .map_err(|error| Error::Config(format!("MCP {name} initialization failed: {error}")))?
+            let initialize = async {
+                let transport_config = StreamableHttpClientTransportConfig::with_uri(url.clone())
+                    .custom_headers(headers);
+                if config.oauth == Some(true) {
+                    if config
+                        .headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("authorization"))
+                    {
+                        return Err(Error::Config(
+                            "MCP OAuth cannot be combined with an Authorization header".into(),
+                        ));
+                    }
+                    let (client, generation) = crate::mcp_auth::client(name, url, client).await?;
+                    identity.update(generation.as_bytes());
+                    NativeClient::default()
+                        .serve(StreamableHttpClientTransport::with_client(
+                            client,
+                            transport_config,
+                        ))
+                        .await
+                } else {
+                    NativeClient::default()
+                        .serve(StreamableHttpClientTransport::with_client(
+                            client,
+                            transport_config,
+                        ))
+                        .await
+                }
+                .map_err(|error| {
+                    if config.oauth == Some(true) {
+                        Error::Config(format!("MCP {name} OAuth connection failed"))
+                    } else {
+                        Error::Config(format!("MCP {name} initialization failed: {error}"))
+                    }
+                })
+            };
+            tokio::time::timeout(timeout.min(Duration::from_secs(10)), initialize)
+                .await
+                .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))??
         } else {
             return Err(Error::Config(format!("MCP {name} needs command or url")));
         };

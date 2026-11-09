@@ -11,6 +11,21 @@ use std::sync::Arc;
 #[derive(Clone, Subcommand)]
 pub enum McpCommand {
     List,
+    /// Sign in to an HTTP MCP server using OAuth and a browser.
+    Login {
+        name: String,
+        #[arg(short = 'l', long)]
+        local: bool,
+        /// Pre-registered public client ID. Omit for dynamic registration.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// Requested OAuth scope. May be specified more than once.
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+    },
+    Logout {
+        name: String,
+    },
     Add {
         name: String,
         #[arg(short = 'l', long)]
@@ -19,6 +34,9 @@ pub enum McpCommand {
         url: Option<String>,
         #[arg(long)]
         bearer_token_env_var: Option<String>,
+        /// Authenticate with credentials saved by mcp login.
+        #[arg(long)]
+        oauth: bool,
         #[arg(long, value_parser = ["direct", "deferred", "codemode", "hidden"])]
         exposure: Option<String>,
         #[arg(long = "env")]
@@ -55,7 +73,7 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
                         entry.as_object(),
                     )
                 {
-                    for key in ["enabled", "exposure", "toolExposure"] {
+                    for key in ["enabled", "exposure", "toolExposure", "oauth"] {
                         if let Some(value) = overlay.get(key) {
                             base.insert(key.into(), value.clone());
                         }
@@ -172,6 +190,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             local,
             url,
             bearer_token_env_var,
+            oauth,
             exposure,
             environment,
             command,
@@ -193,6 +212,14 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             } else {
                 json!({"command":command[0],"args":command[1..]})
             };
+            if oauth {
+                if value.get("url").is_none() || bearer_token_env_var.is_some() {
+                    return Err(Error::Config(
+                        "--oauth requires --url and cannot use --bearer-token-env-var".into(),
+                    ));
+                }
+                value["oauth"] = json!(true);
+            }
             if let Some(exposure) = exposure {
                 value["exposure"] = json!(exposure);
             }
@@ -227,6 +254,74 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 Ok(())
             })?;
             output(json!({"type":"mcp_saved","name":name,"path":path}));
+        }
+        McpCommand::Login {
+            name,
+            local,
+            client_id,
+            scopes,
+        } => {
+            let path = path(args, local);
+            let document = config::read_object(&path)?;
+            let value = document.get("mcpServers").and_then(|servers| servers.get(&name))
+                .ok_or_else(|| Error::Config("MCP server is not configured in this scope; use --local for a project server".into()))?;
+            let server: ServerConfig = serde_json::from_value(value.clone())?;
+            let url = server
+                .url
+                .as_deref()
+                .filter(|_| server.command.is_none())
+                .ok_or_else(|| Error::Config("MCP OAuth requires an HTTP server".into()))?;
+            if server
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("authorization"))
+            {
+                return Err(Error::Config(
+                    "remove the MCP Authorization header before using OAuth".into(),
+                ));
+            }
+            pi_rs_workbench::mcp_auth::login(&name, url, client_id.as_deref(), &scopes, |url| {
+                output(json!({"type":"mcp_authorization","name":name,"url":url}));
+            })
+            .await?;
+            config::update_object(&path, |document| {
+                let server = document
+                    .get_mut("mcpServers")
+                    .and_then(|servers| servers.get_mut(&name))
+                    .ok_or_else(|| {
+                        Error::Config("MCP configuration changed during login".into())
+                    })?;
+                let current: ServerConfig = serde_json::from_value(server.clone())?;
+                if current.url.as_deref() != Some(url)
+                    || current.command.is_some()
+                    || current
+                        .headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("authorization"))
+                {
+                    return Err(Error::Config(
+                        "MCP authentication configuration changed during login".into(),
+                    ));
+                }
+                server["oauth"] = json!(true);
+                Ok(())
+            })?;
+            output(json!({"type":"mcp_logged_in","name":name}));
+        }
+        McpCommand::Logout { name } => {
+            let servers = configurations(args)?;
+            let server: ServerConfig = serde_json::from_value(
+                servers
+                    .get(&name)
+                    .ok_or_else(|| Error::Config("MCP server is not configured".into()))?
+                    .clone(),
+            )?;
+            let url = server
+                .url
+                .as_deref()
+                .ok_or_else(|| Error::Config("MCP OAuth requires an HTTP server".into()))?;
+            pi_rs_workbench::mcp_auth::logout(&name, url).await?;
+            output(json!({"type":"mcp_logged_out","name":name}));
         }
         McpCommand::Remove { name, local } => {
             let path = path(args, local);

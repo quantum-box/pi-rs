@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; add/remove/list commands | OAuth, in-flight tool-list updates |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands | In-flight tool-list updates, OAuth confidential clients and interactive scope upgrades |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
@@ -970,3 +970,29 @@ loopback HTTP, and browser invocation passes the validated URL as an argument.
 A stdio fixture verified all response paths and the exact launcher arguments
 using an isolated replacement launcher, without opening a real browser. Form
 elicitation regressions, workspace tests and all-target Clippy also passed.
+
+### MCP OAuth checkpoint
+
+Native HTTP MCP connections now support public-client OAuth authorization.
+`pi mcp add NAME --url URL --oauth` configures a server, and `pi mcp login NAME`
+starts discovery, dynamic client registration and a browser-based PKCE flow
+with a loopback callback. `--client-id` selects a pre-registered public client,
+and repeated `--scope` options select scopes. Pass `--local` to log in to a
+project-scoped definition.
+`pi mcp logout NAME` removes the saved credentials.
+
+Credentials are written atomically in the user agent directory, with owner-only
+file permissions on Unix. Refresh operations share a process-safe file lock that remains held until a
+blocking write finishes, including when its async caller is cancelled.
+Each successful login receives a new identifier, so old connections cannot load
+credentials from a later login. A failed browser launch preserves the prior
+credentials. Both expiring access tokens and rejected access tokens can refresh
+through the MCP SDK. Credential values are omitted from CLI output.
+
+Local OAuth and MCP fixtures verified dynamic registration, pre-registered
+clients, PKCE verification, rejection of an incorrect callback state,
+authenticated tool calls, token rotation, cross-process reuse, logout and login
+replacement. Store tests cover stale connections, locking, file permissions,
+failed oversized writes and recovery from a damaged store. These are fixture
+checks with an isolated browser launcher. Confidential clients and automatic
+interactive scope upgrades still require implementation.

@@ -18,9 +18,22 @@ const MAX_COMMAND_INPUT: u64 = 1024 * 1024;
 pub mod coding;
 mod file_search;
 pub mod mcp;
+pub mod mcp_auth;
 mod shell_output;
 mod text_edit;
 mod text_page;
+
+pub fn agent_dir() -> PathBuf {
+    std::env::var_os("PI_RS_HOME")
+        .or_else(|| std::env::var_os("PI_CODING_AGENT_DIR"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".pi-rs"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("pi-rs"))
+}
 
 pub struct Tools {
     root: PathBuf,
