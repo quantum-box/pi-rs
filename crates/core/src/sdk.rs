@@ -269,6 +269,15 @@ impl AgentSession {
         self.run(Some(input.into()), Uuid::new_v4(), &mut |_| {})
             .await
     }
+    /// Submit text and images as one durable user message.
+    pub async fn prompt_with_images(
+        &mut self,
+        text: impl Into<String>,
+        images: Vec<crate::ImageContent>,
+    ) -> Result<String> {
+        self.run_input(Some(text.into()), Some(images), Uuid::new_v4(), &mut |_| {})
+            .await
+    }
     pub async fn prompt_with_observer(
         &mut self,
         input: impl Into<String>,
@@ -283,6 +292,15 @@ impl AgentSession {
     pub async fn run(
         &mut self,
         input: Option<String>,
+        run_id: Uuid,
+        observer: &mut Observer<'_>,
+    ) -> Result<String> {
+        self.run_input(input, None, run_id, observer).await
+    }
+    async fn run_input(
+        &mut self,
+        mut input: Option<String>,
+        images: Option<Vec<crate::ImageContent>>,
         run_id: Uuid,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
@@ -301,16 +319,32 @@ impl AgentSession {
             system_prompt: &self.system_prompt,
             limits: self.limits.clone(),
         };
-        let result = agent
-            .run_correlated(
-                &mut self.session,
-                run_id,
-                input,
-                &mut self.input,
-                &active.token,
-                &mut observe,
-            )
-            .await;
+        let result = async {
+            if let Some(images) = images {
+                self.session.append_user_with_images(
+                    input.take().unwrap_or_default(),
+                    images,
+                    Some(run_id),
+                )?;
+                observe(Notification::Committed(
+                    self.session
+                        .records()
+                        .last()
+                        .expect("appended user message"),
+                ));
+            }
+            agent
+                .run_correlated(
+                    &mut self.session,
+                    run_id,
+                    input,
+                    &mut self.input,
+                    &active.token,
+                    &mut observe,
+                )
+                .await
+        }
+        .await;
         let _ = events.send(SessionEvent::RunEnded {
             run_id,
             succeeded: result.is_ok(),
@@ -1044,6 +1078,86 @@ mod tests {
         };
         let (result, ()) = tokio::join!(session.prompt("wait for abort"), abort);
         assert!(matches!(result, Err(Error::Cancelled)));
+        session.close().await.unwrap();
+    }
+    struct ImageModel;
+    #[async_trait::async_trait]
+    impl Model for ImageModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            assert!(request.messages.iter().any(|message| matches!(message,
+                Message::UserWithImages { content, images } if content == "describe" && images[0].data == "aW1hZ2U=")));
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("image accepted".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+    #[tokio::test]
+    async fn image_input_is_atomic_and_survives_a_fork() {
+        let mut session = SessionBuilder::new(Arc::new(ImageModel), "image-model")
+            .in_memory()
+            .unwrap();
+        let answer = session
+            .prompt_with_images(
+                "describe",
+                vec![crate::ImageContent {
+                    data: "aW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "image accepted");
+        session
+            .prompt_with_images(
+                "describe",
+                vec![crate::ImageContent {
+                    data: "aW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .journal()
+                .records()
+                .iter()
+                .filter(|record| matches!(record.event, crate::Event::Assistant { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            session
+                .journal()
+                .records()
+                .iter()
+                .filter(|record| matches!(record.event, crate::Event::UserWithImages { .. }))
+                .count(),
+            2
+        );
+        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        assert!(fork.messages().unwrap().iter().any(
+            |message| matches!(message, Message::UserWithImages { images, .. } if images.len() == 1)
+        ));
+        let count = session.journal().records().len();
+        assert!(
+            session
+                .prompt_with_images(
+                    "bad",
+                    vec![crate::ImageContent {
+                        data: "invalid".into(),
+                        mime_type: "text/plain".into()
+                    }]
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(session.journal().records().len(), count);
+        fork.close().await.unwrap();
         session.close().await.unwrap();
     }
 }

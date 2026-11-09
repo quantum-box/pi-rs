@@ -101,18 +101,20 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
     let name = request["type"].as_str().unwrap_or_default();
     match name {
         "prompt" | "steer" | "follow_up" => {
-            if request
+            let images: Vec<pi_rs::ImageContent> = request
                 .get("images")
-                .is_some_and(|value| value.as_array().is_none_or(|images| !images.is_empty()))
-            {
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default();
+            let message = request["message"].as_str().unwrap_or_default();
+            if message.is_empty() && images.is_empty() {
+                return Err(Error::Config("message or images are required".into()));
+            }
+            if busy(worker) && !images.is_empty() {
                 return Err(Error::Config(
-                    "image input is not supported by this model adapter".into(),
+                    "image inputs cannot currently be queued".into(),
                 ));
             }
-            let message = request["message"]
-                .as_str()
-                .filter(|text| !text.is_empty())
-                .ok_or_else(|| Error::Config("message must be a nonempty string".into()))?;
             if let Some(active) = worker.as_mut().filter(|worker| worker.busy) {
                 let kind = match name {
                     "steer" => "steer",
@@ -130,7 +132,11 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 active.send(json!({"type":kind,"content":message}))?;
                 Ok(Some(json!({"disposition":"queued"})))
             } else {
-                Worker::submit(worker, args, json!({"type":"prompt","content":message}))?;
+                Worker::submit(
+                    worker,
+                    args,
+                    json!({"type":"prompt","content":message,"images":images}),
+                )?;
                 Ok(Some(json!({"disposition":"started"})))
             }
         }

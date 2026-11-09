@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod attachments;
 mod backend;
 mod config;
 mod interactive;
@@ -41,6 +42,10 @@ struct Cli {
     model_explicit: bool,
     #[arg(skip)]
     thinking_explicit: bool,
+    #[arg(skip)]
+    initial_images: Vec<pi_rs::ImageContent>,
+    #[arg(skip)]
+    initial_prompt: Option<String>,
     #[arg(skip)]
     model_scope: Vec<model_selection::Choice>,
     #[arg(skip)]
@@ -479,10 +484,16 @@ async fn execute(mut args: Cli) -> Result<()> {
         args.session = interactive::latest_session(&args.session)?;
     }
     if args.mode == Some(OutputMode::Rpc) {
+        if args.prompt.iter().any(|argument| argument.starts_with('@')) {
+            return Err(Error::Config(
+                "RPC mode accepts images in prompt requests, not @file arguments".into(),
+            ));
+        }
         return rpc::run(args);
     }
     if args.command.is_none() {
-        let mut prompt = args.prompt.join(" ");
+        let (mut prompt, images) = attachments::expand(&args.prompt, &args.workspace)?;
+        args.initial_images = images;
         if !std::io::stdin().is_terminal() && !args.stdin_control {
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input)?;
@@ -490,10 +501,19 @@ async fn execute(mut args: Cli) -> Result<()> {
                 prompt = format!("{input}\n{prompt}");
             }
         }
-        if !prompt.trim().is_empty() {
-            args.command = Some(Command::Run { prompt });
-            if args.mode.is_none() {
-                args.mode = Some(OutputMode::Text);
+        if !prompt.trim().is_empty() || !args.initial_images.is_empty() {
+            if !args.print
+                && args.mode != Some(OutputMode::Json)
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
+            {
+                args.initial_prompt = Some(prompt);
+                args.command = Some(Command::Interactive);
+            } else {
+                args.command = Some(Command::Run { prompt });
+                if args.mode.is_none() {
+                    args.mode = Some(OutputMode::Text);
+                }
             }
         } else if args.print {
             return Err(Error::Config(
@@ -694,7 +714,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     if args.stdin_control {
         read_controls(sender, cancel.clone());
     }
-    let input = match command {
+    let mut input = match command {
         Command::Review {
             child,
             from_record,
@@ -780,10 +800,18 @@ async fn execute(mut args: Cli) -> Result<()> {
         Command::Resume => None,
         _ => unreachable!(),
     };
+    let run_id = args.run_id.unwrap_or_else(Uuid::new_v4);
+    if !args.initial_images.is_empty() {
+        if session.records().iter().any(|record| record.run_id == Some(run_id) || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)) {
+            return Err(Error::DuplicateRun(run_id));
+        }
+        session.append_user_with_images(input.take().unwrap_or_default(), args.initial_images.clone(), Some(run_id))?;
+        observer(Notification::Committed(session.records().last().expect("appended user input")));
+    }
     let answer = agent
         .run_correlated(
             &mut session,
-            args.run_id.unwrap_or_else(Uuid::new_v4),
+            run_id,
             input,
             &mut receiver,
             &cancel,
@@ -878,6 +906,9 @@ fn metadata(record: &pi_rs::Record) -> Value {
         }
         Event::Checkout { target } => json!({"event": "checkout", "target": target}),
         Event::Run { state, .. } => json!({"event": "run", "state": state}),
+        Event::UserWithImages {
+            input_id, images, ..
+        } => json!({"event":"user","input_id":input_id,"images":images.len()}),
         Event::User { input_id, .. } => json!({"event": "user", "input_id": input_id}),
         Event::InputQueued { input } => {
             json!({"event": "input_queued", "input_id": input.id, "kind": input.kind})

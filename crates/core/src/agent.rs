@@ -130,7 +130,7 @@ impl Agent<'_> {
     ) -> Result<String> {
         let branch = session.branch();
         let accepted = branch.iter().any(
-            |record| matches!(record.event, Event::User { input_id: Some(id), .. } if id == run_id),
+            |record| matches!(record.event, Event::User { input_id: Some(id), .. } | Event::UserWithImages { input_id: Some(id), .. } if id == run_id),
         );
         let pending_initial = if accepted {
             None
@@ -242,7 +242,7 @@ impl Agent<'_> {
             .iter()
             .rev()
             .find_map(|record| match &record.event {
-                Event::User { .. } => Some(None),
+                Event::User { .. } | Event::UserWithImages { .. } => Some(None),
                 Event::Assistant {
                     content,
                     invocations,
@@ -255,11 +255,12 @@ impl Agent<'_> {
             if !apply_inputs(session, true, observer)? {
                 return Ok(answer);
             }
-        } else if !session
-            .branch()
-            .iter()
-            .any(|record| matches!(record.event, Event::User { .. }))
-        {
+        } else if !session.branch().iter().any(|record| {
+            matches!(
+                record.event,
+                Event::User { .. } | Event::UserWithImages { .. }
+            )
+        }) {
             apply_inputs(session, true, observer)?;
         }
 
@@ -1303,7 +1304,13 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
     let retain = branch
         .iter()
         .rev()
-        .filter(|record| record.id >= floor && matches!(record.event, Event::User { .. }))
+        .filter(|record| {
+            record.id >= floor
+                && matches!(
+                    record.event,
+                    Event::User { .. } | Event::UserWithImages { .. }
+                )
+        })
         .take(keep_turns)
         .last()?
         .id;
@@ -1314,7 +1321,7 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
         .filter(|record| record.id >= floor && record.id < retain)
     {
         match record.event {
-            Event::User { .. } => start = record.id,
+            Event::User { .. } | Event::UserWithImages { .. } => start = record.id,
             Event::Assistant { .. } => break,
             _ => {}
         }
@@ -1417,7 +1424,10 @@ fn pending_reply(
                     .as_ref()
                     .map(|reply| (*request_id, metadata.clone(), usage.clone(), reply.clone()));
             }
-            Event::Assistant { .. } | Event::User { .. } | Event::ModelRequested { .. } => {
+            Event::Assistant { .. }
+            | Event::User { .. }
+            | Event::UserWithImages { .. }
+            | Event::ModelRequested { .. } => {
                 return None;
             }
             _ => {}
@@ -1481,7 +1491,7 @@ fn apply_inputs(
     let consumed: HashSet<_> = branch
         .iter()
         .filter_map(|record| match record.event {
-            Event::User { input_id, .. } => input_id,
+            Event::User { input_id, .. } | Event::UserWithImages { input_id, .. } => input_id,
             _ => None,
         })
         .collect();

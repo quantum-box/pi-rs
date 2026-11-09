@@ -39,6 +39,34 @@ impl CodingTools {
         tools.unrestricted = true;
         Ok(tools)
     }
+    /// Read a user-selected attachment using the same image limits as the read tool.
+    pub fn read_attachment(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        let tool = CodingTool {
+            root: self.root.clone(),
+            unrestricted: self.unrestricted,
+            kind: Kind::Read,
+        };
+        let name = path
+            .to_str()
+            .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
+        if let Some(image) = tool.read_image(&json!({"path":name}))? {
+            let blocks = image["content"].as_array().expect("image content");
+            let images = blocks
+                .iter()
+                .filter(|block| block["type"] == "image")
+                .cloned()
+                .map(serde_json::from_value)
+                .collect::<std::result::Result<_, _>>()?;
+            let hints = blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok((hints, images))
+        } else {
+            Ok((tool.text(&tool.path(name)?)?, Vec::new()))
+        }
+    }
 }
 
 impl Extension for CodingTools {

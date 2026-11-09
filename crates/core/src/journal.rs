@@ -85,6 +85,13 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_id: Option<Uuid>,
     },
+    /// Atomic image-bearing user input. Legacy UserImages entries remain readable.
+    UserWithImages {
+        content: String,
+        images: Vec<crate::ImageContent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_id: Option<Uuid>,
+    },
     /// Images associated with the preceding user message on this branch.
     UserImages {
         images: Vec<crate::ImageContent>,
@@ -432,6 +439,35 @@ impl Session {
         Ok(())
     }
 
+    pub fn append_user_with_images(
+        &mut self,
+        content: String,
+        images: Vec<crate::ImageContent>,
+        input_id: Option<Uuid>,
+    ) -> Result<()> {
+        ensure_settled(self.operations())?;
+        if content.trim().is_empty() && images.is_empty() {
+            return Err(Error::Config("empty user input".into()));
+        }
+        for image in &images {
+            image.validate()?;
+        }
+        let event = if images.is_empty() {
+            Event::User { content, input_id }
+        } else {
+            Event::UserWithImages {
+                content,
+                images,
+                input_id,
+            }
+        };
+        if serde_json::to_vec(&event)?.len() > 8 * 1024 * 1024 {
+            return Err(Error::Config("user input exceeds size limit".into()));
+        }
+        self.append(event)?;
+        Ok(())
+    }
+
     pub fn edit_context(
         &mut self,
         target: u64,
@@ -657,7 +693,10 @@ fn validate_context_edit(
     if !assistant
         && !matches!(
             record.event,
-            Event::User { .. } | Event::ToolFinished { .. } | Event::ToolReconciled { .. }
+            Event::User { .. }
+                | Event::UserWithImages { .. }
+                | Event::ToolFinished { .. }
+                | Event::ToolReconciled { .. }
         )
     {
         return Err(Error::Session(
@@ -927,6 +966,15 @@ pub(crate) fn conversation(
                 record.id,
                 Message::User {
                     content: content.clone(),
+                },
+            )),
+            Event::UserWithImages {
+                content, images, ..
+            } => messages.push((
+                record.id,
+                Message::UserWithImages {
+                    content: content.clone(),
+                    images: images.clone(),
                 },
             )),
             Event::UserImages { images } => {

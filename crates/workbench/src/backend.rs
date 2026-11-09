@@ -24,6 +24,8 @@ enum Request {
     },
     Prompt {
         content: Option<String>,
+        #[serde(default)]
+        images: Vec<pi_rs::ImageContent>,
     },
     Extension {
         extension_id: String,
@@ -82,7 +84,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
         let (request, scheduled) = tokio::select! {
             _ = stop_notify.notified() => break,
             request = requests.recv() => match request { Some(request) => (request, true), None => break },
-            input = queued.recv() => match input { Some(input) => (Request::Prompt { content: Some(input.content) }, false), None => break },
+            input = queued.recv() => match input { Some(input) => (Request::Prompt { content: Some(input.content), images: Vec::new() }, false), None => break },
         };
         if stopping.load(Ordering::SeqCst) {
             break;
@@ -125,8 +127,8 @@ pub async fn run(mut args: Cli) -> Result<()> {
             let agent = runtime.agent(&args);
             let mut observer = |event: pi_rs::Notification<'_>| observe(event, args.trace);
             match request {
-                Request::Prompt { content } => {
-                    let content = content
+                Request::Prompt { content, images } => {
+                    let mut content = content
                         .map(|input| {
                             runtime
                                 .resources
@@ -134,10 +136,15 @@ pub async fn run(mut args: Cli) -> Result<()> {
                                 .map(|expanded| expanded.unwrap_or(input))
                         })
                         .transpose()?;
+                    let run_id = Uuid::new_v4();
+                    if !images.is_empty() {
+                        session.append_user_with_images(content.take().unwrap_or_default(), images, Some(run_id))?;
+                        observer(pi_rs::Notification::Committed(session.records().last().expect("appended user input")));
+                    }
                     let answer = agent
                         .run_correlated(
                             &mut session,
-                            Uuid::new_v4(),
+                            run_id,
                             content,
                             &mut queued,
                             &cancel,

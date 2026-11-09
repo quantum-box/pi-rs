@@ -28,7 +28,9 @@ pub fn summary(path: &Path, session: &Session) -> SessionSummary {
     };
     for record in session.branch() {
         match &record.event {
-            Event::User { .. } | Event::Assistant { .. } => summary.messages += 1,
+            Event::User { .. } | Event::UserWithImages { .. } | Event::Assistant { .. } => {
+                summary.messages += 1
+            }
             Event::ModelFinished {
                 usage: pi_rs::UsageReport::Measured { usage },
                 ..
@@ -121,10 +123,12 @@ pub fn html(session: &Session) -> String {
     );
     for record in session.branch() {
         match &record.event {
-            Event::User { content, .. } => html.push_str(&format!(
-                "<article class=\"user\"><b>You</b><pre>{}</pre></article>",
-                escape(content)
-            )),
+            Event::User { content, .. } | Event::UserWithImages { content, .. } => {
+                html.push_str(&format!(
+                    "<article class=\"user\"><b>You</b><pre>{}</pre></article>",
+                    escape(content)
+                ))
+            }
             Event::Assistant {
                 content,
                 invocations,

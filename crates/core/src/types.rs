@@ -70,6 +70,24 @@ pub struct ImageContent {
     pub mime_type: String,
 }
 
+impl ImageContent {
+    pub fn validate(&self) -> Result<()> {
+        use base64::Engine;
+        if !matches!(
+            self.mime_type.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) || self.data.is_empty()
+            || self.data.len() > 8 * 1024 * 1024
+            || base64::engine::general_purpose::STANDARD
+                .decode(&self.data)
+                .is_err()
+        {
+            return Err(Error::Config("invalid or oversized image content".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Content-only edits preserve raw history and never dispatch tools.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]

@@ -156,9 +156,13 @@ impl View {
         self.tokens = 0;
         for record in session.branch() {
             match &record.event {
-                pi_rs::Event::User { content, .. } => {
+                pi_rs::Event::User { content, .. }
+                | pi_rs::Event::UserWithImages { content, .. } => {
                     self.history.push(content.clone());
                     self.lines.push(Entry::User(content.clone()));
+                    if let pi_rs::Event::UserWithImages { images, .. } = &record.event {
+                        self.append(&format!("{} attached image(s)", images.len()));
+                    }
                 }
                 pi_rs::Event::UserImages { images } => {
                     self.append(&format!("{} attached image(s)", images.len()));
@@ -687,7 +691,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 .branch()
                 .iter()
                 .filter_map(|record| match &record.event {
-                    pi_rs::Event::User { content, .. } => Some(Item {
+                    pi_rs::Event::User { content, .. }
+                    | pi_rs::Event::UserWithImages { content, .. } => Some(Item {
                         label: format!(
                             "{} {}",
                             record.id,
@@ -708,7 +713,11 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     .ok()
                     .or_else(|| {
                         session.branch().iter().rev().find_map(|record| {
-                            matches!(record.event, pi_rs::Event::User { .. }).then_some(record.id)
+                            matches!(
+                                record.event,
+                                pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. }
+                            )
+                            .then_some(record.id)
                         })
                     })
                     .ok_or_else(|| {
@@ -719,7 +728,9 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     .iter()
                     .find(|record| record.id == target)
                     .ok_or_else(|| Error::Config("invalid fork record".into()))?;
-                let pi_rs::Event::User { content, .. } = &record.event else {
+                let (pi_rs::Event::User { content, .. }
+                | pi_rs::Event::UserWithImages { content, .. }) = &record.event
+                else {
                     return Err(Error::Config("fork must select a user message".into()));
                 };
                 (record.parent.unwrap_or(1), Some(content.clone()))
@@ -830,7 +841,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                                     .branch()
                                     .iter()
                                     .find_map(|record| match &record.event {
-                                        pi_rs::Event::User { content, .. } => {
+                                        pi_rs::Event::User { content, .. }
+                                        | pi_rs::Event::UserWithImages { content, .. } => {
                                             Some(content.chars().take(70).collect())
                                         }
                                         _ => None,
@@ -959,6 +971,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 .map(|record| {
                     let description = match &record.event {
                         pi_rs::Event::User { content, .. }
+                        | pi_rs::Event::UserWithImages { content, .. }
                         | pi_rs::Event::Assistant { content, .. } => {
                             content.chars().take(70).collect::<String>()
                         }
@@ -1009,7 +1022,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     }
     args.allow_commands = true;
     for name in ["notes", "todo"] {
-        if !args.extensions.iter().any(|extension| extension == name) {
+        if !args.no_extensions && !args.extensions.iter().any(|extension| extension == name) {
             args.extensions.push(name.into());
         }
     }
@@ -1055,11 +1068,28 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     let mut keys = Keys::load()?;
     let _terminal = Terminal::enter(args.tui_mode)?;
     let mut worker: Option<Worker> = None;
+    let mut initial = args
+        .initial_prompt
+        .take()
+        .map(|prompt| (prompt, std::mem::take(&mut args.initial_images)));
     let mut dirty = true;
     let mut last_frame = Instant::now();
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     loop {
+        if !args.trust_pending
+            && view.picker.is_none()
+            && let Some((prompt, images)) = initial.take()
+        {
+            view.lines.push(Entry::User(prompt.clone()));
+            view.history.push(prompt.clone());
+            start_request(
+                &args,
+                json!({"type":"prompt","content":prompt,"images":images}),
+                &mut worker,
+            )?;
+        }
+
         if last_theme_check.elapsed() >= Duration::from_millis(500) {
             match theme_watcher.poll(&mut theme) {
                 Ok(changed) => dirty |= changed,
@@ -1565,7 +1595,8 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
             let mut session = Session::open(&args.session)?;
             let record = &session.records()[id as usize - 1];
             let (target, input) = match &record.event {
-                pi_rs::Event::User { content, .. } => {
+                pi_rs::Event::User { content, .. }
+                | pi_rs::Event::UserWithImages { content, .. } => {
                     (record.parent.unwrap_or(1), Some(content.clone()))
                 }
                 _ => (id, None),

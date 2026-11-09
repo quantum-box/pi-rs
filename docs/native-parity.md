@@ -346,3 +346,18 @@ Native entry points are `context-edit <id> <text>`, `context-edit <id> --delete`
 `/context-edit`, `/context-delete` and the RPC `edit_context` request with a
 `target` record ID and `replacement`. Pi `context_edit` entries use the same
 projection when imported, including text and image replacements.
+
+### Multimodal input checkpoint
+
+The CLI accepts `@file` arguments for text and supported images, using the same
+image decoding and size limits as the local read tool. File text precedes the
+prompt, and image bytes remain separate image content. Initial prompts passed
+from a terminal now run inside the TUI and leave it available for further
+conversation. Print and JSON modes remain one-shot.
+
+The owned SDK exposes `prompt_with_images`. Idle RPC `prompt` requests accept
+image blocks, including image-only input. Image-bearing input is committed as
+one journal entry, restored across sessions and preserved in forks. Invalid
+image encodings and oversized input are rejected before that entry is written.
+Queued image input remains pending parity work, as does inline terminal image
+rendering. CLI, RPC and a real terminal fixture verify the new input paths.
