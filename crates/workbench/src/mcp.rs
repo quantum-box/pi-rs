@@ -176,12 +176,7 @@ impl McpExtension {
         }
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         for definition in definitions {
-            if config
-                .tool_exposure
-                .get(definition.name.as_ref())
-                .or(config.exposure.as_ref())
-                .is_some_and(|value| value == "hidden" || value == "off")
-            {
+            if !tool_enabled(config, &definition.name) {
                 continue;
             }
             let normalized = normalize(&definition.name);
@@ -216,14 +211,57 @@ impl McpExtension {
                     json!({"type":"object","properties":{},"additionalProperties":false}),
                 ),
                 (
+                    "list_resource_templates",
+                    "List parameterized resource URI templates from this MCP server",
+                    json!({"type":"object","properties":{},"additionalProperties":false}),
+                ),
+                (
                     "read_resource",
                     "Read a resource URI from this MCP server",
                     json!({"type":"object","properties":{"uri":{"type":"string"}},"required":["uri"],"additionalProperties":false}),
                 ),
             ] {
+                if !tool_enabled(config, name) {
+                    continue;
+                }
                 let mut exposed = format!("{prefix}{name}");
                 while tools.iter().any(|tool| tool.spec().name == exposed) {
                     exposed.push_str("_resource");
+                }
+                tools.push(Arc::new(McpTool {
+                    connection: connection.clone(),
+                    remote_name: name.into(),
+                    spec: ToolSpec {
+                        name: exposed,
+                        description: description.into(),
+                        parameters,
+                    },
+                    resource: true,
+                }));
+            }
+        }
+        if info
+            .as_ref()
+            .is_some_and(|info| info.capabilities.prompts.is_some())
+        {
+            for (name, description, parameters) in [
+                (
+                    "list_prompts",
+                    "List prompts provided by this MCP server",
+                    json!({"type":"object","properties":{},"additionalProperties":false}),
+                ),
+                (
+                    "get_prompt",
+                    "Expand a named MCP prompt with string arguments",
+                    json!({"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object","additionalProperties":{"type":"string"}}},"required":["name"],"additionalProperties":false}),
+                ),
+            ] {
+                if !tool_enabled(config, name) {
+                    continue;
+                }
+                let mut exposed = format!("{prefix}{name}");
+                while tools.iter().any(|tool| tool.spec().name == exposed) {
+                    exposed.push_str("_prompt");
                 }
                 tools.push(Arc::new(McpTool {
                     connection: connection.clone(),
@@ -297,32 +335,41 @@ struct McpTool {
     spec: ToolSpec,
     resource: bool,
 }
-#[async_trait::async_trait]
-impl Tool for McpTool {
-    fn spec(&self) -> ToolSpec {
-        self.spec.clone()
-    }
-    async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome {
-        let call = async {
-            if self.resource {
-                if self.remote_name == "list_resources" {
-                    let resources = self
-                        .connection
-                        .service
-                        .lock()
-                        .await
-                        .list_all_resources()
-                        .await
-                        .map_err(|error| Error::Config(error.to_string()))?;
-                    return Ok(json!({"resources":resources}));
-                }
-                let params = serde_json::from_value(json!({"uri":arguments["uri"]}))?;
-                let result = self
-                    .connection
-                    .service
-                    .lock()
+impl McpTool {
+    async fn invoke_resource(&self, arguments: Value) -> Result<Value> {
+        let service = self.connection.service.lock().await;
+        match self.remote_name.as_str() {
+            "list_resources" => {
+                let resources = service
+                    .list_all_resources()
                     .await
-                    .read_resource_once(params)
+                    .map_err(|error| Error::Config(error.to_string()))?;
+                Ok(json!({"resources":resources}))
+            }
+            "list_resource_templates" => {
+                let templates = service
+                    .list_all_resource_templates()
+                    .await
+                    .map_err(|error| Error::Config(error.to_string()))?;
+                Ok(json!({"resourceTemplates":templates}))
+            }
+            "list_prompts" => {
+                let prompts = service
+                    .list_all_prompts()
+                    .await
+                    .map_err(|error| Error::Config(error.to_string()))?;
+                Ok(json!({"prompts":prompts}))
+            }
+            "get_prompt" => {
+                let prompt = service
+                    .get_prompt(serde_json::from_value(arguments)?)
+                    .await
+                    .map_err(|error| Error::Config(error.to_string()))?;
+                Ok(serde_json::to_value(prompt)?)
+            }
+            "read_resource" => {
+                let result = service
+                    .read_resource_once(serde_json::from_value(json!({"uri":arguments["uri"]}))?)
                     .await
                     .map_err(|error| Error::Config(error.to_string()))?;
                 match result {
@@ -333,6 +380,28 @@ impl Tool for McpTool {
                         "MCP resource requires additional client input".into(),
                     )),
                 }
+            }
+            _ => Err(Error::Config("unknown MCP resource operation".into())),
+        }
+    }
+}
+fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
+    !config
+        .tool_exposure
+        .get(name)
+        .or(config.exposure.as_ref())
+        .is_some_and(|value| value == "hidden" || value == "off")
+}
+
+#[async_trait::async_trait]
+impl Tool for McpTool {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+    async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome {
+        let call = async {
+            if self.resource {
+                self.invoke_resource(arguments).await
             } else {
                 let params = serde_json::from_value(
                     json!({"name":self.remote_name,"arguments":arguments,"_meta":{"operationId":context.operation_id.to_string()}}),
@@ -472,6 +541,16 @@ pub async fn resolve_value(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resource_and_prompt_exposure_respects_server_and_tool_overrides() {
+        let config: ServerConfig = serde_json::from_value(
+            json!({"command":"server","exposure":"hidden","toolExposure":{"get_prompt":"direct"}}),
+        )
+        .unwrap();
+        assert!(!tool_enabled(&config, "list_resources"));
+        assert!(!tool_enabled(&config, "list_prompts"));
+        assert!(tool_enabled(&config, "get_prompt"));
+    }
     #[test]
     fn normalizes_mcp_names_and_preserves_configuration_defaults() {
         assert_eq!(normalize("docs-search/read.file"), "docs_search_read_file");
