@@ -760,6 +760,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     session.select_model(&args.model, args.thinking.as_deref())?;
     let runtime = runtime::configure(&args).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
+    session.set_retry_control(runtime.retry.clone());
     let result = async {
         if let Command::Run { prompt } = &mut command
             && let Some(expanded) = runtime.resources.expand(prompt)?
@@ -789,6 +790,7 @@ async fn execute(mut args: Cli) -> Result<()> {
         } => {
             let mut child = Session::open(child)?;
             child.set_auto_compaction_control(runtime.auto_compaction.clone());
+            child.set_retry_control(runtime.retry.clone());
             let review = pi_rs_review::Review {
                 task: &task,
                 from_record,
@@ -903,6 +905,7 @@ fn observe(event: Notification<'_>, trace: bool) {
         eprintln!("Response reached the output token limit.");
     }
     match event {
+        Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
         Notification::Committed(record) if trace => {
             output(json!({"type": "record", "record": record}))
         }

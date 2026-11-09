@@ -87,6 +87,47 @@ impl Settings {
     pub fn value(&self) -> &Value {
         &self.value
     }
+    pub fn retry_settings(&self) -> pi_rs::RetrySettings {
+        let value = &self.value["retry"];
+        let defaults = pi_rs::RetrySettings::pi_defaults();
+        let number = |key: &str, default| {
+            value[key]
+                .as_u64()
+                .or_else(|| value[key].as_f64().map(|v| v as u64))
+                .unwrap_or(default)
+        };
+        pi_rs::RetrySettings {
+            enabled: value["enabled"].as_bool().unwrap_or(defaults.enabled),
+            max_retries: number("maxRetries", u64::from(defaults.max_retries))
+                .min(u64::from(u32::MAX)) as u32,
+            base_delay_ms: number("baseDelayMs", defaults.base_delay_ms),
+            max_agent_delay_ms: number("maxAgentDelayMs", defaults.max_agent_delay_ms),
+        }
+    }
+    pub fn set_auto_retry_enabled(&mut self, enabled: bool) -> Result<()> {
+        let path = agent_dir().join("settings.json");
+        let update = |settings: &mut Map<String, Value>| -> Result<()> {
+            settings
+                .entry("retry")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or_else(|| Error::Config("retry must be an object".into()))?
+                .insert("enabled".into(), Value::Bool(enabled));
+            Ok(())
+        };
+        update_object(&path, |settings| {
+            update(settings)?;
+            validate_settings(&Value::Object(settings.clone()), &path)
+        })?;
+        if !self.value.is_object() {
+            self.value = serde_json::json!({});
+        }
+        update(self.value.as_object_mut().expect("settings object"))?;
+        if let Some((_, layer)) = self.resource_layers.first_mut() {
+            update(layer.as_object_mut().expect("settings layer"))?;
+        }
+        Ok(())
+    }
     pub fn auto_compaction_enabled(&self) -> bool {
         self.value["compaction"]["enabled"]
             .as_bool()

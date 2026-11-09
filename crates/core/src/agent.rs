@@ -116,6 +116,7 @@ pub struct Agent<'a> {
 }
 
 pub enum Notification<'a> {
+    Retry(crate::RetryEvent),
     Committed(&'a Record),
     /// Final logical context after extensions, before provider encoding. May contain sensitive data.
     Request(&'a ModelRequest),
@@ -226,6 +227,17 @@ impl Agent<'_> {
             },
             observer,
         )?;
+        let mut retry_attempt = 0;
+        let mut retry_observer = |event: Notification<'_>| {
+            match &event {
+                Notification::Retry(crate::RetryEvent::Start { attempt, .. }) => {
+                    retry_attempt = *attempt
+                }
+                Notification::Retry(crate::RetryEvent::End { .. }) => retry_attempt = 0,
+                _ => {}
+            }
+            observer(event);
+        };
         let mut result = self
             .drive(
                 session,
@@ -233,9 +245,22 @@ impl Agent<'_> {
                 effective_input,
                 followups,
                 cancel,
-                observer,
+                &mut retry_observer,
             )
             .await;
+        if retry_attempt > 0 {
+            observer(Notification::Retry(crate::RetryEvent::End {
+                success: result.is_ok(),
+                attempt: retry_attempt,
+                final_error: result.as_ref().err().map(|error| {
+                    if matches!(error, Error::Cancelled) {
+                        "Retry cancelled".into()
+                    } else {
+                        error.to_string()
+                    }
+                }),
+            }));
+        }
         if let Err(error) = queue_inputs(session, followups, observer)
             && result.is_ok()
         {
@@ -340,128 +365,173 @@ impl Agent<'_> {
 
         let mut budget = self.limits.output_tokens_per_run;
         let mut compacted = false;
+        let mut retry_attempt = 0;
         for request_index in 0..self.limits.model_requests {
             queue_inputs(session, followups, observer)?;
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let (reply, advertised, allowance) =
-                if let Some((request, metadata, usage, recorded)) = pending.take() {
-                    self.settle_usage(request, &usage, &metadata).await?;
-                    let allowance = recorded
-                        .max_output_tokens
-                        .min(self.limits.output_tokens_per_request)
-                        .min(budget);
-                    let measured = match usage {
-                        UsageReport::Measured { usage } => Some(usage),
-                        UsageReport::Estimated { output_tokens }
-                            if output_tokens <= u64::from(allowance) =>
-                        {
-                            None
-                        }
-                        _ => return Err(Error::Budget),
-                    };
-                    (
-                        Reply {
-                            request_id: request,
-                            content: recorded.content,
-                            invocations: recorded.invocations,
-                            usage: measured,
-                        },
-                        recorded.advertised_tools.into_iter().collect(),
-                        allowance,
-                    )
-                } else {
-                    apply_inputs(session, false, observer)?;
-                    let max_output_tokens = self.limits.output_tokens_per_request.min(budget);
-                    if max_output_tokens == 0 {
-                        return Err(Error::Budget);
+            let (reply, advertised, allowance) = if let Some((request, metadata, usage, recorded)) =
+                pending.take()
+            {
+                self.settle_usage(request, &usage, &metadata).await?;
+                let allowance = recorded
+                    .max_output_tokens
+                    .min(self.limits.output_tokens_per_request)
+                    .min(budget);
+                let measured = match usage {
+                    UsageReport::Measured { usage } => Some(usage),
+                    UsageReport::Estimated { output_tokens }
+                        if output_tokens <= u64::from(allowance) =>
+                    {
+                        None
                     }
-                    let mut request = self
-                        .request(
+                    _ => return Err(Error::Budget),
+                };
+                (
+                    Reply {
+                        request_id: request,
+                        content: recorded.content,
+                        invocations: recorded.invocations,
+                        usage: measured,
+                    },
+                    recorded.advertised_tools.into_iter().collect(),
+                    allowance,
+                )
+            } else {
+                apply_inputs(session, false, observer)?;
+                let max_output_tokens = self.limits.output_tokens_per_request.min(budget);
+                if max_output_tokens == 0 {
+                    return Err(Error::Budget);
+                }
+                let mut request = self
+                    .request(
+                        session,
+                        &states,
+                        max_output_tokens,
+                        None,
+                        RequestPurpose::Turn,
+                        cancel,
+                    )
+                    .await?;
+                // A context extension can lower the budget but cannot increase the host's limit.
+                request.max_output_tokens = request.max_output_tokens.min(max_output_tokens);
+                if request.max_output_tokens == 0 {
+                    return Err(Error::Budget);
+                }
+                let capacity = self.context_capacity(&request, cancel).await?;
+                let estimate = session.context_usage_estimate();
+                let input_tokens = if estimate.last_usage_record.is_some() {
+                    estimate.tokens
+                } else {
+                    crate::estimate_request_tokens(&request)
+                };
+                let exceeds = capacity.is_some_and(|window| {
+                    input_tokens.saturating_add(u64::from(request.max_output_tokens))
+                        > u64::from(window)
+                });
+                let control = session.auto_compaction_control();
+                let tokens = control.token_settings();
+                let retention = configured_retention(session, tokens.keep_recent_tokens, 1)?;
+                let reserve_reached =
+                    capacity
+                        .zip(tokens.reserve_tokens)
+                        .is_some_and(|(window, reserve)| {
+                            input_tokens > u64::from(window).saturating_sub(reserve)
+                        });
+                let has_prefix = reserve_reached && {
+                    // Metadata alone does not provide anything to summarize.
+                    has_summary_prefix(session, retention.boundary)
+                };
+                if exceeds
+                    || (control.enabled()
+                        && !compacted
+                        && budget > 1
+                        && request_index + 1 < self.limits.model_requests
+                        && reserve_reached
+                        && has_prefix)
+                {
+                    if !control.enabled() {
+                        return Err(Error::Model(
+                            "context does not fit and automatic compaction is disabled".into(),
+                        ));
+                    }
+                    if compacted || request_index + 1 >= self.limits.model_requests {
+                        return Err(Error::Model(
+                            "context does not fit after the bounded compaction attempt".into(),
+                        ));
+                    }
+                    let summary_limit = max_output_tokens.min(512).min(budget / 2);
+                    let spent = self
+                        .summarize_prefix(
                             session,
                             &states,
-                            max_output_tokens,
-                            None,
-                            RequestPurpose::Turn,
-                            cancel,
+                            SummaryScope {
+                                retention,
+                                instructions: None,
+                                output_limit: summary_limit,
+                                cancellation: cancel,
+                            },
+                            observer,
+                            Some(followups),
                         )
                         .await?;
-                    // A context extension can lower the budget but cannot increase the host's limit.
-                    request.max_output_tokens = request.max_output_tokens.min(max_output_tokens);
-                    if request.max_output_tokens == 0 {
-                        return Err(Error::Budget);
-                    }
-                    let capacity = self.context_capacity(&request, cancel).await?;
-                    let estimate = session.context_usage_estimate();
-                    let input_tokens = if estimate.last_usage_record.is_some() {
-                        estimate.tokens
-                    } else {
-                        crate::estimate_request_tokens(&request)
-                    };
-                    let exceeds = capacity.is_some_and(|window| {
-                        input_tokens.saturating_add(u64::from(request.max_output_tokens))
-                            > u64::from(window)
-                    });
-                    let control = session.auto_compaction_control();
-                    let tokens = control.token_settings();
-                    let retention = configured_retention(session, tokens.keep_recent_tokens, 1)?;
-                    let reserve_reached =
-                        capacity
-                            .zip(tokens.reserve_tokens)
-                            .is_some_and(|(window, reserve)| {
-                                input_tokens > u64::from(window).saturating_sub(reserve)
-                            });
-                    let has_prefix = reserve_reached && {
-                        // Metadata alone does not provide anything to summarize.
-                        has_summary_prefix(session, retention.boundary)
-                    };
-                    if exceeds
-                        || (control.enabled()
-                            && !compacted
-                            && budget > 1
-                            && request_index + 1 < self.limits.model_requests
-                            && reserve_reached
-                            && has_prefix)
-                    {
-                        if !control.enabled() {
-                            return Err(Error::Model(
-                                "context does not fit and automatic compaction is disabled".into(),
-                            ));
+                    budget -= spent;
+                    states = session.extension_states();
+                    compacted = true;
+                    continue;
+                }
+                let advertised: HashSet<_> =
+                    request.tools.iter().map(|spec| spec.name.clone()).collect();
+                let allowance = request.max_output_tokens;
+                let result = self
+                    .reply(session, request, true, cancel, observer, Some(followups))
+                    .await?
+                    .outcome;
+                let control = session.retry_control();
+                let settings = control.settings();
+                if let Err(Error::RetryableModel(message)) = &result
+                    && settings.enabled
+                    && retry_attempt < settings.max_retries
+                    && request_index + 1 < self.limits.model_requests
+                {
+                    retry_attempt += 1;
+                    let delay_ms = settings.delay_ms(retry_attempt);
+                    let retry_wait = control.begin_wait();
+                    observer(Notification::Retry(crate::RetryEvent::Start {
+                        attempt: retry_attempt,
+                        max_attempts: settings.max_retries,
+                        delay_ms,
+                        error_message: message.clone(),
+                    }));
+                    let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                    tokio::pin!(sleep);
+                    let waited = loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break Err(Error::Cancelled),
+                            _ = retry_wait.cancel.cancelled() => break Err(Error::Cancelled),
+                            _ = &mut sleep => break Ok(()),
+                            Some(input) = followups.recv() => {
+                                if let Err(error) = queue_input(session, input.into(), observer) { break Err(error); }
+                            }
                         }
-                        if compacted || request_index + 1 >= self.limits.model_requests {
-                            return Err(Error::Model(
-                                "context does not fit after the bounded compaction attempt".into(),
-                            ));
-                        }
-                        let summary_limit = max_output_tokens.min(512).min(budget / 2);
-                        let spent = self
-                            .summarize_prefix(
-                                session,
-                                &states,
-                                SummaryScope {
-                                    retention,
-                                    instructions: None,
-                                    output_limit: summary_limit,
-                                    cancellation: cancel,
-                                },
-                                observer,
-                                Some(followups),
-                            )
-                            .await?;
-                        budget -= spent;
-                        states = session.extension_states();
-                        compacted = true;
-                        continue;
-                    }
-                    let advertised: HashSet<_> =
-                        request.tools.iter().map(|spec| spec.name.clone()).collect();
-                    let allowance = request.max_output_tokens;
-                    let reply = self
-                        .reply(session, request, true, cancel, observer, Some(followups))
-                        .await?;
-                    (reply, advertised, allowance)
-                };
+                    };
+                    drop(retry_wait);
+                    waited?;
+                    continue;
+                }
+                let reply = result?;
+                if retry_attempt > 0 {
+                    observer(Notification::Retry(crate::RetryEvent::End {
+                        success: true,
+                        attempt: retry_attempt,
+                        final_error: None,
+                    }));
+                    retry_attempt = 0;
+                }
+                (reply, advertised, allowance)
+            };
             let finished = reply.invocations.is_empty();
             let answer = finished.then(|| reply.content.clone());
             let invocations = reply.invocations.clone();
@@ -624,7 +694,7 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
-    ) -> Result<Reply> {
+    ) -> Result<ReplyAttempt> {
         let request_id = Uuid::new_v4();
         let allowance = request.max_output_tokens;
         let advertised_tools =
@@ -753,7 +823,7 @@ impl Agent<'_> {
             observer,
         )?;
         self.settle_usage(request_id, &usage, &metadata).await?;
-        result
+        Ok(ReplyAttempt { outcome: result })
     }
 
     async fn settle_usage(
@@ -1544,7 +1614,8 @@ impl Agent<'_> {
         let allowance = request.max_output_tokens;
         let reply = self
             .reply(session, request, false, cancel, observer, inputs)
-            .await?;
+            .await?
+            .outcome?;
         if !reply.invocations.is_empty() {
             return Err(Error::Model(
                 "summary response attempted a tool call".into(),
@@ -1957,6 +2028,11 @@ enum Preparation<'a> {
         guard: tokio_util::sync::DropGuard,
     },
     Skipped(String),
+}
+
+// Journal and accounting failures stay outside the retryable provider outcome.
+struct ReplyAttempt {
+    outcome: Result<Reply>,
 }
 
 struct Reply {

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 pub struct Runtime {
     pub auto_compaction: pi_rs::AutoCompactionControl,
+    pub retry: pi_rs::RetryControl,
     provider: Ollama,
     pub registry: Registry,
     system_prompt: String,
@@ -240,6 +241,7 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             });
 
         Ok(Runtime {
+            retry: pi_rs::RetryControl::new(args.settings.retry_settings()),
             auto_compaction: pi_rs::AutoCompactionControl::new(
                 args.settings.auto_compaction_enabled(),
             ),

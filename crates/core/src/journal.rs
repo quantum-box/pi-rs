@@ -235,6 +235,7 @@ impl SessionStore for MemoryStore {
 
 pub struct Session {
     auto_compaction: crate::AutoCompactionControl,
+    retry: crate::RetryControl,
     store: Box<dyn SessionStore>,
     records: Vec<Record>,
     head: u64,
@@ -243,6 +244,13 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn retry_control(&self) -> crate::RetryControl {
+        self.retry.clone()
+    }
+    pub fn set_retry_control(&mut self, control: crate::RetryControl) {
+        self.retry = control;
+    }
+
     /// Clone this control to change automatic compaction during an active run.
     pub fn auto_compaction_control(&self) -> crate::AutoCompactionControl {
         self.auto_compaction.clone()
@@ -268,6 +276,7 @@ impl Session {
         let head = validated_head(&records)?;
         let mut session = Self {
             auto_compaction: crate::AutoCompactionControl::default(),
+            retry: crate::RetryControl::default(),
             store: Box::new(store),
             records,
             head,

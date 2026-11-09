@@ -37,7 +37,7 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `get_available_thinking_levels`, `switch_session`, `fork`, `clone`,
 `get_fork_messages`, `get_entries`, `get_tree`, `get_last_assistant_text`,
 `edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
-`set_follow_up_mode`, `set_auto_compaction`, and `shutdown`. Responses carry the request ID and a
+`set_follow_up_mode`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance is separate from completion; wait for
 `agent_settled`. The interface emits native journal events plus text updates.
 Additional Pi RPC commands and complete event-schema parity remain in progress.
@@ -1387,3 +1387,31 @@ A five-call CLI tool round trip matched the pinned Pi read tool for the same
 mention, file URL, screenshot-spacing, apostrophe and NFD inputs. Workspace
 tests and all-target Clippy passed. Windows path conversion is unit-tested; interactive Windows acceptance remains
 open alongside the other platform-specific checks.
+
+### Agent-level retry checkpoint
+
+The local workbench now uses Pi's agent retry defaults for retryable model
+failures: three retries, 2-second exponential backoff and a 60-second delay cap.
+`retry.enabled`, `maxRetries`, `baseDelayMs` and `maxAgentDelayMs` are validated
+settings. Low-level hosts retain opt-in retry behavior through `RetryControl`;
+SDK controls can configure retries or abort the active retry wait, and forks
+receive independent copies of the settings.
+
+Each attempt stays within the existing model-request bound. Failed partial
+responses remain in diagnostic history and are omitted from the next request.
+Usage settlement failures remain outside the retryable provider outcome, for
+both completed and failed responses.
+Inputs received during backoff remain queued. Retry waits are cancellable and
+their control state is cleared when the waiting future is dropped.
+
+RPC supports `set_auto_retry` and `abort_retry`, with `auto_retry_start` and
+`auto_retry_end` events. The terminal displays the retry wait, attempt count and
+error. Provider-internal retries and Retry-After handling, summary-specific retry
+policy and a settings-editor toggle remain open.
+
+Tests cover recovery, request and retry caps, queued input, wait cancellation,
+dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify
+503 recovery, exponential delays, aborting backoff and preserving settings when
+disabling retry. A PTY check verifies the retry phase and attempt display,
+recovered output and terminal restoration. The complete workspace test suite
+and all-target Clippy also pass.

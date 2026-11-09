@@ -47,6 +47,11 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     loop {
         if let Some(active) = &mut worker {
             for event in active.events.try_iter() {
+                match event["type"].as_str() {
+                    Some("auto_retry_start") => active.retrying = true,
+                    Some("auto_retry_end" | "agent_settled" | "request") => active.retrying = false,
+                    _ => {}
+                }
                 forward_event(
                     event,
                     &mut active.busy,
@@ -153,6 +158,24 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     }
                 }
                 Ok::<_, Error>(())
+            })();
+            if let Err(error) = result {
+                response(&request, Err(error))?;
+            }
+            continue;
+        }
+        if request["type"] == "set_auto_retry" || request["type"] == "abort_retry" {
+            let result = (|| {
+                let mut control = request.clone();
+                if request["type"] == "set_auto_retry" {
+                    let enabled = request["enabled"]
+                        .as_bool()
+                        .ok_or_else(|| Error::Config("enabled must be a boolean".into()))?;
+                    args.settings.set_auto_retry_enabled(enabled)?;
+                    control =
+                        json!({"type":"set_auto_retry","enabled":enabled,"id":request.get("id")});
+                }
+                Worker::control(&mut worker, &args, control)
             })();
             if let Err(error) = result {
                 response(&request, Err(error))?;
@@ -301,7 +324,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         }
         "abort" | "abort_bash" => Ok(None),
         "get_state" => {
-            let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing && !worker.compacting),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+            let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
             state["autoCompactionEnabled"] = json!(args.settings.auto_compaction_enabled());
             state["steeringMode"] = json!(
                 worker

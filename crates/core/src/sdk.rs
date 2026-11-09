@@ -19,6 +19,7 @@ pub enum SessionEvent {
     Record(Arc<Record>),
     Request(Arc<ModelRequest>),
     Text(String),
+    Retry(crate::RetryEvent),
     RunEnded { run_id: Uuid, succeeded: bool },
 }
 
@@ -27,8 +28,23 @@ pub struct SessionControl {
     input: mpsc::Sender<crate::AgentInput>,
     active: Arc<Mutex<Option<CancellationToken>>>,
     auto_compaction: crate::AutoCompactionControl,
+    retry: crate::RetryControl,
 }
 impl SessionControl {
+    pub fn set_retry_settings(&self, settings: crate::RetrySettings) -> Result<()> {
+        if self.input.is_closed() {
+            return Err(Error::Config("session is closed".into()));
+        }
+        self.retry.configure(settings);
+        Ok(())
+    }
+    pub fn abort_retry(&self) -> Result<()> {
+        if self.input.is_closed() {
+            return Err(Error::Config("session is closed".into()));
+        }
+        self.retry.abort();
+        Ok(())
+    }
     pub fn set_auto_compaction_enabled(&self, enabled: bool) -> Result<()> {
         if self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
@@ -198,6 +214,7 @@ impl SessionBuilder {
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let auto_compaction = session.auto_compaction_control();
+        let retry = session.retry_control();
         Ok(AgentSession {
             model: self.model,
             model_name: self.model_name,
@@ -211,6 +228,7 @@ impl SessionBuilder {
                 input: sender,
                 active: Arc::new(Mutex::new(None)),
                 auto_compaction,
+                retry,
             },
             closed: false,
         })
@@ -366,6 +384,9 @@ impl AgentSession {
         self.session.export_jsonl(destination)
     }
     fn fork_session(&self, session: Session) -> Result<Self> {
+        session
+            .retry_control()
+            .configure(self.session.retry_control().settings());
         let model_name = session
             .model_selection()
             .map(|selection| selection.0)
@@ -656,6 +677,7 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         Notification::Committed(record) => SessionEvent::Record(Arc::new((*record).clone())),
         Notification::Request(request) => SessionEvent::Request(Arc::new((*request).clone())),
         Notification::Text(text) => SessionEvent::Text((*text).into()),
+        Notification::Retry(event) => SessionEvent::Retry(event.clone()),
     };
     let _ = events.send(event);
 }

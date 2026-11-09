@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 pub(super) struct Worker {
     pub(super) compacting: bool,
+    pub(super) retrying: bool,
     pub(super) bashing: bool,
     pub(super) steering_mode: pi_rs::QueueMode,
     pub(super) follow_up_mode: pi_rs::QueueMode,
@@ -157,6 +158,7 @@ impl Worker {
         let persistent = operation.first() == Some(&"serve");
         Ok(Self {
             compacting: operation.first() == Some(&"compact"),
+            retrying: false,
             bashing: false,
             steering_mode,
             follow_up_mode,

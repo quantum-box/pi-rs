@@ -590,6 +590,11 @@ impl View {
                 };
                 self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome);
             }
+            Some("auto_retry_start") => {
+                self.phase = Some("再試行待ち");
+                self.append(&format!("Retry {}/{} · {} ms · {}", value["attempt"], value["maxAttempts"], value["delayMs"], value["errorMessage"].as_str().unwrap_or_default()));
+            }
+            Some("auto_retry_end") => { self.phase = None; }
             Some("model_progress") => {
                 self.phase = Some(match value["stage"].as_str() {
                     Some("loading_model") => "モデル読込待ち",

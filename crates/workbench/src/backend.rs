@@ -86,6 +86,13 @@ enum Request {
         enabled: bool,
         id: Option<serde_json::Value>,
     },
+    SetAutoRetry {
+        enabled: bool,
+        id: Option<serde_json::Value>,
+    },
+    AbortRetry {
+        id: Option<serde_json::Value>,
+    },
     Cancel,
     Shutdown,
 }
@@ -112,6 +119,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
         stopping.clone(),
         ui,
         runtime.auto_compaction.clone(),
+        runtime.retry.clone(),
     );
     let signal_active = active.clone();
     let signal_stopping = stopping.clone();
@@ -202,6 +210,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
             }
             let mut session = Session::open(&args.session)?;
             session.set_auto_compaction_control(runtime.auto_compaction.clone());
+            session.set_retry_control(runtime.retry.clone());
             if session.host_binding().is_some() {
                 return Err(Error::Session(
                     "a managed session must be opened by its host".into(),
@@ -319,6 +328,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
                 Request::Review { child, from_record, resume, task } => {
                     let mut child = Session::open(child)?;
                     child.set_auto_compaction_control(runtime.auto_compaction.clone());
+            child.set_retry_control(runtime.retry.clone());
                     let review = pi_rs_review::Review {
                         task: &task, from_record, resume, timeout: std::time::Duration::from_secs(args.model_timeout_secs),
                         output_budget: args.output_budget,
@@ -371,6 +381,7 @@ fn read_requests(
     stopping: Arc<AtomicBool>,
     ui: Arc<super::extension_ui::Broker>,
     auto_compaction: pi_rs::AutoCompactionControl,
+    retry: pi_rs::RetryControl,
 ) {
     let runtime = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
@@ -387,6 +398,14 @@ fn read_requests(
             };
             let steering = matches!(&request, Request::Steer { .. });
             match request {
+                Request::SetAutoRetry { enabled, id } => {
+                    retry.set_enabled(enabled);
+                    control_response("set_auto_retry", id, Ok(serde_json::Value::Null));
+                }
+                Request::AbortRetry { id } => {
+                    retry.abort();
+                    control_response("abort_retry", id, Ok(serde_json::Value::Null));
+                }
                 Request::SetAutoCompaction { enabled, id } => {
                     auto_compaction.set_enabled(enabled);
                     control_response("set_auto_compaction", id, Ok(serde_json::Value::Null));

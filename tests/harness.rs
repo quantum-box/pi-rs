@@ -1518,3 +1518,249 @@ async fn interrupted_compaction_preserves_prior_branch_and_pending_context() {
     assert!(context.contains("retain the prior task"));
     assert!(!context.contains("partial summary"));
 }
+
+struct RetryScript {
+    requests: Mutex<Vec<ModelRequest>>,
+    failures: usize,
+    settlement_failure: bool,
+}
+#[async_trait::async_trait]
+impl Model for RetryScript {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        let mut requests = self.requests.lock().unwrap();
+        requests.push(request);
+        if requests.len() <= self.failures {
+            return Ok(Box::pin(stream::iter(vec![
+                Ok(ModelEvent::Text("partial".into())),
+                Err(Error::RetryableModel("temporary connection failure".into())),
+            ])));
+        }
+        Ok(Box::pin(stream::iter(
+            answer("recovered").into_iter().map(Ok),
+        )))
+    }
+    async fn record_usage(&self, _: uuid::Uuid, _: &UsageReport) -> Result<()> {
+        if self.settlement_failure {
+            Err(Error::RetryableModel("settlement unavailable".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn enable_fast_retries(session: &Session, max_retries: u32) {
+    session.retry_control().configure(RetrySettings {
+        enabled: true,
+        max_retries,
+        base_delay_ms: 1,
+        max_agent_delay_ms: 4,
+    });
+}
+
+#[tokio::test]
+async fn retries_failed_model_attempts_without_replaying_partial_text() {
+    let model = RetryScript {
+        requests: Mutex::new(vec![]),
+        failures: 2,
+        settlement_failure: false,
+    };
+    let registry = Registry::default();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    enable_fast_retries(&session, 3);
+    let mut events = Vec::new();
+    let (sender, mut inputs) = mpsc::channel::<String>(8);
+    let mut observe = |event: Notification<'_>| {
+        if let Notification::Retry(event) = event {
+            events.push(event);
+        }
+    };
+    assert_eq!(
+        agent(&model, &registry)
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut observe
+            )
+            .await
+            .unwrap(),
+        "recovered"
+    );
+    drop(sender);
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    assert_eq!(events.len(), 3);
+    assert!(matches!(
+        events.last(),
+        Some(RetryEvent::End {
+            success: true,
+            attempt: 2,
+            ..
+        })
+    ));
+    let messages = session.conversation_at(session.head()).unwrap();
+    assert!(!format!("{messages:?}").contains("partial"));
+    assert_eq!(
+        session
+            .records()
+            .iter()
+            .filter(|record| matches!(
+                record.event,
+                Event::ModelFinished {
+                    failure: Some(ModelFailure::Retryable),
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn retry_limits_and_request_budget_both_bound_attempts() {
+    for (retries, requests, expected) in [(0, 12, 1), (2, 12, 3), (5, 2, 2)] {
+        let model = RetryScript {
+            requests: Mutex::new(vec![]),
+            failures: 10,
+            settlement_failure: false,
+        };
+        let registry = Registry::default();
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        enable_fast_retries(&session, retries);
+        let mut harness = agent(&model, &registry);
+        harness.limits.model_requests = requests;
+        let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let mut events = Vec::new();
+        let result = harness
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let Notification::Retry(event) = event {
+                        events.push(event)
+                    }
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(model.requests.lock().unwrap().len(), expected);
+        if expected > 1 {
+            assert!(matches!(
+                events.last(),
+                Some(RetryEvent::End { success: false, .. })
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn retry_wait_is_abortable_and_keeps_queued_inputs() {
+    for abort in [false, true] {
+        let model = RetryScript {
+            requests: Mutex::new(vec![]),
+            failures: 1,
+            settlement_failure: false,
+        };
+        let registry = Registry::default();
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        enable_fast_retries(&session, 3);
+        let control = session.retry_control();
+        let (sender, mut inputs) = mpsc::channel::<String>(4);
+        let mut events = Vec::new();
+        let result = agent(&model, &registry)
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let Notification::Retry(event) = event {
+                        if matches!(event, RetryEvent::Start { .. }) {
+                            assert!(control.is_retrying());
+                            sender.try_send("queued".into()).unwrap();
+                            if abort {
+                                control.abort();
+                            }
+                        }
+                        events.push(event);
+                    }
+                },
+            )
+            .await;
+        assert!(!control.is_retrying());
+        if abort {
+            assert!(matches!(result, Err(Error::Cancelled)));
+            assert_eq!(model.requests.lock().unwrap().len(), 1);
+            assert!(
+                matches!(events.last(),Some(RetryEvent::End {success:false,final_error:Some(message),..}) if message=="Retry cancelled")
+            );
+        } else {
+            assert!(result.is_ok());
+            assert!(
+                format!(
+                    "{:?}",
+                    model.requests.lock().unwrap().last().unwrap().messages
+                )
+                .contains("queued")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_reply_settlement_errors_do_not_retry_the_provider() {
+    let model = RetryScript {
+        requests: Mutex::new(vec![]),
+        failures: 0,
+        settlement_failure: true,
+    };
+    let registry = Registry::default();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    enable_fast_retries(&session, 3);
+    let (_sender, mut inputs) = mpsc::channel::<String>(1);
+    assert!(
+        agent(&model, &registry)
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {}
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn failed_reply_settlement_errors_do_not_retry_the_provider() {
+    let model = RetryScript {
+        requests: Mutex::new(vec![]),
+        failures: 10,
+        settlement_failure: true,
+    };
+    let registry = Registry::default();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    enable_fast_retries(&session, 3);
+    let (_sender, mut inputs) = mpsc::channel::<String>(1);
+    let mut retries = 0;
+    let result = agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| {
+                if matches!(event, Notification::Retry(_)) {
+                    retries += 1
+                }
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert_eq!(retries, 0);
+}
