@@ -148,3 +148,18 @@ Signed AIP webhooks remain a host contract. The existing AIP pre-tool
 webhook can deny and the post-tool and stop notifications are asynchronous.
 Use the synchronous Rust policy boundary to enforce execution and the host's
 existing signature and redaction for any external delivery.
+
+## Pending jobs with authoritative polling
+
+A native tool can opt into automatic job polling with `can_poll()` and
+implement `poll(reference, context)`. Return `Outcome::Pending` from the
+initial invocation with a stable, non-secret job reference. The harness commits
+that reference before polling. Polling receives the original operation ID and
+must only inspect the accepted job, never dispatch it again.
+
+A terminal outcome is committed with the extension state updates. Cancellation
+or timeout while polling retains the pending reference for a later resume.
+Tools that keep the default `can_poll() == false` continue to use host-owned
+reconciliation. MCP tasks use this API and bind each reference to the configured
+server identity. Cancelling local polling leaves the remote job available for
+later status checks.

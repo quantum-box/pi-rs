@@ -542,6 +542,107 @@ mod tests {
         fork.close().await.unwrap();
         assert_eq!(closed.load(Ordering::SeqCst), 1);
     }
+    struct TaskModel;
+    #[async_trait::async_trait]
+    impl Model for TaskModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            let finished = request.messages.iter().any(|message| matches!(message, Message::Tool { content, .. } if content == "job result"));
+            let calls = if finished {
+                vec![]
+            } else {
+                vec![crate::ToolCall {
+                    id: "job-call".into(),
+                    name: "job".into(),
+                    arguments: "{}".into(),
+                }]
+            };
+            let mut events = Vec::new();
+            if finished {
+                events.push(Ok(ModelEvent::Text("done".into())));
+            }
+            events.push(Ok(ModelEvent::Complete { calls, usage: None }));
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+    struct PollingJob {
+        dispatched: AtomicUsize,
+        polls: AtomicUsize,
+        started: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl crate::Tool for PollingJob {
+        fn can_poll(&self) -> bool {
+            true
+        }
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: "job".into(),
+                description: "Test job".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            self.dispatched.fetch_add(1, Ordering::SeqCst);
+            crate::Outcome::Pending {
+                reference: "job-1".into(),
+            }
+        }
+        async fn poll(
+            &self,
+            reference: &str,
+            context: crate::ToolContext,
+        ) -> Option<crate::Outcome> {
+            assert_eq!(reference, "job-1");
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                context.cancellation.cancelled().await;
+                return None;
+            }
+            Some(crate::Outcome::Succeeded("job result".into()))
+        }
+    }
+    struct JobExtension(Arc<PollingJob>);
+    impl Extension for JobExtension {
+        fn id(&self) -> &str {
+            "job-extension"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![self.0.clone()]
+        }
+    }
+    #[tokio::test]
+    async fn pending_job_survives_cancel_and_reopen_without_redispatch() {
+        let job = Arc::new(PollingJob {
+            dispatched: AtomicUsize::new(0),
+            polls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+        });
+        let mut session = SessionBuilder::new(Arc::new(TaskModel), "task")
+            .extension(Arc::new(JobExtension(job.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let (result, ()) = tokio::join!(session.prompt("start job"), async {
+            job.started.notified().await;
+            control.abort();
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pending.jsonl");
+        session.export_jsonl(&path).unwrap();
+        session.close().await.unwrap();
+        drop(session);
+        let mut session = SessionBuilder::new(Arc::new(TaskModel), "task")
+            .extension(Arc::new(JobExtension(job.clone())))
+            .unwrap()
+            .open(path)
+            .unwrap();
+        assert_eq!(session.resume().await.unwrap(), "done");
+        assert_eq!(job.dispatched.load(Ordering::SeqCst), 1);
+        assert_eq!(job.polls.load(Ordering::SeqCst), 2);
+        session.close().await.unwrap();
+    }
     struct WaitingModel;
     #[async_trait::async_trait]
     impl Model for WaitingModel {

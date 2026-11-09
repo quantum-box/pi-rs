@@ -14,7 +14,7 @@ use rmcp::{
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -40,8 +40,33 @@ pub struct ServerConfig {
     pub tool_exposure: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Default)]
+struct NativeClient;
+impl rmcp::ClientHandler for NativeClient {
+    fn get_info(&self) -> rmcp::model::ClientConfig {
+        let mut info = rmcp::model::ClientConfig::default();
+        info.capabilities.extensions = Some(
+            [(
+                rmcp::model::TASKS_EXTENSION_ID.to_owned(),
+                Default::default(),
+            )]
+            .into(),
+        );
+        info
+    }
+}
+#[derive(Serialize, Deserialize)]
+struct TaskReference {
+    connection: String,
+    task_id: String,
+}
+enum CallResult {
+    Data(Value),
+    Task(String),
+}
 struct Connection {
-    service: tokio::sync::Mutex<RunningService<RoleClient, ()>>,
+    identity: String,
+    service: tokio::sync::Mutex<RunningService<RoleClient, NativeClient>>,
     timeout: Duration,
 }
 impl Drop for Connection {
@@ -69,6 +94,7 @@ impl McpExtension {
             ));
         }
         let timeout = Duration::from_secs(config.timeout.unwrap_or(60).clamp(1, 3600));
+        let mut identity = connection_identity(name, config, workspace)?;
         let service = if let Some(command) = &config.command {
             if config.url.is_some()
                 || config
@@ -84,8 +110,16 @@ impl McpExtension {
             for argument in &config.args {
                 process.arg(expand_home(argument));
             }
+            for (key, value) in std::env::vars_os().collect::<BTreeMap<_, _>>() {
+                identity.update(key.as_encoded_bytes());
+                identity.update([0]);
+                identity.update(value.as_encoded_bytes());
+                identity.update([0]);
+            }
             for (key, value) in &config.env {
-                process.env(key, resolve_value(value).await?);
+                let value = resolve_value(value).await?;
+                identity.update(json!([key, value]).to_string());
+                process.env(key, value);
             }
             process.current_dir(
                 config
@@ -97,12 +131,13 @@ impl McpExtension {
             process.kill_on_drop(true);
             let wrapped = wrap_process(process);
             let transport = TokioChildProcess::new(wrapped)?;
-            tokio::time::timeout(timeout.min(Duration::from_secs(10)), ().serve(transport))
-                .await
-                .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
-                .map_err(|error| {
-                    Error::Config(format!("MCP {name} initialization failed: {error}"))
-                })?
+            tokio::time::timeout(
+                timeout.min(Duration::from_secs(10)),
+                NativeClient.serve(transport),
+            )
+            .await
+            .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
+            .map_err(|error| Error::Config(format!("MCP {name} initialization failed: {error}")))?
         } else if let Some(url) = &config.url {
             if config
                 .transport
@@ -124,11 +159,12 @@ impl McpExtension {
             }
             let mut headers = HashMap::new();
             for (name, value) in &config.headers {
-                let name = name
+                let name: reqwest_mcp::header::HeaderName = name
                     .parse()
                     .map_err(|_| Error::Config("invalid MCP header name".into()))?;
-                let value = resolve_value(value)
-                    .await?
+                let resolved = resolve_value(value).await?;
+                identity.update(json!([name.as_str(), resolved]).to_string());
+                let value = resolved
                     .parse()
                     .map_err(|_| Error::Config("invalid MCP header value".into()))?;
                 headers.insert(name, value);
@@ -142,17 +178,19 @@ impl McpExtension {
                 client,
                 StreamableHttpClientTransportConfig::with_uri(url.clone()).custom_headers(headers),
             );
-            tokio::time::timeout(timeout.min(Duration::from_secs(10)), ().serve(transport))
-                .await
-                .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
-                .map_err(|error| {
-                    Error::Config(format!("MCP {name} initialization failed: {error}"))
-                })?
+            tokio::time::timeout(
+                timeout.min(Duration::from_secs(10)),
+                NativeClient.serve(transport),
+            )
+            .await
+            .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
+            .map_err(|error| Error::Config(format!("MCP {name} initialization failed: {error}")))?
         } else {
             return Err(Error::Config(format!("MCP {name} needs command or url")));
         };
         let info = service.peer_info();
         let connection = Arc::new(Connection {
+            identity: format!("{:x}", identity.finalize()),
             service: tokio::sync::Mutex::new(service),
             timeout,
         });
@@ -385,6 +423,13 @@ impl McpTool {
         }
     }
 }
+fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> Result<Sha256> {
+    let workspace = workspace.canonicalize()?;
+    let mut identity = Sha256::new();
+    identity.update(json!({"name":name,"command":config.command,"args":config.args,"url":config.url,"cwd":config.cwd,"workspace":workspace}).to_string());
+    Ok(identity)
+}
+
 fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
     !config
         .tool_exposure
@@ -395,13 +440,16 @@ fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
 
 #[async_trait::async_trait]
 impl Tool for McpTool {
+    fn can_poll(&self) -> bool {
+        !self.resource
+    }
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
     }
     async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome {
         let call = async {
             if self.resource {
-                self.invoke_resource(arguments).await
+                self.invoke_resource(arguments).await.map(CallResult::Data)
             } else {
                 let params = serde_json::from_value(
                     json!({"name":self.remote_name,"arguments":arguments,"_meta":{"operationId":context.operation_id.to_string()}}),
@@ -415,9 +463,17 @@ impl Tool for McpTool {
                     .await
                     .map_err(|error| Error::Config(error.to_string()))?;
                 match result {
-                    CallToolResponse::Complete(result) => Ok(serde_json::to_value(result)?),
+                    CallToolResponse::Complete(result) => {
+                        Ok(CallResult::Data(serde_json::to_value(result)?))
+                    }
+                    CallToolResponse::Task(task) => {
+                        Ok(CallResult::Task(serde_json::to_string(&TaskReference {
+                            connection: self.connection.identity.clone(),
+                            task_id: task.task.task_id,
+                        })?))
+                    }
                     _ => Err(Error::Config(
-                        "MCP tool requires additional client input or task polling".into(),
+                        "MCP tool requires additional client input".into(),
                     )),
                 }
             }
@@ -425,10 +481,63 @@ impl Tool for McpTool {
         tokio::select! {
             _ = context.cancellation.cancelled() => Outcome::Unknown("MCP request cancelled after dispatch".into()),
             result = tokio::time::timeout(self.connection.timeout, call) => match result {
-                Ok(Ok(data)) if data["isError"] == true => Outcome::Failed(data.to_string()),
-                Ok(Ok(data)) => Outcome::Structured { data, attachments: vec![] },
+                Ok(Ok(CallResult::Data(data))) if data["isError"] == true => Outcome::Failed(data.to_string()),
+                Ok(Ok(CallResult::Data(data))) => Outcome::Structured { data, attachments: vec![] },
+                Ok(Ok(CallResult::Task(reference))) => Outcome::Pending { reference },
                 Ok(Err(error)) => Outcome::Unknown(error.to_string()),
                 Err(_) => Outcome::Unknown("MCP request timed out after dispatch".into()),
+            }
+        }
+    }
+    async fn poll(&self, reference: &str, context: ToolContext) -> Option<Outcome> {
+        let task: TaskReference = serde_json::from_str(reference).ok()?;
+        if task.connection != self.connection.identity {
+            return None;
+        }
+        loop {
+            let params = serde_json::from_value(json!({"taskId":task.task_id})).ok()?;
+            let response = self.connection.service.lock().await.get_task(params).await;
+            let Ok(response) = response else {
+                return Some(Outcome::Pending {
+                    reference: reference.into(),
+                });
+            };
+            match response.task.payload {
+                rmcp::model::TaskPayload::Completed { result } => {
+                    let data = Value::Object(result);
+                    return Some(if data["isError"] == true {
+                        Outcome::Failed(data.to_string())
+                    } else {
+                        Outcome::Structured {
+                            data,
+                            attachments: vec![],
+                        }
+                    });
+                }
+                rmcp::model::TaskPayload::Failed { error } => {
+                    return Some(Outcome::Failed(Value::Object(error).to_string()));
+                }
+                rmcp::model::TaskPayload::Cancelled => {
+                    return Some(Outcome::Failed("Remote MCP task was cancelled".into()));
+                }
+                rmcp::model::TaskPayload::Working => {}
+                _ => {
+                    return Some(Outcome::Pending {
+                        reference: reference.into(),
+                    });
+                }
+            }
+            let interval = Duration::from_millis(
+                response
+                    .task
+                    .task
+                    .poll_interval_ms
+                    .unwrap_or(1000)
+                    .clamp(100, 10_000),
+            );
+            tokio::select! {
+                _ = context.cancellation.cancelled() => return Some(Outcome::Pending { reference: reference.into() }),
+                _ = tokio::time::sleep(interval) => {}
             }
         }
     }
@@ -541,6 +650,18 @@ pub async fn resolve_value(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn task_identity_uses_canonical_workspace_across_resume() {
+        let config: ServerConfig =
+            serde_json::from_value(json!({"url":"http://127.0.0.1:8000/mcp"})).unwrap();
+        let relative = connection_identity("jobs", &config, Path::new("."))
+            .unwrap()
+            .finalize();
+        let absolute = connection_identity("jobs", &config, &std::env::current_dir().unwrap())
+            .unwrap()
+            .finalize();
+        assert_eq!(relative, absolute);
+    }
     #[test]
     fn resource_and_prompt_exposure_respects_server_and_tool_overrides() {
         let config: ServerConfig = serde_json::from_value(

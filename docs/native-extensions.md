@@ -117,3 +117,7 @@ re-inclusions. Without declarations, the conventional `skills`, `prompts`,
 `themes` and `extensions` directories are discovered. An empty list disables
 that resource kind. A settings package entry may additionally restrict these
 resources with `{ "source": "...", "skills": ["skills/example"] }`.
+
+Native executable tool descriptors also advertise `can_poll`. The process
+protocol forwards polling by tool name, stable job reference and original
+operation ID. Existing executable descriptors default this capability to false.

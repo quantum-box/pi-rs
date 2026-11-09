@@ -190,8 +190,33 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        recover(session, observer)?;
-        let mut states = self.migrate(session, observer)?;
+        let recovery = recover(session, observer);
+        let mut states = match recovery {
+            Ok(()) => self.migrate(session, observer)?,
+            Err(Error::PendingOperation(_)) => {
+                if let Some((invocation, _)) =
+                    session
+                        .operations()
+                        .into_iter()
+                        .find(|(invocation, state)| {
+                            matches!(state, OperationState::Finished(Outcome::Pending { .. }))
+                                && !self
+                                    .registry
+                                    .tools
+                                    .get(&invocation.call.name)
+                                    .is_some_and(|tool| tool.tool.can_poll())
+                        })
+                {
+                    return Err(Error::PendingOperation(invocation.operation_id));
+                }
+                let mut states = self.migrate(session, observer)?;
+                self.poll_pending(session, &mut states, cancel, observer)
+                    .await?;
+                recover(session, observer)?;
+                states
+            }
+            Err(error) => return Err(error),
+        };
         if let Some((id, content)) = input {
             commit(
                 session,
@@ -651,14 +676,66 @@ impl Agent<'_> {
             // All started outcomes are recorded even if one parallel member failed.
             for (invocation, outcome) in group.iter().zip(outcomes) {
                 if let Err(error) = self.finish_tool(session, invocation, outcome, states, observer)
+                    && (first_error.is_none()
+                        || (matches!(first_error, Some(Error::PendingOperation(_)))
+                            && !matches!(error, Error::PendingOperation(_))))
                 {
-                    first_error.get_or_insert(error);
+                    first_error = Some(error);
                 }
             }
-            if let Some(error) = first_error {
-                return Err(error);
+            match first_error {
+                Some(Error::PendingOperation(_)) => {
+                    self.poll_pending(session, states, cancel, observer).await?
+                }
+                Some(error) => return Err(error),
+                None => {}
             }
             remaining = next;
+        }
+        Ok(())
+    }
+
+    async fn poll_pending(
+        &self,
+        session: &mut Session,
+        states: &mut ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        for (invocation, state) in session.operations() {
+            let OperationState::Finished(Outcome::Pending { reference }) = state else {
+                continue;
+            };
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let operation_id = invocation.operation_id;
+            let tool = self
+                .registry
+                .tools
+                .get(&invocation.call.name)
+                .ok_or(Error::PendingOperation(operation_id))?;
+            if !tool.tool.can_poll() {
+                return Err(Error::PendingOperation(operation_id));
+            }
+            let arguments = serde_json::from_str(&invocation.call.arguments)?;
+            let context = ToolContext {
+                operation_id,
+                cancellation: cancel.child_token(),
+            };
+            if self
+                .authorize(&invocation.call.name, &arguments, &context, states)
+                .await?
+                != Decision::Allow
+            {
+                return Err(Error::PendingOperation(operation_id));
+            }
+            let outcome = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.poll(&reference, context)) => result.ok().flatten().ok_or(Error::PendingOperation(operation_id))?,
+            };
+            self.finish_tool(session, &invocation, outcome, states, observer)?;
         }
         Ok(())
     }

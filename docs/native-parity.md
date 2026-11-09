@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface, explicit hot reload |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI, resource globs and complete validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior, elicitation and task polling |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior and elicitation |
 | Codemode | Core tool invocation APIs | Sandboxed code execution and dynamic tool search |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
@@ -237,3 +237,17 @@ A text response that reaches the provider output limit is retained with its
 `length` finish reason and a visible limit notice. Incomplete tool-call
 responses remain unsuccessful and are not dispatched. CLI regression tests
 verify that text and provider metadata survive the output limit.
+
+MCP tasks now persist their remote job reference before polling for a terminal
+result. Polling cancellation and timeout retain that reference, and resuming
+checks the accepted job without repeating its original invocation. An HTTP
+fixture verifies one dispatch and two status checks. The owned SDK test also
+cancels polling, exports and reopens the session, and verifies one dispatch
+across both runs. Host-owned pending operations retain their reconciliation
+contract.
+
+The CLI task fixture also sends SIGINT during polling and resumes from the
+saved journal in a new process. The remote task is dispatched once across both
+processes. Connection identity normalizes the workspace path and includes
+resolved credentials, so a resumed task cannot silently move to another
+configured identity.

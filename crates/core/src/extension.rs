@@ -33,6 +33,15 @@ pub trait Tool: Send + Sync {
         ToolExecution::Sequential
     }
     async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome;
+    /// Explicitly opt into automatic pending-job polling.
+    fn can_poll(&self) -> bool {
+        false
+    }
+    /// Read an accepted job's state without dispatching the original operation again.
+    /// None leaves reconciliation to the host. Cancellation must preserve the job reference.
+    async fn poll(&self, _reference: &str, _context: ToolContext) -> Option<Outcome> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

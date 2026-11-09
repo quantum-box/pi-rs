@@ -47,6 +47,11 @@ enum ProtocolRequest {
         arguments: Value,
         operation_id: String,
     },
+    Poll {
+        name: String,
+        reference: String,
+        operation_id: String,
+    },
     AfterTool {
         name: String,
         outcome: Outcome,
@@ -79,6 +84,8 @@ struct Description {
 struct DescriptionTool {
     spec: ToolSpec,
     execution: ToolExecution,
+    #[serde(default)]
+    can_poll: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DecisionValue {
@@ -168,6 +175,7 @@ impl Extension for ExecutableExtension {
                     executable: self.executable.clone(),
                     spec: tool.spec.clone(),
                     execution: tool.execution,
+                    can_poll: tool.can_poll,
                 }) as Arc<dyn Tool>
             })
             .collect()
@@ -288,9 +296,13 @@ struct ExecutableTool {
     executable: PathBuf,
     spec: ToolSpec,
     execution: ToolExecution,
+    can_poll: bool,
 }
 #[async_trait::async_trait]
 impl Tool for ExecutableTool {
+    fn can_poll(&self) -> bool {
+        self.can_poll
+    }
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
     }
@@ -313,6 +325,21 @@ impl Tool for ExecutableTool {
             Ok(Err(error)) => Outcome::Unknown(error),
             Err(error) => Outcome::Unknown(error.to_string()),
         }
+    }
+    async fn poll(&self, reference: &str, context: ToolContext) -> Option<Outcome> {
+        let request = ProtocolRequest::Poll {
+            name: self.spec.name.clone(),
+            reference: reference.into(),
+            operation_id: context.operation_id.to_string(),
+        };
+        let path = self.executable.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .flatten()
     }
 }
 struct CancelOnDrop(CancellationToken);
@@ -480,6 +507,7 @@ async fn dispatch(
                 .map(|tool| DescriptionTool {
                     spec: tool.spec(),
                     execution: tool.execution(),
+                    can_poll: tool.can_poll(),
                 })
                 .collect(),
         })),
@@ -539,6 +567,18 @@ async fn dispatch(
                 .ok_or_else(|| "unknown extension tool".to_owned())?;
             encode(Ok(tool.invoke(arguments, context(&operation_id)?).await))
         }
+        ProtocolRequest::Poll {
+            name,
+            reference,
+            operation_id,
+        } => {
+            let tool = extension
+                .tools()
+                .into_iter()
+                .find(|tool| tool.spec().name == name && tool.can_poll())
+                .ok_or_else(|| "unknown polling tool".to_owned())?;
+            encode(Ok(tool.poll(&reference, context(&operation_id)?).await))
+        }
         ProtocolRequest::AfterTool {
             name,
             outcome,
@@ -587,6 +627,57 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 mod tests {
     use super::*;
 
+    struct PollTool;
+    #[async_trait::async_trait]
+    impl Tool for PollTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "polling".into(),
+                description: "test".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn can_poll(&self) -> bool {
+            true
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            panic!("poll must not redispatch")
+        }
+        async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
+            Some(Outcome::Succeeded(reference.into()))
+        }
+    }
+    struct PollExtension;
+    impl Extension for PollExtension {
+        fn id(&self) -> &str {
+            "poll-extension"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(PollTool)]
+        }
+    }
+    #[test]
+    fn protocol_advertises_and_forwards_polling_without_invocation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let extension: Arc<dyn Extension> = Arc::new(PollExtension);
+        let description = runtime
+            .block_on(dispatch(extension.clone(), ProtocolRequest::Describe))
+            .unwrap();
+        assert_eq!(description["tools"][0]["can_poll"], true);
+        let request = ProtocolRequest::Poll {
+            name: "polling".into(),
+            reference: "job-1".into(),
+            operation_id: "00000000-0000-0000-0000-000000000001".into(),
+        };
+        let result = runtime.block_on(dispatch(extension, request)).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Option<Outcome>>(result).unwrap(),
+            Some(Outcome::Succeeded("job-1".into()))
+        );
+    }
     #[test]
     fn protocol_preserves_commands_and_state_across_process_requests() {
         let runtime = tokio::runtime::Builder::new_current_thread()
