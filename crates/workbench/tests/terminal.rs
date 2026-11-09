@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -36,7 +37,7 @@ fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
 }
 
 #[test]
-fn resizing_and_typing_together_keeps_input_and_restores_terminal() {
+fn resize_and_suspend_preserve_input_and_restore_terminal() {
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -73,8 +74,17 @@ fn resizing_and_typing_together_keeps_input_and_restores_terminal() {
         0
     );
     let original = unsafe { original.assume_init() };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command.process_group(0);
+    // The test owns this child job, so suspension cannot stop the test runner.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            Ok(())
+        });
+    }
     let mut process = Process(
-        Command::new(env!("CARGO_BIN_EXE_pi"))
+        command
             .args([
                 "--workspace",
                 root.path().to_str().unwrap(),
@@ -106,7 +116,51 @@ fn resizing_and_typing_together_keeps_input_and_restores_terminal() {
         output_until(&mut master, |text| text.contains(&marker));
         master.write_all(b"\x15").unwrap();
     }
-    master.write_all(b"/quit\r").unwrap();
+    master.write_all(b"resume-draft").unwrap();
+    output_until(&mut master, |text| text.contains("resume-draft"));
+    master.write_all(b"\x1a").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stopped = false;
+    while Instant::now() < deadline {
+        let mut status = 0;
+        let observed = unsafe {
+            libc::waitpid(
+                process.0.id() as libc::pid_t,
+                &mut status,
+                libc::WNOHANG | libc::WUNTRACED,
+            )
+        };
+        if observed > 0 {
+            assert!(libc::WIFSTOPPED(status));
+            assert_eq!(libc::WSTOPSIG(status), libc::SIGTSTP);
+            stopped = true;
+            break;
+        }
+        let mut buffer = [0; 8192];
+        let _ = master.read(&mut buffer);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(stopped, "foreground job did not suspend");
+    let mut paused = std::mem::MaybeUninit::<libc::termios>::uninit();
+    assert_eq!(
+        unsafe { libc::tcgetattr(slave.as_raw_fd(), paused.as_mut_ptr()) },
+        0
+    );
+    let paused = unsafe { paused.assume_init() };
+    assert_eq!(
+        paused.c_lflag & !libc::PENDIN,
+        original.c_lflag & !libc::PENDIN
+    );
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::kill(-(process.0.id() as libc::pid_t), libc::SIGCONT) },
+        0
+    );
+    output_until(&mut master, |text| text.contains("resume-draft"));
+    master.write_all(b"\x15/quit\r").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
         let mut buffer = [0; 8192];

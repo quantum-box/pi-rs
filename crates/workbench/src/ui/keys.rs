@@ -4,6 +4,13 @@ use pi_rs::{Error, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub fn windows_keybindings() -> bool {
+    cfg!(windows)
+        || (cfg!(target_os = "linux")
+            && (std::env::var_os("WSL_DISTRO_NAME").is_some()
+                || std::env::var_os("WSL_INTEROP").is_some()))
+}
+
 #[derive(Default)]
 pub struct Keys {
     bindings: BTreeMap<String, Vec<KeyEvent>>,
@@ -45,20 +52,35 @@ impl Keys {
             ("tui.altScreen.top", &["ctrl+home"]),
             ("tui.altScreen.bottom", &["ctrl+end"]),
             ("app.interrupt", &["escape"]),
+            ("app.suspend", if cfg!(windows) { &[] } else { &["ctrl+z"] }),
             ("app.clear", &["ctrl+c"]),
             ("app.exit", &["ctrl+d"]),
             ("app.editor.external", &["ctrl+g"]),
             ("app.tools.expand", &["ctrl+o"]),
             ("app.thinking.toggle", &["ctrl+t"]),
             ("app.thinking.cycle", &["shift+tab"]),
-            ("app.message.followUp", &["alt+enter"]),
+            (
+                "app.message.followUp",
+                if windows_keybindings() {
+                    &["ctrl+q"]
+                } else {
+                    &["alt+enter"]
+                },
+            ),
             ("app.model.select", &["ctrl+l"]),
             ("app.model.cycleForward", &["ctrl+p"]),
-            ("app.model.cycleBackward", &["ctrl+shift+p"]),
+            (
+                "app.model.cycleBackward",
+                if windows_keybindings() {
+                    &["alt+p"]
+                } else {
+                    &["ctrl+shift+p"]
+                },
+            ),
             ("app.message.copy", &["ctrl+x"]),
             (
                 "app.clipboard.pasteImage",
-                if cfg!(windows) {
+                if windows_keybindings() {
                     &["alt+v"]
                 } else {
                     &["ctrl+v"]

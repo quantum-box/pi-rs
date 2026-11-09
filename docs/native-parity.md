@@ -776,3 +776,15 @@ intact. The native `max` level remains valid in settings.
 
 CLI/RPC fixtures cover default selection, explicit overrides, model scopes,
 session restoration and model switching. Settings-editor regressions pass.
+
+### Terminal suspension checkpoint
+
+On Unix, Ctrl+Z restores normal terminal settings before suspending the
+foreground process group. Continuing the job restores the TUI, draft and image
+rendering. The previous SIGINT disposition is restored after continuation.
+Windows and WSL use Pi's Ctrl+Q follow-up, Alt+P reverse-model and Alt+V paste
+bindings. Unix suspension remains available on WSL.
+
+A committed isolated-process-group PTY test covers resize input and suspension.
+A separate fixture covers both screen modes, SIGINT while suspended, resumed
+draft contents and terminal restoration on exit.

@@ -91,6 +91,34 @@ impl Terminal {
         execute!(std::io::stdout(), EnableBracketedPaste, Hide)?;
         Ok(guard)
     }
+    #[cfg(unix)]
+    fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
+        drop(guard.take());
+        // The foreground job owns this process group, including its frontend worker.
+        let result = unsafe {
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            let mut ignored: libc::sigaction = std::mem::zeroed();
+            ignored.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ignored.sa_mask);
+            if libc::sigaction(libc::SIGINT, &ignored, &mut previous) != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                let status = libc::kill(0, libc::SIGTSTP);
+                let result = if status == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                };
+                if libc::sigaction(libc::SIGINT, &previous, std::ptr::null_mut()) != 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    result
+                }
+            }
+        };
+        *guard = Some(Self::enter(mode, images)?);
+        result.map_err(Error::Io)
+    }
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
@@ -408,7 +436,11 @@ impl View {
                 _ => {}
             }
         }
-        self.append("Enter to send · Alt+Enter to queue · Ctrl+O tools · Ctrl+T thinking · /help");
+        self.append(if crate::ui::keys::windows_keybindings() {
+            "Enter to send · Ctrl+Q to queue · Ctrl+O tools · Ctrl+T thinking · /help"
+        } else {
+            "Enter to send · Alt+Enter to queue · Ctrl+O tools · Ctrl+T thinking · /help"
+        });
         Ok(())
     }
     fn add_images(&mut self, images: &[pi_rs::ImageContent]) {
@@ -1430,7 +1462,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         slash("/resume", &mut args, &mut view)?;
     }
     let mut keys = Keys::load()?;
-    let _terminal = Terminal::enter(args.tui_mode, view.graphics.cleanup())?;
+    let _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+    #[cfg(unix)]
+    let mut _terminal = _terminal;
     let mut worker: Option<Worker> = None;
     let mut initial = args
         .initial_prompt
@@ -1681,6 +1715,26 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     continue;
                 }
                 match action {
+                    "app.suspend" => {
+                        #[cfg(unix)]
+                        {
+                            if args.tui_mode == Some(TuiMode::Regular) {
+                                view.finish_regular()?;
+                            }
+                            if let Err(error) = Terminal::suspend(
+                                &mut _terminal,
+                                args.tui_mode,
+                                view.graphics.cleanup(),
+                            ) {
+                                view.append(&error.to_string());
+                            }
+                            view.graphics.reset();
+                            view.regular.redraw = true;
+                            view.regular.started = false;
+                        }
+                        #[cfg(not(unix))]
+                        view.append("Suspending the terminal is unavailable on this platform");
+                    }
                     "app.interrupt" if is_busy(&worker) => {
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
