@@ -556,9 +556,9 @@ impl CodingTool {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let mut process = ProcessGroup::new(command.spawn()?);
-        let mut stdout = process.child.stdout.take().expect("piped stdout");
-        let mut stderr = process.child.stderr.take().expect("piped stderr");
+        let mut process = ProcessGroup::spawn(command)?;
+        let mut stdout = process.stdout();
+        let mut stderr = process.stderr();
         let deadline = async {
             match timeout {
                 Some(timeout) => tokio::time::sleep(timeout).await,
@@ -579,7 +579,7 @@ impl CodingTool {
                     let output = output.finish()?;
                     return Err(Error::Config(format!("{}\nCommand timed out after {} seconds", output.display, timeout.expect("deadline needs a timeout").as_secs_f64())));
                 }
-                result = process.child.wait(), if status.is_none() => {
+                result = process.wait(), if status.is_none() => {
                     status = Some(result?);
                     process.finished = true;
                     // Descendants may retain inherited pipes after the shell exits.
@@ -748,20 +748,60 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     }
 }
 
+#[cfg(not(windows))]
+type ShellChild = tokio::process::Child;
+#[cfg(windows)]
+type ShellChild = Box<dyn process_wrap::tokio::ChildWrapper>;
+
 struct ProcessGroup {
-    child: tokio::process::Child,
+    child: ShellChild,
     #[cfg(unix)]
     group: Option<u32>,
     finished: bool,
 }
 impl ProcessGroup {
-    fn new(child: tokio::process::Child) -> Self {
-        Self {
+    fn spawn(command: tokio::process::Command) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        let child = {
+            let mut wrapped = process_wrap::tokio::CommandWrap::from(command);
+            wrapped.wrap(process_wrap::tokio::JobObject);
+            wrapped.wrap(process_wrap::tokio::KillOnDrop);
+            wrapped.spawn()?
+        };
+        #[cfg(not(windows))]
+        let child = {
+            let mut command = command;
+            command.spawn()?
+        };
+        Ok(Self {
             #[cfg(unix)]
             group: child.id(),
             child,
             finished: false,
+        })
+    }
+    fn stdout(&mut self) -> tokio::process::ChildStdout {
+        #[cfg(windows)]
+        {
+            self.child.stdout().take().expect("piped stdout")
         }
+        #[cfg(not(windows))]
+        {
+            self.child.stdout.take().expect("piped stdout")
+        }
+    }
+    fn stderr(&mut self) -> tokio::process::ChildStderr {
+        #[cfg(windows)]
+        {
+            self.child.stderr().take().expect("piped stderr")
+        }
+        #[cfg(not(windows))]
+        {
+            self.child.stderr.take().expect("piped stderr")
+        }
+    }
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
     }
 }
 impl Drop for ProcessGroup {
@@ -934,21 +974,31 @@ mod tests {
         let tool = CodingTool {
             root: root.path().to_path_buf(),
             unrestricted: false,
-            kind: Kind::Bash,
+            kind: if cfg!(windows) {
+                Kind::PowerShell
+            } else {
+                Kind::Bash
+            },
+        };
+        let (command, timeout) = if cfg!(windows) {
+            ("Write-Output before; Start-Sleep -Seconds 20", 5.0)
+        } else {
+            ("printf before; sleep 5", 0.05)
         };
         let error = tool
-            .bash(&json!({"command":"printf before; sleep 5", "timeout":0.05}))
+            .bash(&json!({"command":command, "timeout":timeout}))
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("before"));
-        assert!(error.contains("timed out after 0.05"));
+        assert!(error.contains(&format!("timed out after {timeout}")));
         assert_eq!(shell_timeout(&json!({})).unwrap(), None);
         for value in [json!(0), json!(-1), json!(null), json!("1"), json!(2147484)] {
             assert!(shell_timeout(&json!({"timeout":value})).is_err());
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_does_not_wait_for_inherited_background_pipes() {
         let root = tempfile::tempdir().unwrap();
@@ -974,15 +1024,84 @@ mod tests {
         let tool = CodingTool {
             unrestricted: false,
             root: root.path().to_path_buf(),
-            kind: Kind::Bash,
+            kind: if cfg!(windows) {
+                Kind::PowerShell
+            } else {
+                Kind::Bash
+            },
+        };
+        let command = if cfg!(windows) {
+            "[Console]::Out.Write('out'); [Console]::Error.Write('err'); exit 7"
+        } else {
+            "printf out; printf err >&2; exit 7"
         };
         let output = tool
-            .bash(&json!({"command":"printf out; printf err >&2; exit 7"}))
+            .bash(&json!({"command":command}))
             .await
             .unwrap_err()
             .to_string();
         assert!(output.contains("out"));
         assert!(output.contains("err"));
         assert!(output.contains('7'));
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_default_shell_preserves_unicode_and_kills_child_processes() {
+        let root = tempfile::tempdir().unwrap();
+        let extension = CodingTools::local(root.path()).unwrap();
+        assert!(
+            extension
+                .tools()
+                .iter()
+                .any(|tool| tool.spec().name == "powershell")
+        );
+        assert!(
+            !extension
+                .tools()
+                .iter()
+                .any(|tool| tool.spec().name == "bash")
+        );
+        let tool = CodingTool {
+            root: root.path().to_owned(),
+            unrestricted: false,
+            kind: Kind::PowerShell,
+        };
+        let output = tool
+            .shell(&json!({"command":"Write-Output '日本語'"}))
+            .await
+            .unwrap();
+        assert!(output.output.script.contains("日本語"));
+        let ready = root
+            .path()
+            .join("ready.txt")
+            .display()
+            .to_string()
+            .replace('\'', "''");
+        let leaked = root
+            .path()
+            .join("leaked.txt")
+            .display()
+            .to_string()
+            .replace('\'', "''");
+        let script = format!(
+            "Set-Content -LiteralPath '{ready}' -Value ready; Start-Sleep -Seconds 10; Set-Content -LiteralPath '{leaked}' -Value leaked"
+        );
+        let command = format!(
+            "Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-Command',\"{script}\"; Start-Sleep -Seconds 20"
+        );
+        assert!(
+            tool.shell(&json!({"command":command,"timeout":5}))
+                .await
+                .is_err()
+        );
+        assert!(
+            root.path().join("ready.txt").exists(),
+            "child process must have started"
+        );
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert!(
+            !root.path().join("leaked.txt").exists(),
+            "timed-out descendants must be terminated"
+        );
     }
 }

@@ -1,0 +1,39 @@
+name: Rust parity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install supported Rust toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
+      - name: Check formatting
+        run: cargo +1.89.0 fmt --all -- --check
+      - name: Check all targets
+        run: cargo +1.89.0 clippy --locked --workspace --all-features --all-targets -- -D warnings
+      - name: Run native acceptance tests
+        run: cargo +1.89.0 test --locked --workspace --all-features
