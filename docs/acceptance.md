@@ -178,6 +178,15 @@ Workflow に紐づけ、子は既存の子予算で精算する。統合試験12
 記録する。ハーネスで別の操作 ID・対象版・入力を拒否し、隔離 TiDB の Workspace
 受付記録では別 actor、期限切れ、Workspace・リポジトリ・ブランチ・入力の変更を
 拒否した。拒否後に残るジョブ行は0件。元の条件で再送すると同じジョブを返し、
-停止後は再受付を拒否した。運用の承認元と、Workspace がコマンドを起動する直前の
-照合は接続作業が残っている。
+停止後は再受付を拒否した。運用の承認元への接続が残っている。
 [承認の照合と試験](https://github.com/quantum-box/tachyon-apps/commit/9dd9ee2c3ca8110afbe9ef11381f1eabd894fa20)
+
+
+### Workspace の起動前確認
+
+署名付きのサービス間要求でハーネス操作 ID を渡し、Runtime が承認と照合して受付を
+保存した後に Workspace のコマンドを起動する。Root の隔離試験で、承認拒否、
+受付保存の失敗、保存後の期限切れはいずれもコマンド起動0件で、承認が有効な場合は
+実行できた。通常の Builder 呼出しは従来の起動順を維持する。
+実環境の承認元との接続と、Root・AIP を揃えた運用受入は残っている。
+[Workspace 起動前の確認と試験](https://github.com/quantum-box/tachyon-apps/commit/bf830ca75cf4728125554a333f1b9a77f6cb037d)
