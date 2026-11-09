@@ -19,6 +19,9 @@ for the working directory, and `pi --session <path>` opens an explicit session.
 
 Enter sends a prompt. Shift+Enter adds a line, Alt+Enter queues a follow-up,
 Escape cancels the current operation, and PageUp/PageDown scroll the transcript.
+The status bar animates while waiting and shows elapsed time, confirmed model
+loading status when local Ollama reports it, thinking activity, and answer
+generation. Token totals are labeled as settled usage and update on completion.
 `/help` lists the available commands, including `/model`, `/new`, `/resume`,
 `/compact`, `/tree`, `/checkout`, `/plan`, `/review`, `/notes`, and `/todo`.
 The interactive local profile enables `read`, `write`, `edit`, `bash`, `grep`,

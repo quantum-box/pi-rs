@@ -178,6 +178,7 @@ fn model_fixture() -> (String, std::thread::JoinHandle<()>) {
                     .any(|message| message["content"] == "same input")
             );
             let response = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"private-reasoning-sentinel\"},\"finish_reason\":null}]}\n\n",
                 "data: {\"id\":\"fixture-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":null}]}\n\n",
                 "data: {\"id\":\"fixture-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n\n",
@@ -210,6 +211,7 @@ async fn cli_and_library_use_the_same_stream_and_do_not_emit_auth() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(!stdout.contains("private-test-token"));
+    assert!(!stdout.contains("private-reasoning-sentinel"));
     assert!(
         !std::fs::read_to_string(path)
             .unwrap()
@@ -219,6 +221,12 @@ async fn cli_and_library_use_the_same_stream_and_do_not_emit_auth() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
+    let stages: Vec<&str> = events
+        .iter()
+        .filter(|event| event["type"] == "model_progress")
+        .filter_map(|event| event["stage"].as_str())
+        .collect();
+    assert_eq!(stages, ["waiting_for_model", "thinking", "generating"]);
     let answer = events
         .iter()
         .find(|event| event["type"] == "answer")

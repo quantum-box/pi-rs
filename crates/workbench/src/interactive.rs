@@ -1,7 +1,7 @@
 //! Terminal presentation over the same journaled CLI used by automation.
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
@@ -133,6 +133,8 @@ struct View {
     tokens: u64,
     history: Vec<String>,
     history_index: Option<usize>,
+    request_started: Option<Instant>,
+    phase: Option<&'static str>,
 }
 impl View {
     fn append(&mut self, text: &str) {
@@ -177,6 +179,15 @@ impl View {
     }
     fn receive(&mut self, value: Value) {
         match value["type"].as_str() {
+            Some("model_progress") => {
+                self.phase = Some(match value["stage"].as_str() {
+                    Some("loading_model") => "モデル読込待ち",
+                    Some("thinking") => "思考中",
+                    Some("generating") => "回答生成中",
+                    Some("preparing_tool") => "ツール呼出し準備中",
+                    _ => "モデル応答待ち",
+                });
+            }
             Some("text_delta") => self
                 .streaming
                 .push_str(value["delta"].as_str().unwrap_or_default()),
@@ -194,8 +205,15 @@ impl View {
             Some("record") => {
                 let event = &value["record"]["event"];
                 match event["type"].as_str() {
+                    Some("model_requested") => {
+                        self.request_started = Some(Instant::now());
+                        self.phase = Some("モデル応答待ち");
+                    }
                     Some("assistant") => {
                         if let Some(calls) = event["invocations"].as_array() {
+                            if !calls.is_empty() {
+                                self.phase = Some("ツール実行中");
+                            }
                             for call in calls {
                                 self.append(&format!(
                                     "Tool › {}",
@@ -204,11 +222,15 @@ impl View {
                             }
                         }
                     }
-                    Some("tool_finished") => self.append(&format!(
-                        "Tool › {}",
-                        event["outcome"]["status"].as_str().unwrap_or("finished")
-                    )),
+                    Some("tool_finished") => {
+                        self.phase = Some("処理を継続中");
+                        self.append(&format!(
+                            "Tool › {}",
+                            event["outcome"]["status"].as_str().unwrap_or("finished")
+                        ));
+                    }
                     Some("model_finished") => {
+                        self.phase = Some("結果を保存中");
                         let usage = &event["usage"]["usage"];
                         self.tokens = self
                             .tokens
@@ -241,6 +263,21 @@ impl View {
         let end = lines.len().saturating_sub(self.scroll);
         let start = end.saturating_sub(body_height);
         let mut out = std::io::stdout().lock();
+        let elapsed = self
+            .request_started
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+        let status = if busy {
+            let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            format!(
+                "{} {} {:.1}s · Escで取消",
+                spinner[(elapsed.as_millis() / 100) as usize % spinner.len()],
+                self.phase.unwrap_or("処理中"),
+                elapsed.as_secs_f32()
+            )
+        } else {
+            "ready".into()
+        };
         queue!(
             out,
             Hide,
@@ -262,16 +299,7 @@ impl View {
             MoveTo(0, status_row as u16),
             SetForegroundColor(Color::DarkGrey),
             Print(clip(
-                &format!(
-                    "{} · {} · {} tokens",
-                    args.model,
-                    if busy {
-                        "working · Esc cancels"
-                    } else {
-                        "ready"
-                    },
-                    self.tokens
-                ),
+                &format!("{} · {} · 確定 {} tokens", args.model, status, self.tokens),
                 width
             )),
             ResetColor
@@ -438,8 +466,12 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let _terminal = Terminal::enter()?;
     let mut worker: Option<Worker> = None;
     let mut dirty = true;
+    let mut last_frame = Instant::now();
     loop {
         if let Some(active) = &mut worker {
+            if view.request_started.is_none() {
+                view.request_started = Some(Instant::now());
+            }
             for value in active.events.try_iter() {
                 view.receive(value);
                 dirty = true;
@@ -461,12 +493,15 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         "Run stopped ({status}). Use /session to inspect its saved journal."
                     ));
                 }
+                view.request_started = None;
+                view.phase = None;
                 dirty = true;
             }
         }
-        if dirty {
+        if dirty || (worker.is_some() && last_frame.elapsed() >= Duration::from_millis(100)) {
             view.draw(&args, worker.is_some())?;
             dirty = false;
+            last_frame = Instant::now();
         }
         if !event::poll(Duration::from_millis(40))? {
             continue;
@@ -610,6 +645,20 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn progress_distinguishes_loading_thinking_and_generation() {
+        let mut view = View::default();
+        for (stage, label) in [
+            ("loading_model", "モデル読込待ち"),
+            ("thinking", "思考中"),
+            ("generating", "回答生成中"),
+        ] {
+            view.receive(json!({"type":"model_progress","stage":stage}));
+            assert_eq!(view.phase, Some(label));
+        }
+        assert!(view.streaming.is_empty());
+        assert_eq!(view.tokens, 0);
+    }
     #[test]
     fn editor_keeps_graphemes_intact() {
         let mut editor = Editor::default();

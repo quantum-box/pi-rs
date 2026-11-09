@@ -335,7 +335,8 @@ async fn execute(mut args: Cli) -> Result<()> {
             &args.workspace,
         )?))?;
     }
-    let provider = Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?;
+    let provider = Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?
+        .with_progress(|stage| output(json!({"type":"model_progress","stage":stage})));
     let agent = Agent {
         model: &provider,
         model_name: &args.model,

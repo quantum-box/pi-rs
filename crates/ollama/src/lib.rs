@@ -1,5 +1,6 @@
 //! Streaming adapter for Ollama's /v1/chat/completions interface.
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use eventsource_stream::Eventsource;
@@ -13,10 +14,36 @@ use pi_rs_core::{
     Usage,
 };
 
+#[derive(Clone)]
 pub struct Ollama {
     client: Client,
     endpoint: Url,
     token: Option<String>,
+    progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
+}
+
+/// Transient presentation signals, separate from the durable model result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProgress {
+    WaitingForModel,
+    LoadingModel,
+    Thinking,
+    Generating,
+    PreparingTool,
+}
+
+fn report_progress(
+    observer: &Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
+    previous: &mut Option<ModelProgress>,
+    progress: ModelProgress,
+) {
+    if *previous != Some(progress) {
+        *previous = Some(progress);
+        if let Some(observer) = observer {
+            observer(progress);
+        }
+    }
 }
 
 impl Ollama {
@@ -47,13 +74,52 @@ impl Ollama {
             client,
             endpoint,
             token,
+            progress: None,
         })
+    }
+
+    pub fn with_progress(
+        mut self,
+        observer: impl Fn(ModelProgress) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress = Some(Arc::new(observer));
+        self
+    }
+
+    async fn model_loaded(&self, model: &str) -> Option<bool> {
+        let mut endpoint = self.endpoint.clone();
+        endpoint.set_path("/api/ps");
+        let response = self
+            .client
+            .get(endpoint)
+            .timeout(Duration::from_millis(250))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        let value: Value = response.json().await.ok()?;
+        Some(value.get("models")?.as_array()?.iter().any(|item| {
+            item.get("name")
+                .or_else(|| item.get("model"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| {
+                    name.trim_end_matches(":latest") == model.trim_end_matches(":latest")
+                })
+        }))
     }
 }
 
 #[async_trait::async_trait]
 impl Model for Ollama {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        let requested_model = request.model.clone();
+        let mut last_progress = None;
+        report_progress(
+            &self.progress,
+            &mut last_progress,
+            ModelProgress::WaitingForModel,
+        );
         let messages: Vec<_> = request.messages.into_iter().map(encode_message).collect();
         let tools: Vec<_> = request
             .tools
@@ -72,10 +138,30 @@ impl Model for Ollama {
         if let Some(token) = &self.token {
             builder = builder.bearer_auth(token);
         }
-        let response = builder
-            .send()
-            .await
-            .map_err(|_| Error::RetryableModel("HTTP connection failed".into()))?;
+        let monitor_loading = self.progress.is_some()
+            && !requested_model.ends_with(":cloud")
+            && self.endpoint.port_or_known_default() == Some(11434)
+            && matches!(
+                self.endpoint.host_str(),
+                Some("localhost" | "127.0.0.1" | "[::1]")
+            );
+        let response = builder.send();
+        tokio::pin!(response);
+        let mut poll = tokio::time::interval(Duration::from_secs(1));
+        let response = loop {
+            tokio::select! {
+                result = &mut response => break result.map_err(|_| Error::RetryableModel("HTTP connection failed".into()))?,
+                _ = poll.tick(), if monitor_loading => {
+                    if let Some(loaded) = self.model_loaded(&requested_model).await {
+                        report_progress(&self.progress, &mut last_progress, if loaded {
+                            ModelProgress::WaitingForModel
+                        } else {
+                            ModelProgress::LoadingModel
+                        });
+                    }
+                }
+            }
+        };
         if !response.status().is_success() {
             let status = response.status();
             let description = format!("HTTP status {status}");
@@ -96,6 +182,8 @@ impl Model for Ollama {
             return Err(Error::Model("expected an SSE response".into()));
         }
 
+        let progress = self.progress.clone();
+        let loading_probe = self.clone();
         Ok(Box::pin(async_stream::try_stream! {
             let mut bytes = 0usize;
             let mut events = response.bytes_stream().map(move |chunk| {
@@ -109,7 +197,21 @@ impl Model for Ollama {
             let mut calls = BTreeMap::<usize, CallDelta>::new();
             let mut usage = None;
             let mut metadata = ModelMetadata::default();
-            while let Some(event) = events.next().await {
+            loop {
+                let event = tokio::select! {
+                    event = events.next() => event,
+                    _ = poll.tick(), if monitor_loading && matches!(last_progress, Some(ModelProgress::WaitingForModel | ModelProgress::LoadingModel)) => {
+                        if let Some(loaded) = loading_probe.model_loaded(&requested_model).await {
+                            report_progress(&progress, &mut last_progress, if loaded {
+                                ModelProgress::WaitingForModel
+                            } else {
+                                ModelProgress::LoadingModel
+                            });
+                        }
+                        continue;
+                    }
+                };
+                let Some(event) = event else { break; };
                 let event = event.map_err(|_| Error::RetryableModel("broken SSE stream".into()))?;
                 if event.data == "[DONE]" {
                     match metadata.finish_reason.as_deref() {
@@ -142,10 +244,16 @@ impl Model for Ollama {
                     if choice.index != 0 || metadata.finish_reason.is_some() {
                         Err(Error::Model("unexpected choice in model stream".into()))?;
                     }
+                    if choice.delta.reasoning.as_ref().or(choice.delta.reasoning_content.as_ref())
+                        .is_some_and(|text| !text.is_empty()) {
+                        report_progress(&progress, &mut last_progress, ModelProgress::Thinking);
+                    }
                     if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
+                        report_progress(&progress, &mut last_progress, ModelProgress::Generating);
                         yield ModelEvent::Text(content);
                     }
                     for delta in choice.delta.tool_calls.unwrap_or_default() {
+                        report_progress(&progress, &mut last_progress, ModelProgress::PreparingTool);
                         if delta.index >= 64 {
                             Err(Error::Model("invalid tool call index".into()))?;
                         }
@@ -230,6 +338,8 @@ struct Choice {
 #[derive(Deserialize)]
 struct Delta {
     content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<WireCall>>,
 }
 
