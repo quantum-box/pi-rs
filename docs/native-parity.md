@@ -441,3 +441,11 @@ has no separate default timeout, while the caller's configured tool deadline
 continues to apply. A shell that exits while descendants hold its output pipes
 returns after a bounded drain period. Unit and CLI fixtures cover line/byte
 limits, file recovery, Unicode boundaries, timeout output and inherited pipes.
+
+### Text paging checkpoint
+
+Text reads now scan files with bounded memory, including files larger than
+4 MiB. Pages retain complete lines and UTF-8 boundaries, report the next
+`offset`, reject offsets beyond the file, and explain when a single line
+exceeds the byte limit. Explicit line limits report remaining lines. Image
+normalization and the separate write-size limit retain their existing bounds.

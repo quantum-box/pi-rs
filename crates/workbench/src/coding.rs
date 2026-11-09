@@ -310,17 +310,12 @@ impl CodingTool {
 
     fn read(&self, args: &Value) -> Result<String> {
         let path = self.path(string(args, "path")?)?;
-        let content = self.text(&path)?;
         let offset = usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1))
             .unwrap_or(usize::MAX);
-        let limit = usize::try_from(args["limit"].as_u64().unwrap_or(2000)).unwrap_or(usize::MAX);
-        let selected = content
-            .lines()
-            .skip(offset)
-            .take(limit)
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(bounded(selected))
+        let limit = args["limit"]
+            .as_u64()
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+        crate::text_page::read(&path, offset, limit)
     }
 
     fn write(&self, args: &Value) -> Result<String> {
@@ -900,7 +895,7 @@ mod tests {
         assert_eq!(
             tool.read(&json!({"path":"src/a.txt","offset":2,"limit":1}))
                 .unwrap(),
-            "日本語"
+            "日本語\n\n[2 more lines in file. Use offset=3 to continue.]"
         );
         assert!(
             tool.write(&json!({"path":"../escape.txt","content":"bad"}))
