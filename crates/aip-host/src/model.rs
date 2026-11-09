@@ -31,6 +31,9 @@ pub(crate) struct BudgetedModel<'a> {
 
 #[async_trait::async_trait]
 impl Model for BudgetedModel<'_> {
+    async fn context_window(&self, model: &str) -> Option<u32> {
+        self.inner.context_window(model).await
+    }
     async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
         Err(Error::Config(
             "AIP model requests require a durable request ID".into(),

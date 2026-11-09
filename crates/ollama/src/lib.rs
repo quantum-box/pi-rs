@@ -163,32 +163,65 @@ impl Ollama {
         Ok(models)
     }
 
-    async fn model_loaded(&self, model: &str) -> Option<bool> {
+    async fn running_models(&self) -> Option<Value> {
+        let prefix = self.endpoint.path().strip_suffix("/v1/chat/completions")?;
         let mut endpoint = self.endpoint.clone();
-        endpoint.set_path("/api/ps");
-        let response = self
+        endpoint.set_path(&format!("{prefix}/api/ps"));
+        let mut request = self
             .client
             .get(endpoint)
-            .timeout(Duration::from_millis(250))
-            .send()
-            .await
-            .ok()?
-            .error_for_status()
-            .ok()?;
-        let value: Value = response.json().await.ok()?;
-        Some(value.get("models")?.as_array()?.iter().any(|item| {
-            item.get("name")
-                .or_else(|| item.get("model"))
-                .and_then(Value::as_str)
-                .is_some_and(|name| {
-                    name.trim_end_matches(":latest") == model.trim_end_matches(":latest")
-                })
-        }))
+            .timeout(Duration::from_millis(250));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let mut response = request.send().await.ok()?.error_for_status().ok()?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).ok()
     }
+
+    async fn model_loaded(&self, model: &str) -> Option<bool> {
+        let value = self.running_models().await?;
+        Some(
+            value
+                .get("models")?
+                .as_array()?
+                .iter()
+                .any(|item| running_model_matches(item, model)),
+        )
+    }
+}
+
+fn running_model_matches(item: &Value, model: &str) -> bool {
+    item.get("name")
+        .or_else(|| item.get("model"))
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.trim_end_matches(":latest") == model.trim_end_matches(":latest"))
+}
+
+fn running_context_window(value: &Value, model: &str) -> Option<u32> {
+    value
+        .get("models")?
+        .as_array()?
+        .iter()
+        .filter(|item| running_model_matches(item, model))
+        .filter_map(|item| item.get("context_length")?.as_u64()?.try_into().ok())
+        .filter(|window| *window > 0)
+        .min()
 }
 
 #[async_trait::async_trait]
 impl Model for Ollama {
+    async fn context_window(&self, model: &str) -> Option<u32> {
+        let value = self.running_models().await?;
+        running_context_window(&value, model)
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         let requested_model = request.model.clone();
         let mut last_progress = None;
@@ -503,6 +536,23 @@ struct CallDelta {
 #[cfg(test)]
 mod content_tests {
     use super::*;
+    #[test]
+    fn context_capacity_uses_matching_running_models_and_rejects_invalid_sizes() {
+        let value = json!({"models": [
+            {"name":"other:latest", "context_length": 1},
+            {"name":"small:latest", "context_length": 8192},
+            {"model":"small", "context_length": 4096},
+            {"name":"small", "context_length": 0},
+            {"name":"small", "context_length": -1},
+            {"name":"small", "context_length": "1024"},
+            {"name":"small", "context_length": 4294967296_u64}
+        ]});
+        assert_eq!(running_context_window(&value, "small"), Some(4096));
+        assert_eq!(running_context_window(&value, "small:latest"), Some(4096));
+        assert_eq!(running_context_window(&value, "missing"), None);
+        assert_eq!(running_context_window(&json!({}), "small"), None);
+    }
+
     #[test]
     fn thinking_override_preserves_defaults_and_maps_local_effort() {
         let local = Ollama::new("http://127.0.0.1:11434/v1/chat/completions", None).unwrap();

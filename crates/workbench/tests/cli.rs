@@ -171,7 +171,8 @@ fn model_fixture_with_config(
         server.local_addr().unwrap()
     );
     let handle = std::thread::spawn(move || {
-        for _ in 0..2 {
+        let mut completed = 0;
+        while completed < 2 {
             let (mut socket, _) = server.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -179,12 +180,14 @@ fn model_fixture_with_config(
             let mut reader = BufReader::new(&socket);
             let mut content_length = 0;
             let mut authorization = None;
+            let mut metadata_request = false;
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 if line.is_empty() || line == "\r\n" {
                     break;
                 }
+                metadata_request |= line.starts_with("GET /api/ps ");
                 if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                     content_length = value.trim().parse().unwrap();
                 }
@@ -195,6 +198,15 @@ fn model_fixture_with_config(
             if let Some(token) = expected_token {
                 assert_eq!(authorization, Some(format!("Bearer {token}")));
             }
+            if metadata_request {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            completed += 1;
             let mut body = vec![0; content_length];
             reader.read_exact(&mut body).unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();

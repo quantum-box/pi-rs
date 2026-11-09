@@ -1442,6 +1442,39 @@ mod tests {
         session.close().await.unwrap();
     }
 
+    struct WaitingContextModel(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Model for WaitingContextModel {
+        async fn context_window(&self, _: &str) -> Option<u32> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            panic!("cancelled metadata discovery must not reach inference")
+        }
+    }
+
+    #[tokio::test]
+    async fn context_capacity_discovery_can_be_cancelled() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut session =
+            SessionBuilder::new(Arc::new(WaitingContextModel(started.clone())), "waiting")
+                .in_memory()
+                .unwrap();
+        let control = session.controls();
+        let driver = async {
+            started.notified().await;
+            control.abort();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(session.prompt("cancel metadata lookup"), driver)
+        })
+        .await
+        .expect("metadata cancellation must finish promptly");
+        assert!(matches!(result, Err(Error::Cancelled)));
+        session.close().await.unwrap();
+    }
+
     struct WaitingModel;
     #[async_trait::async_trait]
     impl Model for WaitingModel {

@@ -16,6 +16,7 @@ struct Script {
     replies: Mutex<VecDeque<Vec<ModelEvent>>>,
     requests: Mutex<Vec<ModelRequest>>,
     concurrent_start: Option<tokio::sync::Barrier>,
+    context_window: AtomicUsize,
 }
 
 impl Script {
@@ -29,6 +30,11 @@ impl Script {
 
 #[async_trait::async_trait]
 impl Model for Script {
+    async fn context_window(&self, _: &str) -> Option<u32> {
+        u32::try_from(self.context_window.load(Ordering::SeqCst))
+            .ok()
+            .filter(|window| *window > 0)
+    }
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         let request_number = {
             let mut requests = self.requests.lock().unwrap();
@@ -863,54 +869,61 @@ async fn automatic_compaction_can_be_disabled_and_reenabled_without_removing_the
 
 #[tokio::test]
 async fn bounded_automatic_compaction_leaves_the_latest_input_unchanged() {
-    let mut session = Session::with_store(MemoryStore::default()).unwrap();
-    let model = Script::new(vec![
-        answer(&"z".repeat(1500)),
-        answer("older facts"),
-        answer("continued"),
-    ]);
-    let registry = Registry::default();
-    let mut harness = agent(&model, &registry);
-    harness.limits.output_tokens_per_request = 768;
-    let (_, mut inputs) = mpsc::channel(1);
-    let cancel = CancellationToken::new();
-    harness
-        .run(
-            &mut session,
-            Some("old question".into()),
-            &mut inputs,
-            &cancel,
-            &mut ignore,
-        )
-        .await
-        .unwrap();
-    harness.limits.context_window = Some(1350);
-    let latest = "This is the exact latest request.";
-    harness
-        .run(
-            &mut session,
-            Some(latest.into()),
-            &mut inputs,
-            &cancel,
-            &mut ignore,
-        )
-        .await
-        .unwrap();
-    let requests = model.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    assert!(
-        !serde_json::to_string(&requests[1])
-            .unwrap()
-            .contains(latest)
-    );
-    assert!(requests[2].messages.contains(&Message::User {
-        content: latest.into()
-    }));
-    assert!(
-        serde_json::to_string(&requests[2])
-            .unwrap()
-            .contains("older facts")
-    );
+    for discover in [false, true] {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let model = Script::new(vec![
+            answer(&"z".repeat(1500)),
+            answer("older facts"),
+            answer("continued"),
+        ]);
+        let registry = Registry::default();
+        let mut harness = agent(&model, &registry);
+        harness.limits.output_tokens_per_request = 768;
+        let (_, mut inputs) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        harness
+            .run(
+                &mut session,
+                Some("old question".into()),
+                &mut inputs,
+                &cancel,
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        if discover {
+            model.context_window.store(1350, Ordering::SeqCst);
+        } else {
+            model.context_window.store(1, Ordering::SeqCst);
+            harness.limits.context_window = Some(1350);
+        }
+        let latest = "This is the exact latest request.";
+        harness
+            .run(
+                &mut session,
+                Some(latest.into()),
+                &mut inputs,
+                &cancel,
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            !serde_json::to_string(&requests[1])
+                .unwrap()
+                .contains(latest)
+        );
+        assert!(requests[2].messages.contains(&Message::User {
+            content: latest.into()
+        }));
+        assert!(
+            serde_json::to_string(&requests[2])
+                .unwrap()
+                .contains("older facts")
+        );
+    }
 }
 
 #[test]

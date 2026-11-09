@@ -1153,5 +1153,30 @@ cloned controls, fork isolation and closed-session handling. Loopback
 Ollama-adapter checks cover live RPC changes during a held model request,
 settings persistence, field preservation, validation and manual summaries.
 Both terminal layouts were exercised with a model request still running.
-Model-specific reserve/retention settings, automatic context-window discovery
+Model-specific reserve/retention settings, unloaded-model context-window discovery
 and broader provider recovery behavior remain open.
+
+
+### Loaded-model context discovery checkpoint
+
+Models can provide their effective context capacity through the optional async
+`Model::context_window` method. The default remains unknown for existing model
+implementations. The agent uses discovered capacity when `Limits.context_window`
+is absent and preserves an explicit limit when supplied. Metadata waits honor
+cancellation and the model timeout. The host budget adapter forwards this
+capability to the wrapped model.
+
+Ollama reads the matching loaded model's `context_length` from `/api/ps`,
+including model-name aliases with `:latest`. Requests retain the configured
+proxy prefix and bearer authentication. Responses are bounded to 1 MiB and a
+250 ms timeout. Missing, malformed or unavailable metadata falls back to an
+unknown capacity. Unloaded models still require an explicit limit until their
+running capacity becomes available. The reported field is documented in the
+[Ollama running-model API](https://github.com/ollama/ollama/blob/main/docs/api.md#list-running-models).
+
+Core tests cover automatic compaction with discovered capacity, explicit-limit
+precedence and cancellation during discovery. Loopback Ollama-adapter checks
+cover an initially unloaded model, authenticated proxy paths, runtime capacity,
+explicit overrides, malformed/oversized replies, unavailable endpoints and
+metadata timeouts. Existing chat-only fixtures retain their inference checks
+and now reject unsupported metadata requests explicitly.

@@ -51,7 +51,7 @@ pub struct Limits {
     pub output_tokens_per_run: u32,
     pub model_timeout: Duration,
     pub tool_timeout: Duration,
-    /// Estimated total input/output context. When set, try one automatic compaction per run.
+    /// Explicit input/output context capacity. Otherwise use provider discovery when available.
     pub context_window: Option<u32>,
 }
 
@@ -353,7 +353,7 @@ impl Agent<'_> {
                     if request.max_output_tokens == 0 {
                         return Err(Error::Budget);
                     }
-                    if self.exceeds_context(&request)? {
+                    if self.exceeds_context(&request, cancel).await? {
                         if !session.auto_compaction_control().enabled() {
                             return Err(Error::Model(
                                 "context does not fit and automatic compaction is disabled".into(),
@@ -1368,7 +1368,7 @@ impl Agent<'_> {
             content.push_str("\n\nAdditional focus: ");
             content.push_str(instructions);
         }
-        if self.exceeds_context(&request)? {
+        if self.exceeds_context(&request, cancel).await? {
             return Err(Error::Model(
                 "older context does not fit the summary request".into(),
             ));
@@ -1405,8 +1405,20 @@ impl Agent<'_> {
         Ok(output as u32)
     }
 
-    fn exceeds_context(&self, request: &ModelRequest) -> Result<bool> {
-        let Some(window) = self.limits.context_window else {
+    async fn exceeds_context(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+    ) -> Result<bool> {
+        let window = match self.limits.context_window {
+            Some(window) => Some(window),
+            None => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = tokio::time::timeout(self.limits.model_timeout, self.model.context_window(&request.model)) => result.ok().flatten().filter(|window| *window > 0),
+            },
+        };
+        let Some(window) = window else {
             return Ok(false);
         };
         // Conservative approximation of the JSON input and role/tool overhead.

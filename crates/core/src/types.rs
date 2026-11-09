@@ -265,6 +265,10 @@ pub type ModelStream = futures_util::stream::BoxStream<'static, Result<ModelEven
 
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
+    /// Effective context capacity, when the provider can discover it.
+    async fn context_window(&self, _model: &str) -> Option<u32> {
+        None
+    }
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream>;
 
     /// Host adapters can reserve budget using this ID before calling a provider.
