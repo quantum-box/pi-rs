@@ -94,6 +94,9 @@ impl Keys {
                     &["ctrl+v"]
                 },
             ),
+            ("app.tree.foldOrUp", &["alt+left", "ctrl+left"]),
+            ("app.tree.unfoldOrDown", &["alt+right", "ctrl+right"]),
+            ("app.tree.editLabel", &["shift+l"]),
             ("app.session.rename", &["ctrl+r"]),
             ("app.session.delete", &["ctrl+d"]),
             ("app.session.deleteNoninvasive", &["ctrl+backspace"]),
@@ -154,7 +157,10 @@ impl Keys {
             .find(|(action, keys)| {
                 if matches!(
                     action.as_str(),
-                    "app.session.rename"
+                    "app.tree.foldOrUp"
+                        | "app.tree.unfoldOrDown"
+                        | "app.tree.editLabel"
+                        | "app.session.rename"
                         | "app.session.delete"
                         | "app.session.deleteNoninvasive"
                         | "app.session.toggleSort"

@@ -1419,9 +1419,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     };
                     Item {
                         label: format!(
-                            "{} ← {:?} {} {}",
+                            "{} {} {}",
                             record.id,
-                            record.parent,
                             labels.get(&record.id).map(String::as_str).unwrap_or(""),
                             description
                         ),
@@ -1429,7 +1428,13 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     }
                 })
                 .collect();
-            view.picker = Some(Picker::new("Session tree", items));
+            let parents = session
+                .records()
+                .iter()
+                .filter(|record| !matches!(record.event, pi_rs::Event::Checkout { .. }))
+                .map(|record| (record.id, record.parent))
+                .collect();
+            view.picker = Some(Picker::tree(items, parents, labels, session.head()));
         }
         "/checkout" => {
             let id = rest
@@ -1437,6 +1442,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 .map_err(|_| Error::Config("use /checkout <record-id>".into()))?;
             let mut session = Session::open(&args.session)?;
             session.checkout(id)?;
+            drop(session);
             view.restore(args)?;
         }
         _ => {
@@ -2228,6 +2234,13 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
         }
         Selection::Resume(path) => {
             slash(&format!("/resume {}", path.display()), args, view)?;
+        }
+        Selection::Label(id, label) => {
+            Session::open(&args.session)?.set_label(id, (!label.is_empty()).then_some(label))?;
+            slash("/tree", args, view)?;
+            if let Some(picker) = &mut view.picker {
+                picker.focus_record(id);
+            }
         }
         Selection::Checkout(id) => {
             let mut session = Session::open(&args.session)?;

@@ -9,6 +9,7 @@ pub enum Selection {
     RenameSession(PathBuf, String),
     DeleteSession(PathBuf),
     Checkout(u64),
+    Label(u64, String),
     Fork(u64),
     Model(String),
     Theme(String),
@@ -34,11 +35,13 @@ pub struct Picker {
     named_only: bool,
     show_path: bool,
     named_sessions: std::collections::HashSet<PathBuf>,
+    tree: Option<TreeState>,
 }
 #[derive(Clone)]
 enum SessionAction {
     Rename(PathBuf),
     Delete(PathBuf),
+    Label(u64),
 }
 pub enum Input {
     Continue,
@@ -61,6 +64,7 @@ impl Picker {
             named_only: false,
             show_path: false,
             named_sessions: Default::default(),
+            tree: None,
         }
     }
     pub fn sessions(
@@ -74,6 +78,44 @@ impl Picker {
             ..Self::new("Resume session", items)
         }
     }
+    pub fn tree(
+        items: Vec<Item>,
+        parents: std::collections::BTreeMap<u64, Option<u64>>,
+        labels: std::collections::BTreeMap<u64, String>,
+        head: u64,
+    ) -> Self {
+        let tree = TreeState::new(parents, labels, head);
+        let mut items: std::collections::BTreeMap<_, _> = items
+            .into_iter()
+            .filter_map(|item| {
+                if let Selection::Checkout(id) = item.selection {
+                    Some((id, item))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let ordered = tree
+            .order
+            .iter()
+            .filter_map(|id| items.remove(id))
+            .collect();
+        let mut picker = Self {
+            tree: Some(tree),
+            ..Self::new("Session tree", ordered)
+        };
+        picker.focus_record(head);
+        picker
+    }
+    pub fn focus_record(&mut self, id: u64) {
+        if let Some(index) = self
+            .matches()
+            .iter()
+            .position(|item| matches!(item.selection, Selection::Checkout(value) if value == id))
+        {
+            self.selected = index;
+        }
+    }
     fn matches(&self) -> Vec<&Item> {
         let query = self.query.to_lowercase();
         let mut matches: Vec<_> = self
@@ -84,6 +126,12 @@ impl Picker {
                     (&self.active_session, &item.selection)
                     && ((!self.all_workspaces && path.parent() != active.parent())
                         || (self.named_only && !self.named_sessions.contains(path)))
+                {
+                    return false;
+                }
+                if query.is_empty()
+                    && let (Some(tree), Selection::Checkout(id)) = (&self.tree, &item.selection)
+                    && !tree.visible.contains(id)
                 {
                     return false;
                 }
@@ -107,7 +155,7 @@ impl Picker {
         if let Some(action) = self.session_action.clone() {
             if key.code == KeyCode::Esc {
                 self.session_action = None;
-                if matches!(action, SessionAction::Rename(_)) {
+                if matches!(action, SessionAction::Rename(_) | SessionAction::Label(_)) {
                     self.query.clear();
                 }
                 return Input::Continue;
@@ -123,7 +171,10 @@ impl Picker {
                 SessionAction::Rename(path) if key.code == KeyCode::Enter => {
                     return Input::Select(Selection::RenameSession(path, self.query.clone()));
                 }
-                SessionAction::Rename(_) => {}
+                SessionAction::Label(id) if key.code == KeyCode::Enter => {
+                    return Input::Select(Selection::Label(id, self.query.clone()));
+                }
+                SessionAction::Rename(_) | SessionAction::Label(_) => {}
             }
         } else if self.active_session.is_some() {
             self.session_error = None;
@@ -173,6 +224,58 @@ impl Picker {
                 }
             }
         }
+        if self.session_action.is_none() && self.tree.is_some() {
+            let selected =
+                self.matches()
+                    .get(self.selected)
+                    .and_then(|item| match item.selection {
+                        Selection::Checkout(id) => Some(id),
+                        _ => None,
+                    });
+            if let Some(id) = selected {
+                if keys.matches("app.tree.editLabel", key) {
+                    self.query = self
+                        .tree
+                        .as_ref()
+                        .and_then(|tree| tree.labels.get(&id))
+                        .cloned()
+                        .unwrap_or_default();
+                    self.session_action = Some(SessionAction::Label(id));
+                    return Input::Continue;
+                }
+                if keys.matches("app.tree.foldOrUp", key) {
+                    let tree = self.tree.as_mut().expect("tree picker");
+                    let target = if tree
+                        .children
+                        .get(&id)
+                        .is_some_and(|children| !children.is_empty())
+                        && tree.collapsed.insert(id)
+                    {
+                        tree.rebuild_visible();
+                        id
+                    } else {
+                        tree.parents.get(&id).copied().flatten().unwrap_or(id)
+                    };
+                    self.focus_record(target);
+                    return Input::Continue;
+                }
+                if keys.matches("app.tree.unfoldOrDown", key) {
+                    let tree = self.tree.as_mut().expect("tree picker");
+                    let target = if tree.collapsed.remove(&id) {
+                        tree.rebuild_visible();
+                        id
+                    } else {
+                        tree.children
+                            .get(&id)
+                            .and_then(|children| children.first())
+                            .copied()
+                            .unwrap_or(id)
+                    };
+                    self.focus_record(target);
+                    return Input::Continue;
+                }
+            }
+        }
         let count = self.matches().len();
         match key.code {
             KeyCode::Esc => return Input::Cancel,
@@ -218,6 +321,10 @@ impl Picker {
                     format!("Rename session · {}", self.query),
                     "Type the new name · Enter to save · Esc to cancel",
                 ),
+                SessionAction::Label(id) => (
+                    format!("Label record {id} · {}", self.query),
+                    "Type the label · Enter to save · Empty to remove · Esc to cancel",
+                ),
                 SessionAction::Delete(path) => (
                     format!(
                         "Delete {}?",
@@ -255,6 +362,26 @@ impl Picker {
                             }
                             _ => item.label.clone(),
                         }
+                    } else if let (Some(tree), Selection::Checkout(id)) =
+                        (&self.tree, &item.selection)
+                    {
+                        format!(
+                            "{}{}{} {}",
+                            "  ".repeat(tree.depths.get(id).copied().unwrap_or(0).min(12)),
+                            if tree.collapsed.contains(id) {
+                                "▸"
+                            } else if tree
+                                .children
+                                .get(id)
+                                .is_some_and(|children| !children.is_empty())
+                            {
+                                "▾"
+                            } else {
+                                "·"
+                            },
+                            if *id == tree.head { "●" } else { " " },
+                            item.label
+                        )
                     } else {
                         item.label.clone()
                     }
@@ -296,6 +423,8 @@ impl Picker {
             } else {
                 "Recent order · Ctrl+S fuzzy · Ctrl+R rename · Ctrl+D delete · Esc cancel"
             }
+        } else if self.tree.is_some() {
+            "Type to search · Alt+←/→ fold/navigate · Shift+L label · Enter checkout · Esc cancel"
         } else {
             "Type to search · ↑↓ to select · Enter to open · Esc to cancel"
         };
@@ -304,9 +433,127 @@ impl Picker {
     }
 }
 
+struct TreeState {
+    parents: std::collections::BTreeMap<u64, Option<u64>>,
+    children: std::collections::BTreeMap<u64, Vec<u64>>,
+    labels: std::collections::BTreeMap<u64, String>,
+    roots: Vec<u64>,
+    order: Vec<u64>,
+    depths: std::collections::BTreeMap<u64, usize>,
+    collapsed: std::collections::BTreeSet<u64>,
+    visible: std::collections::BTreeSet<u64>,
+    head: u64,
+}
+impl TreeState {
+    fn new(
+        parents: std::collections::BTreeMap<u64, Option<u64>>,
+        labels: std::collections::BTreeMap<u64, String>,
+        head: u64,
+    ) -> Self {
+        let mut children = std::collections::BTreeMap::<_, Vec<_>>::new();
+        let mut roots = Vec::new();
+        for (&id, parent) in &parents {
+            if let Some(parent) = parent.filter(|parent| parents.contains_key(parent)) {
+                children.entry(parent).or_default().push(id);
+            } else {
+                roots.push(id);
+            }
+        }
+        let mut tree = Self {
+            parents,
+            children,
+            labels,
+            roots,
+            order: vec![],
+            depths: Default::default(),
+            collapsed: Default::default(),
+            visible: Default::default(),
+            head,
+        };
+        let mut pending: Vec<_> = tree.roots.iter().rev().map(|id| (*id, 0usize)).collect();
+        while let Some((id, depth)) = pending.pop() {
+            tree.order.push(id);
+            tree.depths.insert(id, depth);
+            if let Some(children) = tree.children.get(&id) {
+                let next_depth = depth + usize::from(children.len() > 1);
+                pending.extend(children.iter().rev().map(|child| (*child, next_depth)));
+            }
+        }
+        tree.rebuild_visible();
+        tree
+    }
+    fn rebuild_visible(&mut self) {
+        self.visible.clear();
+        let mut pending = self.roots.clone();
+        while let Some(id) = pending.pop() {
+            self.visible.insert(id);
+            if !self.collapsed.contains(&id)
+                && let Some(children) = self.children.get(&id)
+            {
+                pending.extend(children);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tree_folding_search_navigation_and_labels_preserve_record_identity() {
+        let parents = [
+            (1, None),
+            (2, Some(1)),
+            (3, Some(2)),
+            (4, Some(1)),
+            (5, Some(4)),
+        ]
+        .into_iter()
+        .collect();
+        let items = (1..=5)
+            .map(|id| Item {
+                label: format!("node {id}"),
+                selection: Selection::Checkout(id),
+            })
+            .collect();
+        let mut picker = Picker::tree(
+            items,
+            parents,
+            [(1, "root".into())].into_iter().collect(),
+            5,
+        );
+        let keys = super::super::keys::Keys::load().unwrap();
+        assert_eq!(picker.selected, 4);
+        picker.focus_record(1);
+        picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
+        assert_eq!(picker.matches().len(), 1);
+        picker.query = "3".into();
+        assert_eq!(picker.matches()[0].label, "node 3");
+        picker.query.clear();
+        picker.input(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &keys);
+        assert_eq!(picker.matches().len(), 5);
+        picker.input(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &keys);
+        assert!(matches!(
+            picker.matches()[picker.selected].selection,
+            Selection::Checkout(2)
+        ));
+        picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
+        picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
+        assert!(matches!(
+            picker.matches()[picker.selected].selection,
+            Selection::Checkout(1)
+        ));
+        picker.input(
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+            &keys,
+        );
+        assert_eq!(picker.query, "root");
+        picker.query = "updated".into();
+        assert!(
+            matches!(picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys), Input::Select(Selection::Label(1, value)) if value == "updated")
+        );
+    }
+
     #[test]
     fn session_scope_and_name_filters_compose_and_reset_selection() {
         let local = PathBuf::from("one/local.jsonl");

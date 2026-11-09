@@ -860,3 +860,16 @@ or compaction, in addition to the existing continuation after an abort.
 A native worker fixture verifies parent-only queue records, prompt isolation,
 review cancellation/resume and follow-up execution on the parent. Workspace
 tests and all-target Clippy pass.
+
+### Session tree navigation checkpoint
+
+The tree selector orders records by ancestry, marks the active head and indents
+forks. Alt+Left/Right folds, unfolds or moves through parent/child records.
+Searching includes records inside folded branches. Shift+L edits or removes a
+record label without changing its identity. Direct `/checkout` releases its
+journal lock before restoring the view.
+
+Unit tests and fullscreen/regular PTY fixtures cover branch navigation,
+folding, search, labels, checkout and terminal restoration. Session and queue
+selector regressions pass. Tree timestamps and richer branch summaries remain
+in the outstanding session work.
