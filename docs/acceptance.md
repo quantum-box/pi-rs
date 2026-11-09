@@ -171,3 +171,13 @@ Workflow に紐づけ、子は既存の子予算で精算する。統合試験12
 確認まで再送や完了扱いは発生しなかった。受付、承認と停止確認は試験用で、
 運用 Workspace の受付先と承認元の接続は残っている。
 [Coding Job の予算と試験](https://github.com/quantum-box/tachyon-apps/commit/ab06f831b047b9f44df8e48a8a147048f81b9221)
+
+### Workspace 受付における承認内容の照合
+
+承認したハーネス操作 ID、対象版、期限、対象と入力のハッシュを既存の専用実行状態に
+記録する。ハーネスで別の操作 ID・対象版・入力を拒否し、隔離 TiDB の Workspace
+受付記録では別 actor、期限切れ、Workspace・リポジトリ・ブランチ・入力の変更を
+拒否した。拒否後に残るジョブ行は0件。元の条件で再送すると同じジョブを返し、
+停止後は再受付を拒否した。運用の承認元と、Workspace がコマンドを起動する直前の
+照合は接続作業が残っている。
+[承認の照合と試験](https://github.com/quantum-box/tachyon-apps/commit/9dd9ee2c3ca8110afbe9ef11381f1eabd894fa20)
