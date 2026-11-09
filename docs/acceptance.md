@@ -263,3 +263,14 @@ Workflow の承認と評価設定に完全な Git コミットIDを指定する�
 ファイルが変わった場合に接続前に停止した。不正な版の受付では Workspace 操作が
 0件だった。Root 70件と隔離 TiDB を含む AIP 統合16件が通過した。
 [Workspace の Git 版照合と検証](https://github.com/quantum-box/tachyon-apps/commit/4b6357af859406871f77ebbc01d762957be4c735)
+
+
+### Workflow 評価設定から Field の模擬下書き
+
+対象 Goal で `field_mock` を設定すると、同じホストの模擬 Field サービスに
+下書きを送れる。既存の Workflow レビューを隔離 TiDB に保存し、承認した入力と
+操作カタログの版だけを許可した。受付応答を失った試験では、別のモデル操作IDで
+再試行しても書込み1件、受付の照会と委譲予算の精算は元のレビューで一度だけだった。
+AIP 統合16件は並列で3回、評価設定7件、Workflow の HTTP 呼出し9件、模擬操作を
+有効にした pi-rs のワークスペース試験25件が通過した。
+[Field 模擬プロファイルと受入試験](https://github.com/quantum-box/tachyon-apps/commit/94e09ca9f5d611433ddb0fb111584d5ef0b32d52)
