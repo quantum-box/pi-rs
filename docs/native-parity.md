@@ -14,7 +14,7 @@ remaining acceptance work for that surface.
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
-| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Full Markdown/table and diff layout fidelity, inline image display, regular-mode history redraw and remaining application actions |
+| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, inline image display, regular-mode history redraw and remaining application actions |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity, Windows runtime validation |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Upstream JSONL import, richer tree navigation and branch summaries, session picker rename/delete/sort, Radius sharing |
@@ -22,8 +22,8 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface, explicit hot reload |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI, resource globs and complete validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior and elicitation |
-| Codemode | Core tool invocation APIs | Sandboxed code execution and dynamic tool search |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery and task polling; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, codemode exposure and elicitation |
+| Codemode | Core tool invocation APIs and shared BM25 tool discovery | Sandboxed code execution and non-chat model invocation |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Published-crate resource bundles and complete source/filter compatibility |
@@ -256,3 +256,13 @@ System prompt arguments accept literal text or existing files resolved from the
 workspace. Repeatable `--append-system-prompt` values preserve their order in
 both one-shot CLI and persistent RPC. Native `-e` and `-n` aliases select
 extensions and session names.
+
+### Deferred discovery checkpoint
+
+MCP `deferred` exposure now hides tool schemas until `tool_search` loads a
+match. A native BM25 ranker uses names, descriptions, schema fields and server
+metadata. Selection state follows the journal branch and survives reopening.
+Exact exposure overrides and wildcard matching are supported. CLI allowlists
+without MCP names keep MCP discovery available without declaring all schemas.
+Tools receive only their owning extension state through an optional invocation
+hook; existing implementations continue through the original hook.

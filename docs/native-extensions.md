@@ -121,3 +121,20 @@ resources with `{ "source": "...", "skills": ["skills/example"] }`.
 Native executable tool descriptors also advertise `can_poll`. The process
 protocol forwards polling by tool name, stable job reference and original
 operation ID. Existing executable descriptors default this capability to false.
+
+## Deferred tool discovery
+
+`pi_rs_extensions::tool_search::ToolSearch` accepts `SearchDocument` values for
+registered tools that should be discovered on demand. It hides those schemas
+until `tool_search` finds a match. Ranking uses names, descriptions, schema
+property descriptions and namespace text. Loaded names are stored in extension
+state, so they follow checkout, fork and resume.
+
+The local MCP integration creates this extension for `deferred` tools. Exact
+`toolExposure` entries take precedence over wildcard entries. A CLI tool
+allowlist without an MCP namespace keeps those MCP tools discoverable while
+omitting their schemas from the initial model request.
+
+Stateful native tools may implement `invoke_with_state` to receive their owning
+extension's current branch state. The default delegates to `invoke`, preserving
+existing tools. The executable protocol forwards the same optional state.

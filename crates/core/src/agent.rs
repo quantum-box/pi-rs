@@ -783,6 +783,7 @@ impl Agent<'_> {
                 tool,
                 args,
                 context,
+                state: states.get(&tool.owner).cloned(),
                 guard,
             },
             Decision::Deny(reason) => Preparation::Skipped(reason),
@@ -892,19 +893,20 @@ impl Agent<'_> {
     }
 
     async fn invoke(&self, preparation: Preparation<'_>, cancel: &CancellationToken) -> Outcome {
-        let (tool, args, context, _guard) = match preparation {
+        let (tool, args, context, state, _guard) = match preparation {
             Preparation::Ready {
                 tool,
                 args,
                 context,
+                state,
                 guard,
-            } => (tool, args, context, guard),
+            } => (tool, args, context, state, guard),
             Preparation::Skipped(reason) => return Outcome::Skipped(reason),
         };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()),
-            result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.invoke(args, context)) =>
+            result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.invoke_with_state(args, context, state.as_ref())) =>
                 result.unwrap_or_else(|_| Outcome::Unknown("tool timed out".into())),
         }
     }
@@ -1136,6 +1138,7 @@ enum Preparation<'a> {
         tool: &'a RegisteredTool,
         args: serde_json::Value,
         context: ToolContext,
+        state: Option<crate::ExtensionState>,
         guard: tokio_util::sync::DropGuard,
     },
     Skipped(String),

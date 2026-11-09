@@ -90,6 +90,14 @@ impl Selection {
                 .is_some_and(|entries| entries.iter().any(|entry| entry.starts_with("mcp__"))),
         })
     }
+    pub fn enable_automatic(&mut self, name: &str) {
+        if !self.no_tools && self.allow.is_none() {
+            self.active.insert(name.into());
+        }
+    }
+    pub fn declares_mcp(&self) -> bool {
+        self.allow.is_none() || self.mcp_selected
+    }
     pub fn includes(&self, name: &str) -> bool {
         if self.exclude.iter().any(|pattern| pattern.is_match(name)) || self.removed.contains(name)
         {
@@ -108,7 +116,7 @@ impl Selection {
         if self.no_builtin && matches!(name, "read_text" | "count_lines" | "lookup_order") {
             return false;
         }
-        if BUILTINS.contains(&name) {
+        if BUILTINS.contains(&name) || name == "tool_search" {
             return false;
         }
         true

@@ -46,6 +46,8 @@ enum ProtocolRequest {
         name: String,
         arguments: Value,
         operation_id: String,
+        #[serde(default)]
+        state: Option<ExtensionState>,
     },
     Poll {
         name: String,
@@ -310,10 +312,19 @@ impl Tool for ExecutableTool {
         self.execution
     }
     async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome {
+        self.invoke_with_state(arguments, context, None).await
+    }
+    async fn invoke_with_state(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+    ) -> Outcome {
         let request = ProtocolRequest::Invoke {
             name: self.spec.name.clone(),
             arguments,
             operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
         };
         let path = self.executable.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
@@ -559,13 +570,16 @@ async fn dispatch(
             name,
             arguments,
             operation_id,
+            state,
         } => {
             let tool = extension
                 .tools()
                 .into_iter()
                 .find(|tool| tool.spec().name == name)
                 .ok_or_else(|| "unknown extension tool".to_owned())?;
-            encode(Ok(tool.invoke(arguments, context(&operation_id)?).await))
+            encode(Ok(tool
+                .invoke_with_state(arguments, context(&operation_id)?, state.as_ref())
+                .await))
         }
         ProtocolRequest::Poll {
             name,
@@ -643,6 +657,14 @@ mod tests {
         async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
             panic!("poll must not redispatch")
         }
+        async fn invoke_with_state(
+            &self,
+            _: Value,
+            _: ToolContext,
+            state: Option<&ExtensionState>,
+        ) -> Outcome {
+            Outcome::Succeeded(state.unwrap().data["text"].as_str().unwrap().into())
+        }
         async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
             Some(Outcome::Succeeded(reference.into()))
         }
@@ -655,6 +677,29 @@ mod tests {
         fn tools(&self) -> Vec<Arc<dyn Tool>> {
             vec![Arc::new(PollTool)]
         }
+    }
+    #[test]
+    fn protocol_forwards_owning_extension_state_to_tool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let request = ProtocolRequest::Invoke {
+            name: "polling".into(),
+            arguments: serde_json::json!({}),
+            operation_id: "00000000-0000-0000-0000-000000000001".into(),
+            state: Some(ExtensionState {
+                version: 1,
+                data: serde_json::json!({"text":"own state"}),
+            }),
+        };
+        let result = runtime
+            .block_on(dispatch(Arc::new(PollExtension), request))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Outcome>(result).unwrap(),
+            Outcome::Succeeded("own state".into())
+        );
     }
     #[test]
     fn protocol_advertises_and_forwards_polling_without_invocation() {

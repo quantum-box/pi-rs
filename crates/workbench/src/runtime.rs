@@ -1,6 +1,6 @@
 //! Shared local runtime construction for print, RPC and terminal sessions.
 use super::{Cli, DEFAULT_SYSTEM_PROMPT, mcp_config, output, resources};
-use pi_rs::{Agent, Limits, ProjectResources, Registry, Result, ollama::Ollama};
+use pi_rs::{Agent, Extension, Limits, ProjectResources, Registry, Result, ollama::Ollama};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde_json::json;
 use std::sync::Arc;
@@ -76,7 +76,33 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into());
     let mcp_connections = mcp_config::connect_all(args, false).await?;
     let result = async {
-        let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
+        let mut selection = super::tool_selection::Selection::new(args)?;
+        let documents: Vec<_> = mcp_connections
+            .iter()
+            .flat_map(|connection| {
+                let tools = if selection.declares_mcp() {
+                    connection.deferred_tools()
+                } else {
+                    connection.tools().into_iter().map(|tool| tool.spec()).collect()
+                };
+                tools.into_iter()
+                    .filter(|tool| selection.includes(&tool.name))
+                    .map(|tool| pi_rs_extensions::tool_search::SearchDocument {
+                        tool,
+                        namespace: format!("{} {}", connection.server_name, connection.description),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let hidden: std::collections::BTreeSet<_> = documents.iter()
+            .map(|document| document.tool.name.clone())
+            .collect();
+        if !documents.is_empty() {
+            selection.enable_automatic("tool_search");
+        }
+        let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = vec![Arc::new(
+            pi_rs_extensions::tool_search::ToolSearch::new(documents),
+        )];
         if let Some(project) = &args.project {
             extensions.push(Arc::new(ProjectInstructions {
                 resources: ProjectResources::open(&args.workspace, args.workspace.join(project))?,
@@ -131,14 +157,21 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         registry.register(Arc::new(pi_rs_workbench::coding::CodingTools::local(
             &args.workspace,
         )?))?;
-        let selection = super::tool_selection::Selection::new(args)?;
         registry.retain_tools(|tool| selection.includes(&tool.name));
-        let system_prompt = local_resources.system_prompt(
+        let visible_tools: Vec<_> = registry.tool_specs().into_iter().filter(|tool| !hidden.contains(&tool.name)).collect();
+        let mut system_prompt = local_resources.system_prompt(
             &base_prompt,
             args.system_prompt.is_some(),
-            &registry.tool_specs(),
+            &visible_tools,
             &args.workspace,
         );
+        if !hidden.is_empty() {
+            system_prompt.push_str("\n\n<mcp_servers>\nUse tool_search to find and load deferred tools from these servers.\n");
+            for connection in &mcp_connections {
+                system_prompt.push_str(&format!("- {}: {}\n", connection.server_name, connection.description));
+            }
+            system_prompt.push_str("</mcp_servers>");
+        }
         let show_reasoning = args.trace;
         let provider = Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?
             .with_reasoning_effort(args.thinking.as_deref())

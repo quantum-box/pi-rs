@@ -1,5 +1,6 @@
 //! Native extensions whose state follows the durable session branch.
 mod process;
+pub mod tool_search;
 pub use process::{ExecutableExtension, serve_extension};
 use std::sync::Arc;
 

@@ -33,6 +33,15 @@ pub trait Tool: Send + Sync {
         ToolExecution::Sequential
     }
     async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome;
+    /// Invoke with this tool's owning extension state from the active branch.
+    async fn invoke_with_state(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        _state: Option<&ExtensionState>,
+    ) -> Outcome {
+        self.invoke(arguments, context).await
+    }
     /// Explicitly opt into automatic pending-job polling.
     fn can_poll(&self) -> bool {
         false
@@ -168,6 +177,7 @@ pub trait Extension: Send + Sync {
 }
 
 pub(crate) struct RegisteredTool {
+    pub owner: String,
     pub tool: Arc<dyn Tool>,
     pub spec: ToolSpec,
     pub validator: jsonschema::Validator,
@@ -315,6 +325,7 @@ impl Registry {
             tools.insert(
                 name.clone(),
                 Arc::new(RegisteredTool {
+                    owner: extension.id().to_owned(),
                     tool,
                     spec,
                     validator,

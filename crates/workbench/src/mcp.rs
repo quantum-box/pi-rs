@@ -1,5 +1,5 @@
 //! Native MCP client connections exposed through the shared tool contract.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,6 +78,7 @@ impl Drop for Connection {
 pub struct McpExtension {
     id: String,
     tools: Vec<Arc<dyn Tool>>,
+    deferred: BTreeSet<String>,
     pub server_name: String,
     pub description: String,
     connection: Arc<Connection>,
@@ -91,6 +92,21 @@ impl McpExtension {
         {
             return Err(Error::Config(
                 "MCP server names use letters, digits, underscore or hyphen".into(),
+            ));
+        }
+        if config
+            .exposure
+            .iter()
+            .chain(config.tool_exposure.values())
+            .any(|value| {
+                !matches!(
+                    value.as_str(),
+                    "direct" | "deferred" | "codemode" | "codemode-deferred" | "hidden" | "off"
+                )
+            })
+        {
+            return Err(Error::Config(
+                "MCP exposure must be direct, deferred, codemode, or hidden".into(),
             ));
         }
         let timeout = Duration::from_secs(config.timeout.unwrap_or(60).clamp(1, 3600));
@@ -213,6 +229,7 @@ impl McpExtension {
             *counts.entry(normalize(&definition.name)).or_default() += 1;
         }
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut deferred = BTreeSet::new();
         for definition in definitions {
             if !tool_enabled(config, &definition.name) {
                 continue;
@@ -231,6 +248,9 @@ impl McpExtension {
                     .unwrap_or_else(|| definition.name.to_string()),
                 parameters: Value::Object((*definition.input_schema).clone()),
             };
+            if is_deferred(config, &definition.name) {
+                deferred.insert(spec.name.clone());
+            }
             tools.push(Arc::new(McpTool {
                 connection: connection.clone(),
                 remote_name: definition.name.into_owned(),
@@ -265,6 +285,9 @@ impl McpExtension {
                 let mut exposed = format!("{prefix}{name}");
                 while tools.iter().any(|tool| tool.spec().name == exposed) {
                     exposed.push_str("_resource");
+                }
+                if is_deferred(config, name) {
+                    deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
                     connection: connection.clone(),
@@ -301,6 +324,9 @@ impl McpExtension {
                 while tools.iter().any(|tool| tool.spec().name == exposed) {
                     exposed.push_str("_prompt");
                 }
+                if is_deferred(config, name) {
+                    deferred.insert(exposed.clone());
+                }
                 tools.push(Arc::new(McpTool {
                     connection: connection.clone(),
                     remote_name: name.into(),
@@ -316,15 +342,32 @@ impl McpExtension {
         let description = config
             .description
             .clone()
-            .or_else(|| info.clone().and_then(|info| info.instructions.clone()))
+            .or_else(|| {
+                info.clone()
+                    .and_then(|info| info.instructions.clone())
+                    .and_then(|instructions| {
+                        instructions
+                            .lines()
+                            .find(|line| !line.trim().is_empty())
+                            .map(str::to_owned)
+                    })
+            })
             .unwrap_or_default();
         Ok(Self {
             id: format!("mcp-{}", normalize(name)),
             tools,
+            deferred,
             server_name: name.into(),
             description,
             connection,
         })
+    }
+    pub fn deferred_tools(&self) -> Vec<ToolSpec> {
+        self.tools
+            .iter()
+            .map(|tool| tool.spec())
+            .filter(|tool| self.deferred.contains(&tool.name))
+            .collect()
     }
     pub async fn close(&self) {
         let _ = self
@@ -430,12 +473,36 @@ fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> R
     Ok(identity)
 }
 
-fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
-    !config
+fn exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
+    config
         .tool_exposure
         .get(name)
+        .or_else(|| {
+            config
+                .tool_exposure
+                .iter()
+                .find(|(pattern, _)| {
+                    pattern.contains('*')
+                        && regex::Regex::new(&format!(
+                            "^{}$",
+                            regex::escape(pattern).replace("\\*", ".*")
+                        ))
+                        .is_ok_and(|matcher| matcher.is_match(name))
+                })
+                .map(|(_, value)| value)
+        })
         .or(config.exposure.as_ref())
-        .is_some_and(|value| value == "hidden" || value == "off")
+        .map(String::as_str)
+        .unwrap_or("direct")
+}
+fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
+    !matches!(exposure(config, name), "hidden" | "off")
+}
+fn is_deferred(config: &ServerConfig, name: &str) -> bool {
+    matches!(
+        exposure(config, name),
+        "deferred" | "codemode" | "codemode-deferred"
+    )
 }
 
 #[async_trait::async_trait]
@@ -650,6 +717,13 @@ pub async fn resolve_value(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_exposure_overrides_wildcard_selection() {
+        let config: ServerConfig = serde_json::from_value(json!({"url":"http://127.0.0.1/mcp","exposure":"hidden","toolExposure":{"read*":"deferred","read_one":"direct"}})).unwrap();
+        assert_eq!(exposure(&config, "read_one"), "direct");
+        assert!(is_deferred(&config, "read_many"));
+        assert!(!tool_enabled(&config, "write"));
+    }
     #[test]
     fn task_identity_uses_canonical_workspace_across_resume() {
         let config: ServerConfig =
