@@ -8,8 +8,9 @@ use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
-    Error, Message, Model, ModelEvent, ModelRequest, ModelStream, Result, ToolCall, Usage,
+use pi_rs_core::{
+    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result, ToolCall,
+    Usage,
 };
 
 pub struct Ollama {
@@ -74,9 +75,17 @@ impl Model for Ollama {
         let response = builder
             .send()
             .await
-            .map_err(|_| Error::Model("HTTP connection failed".into()))?;
+            .map_err(|_| Error::RetryableModel("HTTP connection failed".into()))?;
         if !response.status().is_success() {
-            return Err(Error::Model(format!("HTTP status {}", response.status())));
+            let status = response.status();
+            let description = format!("HTTP status {status}");
+            return Err(
+                if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+                    Error::RetryableModel(description)
+                } else {
+                    Error::Model(description)
+                },
+            );
         }
         if !response
             .headers()
@@ -99,11 +108,11 @@ impl Model for Ollama {
             }).eventsource();
             let mut calls = BTreeMap::<usize, CallDelta>::new();
             let mut usage = None;
-            let mut finish = None;
+            let mut metadata = ModelMetadata::default();
             while let Some(event) = events.next().await {
-                let event = event.map_err(|_| Error::Model("broken SSE stream".into()))?;
+                let event = event.map_err(|_| Error::RetryableModel("broken SSE stream".into()))?;
                 if event.data == "[DONE]" {
-                    match finish.as_deref() {
+                    match metadata.finish_reason.as_deref() {
                         Some("stop") if calls.is_empty() => {},
                         Some("tool_calls") if !calls.is_empty() => {},
                         _ => Err(Error::Model("model response did not finish successfully".into()))?,
@@ -119,11 +128,18 @@ impl Model for Ollama {
                 if chunk.error.is_some() {
                     Err(Error::Model("provider returned a stream error".into()))?;
                 }
+                let previous = metadata.clone();
+                if let Some(id) = chunk.id
+                    && id.len() <= 128 && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+                {
+                    metadata.provider_request_id = Some(id);
+                }
                 if let Some(stats) = chunk.usage {
                     usage = Some(Usage { input_tokens: stats.prompt_tokens, output_tokens: stats.completion_tokens });
+                    metadata.cached_input_tokens = stats.prompt_tokens_details.and_then(|details| details.cached_tokens);
                 }
                 for choice in chunk.choices {
-                    if choice.index != 0 || finish.is_some() {
+                    if choice.index != 0 || metadata.finish_reason.is_some() {
                         Err(Error::Model("unexpected choice in model stream".into()))?;
                     }
                     if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
@@ -140,10 +156,18 @@ impl Model for Ollama {
                             call.arguments.push_str(function.arguments.as_deref().unwrap_or(""));
                         }
                     }
-                    finish = choice.finish_reason;
+                    metadata.finish_reason = choice.finish_reason.map(|reason| {
+                        match reason.as_str() {
+                            "stop" | "tool_calls" | "length" | "content_filter" => reason,
+                            _ => "other".into(),
+                        }
+                    });
+                }
+                if metadata != previous {
+                    yield ModelEvent::Metadata(metadata.clone());
                 }
             }
-            Err(Error::Model("SSE closed before the end marker".into()))?;
+            Err(Error::RetryableModel("SSE closed before the end marker".into()))?;
         }))
     }
 }
@@ -177,6 +201,7 @@ fn encode_message(message: Message) -> Value {
 
 #[derive(Deserialize)]
 struct Chunk {
+    id: Option<String>,
     #[serde(default)]
     choices: Vec<Choice>,
     error: Option<Value>,
@@ -187,6 +212,12 @@ struct Chunk {
 struct WireUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    prompt_tokens_details: Option<PromptTokenDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokenDetails {
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]

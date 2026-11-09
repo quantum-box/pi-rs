@@ -1,0 +1,17 @@
+[package]
+name = "pi-rs-ollama"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Ollama streaming model adapter for pi-rs"
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+eventsource-stream = "0.2"
+futures-util = "0.3"
+pi-rs-core = { path = "../core", version = "0.1.0" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -572,7 +572,7 @@ async fn model_summary_uses_no_tools_and_preserves_the_prior_branch() {
         |message| matches!(message, Message::User { content } if content == "private original")
     ));
     assert!(session.records().iter().any(
-        |record| matches!(&record.event, Event::User { content } if content == "private original")
+        |record| matches!(&record.event, Event::User { content, .. } if content == "private original")
     ));
     assert_eq!(fixture.called.load(Ordering::SeqCst), 0);
 }
@@ -617,7 +617,13 @@ async fn ollama_sse_requires_end_marker_even_after_finish_reason() {
     assert!(
         matches!(stream.next().await.unwrap().unwrap(), ModelEvent::Text(value) if value == "partial")
     );
-    assert!(matches!(stream.next().await.unwrap(), Err(Error::Model(_))));
+    assert!(
+        matches!(stream.next().await.unwrap(), Ok(ModelEvent::Metadata(metadata)) if metadata.finish_reason.as_deref() == Some("stop"))
+    );
+    assert!(matches!(
+        stream.next().await.unwrap(),
+        Err(Error::RetryableModel(_))
+    ));
     assert!(stream.next().await.is_none());
     serve.join().unwrap();
 }
@@ -652,4 +658,243 @@ async fn tool_timeout_blocks_until_reconciliation() {
         matches!(&session.operations()[0].1, OperationState::Finished(Outcome::Unknown(reason)) if reason == "tool timed out")
     );
     assert_eq!(fixture.called.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn durable_queue_distinguishes_followups_and_deduplicates_deliveries() {
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let model = Script::new(vec![
+        tool_reply(&[r#"{"id":"42"}"#]),
+        answer("first"),
+        answer("second"),
+    ]);
+    let fixture = Arc::new(Fixture {
+        called: AtomicUsize::new(0),
+        hold: false,
+        effects: Mutex::default(),
+    });
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Tools(fixture))).unwrap();
+    let agent = agent(&model, &registry);
+    let (send, mut input) = mpsc::channel(8);
+    let follow = QueuedInput {
+        id: uuid::Uuid::new_v4(),
+        kind: InputKind::FollowUp,
+        content: "do the next task".into(),
+    };
+    send.try_send(follow.clone()).unwrap();
+    send.try_send(follow.clone()).unwrap();
+    let run_id = uuid::Uuid::new_v4();
+    let cancel = CancellationToken::new();
+    let result = agent
+        .run_correlated(
+            &mut session,
+            run_id,
+            Some("initial".into()),
+            &mut input,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "second");
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(
+            !serde_json::to_string(&requests[1])
+                .unwrap()
+                .contains(&follow.content)
+        );
+        assert!(
+            serde_json::to_string(&requests[2])
+                .unwrap()
+                .contains(&follow.content)
+        );
+    }
+    let matches = session.records().iter().filter(|record| matches!(record.event, Event::InputQueued { ref input } if input.id == follow.id)).count();
+    assert_eq!(matches, 1);
+    assert!(
+        matches!(agent.run_correlated(&mut session, run_id, Some("initial".into()), &mut input, &cancel, &mut ignore).await, Err(Error::DuplicateRun(id)) if id == run_id)
+    );
+    assert_eq!(
+        agent
+            .run_correlated(&mut session, run_id, None, &mut input, &cancel, &mut ignore)
+            .await
+            .unwrap(),
+        "second"
+    );
+}
+
+struct ParallelFixture {
+    barrier: tokio::sync::Barrier,
+}
+
+#[async_trait::async_trait]
+impl Tool for ParallelFixture {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "lookup".into(),
+            description: "Read fixture".into(),
+            parameters: json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}),
+        }
+    }
+    fn execution(&self) -> ToolExecution {
+        ToolExecution::ParallelRead
+    }
+
+    async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+        self.barrier.wait().await;
+        let id = args["id"].as_str().unwrap();
+        if id == "slow" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Outcome::Succeeded(id.into())
+    }
+}
+
+struct ParallelExtension;
+impl Extension for ParallelExtension {
+    fn id(&self) -> &str {
+        "parallel-fixture"
+    }
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![Arc::new(ParallelFixture {
+            barrier: tokio::sync::Barrier::new(2),
+        })]
+    }
+}
+
+#[tokio::test]
+async fn parallel_read_results_keep_their_original_call_ids() {
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let mut registry = Registry::default();
+    registry.register(Arc::new(ParallelExtension)).unwrap();
+    let model = Script::new(vec![
+        tool_reply(&[r#"{"id":"slow"}"#, r#"{"id":"fast"}"#]),
+        answer("done"),
+    ]);
+    let (_, mut inputs) = mpsc::channel(1);
+    let mut harness = agent(&model, &registry);
+    harness.limits.tool_timeout = Duration::from_secs(2);
+    harness
+        .run(
+            &mut session,
+            Some("read both".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let requests = model.requests.lock().unwrap();
+    assert!(requests[1].messages.contains(&Message::Tool {
+        call_id: "call-0".into(),
+        content: "slow".into()
+    }));
+    assert!(requests[1].messages.contains(&Message::Tool {
+        call_id: "call-1".into(),
+        content: "fast".into()
+    }));
+}
+
+#[tokio::test]
+async fn bounded_automatic_compaction_leaves_the_latest_input_unchanged() {
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let model = Script::new(vec![
+        answer(&"z".repeat(1500)),
+        answer("older facts"),
+        answer("continued"),
+    ]);
+    let registry = Registry::default();
+    let mut harness = agent(&model, &registry);
+    harness.limits.output_tokens_per_request = 768;
+    let (_, mut inputs) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    harness
+        .run(
+            &mut session,
+            Some("old question".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    harness.limits.context_window = Some(1350);
+    let latest = "This is the exact latest request.";
+    harness
+        .run(
+            &mut session,
+            Some(latest.into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        !serde_json::to_string(&requests[1])
+            .unwrap()
+            .contains(latest)
+    );
+    assert!(requests[2].messages.contains(&Message::User {
+        content: latest.into()
+    }));
+    assert!(
+        serde_json::to_string(&requests[2])
+            .unwrap()
+            .contains("older facts")
+    );
+}
+
+#[test]
+fn project_skill_resolution_validates_version_and_scope() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let nested = root.join("nested");
+    for dir in [root, nested.as_path()] {
+        std::fs::create_dir_all(dir.join(".pi/skills/review")).unwrap();
+        std::fs::write(
+            dir.join(".pi/skills/review/SKILL.md"),
+            dir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+    }
+    let resources = ProjectResources::open(root, &nested).unwrap();
+    assert_eq!(resources.skills().unwrap(), ["review"]);
+    let skill = resources.skill("review", None).unwrap();
+    assert_eq!(skill.id, "nested/.pi/skills/review/SKILL.md");
+    std::fs::write(nested.join(".pi/skills/review/SKILL.md"), "new version").unwrap();
+    assert!(resources.skill("review", Some(&skill.version)).is_err());
+    let unrelated = tempdir().unwrap();
+    assert!(ProjectResources::open(root, unrelated.path()).is_err());
+}
+
+#[test]
+fn v1_journal_is_preserved_when_v2_appends() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.jsonl");
+    let session_id = uuid::Uuid::new_v4();
+    let original = format!(
+        "{}\n{}",
+        json!({"version":1,"id":1,"parent":null,"event":{"type":"created","session_id":session_id}}),
+        format_args!(
+            "{}\n",
+            json!({"version":1,"id":2,"parent":1,"event":{"type":"user","content":"legacy input"}})
+        )
+    );
+    std::fs::write(&path, &original).unwrap();
+    let mut session = Session::open(&path).unwrap();
+    assert_eq!(session.session_id(), session_id);
+    session.checkout(1).unwrap();
+    assert_eq!(session.records().last().unwrap().version, 2);
+    drop(session);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .starts_with(&original)
+    );
+    assert_eq!(Session::open(&path).unwrap().head(), 1);
 }

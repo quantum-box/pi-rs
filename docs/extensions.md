@@ -114,3 +114,37 @@ The journal stores actual conversation payloads, and the opt-in trace exposes
 the context sent to the adapter. Use fixture data for full traces. A managed
 deployment needs a tenant-scoped store, content redaction at the observation
 boundary, and retention policies.
+
+## Host commands and profiles
+
+`Registry::compose` resolves enabled dependencies in order. It rejects unknown
+extensions, missing dependencies, dependency cycles, and conflicting tool
+names. A disabled extension has no tools or hooks. Its journal state is kept
+for later reactivation. Static commands are host-only and scoped by extension
+ID. They commit state changes on the active branch.
+
+The workbench enables plan mode and branch review as separate crates. Use
+`extension plan-mode start '<plan>'`, `revise '<plan>'`, `accept`, or
+`discard`. Planning exposes only the host's read-only allowlist and rechecks
+that allowlist before dispatch. Accepting a plan only changes local mode.
+Business authorization still belongs to the destination.
+
+Use `review --child <child-journal> [--from-record <record-id>] '<task>'`
+to run a read-only review in a distinct journal. The parent links the child
+and snapshot record. The child gets a bounded conversation snapshot and
+explicit read-only tools, and its answer is returned to the parent's active
+branch. Use the same task and `--resume` to continue an interrupted review.
+A parent journal holds an exclusive writer lock during the review. File
+contents and external effects are owned by their original systems.
+
+Tools are sequential unless the host declares them parallel reads.
+Consecutive parallel reads run in groups of at most eight. Their results
+are committed in call order. Writes and job dispatches are barriers.
+An accepted asynchronous job can return a durable pending reference.
+Pending and unknown outcomes prevent further model requests until the
+destination is reconciled. Truncated output is reported separately.
+
+Signed AIP webhooks remain a host contract. The existing AIP pre-tool
+webhook can deny and the post-tool and stop notifications are asynchronous.
+Use the synchronous Rust policy boundary to enforce execution and the host's
+existing signature and redaction for any external delivery.

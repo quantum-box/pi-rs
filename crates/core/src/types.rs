@@ -12,6 +12,8 @@ pub enum Error {
     Session(String),
     #[error("model: {0}")]
     Model(String),
+    #[error("model temporarily unavailable: {0}")]
+    RetryableModel(String),
     #[error("extension {id}: {message}")]
     Extension { id: String, message: String },
     #[error("configuration: {0}")]
@@ -22,8 +24,36 @@ pub enum Error {
     Budget,
     #[error("tool operation {0} requires reconciliation")]
     Reconciliation(Uuid),
+    #[error("tool operation {0} is still pending at its execution service")]
+    PendingOperation(Uuid),
+    #[error("run {0} is already recorded; use explicit resume to continue it")]
+    DuplicateRun(Uuid),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputKind {
+    Steer,
+    FollowUp,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueuedInput {
+    pub id: Uuid,
+    pub kind: InputKind,
+    pub content: String,
+}
+
+impl From<String> for QueuedInput {
+    fn from(content: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            kind: InputKind::Steer,
+            content,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
@@ -73,9 +103,25 @@ pub struct ModelRequest {
     pub max_output_tokens: u32,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelMetadata {
+    pub provider_request_id: Option<String>,
+    pub cached_input_tokens: Option<u64>,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsageReport {
+    Measured { usage: Usage },
+    Estimated { output_tokens: u64 },
+    Unconfirmed,
+}
+
 #[derive(Clone, Debug)]
 pub enum ModelEvent {
     Text(String),
+    Metadata(ModelMetadata),
     Complete {
         calls: Vec<ToolCall>,
         usage: Option<Usage>,
@@ -87,6 +133,20 @@ pub type ModelStream = futures_util::stream::BoxStream<'static, Result<ModelEven
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream>;
+
+    /// Host adapters can reserve budget using this ID before calling a provider.
+    async fn stream_with_id(
+        &self,
+        _request_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream(request).await
+    }
+
+    /// Called after the usage record is durable and before tools or another request.
+    async fn record_usage(&self, _request_id: Uuid, _usage: &UsageReport) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -97,6 +157,24 @@ pub enum Outcome {
     Skipped(String),
     /// An effect may have occurred. Only an authoritative reconciliation can clear this state.
     Unknown(String),
+    /// A remote job was accepted and needs an authoritative terminal result.
+    Pending {
+        reference: String,
+    },
+    Truncated {
+        original_bytes: usize,
+    },
+    Structured {
+        data: Value,
+        attachments: Vec<AttachmentRef>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentRef {
+    /// A host-owned reference, never an access token or a signed download URL.
+    pub id: String,
+    pub media_type: String,
 }
 
 impl Outcome {
@@ -106,6 +184,13 @@ impl Outcome {
             Self::Failed(reason) => format!("Tool failed: {reason}"),
             Self::Skipped(reason) => format!("Tool did not start: {reason}"),
             Self::Unknown(reason) => format!("Tool outcome unknown: {reason}"),
+            Self::Pending { .. } => "Tool operation is still pending".into(),
+            Self::Truncated { original_bytes } => format!(
+                "Tool succeeded. Output omitted ({original_bytes} bytes exceeded the limit)."
+            ),
+            Self::Structured { data, attachments } => {
+                serde_json::json!({ "data": data, "attachments": attachments }).to_string()
+            }
         }
     }
 }

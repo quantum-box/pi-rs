@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use pi_rs::{
-    Agent, CancellationToken, Compaction, Error, Event, Limits, Notification, OperationState,
-    Outcome, Registry, Result, Session, ollama::Ollama, project_context,
+    Agent, CancellationToken, Compaction, Error, Event, InputKind, Limits, Notification,
+    OperationState, Outcome, ProjectResources, QueuedInput, Registry, Result, Session,
+    ollama::Ollama,
 };
-use pi_rs_workbench::{CommandPolicy, Tools, WorkbenchContext};
+use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -66,9 +67,18 @@ struct Cli {
     model_timeout_secs: u64,
     #[arg(long, default_value_t = 30, global = true)]
     tool_timeout_secs: u64,
+    /// Estimated model context window. Enables bounded automatic compaction.
+    #[arg(long, global = true)]
+    context_window: Option<u32>,
     /// Read follow-up and cancellation messages as JSON lines on stdin.
     #[arg(long, global = true)]
     stdin_control: bool,
+    /// Correlation key for retrying or explicitly resuming a host run.
+    #[arg(long, global = true)]
+    run_id: Option<Uuid>,
+    /// Disable an optional compiled extension by ID.
+    #[arg(long, global = true)]
+    disable_extension: Vec<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -90,6 +100,21 @@ enum Command {
         record_id: u64,
     },
     Inspect,
+    Review {
+        #[arg(long)]
+        child: PathBuf,
+        #[arg(long)]
+        from_record: Option<u64>,
+        #[arg(long)]
+        resume: bool,
+        task: String,
+    },
+    Extension {
+        extension_id: String,
+        command: String,
+        #[arg(default_value = "")]
+        arguments: String,
+    },
     Reconcile {
         operation_id: Uuid,
         resolution: Resolution,
@@ -106,7 +131,8 @@ enum Resolution {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Control {
-    Followup { content: String },
+    Followup { content: String, id: Option<Uuid> },
+    Steer { content: String, id: Option<Uuid> },
     Cancel,
 }
 
@@ -125,6 +151,11 @@ async fn main() {
 
 async fn execute(args: Cli) -> Result<()> {
     let mut session = Session::open(&args.session)?;
+    if session.host_binding().is_some() {
+        return Err(Error::Session(
+            "a managed session must be opened by its host".into(),
+        ));
+    }
     match args.command {
         Command::Inspect => {
             for record in session.records() {
@@ -170,25 +201,30 @@ async fn execute(args: Cli) -> Result<()> {
         }
         _ => {}
     }
-    let mut system_prompt = args
+    let system_prompt = args
         .system_prompt
         .as_ref()
         .map(std::fs::read_to_string)
         .transpose()?
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into());
+    let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
     if let Some(project) = &args.project {
-        system_prompt.push_str(&project_context(
-            &args.workspace,
-            args.workspace.join(project),
-            &args.skill,
-        )?);
+        extensions.push(Arc::new(ProjectInstructions {
+            resources: ProjectResources::open(&args.workspace, args.workspace.join(project))?,
+            skills: args.skill,
+        }));
     }
-    let mut registry = Registry::default();
+    extensions.push(Arc::new(WorkbenchContext {
+        instruction: args.instruction,
+    }));
+    extensions.push(Arc::new(pi_rs_plan_mode::PlanMode::new([
+        "read_text".into(),
+        "lookup_order".into(),
+    ])));
+    let mut registry =
+        Registry::compose(extensions, &args.disable_extension.into_iter().collect())?;
     registry.register(Arc::new(CommandPolicy {
         allow_commands: args.allow_commands,
-    }))?;
-    registry.register(Arc::new(WorkbenchContext {
-        instruction: args.instruction,
     }))?;
     let order_config = args
         .orders
@@ -207,6 +243,7 @@ async fn execute(args: Cli) -> Result<()> {
             output_tokens_per_run: args.output_budget,
             model_timeout: Duration::from_secs(args.model_timeout_secs),
             tool_timeout: Duration::from_secs(args.tool_timeout_secs),
+            context_window: args.context_window,
         },
     };
     let mut observer = |event: Notification<'_>| match event {
@@ -231,6 +268,66 @@ async fn execute(args: Cli) -> Result<()> {
         }
     });
     let input = match args.command {
+        Command::Review {
+            child,
+            from_record,
+            resume,
+            task,
+        } => {
+            let mut child = Session::open(child)?;
+            let review = pi_rs_review::Review {
+                task: &task,
+                from_record,
+                resume,
+                timeout: Duration::from_secs(args.model_timeout_secs),
+                output_budget: args.output_budget,
+                allowed_tools: ["read_text", "lookup_order"]
+                    .into_iter()
+                    .filter(|name| registry.has_tool(name))
+                    .map(str::to_owned)
+                    .collect(),
+            };
+            let parent_id = session.session_id();
+            let child_id = child.session_id();
+            let mut child_observer = |event: Notification<'_>| {
+                if let Notification::Committed(record) = event {
+                    let mut event = if args.trace {
+                        json!({"type":"record","record":record})
+                    } else {
+                        metadata(record)
+                    };
+                    event["review_parent_session"] = json!(parent_id);
+                    event["review_child_session"] = json!(child_id);
+                    output(event);
+                }
+            };
+            let answer = review
+                .run(
+                    &agent,
+                    &mut session,
+                    &mut child,
+                    &cancel,
+                    &mut child_observer,
+                )
+                .await?;
+            output(
+                json!({"type":"review_answer","content":answer,"child_session":child_id,"parent_session":parent_id}),
+            );
+            return Ok(());
+        }
+        Command::Extension {
+            extension_id,
+            command,
+            arguments,
+        } => {
+            return agent.extension_command(
+                &mut session,
+                &extension_id,
+                &command,
+                &arguments,
+                &mut observer,
+            );
+        }
         Command::Compact {
             summary: Some(summary),
             keep_turns,
@@ -261,13 +358,20 @@ async fn execute(args: Cli) -> Result<()> {
         read_controls(sender, cancel.clone());
     }
     let answer = agent
-        .run(&mut session, input, &mut receiver, &cancel, &mut observer)
+        .run_correlated(
+            &mut session,
+            args.run_id.unwrap_or_else(Uuid::new_v4),
+            input,
+            &mut receiver,
+            &cancel,
+            &mut observer,
+        )
         .await?;
     output(json!({"type": "answer", "content": answer}));
     Ok(())
 }
 
-fn read_controls(sender: mpsc::Sender<String>, cancel: CancellationToken) {
+fn read_controls(sender: mpsc::Sender<QueuedInput>, cancel: CancellationToken) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -277,8 +381,18 @@ fn read_controls(sender: mpsc::Sender<String>, cancel: CancellationToken) {
                     cancel.cancel();
                     return;
                 }
-                Ok(Control::Followup { content }) => {
-                    if sender.try_send(content).is_err() {
+                Ok(control @ (Control::Followup { .. } | Control::Steer { .. })) => {
+                    let (kind, content, id) = match control {
+                        Control::Followup { content, id } => (InputKind::FollowUp, content, id),
+                        Control::Steer { content, id } => (InputKind::Steer, content, id),
+                        Control::Cancel => unreachable!(),
+                    };
+                    let input = QueuedInput {
+                        id: id.unwrap_or_else(Uuid::new_v4),
+                        kind,
+                        content,
+                    };
+                    if sender.try_send(input).is_err() {
                         output(
                             json!({"type": "input_rejected", "reason": "follow-up queue unavailable"}),
                         );
@@ -300,16 +414,36 @@ fn output(event: Value) {
 fn metadata(record: &pi_rs::Record) -> Value {
     let mut value = match &record.event {
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),
+        Event::HostBound { .. } => json!({"event": "host_bound"}),
+        Event::HostRunBound { run_id, .. } => json!({"event": "host_run_bound", "run_id": run_id}),
         Event::Checkout { target } => json!({"event": "checkout", "target": target}),
-        Event::Run { state } => json!({"event": "run", "state": state}),
-        Event::User { .. } => json!({"event": "user"}),
+        Event::Run { state, .. } => json!({"event": "run", "state": state}),
+        Event::User { input_id, .. } => json!({"event": "user", "input_id": input_id}),
+        Event::InputQueued { input } => {
+            json!({"event": "input_queued", "input_id": input.id, "kind": input.kind})
+        }
         Event::ModelRequested {
             model,
             messages,
             tools,
             max_output_tokens,
+            request_id,
+            context_head,
+            context_sha256,
         } => {
-            json!({"event": "model_requested", "model": model, "messages": messages, "tools": tools, "max_output_tokens": max_output_tokens})
+            json!({"event": "model_requested", "request_id": request_id, "context_head": context_head, "context_sha256": context_sha256, "model": model, "messages": messages, "tools": tools, "max_output_tokens": max_output_tokens})
+        }
+        Event::ModelFinished {
+            request_id,
+            metadata,
+            usage,
+            failure,
+            ..
+        } => {
+            json!({"event": "model_finished", "request_id": request_id, "metadata": metadata, "usage": usage, "failure": failure})
+        }
+        Event::TurnFinished { assistant_record } => {
+            json!({"event": "turn_finished", "assistant_record": assistant_record})
         }
         Event::Assistant {
             invocations, usage, ..
@@ -352,6 +486,7 @@ fn metadata(record: &pi_rs::Record) -> Value {
     value["type"] = json!("record");
     value["id"] = json!(record.id);
     value["parent"] = json!(record.parent);
+    value["run_id"] = json!(record.run_id);
     value
 }
 
@@ -361,5 +496,8 @@ fn outcome_status(outcome: &Outcome) -> &'static str {
         Outcome::Failed(_) => "failed",
         Outcome::Skipped(_) => "skipped",
         Outcome::Unknown(_) => "unknown",
+        Outcome::Pending { .. } => "pending",
+        Outcome::Truncated { .. } => "truncated",
+        Outcome::Structured { .. } => "succeeded",
     }
 }

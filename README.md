@@ -37,9 +37,11 @@ and returns the stored answer if the turn already completed.
   `GET <collection-url>/<id>`. Authentication is supplied separately via
   `PI_RS_MODEL_TOKEN` or `PI_RS_ORDERS_TOKEN`.
 - `--stdin-control` on `run` or `resume` accepts
-  `{"type":"followup","content":"..."}` and `{"type":"cancel"}` as JSON lines.
-  The durable user record acknowledges an accepted follow-up. Follow-ups enter
-  context between complete tool batches or model turns. Ctrl-C also cancels.
+  `{"type":"steer","content":"..."}`, `{"type":"followup","content":"..."}`,
+  and `{"type":"cancel"}` as JSON lines. Optional UUID `id` deduplicates
+  a resend. An `input_queued` event acknowledges durable receipt. Steering
+  enters before the next model call. Follow-up waits for the current turn
+  to finish. Ctrl-C also cancels.
 - Stdout uses JSONL. The default stream includes record IDs, statuses, tool
   names, usage, and the final answer. Use `--trace` in a trusted workspace to
   include request context, tool arguments and outputs, and streamed text.
@@ -65,3 +67,18 @@ The [workbench extension crate](crates/workbench/src/lib.rs) provides tool
 registration, a command policy, and a versioned context extension.
 [Evaluation and adoption](docs/evaluation.md) records the pinned Pi comparison
 and the boundaries with AIP, Field, and Workspace Runtime.
+
+### Execution contracts
+
+- `--context-window <estimated-tokens>` enables one automatic compaction
+  attempt per run. The newest request is preserved verbatim. Older history
+  is summarized under the same output budget.
+- `--run-id <uuid>` lets a host correlate an initial request and an explicit
+  `resume`. Duplicate initial requests fail before model or tool execution.
+- Standard output is JSONL. Standard error carries errors. Exit 0 is success,
+  1 is a runtime error (including operations awaiting reconciliation), 2 is
+  CLI input error, and 130 is cancellation. Broken output pipes do not stop
+  durable writes. Use the journal to determine the final state.
+- See [architecture](docs/architecture.md) and the
+  [extension contract](docs/extensions.md) for provider-neutral embedding,
+  plan mode, and branch review.

@@ -1,0 +1,21 @@
+[package]
+name = "pi-rs-aip-host"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Host composition for AIP-owned runs, reservations and delegated tools"
+
+[dependencies]
+async-trait = "0.1"
+pi-rs-core = { path = "../core", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["sync"] }
+uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "time"] }

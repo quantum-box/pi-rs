@@ -1,0 +1,123 @@
+use std::collections::BTreeSet;
+
+use pi_rs_core::{
+    Decision, Extension, ExtensionResult, ExtensionState, Message, ModelRequest, ToolContext,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub struct PlanMode {
+    read_only: BTreeSet<String>,
+}
+
+impl PlanMode {
+    /// The host attests that these exact tools cannot cause side effects.
+    pub fn new(read_only: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            read_only: read_only.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum PlanState {
+    #[default]
+    Normal,
+    Planning {
+        plan: String,
+    },
+    Executing {
+        plan: String,
+    },
+}
+
+fn decode(state: Option<&ExtensionState>) -> ExtensionResult<PlanState> {
+    match state {
+        None => Ok(PlanState::Normal),
+        Some(state) if state.version == 1 => {
+            serde_json::from_value(state.data.clone()).map_err(|_| "invalid plan state".into())
+        }
+        Some(_) => Err("unsupported plan state version".into()),
+    }
+}
+
+#[async_trait::async_trait]
+impl Extension for PlanMode {
+    fn id(&self) -> &str {
+        "plan-mode"
+    }
+
+    fn commands(&self) -> &[&str] {
+        &["start", "revise", "accept", "discard"]
+    }
+
+    fn command(
+        &self,
+        name: &str,
+        argument: &str,
+        previous: Option<&ExtensionState>,
+    ) -> ExtensionResult<ExtensionState> {
+        let state = decode(previous)?;
+        let bounded_plan = || {
+            if argument.trim().is_empty() || argument.len() > 16 * 1024 {
+                Err("plan must contain 1 to 16384 bytes".to_string())
+            } else {
+                Ok(argument.to_owned())
+            }
+        };
+        let next = match (name, state) {
+            ("start", _) | ("revise", PlanState::Planning { .. }) => PlanState::Planning {
+                plan: bounded_plan()?,
+            },
+            ("accept", PlanState::Planning { plan }) => PlanState::Executing { plan },
+            ("discard", _) => PlanState::Normal,
+            _ => return Err("invalid plan mode transition".into()),
+        };
+        Ok(ExtensionState {
+            version: 1,
+            data: serde_json::to_value(next).map_err(|error| error.to_string())?,
+        })
+    }
+
+    fn context(
+        &self,
+        request: &mut ModelRequest,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        let plan = match decode(state)? {
+            PlanState::Normal => return Ok(()),
+            PlanState::Planning { plan } => {
+                request
+                    .tools
+                    .retain(|tool| self.read_only.contains(&tool.name));
+                format!(
+                    "Planning mode. Investigate with the approved read-only tools. Current plan:\n{plan}"
+                )
+            }
+            PlanState::Executing { plan } => format!(
+                "Accepted working plan. Follow the host's current authorization for each operation.\n{plan}"
+            ),
+        };
+        request.messages.insert(
+            1.min(request.messages.len()),
+            Message::User { content: plan },
+        );
+        Ok(())
+    }
+
+    async fn before_tool(
+        &self,
+        name: &str,
+        _: &Value,
+        _: &ToolContext,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Decision> {
+        if matches!(decode(state)?, PlanState::Planning { .. }) && !self.read_only.contains(name) {
+            return Ok(Decision::Deny(
+                "plan mode only allows host-approved read-only tools".into(),
+            ));
+        }
+        Ok(Decision::Allow)
+    }
+}

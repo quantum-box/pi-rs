@@ -1,14 +1,5 @@
-//! Model, session, and tool execution primitives for an embeddable agent.
-mod agent;
-mod context;
-mod extension;
-mod journal;
-pub mod ollama;
-mod types;
+//! Public entry point for the agent core and its optional Ollama adapter.
+pub use pi_rs_core::*;
 
-pub use agent::*;
-pub use context::*;
-pub use extension::*;
-pub use journal::*;
-pub use tokio_util::sync::CancellationToken;
-pub use types::*;
+#[cfg(feature = "ollama")]
+pub use pi_rs_ollama as ollama;

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use pi_rs::{
     Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState, Message, ModelRequest,
-    Outcome, Result, Tool, ToolContext, ToolSpec,
+    Outcome, Result, Tool, ToolContext, ToolExecution, ToolSpec,
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
@@ -78,6 +78,34 @@ impl Extension for CommandPolicy {
         } else {
             Decision::Allow
         })
+    }
+}
+
+pub struct ProjectInstructions {
+    pub resources: pi_rs::ProjectResources,
+    pub skills: Vec<String>,
+}
+
+impl Extension for ProjectInstructions {
+    fn id(&self) -> &str {
+        "workbench-project"
+    }
+
+    fn context(
+        &self,
+        request: &mut ModelRequest,
+        _: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        let Some(Message::System { content }) = request.messages.first_mut() else {
+            return Err("system message missing".into());
+        };
+        content.push_str(
+            &self
+                .resources
+                .context(&self.skills)
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(())
     }
 }
 
@@ -190,6 +218,13 @@ impl Tool for FileTool {
             name: name.into(),
             description: description.into(),
             parameters: string_argument("path"),
+        }
+    }
+
+    fn execution(&self) -> ToolExecution {
+        match self.kind {
+            FileKind::Read => ToolExecution::ParallelRead,
+            FileKind::Count => ToolExecution::Sequential,
         }
     }
 
@@ -314,6 +349,10 @@ impl Tool for OrderLookup {
             description: "Retrieve an order by its exact order ID.".into(),
             parameters: string_argument("id"),
         }
+    }
+
+    fn execution(&self) -> ToolExecution {
+        ToolExecution::ParallelRead
     }
 
     async fn invoke(&self, arguments: Value, _: ToolContext) -> Outcome {
