@@ -109,6 +109,9 @@ pub struct ModelMetadata {
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Provider-native prompt count when the host reports a normalized total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<ResolvedModelIdentity>,
     pub finish_reason: Option<String>,
