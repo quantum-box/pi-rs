@@ -576,26 +576,13 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         }
         "get_session_stats" if !busy(worker) => {
             let session = Session::open(&args.session)?;
-            let mut stats = serde_json::to_value(sessions::statistics(&session))?;
-            stats["sessionId"] = json!(session.session_id());
+            let mut stats = serde_json::to_value(session.statistics())?;
             stats["sessionFile"] = json!(args.session);
-            stats["sessionName"] = json!(session.name());
-            if let Some(window) = args.context_window.filter(|window| *window > 0) {
-                let estimate = session.context_usage_estimate();
-                let after_compaction = session
-                    .branch()
-                    .iter()
-                    .any(|record| matches!(record.event, pi_rs::Event::Compacted { .. }));
-                let tokens = if after_compaction && estimate.last_usage_record.is_none() {
-                    None
-                } else {
-                    Some(estimate.tokens)
-                };
-                stats["contextUsage"] = json!({
-                    "tokens":tokens,
-                    "contextWindow":window,
-                    "percent":tokens.map(|tokens| tokens as f64 / f64::from(window) * 100.0),
-                });
+            if let Some(usage) = args
+                .context_window
+                .and_then(|window| session.context_usage(window))
+            {
+                stats["contextUsage"] = serde_json::to_value(usage)?;
             }
             Ok(Some(stats))
         }

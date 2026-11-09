@@ -273,6 +273,27 @@ impl AgentSession {
     pub fn messages(&self) -> Result<Vec<Message>> {
         self.session.conversation_at(self.session.head())
     }
+    /// Usage and message counts across the complete durable session.
+    pub fn statistics(&self) -> crate::SessionStats {
+        self.session.statistics()
+    }
+
+    /// Resolve the configured or provider-reported context window within the model timeout.
+    pub async fn context_usage(&self) -> Result<Option<crate::ContextUsage>> {
+        self.ensure_open()?;
+        let window = match self.limits.context_window {
+            Some(window) => Some(window),
+            None => tokio::time::timeout(
+                self.limits.model_timeout,
+                self.model.context_window(&self.model_name),
+            )
+            .await
+            .ok()
+            .flatten(),
+        };
+        Ok(window.and_then(|window| self.session.context_usage(window)))
+    }
+
     pub fn tools(&self) -> Vec<crate::ToolSpec> {
         self.registry.tool_specs()
     }
@@ -830,6 +851,116 @@ mod tests {
         );
         session.summarize(0).await.unwrap();
         assert_eq!(model.0.load(Ordering::SeqCst), 3);
+        session.close().await.unwrap();
+    }
+
+    struct StatisticsModel {
+        slow_discovery: bool,
+    }
+    #[async_trait::async_trait]
+    impl Model for StatisticsModel {
+        async fn context_window(&self, _: &str) -> Option<u32> {
+            if self.slow_discovery {
+                std::future::pending::<()>().await;
+            }
+            Some(8192)
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Metadata(crate::ModelMetadata {
+                    cached_input_tokens: Some(2),
+                    cost_usd: serde_json::Number::from_f64(0.125),
+                    ..Default::default()
+                })),
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(crate::Usage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_statistics_and_context_usage_share_the_durable_session() {
+        let mut session = SessionBuilder::new(
+            Arc::new(StatisticsModel {
+                slow_discovery: false,
+            }),
+            "stats",
+        )
+        .limits(Limits {
+            context_window: Some(4096),
+            ..Default::default()
+        })
+        .in_memory()
+        .unwrap();
+        assert_eq!(session.statistics().cost, Some(0.0));
+        session.prompt("hello").await.unwrap();
+        let stats = session.statistics();
+        assert_eq!(stats, session.journal().statistics());
+        assert_eq!(stats.session_id, session.journal().session_id());
+        assert_eq!((stats.user_messages, stats.assistant_messages), (1, 1));
+        assert_eq!(
+            (
+                stats.tokens.input,
+                stats.tokens.cache_read,
+                stats.tokens.output,
+                stats.tokens.total
+            ),
+            (8, 2, 3, 13)
+        );
+        assert_eq!(stats.cost, Some(0.125));
+        let usage = session.context_usage().await.unwrap().unwrap();
+        assert_eq!((usage.context_window, usage.tokens), (4096, Some(13)));
+        assert_eq!(usage.percent, Some(13.0 / 4096.0 * 100.0));
+        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        assert_eq!(fork.statistics().tokens, stats.tokens);
+        assert_ne!(fork.statistics().session_id, stats.session_id);
+        session.summarize(0).await.unwrap();
+        assert_eq!(session.statistics().tokens.total, 26);
+        assert_eq!(session.context_usage().await.unwrap().unwrap().tokens, None);
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+        assert!(session.context_usage().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sdk_context_discovery_is_bounded_and_used_without_an_override() {
+        let mut session = SessionBuilder::new(
+            Arc::new(StatisticsModel {
+                slow_discovery: false,
+            }),
+            "stats",
+        )
+        .in_memory()
+        .unwrap();
+        assert_eq!(
+            session
+                .context_usage()
+                .await
+                .unwrap()
+                .unwrap()
+                .context_window,
+            8192
+        );
+        session.close().await.unwrap();
+        let mut session = SessionBuilder::new(
+            Arc::new(StatisticsModel {
+                slow_discovery: true,
+            }),
+            "stats",
+        )
+        .limits(Limits {
+            model_timeout: std::time::Duration::from_millis(5),
+            ..Default::default()
+        })
+        .in_memory()
+        .unwrap();
+        assert_eq!(session.context_usage().await.unwrap(), None);
         session.close().await.unwrap();
     }
 

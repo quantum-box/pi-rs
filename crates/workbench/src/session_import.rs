@@ -646,32 +646,20 @@ mod tests {
             json!({"type":"compaction","id":"c","parentId":"usage","firstKeptEntryId":"u","summary":"summary","usage":{"input":1,"output":1,"cost":{"total":0.0625}}}),
         ];
         let session = import_pi(entries.clone()).unwrap();
-        assert_eq!(crate::sessions::statistics(&session).cost, Some(0.9375));
+        assert_eq!(session.statistics().cost, Some(0.9375));
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("costs.jsonl");
         session.export_jsonl(&file).unwrap();
-        assert_eq!(
-            crate::sessions::statistics(&Session::open(file).unwrap()).cost,
-            Some(0.9375)
-        );
+        assert_eq!(Session::open(file).unwrap().statistics().cost, Some(0.9375));
         entries[3]["message"]["usage"]["cost"] = Value::Null;
-        assert_eq!(
-            crate::sessions::statistics(&import_pi(entries.clone()).unwrap()).cost,
-            None
-        );
+        assert_eq!(import_pi(entries.clone()).unwrap().statistics().cost, None);
         entries[3]["message"]["usage"]["cost"] = json!({"total":-1});
-        assert_eq!(
-            crate::sessions::statistics(&import_pi(entries.clone()).unwrap()).cost,
-            None
-        );
+        assert_eq!(import_pi(entries.clone()).unwrap().statistics().cost, None);
         entries[3]["message"]
             .as_object_mut()
             .unwrap()
             .remove("usage");
-        assert_eq!(
-            crate::sessions::statistics(&import_pi(entries).unwrap()).cost,
-            None
-        );
+        assert_eq!(import_pi(entries).unwrap().statistics().cost, None);
     }
 
     #[test]
@@ -686,7 +674,7 @@ mod tests {
             json!({"type":"message","id":"branch","parentId":"u","message":{"role":"user","content":"other branch"}}),
         ];
         let session = import_pi(entries).unwrap();
-        let stats = serde_json::to_value(crate::sessions::statistics(&session)).unwrap();
+        let stats = serde_json::to_value(session.statistics()).unwrap();
         assert_eq!(stats["userMessages"], 2);
         assert_eq!(stats["assistantMessages"], 1);
         assert_eq!(stats["toolCalls"], 1);

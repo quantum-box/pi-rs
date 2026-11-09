@@ -1489,3 +1489,17 @@ missing costs and invalid costs. The same fixture returns USD 0.9375 from both
 the pinned Pi statistics implementation and the native RPC. The complete
 workspace tests and all-target Clippy pass. Provider price
 catalogs, automatic native pricing and detailed cost provenance remain open.
+
+### SDK statistics checkpoint
+
+`Session::statistics` and `AgentSession::statistics` expose the same typed,
+serializable totals used by RPC, including session identity. The aggregation
+lives in the core crate so embedded clients and the workbench share it.
+`Session::context_usage` accepts a known window; the owned SDK's asynchronous
+`context_usage` resolves an explicit window or queries the model with a timeout.
+
+SDK tests cover measured usage and cost, session identity, fork totals,
+post-compaction unknown context, explicit-window precedence, provider discovery,
+closed sessions and discovery timeouts. Existing RPC statistics and cost checks,
+the complete workspace tests and all-target Clippy also pass. Additional resource/model/auth factories
+and the other SDK equivalents remain open.
