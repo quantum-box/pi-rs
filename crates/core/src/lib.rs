@@ -5,6 +5,7 @@ mod extension;
 mod journal;
 mod sdk;
 mod types;
+mod ui;
 
 pub use agent::*;
 pub use context::*;
@@ -13,3 +14,4 @@ pub use journal::*;
 pub use sdk::*;
 pub use tokio_util::sync::CancellationToken;
 pub use types::*;
+pub use ui::*;

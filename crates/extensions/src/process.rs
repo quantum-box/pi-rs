@@ -482,10 +482,15 @@ impl ToolHost for DetachedHost {
 struct DuplexRequest {
     request: ProtocolRequest,
     tools: Vec<ToolSpec>,
+    #[serde(default)]
+    has_ui: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DuplexFrame {
+    Ui {
+        request: pi_rs_core::UiRequest,
+    },
     Call {
         calls: Vec<(String, Value)>,
     },
@@ -557,7 +562,7 @@ fn call_duplex(
         let mut output = std::io::BufReader::new(output);
         loop {
             let frame = read_line::<DuplexFrame>(&mut output);
-            let terminal = !matches!(frame, Ok(DuplexFrame::Call { .. }));
+            let terminal = !matches!(frame, Ok(DuplexFrame::Call { .. } | DuplexFrame::Ui { .. }));
             if sender.send(frame).is_err() || terminal {
                 break;
             }
@@ -568,6 +573,7 @@ fn call_duplex(
             serde_json::to_value(DuplexRequest {
                 request,
                 tools: host.tools(),
+                has_ui: host.has_ui(),
             })
             .map_err(|error| error.to_string())?,
         )
@@ -597,6 +603,18 @@ fn call_duplex(
                     .send(serde_json::to_value(results).map_err(|error| error.to_string())?)
                     .map_err(|_| "native extension input closed")?;
             }
+            Ok(Ok(DuplexFrame::Ui { request })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during UI request".to_owned()),
+                        result = host.ui(request) => result,
+                    }
+                });
+                writer
+                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
+                    .map_err(|_| "native extension input closed")?;
+            }
             Ok(Ok(DuplexFrame::Complete { response })) => {
                 let result = serde_json::from_value(response?)
                     .map_err(|error| format!("invalid native extension result: {error}"));
@@ -614,10 +632,30 @@ fn call_duplex(
 
 struct RemoteHost {
     tools: Vec<ToolSpec>,
+    has_ui: bool,
     io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
 }
 #[async_trait::async_trait]
 impl ToolHost for RemoteHost {
+    fn has_ui(&self) -> bool {
+        self.has_ui
+    }
+    async fn ui(&self, request: pi_rs_core::UiRequest) -> ExtensionResult<pi_rs_core::UiResponse> {
+        if !self.has_ui {
+            return Err("interactive extension UI is unavailable".into());
+        }
+        request.validate()?;
+        let io = self.io.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            write_line(&mut io.1, &DuplexFrame::Ui { request })?;
+            read_line::<ExtensionResult<pi_rs_core::UiResponse>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
     fn tools(&self) -> Vec<ToolSpec> {
         self.tools.clone()
     }
@@ -651,6 +689,7 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
     let request: DuplexRequest = read_line(&mut input).map_err(Error::Config)?;
     let host = Arc::new(RemoteHost {
         tools: request.tools,
+        has_ui: request.has_ui,
         io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()

@@ -1,3 +1,4 @@
+pub mod dialog;
 pub mod diff;
 pub mod editor;
 pub mod images;

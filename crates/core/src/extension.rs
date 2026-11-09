@@ -32,6 +32,12 @@ pub enum ToolExecution {
 #[async_trait::async_trait]
 pub trait ToolHost: Send + Sync {
     fn tools(&self) -> Vec<ToolSpec>;
+    fn has_ui(&self) -> bool {
+        false
+    }
+    async fn ui(&self, _request: crate::UiRequest) -> ExtensionResult<crate::UiResponse> {
+        Err("interactive extension UI is unavailable".into())
+    }
     async fn call(&self, name: &str, arguments: Value) -> Outcome;
     /// Submit an ordered group together so compatible reads can overlap.
     async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
@@ -247,9 +253,14 @@ pub struct Registry {
     pub(crate) extensions: Vec<Arc<dyn Extension>>,
     pub(crate) tools: BTreeMap<String, Arc<RegisteredTool>>,
     active: Option<BTreeSet<String>>,
+    pub(crate) ui: Option<Arc<dyn crate::ExtensionUi>>,
 }
 
 impl Registry {
+    /// Attach the embedding application's optional interaction surface.
+    pub fn set_ui(&mut self, ui: Arc<dyn crate::ExtensionUi>) {
+        self.ui = Some(ui);
+    }
     /// Compose enabled extensions in dependency order, preserving input order
     /// among extensions whose dependencies are already satisfied.
     pub fn compose(
@@ -354,6 +365,7 @@ impl Registry {
             extensions: self.extensions.clone(),
             tools,
             active: None,
+            ui: self.ui.clone(),
         })
     }
 

@@ -128,6 +128,10 @@ impl SessionBuilder {
     pub fn open(self, path: impl AsRef<Path>) -> Result<AgentSession> {
         self.build(Session::open(path)?)
     }
+    pub fn ui(mut self, ui: Arc<dyn crate::ExtensionUi>) -> Self {
+        self.registry.set_ui(ui);
+        self
+    }
     pub fn in_memory(self) -> Result<AgentSession> {
         self.build(Session::with_store(MemoryStore::default())?)
     }

@@ -55,6 +55,10 @@ enum Request {
         task: String,
     },
     McpStatus,
+    ExtensionUiResponse {
+        id: Uuid,
+        value: pi_rs::UiResponse,
+    },
     Cancel,
     Shutdown,
 }
@@ -67,12 +71,14 @@ struct ControlState {
 
 pub async fn run(mut args: Cli) -> Result<()> {
     let mut runtime = runtime::configure(&args).await?;
+    let ui = Arc::new(super::extension_ui::Broker::default());
+    runtime.registry.set_ui(ui.clone());
     let active = Arc::new(Mutex::new(ControlState::default()));
     let stopping = Arc::new(AtomicBool::new(false));
     let (commands, mut requests) = mpsc::channel(32);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
-    read_requests(commands, inputs, active.clone(), stopping.clone());
+    read_requests(commands, inputs, active.clone(), stopping.clone(), ui);
     let signal_active = active.clone();
     let signal_stopping = stopping.clone();
     let signal_notify = stop_notify.clone();
@@ -228,6 +234,7 @@ fn read_requests(
     inputs: mpsc::Sender<QueuedMessage>,
     active: Arc<Mutex<ControlState>>,
     stopping: Arc<AtomicBool>,
+    ui: Arc<super::extension_ui::Broker>,
 ) {
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -263,6 +270,7 @@ fn read_requests(
                         output(json!({"type":"input_rejected","reason":"follow-up queue is full"}));
                     }
                 }
+                Request::ExtensionUiResponse { id, value } => ui.resolve(id, value),
                 Request::Cancel => {
                     let mut state = active.lock().expect("worker control");
                     if let Some(cancel) = &state.token {

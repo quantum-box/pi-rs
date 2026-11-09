@@ -17,6 +17,7 @@ mod attachments;
 mod backend;
 mod clipboard;
 mod config;
+mod extension_ui;
 mod interactive;
 mod mcp_config;
 mod model_selection;

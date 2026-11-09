@@ -78,6 +78,22 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 continue;
             }
         };
+        if request["type"] == "extension_ui_response" {
+            if let Some(active) = &mut worker {
+                let value = if request["cancelled"] == true {
+                    Value::Null
+                } else {
+                    request
+                        .get("confirmed")
+                        .unwrap_or(&request["value"])
+                        .clone()
+                };
+                active.send(
+                    json!({"type":"extension_ui_response","id":request["id"],"value":value}),
+                )?;
+            }
+            continue;
+        }
         if request["type"] == "abort" && busy(&worker) {
             if pending_abort.is_some() {
                 response(&request, Err(Error::Config("abort already pending".into())))?;

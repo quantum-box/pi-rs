@@ -687,6 +687,7 @@ impl Agent<'_> {
                     cancellation,
                     depth: scope.depth,
                     call_count: scope.call_count.clone(),
+                    ui: self.registry.ui.clone(),
                 });
                 self.invoke(prepared, cancel, host, scope.depth > 0)
             });
@@ -1384,6 +1385,7 @@ struct NestedRequest {
     reply: oneshot::Sender<Outcome>,
 }
 struct NestedHost {
+    ui: Option<Arc<dyn crate::ExtensionUi>>,
     requests: mpsc::Sender<Vec<NestedRequest>>,
     specs: Arc<Vec<ToolSpec>>,
     parent_operation: Uuid,
@@ -1393,6 +1395,25 @@ struct NestedHost {
 }
 #[async_trait::async_trait]
 impl ToolHost for NestedHost {
+    fn has_ui(&self) -> bool {
+        self.ui.is_some()
+    }
+    async fn ui(&self, request: crate::UiRequest) -> crate::ExtensionResult<crate::UiResponse> {
+        request.validate()?;
+        let ui = self
+            .ui
+            .as_ref()
+            .ok_or_else(|| "interactive extension UI is unavailable".to_owned())?;
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Err("extension UI cancelled".into()),
+            result = ui.request(request.clone(), self.cancellation.clone()) => {
+                let response = result?;
+                if request.accepts_response(&response) { Ok(response) }
+                else { Err("invalid extension UI response".into()) }
+            },
+        }
+    }
     fn tools(&self) -> Vec<ToolSpec> {
         self.specs.as_ref().clone()
     }
@@ -1650,6 +1671,7 @@ mod nested_host_tests {
     async fn batch_retains_invalid_argument_positions_without_dispatching_them() {
         let (requests, mut incoming) = mpsc::channel(1);
         let host = NestedHost {
+            ui: None,
             requests,
             specs: Arc::new(vec![]),
             parent_operation: Uuid::new_v4(),

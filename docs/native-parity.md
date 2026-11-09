@@ -20,7 +20,7 @@ remaining acceptance work for that surface.
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, threaded session selectors, Radius sharing |
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
-| Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface |
+| Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, elicitation |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
@@ -676,3 +676,24 @@ schema while accepting supported legacy forms.
 Tests cover normalized inputs reaching policy hooks, raw-history preservation,
 a preparation timeout without dispatch, old executable descriptors, native
 host calls, cancellation and codemode regression.
+
+### Native extension UI checkpoint
+
+Rust tools can use `ToolHost::has_ui` and the asynchronous `ToolHost::ui`
+interface. Embedded applications supply an `ExtensionUi` through the registry
+or `SessionBuilder::ui`. Native executable extensions use the same correlated
+host protocol for select, confirm, input and multiline editor dialogs, notices,
+status entries, above/below-editor widgets, window titles and editor text.
+`interactive_review` is a runnable Rust example.
+
+The TUI renders dialogs in fullscreen and regular modes. Escape cancels a
+dialog, and abort or timeout removes outstanding requests. RPC forwards
+`extension_ui_request` events with Pi field names and accepts
+`extension_ui_response` with `value`, `confirmed` or `cancelled`. These transient
+interactions are independent of durable tool outcomes.
+
+Workspace tests and real executable fixtures cover correlated responses,
+multiline editing, cancellation and request timeouts. PTY fixtures cover both
+terminal modes and restoration. Existing image, Markdown, diff, session,
+resource and native host-call fixtures continue to pass. Custom terminal
+components and the remaining extension events are still tracked above.

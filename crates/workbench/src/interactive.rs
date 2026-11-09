@@ -129,6 +129,9 @@ struct RegularState {
 struct View {
     regular: RegularState,
     graphics: Renderer,
+    dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
+    ui_status: std::collections::BTreeMap<String, String>,
+    widgets: std::collections::BTreeMap<String, (Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
     picker: Option<Picker>,
     session_name: Option<String>,
@@ -152,6 +155,90 @@ struct View {
     phase: Option<&'static str>,
 }
 impl View {
+    fn ui_request(&mut self, value: &Value) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
+        let id: uuid::Uuid = serde_json::from_value(value["id"].clone())?;
+        let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
+        request.validate().map_err(Error::Config)?;
+        match request {
+            pi_rs::UiRequest::Notify { message, .. } => self.append(&message),
+            pi_rs::UiRequest::SetStatus { key, text } => {
+                if text.is_some()
+                    && !self.ui_status.contains_key(&key)
+                    && self.ui_status.len() >= 64
+                {
+                    return Err(Error::Config("too many extension status entries".into()));
+                }
+                if let Some(text) = text {
+                    self.ui_status.insert(key, text);
+                } else {
+                    self.ui_status.remove(&key);
+                }
+            }
+            pi_rs::UiRequest::SetWidget {
+                key,
+                lines,
+                placement,
+            } => {
+                if lines.is_some() && !self.widgets.contains_key(&key) && self.widgets.len() >= 64 {
+                    return Err(Error::Config("too many extension widgets".into()));
+                }
+                if let Some(lines) = lines {
+                    self.widgets.insert(key, (lines, placement));
+                } else {
+                    self.widgets.remove(&key);
+                }
+            }
+            pi_rs::UiRequest::SetTitle { title } => execute!(
+                std::io::stdout(),
+                crossterm::terminal::SetTitle(
+                    title
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .collect::<String>()
+                )
+            )?,
+            pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
+            pi_rs::UiRequest::GetEditorText => {
+                return Ok(Some((
+                    id,
+                    pi_rs::UiResponse::Text(self.editor.text.clone()),
+                )));
+            }
+            request => {
+                self.scroll = 0;
+                self.dialogs
+                    .push_back(crate::ui::dialog::Dialog::new(id, request));
+            }
+        }
+        Ok(None)
+    }
+    fn widget_lines(
+        &self,
+        theme: &Theme,
+        width: usize,
+        placement: pi_rs::WidgetPlacement,
+    ) -> Vec<Line> {
+        self.widgets
+            .values()
+            .filter(|(_, location)| *location == placement)
+            .flat_map(|(lines, _)| lines.iter())
+            .flat_map(|text| Entry::Notice(text.clone()).render(theme, width, false, true))
+            .collect()
+    }
+    fn extension_status(&self) -> String {
+        if self.ui_status.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{} · ",
+                self.ui_status
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            )
+        }
+    }
     fn draft_status(&self) -> String {
         if self.clipboard.is_some() {
             "Reading clipboard · ".into()
@@ -232,6 +319,9 @@ impl View {
         self.thinking.clear();
         self.draft_images.clear();
         self.clipboard = None;
+        self.dialogs.clear();
+        self.ui_status.clear();
+        self.widgets.clear();
         self.history.clear();
         self.history_index = None;
         self.tokens = 0;
@@ -494,7 +584,12 @@ impl View {
         let height = usize::from(height.max(7));
         let prompt = wrap(&self.editor.text, width);
         let prompt_height = prompt.len().clamp(1, 6).min(height.saturating_sub(5));
-        let body_height = height.saturating_sub(prompt_height + 5);
+        let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
+        below.truncate(height.saturating_sub(prompt_height + 6));
+        if !self.dialogs.is_empty() {
+            below.clear();
+        }
+        let body_height = height.saturating_sub(prompt_height + 5 + below.len());
         let mut lines: Vec<Line> = self
             .lines
             .iter()
@@ -514,6 +609,11 @@ impl View {
         }
         if let Some(picker) = &self.picker {
             lines = picker.render(theme, body_height);
+        }
+        if let Some(dialog) = self.dialogs.front() {
+            lines = dialog.render(theme, width, body_height);
+        } else {
+            lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
         }
         let end = lines
             .len()
@@ -535,7 +635,7 @@ impl View {
         } else {
             String::new()
         };
-        let status = format!("{status}{}", self.draft_status());
+        let status = format!("{status}{}{}", self.draft_status(), self.extension_status());
         self.graphics.clear_placements(&mut out)?;
         queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
         Line::plain(
@@ -552,7 +652,7 @@ impl View {
             line.draw(&mut out, width)?;
             self.graphics.paint(line, &mut out, row)?;
         }
-        let border_row = height - prompt_height - 4;
+        let border_row = height - prompt_height - 4 - below.len();
         queue!(out, MoveTo(0, border_row as u16))?;
         Line::plain(
             &format!(
@@ -569,6 +669,13 @@ impl View {
         for (row, line) in prompt.iter().skip(offset).take(prompt_height).enumerate() {
             queue!(out, MoveTo(0, (border_row + 1 + row) as u16))?;
             Line::plain(line, theme.color("text")).draw(&mut out, width)?;
+        }
+        for (row, line) in below.iter().enumerate() {
+            queue!(
+                out,
+                MoveTo(0, (border_row + 1 + prompt_height + row) as u16)
+            )?;
+            line.draw(&mut out, width)?;
         }
         queue!(out, MoveTo(0, (height - 3) as u16))?;
         Line::plain(&"─".repeat(width), theme.color("border")).draw(&mut out, width)?;
@@ -594,11 +701,19 @@ impl View {
             .last()
             .map_or(0, |line| UnicodeWidthStr::width(line.as_str()))
             .min(width - 1);
-        queue!(
-            out,
-            MoveTo(column as u16, (border_row + 1 + cursor_row - offset) as u16),
-            Show
-        )?;
+        if let Some(dialog) = self.dialogs.front() {
+            if let Some((row, column)) = dialog.cursor(width, body_height) {
+                queue!(out, MoveTo(column as u16, (row + 1) as u16), Show)?;
+            } else {
+                queue!(out, Hide)?;
+            }
+        } else {
+            queue!(
+                out,
+                MoveTo(column as u16, (border_row + 1 + cursor_row - offset) as u16),
+                Show
+            )?;
+        }
         out.flush()?;
         Ok(())
     }
@@ -641,6 +756,11 @@ impl View {
         }
         let prompt = wrap(&self.editor.text, width);
         let prompt_height = prompt.len().clamp(1, 6).min(height - 5);
+        let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
+        below.truncate(height.saturating_sub(prompt_height + 6));
+        if !self.dialogs.is_empty() {
+            below.clear();
+        }
         let mut out = std::io::stdout().lock();
         if redraw {
             self.graphics.clear_placements(&mut out)?;
@@ -679,7 +799,7 @@ impl View {
             }
         }
         let mut active = Vec::new();
-        if !busy && self.picker.is_none() && self.scroll == 0 {
+        if !busy && self.picker.is_none() && self.dialogs.is_empty() && self.scroll == 0 {
             for entry in &self.lines[self.regular.committed..] {
                 for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
                     line.draw(&mut out, width)?;
@@ -706,7 +826,7 @@ impl View {
             active
                 .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
             if let Some(picker) = &self.picker {
-                active = picker.render(theme, height - prompt_height - 4);
+                active = picker.render(theme, height - prompt_height - 4 - below.len());
             }
             let end = active
                 .len()
@@ -714,14 +834,26 @@ impl View {
             active = active[..end]
                 .iter()
                 .rev()
-                .take(height - prompt_height - 4)
+                .take(height - prompt_height - 4 - below.len())
                 .cloned()
                 .collect();
             active.reverse();
-            for line in &active {
-                line.draw(&mut out, width)?;
-                queue!(out, Print("\r\n"))?;
+        }
+        if let Some(dialog) = self.dialogs.front() {
+            active = dialog.render(theme, width, height - prompt_height - 4 - below.len());
+        } else {
+            let available = height - prompt_height - 4 - below.len();
+            let mut widgets = self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor);
+            widgets.truncate(available);
+            let keep = available.saturating_sub(widgets.len());
+            if active.len() > keep {
+                active.drain(..active.len() - keep);
             }
+            active.extend(widgets);
+        }
+        for line in &active {
+            line.draw(&mut out, width)?;
+            queue!(out, Print("\r\n"))?;
         }
         let elapsed = self
             .request_started
@@ -735,7 +867,7 @@ impl View {
         } else {
             String::new()
         };
-        let status = format!("{status}{}", self.draft_status());
+        let status = format!("{status}{}{}", self.draft_status(), self.extension_status());
         Line::plain(
             &format!(
                 "{}{}",
@@ -751,6 +883,10 @@ impl View {
         let offset = cursor.saturating_sub(prompt_height - 1);
         for line in prompt.iter().skip(offset).take(prompt_height) {
             Line::plain(line, theme.color("text")).draw(&mut out, width)?;
+            queue!(out, Print("\r\n"))?;
+        }
+        for line in &below {
+            line.draw(&mut out, width)?;
             queue!(out, Print("\r\n"))?;
         }
         for line in [
@@ -771,17 +907,28 @@ impl View {
         )
         .draw(&mut out, width)?;
         self.regular.cursor_row = active.len() + 1 + cursor - offset;
-        self.regular.region_height = active.len() + prompt_height + 4;
+        self.regular.region_height = active.len() + prompt_height + 4 + below.len();
         let column = prefix
             .last()
             .map_or(0, |line| UnicodeWidthStr::width(line.as_str()))
             .min(width - 1);
+        let (column, show_cursor) = if let Some(dialog) = self.dialogs.front() {
+            let position = dialog.cursor(width, height - prompt_height - 4 - below.len());
+            self.regular.cursor_row = position.map_or(0, |(row, _)| row);
+            (position.map_or(0, |(_, column)| column), position.is_some())
+        } else {
+            (column, true)
+        };
         queue!(
             out,
             MoveUp((self.regular.region_height - self.regular.cursor_row - 1) as u16),
-            MoveToColumn(column as u16),
-            Show
+            MoveToColumn(column as u16)
         )?;
+        if show_cursor {
+            queue!(out, Show)?;
+        } else {
+            queue!(out, Hide)?;
+        }
         self.regular.started = true;
         out.flush()?;
         Ok(())
@@ -1312,7 +1459,27 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             if active.busy && view.request_started.is_none() {
                 view.request_started = Some(Instant::now());
             }
-            for value in active.events.try_iter() {
+            let events: Vec<_> = active.events.try_iter().collect();
+            for value in events {
+                if value["type"] == "extension_ui_request" {
+                    match view.ui_request(&value) {
+                        Ok(Some((id, value))) => active
+                            .send(json!({"type":"extension_ui_response","id":id,"value":value}))?,
+                        Ok(None) => {}
+                        Err(error) => {
+                            view.append(&error.to_string());
+                            active.send(json!({"type":"extension_ui_response","id":value["id"],"value":null}))?;
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
+                if value["type"] == "extension_ui_cancelled" {
+                    view.dialogs
+                        .retain(|dialog| json!(dialog.id) != value["id"]);
+                    dirty = true;
+                    continue;
+                }
                 let settled = value["type"] == "agent_settled";
                 if value["type"] == "agent_started" {
                     active.busy = true;
@@ -1320,6 +1487,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 view.receive(value);
                 if settled {
                     active.busy = false;
+                    view.dialogs.clear();
                     view.settle();
                 }
                 dirty = true;
@@ -1333,6 +1501,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     view.receive(value);
                 }
                 view.settle();
+                view.dialogs.clear();
                 if !status.success() {
                     view.append(&format!(
                         "Run stopped ({status}). Use /session to inspect its saved journal."
@@ -1367,11 +1536,27 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
             Event::Paste(text) => {
-                view.editor.insert(&text);
+                if let Some(dialog) = view.dialogs.front_mut() {
+                    dialog.paste(&text);
+                } else {
+                    view.editor.insert(&text);
+                }
                 dirty = true;
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
+                if let Some(dialog) = view.dialogs.front_mut() {
+                    if let Some(value) = dialog.input(key, &keys) {
+                        let id = dialog.id;
+                        view.dialogs.pop_front();
+                        if let Some(active) = &mut worker {
+                            active.send(
+                                json!({"type":"extension_ui_response","id":id,"value":value}),
+                            )?;
+                        }
+                    }
+                    continue;
+                }
                 if let Some(mut picker) = view.picker.take() {
                     match picker.input(key, &keys) {
                         Input::Continue => view.picker = Some(picker),
@@ -1556,6 +1741,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             }
                         } else if input.trim() == "/reload" {
                             worker.take();
+                            view.dialogs.clear();
+                            view.ui_status.clear();
+                            view.widgets.clear();
                             args.settings =
                                 crate::config::Settings::load(&args.workspace, args.trusted)?;
                             super::packages::prepare(&args).await?;
