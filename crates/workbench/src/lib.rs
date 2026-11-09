@@ -77,7 +77,7 @@ impl Extension for CommandPolicy {
         _: Option<&ExtensionState>,
     ) -> ExtensionResult<Decision> {
         Ok(
-            if matches!(name, "count_lines" | "bash") && !self.allow_commands {
+            if matches!(name, "count_lines" | "bash" | "powershell") && !self.allow_commands {
                 Decision::Deny("host command policy requires --allow-commands".into())
             } else {
                 Decision::Allow

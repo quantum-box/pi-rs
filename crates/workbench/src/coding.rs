@@ -1,5 +1,7 @@
 //! Local coding tools. Hosted callers opt into their own execution profile.
-use std::io::Write;
+use base64::Engine;
+use sha2::{Digest, Sha256};
+use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -46,7 +48,11 @@ impl Extension for CodingTools {
             Kind::Read,
             Kind::Write,
             Kind::Edit,
-            Kind::Bash,
+            if cfg!(windows) {
+                Kind::PowerShell
+            } else {
+                Kind::Bash
+            },
             Kind::Grep,
             Kind::Find,
             Kind::List,
@@ -69,6 +75,7 @@ enum Kind {
     Write,
     Edit,
     Bash,
+    PowerShell,
     Grep,
     Find,
     List,
@@ -87,7 +94,7 @@ impl Tool for CodingTool {
         let (name, description, properties, required) = match self.kind {
             Kind::Read => (
                 "read",
-                "Read UTF-8 text with optional one-based line offset and line limit.",
+                "Read text with optional one-based line offset and line limit, or return a PNG/JPEG/GIF/WebP/BMP/TIFF image to the model.",
                 json!({"path":path,"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}}),
                 vec!["path"],
             ),
@@ -100,11 +107,15 @@ impl Tool for CodingTool {
             Kind::Edit => (
                 "edit",
                 "Apply unique non-overlapping exact replacements, all matched against the original file.",
-                json!({"path":path,"edits":{"type":"array","minItems":1,"items":{"type":"object","properties":{"oldText":{"type":"string","minLength":1},"newText":{"type":"string"}},"required":["oldText","newText"],"additionalProperties":false}}}),
-                vec!["path", "edits"],
+                json!({"path":path,"oldText":{"type":"string","minLength":1},"newText":{"type":"string"},"edits":{"type":"array","minItems":1,"items":{"type":"object","properties":{"oldText":{"type":"string","minLength":1},"newText":{"type":"string"}},"required":["oldText","newText"],"additionalProperties":false}}}),
+                vec!["path"],
             ),
-            Kind::Bash => (
-                "bash",
+            Kind::Bash | Kind::PowerShell => (
+                if matches!(self.kind, Kind::PowerShell) {
+                    "powershell"
+                } else {
+                    "bash"
+                },
                 "Run a shell command in the workspace and return its bounded output and exit status.",
                 json!({"command":{"type":"string"},"timeout":{"type":"integer","minimum":1,"maximum":120}}),
                 vec!["command"],
@@ -128,10 +139,15 @@ impl Tool for CodingTool {
                 vec![],
             ),
         };
+        let mut parameters = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
+        if matches!(self.kind, Kind::Edit) {
+            parameters["anyOf"] =
+                json!([{"required":["edits"]},{"required":["oldText","newText"]}]);
+        }
         ToolSpec {
             name: name.into(),
             description: description.into(),
-            parameters: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
+            parameters,
         }
     }
 
@@ -143,13 +159,25 @@ impl Tool for CodingTool {
     }
 
     async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+        if matches!(self.kind, Kind::Read) {
+            match self.read_image(&args) {
+                Ok(Some(data)) => {
+                    return Outcome::Structured {
+                        data,
+                        attachments: vec![],
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => return Outcome::Failed(error.to_string()),
+            }
+        }
         let result = match self.kind {
             Kind::Read => self.read(&args),
             Kind::Write => self.write(&args),
             Kind::Edit => self.edit(&args),
             Kind::Grep | Kind::Find => self.search(&args),
             Kind::List => self.list(&args),
-            Kind::Bash => self.bash(&args).await,
+            Kind::Bash | Kind::PowerShell => self.bash(&args).await,
         };
         match result {
             Ok(value) => Outcome::Succeeded(value),
@@ -188,6 +216,51 @@ impl CodingTool {
             ));
         }
         Ok(std::fs::read_to_string(path)?)
+    }
+
+    fn read_image(&self, args: &Value) -> Result<Option<Value>> {
+        let path = self.path(string(args, "path")?)?;
+        if !path.is_file() {
+            return Err(Error::Config("expected a regular file".into()));
+        }
+        let mut reader = image::ImageReader::open(&path)?.with_guessed_format()?;
+        if reader.format().is_none() {
+            return Ok(None);
+        }
+        if path.metadata()?.len() > 20 * 1024 * 1024 {
+            return Err(Error::Config("image exceeds 20 MiB".into()));
+        }
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(128 * 1024 * 1024);
+        reader.limits(limits);
+        let original = reader
+            .decode()
+            .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
+        let mut resized = if original.width() > 2000 || original.height() > 2000 {
+            original.thumbnail(2000, 2000)
+        } else {
+            original.clone()
+        };
+        let mut encoded = Vec::new();
+        loop {
+            encoded.clear();
+            resized
+                .write_to(&mut Cursor::new(&mut encoded), image::ImageFormat::Png)
+                .map_err(|error| Error::Config(error.to_string()))?;
+            if encoded.len() <= 512 * 1024 {
+                break;
+            }
+            let width = (resized.width() * 3 / 4).max(1);
+            let height = (resized.height() * 3 / 4).max(1);
+            if width == resized.width() && height == resized.height() {
+                return Err(Error::Config("image cannot fit the output limit".into()));
+            }
+            resized = resized.thumbnail(width, height);
+        }
+        Ok(Some(json!({"content":[
+            {"type":"text","text":format!("Read image {} ({}×{}, provided at {}×{})",path.display(),original.width(),original.height(),resized.width(),resized.height())},
+            {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(encoded)}
+        ]})))
     }
 
     fn read(&self, args: &Value) -> Result<String> {
@@ -249,6 +322,7 @@ impl CodingTool {
             }
             target = existing;
         }
+        let _lock = mutation_lock(&target)?;
         atomic_write(&target, content.as_bytes())?;
         Ok(format!(
             "Wrote {} bytes to {}",
@@ -259,10 +333,15 @@ impl CodingTool {
 
     fn edit(&self, args: &Value) -> Result<String> {
         let path = self.path(string(args, "path")?)?;
+        let _lock = mutation_lock(&path)?;
         let original = self.text(&path)?;
-        let edits = args["edits"]
-            .as_array()
-            .ok_or_else(|| Error::Config("edits must be an array".into()))?;
+        let legacy = vec![json!({"oldText":args["oldText"],"newText":args["newText"]})];
+        let edits = match args.get("edits") {
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| Error::Config("edits must be an array".into()))?,
+            None => &legacy,
+        };
         if edits.is_empty() {
             return Err(Error::Config("at least one edit is required".into()));
         }
@@ -299,11 +378,16 @@ impl CodingTool {
             ));
         }
         atomic_write(&path, output.as_bytes())?;
-        Ok(format!(
-            "Applied {} edits to {}",
-            edits.len(),
-            args["path"].as_str().unwrap_or_default()
-        ))
+        let display_path = args["path"].as_str().unwrap_or_default();
+        let diff = similar::TextDiff::from_lines(&original, &output)
+            .unified_diff()
+            .context_radius(3)
+            .header(display_path, display_path)
+            .to_string();
+        Ok(bounded(format!(
+            "Applied {} edits to {display_path}\n{diff}",
+            edits.len()
+        )))
     }
 
     fn list(&self, args: &Value) -> Result<String> {
@@ -399,9 +483,22 @@ impl CodingTool {
     }
 
     async fn bash(&self, args: &Value) -> Result<String> {
-        let mut command = tokio::process::Command::new("bash");
+        let mut command = if matches!(self.kind, Kind::PowerShell) {
+            let executable = std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                .map(|path| path.join(if cfg!(windows) { "pwsh.exe" } else { "pwsh" }))
+                .find(|path| path.is_file())
+                .unwrap_or_else(|| "powershell.exe".into());
+            let mut command = tokio::process::Command::new(executable);
+            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]).arg(format!("$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); {}", string(args, "command")?));
+            command
+        } else {
+            let mut command = tokio::process::Command::new("bash");
+            command.args(["-c", string(args, "command")?]);
+            command
+        };
         command
-            .args(["-c", string(args, "command")?])
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -441,6 +538,24 @@ fn string<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
     value[name]
         .as_str()
         .ok_or_else(|| Error::Config(format!("{name} must be a string")))
+}
+
+fn mutation_lock(path: &Path) -> Result<std::fs::File> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .unwrap_or_default();
+    let owner = Sha256::digest(home.as_encoded_bytes());
+    let directory = std::env::temp_dir().join(format!("pi-rs-file-locks-{owner:x}"));
+    std::fs::create_dir_all(&directory)?;
+    let digest = Sha256::digest(path.as_os_str().as_encoded_bytes());
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join(format!("{digest:x}.lock")))?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
@@ -530,6 +645,64 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_disjoint_edits_are_serialized_and_return_diffs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "alpha beta\n").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = [("alpha", "A"), ("beta", "B")]
+            .into_iter()
+            .map(|(old, new)| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let tool = CodingTool {
+                        root,
+                        unrestricted: false,
+                        kind: Kind::Edit,
+                    };
+                    barrier.wait();
+                    tool.edit(&json!({"path":"file.txt","oldText":old,"newText":new}))
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            assert!(handle.join().unwrap().contains("@@"));
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "A B\n"
+        );
+    }
+
+    #[test]
+    fn image_reads_preserve_alpha_and_emit_bounded_multimodal_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.png");
+        image::RgbaImage::from_pixel(32, 24, image::Rgba([255, 0, 0, 128]))
+            .save(&path)
+            .unwrap();
+        let tool = CodingTool {
+            root: directory.path().canonicalize().unwrap(),
+            unrestricted: false,
+            kind: Kind::Read,
+        };
+        let value = tool
+            .read_image(&json!({"path":"sample.png"}))
+            .unwrap()
+            .unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(value["content"][1]["data"].as_str().unwrap())
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        assert_eq!(image.dimensions(), (32, 24));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 128]);
+        assert!(bytes.len() <= 512 * 1024);
+    }
 
     #[test]
     fn local_profile_can_read_personal_skills_while_scoped_profile_cannot() {

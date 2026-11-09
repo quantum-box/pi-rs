@@ -207,7 +207,7 @@ impl View {
             .rev()
             .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == operation))
         {
-            *output = outcome.tool_content();
+            *output = display_tool_result(outcome);
             *failed = !matches!(
                 outcome,
                 pi_rs::Outcome::Succeeded(_) | pi_rs::Outcome::Structured { .. }
@@ -408,6 +408,26 @@ impl View {
         out.flush()?;
         Ok(())
     }
+}
+
+fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
+    if let pi_rs::Outcome::Structured { data, .. } = outcome
+        && let Some(blocks) = data["content"].as_array()
+    {
+        return blocks
+            .iter()
+            .filter_map(|block| match block["type"].as_str() {
+                Some("text") => block["text"].as_str().map(str::to_owned),
+                Some("image") => Some(format!(
+                    "[image · {}]",
+                    block["mimeType"].as_str().unwrap_or("image")
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    outcome.tool_content()
 }
 
 const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /compact  /tree  /checkout <id>  /quit\n/extensions  /extension <id> <command> [arguments]\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";

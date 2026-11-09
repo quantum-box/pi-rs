@@ -13,10 +13,10 @@ remaining acceptance work for that surface.
 
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
-| Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and multimodal event handling |
+| Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
 | Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Full Markdown/table and diff layout fidelity, image display, regular terminal mode and remaining application actions |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
-| Local tools | Text read with paging, write, batch exact edits, bash, grep, find, ls | Image read, PowerShell, complete output/error/truncation parity |
+| Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity, Windows runtime validation |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Upstream JSONL import, richer tree navigation and branch summaries, session picker rename/delete/sort, Radius sharing |
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector | Full provider catalog, provider-native adapters, thinking controls, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
@@ -117,3 +117,17 @@ Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials
 were absent from captured CLI output. This checkpoint exposes enabled tools
 directly; OAuth, deferred exposure and live reconnection remain in the table.
+
+### Image and file-tool checkpoint
+
+`read` returns bounded PNG image content for PNG, JPEG, GIF, WebP, BMP and TIFF
+inputs. It preserves alpha, avoids upscaling and reduces large images before
+serialization. The Ollama-compatible adapter forwards image tool results as
+image content blocks in a following user message, keeping the original tool
+call/result pairing. The TUI displays an image placeholder rather than base64.
+Actual inline terminal-image rendering remains unimplemented.
+
+`edit` accepts both batch and legacy single replacements, emits a unified diff,
+and serializes cooperating file mutations across processes. The Windows coding
+profile selects PowerShell. That platform-specific branch has not yet been
+exercised on Windows.

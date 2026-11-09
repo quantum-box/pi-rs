@@ -180,7 +180,11 @@ impl Model for Ollama {
             &mut last_progress,
             ModelProgress::WaitingForModel,
         );
-        let messages: Vec<_> = request.messages.into_iter().map(encode_message).collect();
+        let messages: Vec<_> = request
+            .messages
+            .into_iter()
+            .flat_map(encode_message)
+            .collect();
         let tools: Vec<_> = request
             .tools
             .into_iter()
@@ -347,13 +351,11 @@ impl Model for Ollama {
     }
 }
 
-fn encode_message(message: Message) -> Value {
+fn encode_message(message: Message) -> Vec<Value> {
     match message {
-        Message::System { content } => json!({"role": "system", "content": content}),
-        Message::User { content } => json!({"role": "user", "content": content}),
-        Message::Tool { call_id, content } => {
-            json!({"role": "tool", "tool_call_id": call_id, "content": content})
-        }
+        Message::System { content } => vec![json!({"role": "system", "content": content})],
+        Message::User { content } => vec![json!({"role": "user", "content": content})],
+        Message::Tool { call_id, content } => encode_tool_result(&call_id, content),
         Message::Assistant { content, calls } => {
             let mut message = json!({"role": "assistant", "content": content});
             if !calls.is_empty() {
@@ -369,9 +371,52 @@ fn encode_message(message: Message) -> Value {
                         .collect(),
                 );
             }
-            message
+            vec![message]
         }
     }
+}
+
+fn encode_tool_result(call_id: &str, content: String) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let mut images = Vec::new();
+    let mut content = content;
+    if let Ok(mut result) = serde_json::from_str::<Value>(&content)
+        && let Some(blocks) = result
+            .get_mut("data")
+            .and_then(|data| data.get_mut("content"))
+            .and_then(Value::as_array_mut)
+    {
+        for block in blocks {
+            if block["type"] != "image" {
+                continue;
+            }
+            let Some(data) = block["data"].as_str() else {
+                continue;
+            };
+            let Some(mime) = block["mimeType"].as_str() else {
+                continue;
+            };
+            if !matches!(
+                mime,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            ) || data.len() > 8 * 1024 * 1024
+            {
+                continue;
+            }
+            images.push(json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{data}")}}));
+            block["data"] = json!("[image attached]");
+        }
+        content = result.to_string();
+    }
+    messages.push(json!({"role":"tool","tool_call_id":call_id,"content":content}));
+    if !images.is_empty() {
+        images.insert(
+            0,
+            json!({"type":"text","text":"Images from the preceding tool result."}),
+        );
+        messages.push(json!({"role":"user","content":images}));
+    }
+    messages
 }
 
 #[derive(Deserialize)]
@@ -428,4 +473,30 @@ struct CallDelta {
     id: String,
     name: String,
     arguments: String,
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::*;
+    #[test]
+    fn image_tool_results_keep_pairing_and_move_images_to_a_user_content_block() {
+        let content = json!({"data":{"content":[{"type":"text","text":"A chart"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]},"attachments":[]}).to_string();
+        let messages = encode_tool_result("call-1", content);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["tool_call_id"], "call-1");
+        assert!(
+            !messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("aW1hZ2U=")
+        );
+        assert_eq!(
+            messages[1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+        assert_eq!(
+            encode_tool_result("text", "unchanged".into())[0]["content"],
+            "unchanged"
+        );
+    }
 }
