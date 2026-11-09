@@ -76,6 +76,16 @@ Payment キーはジャーナルのモデル要求 UUID と一致した。Gatewa
 Run 予算の精算は1件だった。通常の Workflow Goal 経路では、同じ実行権の内側で
 一度だけ再照合し、2ターンを完了した。ハーネスの試験では保存済みの操作 ID が
 一致し、精算前に0件、再開後に1件の外部実行を確認した。AIP 統合試験11件が
-通過した。モデルと Payment は試験用実装を使用し、実際の Payment 原票と Field
-への配送は受入が残っている。
+通過した。この復旧試験のモデルと Payment には試験用実装を使用した。
 [Payment 書込み失敗後の復旧試験](https://github.com/quantum-box/tachyon-apps/commit/5ab961ff5d3c493845014643960043c37135dbdf)
+
+
+## Payment 原票と Field 互換 HTTP への配送（PLT-6382、PLT-6387）
+
+隔離 MySQL の既存 Payment 台帳で、明細の保存後に原票の書込みを失敗させた。
+同じ請求キーを並行再送し、確定後にも再送して、明細と原票が各1件であることを
+確認した。既存の ERP 収集と配送は同じ請求キーに紐付く入出力・キャッシュ作成・
+キャッシュ読取りの4レコードを Field 互換 HTTP サーバーへ各1回送った。
+回帰試験を含め MySQL の対象3件が通過した。料金表と受信先は試験用で、運用テナント
+の認可と実際の Field 側の受入検証は残っている。
+[SQL 原票と配送の結合試験](https://github.com/quantum-box/tachyon-apps/commit/12a554b4b47a3c02d5d525918e5495705bec7985)
