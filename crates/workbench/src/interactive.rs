@@ -1206,7 +1206,13 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 (session.head(), None)
             };
             let destination = session_path(&args.workspace, args.session_dir.as_deref());
-            sessions::fork(&session, target, &destination, &args.workspace)?;
+            sessions::fork(
+                &session,
+                &args.session,
+                target,
+                &destination,
+                &args.workspace,
+            )?;
             drop(session);
             args.session = destination;
             view.restore(args)?;

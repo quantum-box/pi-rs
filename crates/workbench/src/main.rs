@@ -539,8 +539,14 @@ async fn execute(mut args: Cli) -> Result<()> {
     }
     if let Some(source) = &args.fork_session {
         let source = sessions::resolve_reference(source, &directory)?;
-        let source = session_import::read(&source)?;
-        sessions::fork(&source, source.head(), &args.session, &args.workspace)?;
+        let source_session = session_import::read(&source)?;
+        sessions::fork(
+            &source_session,
+            &source,
+            source_session.head(),
+            &args.session,
+            &args.workspace,
+        )?;
     }
     let temporary = args.no_session.then(tempfile::tempdir).transpose()?;
     if let Some(directory) = &temporary {
@@ -682,7 +688,13 @@ async fn execute(mut args: Cli) -> Result<()> {
             let destination = destination.unwrap_or_else(|| {
                 interactive::session_path(&args.workspace, args.session_dir.as_deref())
             });
-            sessions::fork(&session, target, &destination, &args.workspace)?;
+            sessions::fork(
+                &session,
+                &args.session,
+                target,
+                &destination,
+                &args.workspace,
+            )?;
             output(json!({"type":"forked","path":destination}));
             return Ok(());
         }

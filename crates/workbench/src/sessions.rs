@@ -158,8 +158,15 @@ pub fn summary(path: &Path, session: &Session) -> SessionSummary {
     summary
 }
 
-pub fn fork(session: &Session, target: u64, destination: &Path, workspace: &Path) -> Result<()> {
+pub fn fork(
+    session: &Session,
+    source: &Path,
+    target: u64,
+    destination: &Path,
+    workspace: &Path,
+) -> Result<()> {
     let mut copy = Session::from_records(session.fork_records(target)?)?;
+    copy.set_parent_session(&source.to_string_lossy())?;
     copy.set_working_directory(workspace)?;
     if let Some(name) = session.name() {
         copy.set_name(name)?;
@@ -428,7 +435,9 @@ mod tests {
     #[test]
     fn exports_and_forks_preserve_session_and_escape_html() {
         let directory = tempfile::tempdir().unwrap();
-        let mut session = Session::open(directory.path().join("source.jsonl")).unwrap();
+        let source = directory.path().join("source.jsonl");
+        let mut session = Session::open(&source).unwrap();
+        session.set_parent_session("ancestor.jsonl").unwrap();
         session.set_name("<script>alert('name')</script>").unwrap();
         let exported = directory.path().join("export.jsonl");
         export(&session, &exported).unwrap();
@@ -436,9 +445,13 @@ mod tests {
         assert!(html(&session).contains("&lt;script&gt;"));
         assert!(!html(&session).contains("<script>"));
         let copy = directory.path().join("fork.jsonl");
-        fork(&session, session.head(), &copy, directory.path()).unwrap();
+        fork(&session, &source, session.head(), &copy, directory.path()).unwrap();
         let copy = Session::open(copy).unwrap();
         assert_eq!(copy.name(), session.name());
+        assert_eq!(
+            copy.parent_session(),
+            Some(source.to_string_lossy().as_ref())
+        );
         assert_ne!(
             serde_json::to_value(&copy.records()[0]).unwrap(),
             serde_json::to_value(&session.records()[0]).unwrap()

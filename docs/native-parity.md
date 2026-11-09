@@ -1565,3 +1565,7 @@ and snapshots retain the reference, local summaries include it, and upstream
 Pi header imports preserve `parentSession`. Tests cover reopening/export,
 invalid RPC input, unlinked sessions and old imports without parent metadata.
 A CLI RPC smoke check covers creation and persistence through normal commands.
+
+CLI, terminal and RPC fork/clone operations record their immediate source as the
+parent, replacing inherited ancestry metadata when a child is forked again.
+This preserves the copied conversation while retaining the correct origin path.

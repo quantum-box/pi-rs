@@ -447,7 +447,13 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             } else {
                 interactive::session_path(&args.workspace, args.session_dir.as_deref())
             };
-            sessions::fork(&session, target, &destination, &args.workspace)?;
+            sessions::fork(
+                &session,
+                &args.session,
+                target,
+                &destination,
+                &args.workspace,
+            )?;
             drop(session);
             switch_session(args, &destination)?;
             Ok(Some(
@@ -921,6 +927,10 @@ mod tests {
         assert_eq!(args.thinking.as_deref(), Some("low"));
         let fork = Session::open(&args.session).unwrap();
         assert_eq!(fork.conversation_at(fork.head()).unwrap().len(), 1);
+        assert_eq!(
+            fork.parent_session(),
+            Some(source.to_string_lossy().as_ref())
+        );
         drop(fork);
         assert_eq!(std::fs::read(&source).unwrap(), before);
         command(
