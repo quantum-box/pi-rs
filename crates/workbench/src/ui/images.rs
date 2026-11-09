@@ -93,13 +93,17 @@ impl InlineImage {
             .max(1)
             .min(maximum_columns.div_ceil(2).max(1));
         let (columns, rows) = dimensions(self.width, self.height, maximum_columns, maximum_rows);
-        let mut lines = vec![Line::default(); rows];
-        lines[rows - 1].image = Some(Placement {
-            image: self.clone(),
-            columns,
-            rows,
-        });
-        lines
+        (0..rows)
+            .map(|offset| Line {
+                image: Some(Placement {
+                    image: self.clone(),
+                    columns,
+                    rows,
+                    offset,
+                }),
+                ..Line::default()
+            })
+            .collect()
     }
 }
 fn dimensions(width: u32, height: u32, max_columns: usize, max_rows: usize) -> (usize, usize) {
@@ -119,6 +123,7 @@ pub struct Placement {
     image: Arc<InlineImage>,
     columns: usize,
     rows: usize,
+    offset: usize,
 }
 #[derive(Clone, Default)]
 pub struct Cleanup(Arc<Mutex<BTreeSet<u32>>>);
@@ -173,19 +178,30 @@ impl Renderer {
         self.placed.clear();
         Ok(())
     }
-    pub fn paint(&mut self, line: &Line, out: &mut impl Write, row: usize) -> std::io::Result<()> {
+    pub fn paint(
+        &mut self,
+        line: &Line,
+        out: &mut impl Write,
+        row: usize,
+        available_rows: usize,
+    ) -> std::io::Result<()> {
         let Some(placement) = &line.image else {
             return Ok(());
         };
         let Some(protocol) = self.protocol else {
             return Ok(());
         };
-        if row.saturating_add(1) < placement.rows {
+        let image = &placement.image;
+        if available_rows == 0 || self.placed.contains(&image.id) {
             return Ok(());
         }
-        let image = &placement.image;
+        if protocol == Protocol::Iterm2
+            && (placement.offset + 1 != placement.rows || row.saturating_add(1) < placement.rows)
+        {
+            return Ok(());
+        }
         queue!(out, SavePosition)?;
-        if placement.rows > 1 {
+        if protocol == Protocol::Iterm2 && placement.rows > 1 {
             queue!(out, MoveUp((placement.rows - 1) as u16))?;
         }
         queue!(out, MoveToColumn(0))?;
@@ -200,18 +216,31 @@ impl Renderer {
                         .expect("image registry")
                         .insert(image.id);
                 }
+                let visible_rows = available_rows.min(placement.rows - placement.offset);
+                let source_start =
+                    (u64::from(image.height) * placement.offset as u64) / placement.rows as u64;
+                let source_end = (u64::from(image.height)
+                    * (placement.offset + visible_rows) as u64)
+                    .div_ceil(placement.rows as u64);
+                let source_height = source_end
+                    .min(u64::from(image.height))
+                    .saturating_sub(source_start)
+                    .max(1);
                 write!(
                     out,
-                    "\x1b_Ga=p,i={},p=1,c={},r={},C=1,q=2;\x1b\\",
-                    image.id, placement.columns, placement.rows
+                    "\x1b_Ga=p,i={},p=1,c={},r={},y={},h={},C=1,q=2;\x1b\\",
+                    image.id, placement.columns, visible_rows, source_start, source_height
                 )?;
                 self.placed.insert(image.id);
             }
-            Protocol::Iterm2 => write!(
-                out,
-                "\x1b]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=1:{}\x07",
-                image.bytes, placement.columns, placement.rows, image.data
-            )?,
+            Protocol::Iterm2 => {
+                write!(
+                    out,
+                    "\x1b]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=1:{}\x07",
+                    image.bytes, placement.columns, placement.rows, image.data
+                )?;
+                self.placed.insert(image.id);
+            }
         }
         queue!(out, RestorePosition)
     }
@@ -302,26 +331,29 @@ mod tests {
         assert_eq!(decoded.get_pixel(0, 0).0[3], 120);
     }
     #[test]
-    fn kitty_uploads_once_repositions_and_skips_clipped_images() {
+    fn kitty_uploads_once_and_crops_the_visible_source_rows() {
         let mut renderer = renderer(Protocol::Kitty);
         let line = Line {
             image: Some(Placement {
                 image: fixture(),
                 columns: 2,
                 rows: 2,
+                offset: 1,
             }),
             ..Default::default()
         };
         let mut output = Vec::new();
-        renderer.paint(&line, &mut output, 0).unwrap();
-        assert!(output.is_empty());
-        renderer.paint(&line, &mut output, 2).unwrap();
+        renderer.paint(&line, &mut output, 0, 1).unwrap();
         let first = String::from_utf8(output).unwrap();
         assert!(first.contains("a=t,f=100"));
         assert!(first.contains("a=p,"));
+        assert!(first.contains("r=1,y=18,h=18"));
+        let mut duplicate = Vec::new();
+        renderer.paint(&line, &mut duplicate, 1, 1).unwrap();
+        assert!(duplicate.is_empty());
         let mut next = Vec::new();
         renderer.clear_placements(&mut next).unwrap();
-        renderer.paint(&line, &mut next, 2).unwrap();
+        renderer.paint(&line, &mut next, 2, 2).unwrap();
         let next = String::from_utf8(next).unwrap();
         assert!(next.contains("a=d,d=i"));
         assert!(!next.contains("a=t,f=100"));
@@ -335,11 +367,12 @@ mod tests {
                 image: fixture(),
                 columns: 2,
                 rows: 1,
+                offset: 0,
             }),
             ..Default::default()
         };
         let mut output = Vec::new();
-        renderer.paint(&line, &mut output, 0).unwrap();
+        renderer.paint(&line, &mut output, 0, 1).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("1337;File=inline=1;"));
         assert!(output.contains("width=2;height=1;preserveAspectRatio=1:"));

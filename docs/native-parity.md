@@ -741,3 +741,15 @@ RPC and both terminal modes passed fixtures covering streamed UTF-8 output,
 nonzero exits, included/excluded model context, cancellation, process cleanup
 and durable restoration. Core tests cover exclusion after reopening the journal,
 and shell tests cover partial UTF-8 chunks and timeouts.
+
+### Clipped Kitty image checkpoint
+
+Fullscreen Kitty rendering now places the visible portion of an image when its
+upper or lower rows lie outside the viewport. Source-row rounding follows the
+pinned Pi renderer. Image data remains cached across scroll and resize, and
+placements are cleared independently of cached uploads. iTerm2 retains its
+whole-image rendering behavior.
+
+Unit tests and a PTY fixture cover upper/lower clipping, scrolling, cached resize
+and terminal restoration. The existing Kitty/iTerm2 fixture passed both modes.
+Regular-mode active-region images and iTerm2 partial-image behavior remain open.

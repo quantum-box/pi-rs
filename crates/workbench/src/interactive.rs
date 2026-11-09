@@ -705,7 +705,8 @@ impl View {
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + 1) as u16))?;
             line.draw(&mut out, width)?;
-            self.graphics.paint(line, &mut out, row)?;
+            self.graphics
+                .paint(line, &mut out, row, body_height - row)?;
         }
         let border_row = height - prompt_height - 4 - below.len();
         queue!(out, MoveTo(0, border_row as u16))?;
@@ -848,7 +849,8 @@ impl View {
             for entry in &self.lines[..self.regular.committed] {
                 for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
                     line.draw(&mut out, width)?;
-                    self.graphics.paint(&line, &mut out, usize::MAX)?;
+                    self.graphics
+                        .paint(&line, &mut out, usize::MAX, usize::MAX)?;
                     queue!(out, Print("\r\n"))?;
                 }
             }
@@ -858,7 +860,8 @@ impl View {
             for entry in &self.lines[self.regular.committed..] {
                 for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
                     line.draw(&mut out, width)?;
-                    self.graphics.paint(&line, &mut out, usize::MAX)?;
+                    self.graphics
+                        .paint(&line, &mut out, usize::MAX, usize::MAX)?;
                     queue!(out, Print("\r\n"))?;
                 }
             }

@@ -5,7 +5,8 @@ and are used under its MIT license in PI-LICENSE.
 The default coding-assistant preamble, skill guidance and edit/write guidance
 in src/resources.rs and src/main.rs are adapted from that same Pi release.
 
-Native terminal-image capability detection follows Pi v1.5.0 terminal-image.ts.
+Native terminal-image capability detection and Kitty source-row cropping follow
+Pi v1.5.0 terminal-image.ts.
 The Rust renderer implements the documented Kitty and iTerm2 protocols.
 
 Markdown heading, fenced code, quote and list presentation in src/ui/render.rs
