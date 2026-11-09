@@ -54,6 +54,10 @@ pub trait Tool: Send + Sync {
     fn output_limit(&self) -> usize {
         1024 * 1024
     }
+    /// Normalize model arguments before schema validation and policy checks.
+    async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
+        Ok(arguments)
+    }
     async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome;
     /// Invoke with this tool's owning extension state from the active branch.
     async fn invoke_with_state(

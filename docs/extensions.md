@@ -50,8 +50,9 @@ outputs, model text, and summaries as data from their respective trust levels.
    registration order and receive the latest committed branch state.
    `Notification::Request` exposes the final context and tool schema.
 3. The journal records the model's complete assistant message and proposed
-   operations. Each tool is dispatched in model order, after the harness
-   checks the registered schema and the pre-tool hooks. The first denial
+   operations. Each tool is dispatched in model order. `prepare_arguments`
+   first normalizes its input, then the harness checks the registered schema
+   and the pre-tool hooks against that normalized value. The first denial
    becomes a skipped operation. A hook error stops the run. Cancellation or a
    hook timeout before dispatch also leaves that operation unstarted.
 4. `after_tool` receives the outcome and can return a new state. The tool
@@ -176,3 +177,16 @@ Cancellation after dispatch leaves the affected operations unknown and blocks
 automatic replay. Calls are bounded to eight nesting levels, 4096 nested calls
 per batch, and 1 MiB of arguments. Existing tools continue through their
 original invocation methods.
+
+## Argument preparation
+
+`Tool::prepare_arguments` may normalize a model's raw JSON before validation.
+The default returns it unchanged. Keep the transformation deterministic and
+free of external effects. The raw call remains in the journal, while schema
+validation, policy checks and execution receive the prepared value. Preparation
+uses the tool deadline and can be cancelled. Invalid, oversized or timed-out
+preparation leaves the operation unstarted. Prepared arguments are bounded to
+16 MiB. Pending-job authorization applies the same preparation step.
+
+Current native executables advertise this capability and forward preparation
+through their process interface. Older descriptors default to unchanged input.

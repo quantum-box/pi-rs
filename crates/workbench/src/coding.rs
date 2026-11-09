@@ -150,15 +150,9 @@ impl Tool for CodingTool {
                     "Apply unique non-overlapping replacements against the original file, preserving UTF-8 BOMs and line endings.",
                     json!({
                         "path": path,
-                        "oldText": {"type":"string", "minLength":1},
-                        "newText": {"type":"string"},
-                        "edits": {"anyOf": [
-                            {"type":"array", "items":replacement},
-                            replacement,
-                            {"type":"string", "minLength":1}
-                        ]}
+                        "edits": {"type":"array", "minItems":1, "items":replacement}
                     }),
-                    vec!["path"],
+                    vec!["path", "edits"],
                 )
             }
             Kind::Bash | Kind::PowerShell => (
@@ -190,11 +184,7 @@ impl Tool for CodingTool {
                 vec![],
             ),
         };
-        let mut parameters = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
-        if matches!(self.kind, Kind::Edit) {
-            parameters["anyOf"] =
-                json!([{"required":["edits"]},{"required":["oldText","newText"]}]);
-        }
+        let parameters = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
         ToolSpec {
             name: name.into(),
             description: description.into(),
@@ -209,6 +199,13 @@ impl Tool for CodingTool {
         }
     }
 
+    async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
+        if matches!(self.kind, Kind::Edit) {
+            crate::text_edit::prepare_arguments(arguments).map_err(|error| error.to_string())
+        } else {
+            Ok(arguments)
+        }
+    }
     async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
         if matches!(self.kind, Kind::Read) {
             match self.read_image(&args) {

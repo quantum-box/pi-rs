@@ -23,6 +23,10 @@ enum ProtocolRequest {
     Migrate {
         state: Option<ExtensionState>,
     },
+    PrepareArguments {
+        name: String,
+        arguments: Value,
+    },
     Context {
         request: ModelRequest,
         state: Option<ExtensionState>,
@@ -97,6 +101,8 @@ struct DescriptionTool {
     can_poll: bool,
     #[serde(default)]
     transactional: bool,
+    #[serde(default)]
+    prepares_arguments: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DecisionValue {
@@ -188,6 +194,7 @@ impl Extension for ExecutableExtension {
                     execution: tool.execution,
                     can_poll: tool.can_poll,
                     transactional: tool.transactional,
+                    prepares_arguments: tool.prepares_arguments,
                     host_calls: self.description.host_calls,
                 }) as Arc<dyn Tool>
             })
@@ -311,6 +318,7 @@ struct ExecutableTool {
     execution: ToolExecution,
     can_poll: bool,
     transactional: bool,
+    prepares_arguments: bool,
     host_calls: bool,
 }
 impl ExecutableTool {
@@ -369,6 +377,19 @@ impl ExecutableTool {
 }
 #[async_trait::async_trait]
 impl Tool for ExecutableTool {
+    async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
+        if !self.prepares_arguments {
+            return Ok(arguments);
+        }
+        self.request(
+            ProtocolRequest::PrepareArguments {
+                name: self.spec.name.clone(),
+                arguments,
+            },
+            CancellationToken::new(),
+        )
+        .await
+    }
     fn can_poll(&self) -> bool {
         self.can_poll
     }
@@ -861,10 +882,19 @@ async fn dispatch_with_host(
                     execution: tool.execution(),
                     can_poll: tool.can_poll(),
                     transactional: true,
+                    prepares_arguments: true,
                 })
                 .collect(),
         })),
         ProtocolRequest::Migrate { state } => encode(extension.migrate(state.as_ref())),
+        ProtocolRequest::PrepareArguments { name, arguments } => {
+            let tool = extension
+                .tools()
+                .into_iter()
+                .find(|tool| tool.spec().name == name)
+                .ok_or_else(|| "unknown extension tool".to_owned())?;
+            encode(tool.prepare_arguments(arguments).await)
+        }
         ProtocolRequest::Context { mut request, state } => {
             extension.context(&mut request, state.as_ref())?;
             encode(Ok(request))
@@ -1015,6 +1045,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_descriptors_disable_new_argument_preparation_by_default() {
+        let descriptor: DescriptionTool = serde_json::from_value(serde_json::json!({
+            "spec":{"name":"old","description":"legacy","parameters":{"type":"object"}},
+            "execution":"sequential"
+        }))
+        .unwrap();
+        assert!(!descriptor.prepares_arguments);
+    }
     struct PollTool;
     #[async_trait::async_trait]
     impl Tool for PollTool {
@@ -1127,6 +1166,7 @@ mod tests {
             .block_on(dispatch(extension.clone(), ProtocolRequest::Describe))
             .unwrap();
         assert_eq!(description["tools"][0]["can_poll"], true);
+        assert_eq!(description["tools"][0]["prepares_arguments"], true);
         let request = ProtocolRequest::Poll {
             name: "polling".into(),
             reference: "job-1".into(),

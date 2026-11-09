@@ -1,10 +1,10 @@
 //! Pi-compatible matching keeps unrelated file lines intact during fuzzy edits.
 use pi_rs::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Edit {
     old_text: String,
@@ -67,6 +67,16 @@ fn edits(arguments: &Value) -> Result<Vec<Edit>> {
         }
     }
     Ok(edits)
+}
+pub fn prepare_arguments(mut arguments: Value) -> Result<Value> {
+    let edits = edits(&arguments)?;
+    let object = arguments
+        .as_object_mut()
+        .ok_or_else(|| Error::Config("edit arguments must be an object".into()))?;
+    object.remove("oldText");
+    object.remove("newText");
+    object.insert("edits".into(), serde_json::to_value(edits)?);
+    Ok(arguments)
 }
 fn replace(mut text: String, replacements: &[Replacement], offset: usize) -> String {
     for replacement in replacements.iter().rev() {

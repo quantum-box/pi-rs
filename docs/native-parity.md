@@ -662,3 +662,17 @@ A CLI fixture combines a relative workspace, `--project`, explicit skill and
 native-extension globs, prompt brace expansion and settings-based patterns.
 Legacy named project skills remain distinct from explicit skill paths. Empty
 required patterns report an error before starting a model request.
+
+### Argument preparation checkpoint
+
+Rust tools can implement `prepare_arguments` before schema validation and
+policy authorization. Normal and nested invocations use the same path. Raw
+arguments remain in the journal. Preparation has cancellation, deadline and
+size bounds, and pending-job authorization uses the prepared value too.
+Native executable descriptors negotiate this hook while older binaries retain
+their existing behavior. The edit tool uses it to advertise its canonical batch
+schema while accepting supported legacy forms.
+
+Tests cover normalized inputs reaching policy hooks, raw-history preservation,
+a preparation timeout without dispatch, old executable descriptors, native
+host calls, cancellation and codemode regression.

@@ -879,6 +879,17 @@ impl Agent<'_> {
                 return Err(Error::PendingOperation(operation_id));
             }
             let arguments = serde_json::from_str(&invocation.call.arguments)?;
+            let arguments = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.prepare_arguments(arguments)) =>
+                    result.ok().and_then(std::result::Result::ok).ok_or(Error::PendingOperation(operation_id))?,
+            };
+            if arguments.to_string().len() > 16 * 1024 * 1024
+                || !tool.validator.is_valid(&arguments)
+            {
+                return Err(Error::PendingOperation(operation_id));
+            }
             let context = ToolContext {
                 operation_id,
                 cancellation: cancel.child_token(),
@@ -920,6 +931,16 @@ impl Agent<'_> {
         };
         let Ok(args) = serde_json::from_str(&call.arguments) else {
             return Ok(Preparation::Skipped("arguments are not valid JSON".into()));
+        };
+        let args = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.prepare_arguments(args)) => match result {
+                Ok(Ok(arguments)) if arguments.to_string().len() <= 16 * 1024 * 1024 => arguments,
+                Ok(Ok(_)) => return Ok(Preparation::Skipped("prepared arguments exceed size limit".into())),
+                Ok(Err(error)) => return Ok(Preparation::Skipped(format!("argument preparation failed: {error}"))),
+                Err(_) => return Ok(Preparation::Skipped("argument preparation timed out".into())),
+            },
         };
         if !tool.validator.is_valid(&args) {
             return Ok(Preparation::Skipped(

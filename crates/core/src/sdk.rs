@@ -766,7 +766,9 @@ mod tests {
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
         ) -> crate::Outcome {
-            let result = host.call("child", serde_json::json!({"value":"ok"})).await;
+            let result = host
+                .call("child", serde_json::json!({"wrapped":"ok"}))
+                .await;
             assert!(
                 matches!(&result, crate::Outcome::Structured { data, .. } if data["output"].as_str().unwrap().len() == 1024 * 1024)
             );
@@ -794,6 +796,15 @@ mod tests {
                 description: "Child".into(),
                 parameters: serde_json::json!({"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}),
             }
+        }
+        async fn prepare_arguments(
+            &self,
+            mut arguments: serde_json::Value,
+        ) -> crate::ExtensionResult<serde_json::Value> {
+            if let Some(value) = arguments.as_object_mut().unwrap().remove("wrapped") {
+                arguments["value"] = value;
+            }
+            Ok(arguments)
         }
         async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
             self.count.fetch_add(1, Ordering::SeqCst);
@@ -836,10 +847,14 @@ mod tests {
         async fn before_tool(
             &self,
             name: &str,
-            _: &serde_json::Value,
+            arguments: &serde_json::Value,
             _: &crate::ToolContext,
             _: Option<&crate::ExtensionState>,
         ) -> crate::ExtensionResult<crate::Decision> {
+            if name == "child" {
+                assert_eq!(arguments["value"], "ok");
+                assert!(arguments.get("wrapped").is_none());
+            }
             Ok(if name == "blocked" {
                 crate::Decision::Deny("blocked".into())
             } else {
@@ -864,6 +879,14 @@ mod tests {
             .filter(|record| matches!(record.event, crate::Event::ToolPlanned { .. }))
             .count();
         assert_eq!(plans, 3);
+        assert!(
+            session
+                .journal()
+                .operations()
+                .iter()
+                .any(|(invocation, _)| invocation.call.name == "child"
+                    && invocation.call.arguments.contains("wrapped"))
+        );
         assert_eq!(session.journal().operations().len(), 4);
         assert!(
             session
@@ -873,6 +896,59 @@ mod tests {
                 .all(|(_, state)| matches!(state, crate::OperationState::Finished(_)))
         );
         session.close().await.unwrap();
+    }
+    struct SlowPrepare(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::Tool for SlowPrepare {
+        fn spec(&self) -> crate::ToolSpec {
+            Bundle.spec()
+        }
+        async fn prepare_arguments(
+            &self,
+            _: serde_json::Value,
+        ) -> crate::ExtensionResult<serde_json::Value> {
+            std::future::pending().await
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            crate::Outcome::Succeeded("unexpected".into())
+        }
+    }
+    struct SlowPrepareExtension(Arc<AtomicUsize>);
+    impl Extension for SlowPrepareExtension {
+        fn id(&self) -> &str {
+            "slow-prepare"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(SlowPrepare(self.0.clone()))]
+        }
+    }
+    #[tokio::test]
+    async fn argument_preparation_timeout_never_dispatches_the_tool() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut session = SessionBuilder::new(Arc::new(NestedModel), "nested")
+            .limits(Limits {
+                model_requests: 1,
+                tool_timeout: std::time::Duration::from_millis(20),
+                ..Limits::default()
+            })
+            .extension(Arc::new(SlowPrepareExtension(count.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        assert!(matches!(
+            session.prompt("prepare").await,
+            Err(Error::Budget)
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(
+            !session
+                .journal()
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, crate::Event::ToolStarted { .. }))
+        );
+        assert!(session.journal().operations().iter().any(|(_, state)| matches!(state, crate::OperationState::Finished(crate::Outcome::Skipped(reason)) if reason.contains("preparation timed out"))));
     }
     struct ParallelBundle;
     #[async_trait::async_trait]
@@ -965,6 +1041,17 @@ mod tests {
                 count: self.calls.clone(),
             }
             .spec()
+        }
+        async fn prepare_arguments(
+            &self,
+            arguments: serde_json::Value,
+        ) -> crate::ExtensionResult<serde_json::Value> {
+            Child {
+                name: "child",
+                count: self.calls.clone(),
+            }
+            .prepare_arguments(arguments)
+            .await
         }
         async fn invoke(
             &self,
