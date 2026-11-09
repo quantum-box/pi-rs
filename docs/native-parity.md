@@ -607,3 +607,17 @@ retain line-level highlighting when that budget is exhausted.
 
 A PTY fixture runs an actual file edit and verifies numbered output and inverse
 word highlighting in fullscreen and regular mode.
+
+### Terminal input and redraw checkpoint
+
+Unix terminal input uses the level-triggered reader to retain input when resize
+notifications arrive alongside key events. A committed PTY regression exercises
+16 resize/input sequences and verifies terminal restoration. Terminal mode
+checks ignore the kernel's transient `PENDIN` typeahead flag while comparing
+all persistent settings.
+
+Display updates coalesce over 16 ms. In a local 100-character input fixture,
+fullscreen redraws decreased from 100 frames to two. Kitty and iTerm2 image
+fixtures passed all four mode/protocol combinations on three successive runs.
+Markdown, edit output, regular-history redraw and session selectors also passed
+their PTY regressions.

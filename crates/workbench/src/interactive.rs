@@ -1170,7 +1170,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         .take()
         .map(|prompt| (prompt, std::mem::take(&mut args.initial_images)));
     let mut dirty = true;
-    let mut last_frame = Instant::now();
+    let frame_interval = Duration::from_millis(16);
+    let mut last_frame = Instant::now() - frame_interval;
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     loop {
@@ -1280,12 +1281,19 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
         }
-        if dirty || (is_busy(&worker) && last_frame.elapsed() >= Duration::from_millis(100)) {
+        if (dirty && last_frame.elapsed() >= frame_interval)
+            || (is_busy(&worker) && last_frame.elapsed() >= Duration::from_millis(100))
+        {
             view.draw(&args, &theme, is_busy(&worker))?;
             dirty = false;
             last_frame = Instant::now();
         }
-        if !event::poll(Duration::from_millis(40))? {
+        let input_wait = if dirty {
+            frame_interval.saturating_sub(last_frame.elapsed())
+        } else {
+            Duration::from_millis(40)
+        };
+        if !event::poll(input_wait)? {
             continue;
         }
         match event::read()? {
