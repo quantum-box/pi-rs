@@ -49,8 +49,12 @@ impl Keys {
             ("app.editor.external", &["ctrl+g"]),
             ("app.tools.expand", &["ctrl+o"]),
             ("app.thinking.toggle", &["ctrl+t"]),
+            ("app.thinking.cycle", &["shift+tab"]),
             ("app.message.followUp", &["alt+enter"]),
             ("app.model.select", &["ctrl+l"]),
+            ("app.model.cycleForward", &["ctrl+p"]),
+            ("app.model.cycleBackward", &["ctrl+shift+p"]),
+            ("app.message.copy", &["ctrl+x"]),
         ];
         let mut bindings = BTreeMap::new();
         for (action, keys) in defaults {

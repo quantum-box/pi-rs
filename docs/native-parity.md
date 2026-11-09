@@ -14,15 +14,15 @@ remaining acceptance work for that surface.
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
-| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Full Markdown/table and diff layout fidelity, image display, regular terminal mode and remaining application actions |
+| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Full Markdown/table and diff layout fidelity, inline image display, regular-mode history redraw and remaining application actions |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity, Windows runtime validation |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Upstream JSONL import, richer tree navigation and branch summaries, session picker rename/delete/sort, Radius sharing |
-| Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector | Full provider catalog, provider-native adapters, thinking controls, retry configuration |
+| Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading | Full Pi event and interactive UI surface, explicit hot reload, scaffolding and package distribution |
-| Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, resource reload | Settings editor UI, package resource integration, resource globs and complete validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools and resources; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior, elicitation and task polling |
+| Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, resource reload | Complete settings editor UI, package resource integration, resource globs and complete validation diagnostics |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools and resources; environment/command credentials; add/remove/list commands | Persistent session connections, OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior, elicitation and task polling |
 | Codemode | Core tool invocation APIs | Sandboxed code execution and dynamic tool search |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload` | Automatic system appearance notifications, live file-watch reload |
 | SDK | Public Rust agent/session/model/tool/extension interfaces | High-level session builder and complete equivalents of Pi's SDK APIs |
@@ -131,3 +131,28 @@ Actual inline terminal-image rendering remains unimplemented.
 and serializes cooperating file mutations across processes. The Windows coding
 profile selects PowerShell. That platform-specific branch has not yet been
 exercised on Windows.
+
+### Model-selection checkpoint
+
+`/thinking`, Shift+Tab and `--thinking` select a reasoning effort. Selection is
+persisted with the active session branch alongside the model. The local Ollama
+adapter maps off to `reasoning_effort: none`, and maps higher Pi-only levels to
+Ollama's accepted range. Providers still decide which efforts their models
+support; capability-aware filtering awaits the provider catalog.
+
+The model and thinking selectors accept Ctrl+S to save a startup default.
+`/settings` currently edits tool-output and thinking-block visibility and saves
+model/thinking defaults. `/settings-json` displays the resolved settings.
+
+### Regular terminal checkpoint
+
+`--tui-mode regular` (or `tuiMode` in settings) keeps completed messages in
+normal terminal scrollback. The fullscreen default remains available. Both
+modes passed the same PTY sequence for project trust, quoted prompt expansion,
+model/thinking selection, settings, tools, exports and terminal restoration.
+Changing display options does not redraw history already committed to normal
+terminal scrollback. Full regular-mode redraw fidelity remains open.
+
+Ctrl+P / Ctrl+Shift+P cycle discovered models. Custom session-action bindings
+and Ctrl+X copying use the same journal operations as their slash commands.
+The checkpoint passed 76 workspace tests and all-target Clippy.

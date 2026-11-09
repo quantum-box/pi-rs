@@ -41,6 +41,9 @@ impl Worker {
             .arg(args.model_timeout_secs.to_string())
             .arg("--tool-timeout-secs")
             .arg(args.tool_timeout_secs.to_string());
+        if let Some(thinking) = &args.thinking {
+            command.arg("--thinking").arg(thinking);
+        }
         if args.trusted {
             command.arg("--trust");
         } else {

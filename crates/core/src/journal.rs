@@ -51,6 +51,10 @@ pub enum Event {
         target: u64,
         label: Option<String>,
     },
+    ModelSelected {
+        model: String,
+        thinking: Option<String>,
+    },
     HostBound {
         scope_digest: String,
     },
@@ -332,6 +336,36 @@ impl Session {
             }
         }
         result
+    }
+
+    pub fn model_selection(&self) -> Option<(String, Option<String>)> {
+        let branch = self.branch();
+        branch
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::ModelSelected { model, thinking } => Some((model.clone(), thinking.clone())),
+                _ => None,
+            })
+            .or_else(|| {
+                branch.iter().rev().find_map(|record| match &record.event {
+                    Event::ModelRequested { model, .. } => Some((model.clone(), None)),
+                    _ => None,
+                })
+            })
+    }
+
+    pub fn select_model(&mut self, model: &str, thinking: Option<&str>) -> Result<()> {
+        if model.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        if self.model_selection() != Some((model.into(), thinking.map(str::to_owned))) {
+            self.append(Event::ModelSelected {
+                model: model.into(),
+                thinking: thinking.map(str::to_owned),
+            })?;
+        }
+        Ok(())
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -753,6 +787,22 @@ pub(crate) fn conversation(
 #[cfg(test)]
 mod session_metadata_tests {
     use super::*;
+
+    #[test]
+    fn model_and_thinking_selection_follow_the_active_branch() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.select_model("first", Some("high")).unwrap();
+        let first = session.head();
+        session.select_model("second", Some("off")).unwrap();
+        session.checkout(first).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("first".into(), Some("high".into())))
+        );
+        let count = session.records().len();
+        session.select_model("first", Some("high")).unwrap();
+        assert_eq!(session.records().len(), count);
+    }
 
     #[test]
     fn fork_remaps_branch_references_and_keeps_the_original_tree() {

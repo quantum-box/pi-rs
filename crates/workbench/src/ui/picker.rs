@@ -11,6 +11,8 @@ pub enum Selection {
     Model(String),
     Theme(String),
     Trust(bool),
+    Thinking(String),
+    Setting(String, serde_json::Value),
 }
 pub struct Item {
     pub label: String,
@@ -26,6 +28,7 @@ pub enum Input {
     Continue,
     Cancel,
     Select(Selection),
+    Save(Selection),
 }
 impl Picker {
     pub fn new(title: &str, items: Vec<Item>) -> Self {
@@ -49,6 +52,11 @@ impl Picker {
             KeyCode::Esc => return Input::Cancel,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Input::Cancel;
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(item) = self.matches().get(self.selected) {
+                    return Input::Save(item.selection.clone());
+                }
             }
             KeyCode::Enter => {
                 if let Some(item) = self.matches().get(self.selected) {

@@ -144,6 +144,12 @@ fn continue_reopens_the_latest_saved_session() {
 }
 
 fn model_fixture() -> (String, std::thread::JoinHandle<()>) {
+    model_fixture_with_effort(None)
+}
+
+fn model_fixture_with_effort(
+    effort: Option<&'static str>,
+) -> (String, std::thread::JoinHandle<()>) {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!(
         "http://{}/v1/chat/completions",
@@ -170,6 +176,9 @@ fn model_fixture() -> (String, std::thread::JoinHandle<()>) {
             let mut body = vec![0; content_length];
             reader.read_exact(&mut body).unwrap();
             let request: Value = serde_json::from_slice(&body).unwrap();
+            if let Some(effort) = effort {
+                assert_eq!(request["reasoning_effort"], effort);
+            }
             assert!(
                 request["messages"]
                     .as_array()
@@ -188,6 +197,40 @@ fn model_fixture() -> (String, std::thread::JoinHandle<()>) {
         }
     });
     (endpoint, handle)
+}
+
+#[test]
+fn thinking_override_reaches_provider_and_restores_from_session() {
+    let (endpoint, server) = model_fixture_with_effort(Some("none"));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
+    for first in [true, false] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .env("PI_RS_HOME", directory.path().join("home"))
+            .arg("--session")
+            .arg(&path)
+            .args(["--endpoint", &endpoint]);
+        if first {
+            command.args(["--thinking", "off"]);
+        }
+        let output = command.args(["run", "same input"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        Session::open(path)
+            .unwrap()
+            .model_selection()
+            .unwrap()
+            .1
+            .as_deref(),
+        Some("off")
+    );
+    server.join().unwrap();
 }
 
 #[tokio::test]

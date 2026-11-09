@@ -36,6 +36,10 @@ struct Cli {
     #[arg(skip)]
     settings: config::Settings,
     #[arg(skip)]
+    model_explicit: bool,
+    #[arg(skip)]
+    thinking_explicit: bool,
+    #[arg(skip)]
     trusted: bool,
     #[arg(skip)]
     trust_pending: bool,
@@ -68,12 +72,18 @@ struct Cli {
     print: bool,
     #[arg(long, value_enum)]
     mode: Option<OutputMode>,
+    /// Choose fullscreen or normal terminal scrollback rendering.
+    #[arg(long, global = true, value_enum)]
+    tui_mode: Option<TuiMode>,
     /// Include full requests, tool payloads and streamed text in stdout JSONL.
     #[arg(long, global = true)]
     trace: bool,
     /// Model served by the Ollama endpoint.
     #[arg(long, default_value = "qwen2.5:7b", global = true)]
     model: String,
+    /// Thinking effort for models that support reasoning.
+    #[arg(long, global = true, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
+    thinking: Option<String>,
     /// Full URL of the Ollama-compatible chat completions endpoint.
     #[arg(
         long,
@@ -145,6 +155,12 @@ struct Cli {
     /// Initial prompt when no explicit subcommand is used.
     #[arg(value_name = "PROMPT", num_args = 0.., trailing_var_arg = true)]
     prompt: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TuiMode {
+    Fullscreen,
+    Regular,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -242,6 +258,10 @@ async fn main() {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        args.model_explicit =
+            matches.value_source("model") == Some(clap::parser::ValueSource::CommandLine);
+        args.thinking_explicit =
+            matches.value_source("thinking") == Some(clap::parser::ValueSource::CommandLine);
         let decision = config::project_trust(
             &args.workspace,
             if args.no_trust {
@@ -259,6 +279,19 @@ async fn main() {
             && let Some(model) = args.settings.string("defaultModel")
         {
             args.model = model.into();
+        }
+        if args.tui_mode.is_none() {
+            args.tui_mode = Some(if args.settings.string("tuiMode") == Some("regular") {
+                TuiMode::Regular
+            } else {
+                TuiMode::Fullscreen
+            });
+        }
+        if args.thinking.is_none() {
+            args.thinking = args
+                .settings
+                .string("defaultThinkingLevel")
+                .map(str::to_owned);
         }
         args.themes.extend(
             args.settings
@@ -488,6 +521,15 @@ async fn execute(mut args: Cli) -> Result<()> {
         }
         _ => {}
     }
+    if let Some((model, thinking)) = session.model_selection() {
+        if !args.model_explicit {
+            args.model = model;
+        }
+        if !args.thinking_explicit {
+            args.thinking = thinking;
+        }
+    }
+    session.select_model(&args.model, args.thinking.as_deref())?;
     let local_resources = resources::Resources::load(&args)?;
     for warning in &local_resources.warnings {
         eprintln!("{warning}");
@@ -561,6 +603,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     }
     let show_reasoning = args.trace;
     let provider = Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?
+        .with_reasoning_effort(args.thinking.as_deref())
         .with_progress(|stage| output(json!({"type":"model_progress","stage":stage})))
         .with_reasoning(move |delta| {
             if show_reasoning {
@@ -761,6 +804,9 @@ fn metadata(record: &pi_rs::Record) -> Value {
     let mut value = match &record.event {
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),
         Event::SessionInfo { name, cwd } => json!({"event":"session_info","name":name,"cwd":cwd}),
+        Event::ModelSelected { model, thinking } => {
+            json!({"event":"model_selected","model":model,"thinking":thinking})
+        }
         Event::Label { target, label } => json!({"event":"label","target":target,"label":label}),
         Event::HostBound { .. } => json!({"event": "host_bound"}),
         Event::HostRunBound { run_id, .. } => {

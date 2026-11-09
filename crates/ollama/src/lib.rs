@@ -21,6 +21,7 @@ pub struct Ollama {
     client: Client,
     endpoint: Url,
     token: Option<String>,
+    reasoning_effort: Option<String>,
     progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -77,9 +78,25 @@ impl Ollama {
             client,
             endpoint,
             token,
+            reasoning_effort: None,
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Override provider thinking effort. None preserves the model default.
+    pub fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        let local_ollama = self.endpoint.port_or_known_default() == Some(11434);
+        self.reasoning_effort = effort.map(|effort| {
+            match effort {
+                "off" => "none",
+                "minimal" if local_ollama => "low",
+                "xhigh" | "max" if local_ollama => "high",
+                effort => effort,
+            }
+            .to_owned()
+        });
+        self
     }
 
     pub fn with_progress(
@@ -197,6 +214,9 @@ impl Model for Ollama {
         });
         if !tools.is_empty() {
             body["tools"] = json!(tools);
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
         }
         let mut builder = self.client.post(self.endpoint.clone()).json(&body);
         if let Some(token) = &self.token {
@@ -478,6 +498,27 @@ struct CallDelta {
 #[cfg(test)]
 mod content_tests {
     use super::*;
+    #[test]
+    fn thinking_override_preserves_defaults_and_maps_local_effort() {
+        let local = Ollama::new("http://127.0.0.1:11434/v1/chat/completions", None).unwrap();
+        assert_eq!(local.reasoning_effort, None);
+        assert_eq!(
+            local
+                .clone()
+                .with_reasoning_effort(Some("off"))
+                .reasoning_effort
+                .as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            local
+                .with_reasoning_effort(Some("max"))
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+    }
+
     #[test]
     fn image_tool_results_keep_pairing_and_move_images_to_a_user_content_block() {
         let content = json!({"data":{"content":[{"type":"text","text":"A chart"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]},"attachments":[]}).to_string();

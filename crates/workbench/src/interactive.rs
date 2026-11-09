@@ -10,11 +10,11 @@ use crate::ui::{
     render::{Entry, Line},
     theme::Theme,
 };
-use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
-use crossterm::style::ResetColor;
+use crossterm::style::{Print, ResetColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use pi_rs::{Error, Result, Session};
@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Cli, process::Worker, sessions};
+use super::{Cli, TuiMode, process::Worker, sessions};
 
 pub(super) fn new_session_path() -> PathBuf {
     session_path(&std::env::current_dir().unwrap_or_default(), None)
@@ -73,40 +73,52 @@ pub(super) fn latest_session(example: &std::path::Path) -> Result<PathBuf> {
         .ok_or_else(|| Error::Config("no saved session in this directory".into()))
 }
 
-struct Terminal;
+struct Terminal {
+    alternate: bool,
+}
 impl Terminal {
-    fn enter() -> Result<Self> {
+    fn enter(mode: Option<TuiMode>) -> Result<Self> {
         terminal::enable_raw_mode()?;
-        let guard = Self;
-        execute!(
-            std::io::stdout(),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            Hide
-        )?;
+        let guard = Self {
+            alternate: mode != Some(TuiMode::Regular),
+        };
+        if guard.alternate {
+            execute!(std::io::stdout(), EnterAlternateScreen)?;
+        }
+        execute!(std::io::stdout(), EnableBracketedPaste, Hide)?;
         Ok(guard)
     }
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
-        let _ = execute!(
-            std::io::stdout(),
-            ResetColor,
-            Show,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
+        if self.alternate {
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        } else {
+            let _ = execute!(std::io::stdout(), Print("\r\n"));
+        }
         let _ = terminal::disable_raw_mode();
     }
 }
 
 #[derive(Default)]
+struct RegularState {
+    committed: usize,
+    cursor_row: usize,
+    region_height: usize,
+    started: bool,
+}
+
+#[derive(Default)]
 struct View {
+    regular: RegularState,
     lines: Vec<Entry>,
     picker: Option<Picker>,
     session_name: Option<String>,
     resources: super::resources::Resources,
     model_list: Option<std::sync::mpsc::Receiver<Result<Vec<String>>>>,
+    available_models: Vec<String>,
+    model_cycle: Option<bool>,
     thinking: String,
     expand_tools: bool,
     hide_thinking: bool,
@@ -134,6 +146,7 @@ impl View {
             ));
         }
         self.session_name = session.name().map(str::to_owned);
+        self.regular.committed = 0;
         self.lines.clear();
         self.streaming.clear();
         self.thinking.clear();
@@ -302,7 +315,10 @@ impl View {
             _ => {}
         }
     }
-    fn draw(&self, args: &Cli, theme: &Theme, busy: bool) -> Result<()> {
+    fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool) -> Result<()> {
+        if args.tui_mode == Some(TuiMode::Regular) {
+            return self.draw_regular(args, theme, busy);
+        }
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
@@ -387,12 +403,17 @@ impl View {
         Line::plain(&args.workspace.display().to_string(), theme.color("dim"))
             .draw(&mut out, width)?;
         queue!(out, MoveTo(0, (height - 1) as u16))?;
-        let model_width = UnicodeWidthStr::width(args.model.as_str());
+        let model = format!(
+            "{} · {}",
+            args.model,
+            args.thinking.as_deref().unwrap_or("default")
+        );
+        let model_width = UnicodeWidthStr::width(model.as_str());
         let usage = format!("↑↓ 確定 {} tokens", self.tokens);
         let usage = clip(&usage, width.saturating_sub(model_width + 1));
         let padding = width.saturating_sub(UnicodeWidthStr::width(usage.as_str()) + model_width);
         Line::plain(
-            &format!("{usage}{}{model}", " ".repeat(padding), model = args.model),
+            &format!("{usage}{}{model}", " ".repeat(padding)),
             theme.color("dim"),
         )
         .draw(&mut out, width)?;
@@ -405,6 +426,157 @@ impl View {
             MoveTo(column as u16, (border_row + 1 + cursor_row - offset) as u16),
             Show
         )?;
+        out.flush()?;
+        Ok(())
+    }
+    fn finish_regular(&mut self) -> Result<()> {
+        if self.regular.started {
+            execute!(
+                std::io::stdout(),
+                MoveDown(
+                    self.regular
+                        .region_height
+                        .saturating_sub(self.regular.cursor_row + 1) as u16
+                ),
+                MoveToColumn(0),
+                Print("\r\n")
+            )?;
+            self.regular.started = false;
+        }
+        Ok(())
+    }
+
+    fn draw_regular(&mut self, args: &Cli, theme: &Theme, busy: bool) -> Result<()> {
+        let (width, height) = terminal::size()?;
+        let width = usize::from(width.max(1));
+        let height = usize::from(height.max(7));
+        let prompt = wrap(&self.editor.text, width);
+        let prompt_height = prompt.len().clamp(1, 6).min(height - 5);
+        let mut out = std::io::stdout().lock();
+        queue!(out, Hide, MoveToColumn(0))?;
+        if self.regular.started {
+            queue!(
+                out,
+                MoveUp(self.regular.cursor_row as u16),
+                Clear(ClearType::FromCursorDown)
+            )?;
+        } else {
+            queue!(out, Print("\r\n"))?;
+            if self.regular.committed == 0 {
+                Line::plain(
+                    &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
+                    theme.color("accent"),
+                )
+                .draw(&mut out, width)?;
+                queue!(out, Print("\r\n"))?;
+            }
+        }
+        if self.lines.len() < self.regular.committed {
+            self.regular.committed = 0;
+        }
+        let mut active = Vec::new();
+        if !busy && self.picker.is_none() && self.scroll == 0 {
+            for entry in &self.lines[self.regular.committed..] {
+                for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
+                    line.draw(&mut out, width)?;
+                    queue!(out, Print("\r\n"))?;
+                }
+            }
+            self.regular.committed = self.lines.len();
+        } else {
+            let start = if self.scroll > 0 {
+                0
+            } else {
+                self.regular.committed
+            };
+            active.extend(self.lines[start..].iter().flat_map(|entry| {
+                entry.render(theme, width, self.expand_tools, !self.hide_thinking)
+            }));
+            active.extend(Entry::Thinking(self.thinking.clone()).render(
+                theme,
+                width,
+                false,
+                !self.hide_thinking,
+            ));
+            active
+                .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
+            if let Some(picker) = &self.picker {
+                active = picker.render(theme, height - prompt_height - 4);
+            }
+            let end = active
+                .len()
+                .saturating_sub(self.scroll.min(active.len().saturating_sub(1)));
+            active = active[..end]
+                .iter()
+                .rev()
+                .take(height - prompt_height - 4)
+                .cloned()
+                .collect();
+            active.reverse();
+            for line in &active {
+                line.draw(&mut out, width)?;
+                queue!(out, Print("\r\n"))?;
+            }
+        }
+        let elapsed = self
+            .request_started
+            .map(|start| start.elapsed().as_secs_f32())
+            .unwrap_or_default();
+        let status = if busy {
+            format!(
+                "{} {elapsed:.1}s · Escで取消 ",
+                self.phase.unwrap_or("処理中")
+            )
+        } else {
+            String::new()
+        };
+        Line::plain(
+            &format!(
+                "{}{}",
+                status,
+                "─".repeat(width.saturating_sub(UnicodeWidthStr::width(status.as_str())))
+            ),
+            theme.color("border"),
+        )
+        .draw(&mut out, width)?;
+        queue!(out, Print("\r\n"))?;
+        let prefix = wrap(&self.editor.text[..self.editor.cursor], width);
+        let cursor = prefix.len().saturating_sub(1);
+        let offset = cursor.saturating_sub(prompt_height - 1);
+        for line in prompt.iter().skip(offset).take(prompt_height) {
+            Line::plain(line, theme.color("text")).draw(&mut out, width)?;
+            queue!(out, Print("\r\n"))?;
+        }
+        for line in [
+            Line::plain(&"─".repeat(width), theme.color("border")),
+            Line::plain(&args.workspace.display().to_string(), theme.color("dim")),
+        ] {
+            line.draw(&mut out, width)?;
+            queue!(out, Print("\r\n"))?;
+        }
+        Line::plain(
+            &format!(
+                "↑↓ {} tokens · {} · {}",
+                self.tokens,
+                args.model,
+                args.thinking.as_deref().unwrap_or("default")
+            ),
+            theme.color("dim"),
+        )
+        .draw(&mut out, width)?;
+        self.regular.cursor_row = active.len() + 1 + cursor - offset;
+        self.regular.region_height = active.len() + prompt_height + 4;
+        let column = prefix
+            .last()
+            .map_or(0, |line| UnicodeWidthStr::width(line.as_str()))
+            .min(width - 1);
+        queue!(
+            out,
+            MoveUp((self.regular.region_height - self.regular.cursor_row - 1) as u16),
+            MoveToColumn(column as u16),
+            Show
+        )?;
+        self.regular.started = true;
         out.flush()?;
         Ok(())
     }
@@ -429,6 +601,8 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     }
     outcome.tool_content()
 }
+
+const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /compact  /tree  /checkout <id>  /quit\n/extensions  /extension <id> <command> [arguments]\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
@@ -550,7 +724,27 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         "/model" if rest.is_empty() => start_model_picker(args, view),
         "/model" => {
             args.model = rest.to_owned();
+            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
             view.append(&format!("Model › {rest}"));
+        }
+        "/thinking" if rest.is_empty() => {
+            view.picker = Some(Picker::new(
+                "Thinking level",
+                THINKING_LEVELS
+                    .iter()
+                    .map(|level| Item {
+                        label: (*level).into(),
+                        selection: Selection::Thinking((*level).into()),
+                    })
+                    .collect(),
+            ));
+        }
+        "/thinking" => {
+            if !THINKING_LEVELS.contains(&rest) {
+                return Err(Error::Config("unknown thinking level".into()));
+            }
+            args.thinking = Some(rest.into());
+            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
         }
         "/new" => {
             args.session = session_path(&args.workspace, args.session_dir.as_deref());
@@ -627,6 +821,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 ],
             ));
         }
+        "/settings-json" => view.append(&serde_json::to_string_pretty(args.settings.value())?),
         "/prompts" => {
             for (name, prompt) in &view.resources.prompts {
                 view.lines
@@ -758,7 +953,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    initialize_session(&args)?;
+    initialize_session(&mut args)?;
     restore_workspace(&mut args)?;
     let mut theme = Theme::load(
         args.use_theme.as_deref().unwrap_or("system"),
@@ -784,7 +979,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         slash("/resume", &mut args, &mut view)?;
     }
     let mut keys = Keys::load()?;
-    let _terminal = Terminal::enter()?;
+    let _terminal = Terminal::enter(args.tui_mode)?;
     let mut worker: Option<Worker> = None;
     let mut dirty = true;
     let mut last_frame = Instant::now();
@@ -793,25 +988,40 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             match receiver.try_recv() {
                 Ok(Ok(models)) => {
                     view.model_list = None;
-                    view.picker = Some(Picker::new(
-                        "Select model",
-                        models
-                            .into_iter()
-                            .map(|model| Item {
-                                label: model.clone(),
-                                selection: Selection::Model(model),
-                            })
-                            .collect(),
-                    ));
+                    view.available_models = models.clone();
+                    if models.is_empty() {
+                        view.model_cycle = None;
+                        view.append("No models available");
+                        dirty = true;
+                        continue;
+                    }
+                    if let Some(reverse) = view.model_cycle.take() {
+                        if let Err(error) = cycle_model(&mut args, &mut view, reverse) {
+                            view.append(&error.to_string());
+                        }
+                    } else {
+                        view.picker = Some(Picker::new(
+                            "Select model",
+                            models
+                                .into_iter()
+                                .map(|model| Item {
+                                    label: model.clone(),
+                                    selection: Selection::Model(model),
+                                })
+                                .collect(),
+                        ));
+                    }
                     dirty = true;
                 }
                 Ok(Err(error)) => {
                     view.model_list = None;
+                    view.model_cycle = None;
                     view.append(&error.to_string());
                     dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     view.model_list = None;
+                    view.model_cycle = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -859,7 +1069,12 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             continue;
         }
         match event::read()? {
-            Event::Resize(..) => dirty = true,
+            Event::Resize(..) => {
+                if args.tui_mode == Some(TuiMode::Regular) {
+                    view.finish_regular()?;
+                }
+                dirty = true;
+            }
             Event::Paste(text) => {
                 view.editor.insert(&text);
                 dirty = true;
@@ -870,6 +1085,21 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     match picker.input(key) {
                         Input::Continue => view.picker = Some(picker),
                         Input::Cancel => {}
+                        Input::Save(selection) => {
+                            let result = match selection {
+                                Selection::Model(model) => {
+                                    args.settings.set_user("defaultModel", json!(model))
+                                }
+                                Selection::Thinking(thinking) => args
+                                    .settings
+                                    .set_user("defaultThinkingLevel", json!(thinking)),
+                                _ => Ok(()),
+                            };
+                            if let Err(error) = result {
+                                view.append(&error.to_string());
+                            }
+                            view.picker = Some(picker);
+                        }
                         Input::Select(selection) => {
                             if let Err(error) = select(selection, &mut args, &mut view, &mut theme)
                             {
@@ -889,6 +1119,44 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                             let _ = active.send(json!({"type":"cancel"}));
                         }
                     }
+                    "app.session.new" | "app.session.tree" | "app.session.fork"
+                    | "app.session.resume"
+                        if worker.is_none() =>
+                    {
+                        let command = match action {
+                            "app.session.new" => "/new",
+                            "app.session.tree" => "/tree",
+                            "app.session.fork" => "/fork",
+                            _ => "/resume",
+                        };
+                        if let Err(error) = slash(command, &mut args, &mut view) {
+                            view.append(&error.to_string());
+                        }
+                    }
+                    "app.message.copy" if worker.is_none() => {
+                        if let Err(error) = sessions::copy_last(&Session::open(&args.session)?) {
+                            view.append(&error.to_string());
+                        }
+                    }
+                    "app.model.cycleForward" | "app.model.cycleBackward" if worker.is_none() => {
+                        if let Err(error) =
+                            cycle_model(&mut args, &mut view, action == "app.model.cycleBackward")
+                        {
+                            view.append(&error.to_string());
+                        }
+                    }
+                    "app.thinking.cycle" if worker.is_none() => {
+                        let next = args
+                            .thinking
+                            .as_deref()
+                            .and_then(|level| {
+                                THINKING_LEVELS.iter().position(|value| *value == level)
+                            })
+                            .map_or(0, |index| (index + 1) % THINKING_LEVELS.len());
+                        args.thinking = Some(THINKING_LEVELS[next].into());
+                        Session::open(&args.session)?
+                            .select_model(&args.model, args.thinking.as_deref())?;
+                    }
                     "app.tools.expand" => view.expand_tools = !view.expand_tools,
                     "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
                     "app.clear" => {
@@ -902,6 +1170,9 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     }
                     "app.exit" => break,
                     "app.editor.external" => {
+                        if args.tui_mode == Some(TuiMode::Regular) {
+                            view.finish_regular()?;
+                        }
                         if let Err(error) = external_editor(&args, &mut view.editor) {
                             view.append(&error.to_string());
                         }
@@ -984,7 +1255,56 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
                         } else if input.trim() == "/settings" {
-                            view.append(&serde_json::to_string_pretty(args.settings.value())?);
+                            view.picker = Some(Picker::new(
+                                "Settings",
+                                vec![
+                                    Item {
+                                        label: format!(
+                                            "Tool output · {} (toggle)",
+                                            if view.expand_tools {
+                                                "expanded"
+                                            } else {
+                                                "collapsed"
+                                            }
+                                        ),
+                                        selection: Selection::Setting(
+                                            "expandTools".into(),
+                                            json!(!view.expand_tools),
+                                        ),
+                                    },
+                                    Item {
+                                        label: format!(
+                                            "Thinking blocks · {} (toggle)",
+                                            if view.hide_thinking {
+                                                "hidden"
+                                            } else {
+                                                "shown"
+                                            }
+                                        ),
+                                        selection: Selection::Setting(
+                                            "hideThinkingBlock".into(),
+                                            json!(!view.hide_thinking),
+                                        ),
+                                    },
+                                    Item {
+                                        label: format!("Save default model · {}", args.model),
+                                        selection: Selection::Setting(
+                                            "defaultModel".into(),
+                                            json!(args.model),
+                                        ),
+                                    },
+                                    Item {
+                                        label: format!(
+                                            "Save default thinking · {}",
+                                            args.thinking.as_deref().unwrap_or("model default")
+                                        ),
+                                        selection: Selection::Setting(
+                                            "defaultThinkingLevel".into(),
+                                            json!(args.thinking),
+                                        ),
+                                    },
+                                ],
+                            ));
                         } else if input.starts_with('/') {
                             match slash(&input, &mut args, &mut view) {
                                 Ok(next) => worker = next,
@@ -1038,6 +1358,31 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         }
     }
     drop(worker);
+    if args.tui_mode == Some(TuiMode::Regular) {
+        view.finish_regular()?;
+    }
+    Ok(())
+}
+
+fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
+    if view.available_models.is_empty() {
+        view.model_cycle = Some(reverse);
+        start_model_picker(args, view);
+        return Ok(());
+    }
+    let index = view
+        .available_models
+        .iter()
+        .position(|model| model == &args.model);
+    let count = view.available_models.len();
+    let next = match (index, reverse) {
+        (Some(index), true) => (index + count - 1) % count,
+        (Some(index), false) => (index + 1) % count,
+        (None, true) => count - 1,
+        (None, false) => 0,
+    };
+    args.model = view.available_models[next].clone();
+    Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
     Ok(())
 }
 
@@ -1088,6 +1433,19 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
         }
         Selection::Model(model) => {
             args.model = model;
+            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
+        }
+        Selection::Thinking(thinking) => {
+            args.thinking = Some(thinking);
+            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
+        }
+        Selection::Setting(key, value) => {
+            args.settings.set_user(&key, value.clone())?;
+            match key.as_str() {
+                "expandTools" => view.expand_tools = value.as_bool().unwrap_or(false),
+                "hideThinkingBlock" => view.hide_thinking = value.as_bool().unwrap_or(false),
+                _ => {}
+            }
         }
         Selection::Trust(decision) => {
             crate::config::save_trust(&args.workspace, decision)?;
@@ -1113,6 +1471,8 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
 
 fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
     let mut next = args.clone();
+    next.model_explicit = false;
+    next.thinking_explicit = false;
     next.session = path;
     restore_workspace(&mut next)?;
     let resources = super::resources::Resources::load(&next)?;
@@ -1125,7 +1485,7 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
     Ok(())
 }
 
-fn initialize_session(args: &Cli) -> Result<()> {
+fn initialize_session(args: &mut Cli) -> Result<()> {
     let mut session = Session::open(&args.session)?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
@@ -1138,10 +1498,27 @@ fn initialize_session(args: &Cli) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
+    if let Some((model, thinking)) = session.model_selection() {
+        if !args.model_explicit {
+            args.model = model;
+        }
+        if !args.thinking_explicit {
+            args.thinking = thinking;
+        }
+    }
+    session.select_model(&args.model, args.thinking.as_deref())?;
     Ok(())
 }
 fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = Session::open(&args.session)?;
+    if let Some((model, thinking)) = session.model_selection() {
+        if !args.model_explicit {
+            args.model = model;
+        }
+        if !args.thinking_explicit {
+            args.thinking = thinking;
+        }
+    }
     if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
         if !path.is_dir() {
@@ -1187,24 +1564,20 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
     };
     let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
     file.write_all(editor.text.as_bytes())?;
-    execute!(
-        std::io::stdout(),
-        Show,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )?;
+    execute!(std::io::stdout(), Show, DisableBracketedPaste)?;
+    if args.tui_mode != Some(TuiMode::Regular) {
+        execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    }
     terminal::disable_raw_mode()?;
     let result = std::process::Command::new(program)
         .args(arguments)
         .arg(file.path())
         .status();
     terminal::enable_raw_mode()?;
-    execute!(
-        std::io::stdout(),
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        Hide
-    )?;
+    execute!(std::io::stdout(), EnableBracketedPaste, Hide)?;
+    if args.tui_mode != Some(TuiMode::Regular) {
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+    }
     if !result?.success() {
         return Err(Error::Config(
             "external editor exited unsuccessfully".into(),
