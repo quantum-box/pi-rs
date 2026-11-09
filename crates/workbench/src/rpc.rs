@@ -576,10 +576,29 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         }
         "get_session_stats" if !busy(worker) => {
             let session = Session::open(&args.session)?;
-            let stats = sessions::summary(&args.session, &session);
-            Ok(Some(
-                json!({"sessionId":session.session_id(),"sessionFile":args.session,"sessionName":session.name(),"totalMessages":stats.messages,"tokens":{"input":stats.input_tokens,"output":stats.output_tokens,"total":stats.input_tokens.saturating_add(stats.output_tokens)}}),
-            ))
+            let mut stats = serde_json::to_value(sessions::statistics(&session))?;
+            stats["sessionId"] = json!(session.session_id());
+            stats["sessionFile"] = json!(args.session);
+            stats["sessionName"] = json!(session.name());
+            stats["cost"] = Value::Null;
+            if let Some(window) = args.context_window.filter(|window| *window > 0) {
+                let estimate = session.context_usage_estimate();
+                let after_compaction = session
+                    .branch()
+                    .iter()
+                    .any(|record| matches!(record.event, pi_rs::Event::Compacted { .. }));
+                let tokens = if after_compaction && estimate.last_usage_record.is_none() {
+                    None
+                } else {
+                    Some(estimate.tokens)
+                };
+                stats["contextUsage"] = json!({
+                    "tokens":tokens,
+                    "contextWindow":window,
+                    "percent":tokens.map(|tokens| tokens as f64 / f64::from(window) * 100.0),
+                });
+            }
+            Ok(Some(stats))
         }
         _ => Err(Error::Config(format!(
             "command {name:?} is unavailable in the current state"

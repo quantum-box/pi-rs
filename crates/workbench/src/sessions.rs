@@ -156,6 +156,128 @@ pub fn summary(path: &Path, session: &Session) -> SessionSummary {
     summary
 }
 
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStats {
+    pub user_messages: u64,
+    pub assistant_messages: u64,
+    pub tool_calls: u64,
+    pub tool_results: u64,
+    pub total_messages: u64,
+    pub tokens: TokenTotals,
+}
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub total: u64,
+}
+impl TokenTotals {
+    fn add(&mut self, usage: pi_rs::Usage, metadata: Option<&pi_rs::ModelMetadata>) {
+        let cache_read = metadata
+            .and_then(|value| value.cached_input_tokens)
+            .unwrap_or(0);
+        let cache_write = metadata
+            .and_then(|value| value.cache_creation_input_tokens)
+            .unwrap_or(0);
+        self.input = self.input.saturating_add(
+            usage
+                .input_tokens
+                .saturating_sub(cache_read.saturating_add(cache_write)),
+        );
+        self.output = self.output.saturating_add(usage.output_tokens);
+        self.cache_read = self.cache_read.saturating_add(cache_read);
+        self.cache_write = self.cache_write.saturating_add(cache_write);
+        self.total = self
+            .input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write);
+    }
+}
+
+/// Durable session totals include branches and compacted history, as Pi does.
+pub fn statistics(session: &Session) -> SessionStats {
+    let records = session.records();
+    let measured: std::collections::BTreeMap<_, _> = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ModelFinished {
+                request_id,
+                usage: pi_rs::UsageReport::Measured { usage },
+                metadata,
+                ..
+            } => Some((*request_id, (*usage, metadata))),
+            _ => None,
+        })
+        .collect();
+    let nested: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ToolPlanned { invocation, .. } => Some(invocation.operation_id),
+            _ => None,
+        })
+        .collect();
+    let mut stats = SessionStats::default();
+    for (usage, metadata) in measured.values() {
+        stats.tokens.add(*usage, Some(metadata));
+    }
+    let mut pending_summary = None;
+    for record in records {
+        match &record.event {
+            Event::User { .. } | Event::UserWithImages { .. } => {
+                stats.user_messages += 1;
+                stats.total_messages += 1;
+            }
+            Event::Assistant {
+                invocations,
+                usage,
+                request_id,
+                ..
+            } => {
+                stats.assistant_messages += 1;
+                stats.total_messages += 1;
+                stats.tool_calls = stats.tool_calls.saturating_add(invocations.len() as u64);
+                if let Some(usage) = usage
+                    && request_id.is_none_or(|id| !measured.contains_key(&id))
+                {
+                    stats.tokens.add(*usage, None);
+                }
+                pending_summary = None;
+            }
+            Event::ToolFinished { operation_id, .. } if !nested.contains(operation_id) => {
+                stats.tool_results += 1;
+                stats.total_messages += 1;
+            }
+            Event::BashExecution { .. } => {
+                stats.total_messages += 1;
+            }
+            Event::ModelRequested { .. } => pending_summary = None,
+            Event::ModelFinished {
+                usage, reply: None, ..
+            } => {
+                pending_summary = match usage {
+                    pi_rs::UsageReport::Measured { usage } => Some(*usage),
+                    _ => None,
+                }
+            }
+            Event::Compacted { usage, .. } => {
+                if let Some(usage) = usage
+                    && Some(*usage) != pending_summary
+                {
+                    stats.tokens.add(*usage, None);
+                }
+                pending_summary = None;
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
 pub fn fork(session: &Session, target: u64, destination: &Path, workspace: &Path) -> Result<()> {
     let mut copy = Session::from_records(session.fork_records(target)?)?;
     copy.set_working_directory(workspace)?;

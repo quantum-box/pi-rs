@@ -1451,3 +1451,25 @@ A PTY check covers native command execution and rejection of an unknown command.
 Workspace tests and all-target Clippy pass. Remaining work includes complete package source identity, command
 execution during an already-active model turn and further extension event/UI
 parity.
+
+### RPC session statistics checkpoint
+
+`get_session_stats` now returns user, assistant, tool-call and tool-result counts
+from the complete durable session, including alternate branches and compacted
+history. Nested tool operations do not inflate model-visible tool counts.
+Measured requests are counted once, and assistant or imported summary usage is
+used when there is no separate measured request record. Input, output,
+cache-read and cache-write totals are exposed separately without counting cached
+input twice.
+
+Import retains cached usage on assistant and tool-result messages and standalone usage,
+compaction and branch-summary entries. An explicit context window also enables
+`contextUsage`; after compaction, its token count remains unknown until a fresh
+measured response is available. Cost is returned as null because native sessions
+do not yet retain verified pricing data. Live statistics while a run owns the
+journal, complete message-variant counting and provider pricing remain open.
+
+Tests cover an imported multi-branch session with assistant, tool-result,
+standalone and summary usage. A loopback RPC test covers message and tool counts,
+cache accounting, summary usage deduplication and unknown post-compaction context.
+The complete workspace tests and all-target Clippy pass.

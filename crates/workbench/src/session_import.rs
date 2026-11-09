@@ -8,6 +8,33 @@ use pi_rs::{Error, Event, Invocation, Outcome, Record, Result, Session, ToolCall
 use serde_json::Value;
 use uuid::Uuid;
 
+fn append_imported_usage(events: &mut Vec<Event>, value: &Value) -> Option<Usage> {
+    value.as_object()?;
+    let cache_read = value["cacheRead"].as_u64().unwrap_or(0);
+    let cache_write = value["cacheWrite"].as_u64().unwrap_or(0);
+    let usage = Usage {
+        input_tokens: value["input"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(cache_read)
+            .saturating_add(cache_write),
+        output_tokens: value["output"].as_u64().unwrap_or(0),
+    };
+    events.push(Event::ModelFinished {
+        request_id: Uuid::new_v4(),
+        metadata: pi_rs::ModelMetadata {
+            cached_input_tokens: Some(cache_read),
+            cache_creation_input_tokens: Some(cache_write),
+            ..Default::default()
+        },
+        usage: pi_rs::UsageReport::Measured { usage },
+        failure: None,
+        partial: String::new(),
+        reply: None,
+    });
+    Some(usage)
+}
+
 pub fn read(path: &Path) -> Result<Session> {
     let mut text = String::new();
     std::fs::File::open(path)?
@@ -296,7 +323,11 @@ fn convert(
                         })
                         .collect();
                     let usage = message.get("usage").map(|usage| Usage {
-                        input_tokens: usage["input"].as_u64().unwrap_or(0),
+                        input_tokens: usage["input"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_add(usage["cacheRead"].as_u64().unwrap_or(0))
+                            .saturating_add(usage["cacheWrite"].as_u64().unwrap_or(0)),
                         output_tokens: usage["output"].as_u64().unwrap_or(0),
                     });
                     let request_id = Uuid::new_v4();
@@ -314,6 +345,8 @@ fn convert(
                     events.push(Event::ModelFinished {
                         request_id,
                         metadata: pi_rs::ModelMetadata {
+                            cached_input_tokens: message["usage"]["cacheRead"].as_u64(),
+                            cache_creation_input_tokens: message["usage"]["cacheWrite"].as_u64(),
                             finish_reason: message["stopReason"].as_str().map(str::to_owned),
                             reasoning,
                             resolved_model: message["model"].as_str().map(|model| {
@@ -343,6 +376,7 @@ fn convert(
                     events.extend(started);
                 }
                 "toolResult" => {
+                    append_imported_usage(&mut events, &message["usage"]);
                     let id = required(message, "toolCallId")?;
                     let operation_id = branch.calls.remove(id).ok_or_else(|| {
                         Error::Session(format!("imported tool result has no call {id}"))
@@ -475,17 +509,21 @@ fn convert(
                         .entry_start,
                 )
             };
+            let usage = append_imported_usage(&mut events, &entry["usage"]);
             events.push(Event::Compacted {
                 summary: required(entry, "summary")?.into(),
                 retain_from,
                 states: Default::default(),
-                usage: None,
+                usage,
             });
         }
-        "branch_summary" => events.push(Event::User {
-            content: format!("Prior branch summary:\n{}", required(entry, "summary")?),
-            input_id: None,
-        }),
+        "branch_summary" => {
+            append_imported_usage(&mut events, &entry["usage"]);
+            events.push(Event::User {
+                content: format!("Prior branch summary:\n{}", required(entry, "summary")?),
+                input_id: None,
+            });
+        }
         "custom_message" => push_user(&mut events, &entry["content"])?,
         "custom" if entry["customType"] == "codemode-store" => {
             if let (Some(set), Some(deleted)) = (
@@ -514,7 +552,10 @@ fn convert(
                 });
             }
         }
-        "custom" | "usage" => {}
+        "usage" => {
+            append_imported_usage(&mut events, &entry["usage"]);
+        }
+        "custom" => {}
         "context_edit" => {
             let source = required(entry, "targetId")?;
             let target = branches
@@ -577,6 +618,30 @@ mod tests {
         );
         assert_eq!(checkpoint.2[0].name, "read");
         assert_eq!(checkpoint.3, &["old"]);
+    }
+
+    #[test]
+    fn statistics_include_all_branches_and_imported_cached_and_summary_usage() {
+        let entries = vec![
+            json!({"type":"session","version":3,"cwd":"/tmp/import"}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"read","arguments":{"path":"x"}}],"usage":{"input":10,"output":4,"cacheRead":3,"cacheWrite":2}}}),
+            json!({"type":"message","id":"t","parentId":"a","message":{"role":"toolResult","toolCallId":"call","content":"result","usage":{"input":2,"output":1,"cacheRead":1}}}),
+            json!({"type":"usage","id":"usage","parentId":"t","usage":{"input":5,"output":1}}),
+            json!({"type":"compaction","id":"c","parentId":"usage","firstKeptEntryId":"u","summary":"summary","usage":{"input":7,"output":2}}),
+            json!({"type":"message","id":"branch","parentId":"u","message":{"role":"user","content":"other branch"}}),
+        ];
+        let session = import_pi(entries).unwrap();
+        let stats = serde_json::to_value(crate::sessions::statistics(&session)).unwrap();
+        assert_eq!(stats["userMessages"], 2);
+        assert_eq!(stats["assistantMessages"], 1);
+        assert_eq!(stats["toolCalls"], 1);
+        assert_eq!(stats["toolResults"], 1);
+        assert_eq!(stats["totalMessages"], 4);
+        assert_eq!(
+            stats["tokens"],
+            json!({"input":24,"output":8,"cacheRead":4,"cacheWrite":2,"total":38})
+        );
     }
 
     #[test]
