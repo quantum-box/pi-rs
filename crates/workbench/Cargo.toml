@@ -20,6 +20,7 @@ evaluation-fixtures = ["dep:pi-rs-fixture-tools"]
 
 [dependencies]
 async-trait = "0.1"
+futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 globset = "0.4"
@@ -37,6 +38,9 @@ pi-rs-plan-mode = { path = "../plan-mode" }
 pi-rs-review = { path = "../review" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 regex = "1"
+process-wrap = { version = "10", features = ["tokio1"] }
+rmcp = { version = "3.9", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

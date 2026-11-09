@@ -232,6 +232,12 @@ impl View {
             Some("text_delta") => self
                 .streaming
                 .push_str(value["delta"].as_str().unwrap_or_default()),
+            Some("mcp_server") => self.append(&format!(
+                "MCP {} · {} · {}",
+                value["name"].as_str().unwrap_or(""),
+                value["status"].as_str().unwrap_or(""),
+                value["error"].as_str().unwrap_or("")
+            )),
             Some("error") => self.append(&format!(
                 "Error › {}",
                 value["message"].as_str().unwrap_or_default()
@@ -585,6 +591,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             switch_session(args, view, path)?;
         }
         "/compact" => return Worker::start(args, &["compact"]).map(Some),
+        "/mcp" => return Worker::start(args, &["mcp", "list"]).map(Some),
         "/trust" => {
             view.picker = Some(Picker::new(
                 "Load project configuration?",

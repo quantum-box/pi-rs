@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 mod config;
 mod interactive;
+mod mcp_config;
 mod process;
 mod resources;
 mod rpc;
@@ -157,6 +158,10 @@ enum OutputMode {
 enum Command {
     /// Open the interactive terminal interface.
     Interactive,
+    Mcp {
+        #[command(subcommand)]
+        command: mcp_config::McpCommand,
+    },
     Run {
         prompt: String,
     },
@@ -286,6 +291,10 @@ async fn main() {
 }
 
 async fn execute(mut args: Cli) -> Result<()> {
+    if let Some(Command::Mcp { command }) = args.command.as_ref() {
+        return mcp_config::command(&args, command.clone()).await;
+    }
+
     if let Some(path) = args
         .resume_session
         .as_ref()
@@ -500,6 +509,8 @@ async fn execute(mut args: Cli) -> Result<()> {
     } else {
         system_prompt = local_resources.system_prompt(&system_prompt);
     }
+    let mcp_connections = mcp_config::connect_all(&args, false).await?;
+    let result = async {
     let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
     if let Some(project) = &args.project {
         extensions.push(Arc::new(ProjectInstructions {
@@ -529,6 +540,10 @@ async fn execute(mut args: Cli) -> Result<()> {
     if let Some(endpoint) = args.fixtures.as_deref() {
         extensions.push(Arc::new(pi_rs_fixture_tools::Fixtures::new(endpoint)?));
     }
+    for connection in &mcp_connections {
+        extensions.push(connection.clone());
+    }
+
     let mut registry =
         Registry::compose(extensions, &args.disable_extension.into_iter().collect())?;
     registry.register(Arc::new(CommandPolicy {
@@ -689,6 +704,11 @@ async fn execute(mut args: Cli) -> Result<()> {
         .await?;
     output(json!({"type": "answer", "content": answer}));
     Ok(())
+    }.await;
+    for connection in mcp_connections {
+        connection.close().await;
+    }
+    result
 }
 
 fn read_controls(sender: mpsc::Sender<QueuedInput>, cancel: CancellationToken) {

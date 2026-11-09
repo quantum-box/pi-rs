@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading | Full Pi event and interactive UI surface, explicit hot reload, scaffolding and package distribution |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, resource reload | Settings editor UI, package resource integration, resource globs and complete validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration | Local CLI server configuration, discovery, authentication, resource tools, exposure controls |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools and resources; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior, elicitation and task polling |
 | Codemode | Core tool invocation APIs | Sandboxed code execution and dynamic tool search |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload` | Automatic system appearance notifications, live file-watch reload |
 | SDK | Public Rust agent/session/model/tool/extension interfaces | High-level session builder and complete equivalents of Pi's SDK APIs |
@@ -103,3 +103,17 @@ personal skill files outside the working directory. Embedded users of
 `CodingTools::local`. A regression test covers that distinction. The resource
 PTY check covered granting project trust, advertising a discovered skill and
 expanding a quoted prompt argument before the model request.
+
+### Local MCP checkpoint
+
+`pi mcp add`, `pi mcp remove`, `pi mcp list` and `/mcp` use user-level
+`mcp.json` and trusted project overrides. The native client uses rmcp 3.9 for
+stdio and streamable HTTP. It exposes namespaced server tools and resource
+listing/reading. Configuration can reference environment variables or bounded
+credential commands. Server processes are isolated into process groups/jobs,
+and the CLI closes connections after each run.
+
+Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
+headers, resource reading, and the model/tool/model round trip. Credentials
+were absent from captured CLI output. This checkpoint exposes enabled tools
+directly; OAuth, deferred exposure and live reconnection remain in the table.

@@ -134,6 +134,24 @@ pub fn save_trust(workspace: &Path, decision: bool) -> Result<()> {
     write_json(&path, &value)
 }
 
+pub fn update_object(
+    path: &Path,
+    update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
+    let mut value = read_object(path)?;
+    update(value.as_object_mut().expect("object"))?;
+    write_json(path, &value)
+}
+
 pub fn read_object(path: &Path) -> Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => {
