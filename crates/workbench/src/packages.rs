@@ -522,6 +522,26 @@ fn source_identity(source: &str) -> String {
     }
     if let Some(source) = source.strip_prefix("git:") {
         let (url, _) = git_reference(source);
+        let repository = if url.contains("://") {
+            reqwest::Url::parse(url).ok()
+        } else {
+            url.strip_prefix("git@")
+                .and_then(|source| source.split_once(':'))
+                .and_then(|(host, path)| {
+                    reqwest::Url::parse(&format!("ssh://git@{host}/{path}")).ok()
+                })
+        };
+        if let Some(repository) = repository
+            && let Some(host) = repository.host_str()
+        {
+            let path = repository.path().trim_matches('/');
+            let path = path.strip_suffix(".git").unwrap_or(path);
+            let port = repository.port().filter(|port| {
+                !matches!((repository.scheme(), port), ("ssh", 22) | ("https", 443))
+            });
+            let authority = port.map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+            return format!("git:{authority}/{path}");
+        }
         let url = url.trim_end_matches('/');
         return format!("git:{}", url.strip_suffix(".git").unwrap_or(url));
     }
@@ -1083,6 +1103,19 @@ mod tests {
             source_identity("git:https://user@host/repo.git@main"),
             source_identity("git:https://user@host/repo#feature/next")
         );
+        let github = source_identity("git:https://github.com/team/repo.git@main");
+        for source in [
+            "git:git@github.com:team/repo.git#feature/next",
+            "git:ssh://git@github.com:22/team/repo@stable",
+            "git:https://user@GITHUB.COM:443/team/repo/",
+        ] {
+            assert_eq!(source_identity(source), github);
+        }
+        assert_ne!(
+            source_identity("git:ssh://git@github.com:2222/team/repo"),
+            github
+        );
+        assert_ne!(source_identity("git:https://github.com/Team/repo"), github);
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let missing = root.join("deleted");

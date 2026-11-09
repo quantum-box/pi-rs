@@ -899,3 +899,10 @@ A stateful stdio fixture exited after each response and returned counter values
 1, 2 and 3 across three prompts in one agent process, with exactly three server
 starts and three mutations. Rust 1.89 workspace tests and all-target Clippy passed.
 Live tool-list updates still require separate implementation and verification.
+
+Git package identity now unifies SSH and HTTPS declarations for the same host
+and repository path, including default ports and `.git` suffixes. Revision and
+transport changes preserve per-package resource filters and scope precedence.
+Explicit non-default ports and case-sensitive repository paths remain distinct.
+Regression tests cover transport aliases, ports, revisions and missing local
+sources.
