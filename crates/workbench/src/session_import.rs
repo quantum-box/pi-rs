@@ -169,6 +169,12 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             entry: header.clone(),
         },
     );
+    if let Some(path) = header["parentSession"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+    {
+        importer.append(&mut root, Event::ParentSession { path: path.into() });
+    }
     let mut branches = BTreeMap::<String, Branch>::new();
     let mut previous = None;
     for (index, entry) in entries.into_iter().enumerate().skip(1) {
@@ -605,6 +611,18 @@ mod tests {
     use super::*;
     use pi_rs::Message;
     use serde_json::json;
+    #[test]
+    fn imports_parent_session_without_adding_model_context() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3,"parentSession":"../parent.jsonl"}),
+        ])
+        .unwrap();
+        assert_eq!(session.parent_session(), Some("../parent.jsonl"));
+        assert!(session.current_messages().is_empty());
+        let legacy = import_pi(vec![json!({"type":"session","version":1})]).unwrap();
+        assert!(legacy.parent_session().is_none());
+    }
+
     #[test]
     fn imports_ordered_system_sections_and_tool_changes() {
         let entry: Value = serde_json::from_str(r#"{"type":"message","id":"system","parentId":null,"message":{"role":"system","content":[{"type":"text","text":"base"}],"sections":{"z":"first","a":"second","removed":null},"toolsAdded":[{"name":"read","description":"Read","parameters":{"type":"object"}}],"toolsRemoved":[{"name":"old"}]}}"#).unwrap();

@@ -1552,3 +1552,16 @@ resource-template, prompt, authentication-header and redaction checks also pass.
 
 The full workspace tests and all-target Clippy pass. Cancellation after a model
 response also settles its unstarted tool operations before returning.
+
+### Parent-session provenance checkpoint
+
+RPC `new_session` retains its optional `parentSession` path in durable native
+metadata. A parent reference does not add conversation messages or read or
+modify the referenced file. Invalid field types are rejected before the active
+session changes. New sessions without a parent remain independent.
+
+The core exposes `parent_session` and `set_parent_session`, native JSONL export
+and snapshots retain the reference, local summaries include it, and upstream
+Pi header imports preserve `parentSession`. Tests cover reopening/export,
+invalid RPC input, unlinked sessions and old imports without parent metadata.
+A CLI RPC smoke check covers creation and persistence through normal commands.

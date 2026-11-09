@@ -976,6 +976,7 @@ fn metadata(record: &pi_rs::Record) -> Value {
             json!({"event":"bash_execution","exitCode":execution.exit_code,"cancelled":execution.cancelled,"truncated":execution.truncated})
         }
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),
+        Event::ParentSession { .. } => json!({"event":"parent_session"}),
         Event::SessionInfo { name, cwd } => json!({"event":"session_info","name":name,"cwd":cwd}),
         Event::ModelSelected { model, thinking } => {
             json!({"event":"model_selected","model":model,"thinking":thinking})

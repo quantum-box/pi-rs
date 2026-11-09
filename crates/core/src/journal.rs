@@ -62,6 +62,10 @@ pub enum Event {
     Created {
         session_id: Uuid,
     },
+    /// Originating session path, retained independently of branch context.
+    ParentSession {
+        path: String,
+    },
     /// Presentation metadata does not enter model context.
     SessionInfo {
         name: Option<String>,
@@ -577,6 +581,25 @@ impl Session {
                 Event::SessionInfo { cwd: Some(cwd), .. } => Some(cwd.as_str()),
                 _ => None,
             })
+    }
+
+    pub fn parent_session(&self) -> Option<&str> {
+        self.records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::ParentSession { path } => Some(path.as_str()),
+                _ => None,
+            })
+    }
+
+    /// Record provenance without reading or modifying the parent journal.
+    pub fn set_parent_session(&mut self, path: &str) -> Result<()> {
+        if path.is_empty() {
+            return Err(Error::Config("parent session path cannot be empty".into()));
+        }
+        self.append(Event::ParentSession { path: path.into() })?;
+        Ok(())
     }
 
     pub fn set_name(&mut self, name: &str) -> Result<()> {

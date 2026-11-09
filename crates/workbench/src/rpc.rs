@@ -456,18 +456,28 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         }
 
         "new_session" if !busy(worker) => {
-            args.session = if args.no_session {
+            let parent = match request.get("parentSession") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(path)) => Some(path.as_str()).filter(|path| !path.is_empty()),
+                Some(_) => return Err(Error::Config("parentSession must be a string".into())),
+            };
+            let destination = if args.no_session {
                 args.session
                     .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
             } else {
                 interactive::session_path(&args.workspace, args.session_dir.as_deref())
             };
-            if let Some(parent) = args.session.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Some(directory) = destination.parent() {
+                std::fs::create_dir_all(directory)?;
             }
-            let mut session = Session::open(&args.session)?;
+            let mut session = Session::open(&destination)?;
             session.set_working_directory(&args.workspace)?;
             super::backend::initialize_queue_modes(&mut session, args)?;
+            if let Some(parent) = parent {
+                session.set_parent_session(parent)?;
+            }
+            drop(session);
+            args.session = destination;
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" if !busy(worker) => {
@@ -809,6 +819,58 @@ mod tests {
         assert!(!busy);
         assert!(compact.is_none());
         assert!(abort.is_none());
+    }
+
+    #[test]
+    fn new_session_retains_parent_and_rejects_invalid_parent_before_switching() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jsonl");
+        drop(Session::open(&source).unwrap());
+        let original = std::fs::read(&source).unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = root.path().to_path_buf();
+        args.session = source.clone();
+        args.session_dir = Some(root.path().join("sessions"));
+        let mut worker = None;
+        assert!(
+            command(
+                &json!({"type":"new_session","parentSession":42}),
+                &mut args,
+                &mut worker
+            )
+            .is_err()
+        );
+        assert_eq!(args.session, source);
+        let parent = source.to_string_lossy().into_owned();
+        command(
+            &json!({"type":"new_session","parentSession":parent}),
+            &mut args,
+            &mut worker,
+        )
+        .unwrap();
+        let child = Session::snapshot(&args.session).unwrap();
+        assert_eq!(child.parent_session(), Some(parent.as_str()));
+        assert!(child.current_messages().is_empty());
+        assert_eq!(
+            super::sessions::summary(&args.session, &child)
+                .parent_session
+                .as_deref(),
+            Some(parent.as_str())
+        );
+        let export = root.path().join("export.jsonl");
+        child.export_jsonl(&export).unwrap();
+        assert_eq!(
+            Session::snapshot(export).unwrap().parent_session(),
+            Some(parent.as_str())
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        command(&json!({"type":"new_session"}), &mut args, &mut worker).unwrap();
+        assert!(
+            Session::snapshot(&args.session)
+                .unwrap()
+                .parent_session()
+                .is_none()
+        );
     }
 
     #[test]
