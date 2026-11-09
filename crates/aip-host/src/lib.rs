@@ -101,6 +101,19 @@ impl HostRegistry {
             delegated,
         })
     }
+
+    /// Inspect or request cancellation through the configured port for a
+    /// recorded operation on this profile's run and active branch.
+    pub async fn reconcile_operation(
+        &self,
+        session: &mut Session,
+        operation_id: uuid::Uuid,
+        cancel_remote: bool,
+    ) -> Result<bool> {
+        let invocation = tools::run_invocation(session, &self.scope, operation_id)?;
+        let port = self.delegated.port(&invocation.call.name)?;
+        reconcile(session, &self.scope, port, operation_id, cancel_remote).await
+    }
 }
 
 pub struct HostTurn<'a> {

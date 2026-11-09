@@ -222,7 +222,8 @@ async fn pending_operation_survives_restart_and_is_neither_replayed_nor_double_s
     let mut session = Session::open(&path).unwrap();
     assert_eq!(session.session_id(), session_id);
     assert!(
-        !reconcile(&mut session, &scope, platform.as_ref(), operation_id, true)
+        !registry
+            .reconcile_operation(&mut session, operation_id, true)
             .await
             .unwrap()
     );
@@ -234,7 +235,8 @@ async fn pending_operation_survives_restart_and_is_neither_replayed_nor_double_s
     ));
     platform.confirmed.store(true, Ordering::SeqCst);
     assert!(
-        reconcile(&mut session, &scope, platform.as_ref(), operation_id, false)
+        registry
+            .reconcile_operation(&mut session, operation_id, false)
             .await
             .unwrap()
     );

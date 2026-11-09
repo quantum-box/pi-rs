@@ -117,6 +117,14 @@ impl DelegatedTools {
                     .any(|candidate| candidate.delegation == tool.delegation)
         })
     }
+
+    pub(crate) fn port(&self, name: &str) -> Result<&dyn DelegatedPort> {
+        self.tools
+            .iter()
+            .find(|tool| tool.delegation.spec.name == name)
+            .map(|tool| tool.port.as_ref())
+            .ok_or_else(|| Error::Config("recorded tool is unavailable in this AIP profile".into()))
+    }
 }
 
 impl Extension for DelegatedTools {
@@ -176,6 +184,24 @@ impl Tool for RemoteTool {
     }
 }
 
+pub(crate) fn run_invocation<'a>(
+    session: &'a Session,
+    scope: &RunScope,
+    operation_id: Uuid,
+) -> Result<&'a pi_rs_core::Invocation> {
+    session
+        .branch()
+        .into_iter()
+        .filter(|record| record.run_id == Some(scope.journal_run_id))
+        .find_map(|record| match &record.event {
+            pi_rs_core::Event::Assistant { invocations, .. } => invocations
+                .iter()
+                .find(|invocation| invocation.operation_id == operation_id),
+            _ => None,
+        })
+        .ok_or_else(|| Error::Session("operation belongs to a different AIP run".into()))
+}
+
 pub async fn reconcile(
     session: &mut Session,
     scope: &RunScope,
@@ -184,15 +210,7 @@ pub async fn reconcile(
     cancel_remote: bool,
 ) -> Result<bool> {
     scope.bind(session)?;
-    if !session.branch().iter().any(|record| {
-        record.run_id == Some(scope.journal_run_id)
-            && matches!(&record.event, pi_rs_core::Event::Assistant { invocations, .. }
-                if invocations.iter().any(|invocation| invocation.operation_id == operation_id))
-    }) {
-        return Err(Error::Session(
-            "operation belongs to a different AIP run".into(),
-        ));
-    }
+    run_invocation(session, scope, operation_id)?;
     let state = session
         .operations()
         .into_iter()
