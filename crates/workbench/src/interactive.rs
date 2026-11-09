@@ -2373,7 +2373,10 @@ fn select(
                 "modelThinkingLevels" => json!({}),
                 "steeringMode" | "followUpMode" => json!("one-at-a-time"),
                 "codemode" => json!({"mode":"on", "inlineBudget":3000}),
-                "compaction" => json!({"enabled":args.settings.auto_compaction_enabled()}),
+                "compaction" => {
+                    let tokens = args.settings.compaction_tokens(&args.model);
+                    json!({"enabled":args.settings.auto_compaction_enabled(), "reserveTokens":tokens.reserve_tokens, "keepRecentTokens":tokens.keep_recent_tokens})
+                }
                 _ => json!([]),
             };
             let value = args.settings.value().get(&key).unwrap_or(&default);

@@ -1153,7 +1153,7 @@ cloned controls, fork isolation and closed-session handling. Loopback
 Ollama-adapter checks cover live RPC changes during a held model request,
 settings persistence, field preservation, validation and manual summaries.
 Both terminal layouts were exercised with a model request still running.
-Reference compaction defaults and unloaded-model context-window discovery
+Unloaded-model context-window discovery
 and broader provider recovery behavior remain open.
 
 
@@ -1186,7 +1186,8 @@ and now reject unsupported metadata requests explicitly.
 
 Explicit `compaction.reserveTokens` and `compaction.keepRecentTokens` settings
 now reach the agent. Each field resolves independently through
-`compaction.modelOverrides["ollama/<model>"]`, then the ordinary setting.
+`compaction.modelOverrides["ollama/<model>"]`, then the ordinary setting, then
+the reference defaults recorded below.
 Values are validated as non-negative JavaScript-safe integers. Zero is valid,
 and unrelated settings remain preserved.
 
@@ -1199,8 +1200,8 @@ summary when an older prefix exists and enough request budget remains. The
 existing one-compaction-per-run bound still applies. Native SDK controls expose
 the same optional token settings, and forks receive an independent copy.
 
-Omitted token fields continue to use the native bounded policy. The reference
-built-in token defaults remain open; within-turn boundaries are covered below.
+Within-turn boundaries and omitted-field defaults are covered by the following
+checkpoints. Low-level hosts can still supply their own optional token policy.
 `/settings` exposes the compaction object for editing, with reload/startup
 application for token-policy changes.
 
@@ -1235,4 +1236,29 @@ Core tests cover a trailing tool result, late context edits, source preservation
 reopening and the retained assistant/tool pair. SDK tests cover retaining an
 assistant inside a turn. Loopback checks exercise automatic and manual RPC
 compaction, model overrides, CLI turn-count overrides and completion responses.
-Reference default token values and token-estimator differences remain open.
+Token-estimator differences remain open. Reference default values are covered
+by the following checkpoint.
+
+
+### Reference compaction defaults checkpoint
+
+The local workbench now defaults to `reserveTokens = 16384` and
+`keepRecentTokens = 20000`, matching Pi v1.5.0. Resolution is independent for
+each field, with a model-specific value taking priority over the ordinary
+setting and built-in default. Explicit zero remains zero. Missing values are
+resolved in memory without rewriting user settings. The native SDK exposes
+`CompactionTokens::pi_defaults()` for hosts choosing this standard policy.
+
+The compaction settings editor displays the resolved defaults when no
+compaction object exists. A manual summary with no projected prefix returns
+`Nothing to compact (session too small)` before any model request. Automatic
+threshold handling also checks for actual projected history before attempting
+a summary, so metadata-only prefixes do not trigger empty summaries on small
+context models. Explicit `--keep-turns` and SDK turn counts still select their
+requested retention.
+
+Tests cover per-field fallback, model overrides, zero values, small-session
+summary rejection, and short prompts with a context smaller than the default
+reserve. Loopback checks cover the CLI/RPC default path, a skipped summary,
+explicit CLI override and preservation of the settings file. Both terminal
+layouts display the defaults without creating a settings file.

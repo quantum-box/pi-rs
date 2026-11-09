@@ -34,6 +34,16 @@ pub struct CompactionTokens {
     pub keep_recent_tokens: Option<u64>,
 }
 
+impl CompactionTokens {
+    /// Standard Pi compaction policy. Low-level hosts may retain None for custom policy.
+    pub const fn pi_defaults() -> Self {
+        Self {
+            reserve_tokens: Some(16_384),
+            keep_recent_tokens: Some(20_000),
+        }
+    }
+}
+
 impl AutoCompactionControl {
     pub fn new(enabled: bool) -> Self {
         Self {
@@ -398,8 +408,8 @@ impl Agent<'_> {
                                 input_tokens > u64::from(window).saturating_sub(reserve)
                             });
                     let has_prefix = reserve_reached && {
-                        let branch = session.branch();
-                        retention.boundary != retain_from(&branch, usize::MAX)
+                        // Metadata alone does not provide anything to summarize.
+                        has_summary_prefix(session, retention.boundary)
                     };
                     if exceeds
                         || (control.enabled()
@@ -1489,6 +1499,11 @@ impl Agent<'_> {
             return Err(Error::Budget);
         }
         let before = retention.boundary;
+        if !has_summary_prefix(session, before) {
+            return Err(Error::Config(
+                "Nothing to compact (session too small)".into(),
+            ));
+        }
         let mut request = self
             .request(
                 session,
@@ -1635,6 +1650,12 @@ impl Agent<'_> {
             observer,
         )
     }
+}
+
+fn has_summary_prefix(session: &Session, boundary: Option<u64>) -> bool {
+    conversation_entries(&session.branch(), session.operations())
+        .iter()
+        .any(|(source, _)| boundary.is_none_or(|boundary| *source < boundary))
 }
 
 #[derive(Clone, Copy)]

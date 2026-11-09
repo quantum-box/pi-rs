@@ -784,6 +784,38 @@ mod tests {
         session.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn reference_retention_rejects_a_small_session_without_requesting_a_summary() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "echo")
+            .limits(Limits {
+                context_window: Some(2048),
+                output_tokens_per_request: 128,
+                ..Limits::default()
+            })
+            .in_memory()
+            .unwrap();
+        session.prompt("small session").await.unwrap();
+        session
+            .controls()
+            .set_compaction_tokens(crate::CompactionTokens::pi_defaults())
+            .unwrap();
+        session.prompt("still a small session").await.unwrap();
+        let error = session.summarize_configured(None).await.unwrap_err();
+        assert!(error.to_string().contains("Nothing to compact"));
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+        assert!(
+            !session
+                .journal()
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, crate::Event::Compacted { .. }))
+        );
+        session.summarize(0).await.unwrap();
+        assert_eq!(model.0.load(Ordering::SeqCst), 3);
+        session.close().await.unwrap();
+    }
+
     struct EchoModel(AtomicUsize);
     #[async_trait::async_trait]
     impl Model for EchoModel {

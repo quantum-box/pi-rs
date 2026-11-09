@@ -99,11 +99,17 @@ impl Settings {
             overrides
                 .get(name)
                 .or_else(|| compaction.get(name))
-                .and_then(Value::as_u64)
+                .and_then(|value| {
+                    // JSON Schema accepts 42.0 as an integer and bounds it before this conversion.
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_f64().map(|number| number as u64))
+                })
         };
+        let defaults = pi_rs::CompactionTokens::pi_defaults();
         pi_rs::CompactionTokens {
-            reserve_tokens: token_value("reserveTokens"),
-            keep_recent_tokens: token_value("keepRecentTokens"),
+            reserve_tokens: token_value("reserveTokens").or(defaults.reserve_tokens),
+            keep_recent_tokens: token_value("keepRecentTokens").or(defaults.keep_recent_tokens),
         }
     }
     pub fn set_auto_compaction_enabled(&mut self, enabled: bool) -> Result<()> {
@@ -443,9 +449,58 @@ mod tests {
         );
         assert_eq!(
             Settings::default().compaction_tokens("first"),
-            pi_rs::CompactionTokens::default()
+            pi_rs::CompactionTokens::pi_defaults()
         );
         validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+    }
+
+    #[test]
+    fn missing_compaction_token_fields_use_pi_defaults_without_overwriting_zero() {
+        let settings = Settings {
+            value: json!({"compaction":{"reserveTokens":0,"modelOverrides":{"ollama/test":{"keepRecentTokens":0}}}}),
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.compaction_tokens("test"),
+            pi_rs::CompactionTokens {
+                reserve_tokens: Some(0),
+                keep_recent_tokens: Some(0)
+            }
+        );
+        assert_eq!(
+            settings.compaction_tokens("other"),
+            pi_rs::CompactionTokens {
+                reserve_tokens: Some(0),
+                keep_recent_tokens: Some(20_000)
+            }
+        );
+        let only_keep = Settings {
+            value: json!({"compaction":{"keepRecentTokens":17}}),
+            ..Settings::default()
+        };
+        assert_eq!(
+            only_keep.compaction_tokens("test"),
+            pi_rs::CompactionTokens {
+                reserve_tokens: Some(16_384),
+                keep_recent_tokens: Some(17)
+            }
+        );
+    }
+
+    #[test]
+    fn compaction_tokens_accept_integral_json_numbers() {
+        let settings = Settings {
+            value: json!({"compaction":{"reserveTokens":0.0,"keepRecentTokens":42.0}}),
+            ..Settings::default()
+        };
+        validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+        assert_eq!(
+            settings.compaction_tokens("test"),
+            pi_rs::CompactionTokens {
+                reserve_tokens: Some(0),
+                keep_recent_tokens: Some(42)
+            }
+        );
     }
 
     #[test]
