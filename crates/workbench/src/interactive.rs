@@ -163,6 +163,9 @@ impl View {
                 pi_rs::Event::ModelFinished {
                     metadata, usage, ..
                 } => {
+                    if metadata.finish_reason.as_deref() == Some("length") {
+                        self.append("Response reached the output token limit.");
+                    }
                     if let Some(reasoning) = &metadata.reasoning {
                         self.lines.push(Entry::Thinking(reasoning.clone()));
                     }
@@ -302,6 +305,9 @@ impl View {
                         }
                     }
                     Some("model_finished") => {
+                        if event["metadata"]["finish_reason"] == "length" {
+                            self.append("Response reached the output token limit.");
+                        }
                         self.phase = Some("結果を保存中");
                         let usage = &event["usage"]["usage"];
                         self.tokens = self

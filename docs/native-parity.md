@@ -232,3 +232,8 @@ MCP resource discovery now includes parameterized URI templates. Servers can
 also expose prompt discovery and prompt expansion through namespaced tools.
 An authenticated HTTP fixture verifies all three operations through a model
 tool roundtrip. Server/tool exposure overrides apply to these synthetic tools.
+
+A text response that reaches the provider output limit is retained with its
+`length` finish reason and a visible limit notice. Incomplete tool-call
+responses remain unsuccessful and are not dispatched. CLI regression tests
+verify that text and provider metadata survive the output limit.

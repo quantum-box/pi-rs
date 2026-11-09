@@ -150,6 +150,13 @@ fn model_fixture() -> (String, std::thread::JoinHandle<()>) {
 fn model_fixture_with_effort(
     effort: Option<&'static str>,
 ) -> (String, std::thread::JoinHandle<()>) {
+    model_fixture_with_finish(effort, "stop")
+}
+
+fn model_fixture_with_finish(
+    effort: Option<&'static str>,
+    finish: &'static str,
+) -> (String, std::thread::JoinHandle<()>) {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!(
         "http://{}/v1/chat/completions",
@@ -192,11 +199,45 @@ fn model_fixture_with_effort(
                 "data: {\"id\":\"fixture-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n\n",
                 "data: [DONE]\n\n",
-            );
+            ).replace("\"finish_reason\":\"stop\"", &format!("\"finish_reason\":\"{finish}\""));
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
         }
     });
     (endpoint, handle)
+}
+
+#[test]
+fn token_limit_preserves_partial_text_and_its_finish_reason() {
+    let (endpoint, server) = model_fixture_with_finish(None, "length");
+    let directory = tempfile::tempdir().unwrap();
+    for index in 0..2 {
+        let path = directory.path().join(format!("{index}.jsonl"));
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", directory.path().join("home"))
+            .args([
+                "--endpoint",
+                &endpoint,
+                "--print",
+                "--no-tools",
+                "--session",
+            ])
+            .arg(&path)
+            .arg("same input")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "fixture answer\n"
+        );
+        let session = Session::open(path).unwrap();
+        assert!(session.records().iter().any(|record| matches!(&record.event, pi_rs::Event::ModelFinished { metadata, .. } if metadata.finish_reason.as_deref() == Some("length"))));
+    }
+    server.join().unwrap();
 }
 
 #[test]

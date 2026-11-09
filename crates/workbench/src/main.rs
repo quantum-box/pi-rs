@@ -677,6 +677,12 @@ async fn execute(mut args: Cli) -> Result<()> {
 }
 
 fn observe(event: Notification<'_>, trace: bool) {
+    if TEXT_OUTPUT.load(Ordering::Relaxed)
+        && let Notification::Committed(record) = &event
+        && matches!(&record.event, Event::ModelFinished { metadata, .. } if metadata.finish_reason.as_deref() == Some("length"))
+    {
+        eprintln!("Response reached the output token limit.");
+    }
     match event {
         Notification::Committed(record) if trace => {
             output(json!({"type": "record", "record": record}))

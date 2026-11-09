@@ -301,7 +301,7 @@ impl Model for Ollama {
                 let event = event.map_err(|_| Error::RetryableModel("broken SSE stream".into()))?;
                 if event.data == "[DONE]" {
                     match metadata.finish_reason.as_deref() {
-                        Some("stop") if calls.is_empty() => {},
+                        Some("stop" | "length") if calls.is_empty() => {},
                         Some("tool_calls") if !calls.is_empty() => {},
                         _ => Err(Error::Model("model response did not finish successfully".into()))?,
                     }
