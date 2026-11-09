@@ -8,7 +8,7 @@ use crossterm::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
     },
 };
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -21,6 +21,7 @@ pub struct Span {
     pub color: Color,
     pub bold: bool,
     pub italic: bool,
+    pub strikethrough: bool,
 }
 impl Span {
     fn new(text: impl Into<String>, color: Color) -> Self {
@@ -29,6 +30,7 @@ impl Span {
             color,
             bold: false,
             italic: false,
+            strikethrough: false,
         }
     }
 }
@@ -64,6 +66,11 @@ impl Line {
                     Attribute::Italic
                 } else {
                     Attribute::NoItalic
+                }),
+                SetAttribute(if span.strikethrough {
+                    Attribute::CrossedOut
+                } else {
+                    Attribute::NotCrossedOut
                 })
             )?;
             for grapheme in span.text.graphemes(true) {
@@ -234,20 +241,180 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static SYNTAX_THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
+#[derive(Default)]
+struct Table {
+    alignments: Vec<Alignment>,
+    rows: Vec<Vec<Vec<Span>>>,
+    row: Vec<Vec<Span>>,
+}
+impl Table {
+    fn finish_row(&mut self, heading: bool) {
+        if heading {
+            for span in self.row.iter_mut().flatten() {
+                span.bold = true;
+            }
+        }
+        self.rows.push(std::mem::take(&mut self.row));
+    }
+    fn render(self, theme: &Theme, width: usize) -> Vec<Line> {
+        let columns = self.alignments.len();
+        if columns == 0 {
+            return Vec::new();
+        }
+        let minimum: Vec<usize> = (0..columns)
+            .map(|column| {
+                self.rows
+                    .iter()
+                    .filter_map(|row| row.get(column))
+                    .flatten()
+                    .flat_map(|span| span.text.graphemes(true))
+                    .map(UnicodeWidthStr::width)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1)
+            })
+            .collect();
+        if width < columns * 3 + 1 + minimum.iter().sum::<usize>() {
+            let mut lines = Vec::new();
+            for row in self.rows {
+                for cell in row {
+                    lines.extend(wrap(&cell, width));
+                }
+                lines.push(Line::default());
+            }
+            return lines;
+        }
+        let available = width - columns * 3 - 1;
+        let natural: Vec<usize> = (0..columns)
+            .map(|column| {
+                self.rows
+                    .iter()
+                    .filter_map(|row| row.get(column))
+                    .map(|cell| {
+                        cell.iter()
+                            .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                            .sum()
+                    })
+                    .max()
+                    .unwrap_or(1)
+                    .max(1)
+            })
+            .collect();
+        let mut widths = minimum;
+        for _ in widths.iter().sum::<usize>()..available {
+            let Some(column) = (0..columns)
+                .filter(|&column| widths[column] < natural[column])
+                .min_by_key(|&column| widths[column])
+            else {
+                break;
+            };
+            widths[column] += 1;
+        }
+        let border = |left: &str, middle: &str, right: &str| {
+            Line::plain(
+                &format!(
+                    "{left}{}{right}",
+                    widths
+                        .iter()
+                        .map(|width| "─".repeat(width + 2))
+                        .collect::<Vec<_>>()
+                        .join(middle)
+                ),
+                theme.color("borderMuted"),
+            )
+        };
+        let mut lines = vec![border("┌", "┬", "┐")];
+        for (index, row) in self.rows.into_iter().enumerate() {
+            let cells: Vec<_> = widths
+                .iter()
+                .enumerate()
+                .map(|(column, width)| {
+                    wrap(row.get(column).map(Vec::as_slice).unwrap_or(&[]), *width)
+                })
+                .collect();
+            for line_index in 0..cells.iter().map(Vec::len).max().unwrap_or(1) {
+                let mut line = Line::plain("│", theme.color("borderMuted"));
+                for (column, cell) in cells.iter().enumerate() {
+                    let spans = cell
+                        .get(line_index)
+                        .map(|line| line.spans.as_slice())
+                        .unwrap_or(&[]);
+                    let used: usize = spans
+                        .iter()
+                        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                        .sum();
+                    let padding = widths[column].saturating_sub(used);
+                    let left = match self.alignments[column] {
+                        Alignment::Right => padding,
+                        Alignment::Center => padding / 2,
+                        _ => 0,
+                    };
+                    line.spans
+                        .push(Span::new(" ".repeat(left + 1), theme.color("text")));
+                    line.spans.extend_from_slice(spans);
+                    line.spans.push(Span::new(
+                        format!("{}│", " ".repeat(padding - left + 1)),
+                        theme.color("borderMuted"),
+                    ));
+                }
+                lines.push(line);
+            }
+            if index == 0 {
+                lines.push(border("├", "┼", "┤"));
+            }
+        }
+        lines.push(border("└", "┴", "┘"));
+        lines
+    }
+}
+
 pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut bold = 0usize;
     let mut italic = 0usize;
+    let mut strikethrough = 0usize;
     let mut heading = false;
     let mut code: Option<String> = None;
     let mut code_text = String::new();
     let mut lists: Vec<Option<u64>> = Vec::new();
+    let mut table: Option<Table> = None;
+    let mut links = Vec::new();
     for event in Parser::new_ext(
         text,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
     ) {
         match event {
+            Event::Start(Tag::Table(alignments)) => {
+                flush(&mut spans, &mut lines, width);
+                table = Some(Table {
+                    alignments,
+                    ..Table::default()
+                });
+            }
+            Event::End(TagEnd::TableCell) => {
+                if let Some(table) = &mut table {
+                    table.row.push(std::mem::take(&mut spans));
+                }
+            }
+            Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
+                if let Some(table) = &mut table {
+                    table.finish_row(matches!(event, Event::End(TagEnd::TableHead)));
+                }
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(table) = table.take() {
+                    lines.extend(table.render(theme, width));
+                }
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => links.push(dest_url.into_string()),
+            Event::End(TagEnd::Link) => {
+                if let Some(url) = links.pop() {
+                    spans.push(Span::new(format!(" ({url})"), theme.color("mdLinkUrl")));
+                }
+            }
+            Event::Start(Tag::Strikethrough) => strikethrough += 1,
+            Event::End(TagEnd::Strikethrough) => strikethrough = strikethrough.saturating_sub(1),
             Event::Start(Tag::Strong) => bold += 1,
             Event::End(TagEnd::Strong) => bold = bold.saturating_sub(1),
             Event::Start(Tag::Emphasis) => italic += 1,
@@ -326,20 +493,24 @@ pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
                 } else {
                     let mut span = Span::new(
                         text,
-                        theme.color(if heading { "mdHeading" } else { "text" }),
+                        theme.color(if heading {
+                            "mdHeading"
+                        } else if !links.is_empty() {
+                            "mdLink"
+                        } else {
+                            "text"
+                        }),
                     );
                     span.bold = bold > 0 || heading;
                     span.italic = italic > 0;
+                    span.strikethrough = strikethrough > 0;
                     spans.push(span);
                 }
             }
             Event::Code(text) => spans.push(Span::new(text, theme.color("mdCode"))),
             Event::SoftBreak => spans.push(Span::new(" ", theme.color("text"))),
-            Event::HardBreak | Event::End(TagEnd::Paragraph | TagEnd::Item | TagEnd::TableRow) => {
+            Event::HardBreak | Event::End(TagEnd::Paragraph | TagEnd::Item) => {
                 flush(&mut spans, &mut lines, width)
-            }
-            Event::End(TagEnd::TableCell) => {
-                spans.push(Span::new(" │ ", theme.color("borderMuted")))
             }
             Event::Rule => {
                 flush(&mut spans, &mut lines, width);
@@ -365,6 +536,33 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tables_align_unicode_cells_and_wrap_at_terminal_width() {
+        let source = "| Name | Count |\n| :--- | ---: |\n| 日本語 | 12 |\n| long description | 3 |";
+        for width in [5, 20, 50] {
+            let lines = markdown(source, &Theme::system(), width);
+            assert!(lines.iter().all(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                    .sum::<usize>()
+                    <= width
+            }));
+            let text = lines
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+                .collect::<String>();
+            assert!(text.contains("12"));
+            assert!(text.contains("日本"));
+        }
+        let lines = markdown("[Documentation](https://example.com)", &Theme::system(), 80);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("https://example.com"))
+        );
+    }
     #[test]
     fn wraps_styles_without_splitting_graphemes_or_allowing_escapes() {
         let lines = wrap(&[Span::new("日本👩‍💻\x1b[31m", Color::Green)], 4);
