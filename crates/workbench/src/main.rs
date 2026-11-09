@@ -23,6 +23,7 @@ mod resources;
 mod rpc;
 mod runtime;
 mod sessions;
+mod tool_selection;
 mod ui;
 
 static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
@@ -104,6 +105,18 @@ struct Cli {
     /// Enable local read, write, edit, bash, grep, find, and ls tools.
     #[arg(long, global = true)]
     coding_tools: bool,
+    /// Disable all tools unless explicitly selected.
+    #[arg(long, global = true)]
+    no_tools: bool,
+    /// Disable built-in tools while keeping extension tools.
+    #[arg(long, global = true)]
+    no_builtin_tools: bool,
+    /// Comma-separated tool names/patterns, or +name/-name modifiers.
+    #[arg(short = 't', long, global = true, allow_hyphen_values = true)]
+    tools: Option<String>,
+    /// Comma-separated tool names/patterns to remove from the selection.
+    #[arg(long, global = true)]
+    exclude_tools: Option<String>,
     /// Enable a bundled extension or a native extension executable. Repeatable.
     #[arg(long = "extension", global = true)]
     extensions: Vec<String>,

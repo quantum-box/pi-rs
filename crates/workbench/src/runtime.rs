@@ -114,19 +114,19 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             extensions,
             &args.disable_extension.iter().cloned().collect(),
         )?;
-        registry.register(Arc::new(CommandPolicy {
+        registry.register(Arc::new(LocalCommandPolicy(CommandPolicy {
             allow_commands: args.allow_commands,
-        }))?;
+        })))?;
         let order_config = args
             .orders
             .as_deref()
             .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
         registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
-        if args.coding_tools {
-            registry.register(Arc::new(pi_rs_workbench::coding::CodingTools::local(
-                &args.workspace,
-            )?))?;
-        }
+        registry.register(Arc::new(pi_rs_workbench::coding::CodingTools::local(
+            &args.workspace,
+        )?))?;
+        let selection = super::tool_selection::Selection::new(args)?;
+        registry.retain_tools(|tool| selection.includes(&tool.name));
         let system_prompt = local_resources.system_prompt(
             &base_prompt,
             args.system_prompt.is_some(),
@@ -158,4 +158,25 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         }
     }
     result
+}
+
+struct LocalCommandPolicy(CommandPolicy);
+#[async_trait::async_trait]
+impl pi_rs::Extension for LocalCommandPolicy {
+    fn id(&self) -> &str {
+        self.0.id()
+    }
+    async fn before_tool(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &pi_rs::ToolContext,
+        state: Option<&pi_rs::ExtensionState>,
+    ) -> pi_rs::ExtensionResult<pi_rs::Decision> {
+        if matches!(name, "bash" | "powershell") {
+            Ok(pi_rs::Decision::Allow)
+        } else {
+            self.0.before_tool(name, arguments, context, state).await
+        }
+    }
 }

@@ -208,6 +208,11 @@ impl Registry {
         Ok(registry)
     }
 
+    /// Restrict the advertised and executable tools while retaining extension hooks.
+    pub fn retain_tools(&mut self, mut keep: impl FnMut(&ToolSpec) -> bool) {
+        self.tools.retain(|_, tool| keep(&tool.spec));
+    }
+
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|tool| tool.spec.clone()).collect()
     }

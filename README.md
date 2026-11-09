@@ -24,8 +24,9 @@ loading status when local Ollama reports it, thinking activity, and answer
 generation. Token totals are labeled as settled usage and update on completion.
 `/help` lists the available commands, including `/model`, `/new`, `/resume`,
 `/compact`, `/tree`, `/checkout`, `/plan`, `/review`, `/notes`, and `/todo`.
-The interactive local profile enables `read`, `write`, `edit`, `bash`, `grep`,
-`find`, and `ls`. Shell commands run with the launching user's permissions.
+The default CLI and interactive profile enables `read`, `write`, `edit`, and
+`bash` (`powershell` on Windows). Shell commands run with the launching user's
+permissions. `--coding-tools` additionally enables `grep`, `find`, and `ls`.
 
 ```sh
 pi --print 'Explain this project'
@@ -34,8 +35,10 @@ pi --mode rpc
 ```
 
 The existing `pi-rs ... run <prompt>` interface retains its JSONL output.
-Add `--coding-tools --allow-commands` to that interface to enable the local
-coding profile. The current RPC commands are documented in
+Use `--tools read,grep` for an allowlist, `--tools=+grep,-bash` to adjust the
+defaults, `--exclude-tools "mcp__*"` to exclude matching tools, or `--no-tools`
+to start without tools. `--no-builtin-tools` retains extension tools. The
+current RPC commands are documented in
 [the parity checklist](docs/native-parity.md).
 
 ## Native extensions

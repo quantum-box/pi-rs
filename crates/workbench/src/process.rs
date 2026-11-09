@@ -58,6 +58,18 @@ impl Worker {
         if args.coding_tools {
             command.arg("--coding-tools");
         }
+        if args.no_tools {
+            command.arg("--no-tools");
+        }
+        if args.no_builtin_tools {
+            command.arg("--no-builtin-tools");
+        }
+        if let Some(tools) = &args.tools {
+            command.arg("--tools").arg(tools);
+        }
+        if let Some(tools) = &args.exclude_tools {
+            command.arg("--exclude-tools").arg(tools);
+        }
         for extension in &args.extensions {
             command.arg("--extension").arg(extension);
         }
@@ -169,6 +181,7 @@ fn configuration(args: &Cli) -> Value {
         "endpoint":args.endpoint,"extensions":args.extensions,"disabled":args.disable_extension,
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
         "system_prompt":args.system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
+        "tools":args.tools,"exclude_tools":args.exclude_tools,"no_tools":args.no_tools,"no_builtin_tools":args.no_builtin_tools,
         "coding_tools":args.coding_tools,"requests":args.max_requests,"output_tokens":args.max_output_tokens,
         "output_budget":args.output_budget,"context_window":args.context_window,
         "model_timeout":args.model_timeout_secs,"tool_timeout":args.tool_timeout_secs

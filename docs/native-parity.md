@@ -218,3 +218,12 @@ persistent branch forks. Forks receive a fresh session identity and can be
 reopened independently. CLI import/export/fork now use the same atomic snapshot
 publication path. Tests verify independent continuation and refusal to replace
 existing files.
+
+### Tool selection checkpoint
+
+The CLI, TUI and RPC use the native default read/shell/edit/write selection.
+`--tools`, `--exclude-tools`, `--no-tools`, `--no-builtin-tools`, and
+`defaultTools` control advertised and executable tools. Allowlist patterns,
+exact `+name`/`-name` changes, MCP namespace selection and exclusions are
+supported. Existing legacy `read_text`/`count_lines` integrations remain
+available, and `count_lines` retains its explicit command-policy flag.

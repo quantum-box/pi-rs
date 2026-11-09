@@ -968,7 +968,6 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             "interactive mode requires a terminal; use run <prompt> for automation".into(),
         ));
     }
-    args.coding_tools = true;
     args.allow_commands = true;
     for name in ["notes", "todo"] {
         if !args.extensions.iter().any(|extension| extension == name) {
