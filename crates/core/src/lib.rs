@@ -4,6 +4,7 @@ mod context;
 mod extension;
 mod journal;
 mod sdk;
+mod tokens;
 mod types;
 mod ui;
 
@@ -12,6 +13,7 @@ pub use context::*;
 pub use extension::*;
 pub use journal::*;
 pub use sdk::*;
+pub use tokens::{estimate_message_tokens, estimate_request_tokens};
 pub use tokio_util::sync::CancellationToken;
 pub use types::*;
 pub use ui::*;

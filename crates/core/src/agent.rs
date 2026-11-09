@@ -393,7 +393,7 @@ impl Agent<'_> {
                         return Err(Error::Budget);
                     }
                     let capacity = self.context_capacity(&request, cancel).await?;
-                    let input_tokens = serde_json::to_vec(&request)?.len().div_ceil(3) as u64;
+                    let input_tokens = crate::estimate_request_tokens(&request);
                     let exceeds = capacity.is_some_and(|window| {
                         input_tokens.saturating_add(u64::from(request.max_output_tokens))
                             > u64::from(window)
@@ -1592,8 +1592,9 @@ impl Agent<'_> {
         let Some(window) = self.context_capacity(request, cancel).await? else {
             return Ok(false);
         };
-        let bytes = serde_json::to_vec(request)?.len();
-        Ok(bytes.div_ceil(3) + request.max_output_tokens as usize > window as usize)
+        Ok(crate::estimate_request_tokens(request)
+            .saturating_add(u64::from(request.max_output_tokens))
+            > u64::from(window))
     }
 
     fn commit_compaction(
@@ -1700,9 +1701,10 @@ fn configured_retention(
     };
     let mut cut = first;
     let mut accumulated = 0_u64;
-    for (index, (_, message)) in entries.iter().enumerate().rev() {
-        accumulated =
-            accumulated.saturating_add(serde_json::to_vec(message)?.len().div_ceil(3) as u64);
+    for (index, (source, message)) in entries.iter().enumerate().rev() {
+        accumulated = accumulated.saturating_add(crate::tokens::estimate_source_tokens(
+            session, *source, message,
+        ));
         if accumulated >= target {
             cut = candidates
                 .iter()
@@ -1779,8 +1781,12 @@ fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> 
     // increasingly large suffix. Shell results count as context, not new turns.
     while low < high {
         let middle = low + (high - low) / 2;
-        let messages = conversation(&branch[turns[middle]..], operations.clone());
-        let tokens = serde_json::to_vec(&messages)?.len().div_ceil(3) as u64;
+        let messages = conversation_entries(&branch[turns[middle]..], operations.clone());
+        let tokens = messages.iter().fold(0_u64, |tokens, (source, message)| {
+            tokens.saturating_add(crate::tokens::estimate_source_tokens(
+                session, *source, message,
+            ))
+        });
         if tokens >= target {
             low = middle + 1;
         } else {

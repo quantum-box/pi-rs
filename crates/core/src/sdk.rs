@@ -742,12 +742,7 @@ mod tests {
                 exclude_from_context: false,
             })
             .unwrap();
-        let messages = session.messages().unwrap();
-        let target = serde_json::to_vec(messages.last().unwrap())
-            .unwrap()
-            .len()
-            .div_ceil(3) as u64
-            + 1;
+        let target = ("report".encode_utf16().count() as u64 + 600).div_ceil(4) + 1;
         let control = session.journal().auto_compaction_control();
         control.set_token_settings(crate::CompactionTokens {
             reserve_tokens: None,

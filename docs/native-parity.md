@@ -1118,7 +1118,7 @@ APIs retain their behavior. Focus text does not become a user-history entry.
 
 RPC compaction replies after the summary checkpoint is committed, with
 `summary`, `firstKeptEntryId` and `tokensBefore`. The token count uses the native
-runtime's approximate three-bytes-per-token estimate. Compaction errors,
+runtime's character-based estimate described in the token-estimation checkpoint. Compaction errors,
 cancellation and unexpected worker exit return failed responses. The worker
 stays busy until that response, and `get_state` reports compaction separately
 from streaming. Queue controls retain their existing behavior.
@@ -1262,3 +1262,25 @@ summary rejection, and short prompts with a context smaller than the default
 reserve. Loopback checks cover the CLI/RPC default path, a skipped summary,
 explicit CLI override and preservation of the settings file. Both terminal
 layouts display the defaults without creating a settings file.
+
+
+### Character-based token estimate checkpoint
+
+The core now estimates visible text with Pi's UTF-16-length / 4 rule and a
+fixed 1,200-token image budget. User images are independent of their Base64
+length. Assistant calls include their names and normalized JSON arguments.
+System prompts and advertised tool schemas are included in request estimates.
+Shell entries count their command and output, excluding presentation wrappers.
+
+The same estimators drive context checks, configured retention boundaries and
+RPC `tokensBefore`. Native structured tool images use the same extraction
+routine as the Ollama encoder, so inline image bytes do not become text-token
+estimates. The encoder retains its existing text and image output shape.
+
+Reference comparisons matched empty/ASCII/Japanese/emoji text, user images and
+tool-call examples. Tests also cover image-size independence and existing
+provider image output. Loopback checks exercised configured compaction,
+explicit limits, loaded-model discovery and fallback behavior. Test context
+budgets were updated to continue exercising the same boundaries with the new
+estimator. Provider-usage anchoring and provider-specific reasoning accounting
+remain open.

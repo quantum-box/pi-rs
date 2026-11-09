@@ -146,6 +146,43 @@ impl ImageContent {
     }
 }
 
+/// Separate supported images from native structured tool output for provider encoding.
+pub fn extract_tool_images(mut content: String) -> (String, Vec<ImageContent>) {
+    let mut images = Vec::new();
+    if let Ok(mut result) = serde_json::from_str::<Value>(&content)
+        && let Some(blocks) = result
+            .get_mut("data")
+            .and_then(|data| data.get_mut("content"))
+            .and_then(Value::as_array_mut)
+    {
+        for block in blocks {
+            if block["type"] != "image" {
+                continue;
+            }
+            let Some(data) = block["data"].as_str() else {
+                continue;
+            };
+            let Some(mime) = block["mimeType"].as_str() else {
+                continue;
+            };
+            if !matches!(
+                mime,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            ) || data.len() > 8 * 1024 * 1024
+            {
+                continue;
+            }
+            images.push(ImageContent {
+                data: data.to_owned(),
+                mime_type: mime.to_owned(),
+            });
+            block["data"] = serde_json::json!("[image attached]");
+        }
+        content = result.to_string();
+    }
+    (content, images)
+}
+
 /// Content-only edits preserve raw history and never dispatch tools.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]

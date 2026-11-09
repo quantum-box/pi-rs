@@ -388,6 +388,27 @@ impl Session {
         Ok(messages)
     }
 
+    /// Estimated visible conversation tokens, including the current compaction summary.
+    pub fn estimated_context_tokens(&self) -> u64 {
+        let branch = self.branch();
+        let summary = branch.iter().rev().find_map(|record| match &record.event {
+            Event::Compacted { summary, .. } => Some(summary),
+            _ => None,
+        });
+        let initial = summary.map_or(0, |summary| {
+            crate::estimate_message_tokens(&Message::User {
+                content: summary.clone(),
+            })
+        });
+        conversation_entries(&branch, self.operations())
+            .iter()
+            .fold(initial, |tokens, (source, message)| {
+                tokens.saturating_add(crate::tokens::estimate_source_tokens(
+                    self, *source, message,
+                ))
+            })
+    }
+
     pub fn operations(&self) -> Vec<(Invocation, OperationState)> {
         operations(&self.branch())
     }

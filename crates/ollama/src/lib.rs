@@ -436,36 +436,14 @@ fn encode_message(message: Message) -> Vec<Value> {
 
 fn encode_tool_result(call_id: &str, content: String) -> Vec<Value> {
     let mut messages = Vec::new();
-    let mut images = Vec::new();
-    let mut content = content;
-    if let Ok(mut result) = serde_json::from_str::<Value>(&content)
-        && let Some(blocks) = result
-            .get_mut("data")
-            .and_then(|data| data.get_mut("content"))
-            .and_then(Value::as_array_mut)
-    {
-        for block in blocks {
-            if block["type"] != "image" {
-                continue;
-            }
-            let Some(data) = block["data"].as_str() else {
-                continue;
-            };
-            let Some(mime) = block["mimeType"].as_str() else {
-                continue;
-            };
-            if !matches!(
-                mime,
-                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-            ) || data.len() > 8 * 1024 * 1024
-            {
-                continue;
-            }
-            images.push(json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{data}")}}));
-            block["data"] = json!("[image attached]");
-        }
-        content = result.to_string();
-    }
+    let (content, images) = pi_rs_core::extract_tool_images(content);
+    let mut images: Vec<_> = images
+        .into_iter()
+        .map(|image| {
+            let url = format!("data:{};base64,{}", image.mime_type, image.data);
+            json!({"type":"image_url","image_url":{"url":url}})
+        })
+        .collect();
     messages.push(json!({"role":"tool","tool_call_id":call_id,"content":content}));
     if !images.is_empty() {
         images.insert(

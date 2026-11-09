@@ -826,7 +826,7 @@ async fn automatic_compaction_can_be_disabled_and_reenabled_without_removing_the
         )
         .await
         .unwrap();
-    harness.limits.context_window = Some(1350);
+    harness.limits.context_window = Some(1100);
     let control = session.auto_compaction_control();
     control.set_enabled(false);
     let result = harness
@@ -898,7 +898,7 @@ async fn configured_reserve_compacts_early_and_preserves_recent_messages() {
         .auto_compaction_control()
         .set_token_settings(CompactionTokens {
             reserve_tokens: Some(1500),
-            keep_recent_tokens: Some(400),
+            keep_recent_tokens: Some(300),
         });
     harness
         .run(
@@ -1061,10 +1061,10 @@ async fn bounded_automatic_compaction_leaves_the_latest_input_unchanged() {
             .await
             .unwrap();
         if discover {
-            model.context_window.store(1350, Ordering::SeqCst);
+            model.context_window.store(1100, Ordering::SeqCst);
         } else {
             model.context_window.store(1, Ordering::SeqCst);
-            harness.limits.context_window = Some(1350);
+            harness.limits.context_window = Some(1100);
         }
         let latest = "This is the exact latest request.";
         harness
