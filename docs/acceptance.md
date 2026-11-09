@@ -210,3 +210,13 @@ Run 取消後の承認は拒否した。評価用 Workflow の起動設定と、
 消費済み4トークンを元の出力上限10から差し引いた。実運用の Workflow worker が
 待機枠を超えた場合の保留経路と、Workspace の実停止確認は残っている。
 [Workflow ターンの照会と試験](https://github.com/quantum-box/tachyon-apps/commit/14cfa7c18a2c572759fb6d747cdbd017665ad801)
+
+
+### Workflow worker が外部操作の確認を待つ
+
+Workflow Goal の実行口で最初の照会期限を超えても、同じターン番号の実行権を
+更新して待機を続けた。確認後の再開でジョブ送信は1件、モデル精算は各要求1件。
+別の試験では実行権更新後の取消要求が元の操作に1回届き、停止の応答が得られない
+間はジャーナルに終端結果を記録しなかった。ジョブの受付、照会、取消は試験用。
+実 Workspace で停止を確認する経路は残っている。
+[Workflow worker の待機と取消試験](https://github.com/quantum-box/tachyon-apps/commit/1168e51b1f760c576ebbaae4be3a9f53829b9fe7)
