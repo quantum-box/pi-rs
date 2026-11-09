@@ -165,7 +165,23 @@ pub struct SessionStats {
     pub tool_results: u64,
     pub total_messages: u64,
     pub tokens: TokenTotals,
+    pub cost: Option<f64>,
 }
+impl SessionStats {
+    fn add_usage(&mut self, usage: pi_rs::Usage, metadata: Option<&pi_rs::ModelMetadata>) {
+        self.tokens.add(usage, metadata);
+        let cost = metadata
+            .and_then(|metadata| metadata.cost_usd.as_ref())
+            .and_then(serde_json::Number::as_f64)
+            .filter(|cost| cost.is_finite() && *cost >= 0.0);
+        self.cost = self
+            .cost
+            .zip(cost)
+            .map(|(total, cost)| total + cost)
+            .filter(|cost| cost.is_finite());
+    }
+}
+
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenTotals {
@@ -221,9 +237,12 @@ pub fn statistics(session: &Session) -> SessionStats {
             _ => None,
         })
         .collect();
-    let mut stats = SessionStats::default();
+    let mut stats = SessionStats {
+        cost: Some(0.0),
+        ..SessionStats::default()
+    };
     for (usage, metadata) in measured.values() {
-        stats.tokens.add(*usage, Some(metadata));
+        stats.add_usage(*usage, Some(metadata));
     }
     let mut pending_summary = None;
     for record in records {
@@ -244,7 +263,7 @@ pub fn statistics(session: &Session) -> SessionStats {
                 if let Some(usage) = usage
                     && request_id.is_none_or(|id| !measured.contains_key(&id))
                 {
-                    stats.tokens.add(*usage, None);
+                    stats.add_usage(*usage, None);
                 }
                 pending_summary = None;
             }
@@ -255,20 +274,26 @@ pub fn statistics(session: &Session) -> SessionStats {
             Event::BashExecution { .. } => {
                 stats.total_messages += 1;
             }
-            Event::ModelRequested { .. } => pending_summary = None,
-            Event::ModelFinished {
-                usage, reply: None, ..
-            } => {
-                pending_summary = match usage {
-                    pi_rs::UsageReport::Measured { usage } => Some(*usage),
+            Event::ModelRequested { request_id, .. } => {
+                pending_summary = None;
+                if request_id.is_none_or(|id| !measured.contains_key(&id)) {
+                    stats.cost = None;
+                }
+            }
+            Event::ModelFinished { usage, reply, .. } => {
+                pending_summary = match (usage, reply) {
+                    (pi_rs::UsageReport::Measured { usage }, None) => Some(*usage),
                     _ => None,
+                };
+                if !matches!(usage, pi_rs::UsageReport::Measured { .. }) {
+                    stats.cost = None;
                 }
             }
             Event::Compacted { usage, .. } => {
                 if let Some(usage) = usage
                     && Some(*usage) != pending_summary
                 {
-                    stats.tokens.add(*usage, None);
+                    stats.add_usage(*usage, None);
                 }
                 pending_summary = None;
             }

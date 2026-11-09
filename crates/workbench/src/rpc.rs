@@ -580,7 +580,6 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             stats["sessionId"] = json!(session.session_id());
             stats["sessionFile"] = json!(args.session);
             stats["sessionName"] = json!(session.name());
-            stats["cost"] = Value::Null;
             if let Some(window) = args.context_window.filter(|window| *window > 0) {
                 let estimate = session.context_usage_estimate();
                 let after_compaction = session

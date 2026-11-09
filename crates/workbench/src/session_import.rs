@@ -8,6 +8,19 @@ use pi_rs::{Error, Event, Invocation, Outcome, Record, Result, Session, ToolCall
 use serde_json::Value;
 use uuid::Uuid;
 
+fn imported_cost(value: &Value) -> Option<serde_json::Number> {
+    match &value["cost"]["total"] {
+        Value::Number(number)
+            if number
+                .as_f64()
+                .is_some_and(|value| value >= 0.0 && value.is_finite()) =>
+        {
+            Some(number.clone())
+        }
+        _ => None,
+    }
+}
+
 fn append_imported_usage(events: &mut Vec<Event>, value: &Value) -> Option<Usage> {
     value.as_object()?;
     let cache_read = value["cacheRead"].as_u64().unwrap_or(0);
@@ -23,6 +36,7 @@ fn append_imported_usage(events: &mut Vec<Event>, value: &Value) -> Option<Usage
     events.push(Event::ModelFinished {
         request_id: Uuid::new_v4(),
         metadata: pi_rs::ModelMetadata {
+            cost_usd: imported_cost(value),
             cached_input_tokens: Some(cache_read),
             cache_creation_input_tokens: Some(cache_write),
             ..Default::default()
@@ -345,6 +359,7 @@ fn convert(
                     events.push(Event::ModelFinished {
                         request_id,
                         metadata: pi_rs::ModelMetadata {
+                            cost_usd: imported_cost(&message["usage"]),
                             cached_input_tokens: message["usage"]["cacheRead"].as_u64(),
                             cache_creation_input_tokens: message["usage"]["cacheWrite"].as_u64(),
                             finish_reason: message["stopReason"].as_str().map(str::to_owned),
@@ -618,6 +633,45 @@ mod tests {
         );
         assert_eq!(checkpoint.2[0].name, "read");
         assert_eq!(checkpoint.3, &["old"]);
+    }
+
+    #[test]
+    fn imported_costs_survive_reopening_and_unknown_costs_are_not_zeroed() {
+        let mut entries = vec![
+            json!({"type":"session","version":3,"cwd":"/tmp/import"}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":"first","usage":{"input":1,"output":1,"cost":{"total":0.25}}}}),
+            json!({"type":"message","id":"b","parentId":"u","message":{"role":"assistant","content":"branch","usage":{"input":1,"output":1,"cost":{"total":0.5}}}}),
+            json!({"type":"usage","id":"usage","parentId":"b","usage":{"input":1,"output":1,"cost":{"total":0.125}}}),
+            json!({"type":"compaction","id":"c","parentId":"usage","firstKeptEntryId":"u","summary":"summary","usage":{"input":1,"output":1,"cost":{"total":0.0625}}}),
+        ];
+        let session = import_pi(entries.clone()).unwrap();
+        assert_eq!(crate::sessions::statistics(&session).cost, Some(0.9375));
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("costs.jsonl");
+        session.export_jsonl(&file).unwrap();
+        assert_eq!(
+            crate::sessions::statistics(&Session::open(file).unwrap()).cost,
+            Some(0.9375)
+        );
+        entries[3]["message"]["usage"]["cost"] = Value::Null;
+        assert_eq!(
+            crate::sessions::statistics(&import_pi(entries.clone()).unwrap()).cost,
+            None
+        );
+        entries[3]["message"]["usage"]["cost"] = json!({"total":-1});
+        assert_eq!(
+            crate::sessions::statistics(&import_pi(entries.clone()).unwrap()).cost,
+            None
+        );
+        entries[3]["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("usage");
+        assert_eq!(
+            crate::sessions::statistics(&import_pi(entries).unwrap()).cost,
+            None
+        );
     }
 
     #[test]

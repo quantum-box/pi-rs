@@ -258,6 +258,9 @@ pub struct ModelRequest {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelMetadata {
+    /// Provider- or importer-supplied total cost in USD; absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<serde_json::Number>,
     pub provider_request_id: Option<String>,
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1465,11 +1465,27 @@ input twice.
 Import retains cached usage on assistant and tool-result messages and standalone usage,
 compaction and branch-summary entries. An explicit context window also enables
 `contextUsage`; after compaction, its token count remains unknown until a fresh
-measured response is available. Cost is returned as null because native sessions
-do not yet retain verified pricing data. Live statistics while a run owns the
+measured response is available. Unknown cost is returned as null; preservation of reported costs is covered
+below. Live statistics while a run owns the
 journal, complete message-variant counting and provider pricing remain open.
 
 Tests cover an imported multi-branch session with assistant, tool-result,
 standalone and summary usage. A loopback RPC test covers message and tool counts,
 cache accounting, summary usage deduplication and unknown post-compaction context.
 The complete workspace tests and all-target Clippy pass.
+
+
+### Reported session cost checkpoint
+
+Model metadata can retain an optional USD total, preserving old journals that
+omit it. Pi imports preserve the reported total for assistant and tool-result
+messages, standalone usage, compaction and branch summaries. Session statistics
+sum each measured request once across all branches. Missing prices, invalid
+negative prices or unconfirmed usage keep the total unknown instead of implying
+zero cost. An empty session has zero recorded cost.
+
+Tests verify reported costs across branches and compaction, file reopening,
+missing costs and invalid costs. The same fixture returns USD 0.9375 from both
+the pinned Pi statistics implementation and the native RPC. The complete
+workspace tests and all-target Clippy pass. Provider price
+catalogs, automatic native pricing and detailed cost provenance remain open.
