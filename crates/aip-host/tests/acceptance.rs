@@ -381,7 +381,14 @@ async fn hosted_review_keeps_parent_child_identity_and_recovers_a_cancelled_chil
         .unwrap();
     let from_record = parent.head();
     let stopped = CancellationToken::new();
-    stopped.cancel();
+    let child_run_id = child_scope.journal_run_id;
+    let trigger = stopped.clone();
+    let mut cancel_during_request = |event: Notification<'_>| {
+        if matches!(event, Notification::Committed(Record { run_id: Some(id), event: Event::ModelRequested { .. }, .. }) if *id == child_run_id)
+        {
+            trigger.cancel();
+        }
+    };
     let mut review = ManagedReview {
         parent: &parent_turn,
         child: &child_turn,
@@ -391,7 +398,12 @@ async fn hosted_review_keeps_parent_child_identity_and_recovers_a_cancelled_chil
     };
     assert!(matches!(
         review
-            .run(&mut parent, &mut child, &stopped, &mut ignore)
+            .run(
+                &mut parent,
+                &mut child,
+                &stopped,
+                &mut cancel_during_request
+            )
             .await,
         Err(Error::Cancelled)
     ));

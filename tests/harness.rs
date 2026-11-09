@@ -1020,3 +1020,55 @@ fn extension_profiles_reject_cycles_and_disabled_dependencies() {
     .unwrap();
     assert!(!registry.has_tool("lookup"));
 }
+
+#[tokio::test]
+async fn interrupted_compaction_preserves_prior_branch_and_pending_context() {
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let model = Script::new(vec![
+        answer("original answer"),
+        vec![ModelEvent::Text("partial summary".into())],
+        answer("continued"),
+    ]);
+    let registry = Registry::default();
+    let agent = agent(&model, &registry);
+    let (_, mut inputs) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    agent
+        .run(
+            &mut session,
+            Some("retain the prior task".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert!(
+        agent
+            .summarize(&mut session, 0, &cancel, &mut ignore)
+            .await
+            .is_err()
+    );
+    assert!(
+        !session
+            .records()
+            .iter()
+            .any(|record| matches!(record.event, Event::Compacted { .. }))
+    );
+    assert!(session.records().iter().any(|record| matches!(&record.event,
+        Event::ModelFinished { partial, usage: UsageReport::Unconfirmed, failure: Some(_), .. } if partial == "partial summary")));
+    agent
+        .run(
+            &mut session,
+            Some("continue".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let requests = model.requests.lock().unwrap();
+    let context = serde_json::to_string(&requests[2]).unwrap();
+    assert!(context.contains("retain the prior task"));
+    assert!(!context.contains("partial summary"));
+}

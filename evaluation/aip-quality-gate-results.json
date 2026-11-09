@@ -1,0 +1,352 @@
+[
+  {
+    "report": {
+      "baseline": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.9332119004250151,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 576.0,
+        "mean_wall_time_ms": 1337.6666666666667,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "candidate": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.7838494231936854,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 576.0,
+        "mean_wall_time_ms": 780.0,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "decision": "reject",
+      "evaluated_at": "2026-11-09T03:30:13.376739Z",
+      "layer": "controlled_task",
+      "net": {
+        "cost_nanodollars_delta": 0.0,
+        "includes_analysis_cost": true,
+        "total_tokens_delta": 0.0,
+        "verified_pass_rate_delta": 0.0
+      },
+      "policy": "pol_pi_rs_evaluation",
+      "policy_version": 1,
+      "reasons": [
+        {
+          "reason": "cache_regression"
+        },
+        {
+          "reason": "no_net_saving"
+        }
+      ],
+      "unverified_external_references": []
+    },
+    "task": "read"
+  },
+  {
+    "report": {
+      "baseline": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.9280926264472882,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 570.0,
+        "mean_wall_time_ms": 1011.0,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "candidate": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.9402803168799512,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 570.0,
+        "mean_wall_time_ms": 599.3333333333334,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "decision": "reject",
+      "evaluated_at": "2026-11-09T03:30:13.376739Z",
+      "layer": "controlled_task",
+      "net": {
+        "cost_nanodollars_delta": 0.0,
+        "includes_analysis_cost": true,
+        "total_tokens_delta": 0.0,
+        "verified_pass_rate_delta": 0.0
+      },
+      "policy": "pol_pi_rs_evaluation",
+      "policy_version": 1,
+      "reasons": [
+        {
+          "reason": "no_net_saving"
+        }
+      ],
+      "unverified_external_references": []
+    },
+    "task": "count"
+  },
+  {
+    "report": {
+      "baseline": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.8603531300160513,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 681.0,
+        "mean_wall_time_ms": 1697.6666666666667,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 0.0
+      },
+      "candidate": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.8426966292134831,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 681.0,
+        "mean_wall_time_ms": 1316.0,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 0.0
+      },
+      "decision": "reject",
+      "evaluated_at": "2026-11-09T03:30:13.376739Z",
+      "layer": "controlled_task",
+      "net": {
+        "cost_nanodollars_delta": 0.0,
+        "includes_analysis_cost": true,
+        "total_tokens_delta": 0.0,
+        "verified_pass_rate_delta": 0.0
+      },
+      "policy": "pol_pi_rs_evaluation",
+      "policy_version": 1,
+      "reasons": [
+        {
+          "reason": "no_net_saving"
+        }
+      ],
+      "unverified_external_references": []
+    },
+    "task": "order"
+  },
+  {
+    "report": {
+      "baseline": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.7977941176470589,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 875.0,
+        "mean_wall_time_ms": 1898.6666666666667,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "candidate": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.8129084967320263,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 875.0,
+        "mean_wall_time_ms": 1430.0,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "decision": "reject",
+      "evaluated_at": "2026-11-09T03:30:13.376739Z",
+      "layer": "controlled_task",
+      "net": {
+        "cost_nanodollars_delta": 0.0,
+        "includes_analysis_cost": true,
+        "total_tokens_delta": 0.0,
+        "verified_pass_rate_delta": 0.0
+      },
+      "policy": "pol_pi_rs_evaluation",
+      "policy_version": 1,
+      "reasons": [
+        {
+          "reason": "no_net_saving"
+        }
+      ],
+      "unverified_external_references": []
+    },
+    "task": "code_fix"
+  },
+  {
+    "report": {
+      "baseline": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.9422222222222222,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 778.0,
+        "mean_wall_time_ms": 1134.0,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "candidate": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.9297777777777778,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 778.0,
+        "mean_wall_time_ms": 777.0,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "decision": "reject",
+      "evaluated_at": "2026-11-09T03:30:13.376739Z",
+      "layer": "controlled_task",
+      "net": {
+        "cost_nanodollars_delta": 0.0,
+        "includes_analysis_cost": true,
+        "total_tokens_delta": 0.0,
+        "verified_pass_rate_delta": 0.0
+      },
+      "policy": "pol_pi_rs_evaluation",
+      "policy_version": 1,
+      "reasons": [
+        {
+          "reason": "no_net_saving"
+        }
+      ],
+      "unverified_external_references": []
+    },
+    "task": "mock_write"
+  },
+  {
+    "report": {
+      "baseline": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.7621131983707216,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 5730.0,
+        "mean_wall_time_ms": 6296.0,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "candidate": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.8667450519302372,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 5212.0,
+        "mean_wall_time_ms": 3033.3333333333335,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 1.0
+      },
+      "decision": "reject",
+      "evaluated_at": "2026-11-09T03:30:13.376739Z",
+      "layer": "controlled_task",
+      "net": {
+        "cost_nanodollars_delta": 0.0,
+        "includes_analysis_cost": true,
+        "total_tokens_delta": -518.0,
+        "verified_pass_rate_delta": 0.0
+      },
+      "policy": "pol_pi_rs_evaluation",
+      "policy_version": 1,
+      "reasons": [
+        {
+          "field": "settings",
+          "reason": "condition_mismatch"
+        },
+        {
+          "reason": "analysis_cost_exceeds_saving"
+        }
+      ],
+      "unverified_external_references": []
+    },
+    "task": "compact"
+  },
+  {
+    "report": {
+      "baseline": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.9389281262982966,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 2649.0,
+        "mean_wall_time_ms": 5858.0,
+        "stddev_total_tokens": 0.0,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 0.0
+      },
+      "candidate": {
+        "completion_rate": 1.0,
+        "mean_analysis_cost_nanodollars": 0.0,
+        "mean_cache_read_share": 0.8227077582240626,
+        "mean_cost_nanodollars": 0.0,
+        "mean_rework": 0.0,
+        "mean_total_tokens": 1971.0,
+        "mean_wall_time_ms": 5515.0,
+        "stddev_total_tokens": 71.84010022264724,
+        "trials": 3,
+        "unknown_usage_trials": 0,
+        "verified_pass_rate": 0.0
+      },
+      "decision": "reject",
+      "evaluated_at": "2026-11-09T03:30:13.376739Z",
+      "layer": "controlled_task",
+      "net": {
+        "cost_nanodollars_delta": 0.0,
+        "includes_analysis_cost": true,
+        "total_tokens_delta": -678.0,
+        "verified_pass_rate_delta": 0.0
+      },
+      "policy": "pol_pi_rs_evaluation",
+      "policy_version": 1,
+      "reasons": [
+        {
+          "field": "settings",
+          "reason": "condition_mismatch"
+        },
+        {
+          "reason": "cache_regression"
+        },
+        {
+          "reason": "analysis_cost_exceeds_saving"
+        }
+      ],
+      "unverified_external_references": []
+    },
+    "task": "review"
+  }
+]

@@ -28,6 +28,17 @@ Pi v1.5.0 `f9a26365568127461c47a07a37dcb42c140a3ac5`、Ollama v0.40.15、Qwen2.5
 
 圧縮課題は Rust が少ないトークンで、両者とも記録した検証コードを復元した。レビューの品質はこの条件ではいずれも不足している。少数の合成課題からモデルやハーネス全般の品質差は推定できない。
 
+## AIP Evaluation での判定
+
+既存の AIP Evaluation のトークン最適化判定に、7課題の全試行を読み込ませた。7課題すべてで最適化としての採用条件を満たさなかった。通常課題5件では純節約額が得られず、読取りではキャッシュ利用率も低下した。圧縮とレビューでは比較設定の差があり、解析コストも節約額を上回った。API 従量費が $0 のローカルモデルでの判定なので、課金モデルでの節約額はこの結果から推定できない。 [AIP 判定結果](../evaluation/aip-quality-gate-results.json)
+
+```sh
+# pi-rs
+node evaluation/aip-input.mjs > /tmp/pi-rs-aip-input.json
+# tachyon-apps の Rust Harness 評価対応ブランチ
+cargo run --locked -p aip-composition --features pi-rs-evaluation --example pi_rs_quality_gate -- /tmp/pi-rs-aip-input.json
+```
+
 ## 拡張追加と復帰
 
 AI が `pi-rs-fixture-tools` を独立crateとして追加し、合成のコード修正と注文の操作、版付きの実行回数を実装した。ホストの機能指定で組み込む。評価用の拡張を有効にするコード変更はワークベンチの合成部に閉じている。 [サンプル拡張](../crates/fixture-tools/src/lib.rs)

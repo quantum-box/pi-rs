@@ -5,7 +5,7 @@
 | 対象 | 証拠 | 残る検証 |
 | --- | --- | --- |
 | PLT-6367、6368 | [対応表と依存方向](architecture.md)。コア、Ollama、CLI、保存ポートを分離。 | |
-| PLT-6369、6388 | [7課題・3反復の比較](expanded-evaluation.md)。ツールの効果と回答の独立判定。 | AIP Evaluation からの取込みと結合受入に合わせた再評価。 |
+| PLT-6369、6388 | [7課題・3反復の比較](expanded-evaluation.md)。ツールの効果と回答の独立判定。[AIP Evaluation の判定](../evaluation/aip-quality-gate-results.json)も記録。 | |
 | PLT-6370〜6377 | [実行・保存契約](extensions.md)。SSE 切断、tool_call 対応、追加入力の重複、v1 から v2 への追記、圧縮、Skill の版、CLI とライブラリの共通経路を検証。 | |
 | PLT-6378、6379 | 依存循環、無効な依存と拡張、未知の状態保持。候補バイナリの検証と復帰を実行。 [拡張サイクル](../evaluation/extension-cycle-results.json) | |
 | PLT-6380、6382、6383 | [AIP ホスト側の受入テスト](../crates/aip-host/tests/acceptance.rs)。権限取消、期限切れ承認、対象版変更、再開と操作照会、予算枯渇、精算の重複を模擬境界で検証。 | 実際の AIP Run と Coding Job／Workspace、MCP、業務 API を結んだ受入。 |
