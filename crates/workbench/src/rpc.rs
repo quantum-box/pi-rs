@@ -26,6 +26,15 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             "a managed session must be opened by its host".into(),
         ));
     }
+    if let Some((model, thinking)) = session.model_selection() {
+        if !args.model_explicit {
+            args.model = model;
+        }
+        if !args.thinking_explicit {
+            args.thinking = thinking;
+        }
+    }
+    constrain_model_scope(&mut args);
     drop(session);
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -139,9 +148,148 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             }
         }
         "abort" => Ok(None),
-        "get_state" => Ok(Some(
-            json!({"sessionFile":args.session,"isStreaming":busy(worker),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"model":{"id":args.model,"provider":"ollama"}}),
+        "get_state" => {
+            let mut state = json!({"sessionFile":args.session,"isStreaming":busy(worker),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+            if !busy(worker) {
+                let session = Session::open(&args.session)?;
+                state["sessionId"] = json!(session.session_id());
+                state["sessionName"] = json!(session.name());
+                state["messageCount"] = json!(session.conversation_at(session.head())?.len());
+            }
+            Ok(Some(state))
+        }
+        "get_available_models" => Ok(Some(
+            json!({"models":available_models(args)?.iter().map(|model| model_value(model)).collect::<Vec<_>>()}),
         )),
+        "cycle_model" if !busy(worker) => {
+            let available = available_models(args)?;
+            if available.is_empty() {
+                return Ok(None);
+            }
+            let next = available
+                .iter()
+                .position(|model| *model == args.model)
+                .map_or(0, |index| (index + 1) % available.len());
+            args.model = available[next].clone();
+            if let Some(choice) = args
+                .model_scope
+                .iter()
+                .find(|choice| choice.model == args.model)
+                && choice.thinking.is_some()
+            {
+                args.thinking = choice.thinking.clone();
+            }
+            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
+            Ok(Some(
+                json!({"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
+            ))
+        }
+        "get_available_thinking_levels" => Ok(Some(json!({"levels":THINKING_LEVELS}))),
+        "set_thinking_level" | "cycle_thinking_level" if !busy(worker) => {
+            let level = if name == "set_thinking_level" {
+                request["level"]
+                    .as_str()
+                    .filter(|level| THINKING_LEVELS.contains(level))
+                    .ok_or_else(|| Error::Config("invalid thinking level".into()))?
+            } else {
+                let index = THINKING_LEVELS
+                    .iter()
+                    .position(|level| Some(*level) == args.thinking.as_deref())
+                    .unwrap_or(0);
+                THINKING_LEVELS[(index + 1) % THINKING_LEVELS.len()]
+            };
+            args.thinking = Some(level.into());
+            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
+            Ok((name == "cycle_thinking_level").then(|| json!({"level":level})))
+        }
+        "get_entries" if !busy(worker) => {
+            let session = Session::open(&args.session)?;
+            let since = request.get("since").map(record_id).transpose()?;
+            if since.is_some_and(|id| !session.records().iter().any(|record| record.id == id)) {
+                return Err(Error::Config("unknown since entry".into()));
+            }
+            let entries: Vec<_> = session
+                .records()
+                .iter()
+                .filter(|record| since.is_none_or(|id| record.id > id))
+                .collect();
+            Ok(Some(
+                json!({"entries":entries,"leafId":session.head().to_string()}),
+            ))
+        }
+        "get_tree" if !busy(worker) => {
+            let session = Session::open(&args.session)?;
+            Ok(Some(
+                json!({"tree":session_tree(&session),"leafId":session.head().to_string()}),
+            ))
+        }
+        "get_fork_messages" if !busy(worker) => {
+            let session = Session::open(&args.session)?;
+            let messages: Vec<_> = session
+                .branch()
+                .iter()
+                .filter_map(|record| match &record.event {
+                    pi_rs::Event::User { content, .. }
+                    | pi_rs::Event::UserWithImages { content, .. } => {
+                        Some(json!({"entryId":record.id.to_string(),"text":content}))
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(Some(json!({"messages":messages})))
+        }
+        "get_last_assistant_text" if !busy(worker) => {
+            let session = Session::open(&args.session)?;
+            let text = session
+                .conversation_at(session.head())?
+                .into_iter()
+                .rev()
+                .find_map(|message| match message {
+                    pi_rs::Message::Assistant { content, .. } => Some(content),
+                    _ => None,
+                });
+            Ok(Some(json!({"text":text})))
+        }
+        "switch_session" if !busy(worker) => {
+            let path = request["sessionPath"]
+                .as_str()
+                .ok_or_else(|| Error::Config("sessionPath is required".into()))?;
+            let path = args.workspace.join(path);
+            switch_session(args, &path)?;
+            Ok(Some(json!({"cancelled":false})))
+        }
+        "fork" | "clone" if !busy(worker) => {
+            let session = Session::open(&args.session)?;
+            let (target, text) = if name == "fork" {
+                let id = record_id(&request["entryId"])?;
+                let record = session
+                    .records()
+                    .iter()
+                    .find(|record| record.id == id)
+                    .ok_or_else(|| Error::Config("unknown fork entry".into()))?;
+                match &record.event {
+                    pi_rs::Event::User { content, .. }
+                    | pi_rs::Event::UserWithImages { content, .. } => {
+                        (record.parent.unwrap_or(1), Some(content.clone()))
+                    }
+                    _ => return Err(Error::Config("fork must select a user message".into())),
+                }
+            } else {
+                (session.head(), None)
+            };
+            let destination = if args.no_session {
+                args.session
+                    .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
+            } else {
+                interactive::session_path(&args.workspace, args.session_dir.as_deref())
+            };
+            sessions::fork(&session, target, &destination, &args.workspace)?;
+            drop(session);
+            switch_session(args, &destination)?;
+            Ok(Some(
+                json!({"cancelled":false,"text":text,"sessionFile":args.session}),
+            ))
+        }
         "get_messages" if !busy(worker) => {
             let session = Session::open(&args.session)?;
             Ok(Some(
@@ -163,13 +311,21 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" if !busy(worker) => {
+            if request["provider"]
+                .as_str()
+                .is_some_and(|provider| provider != "ollama")
+            {
+                return Err(Error::Config(
+                    "this endpoint uses the ollama provider".into(),
+                ));
+            }
             let model = request["modelId"]
                 .as_str()
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| Error::Config("modelId is required".into()))?;
             args.model = model.to_owned();
             Session::open(&args.session)?.select_model(model, args.thinking.as_deref())?;
-            Ok(Some(json!({"id":model,"provider":"ollama"})))
+            Ok(Some(model_value(model)))
         }
         "compact" if !busy(worker) => {
             Worker::submit(
@@ -227,6 +383,90 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
     }
 }
 
+const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+fn model_value(model: &str) -> Value {
+    json!({"id":model,"name":model,"provider":"ollama"})
+}
+
+fn available_models(args: &Cli) -> Result<Vec<String>> {
+    if !args.model_scope.is_empty() {
+        return Ok(args
+            .model_scope
+            .iter()
+            .map(|choice| choice.model.clone())
+            .collect());
+    }
+    let endpoint = args.endpoint.clone();
+    let token = args.model_token();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(pi_rs::ollama::Ollama::new(&endpoint, token)?.models())
+    })
+    .join()
+    .map_err(|_| Error::Config("model discovery worker stopped".into()))?
+}
+
+fn record_id(value: &Value) -> Result<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .filter(|id| *id > 0)
+        .ok_or_else(|| Error::Config("entry ID must be a positive integer".into()))
+}
+
+fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
+    if !path.is_file() {
+        return Err(Error::Config("session file not found".into()));
+    }
+    let session = Session::open(path)?;
+    if session.host_binding().is_some() {
+        return Err(Error::Session(
+            "a managed session must be opened by its host".into(),
+        ));
+    }
+    if let Some((model, thinking)) = session.model_selection() {
+        args.model = model;
+        args.thinking = thinking;
+    }
+    constrain_model_scope(args);
+    args.session = path.to_path_buf();
+    Ok(())
+}
+
+fn constrain_model_scope(args: &mut Cli) {
+    if !args.model_scope.is_empty()
+        && !args
+            .model_scope
+            .iter()
+            .any(|choice| choice.model == args.model)
+    {
+        args.model = args.model_scope[0].model.clone();
+        if args.model_scope[0].thinking.is_some() {
+            args.thinking = args.model_scope[0].thinking.clone();
+        }
+    }
+}
+
+fn session_tree(session: &Session) -> Vec<Value> {
+    let labels = session.labels();
+    let mut children = std::collections::BTreeMap::<u64, Vec<Value>>::new();
+    let mut roots = Vec::new();
+    for record in session.records().iter().rev() {
+        let mut descendants = children.remove(&record.id).unwrap_or_default();
+        descendants.reverse();
+        let node = json!({"entry":record,"children":descendants,"label":labels.get(&record.id)});
+        match record.parent {
+            Some(parent) => children.entry(parent).or_default().push(node),
+            None => roots.push(node),
+        }
+    }
+    roots.reverse();
+    roots
+}
+
 fn busy(worker: &Option<Worker>) -> bool {
     worker.as_ref().is_some_and(|worker| worker.busy)
 }
@@ -279,4 +519,126 @@ fn emit(value: Value) -> Result<()> {
     writeln!(output, "{value}")?;
     output.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn native_session_commands_preserve_sources_and_restore_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jsonl");
+        let mut session = Session::open(&source).unwrap();
+        session.select_model("fixture:4b", Some("low")).unwrap();
+        session
+            .append_user_with_images("first".into(), vec![], None)
+            .unwrap();
+        let first = session.head();
+        session
+            .append_user_with_images("second".into(), vec![], None)
+            .unwrap();
+        let second = session.head();
+        drop(session);
+        let before = std::fs::read(&source).unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = root.path().to_path_buf();
+        args.session = source.clone();
+        args.session_dir = Some(root.path().join("sessions"));
+        let mut worker = None;
+        let entries = command(
+            &json!({"type":"get_entries", "since":first.to_string()}),
+            &mut args,
+            &mut worker,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(entries["entries"][0]["id"], second);
+        let forks = command(&json!({"type":"get_fork_messages"}), &mut args, &mut worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(forks["messages"].as_array().unwrap().len(), 2);
+        let tree = command(&json!({"type":"get_tree"}), &mut args, &mut worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tree["tree"].as_array().unwrap().len(), 1);
+        command(
+            &json!({"type":"fork","entryId":second.to_string()}),
+            &mut args,
+            &mut worker,
+        )
+        .unwrap();
+        assert_ne!(args.session, source);
+        assert_eq!(args.model, "fixture:4b");
+        assert_eq!(args.thinking.as_deref(), Some("low"));
+        let fork = Session::open(&args.session).unwrap();
+        assert_eq!(fork.conversation_at(fork.head()).unwrap().len(), 1);
+        drop(fork);
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        command(
+            &json!({"type":"switch_session","sessionPath":source}),
+            &mut args,
+            &mut worker,
+        )
+        .unwrap();
+        assert_eq!(args.session, source);
+        assert!(
+            command(
+                &json!({"type":"get_entries","since":"999999"}),
+                &mut args,
+                &mut worker
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn thinking_commands_persist_and_reject_invalid_levels() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.session = root.path().join("thinking.jsonl");
+        args.model_scope = vec![
+            crate::model_selection::Choice {
+                model: "a".into(),
+                thinking: Some("low".into()),
+            },
+            crate::model_selection::Choice {
+                model: "b".into(),
+                thinking: Some("high".into()),
+            },
+        ];
+        args.model = "a".into();
+        let mut worker = None;
+        command(
+            &json!({"type":"set_thinking_level","level":"medium"}),
+            &mut args,
+            &mut worker,
+        )
+        .unwrap();
+        let result = command(
+            &json!({"type":"cycle_thinking_level"}),
+            &mut args,
+            &mut worker,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["level"], "high");
+        let result = command(&json!({"type":"cycle_model"}), &mut args, &mut worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["model"]["id"], "b");
+        assert_eq!(
+            Session::open(&args.session).unwrap().model_selection(),
+            Some(("b".into(), Some("high".into())))
+        );
+        assert!(
+            command(
+                &json!({"type":"set_thinking_level","level":"invalid"}),
+                &mut args,
+                &mut worker
+            )
+            .is_err()
+        );
+    }
 }

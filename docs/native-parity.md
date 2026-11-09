@@ -32,7 +32,11 @@ remaining acceptance work for that surface.
 
 The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `get_state`, `get_messages`, `new_session`, `set_model`, `compact`,
-`get_session_stats`, `set_session_name`, `export_html`, and `shutdown`. Responses carry the request ID and a
+`get_session_stats`, `set_session_name`, `export_html`, `get_available_models`,
+`cycle_model`, `set_thinking_level`, `cycle_thinking_level`,
+`get_available_thinking_levels`, `switch_session`, `fork`, `clone`,
+`get_fork_messages`, `get_entries`, `get_tree`, `get_last_assistant_text`,
+`edit_context`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance is separate from completion; wait for
 `agent_settled`. The interface emits native journal events plus text updates.
 Additional Pi RPC commands and complete event-schema parity remain in progress.
@@ -449,3 +453,15 @@ Text reads now scan files with bounded memory, including files larger than
 `offset`, reject offsets beyond the file, and explain when a single line
 exceeds the byte limit. Explicit line limits report remaining lines. Image
 normalization and the separate write-size limit retain their existing bounds.
+
+### RPC navigation checkpoint
+
+RPC clients can discover and cycle endpoint models, set or cycle thinking,
+inspect native entries and the session tree, retrieve forkable user messages,
+and clone, fork or switch sessions. Selection restores with the chosen branch.
+Forking returns the selected user text and starts its copy before that message.
+Source journals remain intact. `get_entries` accepts a native record ID in
+`since`; entries and tree nodes retain the native journal schema.
+
+The reported thinking levels are the native selectable levels. Provider-specific
+capability filtering and full upstream RPC message/event schemas remain open.
