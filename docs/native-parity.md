@@ -1153,7 +1153,7 @@ cloned controls, fork isolation and closed-session handling. Loopback
 Ollama-adapter checks cover live RPC changes during a held model request,
 settings persistence, field preservation, validation and manual summaries.
 Both terminal layouts were exercised with a model request still running.
-Reference compaction defaults, partial-turn retention, unloaded-model context-window discovery
+Reference compaction defaults and unloaded-model context-window discovery
 and broader provider recovery behavior remain open.
 
 
@@ -1192,14 +1192,15 @@ and unrelated settings remain preserved.
 
 A configured reserve can start compaction before the hard context limit is
 reached. Manual TUI, RPC and CLI summaries use configured token retention;
-CLI `--keep-turns` remains an explicit override. Configured recent-token retention selects complete conversation turns,
-so tool calls and their results stay together. A soft threshold only starts a
+CLI `--keep-turns` remains an explicit override. Configured recent-token retention initially selected complete conversation
+turns. The checkpoint below adds message boundaries within a turn while
+keeping tool calls with their results. A soft threshold only starts a
 summary when an older prefix exists and enough request budget remains. The
 existing one-compaction-per-run bound still applies. Native SDK controls expose
 the same optional token settings, and forks receive an independent copy.
 
 Omitted token fields continue to use the native bounded policy. The reference
-built-in token defaults and cuts within a conversation turn remain open.
+built-in token defaults remain open; within-turn boundaries are covered below.
 `/settings` exposes the compaction object for editing, with reload/startup
 application for token-policy changes.
 
@@ -1208,3 +1209,30 @@ output within its real conversation turn. Settings
 tests cover per-field model overrides, zero, invalid numbers and malformed
 model overrides. The RPC fixture exercises model changes, early compaction and
 preserved user settings through the normal worker path.
+
+
+### Within-turn compaction boundary checkpoint
+
+Configured token retention can now start at a user or assistant message within
+a turn. Tool-result entries are never selected alone. When trailing tool
+results meet the retention target, their assistant call remains with them.
+Adjacent non-context records are kept with the selected boundary, and the
+existing compaction entry records that boundary for reopening and branch replay.
+
+Context projection retains source IDs through edits and tool-pair repair.
+Summary requests use the currently projected prefix, so an edit or deletion
+recorded after the selected boundary still applies. For a split turn, the
+summary prompt includes the initiating request and asks the model to preserve
+what is needed to interpret the retained messages. Extension hooks can retain
+additional whole turns, while dropping unsummarized context remains rejected.
+
+Automatic compaction, manual RPC/TUI compaction and CLI compaction use this
+boundary when token retention is configured. Explicit `--keep-turns` and the
+existing SDK methods retain their turn-count behavior. The SDK also exposes
+`summarize_configured` for token-based selection.
+
+Core tests cover a trailing tool result, late context edits, source preservation,
+reopening and the retained assistant/tool pair. SDK tests cover retaining an
+assistant inside a turn. Loopback checks exercise automatic and manual RPC
+compaction, model overrides, CLI turn-count overrides and completion responses.
+Reference default token values and token-estimator differences remain open.

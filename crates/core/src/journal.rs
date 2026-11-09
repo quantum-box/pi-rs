@@ -1106,6 +1106,16 @@ pub(crate) fn conversation(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<Message> {
+    conversation_entries(path, operations)
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect()
+}
+
+pub(crate) fn conversation_entries(
+    path: &[&Record],
+    operations: Vec<(Invocation, OperationState)>,
+) -> Vec<(u64, Message)> {
     let retain_from = path
         .iter()
         .rev()
@@ -1217,9 +1227,9 @@ pub(crate) fn conversation(
     let mut messages: Vec<_> = messages
         .into_iter()
         .filter_map(|(source, message)| match edits.get(&source) {
-            Some(Some(replacement)) => Some(project_content(message, replacement)),
+            Some(Some(replacement)) => Some((source, project_content(message, replacement))),
             Some(None) => None,
-            None => Some(message),
+            None => Some((source, message)),
         })
         .collect();
     if !edits.is_empty() {
@@ -1228,19 +1238,19 @@ pub(crate) fn conversation(
     messages
 }
 
-fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
+fn repair_tool_pairs(messages: Vec<(u64, Message)>) -> Vec<(u64, Message)> {
     let mut projected = Vec::new();
     let mut messages = messages.into_iter().peekable();
-    while let Some(message) = messages.next() {
+    while let Some((source, message)) = messages.next() {
         match message {
             Message::Assistant { content, mut calls } => {
                 let mut results = Vec::new();
-                while matches!(messages.peek(), Some(Message::Tool { .. })) {
+                while matches!(messages.peek(), Some((_, Message::Tool { .. }))) {
                     results.push(messages.next().expect("peeked tool result"));
                 }
                 let result_ids: std::collections::BTreeSet<_> = results
                     .iter()
-                    .filter_map(|message| match message {
+                    .filter_map(|(_, message)| match message {
                         Message::Tool { call_id, .. } => Some(call_id.as_str()),
                         _ => None,
                     })
@@ -1249,12 +1259,12 @@ fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
                 let call_ids: std::collections::BTreeSet<_> =
                     calls.iter().map(|call| call.id.clone()).collect();
                 if !content.is_empty() || !calls.is_empty() {
-                    projected.push(Message::Assistant { content, calls });
+                    projected.push((source, Message::Assistant { content, calls }));
                 }
-                projected.extend(results.into_iter().filter(|message| matches!(message, Message::Tool { call_id, .. } if call_ids.contains(call_id))));
+                projected.extend(results.into_iter().filter(|(_, message)| matches!(message, Message::Tool { call_id, .. } if call_ids.contains(call_id))));
             }
             Message::Tool { .. } => {}
-            message => projected.push(message),
+            message => projected.push((source, message)),
         }
     }
     projected

@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::extension::{RegisteredTool, hook};
-use crate::journal::{conversation, ensure_settled};
+use crate::journal::{conversation, conversation_entries, ensure_settled};
 use crate::{
     AgentInput, CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind,
     Invocation, Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest,
@@ -390,7 +390,7 @@ impl Agent<'_> {
                     });
                     let control = session.auto_compaction_control();
                     let tokens = control.token_settings();
-                    let keep_turns = retained_turn_count(session, tokens.keep_recent_tokens)?;
+                    let retention = configured_retention(session, tokens.keep_recent_tokens, 1)?;
                     let reserve_reached =
                         capacity
                             .zip(tokens.reserve_tokens)
@@ -399,7 +399,7 @@ impl Agent<'_> {
                             });
                     let has_prefix = reserve_reached && {
                         let branch = session.branch();
-                        retain_from(&branch, keep_turns) != retain_from(&branch, usize::MAX)
+                        retention.boundary != retain_from(&branch, usize::MAX)
                     };
                     if exceeds
                         || (control.enabled()
@@ -425,7 +425,7 @@ impl Agent<'_> {
                                 session,
                                 &states,
                                 SummaryScope {
-                                    keep_turns,
+                                    retention,
                                     instructions: None,
                                     output_limit: summary_limit,
                                     cancellation: cancel,
@@ -562,7 +562,21 @@ impl Agent<'_> {
                 content: format!("Prior conversation summary (context only):\n{summary}"),
             });
         }
-        messages.extend(conversation(history, session.operations()));
+        if let Some(boundary) = before {
+            let mut keep_group = false;
+            messages.extend(
+                conversation_entries(&branch, session.operations())
+                    .into_iter()
+                    .filter_map(|(source, message)| {
+                        if !matches!(message, Message::Tool { .. }) {
+                            keep_group = source < boundary;
+                        }
+                        keep_group.then_some(message)
+                    }),
+            );
+        } else {
+            messages.extend(conversation(history, session.operations()));
+        }
         if messages.len() == 1 {
             return Err(Error::Session("there is no conversation to resume".into()));
         }
@@ -1327,6 +1341,36 @@ impl Agent<'_> {
         self.commit_compaction(session, compaction, &states, None, None, observer)
     }
 
+    /// Commit a caller-supplied summary using configured token retention.
+    pub fn compact_configured(
+        &self,
+        session: &mut Session,
+        summary: String,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        let retention = configured_retention(
+            session,
+            session
+                .auto_compaction_control()
+                .token_settings()
+                .keep_recent_tokens,
+            1,
+        )?;
+        self.commit_compaction(
+            session,
+            Compaction {
+                summary,
+                keep_turns: retention.keep_turns,
+            },
+            &states,
+            None,
+            Some(retention),
+            observer,
+        )
+    }
+
     /// Request a model-generated summary in a tool-free turn, then compact atomically.
     pub async fn summarize(
         &self,
@@ -1361,8 +1405,52 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
         instructions: Option<&str>,
     ) -> Result<()> {
+        self.summarize_selected(
+            session,
+            Some(keep_turns),
+            cancel,
+            observer,
+            inputs,
+            instructions,
+        )
+        .await
+    }
+
+    /// Summarize using the session's configured token-retention boundary.
+    pub async fn summarize_configured<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        inputs: Option<&mut mpsc::Receiver<T>>,
+        instructions: Option<&str>,
+    ) -> Result<()> {
+        self.summarize_selected(session, None, cancel, observer, inputs, instructions)
+            .await
+    }
+
+    async fn summarize_selected<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        keep_turns: Option<usize>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        inputs: Option<&mut mpsc::Receiver<T>>,
+        instructions: Option<&str>,
+    ) -> Result<()> {
         ensure_settled(session.operations())?;
         let states = self.migrate(session, observer)?;
+        let retention = match keep_turns {
+            Some(turns) => RetentionPlan::turns(session, turns),
+            None => configured_retention(
+                session,
+                session
+                    .auto_compaction_control()
+                    .token_settings()
+                    .keep_recent_tokens,
+                1,
+            )?,
+        };
         let limit = self
             .limits
             .output_tokens_per_request
@@ -1371,7 +1459,7 @@ impl Agent<'_> {
             session,
             &states,
             SummaryScope {
-                keep_turns,
+                retention,
                 instructions,
                 output_limit: limit,
                 cancellation: cancel,
@@ -1392,7 +1480,7 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<u32> {
         let SummaryScope {
-            keep_turns,
+            retention,
             instructions,
             output_limit: limit,
             cancellation: cancel,
@@ -1400,7 +1488,7 @@ impl Agent<'_> {
         if limit == 0 || self.limits.model_requests == 0 {
             return Err(Error::Budget);
         }
-        let before = retain_from(&session.branch(), keep_turns);
+        let before = retention.boundary;
         let mut request = self
             .request(
                 session,
@@ -1417,6 +1505,11 @@ impl Agent<'_> {
         }
         request.tools.clear();
         request.messages.push(Message::User { content: "Summarize only this older conversation. Record confirmed facts, decisions, and explicitly unresolved items. Preserve useful tool outcomes. Do not infer the current work status or invent open tasks. Omit credentials. Return only the summary.".into() });
+        if retention.split_turn
+            && let Some(Message::User { content }) = request.messages.last_mut()
+        {
+            content.push_str("\nThe retained context begins within a turn. Preserve the user's request and completed steps needed to interpret the retained messages.");
+        }
         if let Some(instructions) = instructions.filter(|value| !value.is_empty())
             && let Some(Message::User { content }) = request.messages.last_mut()
         {
@@ -1450,11 +1543,11 @@ impl Agent<'_> {
             session,
             Compaction {
                 summary: reply.content,
-                keep_turns,
+                keep_turns: retention.keep_turns,
             },
             states,
             reply.usage,
-            Some(keep_turns),
+            Some(retention),
             observer,
         )?;
         Ok(output as u32)
@@ -1494,7 +1587,7 @@ impl Agent<'_> {
         mut compaction: Compaction,
         states: &ExtensionStates,
         usage: Option<Usage>,
-        minimum_retention: Option<usize>,
+        minimum_retention: Option<RetentionPlan>,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
         for extension in &self.registry.extensions {
@@ -1513,12 +1606,15 @@ impl Agent<'_> {
                 "summary must contain between 1 and 65536 bytes".into(),
             ));
         }
-        if minimum_retention.is_some_and(|minimum| compaction.keep_turns < minimum) {
+        if minimum_retention.is_some_and(|minimum| compaction.keep_turns < minimum.keep_turns) {
             return Err(Error::Config(
                 "compaction would drop turns absent from the summary".into(),
             ));
         }
-        let retain_from = retain_from(&session.branch(), compaction.keep_turns);
+        let retain_from = match minimum_retention {
+            Some(retention) if retention.keep_turns == compaction.keep_turns => retention.boundary,
+            _ => retain_from(&session.branch(), compaction.keep_turns),
+        };
         let mut changes = ExtensionStates::new();
         for extension in &self.registry.extensions {
             if let Some(state) = hook(
@@ -1539,6 +1635,102 @@ impl Agent<'_> {
             observer,
         )
     }
+}
+
+#[derive(Clone, Copy)]
+struct RetentionPlan {
+    keep_turns: usize,
+    boundary: Option<u64>,
+    split_turn: bool,
+}
+impl RetentionPlan {
+    fn turns(session: &Session, keep_turns: usize) -> Self {
+        Self {
+            keep_turns,
+            boundary: retain_from(&session.branch(), keep_turns),
+            split_turn: false,
+        }
+    }
+}
+
+fn configured_retention(
+    session: &Session,
+    target: Option<u64>,
+    fallback: usize,
+) -> Result<RetentionPlan> {
+    let Some(target) = target else {
+        return Ok(RetentionPlan::turns(session, fallback));
+    };
+    let branch = session.branch();
+    let entries = conversation_entries(&branch, session.operations());
+    let candidates: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, message))| {
+            matches!(
+                message,
+                Message::User { .. } | Message::UserWithImages { .. } | Message::Assistant { .. }
+            )
+            .then_some(index)
+        })
+        .collect();
+    let Some(&first) = candidates.first() else {
+        return Ok(RetentionPlan::turns(session, fallback));
+    };
+    let mut cut = first;
+    let mut accumulated = 0_u64;
+    for (index, (_, message)) in entries.iter().enumerate().rev() {
+        accumulated =
+            accumulated.saturating_add(serde_json::to_vec(message)?.len().div_ceil(3) as u64);
+        if accumulated >= target {
+            cut = candidates
+                .iter()
+                .copied()
+                .find(|candidate| *candidate >= index)
+                .unwrap_or_else(|| *candidates.last().expect("nonempty candidates"));
+            break;
+        }
+    }
+    let source = entries[cut].0;
+    let mut boundary_index = branch
+        .iter()
+        .position(|record| record.id == source)
+        .expect("projected source belongs to branch");
+    let visible: HashSet<_> = entries.iter().map(|(source, _)| *source).collect();
+    while boundary_index > 0 {
+        let previous = branch[boundary_index - 1];
+        if visible.contains(&previous.id) || matches!(previous.event, Event::Compacted { .. }) {
+            break;
+        }
+        boundary_index -= 1;
+    }
+    let turn_start = entries[..=cut]
+        .iter()
+        .rev()
+        .find_map(|(source, message)| {
+            matches!(
+                message,
+                Message::User { .. } | Message::UserWithImages { .. }
+            )
+            .then_some(*source)
+        })
+        .unwrap_or(source);
+    let keep_turns = branch
+        .iter()
+        .filter(|record| {
+            record.id >= turn_start
+                && matches!(
+                    record.event,
+                    Event::User { .. } | Event::UserWithImages { .. }
+                )
+        })
+        .count()
+        .max(1);
+    Ok(RetentionPlan {
+        keep_turns,
+        boundary: Some(branch[boundary_index].id),
+        split_turn: matches!(entries[cut].1, Message::Assistant { .. }),
+    })
 }
 
 fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> {
@@ -1620,7 +1812,7 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
 }
 
 struct SummaryScope<'a> {
-    keep_turns: usize,
+    retention: RetentionPlan,
     instructions: Option<&'a str>,
     output_limit: u32,
     cancellation: &'a CancellationToken,

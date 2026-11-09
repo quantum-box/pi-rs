@@ -868,7 +868,7 @@ async fn automatic_compaction_can_be_disabled_and_reenabled_without_removing_the
 }
 
 #[tokio::test]
-async fn configured_reserve_compacts_early_and_preserves_recent_complete_turns() {
+async fn configured_reserve_compacts_early_and_preserves_recent_messages() {
     let mut session = Session::with_store(MemoryStore::default()).unwrap();
     let model = Script::new(vec![
         answer(&"a".repeat(1500)),
@@ -915,18 +915,125 @@ async fn configured_reserve_compacts_early_and_preserves_recent_complete_turns()
     assert!(requests[2].messages.contains(&Message::User {
         content: "first question".into()
     }));
-    assert!(!requests[2].messages.contains(&Message::User {
+    assert!(requests[2].messages.contains(&Message::User {
         content: "second question".into()
     }));
-    assert!(requests[3].messages.contains(&Message::User {
+    assert!(!requests[3].messages.contains(&Message::User {
         content: "second question".into()
     }));
+    assert!(requests[3].messages.iter().any(|message| matches!(message, Message::Assistant { content, .. } if content == &"b".repeat(1500))));
     assert!(requests[3].messages.contains(&Message::User {
         content: "latest question".into()
     }));
     assert!(!requests[3].messages.contains(&Message::User {
         content: "first question".into()
     }));
+}
+
+#[tokio::test]
+async fn split_turn_retention_preserves_tool_pairs_and_projects_late_edits() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("split.jsonl");
+    let mut session = Session::open(&path).unwrap();
+    let fixture = Arc::new(Fixture {
+        called: AtomicUsize::new(0),
+        hold: false,
+        effects: Mutex::default(),
+    });
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Tools(fixture))).unwrap();
+    let model = Script::new(vec![
+        tool_reply(&[r#"{"id":"kept"}"#]),
+        answer("remove this final reply"),
+        answer("summary of revised input"),
+    ]);
+    let harness = agent(&model, &registry);
+    let (_, mut inputs) = mpsc::channel::<AgentInput>(1);
+    let cancel = CancellationToken::new();
+    harness
+        .run_correlated(
+            &mut session,
+            uuid::Uuid::new_v4(),
+            Some("original private input".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let mut final_cut = Session::from_records(session.records().to_vec()).unwrap();
+    final_cut
+        .auto_compaction_control()
+        .set_token_settings(CompactionTokens {
+            reserve_tokens: None,
+            keep_recent_tokens: Some(1),
+        });
+    harness
+        .compact_configured(&mut final_cut, "supplied summary".into(), &mut ignore)
+        .unwrap();
+    let retained_final = final_cut.conversation_at(final_cut.head()).unwrap();
+    assert_eq!(retained_final.len(), 2);
+    assert!(
+        matches!(&retained_final[1], Message::Assistant { content, calls } if content == "remove this final reply" && calls.is_empty())
+    );
+    let user = session
+        .records()
+        .iter()
+        .find(|record| matches!(record.event, Event::User { .. }))
+        .unwrap()
+        .id;
+    let last_assistant = session
+        .records()
+        .iter()
+        .rev()
+        .find(|record| matches!(record.event, Event::Assistant { .. }))
+        .unwrap()
+        .id;
+    session
+        .edit_context(user, Some(ContextContent::Text("revised input".into())))
+        .unwrap();
+    session.edit_context(last_assistant, None).unwrap();
+    session
+        .auto_compaction_control()
+        .set_token_settings(CompactionTokens {
+            reserve_tokens: None,
+            keep_recent_tokens: Some(1),
+        });
+    harness
+        .summarize_configured(&mut session, &cancel, &mut ignore, Some(&mut inputs), None)
+        .await
+        .unwrap();
+    let requests = model.requests.lock().unwrap();
+    assert!(requests[2].tools.is_empty());
+    assert!(requests[2].messages.contains(&Message::User {
+        content: "revised input".into()
+    }));
+    assert!(
+        !serde_json::to_string(&requests[2])
+            .unwrap()
+            .contains("original private input")
+    );
+    assert!(
+        !requests[2]
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Tool { .. }))
+    );
+    drop(requests);
+    let retained = session.conversation_at(session.head()).unwrap();
+    assert!(
+        matches!(&retained[0], Message::User { content } if content.starts_with("Prior conversation summary:"))
+    );
+    assert!(
+        matches!(&retained[1], Message::Assistant { calls, .. } if calls.len() == 1),
+        "{retained:?}"
+    );
+    assert!(matches!(&retained[2], Message::Tool { content, .. } if content == "found kept"));
+    assert_eq!(retained.len(), 3);
+    drop(session);
+    let reopened = Session::open(path).unwrap();
+    assert_eq!(reopened.conversation_at(reopened.head()).unwrap(), retained);
+    assert!(reopened.records().iter().any(|record| matches!(&record.event, Event::User { content, .. } if content == "original private input")));
 }
 
 #[tokio::test]

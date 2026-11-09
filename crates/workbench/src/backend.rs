@@ -272,22 +272,18 @@ pub async fn run(mut args: Cli) -> Result<()> {
                     use_token_settings,
                     ..
                 } => {
-                    let keep_turns = if use_token_settings {
-                        runtime.auto_compaction.retained_turns(&session, keep_turns)?
-                    } else { keep_turns };
                     let tokens_before = serde_json::to_vec(
                         &session.conversation_at(session.head())?,
                     )?.len().div_ceil(3);
-                    agent
-                        .summarize_with_instructions(
-                            &mut session,
-                            keep_turns,
-                            &cancel,
-                            &mut observer,
-                            Some(&mut queued),
-                            instructions.as_deref(),
-                        )
-                        .await?;
+                    if use_token_settings {
+                        agent.summarize_configured(
+                            &mut session, &cancel, &mut observer, Some(&mut queued), instructions.as_deref(),
+                        ).await?;
+                    } else {
+                        agent.summarize_with_instructions(
+                            &mut session, keep_turns, &cancel, &mut observer, Some(&mut queued), instructions.as_deref(),
+                        ).await?;
+                    }
                     if let Some(record) = session.records().last()
                         && let pi_rs::Event::Compacted { summary, retain_from, .. } = &record.event
                     {

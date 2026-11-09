@@ -847,31 +847,24 @@ async fn execute(mut args: Cli) -> Result<()> {
             keep_turns,
             ..
         } => {
-            let keep_turns = match keep_turns {
-                Some(turns) => turns,
-                None => runtime.auto_compaction.retained_turns(&session, 1)?,
+            return match keep_turns {
+                Some(keep_turns) => agent.compact(
+                    &mut session, Compaction { summary, keep_turns }, &mut observer,
+                ),
+                None => agent.compact_configured(&mut session, summary, &mut observer),
             };
-            return agent.compact(
-                &mut session,
-                Compaction {
-                    summary,
-                    keep_turns,
-                },
-                &mut observer,
-            );
         }
         Command::Compact {
-            summary: None,
-            keep_turns,
-            instructions,
+            summary: None, keep_turns, instructions,
         } => {
-            let keep_turns = match keep_turns {
-                Some(turns) => turns,
-                None => runtime.auto_compaction.retained_turns(&session, 1)?,
+            return match keep_turns {
+                Some(keep_turns) => agent.summarize_with_instructions::<pi_rs::AgentInput>(
+                    &mut session, keep_turns, &cancel, &mut observer, None, instructions.as_deref(),
+                ).await,
+                None => agent.summarize_configured::<pi_rs::AgentInput>(
+                    &mut session, &cancel, &mut observer, None, instructions.as_deref(),
+                ).await,
             };
-            return agent
-                .summarize_with_instructions::<pi_rs::AgentInput>(&mut session, keep_turns, &cancel, &mut observer, None, instructions.as_deref())
-                .await;
         }
         Command::Run { prompt } => Some(prompt),
         Command::Resume => None,

@@ -522,6 +522,19 @@ impl AgentSession {
         keep_turns: usize,
         instructions: Option<&str>,
     ) -> Result<()> {
+        self.summarize_selected(Some(keep_turns), instructions)
+            .await
+    }
+
+    pub async fn summarize_configured(&mut self, instructions: Option<&str>) -> Result<()> {
+        self.summarize_selected(None, instructions).await
+    }
+
+    async fn summarize_selected(
+        &mut self,
+        keep_turns: Option<usize>,
+        instructions: Option<&str>,
+    ) -> Result<()> {
         self.ensure_open()?;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
@@ -533,16 +546,31 @@ impl AgentSession {
             limits: self.limits.clone(),
         };
         let mut observer = |event: Notification<'_>| emit(&events, &event);
-        let result = agent
-            .summarize_with_instructions(
-                &mut self.session,
-                keep_turns,
-                &active.token,
-                &mut observer,
-                Some(&mut self.input),
-                instructions,
-            )
-            .await;
+        let result = match keep_turns {
+            Some(keep_turns) => {
+                agent
+                    .summarize_with_instructions(
+                        &mut self.session,
+                        keep_turns,
+                        &active.token,
+                        &mut observer,
+                        Some(&mut self.input),
+                        instructions,
+                    )
+                    .await
+            }
+            None => {
+                agent
+                    .summarize_configured(
+                        &mut self.session,
+                        &active.token,
+                        &mut observer,
+                        Some(&mut self.input),
+                        instructions,
+                    )
+                    .await
+            }
+        };
         let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
         result.and(final_inputs)
     }
@@ -726,6 +754,33 @@ mod tests {
             keep_recent_tokens: Some(target),
         });
         assert_eq!(control.retained_turns(session.journal(), 1).unwrap(), 1);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_summary_can_retain_an_assistant_inside_a_turn() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .in_memory()
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        session.prompt("second").await.unwrap();
+        session
+            .controls()
+            .set_compaction_tokens(crate::CompactionTokens {
+                reserve_tokens: None,
+                keep_recent_tokens: Some(1),
+            })
+            .unwrap();
+        session
+            .summarize_configured(Some("Keep confirmed facts."))
+            .await
+            .unwrap();
+        let messages = session.messages().unwrap();
+        assert!(matches!(&messages[0], Message::User { content } if content.contains("answer 3")));
+        assert!(
+            matches!(&messages[1], Message::Assistant { content, .. } if content == "answer 2")
+        );
+        assert_eq!(messages.len(), 2);
         session.close().await.unwrap();
     }
 
