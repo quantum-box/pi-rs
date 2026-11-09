@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use pi_rs_core::{
-    Agent, CancellationToken, Error, Extension, ExtensionResult, ExtensionState, Message,
-    ModelRequest, Observer, Result, Session,
+    Agent, CancellationToken, Error, Event, Extension, ExtensionResult, ExtensionState, Message,
+    ModelRequest, Observer, Result, RunState, Session, UsageReport,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -168,8 +168,41 @@ impl Review<'_> {
             link.task
         );
         let mut limits = agent.limits.clone();
-        limits.output_tokens_per_run = limits.output_tokens_per_run.min(self.output_budget);
-        limits.model_requests = limits.model_requests.min(4);
+        let mut requested = BTreeMap::new();
+        let mut completed = false;
+        for record in child
+            .records()
+            .iter()
+            .filter(|record| record.run_id == Some(child_id))
+        {
+            match &record.event {
+                Event::ModelRequested {
+                    request_id: Some(id),
+                    max_output_tokens,
+                    ..
+                } => {
+                    requested.insert(*id, u64::from(*max_output_tokens));
+                }
+                Event::ModelFinished {
+                    request_id,
+                    usage: UsageReport::Measured { usage },
+                    ..
+                } => {
+                    requested.insert(*request_id, usage.output_tokens);
+                }
+                Event::Run { state, .. } => completed = *state == RunState::Completed,
+                _ => {}
+            }
+        }
+        let spent = requested.values().copied().fold(0, u64::saturating_add);
+        limits.output_tokens_per_run = limits
+            .output_tokens_per_run
+            .min(self.output_budget)
+            .saturating_sub(u32::try_from(spent).unwrap_or(u32::MAX));
+        limits.model_requests = limits.model_requests.min(4).saturating_sub(requested.len());
+        if !completed && (limits.output_tokens_per_run == 0 || limits.model_requests == 0) {
+            return Err(Error::Budget);
+        }
         let tools = agent.registry.read_only_subset(&self.allowed_tools)?;
         let reviewer = Agent {
             model: agent.model,

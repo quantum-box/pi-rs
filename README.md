@@ -82,3 +82,6 @@ and the boundaries with AIP, Field, and Workspace Runtime.
 - See [architecture](docs/architecture.md) and the
   [extension contract](docs/extensions.md) for provider-neutral embedding,
   plan mode, and branch review.
+
+[Expanded Pi comparison](docs/expanded-evaluation.md) covers synthetic code
+repair, writes, compaction, and branch review.

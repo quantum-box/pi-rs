@@ -1,0 +1,14 @@
+{
+  "previous_build_ms": 5222,
+  "failed_build_ms": 57,
+  "candidate_build_ms": 291,
+  "candidate_contract_check_ms": 23059,
+  "activate_and_continue_ms": 114,
+  "stage_to_use_ms": 23473,
+  "rollback_and_continue_ms": 53,
+  "failed_build_left_previous_usable": true,
+  "incompatible_state_rejected": true,
+  "old_binary_preserved_extension_state": true,
+  "operation_count_after_rollback": 1,
+  "resumed_original_code": "RZ-73"
+}

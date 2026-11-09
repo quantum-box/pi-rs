@@ -1,6 +1,6 @@
 # 評価と採用範囲
 
-対象は Linear の P-PLT-125。採用範囲を、開発・検証用の独立した Rust ライブラリと CLI に限定する。Tachyon の既存実行経路を置き換える判断は、テナント境界での検証と、実業務での費用・介入率の測定が揃うまで保留する。 [Linear プロジェクト](https://linear.app/quantum-box/project/rust-agent-harness-pi%E3%81%AE%E3%82%B3%E3%82%A2%E6%8B%A1%E5%BC%B5%E3%82%92%E5%86%8D%E5%AE%9F%E8%A3%85-cd933e2f2ff7/overview)
+対象は Linear の P-PLT-125。これは初回3課題のベースラインであり、再現にはコミット `474414bd863267d5a4903d0f32d44b3f0af9497e` を使う。現行の手順と結果は [拡張比較](expanded-evaluation.md) にある。採用範囲を、開発・検証用の独立した Rust ライブラリと CLI に限定する。Tachyon の既存実行経路を置き換える判断は、テナント境界での検証と、実業務での費用・介入率の測定が揃うまで保留する。 [Linear プロジェクト](https://linear.app/quantum-box/project/rust-agent-harness-pi%E3%81%AE%E3%82%B3%E3%82%A2%E6%8B%A1%E5%BC%B5%E3%82%92%E5%86%8D%E5%AE%9F%E8%A3%85-cd933e2f2ff7/overview)
 
 ## M1 既存実装との境界
 

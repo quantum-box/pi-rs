@@ -1055,6 +1055,7 @@ dependencies = [
  "futures-util",
  "pi-rs-core",
  "pi-rs-ollama",
+ "pi-rs-review",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1094,6 +1095,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-rs-fixture-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pi-rs-core",
+ "reqwest",
+ "serde_json",
+]
+
+[[package]]
 name = "pi-rs-ollama"
 version = "0.1.0"
 dependencies = [
@@ -1115,6 +1126,8 @@ dependencies = [
  "pi-rs-core",
  "serde",
  "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1135,6 +1148,7 @@ dependencies = [
  "async-trait",
  "clap",
  "pi-rs",
+ "pi-rs-fixture-tools",
  "pi-rs-plan-mode",
  "pi-rs-review",
  "reqwest",

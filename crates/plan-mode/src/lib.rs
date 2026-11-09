@@ -121,3 +121,51 @@ impl Extension for PlanMode {
         Ok(Decision::Allow)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pi_rs_core::{CancellationToken, ToolSpec};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn planning_filters_tools_and_rejects_unadvertised_writes() {
+        let extension = PlanMode::new(["read".into()]);
+        let state = extension
+            .command("start", "review the changes", None)
+            .unwrap();
+        let mut request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "fixture".into(),
+            }],
+            tools: ["read", "command", "mcp_write"]
+                .into_iter()
+                .map(|name| ToolSpec {
+                    name: name.into(),
+                    description: "fixture".into(),
+                    parameters: json!({"type":"object"}),
+                })
+                .collect(),
+            max_output_tokens: 32,
+        };
+        extension.context(&mut request, Some(&state)).unwrap();
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, "read");
+        let context = ToolContext {
+            operation_id: uuid::Uuid::new_v4(),
+            cancellation: CancellationToken::new(),
+        };
+        for name in ["command", "mcp_write"] {
+            assert!(matches!(
+                extension
+                    .before_tool(name, &json!({}), &context, Some(&state))
+                    .await
+                    .unwrap(),
+                Decision::Deny(_)
+            ));
+        }
+        let accepted = extension.command("accept", "", Some(&state)).unwrap();
+        assert_eq!(accepted.data["mode"], "executing");
+    }
+}

@@ -10,10 +10,14 @@ publish = false
 name = "pi-rs"
 path = "src/main.rs"
 
+[features]
+evaluation-fixtures = ["dep:pi-rs-fixture-tools"]
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 pi-rs = { path = "../.." }
+pi-rs-fixture-tools = { path = "../fixture-tools", optional = true }
 pi-rs-plan-mode = { path = "../plan-mode" }
 pi-rs-review = { path = "../review" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

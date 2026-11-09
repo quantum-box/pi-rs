@@ -51,6 +51,10 @@ struct Cli {
     /// Optional read-only order API collection URL.
     #[arg(long, global = true)]
     orders: Option<String>,
+    /// Loopback fixture destination for evaluation-only mutating tools.
+    #[cfg(feature = "evaluation-fixtures")]
+    #[arg(long, global = true)]
+    fixtures: Option<String>,
     /// File containing the system prompt.
     #[arg(long, global = true)]
     system_prompt: Option<PathBuf>,
@@ -221,6 +225,11 @@ async fn execute(args: Cli) -> Result<()> {
         "read_text".into(),
         "lookup_order".into(),
     ])));
+    extensions.push(Arc::new(pi_rs_review::ReviewContext));
+    #[cfg(feature = "evaluation-fixtures")]
+    if let Some(endpoint) = args.fixtures.as_deref() {
+        extensions.push(Arc::new(pi_rs_fixture_tools::Fixtures::new(endpoint)?));
+    }
     let mut registry =
         Registry::compose(extensions, &args.disable_extension.into_iter().collect())?;
     registry.register(Arc::new(CommandPolicy {
@@ -415,7 +424,9 @@ fn metadata(record: &pi_rs::Record) -> Value {
     let mut value = match &record.event {
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),
         Event::HostBound { .. } => json!({"event": "host_bound"}),
-        Event::HostRunBound { run_id, .. } => json!({"event": "host_run_bound", "run_id": run_id}),
+        Event::HostRunBound { run_id, .. } => {
+            json!({"event": "host_run_bound", "bound_run_id": run_id})
+        }
         Event::Checkout { target } => json!({"event": "checkout", "target": target}),
         Event::Run { state, .. } => json!({"event": "run", "state": state}),
         Event::User { input_id, .. } => json!({"event": "user", "input_id": input_id}),

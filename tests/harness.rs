@@ -898,3 +898,125 @@ fn v1_journal_is_preserved_when_v2_appends() {
     );
     assert_eq!(Session::open(&path).unwrap().head(), 1);
 }
+
+#[tokio::test]
+async fn review_reads_selected_branch_and_returns_findings_to_the_parent() {
+    use pi_rs_review::{Review, ReviewContext};
+
+    let mut parent = Session::with_store(MemoryStore::default()).unwrap();
+    let mut child = Session::with_store(MemoryStore::default()).unwrap();
+    let model = Script::new(vec![
+        answer("recorded"),
+        answer("detour"),
+        answer("dry run finding"),
+        answer("parent received finding"),
+    ]);
+    let mut registry = Registry::default();
+    registry.register(Arc::new(ReviewContext)).unwrap();
+    let harness = agent(&model, &registry);
+    let cancel = CancellationToken::new();
+    let (_, mut inputs) = mpsc::channel(1);
+    harness
+        .run(
+            &mut parent,
+            Some("original dry run authorization".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let anchor = parent.head();
+    harness
+        .run(
+            &mut parent,
+            Some("hypothetical production detour".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let review = Review {
+        task: "review authorization",
+        from_record: Some(anchor),
+        allowed_tools: Default::default(),
+        output_budget: 100,
+        timeout: Duration::from_secs(2),
+        resume: false,
+    };
+    assert_eq!(
+        review
+            .run(&harness, &mut parent, &mut child, &cancel, &mut ignore)
+            .await
+            .unwrap(),
+        "dry run finding"
+    );
+    assert!(
+        parent.extension_states()["branch-review"]
+            .data
+            .get(child.session_id().to_string())
+            .is_some()
+    );
+    harness
+        .run(
+            &mut parent,
+            Some("continue after review".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let requests = model.requests.lock().unwrap();
+    let child_context = serde_json::to_string(&requests[2]).unwrap();
+    assert!(child_context.contains("original dry run authorization"));
+    assert!(!child_context.contains("hypothetical production detour"));
+    let parent_context = serde_json::to_string(&requests[3]).unwrap();
+    assert!(
+        parent_context.contains("dry run finding")
+            && parent_context.contains("hypothetical production detour")
+    );
+}
+
+struct Depends(&'static str, &'static [&'static str]);
+impl Extension for Depends {
+    fn id(&self) -> &str {
+        self.0
+    }
+    fn dependencies(&self) -> &[&str] {
+        self.1
+    }
+}
+
+#[test]
+fn extension_profiles_reject_cycles_and_disabled_dependencies() {
+    assert!(
+        Registry::compose(
+            vec![
+                Arc::new(Depends("a", &["b"])),
+                Arc::new(Depends("b", &["a"]))
+            ],
+            &Default::default()
+        )
+        .is_err()
+    );
+    assert!(
+        Registry::compose(
+            vec![Arc::new(Depends("a", &["b"])), Arc::new(Depends("b", &[]))],
+            &["b".into()].into()
+        )
+        .is_err()
+    );
+    let fixture = Arc::new(Fixture {
+        called: AtomicUsize::new(0),
+        hold: false,
+        effects: Mutex::default(),
+    });
+    let registry = Registry::compose(
+        vec![Arc::new(Tools(fixture))],
+        &["test-tools".into()].into(),
+    )
+    .unwrap();
+    assert!(!registry.has_tool("lookup"));
+}

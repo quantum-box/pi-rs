@@ -101,6 +101,35 @@ pub struct HostTurn<'a> {
 }
 
 impl HostTurn<'_> {
+    /// Apply a host command to the same authenticated journal as the turn.
+    pub fn extension_command(
+        &self,
+        session: &mut Session,
+        extension_id: &str,
+        command: &str,
+        arguments: &str,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        self.check_profile(session)?;
+        Agent {
+            model: self.model,
+            model_name: self.model_name,
+            registry: &self.registry.registry,
+            system_prompt: self.system_prompt,
+            limits: self.limits.clone(),
+        }
+        .extension_command(session, extension_id, command, arguments, observer)
+    }
+
+    fn check_profile(&self, session: &mut Session) -> Result<()> {
+        if self.registry.scope != *self.scope {
+            return Err(Error::Config(
+                "tool profile belongs to a different AIP run".into(),
+            ));
+        }
+        self.scope.bind(session)
+    }
+
     pub async fn run(
         &self,
         session: &mut Session,
@@ -109,12 +138,7 @@ impl HostTurn<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        if self.registry.scope != *self.scope {
-            return Err(Error::Config(
-                "tool profile belongs to a different AIP run".into(),
-            ));
-        }
-        self.scope.bind(session)?;
+        self.check_profile(session)?;
         let model = BudgetedModel {
             scope: self.scope,
             inner: self.model,
