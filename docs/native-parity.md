@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands | In-flight tool-list updates, OAuth confidential clients and interactive scope upgrades |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands | In-flight tool-list updates, client metadata registrations and interactive scope upgrades |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
@@ -994,5 +994,22 @@ clients, PKCE verification, rejection of an incorrect callback state,
 authenticated tool calls, token rotation, cross-process reuse, logout and login
 replacement. Store tests cover stale connections, locking, file permissions,
 failed oversized writes and recovery from a damaged store. These are fixture
-checks with an isolated browser launcher. Confidential clients and automatic
-interactive scope upgrades still require implementation.
+checks with an isolated browser launcher. Automatic interactive scope upgrades still require implementation.
+
+### Confidential MCP client checkpoint
+
+`pi mcp login NAME --client-id ID --client-secret-env VARIABLE` authorizes a
+pre-registered confidential client. The command line carries the environment
+variable name. Its value is saved with the tokens in the private credential
+file. Client secrets returned by dynamic registration are also retained.
+Restored connections configure the saved client authentication and redirect
+URI after the SDK verifies the authorization server issuer.
+
+Local fixtures passed both `client_secret_basic` and `client_secret_post`,
+including browser authorization, separate-process restoration, proactive and
+rejected-token refresh, logout, re-login and concurrent configuration edits.
+Existing public-client fixtures also passed. Store tests preserve registration
+metadata across refresh and accept older files that have no registration field.
+The fixtures use a replacement browser launcher and a local authorization
+server. Client metadata document registration and interactive scope upgrades
+remain open.

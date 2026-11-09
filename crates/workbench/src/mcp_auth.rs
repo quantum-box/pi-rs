@@ -17,13 +17,21 @@ struct FileCredentials {
     path: PathBuf,
     generation: Option<Uuid>,
     new_login: bool,
+    registration: Arc<Mutex<Option<ClientRegistration>>>,
     // Blocking writes retain this lock even if their async caller is cancelled.
     lease: Arc<Mutex<Weak<std::fs::File>>>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct ClientRegistration {
+    client_secret: Option<String>,
+    redirect_uri: String,
 }
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     generation: Uuid,
     credentials: StoredCredentials,
+    #[serde(default)]
+    registration: Option<ClientRegistration>,
 }
 impl FileCredentials {
     fn new(name: &str, url: &str) -> Result<Self> {
@@ -36,6 +44,7 @@ impl FileCredentials {
                 .join(format!("{digest:x}.json")),
             generation: None,
             new_login: false,
+            registration: Arc::default(),
             lease: Arc::default(),
         })
     }
@@ -67,6 +76,16 @@ impl FileCredentials {
         if !self.new_login && self.generation.is_some() && current.is_none() {
             return Err(AuthError::AuthorizationRequired);
         }
+        let registration = self
+            .registration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .or_else(|| {
+                current
+                    .as_ref()
+                    .and_then(|envelope| envelope.registration.clone())
+            });
         let generation = if self.new_login {
             self.generation.unwrap_or_else(Uuid::new_v4)
         } else {
@@ -87,6 +106,7 @@ impl FileCredentials {
         let bytes = serde_json::to_vec(&Envelope {
             generation,
             credentials,
+            registration,
         })
         .map_err(|_| store_error())?;
         if bytes.len() >= 128 * 1024 {
@@ -114,7 +134,7 @@ fn auth_error(error: AuthError) -> Error {
             "MCP OAuth login required; run pi mcp login for this server"
         }
         AuthError::RegistrationFailed(_) => {
-            "MCP OAuth client registration failed; use --client-id for a pre-registered public client"
+            "MCP OAuth client registration failed; use --client-id for a pre-registered client"
         }
         AuthError::PkceUnsupported => "MCP authorization server does not support PKCE S256",
         AuthError::NoAuthorizationSupport => "MCP server does not advertise OAuth authorization",
@@ -214,6 +234,17 @@ pub async fn client(
     if !manager.initialize_from_store().await.map_err(auth_error)? {
         return Err(auth_error(AuthError::AuthorizationRequired));
     }
+    if let Some(registration) = envelope.registration {
+        let mut config = rmcp::transport::auth::OAuthClientConfig::new(
+            envelope.credentials.client_id,
+            registration.redirect_uri,
+        )
+        .with_scopes(envelope.credentials.granted_scopes);
+        if let Some(secret) = registration.client_secret {
+            config = config.with_client_secret(secret);
+        }
+        manager.configure_client(config).map_err(auth_error)?;
+    }
     drop(guard);
     Ok((AuthClient::new(client, manager), identity))
 }
@@ -224,11 +255,23 @@ pub async fn logout(name: &str, url: &str) -> Result<()> {
     store.clear().await.map_err(auth_error)
 }
 
-/// Run a native authorization-code flow with a loopback callback and PKCE.
+/// Start an authorization-code flow with server-provided client registration.
 pub async fn login(
     name: &str,
     url: &str,
     client_id: Option<&str>,
+    scopes: &[String],
+    announce: impl Fn(&str),
+) -> Result<()> {
+    login_with_secret(name, url, client_id, None, scopes, announce).await
+}
+
+/// Authorize a public or confidential client with an optional client secret.
+pub async fn login_with_secret(
+    name: &str,
+    url: &str,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
     scopes: &[String],
     announce: impl Fn(&str),
 ) -> Result<()> {
@@ -247,6 +290,11 @@ pub async fn login(
             "MCP OAuth requires HTTPS or loopback HTTP without embedded credentials".into(),
         ));
     }
+    if client_secret.is_some() && client_id.is_none() {
+        return Err(Error::Config(
+            "--client-secret-env requires --client-id".into(),
+        ));
+    }
     let mut store = FileCredentials::new(name, url)?;
     store.new_login = true;
     store.generation = Some(Uuid::new_v4());
@@ -259,12 +307,35 @@ pub async fn login(
         "http://127.0.0.1:{}/callback",
         listener.local_addr()?.port()
     );
+    let scopes = if scopes.is_empty() {
+        manager.select_initial_scopes(&[]).await
+    } else {
+        scopes.to_vec()
+    };
+    let (client_id, secret) = if let Some(client_id) = client_id {
+        (client_id.to_owned(), client_secret.map(str::to_owned))
+    } else {
+        let refs: Vec<_> = scopes.iter().map(String::as_str).collect();
+        let registration = manager
+            .register_client("pi-rs", &callback, &refs)
+            .await
+            .map_err(auth_error)?;
+        (registration.client_id, registration.client_secret)
+    };
+    *store
+        .registration
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(ClientRegistration {
+        client_secret: secret.clone(),
+        redirect_uri: callback.clone(),
+    });
     let mut request = AuthorizationRequest::new(&callback)
         .with_client_name("pi-rs")
         .with_initial_scope_selection()
-        .with_scopes(scopes.iter().cloned());
-    if let Some(client_id) = client_id {
-        request = request.with_preregistered_client(client_id);
+        .with_scopes(scopes)
+        .with_preregistered_client(client_id);
+    if let Some(secret) = secret {
+        request = request.with_client_secret(secret);
     }
     let session = AuthorizationSession::new(manager, request)
         .await
@@ -357,8 +428,13 @@ mod tests {
             path: directory.path().join("credentials.json"),
             generation: Some(first),
             new_login: true,
+            registration: Arc::default(),
             lease: Arc::default(),
         };
+        *login.registration.lock().unwrap() = Some(ClientRegistration {
+            client_secret: Some("fixture-client-secret".into()),
+            redirect_uri: "http://127.0.0.1:12345/callback".into(),
+        });
         login
             .save(StoredCredentials::new("first".into(), None, vec![], None))
             .await
@@ -366,6 +442,7 @@ mod tests {
         let client = FileCredentials {
             generation: Some(first),
             new_login: false,
+            registration: Arc::default(),
             ..login.clone()
         };
         client
@@ -382,6 +459,12 @@ mod tests {
             "first-refreshed"
         );
         assert_eq!(client.read().unwrap().unwrap().generation, first);
+        let registered = client.read().unwrap().unwrap().registration.unwrap();
+        assert_eq!(
+            registered.client_secret.as_deref(),
+            Some("fixture-client-secret")
+        );
+        assert_eq!(registered.redirect_uri, "http://127.0.0.1:12345/callback");
         assert!(
             client
                 .save(StoredCredentials::new(
@@ -440,6 +523,7 @@ mod tests {
             path,
             generation: Some(Uuid::new_v4()),
             new_login: true,
+            registration: Arc::default(),
             lease: Arc::default(),
         };
         assert!(login.load().await.unwrap().is_none());
@@ -457,6 +541,12 @@ mod tests {
             ..login
         };
         assert_eq!(client.load().await.unwrap().unwrap().client_id, "recovered");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&client.path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("registration");
+        std::fs::write(&client.path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(client.read().unwrap().unwrap().registration.is_none());
+        assert_eq!(client.load().await.unwrap().unwrap().client_id, "recovered");
     }
 
     #[tokio::test]
@@ -466,6 +556,7 @@ mod tests {
             path: directory.path().join("credentials.json"),
             generation: None,
             new_login: false,
+            registration: Arc::default(),
             lease: Arc::default(),
         };
         let first = store.acquire_refresh_guard().await.unwrap();

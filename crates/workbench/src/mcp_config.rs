@@ -16,9 +16,12 @@ pub enum McpCommand {
         name: String,
         #[arg(short = 'l', long)]
         local: bool,
-        /// Pre-registered public client ID. Omit for dynamic registration.
+        /// Pre-registered client ID. Omit for dynamic registration.
         #[arg(long)]
         client_id: Option<String>,
+        /// Environment variable containing the confidential client secret.
+        #[arg(long, requires = "client_id")]
+        client_secret_env: Option<String>,
         /// Requested OAuth scope. May be specified more than once.
         #[arg(long = "scope")]
         scopes: Vec<String>,
@@ -259,6 +262,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             name,
             local,
             client_id,
+            client_secret_env,
             scopes,
         } => {
             let path = path(args, local);
@@ -280,9 +284,23 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     "remove the MCP Authorization header before using OAuth".into(),
                 ));
             }
-            pi_rs_workbench::mcp_auth::login(&name, url, client_id.as_deref(), &scopes, |url| {
-                output(json!({"type":"mcp_authorization","name":name,"url":url}));
-            })
+            let client_secret = client_secret_env
+                .map(|name| {
+                    std::env::var(name).map_err(|_| {
+                        Error::Config("OAuth client secret environment variable is not set".into())
+                    })
+                })
+                .transpose()?;
+            pi_rs_workbench::mcp_auth::login_with_secret(
+                &name,
+                url,
+                client_id.as_deref(),
+                client_secret.as_deref(),
+                &scopes,
+                |url| {
+                    output(json!({"type":"mcp_authorization","name":name,"url":url}));
+                },
+            )
             .await?;
             config::update_object(&path, |document| {
                 let server = document
