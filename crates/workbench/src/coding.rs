@@ -530,8 +530,13 @@ impl CodingTool {
         let mut results = Vec::new();
         for entry in ignore::WalkBuilder::new(&base)
             .hidden(false)
+            .filter_entry(move |entry| {
+                entry.depth() == 0
+                    || !is_find
+                    || !entry.file_type().is_some_and(|kind| kind.is_dir())
+                    || !matches!(entry.file_name().to_str(), Some("node_modules" | ".git"))
+            })
             .build()
-            .take(100_000)
         {
             let entry = entry.map_err(|error| Error::Config(error.to_string()))?;
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -1150,6 +1155,29 @@ mod tests {
         let output = tool.list(&json!({"limit":1})).unwrap();
         assert!(output.starts_with("alpha\n"));
         assert!(output.contains("1 entries limit reached"));
+    }
+
+    #[test]
+    fn find_excludes_dependency_and_git_metadata_directories() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["node_modules/nested", ".git/objects", "src"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            std::fs::write(root.path().join(directory).join("sample.rs"), "").unwrap();
+        }
+        let tool = CodingTool {
+            unrestricted: false,
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Find,
+        };
+        assert_eq!(
+            tool.search(&json!({"pattern":"**/*.rs"})).unwrap(),
+            Path::new("src").join("sample.rs").display().to_string()
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"**/*.rs", "path":"node_modules"}))
+                .unwrap(),
+            Path::new("nested").join("sample.rs").display().to_string()
+        );
     }
 
     #[test]

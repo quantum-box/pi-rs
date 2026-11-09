@@ -921,3 +921,9 @@ defaults, malformed JSON, constraint violations, successful values, cancellation
 and noninteractive decline. Existing HTTP resources, URI templates, prompts,
 remote task polling and task resumption passed their regression fixtures.
 Workspace tests and all-target Clippy passed on Rust 1.89.
+
+The native `find` tool excludes dependency and Git metadata directories during
+normal traversal while allowing an explicitly selected dependency root. File
+search no longer silently stops after visiting 100,000 filesystem entries. Its
+configured result and output limits continue to apply. Focused coding-tool tests
+cover the traversal exclusions and explicit-root behavior.
