@@ -60,3 +60,12 @@ Field の隔離結合試験では、Workflow Run、Harness Run、セッション
 再照会と確定を追跡した。入力、応答、認証トークン、外部の参照値はログに出なかった。
 AIP 統合試験10件と課金入口の検査58件が通過した。
 [監査と課金境界の実装](https://github.com/quantum-box/tachyon-apps/commit/030c4d569ff7c3a11ddf763b7f437a10a51adaf8)
+
+隔離評価の Workflow ストリームを既存の Gateway Payment 処理につないだ。
+Payment が拒否した場合はモデル送信0件。正常時にはキャッシュ使用量、価格版、
+Workflow Run の親 ID を既存の `llms_chat_completion` 原票の形式で Payment に
+渡す。Goal 保存失敗後の再送でもモデル要求と Payment 呼出しは各2件のままで、
+Payment キーはジャーナルのモデル要求 UUID と一致した。Gateway の課金試験
+14件と AIP 統合試験10件が通過した。Payment と料金表には試験用実装を使った。
+実際の請求記録、課金結果が不明な場合の復旧、Field への配送は受入が残っている。
+[Payment 接続と検証記録](https://github.com/quantum-box/tachyon-apps/commit/afd3d0bcda2fd1a9487135fbab3e769345aebc07)
