@@ -565,10 +565,16 @@ async fn revoked_reference_stops_dispatch_after_a_branch_reopens() {
 }
 
 #[tokio::test]
-async fn hosted_recovery_replays_durable_usage_before_any_new_model_request() {
+async fn hosted_recovery_reuses_reply_and_defers_tools_until_usage_is_recorded() {
+    assert_recovered_reply(false).await;
+    assert_recovered_reply(true).await;
+}
+
+async fn assert_recovered_reply(with_tool: bool) {
     struct MeteredModel {
         sends: AtomicUsize,
         receipts: Mutex<Vec<(Uuid, UsageReport, ModelMetadata)>>,
+        with_tool: bool,
     }
 
     #[async_trait::async_trait]
@@ -587,7 +593,15 @@ async fn hosted_recovery_replays_durable_usage_before_any_new_model_request() {
                     ..Default::default()
                 })),
                 Ok(ModelEvent::Complete {
-                    calls: vec![],
+                    calls: self
+                        .with_tool
+                        .then(|| ToolCall {
+                            id: "recorded-call".into(),
+                            name: "fixture_submit".into(),
+                            arguments: "{}".into(),
+                        })
+                        .into_iter()
+                        .collect(),
                     usage: Some(Usage {
                         input_tokens: 21,
                         output_tokens: 8,
@@ -616,12 +630,18 @@ async fn hosted_recovery_replays_durable_usage_before_any_new_model_request() {
 
     let platform = Arc::new(Platform::default());
     let scope = scope();
-    let registry = HostRegistry::discover(&scope, platform.clone(), BTreeSet::new(), vec![])
-        .await
-        .unwrap();
+    let registry = HostRegistry::discover(
+        &scope,
+        platform.clone(),
+        BTreeSet::from(["fixture_submit".into()]),
+        vec![],
+    )
+    .await
+    .unwrap();
     let model = MeteredModel {
         sends: AtomicUsize::new(0),
         receipts: Mutex::new(Vec::new()),
+        with_tool,
     };
     let host = HostTurn {
         scope: &scope,
@@ -651,13 +671,33 @@ async fn hosted_recovery_replays_durable_usage_before_any_new_model_request() {
     drop(session);
 
     let mut session = Session::open(&path).unwrap();
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    assert!(matches!(
-        host.run(&mut session, None, &mut inputs, &cancelled, &mut ignore)
-            .await,
-        Err(Error::Cancelled)
-    ));
+    assert!(platform.effects.lock().unwrap().is_empty());
+    let result = host
+        .run(
+            &mut session,
+            None,
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await;
+    if with_tool {
+        let Err(Error::PendingOperation(operation)) = result else {
+            panic!("expected exactly one recorded tool to be dispatched");
+        };
+        assert_eq!(
+            *platform.effects.lock().unwrap(),
+            BTreeSet::from([operation])
+        );
+        assert!(session.records().iter().any(|record| matches!(
+            &record.event,
+            Event::ModelFinished { reply: Some(reply), .. }
+                if reply.invocations[0].operation_id == operation
+        )));
+    } else {
+        assert_eq!(result.unwrap(), "measured");
+        assert!(platform.effects.lock().unwrap().is_empty());
+    }
     assert_eq!(model.sends.load(Ordering::SeqCst), 1);
     let receipts = model.receipts.lock().unwrap();
     assert_eq!(receipts.len(), 2);

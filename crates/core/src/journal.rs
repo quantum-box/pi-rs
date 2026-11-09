@@ -25,6 +25,15 @@ pub enum RunState {
     WaitingForOperation,
 }
 
+/// A validated turn response stored before settling usage or dispatching tools.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecordedReply {
+    pub content: String,
+    pub invocations: Vec<Invocation>,
+    pub advertised_tools: Vec<String>,
+    pub max_output_tokens: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -73,6 +82,8 @@ pub enum Event {
         failure: Option<ModelFailure>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         partial: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<RecordedReply>,
     },
     TurnFinished {
         assistant_record: u64,
@@ -81,6 +92,8 @@ pub enum Event {
         content: String,
         invocations: Vec<Invocation>,
         usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<Uuid>,
     },
     ToolStarted {
         operation_id: Uuid,

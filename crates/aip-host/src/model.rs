@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 use pi_rs_core::{
     Error, Event, Model, ModelMetadata, ModelRequest, ModelStream, Record, Result, UsageReport,
@@ -25,6 +26,7 @@ pub(crate) struct BudgetedModel<'a> {
     pub scope: &'a RunScope,
     pub inner: &'a dyn Model,
     pub budget: &'a dyn BudgetPort,
+    pub recorded_usage: Mutex<BTreeSet<Uuid>>,
 }
 
 #[async_trait::async_trait]
@@ -53,9 +55,22 @@ impl Model for BudgetedModel<'_> {
         metadata: &ModelMetadata,
     ) -> Result<()> {
         self.record_usage(request_id, usage).await?;
+        if self
+            .recorded_usage
+            .lock()
+            .expect("usage lock poisoned")
+            .contains(&request_id)
+        {
+            return Ok(());
+        }
         self.inner
             .record_usage_with_metadata(request_id, usage, metadata)
-            .await
+            .await?;
+        self.recorded_usage
+            .lock()
+            .expect("usage lock poisoned")
+            .insert(request_id);
+        Ok(())
     }
 }
 
@@ -85,6 +100,15 @@ impl BudgetedModel<'_> {
                 } => {
                     finished = Some((*request_id, record.id));
                     requests.insert(*request_id, (usage, Some(metadata)));
+                }
+                Event::Assistant {
+                    request_id: Some(request),
+                    ..
+                } => {
+                    if let Some((_, metadata)) = requests.get_mut(request) {
+                        *metadata = None;
+                    }
+                    finished = None;
                 }
                 Event::Assistant { .. } | Event::Compacted { usage: Some(_), .. }
                     if finished.is_some_and(|(_, id)| record.parent == Some(id)) =>

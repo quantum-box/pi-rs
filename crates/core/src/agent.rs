@@ -11,8 +11,8 @@ use crate::journal::{conversation, ensure_settled};
 use crate::{
     CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind, Invocation,
     Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest, OperationState, Outcome,
-    QueuedInput, Record, Registry, RequestPurpose, Result, RunState, Session, ToolContext,
-    ToolExecution, Usage, UsageReport,
+    QueuedInput, Record, RecordedReply, Registry, RequestPurpose, Result, RunState, Session,
+    ToolContext, ToolExecution, Usage, UsageReport,
 };
 
 #[derive(Clone, Debug)]
@@ -149,7 +149,14 @@ impl Agent<'_> {
             observer,
         )?;
         let mut result = self
-            .drive(session, effective_input, followups, cancel, observer)
+            .drive(
+                session,
+                run_id,
+                effective_input,
+                followups,
+                cancel,
+                observer,
+            )
             .await;
         if let Err(error) = queue_inputs(session, followups, observer)
             && result.is_ok()
@@ -177,6 +184,7 @@ impl Agent<'_> {
     async fn drive<T: Into<QueuedInput> + Send>(
         &self,
         session: &mut Session,
+        run_id: Uuid,
         input: Option<(Uuid, String)>,
         followups: &mut mpsc::Receiver<T>,
         cancel: &CancellationToken,
@@ -195,8 +203,11 @@ impl Agent<'_> {
             )?;
         }
 
+        let mut pending = pending_reply(session, run_id);
         queue_inputs(session, followups, observer)?;
-        apply_inputs(session, false, observer)?;
+        if pending.is_none() {
+            apply_inputs(session, false, observer)?;
+        }
         if let Some(answer) = session
             .branch()
             .iter()
@@ -230,52 +241,81 @@ impl Agent<'_> {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            apply_inputs(session, false, observer)?;
-            let max_output_tokens = self.limits.output_tokens_per_request.min(budget);
-            if max_output_tokens == 0 {
-                return Err(Error::Budget);
-            }
-            let mut request = self
-                .request(
-                    session,
-                    &states,
-                    max_output_tokens,
-                    None,
-                    RequestPurpose::Turn,
-                    cancel,
-                )
-                .await?;
-            // A context extension can lower the budget but cannot increase the host's limit.
-            request.max_output_tokens = request.max_output_tokens.min(max_output_tokens);
-            if request.max_output_tokens == 0 {
-                return Err(Error::Budget);
-            }
-            if self.exceeds_context(&request)? {
-                if compacted || request_index + 1 >= self.limits.model_requests {
-                    return Err(Error::Model(
-                        "context does not fit after the bounded compaction attempt".into(),
-                    ));
-                }
-                let summary_limit = max_output_tokens.min(512).min(budget / 2);
-                let spent = self
-                    .summarize_prefix(session, &states, 1, summary_limit, cancel, observer)
-                    .await?;
-                budget -= spent;
-                states = session.extension_states();
-                compacted = true;
-                continue;
-            }
-            let advertised: HashSet<_> =
-                request.tools.iter().map(|spec| spec.name.clone()).collect();
-            let allowance = request.max_output_tokens;
-            let reply = self.reply(session, request, cancel, observer).await?;
+            let (reply, advertised, allowance) =
+                if let Some((request, metadata, usage, recorded)) = pending.take() {
+                    self.settle_usage(request, &usage, &metadata).await?;
+                    let allowance = recorded
+                        .max_output_tokens
+                        .min(self.limits.output_tokens_per_request)
+                        .min(budget);
+                    let measured = match usage {
+                        UsageReport::Measured { usage } => Some(usage),
+                        UsageReport::Estimated { output_tokens }
+                            if output_tokens <= u64::from(allowance) =>
+                        {
+                            None
+                        }
+                        _ => return Err(Error::Budget),
+                    };
+                    (
+                        Reply {
+                            request_id: request,
+                            content: recorded.content,
+                            invocations: recorded.invocations,
+                            usage: measured,
+                        },
+                        recorded.advertised_tools.into_iter().collect(),
+                        allowance,
+                    )
+                } else {
+                    apply_inputs(session, false, observer)?;
+                    let max_output_tokens = self.limits.output_tokens_per_request.min(budget);
+                    if max_output_tokens == 0 {
+                        return Err(Error::Budget);
+                    }
+                    let mut request = self
+                        .request(
+                            session,
+                            &states,
+                            max_output_tokens,
+                            None,
+                            RequestPurpose::Turn,
+                            cancel,
+                        )
+                        .await?;
+                    // A context extension can lower the budget but cannot increase the host's limit.
+                    request.max_output_tokens = request.max_output_tokens.min(max_output_tokens);
+                    if request.max_output_tokens == 0 {
+                        return Err(Error::Budget);
+                    }
+                    if self.exceeds_context(&request)? {
+                        if compacted || request_index + 1 >= self.limits.model_requests {
+                            return Err(Error::Model(
+                                "context does not fit after the bounded compaction attempt".into(),
+                            ));
+                        }
+                        let summary_limit = max_output_tokens.min(512).min(budget / 2);
+                        let spent = self
+                            .summarize_prefix(session, &states, 1, summary_limit, cancel, observer)
+                            .await?;
+                        budget -= spent;
+                        states = session.extension_states();
+                        compacted = true;
+                        continue;
+                    }
+                    let advertised: HashSet<_> =
+                        request.tools.iter().map(|spec| spec.name.clone()).collect();
+                    let allowance = request.max_output_tokens;
+                    let reply = self.reply(session, request, true, cancel, observer).await?;
+                    (reply, advertised, allowance)
+                };
             let finished = reply.invocations.is_empty();
             let answer = finished.then(|| reply.content.clone());
             let invocations = reply.invocations.clone();
             let output_tokens = reply
                 .usage
                 .map_or(u64::from(allowance), |usage| usage.output_tokens);
-            if output_tokens > u64::from(allowance) {
+            if allowance == 0 || output_tokens > u64::from(allowance) {
                 return Err(Error::Budget);
             }
             budget -= output_tokens as u32;
@@ -285,6 +325,7 @@ impl Agent<'_> {
                     content: reply.content,
                     invocations: reply.invocations,
                     usage: reply.usage,
+                    request_id: Some(reply.request_id),
                 },
                 observer,
             )?;
@@ -404,11 +445,14 @@ impl Agent<'_> {
         &self,
         session: &mut Session,
         request: ModelRequest,
+        retain_reply: bool,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<Reply> {
         let request_id = Uuid::new_v4();
         let allowance = request.max_output_tokens;
+        let advertised_tools =
+            retain_reply.then(|| request.tools.iter().map(|tool| tool.name.clone()).collect());
         let context_head = session.head();
         let context_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
         commit(
@@ -461,6 +505,7 @@ impl Agent<'_> {
                             });
                         }
                         return Ok(Reply {
+                            request_id,
                             content: std::mem::take(&mut content),
                             invocations,
                             usage,
@@ -503,17 +548,34 @@ impl Agent<'_> {
                 usage: usage.clone(),
                 failure,
                 partial: content,
+                reply: advertised_tools.and_then(|advertised_tools| {
+                    result.as_ref().ok().map(|reply| RecordedReply {
+                        content: reply.content.clone(),
+                        invocations: reply.invocations.clone(),
+                        advertised_tools,
+                        max_output_tokens: allowance,
+                    })
+                }),
             },
             observer,
         )?;
+        self.settle_usage(request_id, &usage, &metadata).await?;
+        result
+    }
+
+    async fn settle_usage(
+        &self,
+        request_id: Uuid,
+        usage: &UsageReport,
+        metadata: &ModelMetadata,
+    ) -> Result<()> {
         tokio::time::timeout(
             self.limits.model_timeout,
             self.model
-                .record_usage_with_metadata(request_id, &usage, &metadata),
+                .record_usage_with_metadata(request_id, usage, metadata),
         )
         .await
-        .map_err(|_| Error::RetryableModel("model usage settlement timed out".into()))??;
-        result
+        .map_err(|_| Error::RetryableModel("model usage settlement timed out".into()))?
     }
 
     async fn tool_batch(
@@ -868,7 +930,9 @@ impl Agent<'_> {
             ));
         }
         let allowance = request.max_output_tokens;
-        let reply = self.reply(session, request, cancel, observer).await?;
+        let reply = self
+            .reply(session, request, false, cancel, observer)
+            .await?;
         if !reply.invocations.is_empty() {
             return Err(Error::Model(
                 "summary response attempted a tool call".into(),
@@ -1001,9 +1065,41 @@ enum Preparation<'a> {
 }
 
 struct Reply {
+    request_id: Uuid,
     content: String,
     invocations: Vec<Invocation>,
     usage: Option<Usage>,
+}
+
+fn pending_reply(
+    session: &Session,
+    run_id: Uuid,
+) -> Option<(Uuid, ModelMetadata, UsageReport, RecordedReply)> {
+    for record in session
+        .branch()
+        .into_iter()
+        .rev()
+        .filter(|record| record.run_id == Some(run_id))
+    {
+        match &record.event {
+            Event::ModelFinished {
+                request_id,
+                metadata,
+                usage,
+                reply,
+                ..
+            } => {
+                return reply
+                    .as_ref()
+                    .map(|reply| (*request_id, metadata.clone(), usage.clone(), reply.clone()));
+            }
+            Event::Assistant { .. } | Event::User { .. } | Event::ModelRequested { .. } => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> Result<()> {

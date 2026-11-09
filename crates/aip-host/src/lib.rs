@@ -156,6 +156,7 @@ impl HostTurn<'_> {
             scope: self.scope,
             inner: self.model,
             budget: self.budget,
+            recorded_usage: Default::default(),
         };
         model.settle_session(session.records(), true).await?;
         let agent = Agent {
