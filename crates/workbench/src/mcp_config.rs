@@ -22,6 +22,9 @@ pub enum McpCommand {
         /// Environment variable containing the confidential client secret.
         #[arg(long, requires = "client_id")]
         client_secret_env: Option<String>,
+        /// HTTPS client metadata document used when the server supports URL-based client IDs.
+        #[arg(long, conflicts_with_all = ["client_id", "client_secret_env"])]
+        client_metadata_url: Option<String>,
         /// Requested OAuth scope. May be specified more than once.
         #[arg(long = "scope")]
         scopes: Vec<String>,
@@ -263,6 +266,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             local,
             client_id,
             client_secret_env,
+            client_metadata_url,
             scopes,
         } => {
             let path = path(args, local);
@@ -291,17 +295,28 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     })
                 })
                 .transpose()?;
-            pi_rs_workbench::mcp_auth::login_with_secret(
-                &name,
-                url,
-                client_id.as_deref(),
-                client_secret.as_deref(),
-                &scopes,
-                |url| {
-                    output(json!({"type":"mcp_authorization","name":name,"url":url}));
-                },
-            )
-            .await?;
+            let announce =
+                |url: &str| output(json!({"type":"mcp_authorization","name":name,"url":url}));
+            if let Some(metadata_url) = client_metadata_url {
+                pi_rs_workbench::mcp_auth::login_with_metadata(
+                    &name,
+                    url,
+                    &metadata_url,
+                    &scopes,
+                    announce,
+                )
+                .await?;
+            } else {
+                pi_rs_workbench::mcp_auth::login_with_secret(
+                    &name,
+                    url,
+                    client_id.as_deref(),
+                    client_secret.as_deref(),
+                    &scopes,
+                    announce,
+                )
+                .await?;
+            }
             config::update_object(&path, |document| {
                 let server = document
                     .get_mut("mcpServers")

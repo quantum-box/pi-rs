@@ -275,6 +275,38 @@ pub async fn login_with_secret(
     scopes: &[String],
     announce: impl Fn(&str),
 ) -> Result<()> {
+    authorize(name, url, client_id, client_secret, None, scopes, announce).await
+}
+
+/// Use a hosted client metadata document, falling back to dynamic registration.
+pub async fn login_with_metadata(
+    name: &str,
+    url: &str,
+    client_metadata_url: &str,
+    scopes: &[String],
+    announce: impl Fn(&str),
+) -> Result<()> {
+    authorize(
+        name,
+        url,
+        None,
+        None,
+        Some(client_metadata_url),
+        scopes,
+        announce,
+    )
+    .await
+}
+
+async fn authorize(
+    name: &str,
+    url: &str,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+    client_metadata_url: Option<&str>,
+    scopes: &[String],
+    announce: impl Fn(&str),
+) -> Result<()> {
     use rmcp::transport::auth::{AuthorizationRequest, AuthorizationSession};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -301,6 +333,12 @@ pub async fn login_with_secret(
     let mut manager = AuthorizationManager::new(url).await.map_err(auth_error)?;
     manager.set_credential_store(store.clone());
     let metadata = manager.resolve_metadata().await.map_err(auth_error)?;
+    let supports_client_metadata = metadata
+        .metadata
+        .additional_fields
+        .get("client_id_metadata_document_supported")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     manager.set_metadata(metadata.metadata);
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let callback = format!(
@@ -313,14 +351,16 @@ pub async fn login_with_secret(
         scopes.to_vec()
     };
     let (client_id, secret) = if let Some(client_id) = client_id {
-        (client_id.to_owned(), client_secret.map(str::to_owned))
+        (Some(client_id.to_owned()), client_secret.map(str::to_owned))
+    } else if client_metadata_url.is_some() && supports_client_metadata {
+        (None, None)
     } else {
         let refs: Vec<_> = scopes.iter().map(String::as_str).collect();
         let registration = manager
             .register_client("pi-rs", &callback, &refs)
             .await
             .map_err(auth_error)?;
-        (registration.client_id, registration.client_secret)
+        (Some(registration.client_id), registration.client_secret)
     };
     *store
         .registration
@@ -332,8 +372,12 @@ pub async fn login_with_secret(
     let mut request = AuthorizationRequest::new(&callback)
         .with_client_name("pi-rs")
         .with_initial_scope_selection()
-        .with_scopes(scopes)
-        .with_preregistered_client(client_id);
+        .with_scopes(scopes);
+    if let Some(client_id) = client_id {
+        request = request.with_preregistered_client(client_id);
+    } else if let Some(url) = client_metadata_url {
+        request = request.with_client_metadata_url(url);
+    }
     if let Some(secret) = secret {
         request = request.with_client_secret(secret);
     }

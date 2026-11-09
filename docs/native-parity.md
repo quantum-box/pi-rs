@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands | In-flight tool-list updates, client metadata registrations and interactive scope upgrades |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands | In-flight tool-list updates, interactive scope upgrades |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
@@ -1011,5 +1011,18 @@ rejected-token refresh, logout, re-login and concurrent configuration edits.
 Existing public-client fixtures also passed. Store tests preserve registration
 metadata across refresh and accept older files that have no registration field.
 The fixtures use a replacement browser launcher and a local authorization
-server. Client metadata document registration and interactive scope upgrades
-remain open.
+server. Interactive scope upgrades remain open.
+
+### MCP client metadata registration checkpoint
+
+`pi mcp login NAME --client-metadata-url HTTPS_URL` uses a hosted client metadata
+document when the authorization server advertises support. Otherwise the
+client performs dynamic registration, including persistence of any returned
+client secret. Explicit client-ID and metadata-URL options are mutually
+exclusive. Existing public and confidential login APIs remain available.
+
+Local authorization fixtures verified URL-based client IDs, restoration and
+refresh, invalid metadata URLs, conflicting options, and fallback to
+confidential dynamic registration. The hosted document is supplied by the
+caller and interpreted by the authorization server. Browser interaction was
+verified with the isolated test launcher.
