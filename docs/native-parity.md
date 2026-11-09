@@ -635,3 +635,17 @@ Tests cover pixel validation, alpha preservation, draft delivery and image-only
 input validation. The live clipboard check exercised the empty/unavailable
 clipboard error and clean terminal exit. A populated OS image clipboard has not
 yet been exercised in this environment.
+
+### Edit matching checkpoint
+
+File edits preserve UTF-8 BOMs and the file's LF/CRLF convention. Matching first
+uses exact text, then Pi-compatible Unicode normalization, quote/dash handling
+and trailing-space normalization. If fuzzy matching is needed, only touched
+line blocks are rewritten from the normalized view. Other line content retains
+its original characters and whitespace.
+
+Batch input accepts arrays, a single edit object or a JSON-encoded array/object.
+Legacy replacements can accompany a batch. All replacements match the same
+original snapshot. Ambiguous normalized matches, overlapping replacements and
+no-op edits fail before publication. CLI fixtures verify these input forms,
+line endings, unchanged lines and failure atomicity through real tool calls.

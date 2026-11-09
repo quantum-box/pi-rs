@@ -135,12 +135,32 @@ impl Tool for CodingTool {
                 json!({"path":path,"content":{"type":"string"}}),
                 vec!["path", "content"],
             ),
-            Kind::Edit => (
-                "edit",
-                "Apply unique non-overlapping exact replacements, all matched against the original file.",
-                json!({"path":path,"oldText":{"type":"string","minLength":1},"newText":{"type":"string"},"edits":{"type":"array","minItems":1,"items":{"type":"object","properties":{"oldText":{"type":"string","minLength":1},"newText":{"type":"string"}},"required":["oldText","newText"],"additionalProperties":false}}}),
-                vec!["path"],
-            ),
+            Kind::Edit => {
+                let replacement = json!({
+                    "type": "object",
+                    "properties": {
+                        "oldText": {"type":"string", "minLength":1},
+                        "newText": {"type":"string"}
+                    },
+                    "required": ["oldText", "newText"],
+                    "additionalProperties": false
+                });
+                (
+                    "edit",
+                    "Apply unique non-overlapping replacements against the original file, preserving UTF-8 BOMs and line endings.",
+                    json!({
+                        "path": path,
+                        "oldText": {"type":"string", "minLength":1},
+                        "newText": {"type":"string"},
+                        "edits": {"anyOf": [
+                            {"type":"array", "items":replacement},
+                            replacement,
+                            {"type":"string", "minLength":1}
+                        ]}
+                    }),
+                    vec!["path"],
+                )
+            }
             Kind::Bash | Kind::PowerShell => (
                 if matches!(self.kind, Kind::PowerShell) {
                     "powershell"
@@ -375,40 +395,7 @@ impl CodingTool {
         let path = self.path(string(args, "path")?)?;
         let _lock = mutation_lock(&path)?;
         let original = self.text(&path)?;
-        let legacy = vec![json!({"oldText":args["oldText"],"newText":args["newText"]})];
-        let edits = match args.get("edits") {
-            Some(value) => value
-                .as_array()
-                .ok_or_else(|| Error::Config("edits must be an array".into()))?,
-            None => &legacy,
-        };
-        if edits.is_empty() {
-            return Err(Error::Config("at least one edit is required".into()));
-        }
-        let mut replacements = Vec::new();
-        for edit in edits {
-            let old = string(edit, "oldText")?;
-            let new = string(edit, "newText")?;
-            if old.is_empty() {
-                return Err(Error::Config("oldText must not be empty".into()));
-            }
-            let mut matches = original.match_indices(old);
-            let (start, _) = matches
-                .next()
-                .ok_or_else(|| Error::Config("oldText was not found".into()))?;
-            if matches.next().is_some() {
-                return Err(Error::Config("oldText matches more than once".into()));
-            }
-            replacements.push((start, start + old.len(), new));
-        }
-        replacements.sort_by_key(|(start, _, _)| *start);
-        if replacements.windows(2).any(|pair| pair[0].1 > pair[1].0) {
-            return Err(Error::Config("edits overlap in the original file".into()));
-        }
-        let mut output = original.clone();
-        for (start, end, replacement) in replacements.into_iter().rev() {
-            output.replace_range(start..end, replacement);
-        }
+        let (output, count) = crate::text_edit::apply(&original, args)?;
         if output.len() as u64 > MAX_FILE_BYTES {
             return Err(Error::Config("edited file exceeds 4 MiB".into()));
         }
@@ -426,7 +413,7 @@ impl CodingTool {
             .to_string();
         Ok(bounded(format!(
             "Applied {} edits to {display_path}\n{diff}",
-            edits.len()
+            count
         )))
     }
 

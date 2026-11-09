@@ -19,6 +19,7 @@ pub mod coding;
 mod file_search;
 pub mod mcp;
 mod shell_output;
+mod text_edit;
 mod text_page;
 
 pub struct Tools {
