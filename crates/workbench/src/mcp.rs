@@ -1,7 +1,10 @@
 //! Native MCP client connections exposed through the shared tool contract.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use pi_rs::{Error, Extension, Outcome, Result, Tool, ToolContext, ToolSpec};
@@ -68,6 +71,40 @@ struct Connection {
     identity: String,
     service: tokio::sync::Mutex<RunningService<RoleClient, NativeClient>>,
     timeout: Duration,
+    name: String,
+    config: ServerConfig,
+    workspace: PathBuf,
+    closed: AtomicBool,
+}
+impl Connection {
+    async fn active_service(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, RunningService<RoleClient, NativeClient>>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Error::Config("MCP connection is closed".into()));
+        }
+        let mut service = self.service.lock().await;
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Error::Config("MCP connection is closed".into()));
+        }
+        if service.is_closed() || service.peer().is_transport_closed() {
+            let replacement =
+                McpExtension::connect(&self.name, &self.config, &self.workspace).await?;
+            if replacement.connection.identity != self.identity
+                || self.closed.load(Ordering::SeqCst)
+            {
+                replacement.close().await;
+                return Err(Error::Config(
+                    "MCP credentials or connection identity changed; reload the configuration"
+                        .into(),
+                ));
+            }
+            let mut incoming = replacement.connection.service.lock().await;
+            std::mem::swap(&mut *service, &mut *incoming);
+            drop(incoming);
+        }
+        Ok(service)
+    }
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -211,6 +248,10 @@ impl McpExtension {
             identity: format!("{:x}", identity.finalize()),
             service: tokio::sync::Mutex::new(service),
             timeout,
+            name: name.into(),
+            config: config.clone(),
+            workspace: workspace.to_owned(),
+            closed: AtomicBool::new(false),
         });
         let definitions = if info
             .as_ref()
@@ -393,6 +434,7 @@ impl McpExtension {
             .collect()
     }
     pub async fn close(&self) {
+        self.connection.closed.store(true, Ordering::SeqCst);
         let _ = self
             .connection
             .service
@@ -441,7 +483,7 @@ struct McpTool {
 }
 impl McpTool {
     async fn invoke_resource(&self, arguments: Value) -> Result<Value> {
-        let service = self.connection.service.lock().await;
+        let service = self.connection.active_service().await?;
         match self.remote_name.as_str() {
             "list_resources" => {
                 let resources = service
@@ -546,9 +588,8 @@ impl Tool for McpTool {
                 )?;
                 let result = self
                     .connection
-                    .service
-                    .lock()
-                    .await
+                    .active_service()
+                    .await?
                     .call_tool_once(params)
                     .await
                     .map_err(|error| Error::Config(error.to_string()))?;
@@ -586,7 +627,14 @@ impl Tool for McpTool {
         }
         loop {
             let params = serde_json::from_value(json!({"taskId":task.task_id})).ok()?;
-            let response = self.connection.service.lock().await.get_task(params).await;
+            let response = match self.connection.active_service().await {
+                Ok(service) => service.get_task(params).await,
+                Err(_) => {
+                    return Some(Outcome::Pending {
+                        reference: reference.into(),
+                    });
+                }
+            };
             let Ok(response) = response else {
                 return Some(Outcome::Pending {
                     reference: reference.into(),
