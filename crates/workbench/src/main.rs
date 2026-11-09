@@ -21,6 +21,7 @@ mod mcp_config;
 mod model_selection;
 mod packages;
 mod process;
+mod resource_paths;
 mod resources;
 mod rpc;
 mod runtime;
@@ -46,6 +47,8 @@ struct Cli {
     initial_images: Vec<pi_rs::ImageContent>,
     #[arg(skip)]
     initial_prompt: Option<String>,
+    #[arg(skip)]
+    theme_paths: Vec<PathBuf>,
     #[arg(skip)]
     model_scope: Vec<model_selection::Choice>,
     #[arg(skip)]
@@ -383,14 +386,6 @@ async fn main() {
                 .settings
                 .string("defaultThinkingLevel")
                 .map(str::to_owned);
-        }
-        if !args.no_themes {
-            args.themes.extend(
-                args.settings
-                    .strings("themes")
-                    .into_iter()
-                    .map(PathBuf::from),
-            );
         }
         if args.use_theme.is_none() {
             args.use_theme = args.settings.string("theme").map(str::to_owned);

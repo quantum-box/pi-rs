@@ -108,12 +108,12 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             "on" => false,
             _ => return Err(pi_rs::Error::Config("codemode.mode must be on or only".into())),
         };
-        let enabled = |name: &str| !args.no_extensions || args.extensions.iter().any(|entry| entry == name);
+        let enabled = |name: &str| super::resource_paths::builtin_enabled(args, name);
         let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
-        if enabled("builtin:tool-search") || !mcp_connections.is_empty() {
+        if enabled("builtin:tool-search")? {
             extensions.push(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(documents)));
         }
-        if enabled("builtin:codemode") || mcp_connections.iter().any(|connection| connection.has_codemode()) {
+        if enabled("builtin:codemode")? {
             extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
                 inline_budget: args.settings.value()["codemode"]["inlineBudget"].as_u64().unwrap_or(3000).min(100_000) as usize,
@@ -137,24 +137,18 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             )));
             extensions.push(Arc::new(pi_rs_review::ReviewContext));
         }
-        let mut extension_names = args.extensions.clone();
+        let mut extension_names: Vec<_> = args.extensions.iter().filter(|entry| super::resource_paths::named_extension(entry)).cloned().collect();
         if !args.no_extensions {
-            extension_names.extend(
-                local_resources
-                    .packages
-                    .extensions
-                    .iter()
-                    .map(|path| path.to_string_lossy().into_owned()),
-            );
+            extension_names.extend(args.settings.strings("extensions").into_iter().filter(|entry| super::resource_paths::named_extension(entry)));
         }
-        for name in extension_names
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-        {
+        extension_names.extend(local_resources.extensions.iter().map(|path| path.to_string_lossy().into_owned()));
+        let mut seen = std::collections::BTreeSet::new();
+        for name in extension_names.iter().filter(|name| seen.insert((*name).clone())) {
             match name.as_str() {
                 "builtin:mcp" | "builtin:codemode" | "builtin:tool-search" => {},
                 "notes" => extensions.push(Arc::new(pi_rs_extensions::Notes)),
                 "todo" => extensions.push(Arc::new(pi_rs_extensions::TodoList)),
+                name if name.starts_with("builtin:") => return Err(pi_rs::Error::Config(format!("unsupported native built-in extension {name}"))),
                 _ => extensions.push(Arc::new(pi_rs_extensions::ExecutableExtension::load(name)?)),
             }
         }

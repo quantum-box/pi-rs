@@ -19,19 +19,25 @@ pub fn agent_dir() -> PathBuf {
 #[derive(Clone, Default)]
 pub struct Settings {
     value: Value,
+    resource_layers: Vec<(PathBuf, Value)>,
 }
 impl Settings {
     pub fn load(workspace: &Path, trusted: bool) -> Result<Self> {
         let mut value = read_object(&agent_dir().join("settings.json"))?;
+        let mut resource_layers = vec![(agent_dir(), value.clone())];
         if trusted {
             let mut project = read_object(&workspace.join(".pi/settings.json"))?;
             project
                 .as_object_mut()
                 .expect("object")
                 .remove("defaultProjectTrust");
+            resource_layers.push((workspace.join(".pi"), project.clone()));
             merge(&mut value, project);
         }
-        Ok(Self { value })
+        Ok(Self {
+            value,
+            resource_layers,
+        })
     }
     pub fn string(&self, key: &str) -> Option<&str> {
         self.value.get(key)?.as_str()
@@ -47,6 +53,31 @@ impl Settings {
             .flatten()
             .filter_map(Value::as_str)
             .map(str::to_owned)
+            .collect()
+    }
+    pub fn resource_layers(&self, key: &str) -> Result<Vec<(PathBuf, Vec<String>)>> {
+        let layers = if self.resource_layers.is_empty() {
+            vec![(agent_dir(), self.value.clone())]
+        } else {
+            self.resource_layers.clone()
+        };
+        layers
+            .into_iter()
+            .map(|(base, value)| {
+                let entries = value
+                    .get(key)
+                    .map(|value| {
+                        serde_json::from_value::<Vec<String>>(value.clone()).map_err(|error| {
+                            Error::Config(format!(
+                                "{}: invalid {key}: {error}",
+                                base.join("settings.json").display()
+                            ))
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok((base, entries))
+            })
             .collect()
     }
     pub fn value(&self) -> &Value {
@@ -74,7 +105,13 @@ impl Settings {
         self.value
             .as_object_mut()
             .expect("settings object")
-            .insert(key.into(), value);
+            .insert(key.into(), value.clone());
+        if let Some((_, layer)) = self.resource_layers.first_mut() {
+            layer
+                .as_object_mut()
+                .expect("settings layer")
+                .insert(key.into(), value);
+        }
         Ok(())
     }
 }
@@ -218,6 +255,83 @@ fn merge(base: &mut Value, overlay: Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn resources_keep_scope_paths_filters_and_project_precedence() {
+        use super::super::resource_paths::{self, Kind};
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("agent");
+        let workspace = directory.path().join("work");
+        let project = workspace.join(".pi");
+        for base in [&user, &project] {
+            std::fs::create_dir_all(base.join("templates")).unwrap();
+            std::fs::create_dir_all(base.join("prompts")).unwrap();
+            std::fs::write(base.join("templates/item.md"), "template").unwrap();
+            std::fs::write(base.join("templates/skip.md"), "excluded").unwrap();
+            std::fs::write(base.join("prompts/common.md"), "auto").unwrap();
+        }
+        let mut args = super::super::Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = workspace.clone();
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![
+                (
+                    user.clone(),
+                    json!({"prompts":["templates", "!**/skip.md"], "extensions":["-builtin:mcp"]}),
+                ),
+                (
+                    project.clone(),
+                    json!({"prompts":["templates", "!**/skip.md"], "extensions":["+builtin:mcp"]}),
+                ),
+            ],
+        };
+        let mut warnings = Vec::new();
+        let paths = resource_paths::resolve(&args, Kind::Prompt, &[], &[], &mut warnings).unwrap();
+        assert_eq!(
+            paths[0],
+            project.join("templates/item.md").canonicalize().unwrap()
+        );
+        assert!(paths.contains(&user.join("templates/item.md").canonicalize().unwrap()));
+        assert!(paths.iter().all(|path| !path.ends_with("skip.md")));
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("work-alias");
+            std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+            args.workspace = alias;
+            let aliased =
+                resource_paths::resolve(&args, Kind::Prompt, &[], &[], &mut warnings).unwrap();
+            assert!(aliased.iter().all(|path| !path.ends_with("skip.md")));
+            args.workspace = workspace.clone();
+        }
+        assert!(resource_paths::builtin_enabled(&args, "builtin:mcp").unwrap());
+        args.no_extensions = true;
+        assert!(!resource_paths::builtin_enabled(&args, "builtin:mcp").unwrap());
+        args.extensions.push("builtin:mcp".into());
+        assert!(resource_paths::builtin_enabled(&args, "builtin:mcp").unwrap());
+        args.no_prompt_templates = true;
+        let explicit = user.join("templates/skip.md");
+        assert_eq!(
+            resource_paths::resolve(
+                &args,
+                Kind::Prompt,
+                &[],
+                std::slice::from_ref(&explicit),
+                &mut warnings
+            )
+            .unwrap(),
+            vec![explicit.canonicalize().unwrap()]
+        );
+        assert!(warnings.is_empty());
+        args.settings.resource_layers[0].1["prompts"] = json!("invalid array");
+        let error = args
+            .settings
+            .resource_layers("prompts")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("settings.json") && error.contains("prompts"));
+    }
+
     #[test]
     fn project_settings_merge_nested_objects_and_resource_lists() {
         let mut base = json!({"theme":"dark","compaction":{"enabled":true,"reserveTokens":100},"skills":["first"]});

@@ -26,6 +26,8 @@ pub struct Resources {
     pub prompts: BTreeMap<String, Prompt>,
     pub warnings: Vec<String>,
     pub packages: super::packages::PackageResources,
+    pub extensions: Vec<PathBuf>,
+    pub themes: Vec<PathBuf>,
 }
 #[derive(Deserialize, Default)]
 struct Frontmatter {
@@ -70,54 +72,53 @@ impl Resources {
                 }
             }
         }
-        let mut skill_roots = vec![agent.join("skills")];
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            skill_roots.push(PathBuf::from(home).join(".agents/skills"));
-        }
-        let mut prompt_roots = vec![agent.join("prompts")];
+        use super::resource_paths::{self, Kind};
+        let explicit_skills: Vec<_> = args
+            .skill
+            .iter()
+            .filter_map(|path| {
+                let path = resource_path(&workspace, path);
+                (args.project.is_none() || path.exists()).then_some(path)
+            })
+            .collect();
+        let skill_roots = resource_paths::resolve(
+            args,
+            Kind::Skill,
+            &resources.packages.skills,
+            &explicit_skills,
+            &mut resources.warnings,
+        )?;
+        let prompt_roots = resource_paths::resolve(
+            args,
+            Kind::Prompt,
+            &resources.packages.prompts,
+            &args.prompt_template,
+            &mut resources.warnings,
+        )?;
+        let explicit_extensions: Vec<_> = args
+            .extensions
+            .iter()
+            .filter(|entry| !resource_paths::named_extension(entry))
+            .map(PathBuf::from)
+            .collect();
+        resources.extensions = resource_paths::resolve(
+            args,
+            Kind::Extension,
+            &resources.packages.extensions,
+            &explicit_extensions,
+            &mut resources.warnings,
+        )?;
+        resources.themes = resource_paths::resolve(
+            args,
+            Kind::Theme,
+            &resources.packages.themes,
+            &args.themes,
+            &mut resources.warnings,
+        )?;
         let mut config_directories = vec![agent.clone()];
         if args.trusted {
-            skill_roots.push(workspace.join(".pi/skills"));
-            for directory in workspace.ancestors() {
-                skill_roots.push(directory.join(".agents/skills"));
-                if directory.join(".git").exists() {
-                    break;
-                }
-            }
-            prompt_roots.push(workspace.join(".pi/prompts"));
             config_directories.push(workspace.join(".pi"));
         }
-        skill_roots.extend(
-            args.settings
-                .strings("skills")
-                .into_iter()
-                .map(|path| resource_path(&workspace, &path)),
-        );
-        prompt_roots.extend(
-            args.settings
-                .strings("prompts")
-                .into_iter()
-                .map(|path| resource_path(&workspace, &path)),
-        );
-        skill_roots.extend(resources.packages.skills.iter().cloned());
-        prompt_roots.extend(resources.packages.prompts.iter().cloned());
-        if args.no_skills {
-            skill_roots.clear();
-        }
-        if args.no_prompt_templates {
-            prompt_roots.clear();
-        }
-        skill_roots.extend(args.skill.iter().filter_map(|path| {
-            let path = resource_path(&workspace, path);
-            (args.project.is_none() || path.exists()).then_some(path)
-        }));
-        prompt_roots.extend(args.prompt_template.iter().map(|path| {
-            if path.is_absolute() {
-                path.clone()
-            } else {
-                workspace.join(path)
-            }
-        }));
         for directory in config_directories {
             let system = directory.join("SYSTEM.md");
             if system.is_file() {

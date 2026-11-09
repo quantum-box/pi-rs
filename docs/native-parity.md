@@ -21,7 +21,7 @@ remaining acceptance work for that surface.
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface, explicit hot reload |
-| Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI, resource globs and complete validation diagnostics |
+| Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, elicitation |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation, complete output/image fidelity and limits |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
@@ -375,3 +375,19 @@ Package resource filters distinguish glob patterns from exact `+path` and
 exclusions take precedence regardless of array order. Skill-directory paths
 resolve to their SKILL.md resource. Manifest directory roots still expand to
 their declared resources, and filters remain limited to that declared set.
+
+### Resource discovery checkpoint
+
+Native executable extensions are discovered in user and trusted-project
+extension directories, and configured files or directories resolve from their
+own settings directory. CLI resource paths resolve from the working directory.
+Skills, prompt templates and themes use the same scoped discovery. Explicit
+CLI paths take precedence, followed by project resources and user resources.
+Canonical paths prevent duplicate loading through aliases.
+
+Resource exclusions and exact inclusion overrides apply to configured roots
+and discovered paths. Built-in extension overrides retain separate user and
+project layers, so a project override can re-enable a user-disabled built-in.
+Theme discovery uses the filtered resource list and preserves live reload.
+Fixtures verify automatic and configured native extensions, trust gating,
+explicit overrides, project template precedence and live theme updates.

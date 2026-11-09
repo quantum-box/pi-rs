@@ -202,7 +202,7 @@ pub fn resources(args: &Cli) -> Result<PackageResources> {
     }
     Ok(result)
 }
-fn validate_patterns(patterns: &[String]) -> Result<()> {
+pub(crate) fn validate_patterns(patterns: &[String]) -> Result<()> {
     for pattern in patterns
         .iter()
         .filter(|pattern| !pattern.starts_with(['+', '-']))
@@ -221,7 +221,7 @@ fn validate_patterns(patterns: &[String]) -> Result<()> {
     }
     Ok(())
 }
-fn selected(path: &Path, root: &Path, filters: &[String]) -> bool {
+pub(crate) fn selected(path: &Path, root: &Path, filters: &[String]) -> bool {
     select_resource(path, root, filters, false)
 }
 fn manifest_selected(path: &Path, root: &Path, filters: &[String]) -> bool {
@@ -262,7 +262,7 @@ fn select_resource(path: &Path, root: &Path, filters: &[String], directory_roots
     }
     included
 }
-fn resource_matches(
+pub(crate) fn resource_matches(
     path: &Path,
     root: &Path,
     pattern: &str,

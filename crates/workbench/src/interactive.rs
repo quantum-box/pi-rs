@@ -1037,16 +1037,13 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     restore_workspace(&mut args)?;
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
-    if !args.no_themes {
-        args.themes
-            .extend(initial_resources.packages.themes.iter().cloned());
-    }
+    args.theme_paths = initial_resources.themes.clone();
     let mut theme = Theme::load(
         args.use_theme.as_deref().unwrap_or("system"),
-        &args.themes,
+        &args.theme_paths,
         &args.workspace,
         args.trusted,
-        !args.no_themes,
+        false,
     )?;
     let mut view = View {
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
@@ -1324,10 +1321,10 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             }
                         } else if input.trim() == "/theme" {
                             let names = Theme::discover(
-                                &args.themes,
+                                &args.theme_paths,
                                 &args.workspace,
                                 args.trusted,
-                                !args.no_themes,
+                                false,
                             );
                             let title = format!(
                                 "Select theme · {}",
@@ -1350,10 +1347,10 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         } else if let Some(name) = input.strip_prefix("/theme ") {
                             match Theme::load(
                                 name.trim(),
-                                &args.themes,
+                                &args.theme_paths,
                                 &args.workspace,
                                 args.trusted,
-                                !args.no_themes,
+                                false,
                             ) {
                                 Ok(next) => {
                                     args.settings.set_user("theme", json!(name.trim()))?;
@@ -1367,30 +1364,18 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             args.settings =
                                 crate::config::Settings::load(&args.workspace, args.trusted)?;
                             super::packages::prepare(&args).await?;
-                            args.themes
-                                .retain(|path| !view.resources.packages.themes.contains(path));
                             view.resources = super::resources::Resources::load(&args)?;
-                            for path in view
-                                .resources
-                                .packages
-                                .themes
-                                .iter()
-                                .filter(|_| !args.no_themes)
-                            {
-                                if !args.themes.contains(path) {
-                                    args.themes.push(path.clone());
-                                }
-                            }
+                            args.theme_paths = view.resources.themes.clone();
                             match Keys::load() {
                                 Ok(next) => keys = next,
                                 Err(error) => view.append(&error.to_string()),
                             }
                             match Theme::load(
                                 args.use_theme.as_deref().unwrap_or("system"),
-                                &args.themes,
+                                &args.theme_paths,
                                 &args.workspace,
                                 args.trusted,
-                                !args.no_themes,
+                                false,
                             ) {
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
@@ -1643,10 +1628,10 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
         Selection::Theme(name) => {
             let next = Theme::load(
                 &name,
-                &args.themes,
+                &args.theme_paths,
                 &args.workspace,
                 args.trusted,
-                !args.no_themes,
+                false,
             )?;
             args.settings.set_user("theme", json!(name))?;
             args.use_theme = Some(name);
@@ -1663,6 +1648,7 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
     next.session = path;
     restore_workspace(&mut next)?;
     let resources = super::resources::Resources::load(&next)?;
+    next.theme_paths = resources.themes.clone();
     view.restore(&next)?;
     view.resources = resources;
     *args = next;
