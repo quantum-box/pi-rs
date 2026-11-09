@@ -83,13 +83,16 @@ impl BudgetedModel<'_> {
                     metadata,
                     ..
                 } => {
-                    finished = Some(*request_id);
+                    finished = Some((*request_id, record.id));
                     requests.insert(*request_id, (usage, Some(metadata)));
                 }
-                Event::Assistant { .. } | Event::Compacted { .. } => {
-                    // The core commits a response only after its usage hook succeeds.
-                    if let Some((_, metadata)) =
-                        finished.take().and_then(|id| requests.get_mut(&id))
+                Event::Assistant { .. } | Event::Compacted { usage: Some(_), .. }
+                    if finished.is_some_and(|(_, id)| record.parent == Some(id)) =>
+                {
+                    // A response attached to this measurement proves the hook returned.
+                    if let Some((_, metadata)) = finished
+                        .take()
+                        .and_then(|(request, _)| requests.get_mut(&request))
                     {
                         *metadata = None;
                     }
