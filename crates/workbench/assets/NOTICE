@@ -10,3 +10,4 @@ The Rust renderer implements the documented Kitty and iTerm2 protocols.
 
 Markdown heading, fenced code, quote and list presentation in src/ui/render.rs
 follows Pi v1.5.0 Markdown rendering conventions.
+Edit-diff word highlighting follows Pi v1.5.0 diff.ts presentation conventions.

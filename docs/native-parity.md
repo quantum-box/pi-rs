@@ -596,3 +596,14 @@ Horizontal rules use the reference 80-column maximum.
 
 Unit tests cover these layouts and Unicode widths. A PTY fixture verifies both
 terminal modes, heading decoration, code fences, nested quotes and clean exit.
+
+### Edit diff presentation checkpoint
+
+Edit tool panels retain unified hunk information, show original and updated line
+numbers, and highlight changed words for one-line replacements. Added, removed
+and context lines use their dedicated theme colors. Tabs expand to three spaces,
+and word comparison has a shared 100 ms budget per render. Large comparisons
+retain line-level highlighting when that budget is exhausted.
+
+A PTY fixture runs an actual file edit and verifies numbered output and inverse
+word highlighting in fullscreen and regular mode.

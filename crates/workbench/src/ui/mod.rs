@@ -1,3 +1,4 @@
+pub mod diff;
 pub mod editor;
 pub mod images;
 pub mod keys;

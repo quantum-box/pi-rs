@@ -86,6 +86,24 @@ and the host stops a request after 30 seconds. Unknown outcomes retain the
 operation's reconciliation requirement. Load only executables you trust with
 the permissions and environment of the local CLI.
 
+Current executables also advertise bidirectional host calls through protocol v2.
+A tool can override `invoke_with_host` or `invoke_transaction`, inspect
+`host.tools()` and call `host.call(name, arguments)` or `host.call_batch(calls)`.
+Batches preserve result order and allow host-approved parallel reads. Every
+nested call keeps the host's validation, policies, journal and cancellation.
+Protocol-v2 frames are bounded to 4 MiB, and invocation follows the host's
+configured tool deadline. Metadata and other hooks retain protocol v1.
+
+A working host-call example is available with the standard extensions.
+
+```sh
+cargo build --locked -p pi-rs-extensions --example parallel_read
+pi -e ./target/debug/examples/parallel_read
+```
+
+The `parallel_read` tool accepts a `paths` array and reads those files through
+the host's registered `read` tool.
+
 ## Create and install a native package
 
 ```sh
@@ -105,15 +123,14 @@ extensions load in the CLI, terminal and RPC runtime. Reload the terminal after
 changing installed packages.
 
 Sources can be local binaries, local Cargo packages, `cargo:crate@version`, or
-`git:https://host/repository.git#ref`. `install -l` and `remove -l` select
+`git:https://host/repository.git@ref` (`#ref` also works). `install -l` and `remove -l` select
 project settings. Project packages load only after the project is trusted.
 Removal updates settings and retains the build cache.
 
 Packages may declare `extensions`, `skills`, `prompts`, and `themes` in
 `[package.metadata.pi]` or the `pi` object of `pi-package.json`. Extension names
 select compiled binaries. Resource paths select files or directories under the
-package root, with glob patterns and ordered `!`/`-` exclusions and `+`
-re-inclusions. Without declarations, the conventional `skills`, `prompts`,
+package root, with glob patterns, `!`/`-` exclusions and exact `+` re-inclusions. Without declarations, the conventional `skills`, `prompts`,
 `themes` and `extensions` directories are discovered. An empty list disables
 that resource kind. A settings package entry may additionally restrict these
 resources with `{ "source": "...", "skills": ["skills/example"] }`.

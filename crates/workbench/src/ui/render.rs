@@ -22,16 +22,18 @@ pub struct Span {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub inverse: bool,
     pub strikethrough: bool,
 }
 impl Span {
-    fn new(text: impl Into<String>, color: Color) -> Self {
+    pub(super) fn new(text: impl Into<String>, color: Color) -> Self {
         Self {
             text: clean(&text.into()),
             color,
             bold: false,
             italic: false,
             underline: false,
+            inverse: false,
             strikethrough: false,
         }
     }
@@ -70,6 +72,11 @@ impl Line {
                     Attribute::Italic
                 } else {
                     Attribute::NoItalic
+                }),
+                SetAttribute(if span.inverse {
+                    Attribute::Reverse
+                } else {
+                    Attribute::NoReverse
                 }),
                 SetAttribute(if span.underline {
                     Attribute::Underlined
@@ -193,15 +200,13 @@ impl Entry {
                 let output_lines: Vec<_> = output.lines().collect();
                 let limit = if expand_tools { output_lines.len() } else { 10 };
                 let render_text = |text: &str, lines: &mut Vec<Line>| {
-                    for text in text.split('\n') {
-                        let color = if name == "edit" && text.starts_with('+') {
-                            "toolDiffAdded"
-                        } else if name == "edit" && text.starts_with('-') {
-                            "toolDiffRemoved"
-                        } else {
-                            "toolOutput"
-                        };
-                        lines.extend(wrap(&[Span::new(text, theme.color(color))], inner));
+                    if name == "edit" {
+                        lines.extend(super::diff::render(text, theme, inner));
+                    } else {
+                        for text in text.split('\n') {
+                            lines
+                                .extend(wrap(&[Span::new(text, theme.color("toolOutput"))], inner));
+                        }
                     }
                 };
                 if expand_tools && !parts.is_empty() {
@@ -212,8 +217,14 @@ impl Entry {
                         }
                     }
                 } else {
-                    for text in output_lines.iter().take(limit) {
-                        render_text(text, &mut lines);
+                    let visible = output_lines
+                        .iter()
+                        .take(limit)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !visible.is_empty() {
+                        render_text(&visible, &mut lines);
                     }
                 }
                 if output_lines.len() > limit {
