@@ -248,7 +248,7 @@ pub(crate) struct RegisteredTool {
     pub validator: jsonschema::Validator,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Registry {
     pub(crate) extensions: Vec<Arc<dyn Extension>>,
     pub(crate) tools: BTreeMap<String, Arc<RegisteredTool>>,
@@ -369,6 +369,31 @@ impl Registry {
         })
     }
 
+    /// Replace one registered extension atomically, retaining its hook order and UI.
+    /// Returns false when the extension is not enabled in this registry.
+    pub fn replace(&mut self, extension: Arc<dyn Extension>) -> Result<bool> {
+        let Some(index) = self
+            .extensions
+            .iter()
+            .position(|item| item.id() == extension.id())
+        else {
+            return Ok(false);
+        };
+        let mut candidate = self.clone();
+        candidate.extensions.remove(index);
+        candidate
+            .tools
+            .retain(|_, tool| tool.owner != extension.id());
+        candidate.register(extension)?;
+        let replacement = candidate.extensions.pop().expect("registered extension");
+        candidate.extensions.insert(index, replacement);
+        if let Some(active) = &mut candidate.active {
+            active.retain(|name| candidate.tools.contains_key(name));
+        }
+        *self = candidate;
+        Ok(true)
+    }
+
     pub fn register(&mut self, extension: Arc<dyn Extension>) -> Result<()> {
         let id = extension.id();
         if id.is_empty() || self.extensions.iter().any(|item| item.id() == id) {
@@ -436,4 +461,84 @@ pub(crate) fn hook<T>(extension: &dyn Extension, result: ExtensionResult<T>) -> 
         id: extension.id().into(),
         message,
     })
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct TestExtension(&'static str, &'static str);
+    impl Extension for TestExtension {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(TestTool(self.1))]
+        }
+    }
+    struct TestTool(&'static str);
+    #[async_trait::async_trait]
+    impl Tool for TestTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.0.into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            Outcome::Succeeded(String::new())
+        }
+    }
+
+    #[test]
+    fn replacing_tools_is_atomic_and_keeps_extension_order() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(TestExtension("first", "old")))
+            .unwrap();
+        registry
+            .register(Arc::new(TestExtension("second", "other")))
+            .unwrap();
+        registry
+            .set_active_tools(["old".into(), "other".into()])
+            .unwrap();
+        assert!(
+            registry
+                .replace(Arc::new(TestExtension("first", "new")))
+                .unwrap()
+        );
+        assert!(!registry.has_tool("old"));
+        assert!(registry.has_tool("new"));
+        assert_eq!(
+            registry
+                .active_tool_specs()
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            ["other"]
+        );
+        assert_eq!(
+            registry
+                .extensions
+                .iter()
+                .map(|extension| extension.id())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let before = registry.tool_specs();
+        assert!(
+            registry
+                .replace(Arc::new(TestExtension("first", "other")))
+                .is_err()
+        );
+        assert_eq!(registry.tool_specs(), before);
+        assert!(
+            !registry
+                .replace(Arc::new(TestExtension("disabled", "extra")))
+                .unwrap()
+        );
+        assert!(!registry.has_tool("extra"));
+    }
 }

@@ -327,7 +327,6 @@ impl McpExtension {
         } else {
             return Err(Error::Config(format!("MCP {name} needs command or url")));
         };
-        let info = service.peer_info();
         let connection = Arc::new(Connection {
             identity: format!("{:x}", identity.finalize()),
             service: tokio::sync::Mutex::new(service),
@@ -337,6 +336,20 @@ impl McpExtension {
             workspace: workspace.to_owned(),
             closed: AtomicBool::new(false),
         });
+        Self::discover(connection).await
+    }
+
+    /// Reload definitions while keeping the established transport and remote state.
+    pub async fn refresh(&self) -> Result<Self> {
+        drop(self.connection.active_service().await?);
+        Self::discover(self.connection.clone()).await
+    }
+
+    async fn discover(connection: Arc<Connection>) -> Result<Self> {
+        let name = connection.name.clone();
+        let config = connection.config.clone();
+        let timeout = connection.timeout;
+        let info = connection.service.lock().await.peer_info();
         let definitions = if info
             .as_ref()
             .is_some_and(|info| info.capabilities.tools.is_some())
@@ -350,7 +363,7 @@ impl McpExtension {
         } else {
             Vec::new()
         };
-        let prefix = format!("mcp__{}__", normalize(name));
+        let prefix = format!("mcp__{}__", normalize(&name));
         let mut counts = BTreeMap::<String, usize>::new();
         for definition in &definitions {
             *counts.entry(normalize(&definition.name)).or_default() += 1;
@@ -360,7 +373,7 @@ impl McpExtension {
         let mut has_codemode = false;
         let mut has_deferred = false;
         for definition in definitions {
-            if !tool_enabled(config, &definition.name) {
+            if !tool_enabled(&config, &definition.name) {
                 continue;
             }
             let normalized = normalize(&definition.name);
@@ -377,10 +390,10 @@ impl McpExtension {
                     .unwrap_or_else(|| definition.name.to_string()),
                 parameters: Value::Object((*definition.input_schema).clone()),
             };
-            if is_deferred(config, &definition.name) {
-                has_deferred |= exposure(config, &definition.name) == "deferred";
+            if is_deferred(&config, &definition.name) {
+                has_deferred |= exposure(&config, &definition.name) == "deferred";
                 has_codemode |= matches!(
-                    exposure(config, &definition.name),
+                    exposure(&config, &definition.name),
                     "codemode" | "codemode-deferred"
                 );
                 deferred.insert(spec.name.clone());
@@ -413,17 +426,17 @@ impl McpExtension {
                     json!({"type":"object","properties":{"uri":{"type":"string"}},"required":["uri"],"additionalProperties":false}),
                 ),
             ] {
-                if !tool_enabled(config, name) {
+                if !tool_enabled(&config, name) {
                     continue;
                 }
                 let mut exposed = format!("{prefix}{name}");
                 while tools.iter().any(|tool| tool.spec().name == exposed) {
                     exposed.push_str("_resource");
                 }
-                if is_deferred(config, name) {
-                    has_deferred |= exposure(config, name) == "deferred";
+                if is_deferred(&config, name) {
+                    has_deferred |= exposure(&config, name) == "deferred";
                     has_codemode |=
-                        matches!(exposure(config, name), "codemode" | "codemode-deferred");
+                        matches!(exposure(&config, name), "codemode" | "codemode-deferred");
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -454,17 +467,17 @@ impl McpExtension {
                     json!({"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object","additionalProperties":{"type":"string"}}},"required":["name"],"additionalProperties":false}),
                 ),
             ] {
-                if !tool_enabled(config, name) {
+                if !tool_enabled(&config, name) {
                     continue;
                 }
                 let mut exposed = format!("{prefix}{name}");
                 while tools.iter().any(|tool| tool.spec().name == exposed) {
                     exposed.push_str("_prompt");
                 }
-                if is_deferred(config, name) {
-                    has_deferred |= exposure(config, name) == "deferred";
+                if is_deferred(&config, name) {
+                    has_deferred |= exposure(&config, name) == "deferred";
                     has_codemode |=
-                        matches!(exposure(config, name), "codemode" | "codemode-deferred");
+                        matches!(exposure(&config, name), "codemode" | "codemode-deferred");
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -494,12 +507,12 @@ impl McpExtension {
             })
             .unwrap_or_default();
         Ok(Self {
-            id: format!("mcp-{}", normalize(name)),
+            id: format!("mcp-{}", normalize(&name)),
             tools,
             deferred,
             has_codemode,
             has_deferred,
-            server_name: name.into(),
+            server_name: name,
             description,
             connection,
         })

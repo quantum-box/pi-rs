@@ -171,6 +171,13 @@ pub async fn run(mut args: Cli) -> Result<()> {
         }
         output(json!({"type":"agent_started"}));
         let result = async {
+            if matches!(&request, Request::Prompt { .. }) {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = runtime.refresh_mcp(&args) => result?,
+                }
+            }
             let mut session = Session::open(&args.session)?;
             if session.host_binding().is_some() {
                 return Err(Error::Session(

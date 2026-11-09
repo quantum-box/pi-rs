@@ -10,6 +10,7 @@ pub struct Runtime {
     provider: Ollama,
     pub registry: Registry,
     system_prompt: String,
+    base_prompt: String,
     pub resources: resources::Resources,
     servers: Vec<Arc<pi_rs_workbench::mcp::McpExtension>>,
 }
@@ -48,6 +49,35 @@ impl Runtime {
         }
         Ok(())
     }
+    pub async fn refresh_mcp(&mut self, args: &Cli) -> Result<()> {
+        if self.servers.is_empty() {
+            return Ok(());
+        }
+        let mut servers = Vec::with_capacity(self.servers.len());
+        let mut registry = self.registry.clone();
+        for server in &self.servers {
+            let refreshed = Arc::new(server.refresh().await?);
+            registry.replace(refreshed.clone())?;
+            servers.push(refreshed);
+        }
+        let (selection, documents, hidden) = tool_discovery(args, &servers)?;
+        registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
+            documents,
+        )))?;
+        let system_prompt = select_tools(
+            &mut registry,
+            &selection,
+            &hidden,
+            (&self.resources, &self.base_prompt),
+            args,
+            &servers,
+        )?;
+        self.registry = registry;
+        self.servers = servers;
+        self.system_prompt = system_prompt;
+        Ok(())
+    }
+
     pub fn set_thinking(&mut self, thinking: Option<&str>) {
         self.provider = self.provider.clone().with_reasoning_effort(thinking);
     }
@@ -76,47 +106,33 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into());
     let mcp_connections = mcp_config::connect_all(args, false).await?;
     let result = async {
-        let mut selection = super::tool_selection::Selection::new(args)?;
-        let documents: Vec<_> = mcp_connections
-            .iter()
-            .flat_map(|connection| {
-                let tools = if selection.declares_mcp() {
-                    connection.deferred_tools()
-                } else {
-                    connection.tools().into_iter().map(|tool| tool.spec()).collect()
-                };
-                tools.into_iter()
-                    .filter(|tool| selection.includes(&tool.name))
-                    .map(|tool| pi_rs_extensions::tool_search::SearchDocument {
-                        tool,
-                        namespace: format!("{} {}", connection.server_name, connection.description),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let hidden: std::collections::BTreeSet<_> = documents.iter()
-            .map(|document| document.tool.name.clone())
-            .collect();
-        if mcp_connections.iter().any(|connection| connection.has_deferred()) {
-            selection.enable_automatic("tool_search");
-        }
-        if mcp_connections.iter().any(|connection| connection.has_codemode()) && mcp_config::auto_enable_codemode(args)? {
-            selection.enable_automatic("codemode");
-        }
-        let only_code = match args.settings.value()["codemode"]["mode"].as_str().unwrap_or("on") {
+        let (selection, documents, hidden) = tool_discovery(args, &mcp_connections)?;
+        let only_code = match args.settings.value()["codemode"]["mode"]
+            .as_str()
+            .unwrap_or("on")
+        {
             "only" => true,
             "on" => false,
-            _ => return Err(pi_rs::Error::Config("codemode.mode must be on or only".into())),
+            _ => {
+                return Err(pi_rs::Error::Config(
+                    "codemode.mode must be on or only".into(),
+                ));
+            }
         };
         let enabled = |name: &str| super::resource_paths::builtin_enabled(args, name);
         let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
         if enabled("builtin:tool-search")? {
-            extensions.push(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(documents)));
+            extensions.push(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
+                documents,
+            )));
         }
         if enabled("builtin:codemode")? {
             extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
-                inline_budget: args.settings.value()["codemode"]["inlineBudget"].as_u64().unwrap_or(3000).min(100_000) as usize,
+                inline_budget: args.settings.value()["codemode"]["inlineBudget"]
+                    .as_u64()
+                    .unwrap_or(3000)
+                    .min(100_000) as usize,
                 timeout: args.tool_timeout(),
             }));
         }
@@ -125,7 +141,12 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         {
             extensions.push(Arc::new(ProjectInstructions {
                 resources: ProjectResources::open(&args.workspace, args.workspace.join(project))?,
-                skills: args.skill.iter().filter(|value| super::resource_paths::skill_path(args, value).is_none()).cloned().collect(),
+                skills: args
+                    .skill
+                    .iter()
+                    .filter(|value| super::resource_paths::skill_path(args, value).is_none())
+                    .cloned()
+                    .collect(),
             }));
         }
         if !args.no_extensions {
@@ -137,18 +158,40 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             )));
             extensions.push(Arc::new(pi_rs_review::ReviewContext));
         }
-        let mut extension_names: Vec<_> = args.extensions.iter().filter(|entry| super::resource_paths::named_extension(entry)).cloned().collect();
+        let mut extension_names: Vec<_> = args
+            .extensions
+            .iter()
+            .filter(|entry| super::resource_paths::named_extension(entry))
+            .cloned()
+            .collect();
         if !args.no_extensions {
-            extension_names.extend(args.settings.strings("extensions").into_iter().filter(|entry| super::resource_paths::named_extension(entry)));
+            extension_names.extend(
+                args.settings
+                    .strings("extensions")
+                    .into_iter()
+                    .filter(|entry| super::resource_paths::named_extension(entry)),
+            );
         }
-        extension_names.extend(local_resources.extensions.iter().map(|path| path.to_string_lossy().into_owned()));
+        extension_names.extend(
+            local_resources
+                .extensions
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
         let mut seen = std::collections::BTreeSet::new();
-        for name in extension_names.iter().filter(|name| seen.insert((*name).clone())) {
+        for name in extension_names
+            .iter()
+            .filter(|name| seen.insert((*name).clone()))
+        {
             match name.as_str() {
-                "builtin:mcp" | "builtin:codemode" | "builtin:tool-search" => {},
+                "builtin:mcp" | "builtin:codemode" | "builtin:tool-search" => {}
                 "notes" => extensions.push(Arc::new(pi_rs_extensions::Notes)),
                 "todo" => extensions.push(Arc::new(pi_rs_extensions::TodoList)),
-                name if name.starts_with("builtin:") => return Err(pi_rs::Error::Config(format!("unsupported native built-in extension {name}"))),
+                name if name.starts_with("builtin:") => {
+                    return Err(pi_rs::Error::Config(format!(
+                        "unsupported native built-in extension {name}"
+                    )));
+                }
                 _ => extensions.push(Arc::new(pi_rs_extensions::ExecutableExtension::load(name)?)),
             }
         }
@@ -175,23 +218,14 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         registry.register(Arc::new(pi_rs_workbench::coding::CodingTools::local(
             &args.workspace,
         )?))?;
-        registry.retain_tools(|tool| selection.callable(&tool.name));
-        let active: Vec<_> = registry.tool_specs().into_iter().filter(|tool| selection.includes(&tool.name)).map(|tool| tool.name).collect();
-        registry.set_active_tools(active)?;
-        let visible_tools: Vec<_> = registry.active_tool_specs().into_iter().filter(|tool| !hidden.contains(&tool.name) && (!only_code || matches!(tool.name.as_str(), "codemode" | "tool_search"))).collect();
-        let mut system_prompt = local_resources.system_prompt(
-            &base_prompt,
-            args.system_prompt.is_some(),
-            &visible_tools,
-            &args.workspace,
-        );
-        if !hidden.is_empty() {
-            system_prompt.push_str("\n\n<mcp_servers>\nUse codemode searchTools() or tool_search to discover tools from these servers.\n");
-            for connection in &mcp_connections {
-                system_prompt.push_str(&format!("- {}: {}\n", connection.server_name, connection.description));
-            }
-            system_prompt.push_str("</mcp_servers>");
-        }
+        let system_prompt = select_tools(
+            &mut registry,
+            &selection,
+            &hidden,
+            (&local_resources, &base_prompt),
+            args,
+            &mcp_connections,
+        )?;
         let show_reasoning = args.trace;
         let provider = Ollama::new(&args.endpoint, args.model_token())?
             .with_reasoning_effort(args.thinking.as_deref())
@@ -206,6 +240,7 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             provider,
             registry,
             system_prompt,
+            base_prompt,
             resources: local_resources,
             servers: mcp_connections.clone(),
         })
@@ -217,6 +252,102 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         }
     }
     result
+}
+
+fn tool_discovery(
+    args: &Cli,
+    mcp_connections: &[Arc<pi_rs_workbench::mcp::McpExtension>],
+) -> Result<(
+    super::tool_selection::Selection,
+    Vec<pi_rs_extensions::tool_search::SearchDocument>,
+    std::collections::BTreeSet<String>,
+)> {
+    let mut selection = super::tool_selection::Selection::new(args)?;
+    let documents: Vec<_> = mcp_connections
+        .iter()
+        .flat_map(|connection| {
+            let tools = if selection.declares_mcp() {
+                connection.deferred_tools()
+            } else {
+                connection
+                    .tools()
+                    .into_iter()
+                    .map(|tool| tool.spec())
+                    .collect()
+            };
+            tools
+                .into_iter()
+                .filter(|tool| selection.includes(&tool.name))
+                .map(|tool| pi_rs_extensions::tool_search::SearchDocument {
+                    tool,
+                    namespace: format!("{} {}", connection.server_name, connection.description),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let hidden: std::collections::BTreeSet<_> = documents
+        .iter()
+        .map(|document| document.tool.name.clone())
+        .collect();
+    if mcp_connections
+        .iter()
+        .any(|connection| connection.has_deferred())
+    {
+        selection.enable_automatic("tool_search");
+    }
+    if mcp_connections
+        .iter()
+        .any(|connection| connection.has_codemode())
+        && mcp_config::auto_enable_codemode(args)?
+    {
+        selection.enable_automatic("codemode");
+    }
+    Ok((selection, documents, hidden))
+}
+
+fn select_tools(
+    registry: &mut Registry,
+    selection: &super::tool_selection::Selection,
+    hidden: &std::collections::BTreeSet<String>,
+    prompt: (&resources::Resources, &str),
+    args: &Cli,
+    mcp_connections: &[Arc<pi_rs_workbench::mcp::McpExtension>],
+) -> Result<String> {
+    let (resources, base_prompt) = prompt;
+    let only_code = args.settings.value()["codemode"]["mode"].as_str() == Some("only");
+    registry.retain_tools(|tool| selection.callable(&tool.name));
+    let active: Vec<_> = registry
+        .tool_specs()
+        .into_iter()
+        .filter(|tool| selection.includes(&tool.name))
+        .map(|tool| tool.name)
+        .collect();
+    registry.set_active_tools(active)?;
+    let visible_tools: Vec<_> = registry
+        .active_tool_specs()
+        .into_iter()
+        .filter(|tool| {
+            !hidden.contains(&tool.name)
+                && (!only_code || matches!(tool.name.as_str(), "codemode" | "tool_search"))
+        })
+        .collect();
+    let mut system_prompt = resources.system_prompt(
+        base_prompt,
+        args.system_prompt.is_some(),
+        &visible_tools,
+        &args.workspace,
+    );
+    if !hidden.is_empty() {
+        system_prompt.push_str("\n\n<mcp_servers>\nUse codemode searchTools() or tool_search to discover tools from these servers.\n");
+        for connection in mcp_connections {
+            system_prompt.push_str(&format!(
+                "- {}: {}\n",
+                connection.server_name, connection.description
+            ));
+        }
+        system_prompt.push_str("</mcp_servers>");
+    }
+    Ok(system_prompt)
 }
 
 struct LocalCommandPolicy(CommandPolicy);
