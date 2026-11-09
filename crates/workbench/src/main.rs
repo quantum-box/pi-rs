@@ -17,6 +17,7 @@ mod backend;
 mod config;
 mod interactive;
 mod mcp_config;
+mod packages;
 mod process;
 mod resources;
 mod rpc;
@@ -175,6 +176,8 @@ enum Command {
     Interactive,
     #[command(hide = true)]
     Serve,
+    #[command(flatten)]
+    Package(packages::PackageCommand),
     Mcp {
         #[command(subcommand)]
         command: mcp_config::McpCommand,
@@ -325,6 +328,9 @@ async fn main() {
 }
 
 async fn execute(mut args: Cli) -> Result<()> {
+    if let Some(Command::Package(command)) = args.command.as_ref() {
+        return packages::command(&args, command.clone()).await;
+    }
     if matches!(args.command, Some(Command::Serve)) {
         return backend::run(args).await;
     }
@@ -377,7 +383,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     );
     let mut command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
-        return interactive::run(args);
+        return interactive::run(args).await;
     }
     if let Some(parent) = args
         .session

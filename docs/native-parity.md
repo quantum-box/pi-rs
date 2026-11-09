@@ -20,13 +20,13 @@ remaining acceptance work for that surface.
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Upstream JSONL import, richer tree navigation and branch summaries, session picker rename/delete/sort, Radius sharing |
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
-| Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading | Full Pi event and interactive UI surface, explicit hot reload, scaffolding and package distribution |
-| Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, resource reload | Complete settings editor UI, package resource integration, resource globs and complete validation diagnostics |
+| Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface, explicit hot reload |
+| Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI, resource globs and complete validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools and resources; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior, elicitation and task polling |
 | Codemode | Core tool invocation APIs | Sandboxed code execution and dynamic tool search |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload` | Automatic system appearance notifications, live file-watch reload |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory forks, compaction and lifecycle shutdown | Complete resource/model/auth factories, persistent fork/export helpers and remaining Pi SDK equivalents |
-| Packages | Cargo composition and native extension catalog | Package install/remove/update/list, dependency and resource management |
+| Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Published-crate resource bundles and complete source/filter compatibility |
 
 ## Current RPC subset
 
@@ -182,3 +182,12 @@ A stateful MCP fixture retained counter values 1, 2 and 3 across prompts, a
 notes command and cancellation, using one server process. A separate RPC
 fixture retained its connection across `new_session`, verified idle abort,
 and shut down cleanly. Fullscreen and regular-mode PTY regression checks pass.
+
+### Native package checkpoint
+
+`init-extension`, `install`, `remove`, `update` and `list` manage native Cargo,
+git and local packages. Builds are cached, serialized per source and validated
+before settings change. User and trusted-project declarations support resource
+filters. Packaged extensions, skills, prompts and themes load through the
+normal terminal/CLI/RPC resource paths. TypeScript/npm runtime compatibility is
+outside the requested native Rust equivalence.

@@ -962,7 +962,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
     Ok(None)
 }
 
-pub(super) fn run(mut args: Cli) -> Result<()> {
+pub(super) async fn run(mut args: Cli) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Config(
             "interactive mode requires a terminal; use run <prompt> for automation".into(),
@@ -984,6 +984,10 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     }
     initialize_session(&mut args)?;
     restore_workspace(&mut args)?;
+    super::packages::prepare(&args).await?;
+    let initial_resources = super::resources::Resources::load(&args)?;
+    args.themes
+        .extend(initial_resources.packages.themes.iter().cloned());
     let mut theme = Theme::load(
         args.use_theme.as_deref().unwrap_or("system"),
         &args.themes,
@@ -996,7 +1000,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         ..View::default()
     };
     view.restore(&args)?;
-    view.resources = super::resources::Resources::load(&args)?;
+    view.resources = initial_resources;
     if args.trust_pending {
         slash("/trust", &mut args, &mut view)?;
     }
@@ -1274,7 +1278,15 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                             worker.take();
                             args.settings =
                                 crate::config::Settings::load(&args.workspace, args.trusted)?;
+                            super::packages::prepare(&args).await?;
+                            args.themes
+                                .retain(|path| !view.resources.packages.themes.contains(path));
                             view.resources = super::resources::Resources::load(&args)?;
+                            for path in &view.resources.packages.themes {
+                                if !args.themes.contains(path) {
+                                    args.themes.push(path.clone());
+                                }
+                            }
                             match Keys::load() {
                                 Ok(next) => keys = next,
                                 Err(error) => view.append(&error.to_string()),

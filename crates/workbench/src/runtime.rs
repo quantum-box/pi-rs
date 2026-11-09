@@ -57,6 +57,7 @@ impl Runtime {
 }
 
 pub async fn configure(args: &Cli) -> Result<Runtime> {
+    super::packages::prepare(args).await?;
     let local_resources = resources::Resources::load(args)?;
     for warning in &local_resources.warnings {
         eprintln!("{warning}");
@@ -89,8 +90,15 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             ["read_text", "lookup_order", "read", "grep", "find", "ls"].map(str::to_owned),
         )));
         extensions.push(Arc::new(pi_rs_review::ReviewContext));
-        for name in args
-            .extensions
+        let mut extension_names = args.extensions.clone();
+        extension_names.extend(
+            local_resources
+                .packages
+                .extensions
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
+        for name in extension_names
             .iter()
             .collect::<std::collections::BTreeSet<_>>()
         {

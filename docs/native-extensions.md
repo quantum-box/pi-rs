@@ -85,3 +85,35 @@ Write diagnostic logs to stderr. Requests and responses are limited to 4 MiB,
 and the host stops a request after 30 seconds. Unknown outcomes retain the
 operation's reconciliation requirement. Load only executables you trust with
 the permissions and environment of the local CLI.
+
+## Create and install a native package
+
+```sh
+pi init-extension ./my-extension
+pi install ./my-extension
+pi --session /tmp/native.jsonl extension my-extension set 'Project guidance'
+pi list
+pi update ./my-extension
+pi remove ./my-extension
+```
+
+The generated Cargo binary implements the native extension protocol. For work
+against a local pi-rs checkout, pass `--dev-path /path/to/pi-rs` to
+`init-extension`. Installation builds a release binary into the agent package
+cache and validates its descriptor before adding it to settings. Installed
+extensions load in the CLI, terminal and RPC runtime. Reload the terminal after
+changing installed packages.
+
+Sources can be local binaries, local Cargo packages, `cargo:crate@version`, or
+`git:https://host/repository.git#ref`. `install -l` and `remove -l` select
+project settings. Project packages load only after the project is trusted.
+Removal updates settings and retains the build cache.
+
+Packages may declare `extensions`, `skills`, `prompts`, and `themes` in
+`[package.metadata.pi]` or the `pi` object of `pi-package.json`. Extension names
+select compiled binaries. Resource paths select files or directories under the
+package root, with glob patterns and ordered `!`/`-` exclusions and `+`
+re-inclusions. Without declarations, the conventional `skills`, `prompts`,
+`themes` and `extensions` directories are discovered. An empty list disables
+that resource kind. A settings package entry may additionally restrict these
+resources with `{ "source": "...", "skills": ["skills/example"] }`.

@@ -25,6 +25,7 @@ pub struct Resources {
     pub skills: BTreeMap<String, Skill>,
     pub prompts: BTreeMap<String, Prompt>,
     pub warnings: Vec<String>,
+    pub packages: super::packages::PackageResources,
 }
 #[derive(Deserialize, Default)]
 struct Frontmatter {
@@ -35,7 +36,10 @@ struct Frontmatter {
 }
 impl Resources {
     pub fn load(args: &Cli) -> Result<Self> {
-        let mut resources = Self::default();
+        let mut resources = Self {
+            packages: super::packages::resources(args)?,
+            ..Self::default()
+        };
         let agent = crate::config::agent_dir();
         let workspace = args.workspace.canonicalize()?;
         let mut directories = workspace
@@ -95,6 +99,8 @@ impl Resources {
                 .into_iter()
                 .map(|path| resource_path(&workspace, &path)),
         );
+        skill_roots.extend(resources.packages.skills.iter().cloned());
+        prompt_roots.extend(resources.packages.prompts.iter().cloned());
         for directory in config_directories {
             let system = directory.join("SYSTEM.md");
             if system.is_file() {
