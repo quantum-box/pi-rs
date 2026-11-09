@@ -96,6 +96,17 @@ Run 予算の精算は1件だった。通常の Workflow Goal 経路では、同
 `pi-rs-evaluation` のビルド機能と明示的な評価設定を使い、テナント、Run、ステップ、
 実行ユーザー、モデルを照合する。モデル送信前には既存の AI プラン、Gateway の
 モデル認可、Run の予算予約と Payment の事前審査を通す。API の試験211件が通過し、
-評価機能を省いたビルドの確認も通過した。外部ツールの登録は空で、運用環境への
-適用と実際の Field での受入検証は残っている。
+評価機能を省いたビルドの確認も通過した。外部ツールは設定なしでは空。
+運用環境への適用と実際の Field での受入検証は残っている。
 [AIP API の接続と試験](https://github.com/quantum-box/tachyon-apps/commit/15123aa4c510a2274862859d44ad680d4705ab8e)
+
+
+## Linear の読取り専用 MCP（PLT-6380、PLT-6383）
+
+対象 Run の `linear_read` 設定でテナントの既存接続 ID と、`get_issue` または
+`list_issues` を指定できる。既存の Runtime が接続を照会し、Linear の読取り専用
+MCP URL を使う。試験では書込み設定と既存接続の差し替えを拒否し、隔離 HTTP
+サーバーで許可取消後の追加送信が0件であることを確認した。AIP 統合試験11件、
+Runtime の接続試験4件、AIP API の試験212件が通過した。実際の Linear 接続、
+読取り操作の予算精算、添付参照は受入が残っている。
+[接続と試験](https://github.com/quantum-box/tachyon-apps/commit/226dd8830ebf47a6a17174b5ffd1d5f9761f2b8f) · [Linear MCP](https://linear.app/docs/mcp)
