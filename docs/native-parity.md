@@ -369,3 +369,9 @@ Steering is applied before follow-ups at the next response boundary. Queued
 images survive cancellation and reopening, and their IDs prevent duplicate
 consumption. Existing text-only `QueuedInput` callers continue through the
 extended queue representation.
+
+Package resource filters distinguish glob patterns from exact `+path` and
+`-path` overrides. Exclusions apply before exact inclusions, and exact
+exclusions take precedence regardless of array order. Skill-directory paths
+resolve to their SKILL.md resource. Manifest directory roots still expand to
+their declared resources, and filters remain limited to that declared set.

@@ -186,6 +186,9 @@ pub fn resources(args: &Cli) -> Result<PackageResources> {
                 .get(name)
                 .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
                 .transpose()?;
+            if let Some(filters) = &filters {
+                validate_patterns(filters)?;
+            }
             for path in paths {
                 if filters
                     .as_ref()
@@ -199,34 +202,111 @@ pub fn resources(args: &Cli) -> Result<PackageResources> {
     }
     Ok(result)
 }
-fn selected(path: &Path, root: &Path, filters: &[String]) -> bool {
-    let relative = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    let mut included =
-        !filters.is_empty() && filters.iter().all(|filter| filter.starts_with(['!', '-']));
-    for filter in filters {
-        let (include, pattern) = if let Some(pattern) = filter
+fn validate_patterns(patterns: &[String]) -> Result<()> {
+    for pattern in patterns
+        .iter()
+        .filter(|pattern| !pattern.starts_with(['+', '-']))
+    {
+        let pattern = pattern
             .strip_prefix('!')
-            .or_else(|| filter.strip_prefix('-'))
-        {
-            (false, pattern)
-        } else {
-            (true, filter.strip_prefix('+').unwrap_or(filter))
-        };
-        let pattern = pattern.trim_start_matches("./");
-        let matches = globset::Glob::new(pattern)
-            .is_ok_and(|glob| glob.compile_matcher().is_match(&relative))
-            || relative.starts_with(&format!("{pattern}/"))
-            || path.file_name().is_some_and(|name| name == pattern);
-        if matches {
-            included = include;
-        }
+            .unwrap_or(pattern)
+            .replace('\\', "/");
+        globset::GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .backslash_escape(false)
+            .build()
+            .map_err(|error| {
+                Error::Config(format!("invalid resource pattern {pattern:?}: {error}"))
+            })?;
+    }
+    Ok(())
+}
+fn selected(path: &Path, root: &Path, filters: &[String]) -> bool {
+    select_resource(path, root, filters, false)
+}
+fn manifest_selected(path: &Path, root: &Path, filters: &[String]) -> bool {
+    select_resource(path, root, filters, true)
+}
+fn select_resource(path: &Path, root: &Path, filters: &[String], directory_roots: bool) -> bool {
+    if filters.is_empty() {
+        return false;
+    }
+    let plain: Vec<_> = filters
+        .iter()
+        .filter(|filter| !filter.starts_with(['!', '+', '-']))
+        .collect();
+    let mut included = plain.is_empty()
+        || plain
+            .iter()
+            .any(|pattern| resource_matches(path, root, pattern, false, directory_roots));
+    if filters
+        .iter()
+        .filter_map(|filter| filter.strip_prefix('!'))
+        .any(|pattern| resource_matches(path, root, pattern, false, directory_roots))
+    {
+        included = false;
+    }
+    if filters
+        .iter()
+        .filter_map(|filter| filter.strip_prefix('+'))
+        .any(|pattern| resource_matches(path, root, pattern, true, directory_roots))
+    {
+        included = true;
+    }
+    if filters
+        .iter()
+        .filter_map(|filter| filter.strip_prefix('-'))
+        .any(|pattern| resource_matches(path, root, pattern, true, directory_roots))
+    {
+        included = false;
     }
     included
 }
+fn resource_matches(
+    path: &Path,
+    root: &Path,
+    pattern: &str,
+    exact: bool,
+    directory_roots: bool,
+) -> bool {
+    let normalize = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    let pattern = pattern.replace('\\', "/");
+    let pattern = pattern.trim_start_matches("./").to_owned();
+    let mut candidates = vec![
+        normalize(path),
+        normalize(path.strip_prefix(root).unwrap_or(path)),
+    ];
+    if path.file_name().is_some_and(|name| name == "SKILL.md")
+        && let Some(parent) = path.parent()
+    {
+        candidates.push(normalize(parent));
+        candidates.push(normalize(parent.strip_prefix(root).unwrap_or(parent)));
+        if !exact && let Some(name) = parent.file_name() {
+            candidates.push(name.to_string_lossy().into_owned());
+        }
+    }
+    if exact {
+        return candidates.iter().any(|candidate| candidate == &pattern);
+    }
+    if let Some(name) = path.file_name() {
+        candidates.push(name.to_string_lossy().into_owned());
+    }
+    let Ok(glob) = globset::GlobBuilder::new(&pattern)
+        .literal_separator(true)
+        .backslash_escape(false)
+        .build()
+    else {
+        return false;
+    };
+    let matcher = glob.compile_matcher();
+    candidates.iter().any(|candidate| {
+        matcher.is_match(candidate)
+            || (directory_roots
+                && !pattern.contains(['*', '?', '[', '{'])
+                && candidate.starts_with(&format!("{pattern}/")))
+    })
+}
+
 fn source_field(value: &Value) -> Option<&str> {
     value.as_str().or_else(|| value.get("source")?.as_str())
 }
@@ -453,7 +533,7 @@ async fn install(source: &str) -> Result<Installed> {
             .filter(|path| {
                 names.iter().any(|name| {
                     path.file_stem().is_some_and(|file| file == name.as_str())
-                        || selected(path, &root, std::slice::from_ref(name))
+                        || manifest_selected(path, &root, std::slice::from_ref(name))
                 })
             })
             .collect()
@@ -476,6 +556,7 @@ async fn install(source: &str) -> Result<Installed> {
             .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
             .transpose()?
             .unwrap_or_else(|| vec![name.into()]);
+        validate_patterns(&patterns)?;
         for entry in ignore::WalkBuilder::new(&root)
             .hidden(false)
             .git_ignore(false)
@@ -490,7 +571,7 @@ async fn install(source: &str) -> Result<Installed> {
         {
             if entry.file_type().is_some_and(|kind| kind.is_file())
                 && entry.file_name().to_string_lossy().ends_with(suffix)
-                && selected(entry.path(), &root, &patterns)
+                && manifest_selected(entry.path(), &root, &patterns)
             {
                 target.push(entry.into_path());
             }
@@ -657,19 +738,49 @@ mod tests {
                 .map(|item| (*item).to_owned())
                 .collect::<Vec<_>>()
         };
-        assert!(selected(&path, root, &filters(&["skills"])));
+        assert!(manifest_selected(&path, root, &filters(&["skills"])));
         assert!(selected(&path, root, &filters(&["!skills/other"])));
         assert!(!selected(&path, root, &[]));
         assert!(!selected(
             &path,
             root,
-            &filters(&["skills", "!skills/demo"])
+            &filters(&["skills/**", "!skills/demo"])
         ));
         assert!(selected(
             &path,
             root,
-            &filters(&["skills", "!skills/demo", "+skills/demo"])
+            &filters(&["skills/**", "!skills/demo", "+skills/demo"])
         ));
+    }
+    #[test]
+    fn exact_filter_overrides_do_not_expand_globs_or_depend_on_order() {
+        let root = Path::new("/package");
+        let path = root.join("prompts/nested/demo.md");
+        let patterns = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| (*item).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(selected(&path, root, &patterns(&["+missing.md"])));
+        assert!(selected(
+            &path,
+            root,
+            &patterns(&["!**", "+prompts/nested/demo.md"])
+        ));
+        assert!(!selected(&path, root, &patterns(&["!**", "+demo.md"])));
+        assert!(!selected(
+            &path,
+            root,
+            &patterns(&["!**", "+prompts/**/*.md"])
+        ));
+        assert!(!selected(
+            &path,
+            root,
+            &patterns(&["-prompts/nested/demo.md", "+prompts/nested/demo.md"])
+        ));
+        assert!(!selected(&path, root, &patterns(&["prompts/*.md"])));
+        assert!(selected(&path, root, &patterns(&["prompts/**/*.md"])));
     }
     #[test]
     fn scaffold_is_buildable_shape_and_refuses_overwrite() {
