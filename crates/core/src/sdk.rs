@@ -890,10 +890,13 @@ mod tests {
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
         ) -> crate::Outcome {
-            let results = futures_util::future::join_all(
-                (0..2).map(|_| host.call("barrier", serde_json::json!({}))),
-            )
-            .await;
+            let results = host
+                .call_batch(
+                    (0..2)
+                        .map(|_| ("barrier".into(), serde_json::json!({})))
+                        .collect(),
+                )
+                .await;
             assert!(
                 results
                     .iter()

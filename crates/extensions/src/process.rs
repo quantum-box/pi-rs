@@ -1,5 +1,5 @@
 //! Versioned process boundary for user-authored Rust extensions.
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -86,6 +86,8 @@ struct Description {
     dependencies: Vec<String>,
     commands: Vec<String>,
     tools: Vec<DescriptionTool>,
+    #[serde(default)]
+    host_calls: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
@@ -186,6 +188,7 @@ impl Extension for ExecutableExtension {
                     execution: tool.execution,
                     can_poll: tool.can_poll,
                     transactional: tool.transactional,
+                    host_calls: self.description.host_calls,
                 }) as Arc<dyn Tool>
             })
             .collect()
@@ -308,6 +311,7 @@ struct ExecutableTool {
     execution: ToolExecution,
     can_poll: bool,
     transactional: bool,
+    host_calls: bool,
 }
 impl ExecutableTool {
     async fn request<T: serde::de::DeserializeOwned + Send + 'static>(
@@ -328,6 +332,7 @@ impl ExecutableTool {
         context: ToolContext,
         state: Option<&ExtensionState>,
         programmatic: bool,
+        host: Arc<dyn ToolHost>,
     ) -> ToolReply {
         if !self.transactional {
             return self
@@ -343,9 +348,23 @@ impl ExecutableTool {
             transaction: true,
             programmatic,
         };
-        self.request(request, context.cancellation)
+        if self.host_calls {
+            let path = self.executable.clone();
+            let guard = CancelOnDrop(context.cancellation.child_token());
+            let cancellation = guard.0.clone();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                call_duplex(&path, request, host, &cancellation, &runtime)
+            })
             .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
             .unwrap_or_else(|error| Outcome::Unknown(error).into())
+        } else {
+            self.request(request, context.cancellation)
+                .await
+                .unwrap_or_else(|error| Outcome::Unknown(error).into())
+        }
     }
 }
 #[async_trait::async_trait]
@@ -380,23 +399,36 @@ impl Tool for ExecutableTool {
             .await
             .unwrap_or_else(Outcome::Unknown)
     }
+    async fn invoke_with_host(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> Outcome {
+        self.invoke_remote(arguments, context, state, false, host)
+            .await
+            .outcome
+    }
     async fn invoke_transaction(
         &self,
         arguments: Value,
         context: ToolContext,
         state: Option<&ExtensionState>,
-        _host: Arc<dyn ToolHost>,
+        host: Arc<dyn ToolHost>,
     ) -> ToolReply {
-        self.invoke_remote(arguments, context, state, false).await
+        self.invoke_remote(arguments, context, state, false, host)
+            .await
     }
     async fn invoke_programmatic(
         &self,
         arguments: Value,
         context: ToolContext,
         state: Option<&ExtensionState>,
-        _host: Arc<dyn ToolHost>,
+        host: Arc<dyn ToolHost>,
     ) -> ToolReply {
-        self.invoke_remote(arguments, context, state, true).await
+        self.invoke_remote(arguments, context, state, true, host)
+            .await
     }
     async fn poll(&self, reference: &str, context: ToolContext) -> Option<Outcome> {
         let request = ProtocolRequest::Poll {
@@ -423,6 +455,192 @@ impl ToolHost for DetachedHost {
     async fn call(&self, _: &str, _: Value) -> Outcome {
         Outcome::Skipped("host tool calls are unavailable through this executable protocol".into())
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DuplexRequest {
+    request: ProtocolRequest,
+    tools: Vec<ToolSpec>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DuplexFrame {
+    Call {
+        calls: Vec<(String, Value)>,
+    },
+    Complete {
+        response: std::result::Result<Value, String>,
+    },
+}
+
+fn write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
+    let mut bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 >= MAX_MESSAGE {
+        return Err("native extension frame exceeds 4 MiB".into());
+    }
+    bytes.push(b'\n');
+    writer
+        .write_all(&bytes)
+        .and_then(|_| writer.flush())
+        .map_err(|error| error.to_string())
+}
+fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> ExtensionResult<T> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_MESSAGE + 1)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_MESSAGE {
+        return Err("native extension frame exceeds 4 MiB".into());
+    }
+    if bytes.is_empty() {
+        return Err("native extension connection closed".into());
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))
+}
+
+fn call_duplex(
+    path: &Path,
+    request: ProtocolRequest,
+    host: Arc<dyn ToolHost>,
+    cancellation: &CancellationToken,
+    runtime: &tokio::runtime::Handle,
+) -> ExtensionResult<ToolReply> {
+    let mut command = Command::new(path);
+    command
+        .arg("--pi-rs-extension-v2")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
+    let mut input = child.stdin().take().expect("piped stdin");
+    let output = child.stdout().take().expect("piped stdout");
+    let (writer, writes) = std::sync::mpsc::sync_channel::<Value>(1);
+    let (errors, failed) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        for value in writes {
+            if let Err(error) = write_line(&mut input, &value) {
+                let _ = errors.send(error);
+                break;
+            }
+        }
+    });
+    let (sender, frames) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut output = std::io::BufReader::new(output);
+        loop {
+            let frame = read_line::<DuplexFrame>(&mut output);
+            let terminal = !matches!(frame, Ok(DuplexFrame::Call { .. }));
+            if sender.send(frame).is_err() || terminal {
+                break;
+            }
+        }
+    });
+    writer
+        .send(
+            serde_json::to_value(DuplexRequest {
+                request,
+                tools: host.tools(),
+            })
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|_| "native extension input closed")?;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(
+                "native extension operation cancelled; outcome requires reconciliation".into(),
+            );
+        }
+        if let Ok(error) = failed.try_recv() {
+            return Err(error);
+        }
+        match frames.recv_timeout(Duration::from_millis(5)) {
+            Ok(Ok(DuplexFrame::Call { calls })) => {
+                if calls.len() > 4096 {
+                    return Err("native extension batch exceeds execution limit".into());
+                }
+                let results = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during host call".to_owned()),
+                        results = host.call_batch(calls) => Ok(results),
+                    }
+                })?;
+                writer
+                    .send(serde_json::to_value(results).map_err(|error| error.to_string())?)
+                    .map_err(|_| "native extension input closed")?;
+            }
+            Ok(Ok(DuplexFrame::Complete { response })) => {
+                let result = serde_json::from_value(response?)
+                    .map_err(|error| format!("invalid native extension result: {error}"));
+                // A complete frame ends the operation. Drop also reaps descendants.
+                return result;
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("native extension output closed".into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+struct RemoteHost {
+    tools: Vec<ToolSpec>,
+    io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
+}
+#[async_trait::async_trait]
+impl ToolHost for RemoteHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.tools.clone()
+    }
+    async fn call(&self, name: &str, arguments: Value) -> Outcome {
+        self.call_batch(vec![(name.into(), arguments)])
+            .await
+            .remove(0)
+    }
+    async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
+        let count = calls.len();
+        let io = self.io.clone();
+        let result = tokio::task::spawn_blocking(move || -> ExtensionResult<Vec<Outcome>> {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            write_line(&mut io.1, &DuplexFrame::Call { calls })?;
+            let outcomes: Vec<Outcome> = read_line(&mut io.0)?;
+            if outcomes.len() != count {
+                return Err("native extension received an invalid batch size".into());
+            }
+            Ok(outcomes)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        result.unwrap_or_else(|error| vec![Outcome::Unknown(error); count])
+    }
+}
+fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
+    let mut input = std::io::BufReader::new(std::io::stdin());
+    let request: DuplexRequest = read_line(&mut input).map_err(Error::Config)?;
+    let host = Arc::new(RemoteHost {
+        tools: request.tools,
+        io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let response = runtime.block_on(dispatch_with_host(extension, request.request, host.clone()));
+    let mut io = host
+        .io
+        .lock()
+        .map_err(|_| Error::Config("native extension connection lock failed".into()))?;
+    write_line(&mut io.1, &DuplexFrame::Complete { response }).map_err(Error::Config)
 }
 
 struct CancelOnDrop(CancellationToken);
@@ -452,13 +670,9 @@ fn call<T: serde::de::DeserializeOwned>(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let child = command.spawn().map_err(|error| error.to_string())?;
-    let mut child = ChildGuard {
-        process: child,
-        finished: false,
-    };
-    let mut input = child.process.stdin.take().expect("piped stdin");
-    let output = child.process.stdout.take().expect("piped stdout");
+    let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
+    let mut input = child.stdin().take().expect("piped stdin");
+    let output = child.stdout().take().expect("piped stdout");
     let (writer, written) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let _ = writer.send(input.write_all(&bytes));
@@ -516,9 +730,52 @@ fn call<T: serde::de::DeserializeOwned>(
     serde_json::from_value(envelope.response?)
         .map_err(|error| format!("invalid native extension result: {error}"))
 }
+#[cfg(windows)]
+type NativeChild = Box<dyn process_wrap::std::ChildWrapper>;
+#[cfg(not(windows))]
+type NativeChild = std::process::Child;
 struct ChildGuard {
-    process: std::process::Child,
+    process: NativeChild,
     finished: bool,
+}
+impl ChildGuard {
+    fn spawn(command: Command) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        let process = {
+            let mut wrapped = process_wrap::std::CommandWrap::from(command);
+            wrapped.wrap(process_wrap::std::JobObject);
+            wrapped.spawn()?
+        };
+        #[cfg(not(windows))]
+        let process = {
+            let mut command = command;
+            command.spawn()?
+        };
+        Ok(Self {
+            process,
+            finished: false,
+        })
+    }
+    fn stdin(&mut self) -> &mut Option<std::process::ChildStdin> {
+        #[cfg(windows)]
+        {
+            self.process.stdin()
+        }
+        #[cfg(not(windows))]
+        {
+            &mut self.process.stdin
+        }
+    }
+    fn stdout(&mut self) -> &mut Option<std::process::ChildStdout> {
+        #[cfg(windows)]
+        {
+            self.process.stdout()
+        }
+        #[cfg(not(windows))]
+        {
+            &mut self.process.stdout
+        }
+    }
 }
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -540,6 +797,9 @@ impl Drop for ChildGuard {
 /// Entry point for a native extension binary. Its stdout is reserved for the
 /// protocol response. Diagnostic output belongs on stderr.
 pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
+    if std::env::args().any(|argument| argument == "--pi-rs-extension-v2") {
+        return serve_duplex(extension);
+    }
     let mut input = Vec::new();
     std::io::stdin()
         .take(MAX_MESSAGE + 1)
@@ -571,6 +831,14 @@ async fn dispatch(
     extension: Arc<dyn Extension>,
     request: ProtocolRequest,
 ) -> ExtensionResult<Value> {
+    dispatch_with_host(extension, request, Arc::new(DetachedHost)).await
+}
+
+async fn dispatch_with_host(
+    extension: Arc<dyn Extension>,
+    request: ProtocolRequest,
+    host: Arc<dyn ToolHost>,
+) -> ExtensionResult<Value> {
     match request {
         ProtocolRequest::Describe => encode(Ok(Description {
             id: extension.id().into(),
@@ -584,6 +852,7 @@ async fn dispatch(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            host_calls: true,
             tools: extension
                 .tools()
                 .into_iter()
@@ -654,7 +923,6 @@ async fn dispatch(
                 .ok_or_else(|| "unknown extension tool".to_owned())?;
             if transaction {
                 let context = context(&operation_id)?;
-                let host = Arc::new(DetachedHost);
                 let reply = if programmatic {
                     tool.invoke_programmatic(arguments, context, state.as_ref(), host)
                         .await
@@ -728,6 +996,24 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplex_frames_are_bounded_and_leave_later_frames_unread() {
+        let mut bytes = Vec::new();
+        write_line(&mut bytes, &serde_json::json!({"first":1})).unwrap();
+        write_line(&mut bytes, &serde_json::json!({"second":2})).unwrap();
+        let mut reader = std::io::Cursor::new(bytes);
+        assert_eq!(read_line::<Value>(&mut reader).unwrap()["first"], 1);
+        assert_eq!(read_line::<Value>(&mut reader).unwrap()["second"], 2);
+        assert!(read_line::<Value>(&mut reader).is_err());
+        assert!(write_line(&mut Vec::new(), &"x".repeat(MAX_MESSAGE as usize)).is_err());
+        let oversized = vec![b'x'; MAX_MESSAGE as usize + 1];
+        assert!(
+            read_line::<Value>(&mut std::io::Cursor::new(oversized))
+                .unwrap_err()
+                .contains("exceeds")
+        );
+    }
 
     struct PollTool;
     #[async_trait::async_trait]

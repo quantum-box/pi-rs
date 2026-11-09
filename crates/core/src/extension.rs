@@ -33,6 +33,15 @@ pub enum ToolExecution {
 pub trait ToolHost: Send + Sync {
     fn tools(&self) -> Vec<ToolSpec>;
     async fn call(&self, name: &str, arguments: Value) -> Outcome;
+    /// Submit an ordered group together so compatible reads can overlap.
+    async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
+        futures_util::future::join_all(
+            calls
+                .into_iter()
+                .map(|(name, arguments)| async move { self.call(&name, arguments).await }),
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]

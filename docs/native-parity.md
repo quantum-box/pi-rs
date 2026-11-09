@@ -299,7 +299,7 @@ private-store persistence across processes, and default MCP discovery and
 execution. Tests cover rollback, interruption, memory/stack limits, output
 truncation and parallel script calls through the core execution host. The
 native JSON code argument differs from Pi's provider-specific raw-code input.
-Non-chat model APIs and remaining execution-limit differences remain open. Executable extensions still lack bidirectional host-tool invocation.
+Non-chat model APIs and remaining execution-limit differences remain open.
 
 ### Resource selection checkpoint
 
@@ -569,3 +569,18 @@ remote-workspace resumption, filters, path display and terminal restoration.
 The Rust 1.89 CI matrix passed formatting, all-target Clippy and workspace tests
 on Linux, macOS and Windows at commit `706a249`. Subsequent changes receive the
 same matrix on main.
+
+### Native extension host calls
+
+Native executables built with the current `serve_extension` can discover and
+invoke host tools through protocol v2. Nested calls pass through the agent's
+normal policies, argument validation, journal and cancellation. `ToolHost`
+provides ordered batches so compatible reads can execute together. Existing
+protocol-v1 executables continue to load through their original interface.
+
+The `parallel_read` example demonstrates a Rust executable reading several files
+through that host interface. A CLI fixture verifies the model-to-extension-to-host
+round trip and individual journal entries. A cancellation fixture verifies that
+the native process and nested shell stop before a delayed side effect. Frames
+are bounded to 4 MiB. Native invocation uses the host's tool deadline, while
+legacy metadata hooks retain their existing bounded execution.

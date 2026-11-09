@@ -1913,6 +1913,7 @@ dependencies = [
  "futures-util",
  "libc",
  "pi-rs-core",
+ "process-wrap",
  "regex",
  "rquickjs",
  "serde",

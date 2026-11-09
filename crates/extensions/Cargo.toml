@@ -20,5 +20,8 @@ unicode-normalization = "0.1"
 unicode-segmentation = "1.12"
 rquickjs = { version = "0.14.0", features = ["futures", "parallel"] }
 
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "10", features = ["std"] }
+
 [dev-dependencies]
 futures-util = "0.3"

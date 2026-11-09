@@ -698,19 +698,26 @@ impl Agent<'_> {
                 tokio::select! {
                     completed = &mut outcomes => break completed,
                     Some(request) = async {
-                        match pending_requests.pop_front() {
-                            Some(request) => Some(request),
-                            None => incoming.recv().await,
+                        if pending_requests.is_empty() {
+                            pending_requests.extend(incoming.recv().await?);
                         }
+                        pending_requests.pop_front()
                     } => {
                         let parent = request.parent_operation;
                         let mut batch = vec![request];
                         while batch.len() < 8 {
-                            match incoming.try_recv() {
-                                Ok(request) if request.parent_operation == parent => batch.push(request),
-                                Ok(request) => { pending_requests.push_back(request); break; }
-                                Err(_) => break,
+                            if pending_requests.is_empty() {
+                                match incoming.try_recv() {
+                                    Ok(requests) => pending_requests.extend(requests),
+                                    Err(_) => break,
+                                }
                             }
+                            let request = pending_requests.pop_front().expect("queued nested request");
+                            if request.parent_operation != parent {
+                                pending_requests.push_front(request);
+                                break;
+                            }
+                            batch.push(request);
                         }
                         let nested = self.nested_tools(session, batch, states, observer);
                         tokio::pin!(nested);
@@ -1356,7 +1363,7 @@ struct NestedRequest {
     reply: oneshot::Sender<Outcome>,
 }
 struct NestedHost {
-    requests: mpsc::Sender<NestedRequest>,
+    requests: mpsc::Sender<Vec<NestedRequest>>,
     specs: Arc<Vec<ToolSpec>>,
     parent_operation: Uuid,
     cancellation: CancellationToken,
@@ -1369,30 +1376,53 @@ impl ToolHost for NestedHost {
         self.specs.as_ref().clone()
     }
     async fn call(&self, name: &str, arguments: serde_json::Value) -> Outcome {
-        if self.depth >= 8 || self.call_count.fetch_add(1, Ordering::Relaxed) >= 4096 {
-            return Outcome::Skipped("nested tool execution limit reached".into());
-        }
-        if arguments.to_string().len() > 1024 * 1024 {
-            return Outcome::Skipped("nested tool arguments exceed size limit".into());
-        }
-        let (reply, result) = oneshot::channel();
-        let request = NestedRequest {
-            name: name.into(),
-            arguments,
-            parent_operation: self.parent_operation,
-            cancellation: self.cancellation.clone(),
-            depth: self.depth + 1,
-            call_count: self.call_count.clone(),
-            reply,
-        };
-        tokio::select! {
-            biased;
-            _ = self.cancellation.cancelled() => return Outcome::Skipped("cancelled before nested dispatch".into()),
-            sent = self.requests.send(request) => if sent.is_err() { return Outcome::Skipped("parent tool has finished".into()); }
-        }
-        result
+        self.call_batch(vec![(name.into(), arguments)])
             .await
-            .unwrap_or_else(|_| Outcome::Unknown("nested tool response was lost".into()))
+            .remove(0)
+    }
+    async fn call_batch(&self, calls: Vec<(String, serde_json::Value)>) -> Vec<Outcome> {
+        let mut requests = Vec::new();
+        let mut results = Vec::new();
+        for (name, arguments) in calls {
+            let error =
+                if self.depth >= 8 || self.call_count.fetch_add(1, Ordering::Relaxed) >= 4096 {
+                    Some("nested tool execution limit reached")
+                } else if arguments.to_string().len() > 1024 * 1024 {
+                    Some("nested tool arguments exceed size limit")
+                } else {
+                    None
+                };
+            let (reply, result) = oneshot::channel();
+            if let Some(error) = error {
+                let _ = reply.send(Outcome::Skipped(error.into()));
+            } else {
+                requests.push(NestedRequest {
+                    name,
+                    arguments,
+                    parent_operation: self.parent_operation,
+                    cancellation: self.cancellation.clone(),
+                    depth: self.depth + 1,
+                    call_count: self.call_count.clone(),
+                    reply,
+                });
+            }
+            results.push(result);
+        }
+        if !requests.is_empty() {
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return results.into_iter().map(|_| Outcome::Skipped("cancelled before nested dispatch".into())).collect(),
+                sent = self.requests.send(requests) => if sent.is_err() {
+                    return results.into_iter().map(|_| Outcome::Skipped("parent tool has finished".into())).collect();
+                }
+            }
+        }
+        futures_util::future::join_all(results.into_iter().map(|result| async move {
+            result
+                .await
+                .unwrap_or_else(|_| Outcome::Unknown("nested tool response was lost".into()))
+        }))
+        .await
     }
 }
 
@@ -1589,4 +1619,41 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
         }
     }
     ensure_settled(session.operations())
+}
+
+#[cfg(test)]
+mod nested_host_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn batch_retains_invalid_argument_positions_without_dispatching_them() {
+        let (requests, mut incoming) = mpsc::channel(1);
+        let host = NestedHost {
+            requests,
+            specs: Arc::new(vec![]),
+            parent_operation: Uuid::new_v4(),
+            cancellation: CancellationToken::new(),
+            depth: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let calls = vec![
+            (
+                "oversized".into(),
+                serde_json::json!("x".repeat(1024 * 1024)),
+            ),
+            ("valid".into(), serde_json::json!({})),
+        ];
+        let (outcomes, ()) = tokio::join!(host.call_batch(calls), async {
+            let mut requests = incoming.recv().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = requests.remove(0);
+            assert_eq!(request.name, "valid");
+            request
+                .reply
+                .send(Outcome::Succeeded("done".into()))
+                .unwrap();
+        });
+        assert!(matches!(outcomes[0], Outcome::Skipped(_)));
+        assert_eq!(outcomes[1], Outcome::Succeeded("done".into()));
+    }
 }
