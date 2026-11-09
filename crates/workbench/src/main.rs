@@ -22,6 +22,7 @@ mod process;
 mod resources;
 mod rpc;
 mod runtime;
+mod session_import;
 mod sessions;
 mod tool_selection;
 mod ui;
@@ -847,6 +848,8 @@ fn metadata(record: &pi_rs::Record) -> Value {
         } => {
             json!({"event": "compacted", "retain_from": retain_from, "usage": usage})
         }
+        Event::UserImages { images } => json!({"event":"user_images","images":images.len()}),
+        Event::SourceEntry { format, .. } => json!({"event":"source_entry","format":format}),
         Event::ExtensionStates { states } => {
             let versions: Vec<_> = states
                 .iter()

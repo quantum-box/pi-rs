@@ -64,6 +64,13 @@ pub struct ToolCall {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ImageContent {
+    pub data: String,
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
     System {
@@ -71,6 +78,10 @@ pub enum Message {
     },
     User {
         content: String,
+    },
+    UserWithImages {
+        content: String,
+        images: Vec<ImageContent>,
     },
     Assistant {
         content: String,

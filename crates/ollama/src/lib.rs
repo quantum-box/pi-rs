@@ -375,6 +375,11 @@ fn encode_message(message: Message) -> Vec<Value> {
     match message {
         Message::System { content } => vec![json!({"role": "system", "content": content})],
         Message::User { content } => vec![json!({"role": "user", "content": content})],
+        Message::UserWithImages { content, images } => {
+            let mut blocks = vec![json!({"type":"text","text":content})];
+            blocks.extend(images.into_iter().map(|image| json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}", image.mime_type, image.data)}})));
+            vec![json!({"role":"user","content":blocks})]
+        }
         Message::Tool { call_id, content } => encode_tool_result(&call_id, content),
         Message::Assistant { content, calls } => {
             let mut message = json!({"role": "assistant", "content": content});
@@ -538,6 +543,23 @@ mod content_tests {
         assert_eq!(
             encode_tool_result("text", "unchanged".into())[0]["content"],
             "unchanged"
+        );
+    }
+    #[test]
+    fn user_images_are_sent_in_the_original_user_message() {
+        let messages = encode_message(Message::UserWithImages {
+            content: "look".into(),
+            images: vec![pi_rs_core::ImageContent {
+                data: "aW1hZ2U=".into(),
+                mime_type: "image/png".into(),
+            }],
+        });
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "look");
+        assert_eq!(
+            messages[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
         );
     }
 }

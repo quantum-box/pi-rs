@@ -39,6 +39,11 @@ pub struct RecordedReply {
 // Keep the public journal event shape stable as optional provider metadata grows.
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
+    /// Original external entry retained during an explicit session import.
+    SourceEntry {
+        format: String,
+        entry: serde_json::Value,
+    },
     Created {
         session_id: Uuid,
     },
@@ -74,6 +79,10 @@ pub enum Event {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_id: Option<Uuid>,
+    },
+    /// Images associated with the preceding user message on this branch.
+    UserImages {
+        images: Vec<crate::ImageContent>,
     },
     InputQueued {
         input: QueuedInput,
@@ -801,6 +810,17 @@ pub(crate) fn conversation(
             Event::User { content, .. } => messages.push(Message::User {
                 content: content.clone(),
             }),
+            Event::UserImages { images } => {
+                if let Some(message @ Message::User { .. }) = messages.last_mut() {
+                    let Message::User { content } = message else {
+                        unreachable!()
+                    };
+                    *message = Message::UserWithImages {
+                        content: content.clone(),
+                        images: images.clone(),
+                    };
+                }
+            }
             Event::Assistant {
                 content,
                 invocations,

@@ -160,6 +160,9 @@ impl View {
                     self.history.push(content.clone());
                     self.lines.push(Entry::User(content.clone()));
                 }
+                pi_rs::Event::UserImages { images } => {
+                    self.append(&format!("{} attached image(s)", images.len()));
+                }
                 pi_rs::Event::ModelFinished {
                     metadata, usage, ..
                 } => {

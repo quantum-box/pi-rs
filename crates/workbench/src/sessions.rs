@@ -55,7 +55,7 @@ pub fn import(source: &Path, destination: &Path) -> Result<()> {
     if !source.is_file() {
         return Err(Error::Config("session file not found".into()));
     }
-    let source = Session::open(source)?;
+    let source = super::session_import::read(source)?;
     if source.host_binding().is_some() {
         return Err(Error::Session(
             "managed sessions must be imported by their host".into(),
