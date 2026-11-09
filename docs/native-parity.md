@@ -1366,3 +1366,24 @@ repository, symlinks and result-limit notices. A six-call CLI model/tool/model
 round trip produced exactly the same results as the pinned Pi tool for the same
 fixture. Workspace tests and all-target Clippy passed. Full structured tool details and
 remaining native search edge cases still require acceptance work.
+
+### Local file-path input checkpoint
+
+The file tools share Pi-style input normalization for leading `@`, home-directory
+paths, file URLs and Unicode space variants. Windows input also accepts drive
+paths written in Git Bash, Cygwin and WSL form. Dot segments resolve before file
+lookup. Existing canonical-path checks and parent traversal restrictions remain
+in the workspace-scoped profile.
+
+Only reads try the reference's filename alternatives when the exact path is
+missing: screenshot AM/PM spacing, NFD Unicode, curly apostrophes and the combined
+NFD/apostrophe variant. Writes and edits use the requested normalized name.
+CLI attachments share the read resolver, so early canonicalization no longer
+prevents these alternatives from working.
+
+Tests cover normalization, file URLs, Windows drive forms, read-alternative
+precedence, attachment resolution and the distinction between read and edit.
+A five-call CLI tool round trip matched the pinned Pi read tool for the same
+mention, file URL, screenshot-spacing, apostrophe and NFD inputs. Workspace
+tests and all-target Clippy passed. Windows path conversion is unit-tested; interactive Windows acceptance remains
+open alongside the other platform-specific checks.

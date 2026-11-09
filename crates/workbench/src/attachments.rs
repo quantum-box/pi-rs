@@ -1,5 +1,5 @@
 //! Explicit @file inputs for the initial CLI prompt.
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pi_rs::{Error, ImageContent, Result};
 
@@ -13,20 +13,7 @@ pub fn expand(arguments: &[String], workspace: &Path) -> Result<(String, Vec<Ima
             messages.push(argument.as_str());
             continue;
         };
-        let path = if let Some(relative) = path.strip_prefix("~/") {
-            let home = std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .ok_or_else(|| Error::Config("home directory is unavailable".into()))?;
-            PathBuf::from(home).join(relative)
-        } else {
-            PathBuf::from(path)
-        };
-        let path = if path.is_absolute() {
-            path
-        } else {
-            workspace.join(path)
-        }
-        .canonicalize()?;
+        let path = tools.resolve_read_path(Path::new(path))?;
         let (content, attached) = tools.read_attachment(&path)?;
         let name = path
             .to_string_lossy()
@@ -53,6 +40,19 @@ pub fn expand(arguments: &[String], workspace: &Path) -> Result<(String, Vec<Ima
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attachments_use_reader_filename_fallbacks_and_file_urls() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("Capture d’ecran.md");
+        std::fs::write(&file, "fallback attachment").unwrap();
+        let (text, images) = expand(&["@Capture d'ecran.md".into()], directory.path()).unwrap();
+        assert!(text.contains("fallback attachment"));
+        assert!(images.is_empty());
+        let url = reqwest::Url::from_file_path(&file).unwrap();
+        let (text, _) = expand(&[format!("@{url}")], directory.path()).unwrap();
+        assert!(text.contains("fallback attachment"));
+    }
+
     #[test]
     fn explicit_text_and_image_files_share_the_normal_attachment_reader() {
         let directory = tempfile::tempdir().unwrap();

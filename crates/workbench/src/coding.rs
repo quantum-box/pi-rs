@@ -94,6 +94,19 @@ impl CodingTools {
         })
     }
 
+    /// Resolve a reader path, including Pi's filename fallbacks and this profile's scope.
+    pub fn resolve_read_path(&self, path: &Path) -> Result<PathBuf> {
+        CodingTool {
+            root: self.root.clone(),
+            unrestricted: self.unrestricted,
+            kind: Kind::Read,
+        }
+        .path(
+            path.to_str()
+                .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?,
+        )
+    }
+
     /// Read a user-selected attachment using the same image limits as the read tool.
     pub fn read_attachment(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
         let tool = CodingTool {
@@ -331,7 +344,7 @@ impl Tool for CodingTool {
 
 impl CodingTool {
     fn path(&self, value: &str) -> Result<PathBuf> {
-        let input = Path::new(value);
+        let input = crate::coding_paths::normalize(value)?;
         if !self.unrestricted
             && input
                 .components()
@@ -339,10 +352,11 @@ impl CodingTool {
         {
             return Err(Error::Config("parent traversal is not supported".into()));
         }
-        let path = if input.is_absolute() {
-            input.to_path_buf()
+        let path = crate::coding_paths::resolve(&self.root, &input);
+        let path = if matches!(self.kind, Kind::Read) {
+            crate::coding_paths::read_variant(path)
         } else {
-            self.root.join(input)
+            path
         };
         let resolved = path.canonicalize()?;
         if !self.unrestricted && !resolved.starts_with(&self.root) {
@@ -395,12 +409,8 @@ impl CodingTool {
         if content.len() as u64 > MAX_FILE_BYTES {
             return Err(Error::Config("content exceeds 4 MiB".into()));
         }
-        let input = Path::new(string(args, "path")?);
-        let target = if input.is_absolute() {
-            input.to_path_buf()
-        } else {
-            self.root.join(input)
-        };
+        let input = crate::coding_paths::normalize(string(args, "path")?)?;
+        let target = crate::coding_paths::resolve(&self.root, &input);
         if !self.unrestricted
             && (!target.starts_with(&self.root)
                 || input
@@ -1207,6 +1217,39 @@ mod tests {
         );
         assert!(
             tool.write(&json!({"path":"../escape.txt","content":"bad"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn file_tools_share_path_normalization_and_reader_fallbacks() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: false,
+            kind: Kind::Write,
+        };
+        tool.write(&json!({"path":"@nested/some\u{202f}file.txt", "content":"hello"}))
+            .unwrap();
+        let url = reqwest::Url::from_file_path(root.path().join("nested/some file.txt")).unwrap();
+        let reader = CodingTool {
+            kind: Kind::Read,
+            ..tool
+        };
+        assert_eq!(reader.read(&json!({"path":url.as_str()})).unwrap(), "hello");
+        assert!(reader.read(&json!({"path":"@../escape"})).is_err());
+        std::fs::write(root.path().join("Capture d’ecran.txt"), "curly").unwrap();
+        assert_eq!(
+            reader.read(&json!({"path":"Capture d'ecran.txt"})).unwrap(),
+            "curly"
+        );
+        let editor = CodingTool {
+            kind: Kind::Edit,
+            ..reader
+        };
+        assert!(
+            editor
+                .edit(&json!({"path":"Capture d'ecran.txt", "oldText":"curly", "newText":"other"}))
                 .is_err()
         );
     }
