@@ -331,6 +331,14 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
     }
     Err(Error::Config("unterminated resource frontmatter".into()))
 }
+pub fn prompt_argument(workspace: &Path, argument: &str) -> Result<String> {
+    let path = resource_path(workspace, argument);
+    if path.is_file() {
+        read(&path)
+    } else {
+        Ok(argument.into())
+    }
+}
 fn read(path: &Path) -> Result<String> {
     let mut text = String::new();
     std::fs::File::open(path)?
@@ -389,6 +397,19 @@ fn expand_arguments(body: &str, arguments: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prompt_arguments_accept_text_and_workspace_relative_files() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("system.md"), "File instruction").unwrap();
+        assert_eq!(
+            prompt_argument(directory.path(), "system.md").unwrap(),
+            "File instruction"
+        );
+        assert_eq!(
+            prompt_argument(directory.path(), "A literal instruction.").unwrap(),
+            "A literal instruction."
+        );
+    }
     #[test]
     fn prompt_uses_available_readers_and_preserves_custom_precedence() {
         let mut resources = Resources::default();

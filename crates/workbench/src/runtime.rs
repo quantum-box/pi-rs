@@ -58,14 +58,20 @@ impl Runtime {
 
 pub async fn configure(args: &Cli) -> Result<Runtime> {
     super::packages::prepare(args).await?;
-    let local_resources = resources::Resources::load(args)?;
+    let mut local_resources = resources::Resources::load(args)?;
+    for argument in &args.append_system_prompt {
+        local_resources.append_system.push_str("\n\n");
+        local_resources
+            .append_system
+            .push_str(&resources::prompt_argument(&args.workspace, argument)?);
+    }
     for warning in &local_resources.warnings {
         eprintln!("{warning}");
     }
     let base_prompt = args
         .system_prompt
         .as_ref()
-        .map(std::fs::read_to_string)
+        .map(|value| resources::prompt_argument(&args.workspace, &value.to_string_lossy()))
         .transpose()?
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into());
     let mcp_connections = mcp_config::connect_all(args, false).await?;

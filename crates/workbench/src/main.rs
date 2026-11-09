@@ -56,7 +56,7 @@ struct Cli {
     #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["session", "continue_session", "no_session"])]
     resume_session: Option<PathBuf>,
     /// Name the current session.
-    #[arg(long, global = true)]
+    #[arg(short = 'n', long, global = true)]
     name: Option<String>,
     /// Override the directory in which sessions are stored.
     #[arg(long, global = true)]
@@ -118,7 +118,7 @@ struct Cli {
     #[arg(long, global = true)]
     exclude_tools: Option<String>,
     /// Enable a bundled extension or a native extension executable. Repeatable.
-    #[arg(long = "extension", global = true)]
+    #[arg(short = 'e', long = "extension", global = true)]
     extensions: Vec<String>,
     /// Theme name, or a light/dark theme pair for automatic appearance.
     #[arg(long, global = true)]
@@ -134,9 +134,12 @@ struct Cli {
     #[cfg(feature = "evaluation-fixtures")]
     #[arg(long, global = true)]
     fixtures: Option<String>,
-    /// File containing the system prompt.
+    /// System prompt text or a file containing it.
     #[arg(long, global = true)]
     system_prompt: Option<PathBuf>,
+    /// Append system prompt text or an existing file. Repeatable.
+    #[arg(long, global = true)]
+    append_system_prompt: Vec<String>,
     /// Additional trusted instruction applied by the context extension.
     #[arg(long, global = true)]
     instruction: Option<String>,

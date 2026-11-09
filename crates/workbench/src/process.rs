@@ -85,6 +85,9 @@ impl Worker {
         if let Some(path) = &args.system_prompt {
             command.arg("--system-prompt").arg(path);
         }
+        for argument in &args.append_system_prompt {
+            command.arg("--append-system-prompt").arg(argument);
+        }
         if let Some(text) = &args.instruction {
             command.arg("--instruction").arg(text);
         }
@@ -180,7 +183,7 @@ fn configuration(args: &Cli) -> Value {
         "workspace":args.workspace,
         "endpoint":args.endpoint,"extensions":args.extensions,"disabled":args.disable_extension,
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
-        "system_prompt":args.system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
+        "system_prompt":args.system_prompt,"append_system_prompt":args.append_system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
         "tools":args.tools,"exclude_tools":args.exclude_tools,"no_tools":args.no_tools,"no_builtin_tools":args.no_builtin_tools,
         "coding_tools":args.coding_tools,"requests":args.max_requests,"output_tokens":args.max_output_tokens,
         "output_budget":args.output_budget,"context_window":args.context_window,

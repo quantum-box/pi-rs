@@ -251,3 +251,8 @@ saved journal in a new process. The remote task is dispatched once across both
 processes. Connection identity normalizes the workspace path and includes
 resolved credentials, so a resumed task cannot silently move to another
 configured identity.
+
+System prompt arguments accept literal text or existing files resolved from the
+workspace. Repeatable `--append-system-prompt` values preserve their order in
+both one-shot CLI and persistent RPC. Native `-e` and `-n` aliases select
+extensions and session names.
