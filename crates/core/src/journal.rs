@@ -1842,6 +1842,7 @@ mod snapshot_tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         let repaired = Session::open(&path).unwrap();
         assert_eq!(repaired.head(), head);
+        drop(repaired);
         assert!(std::fs::read(&path).unwrap().len() < before.len());
     }
 
