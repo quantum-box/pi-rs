@@ -253,3 +253,13 @@ Root の受付と AIP の取消を隔離 TiDB で競合させ、同じ実行状�
 失敗させ、通知の再送で書き込めた後だけ相関を完了することも確認した。
 AIP 統合16件と Runtime の完了通知18件が通過した。実環境の受入は残っている。
 [受付と取消の競合試験](https://github.com/quantum-box/tachyon-apps/commit/795c17d9d7c68f77033be348077837612c5fae97)
+
+
+### Workspace の起動直前に承認した Git 版を確認
+
+Workflow の承認と評価設定に完全な Git コミットIDを指定する。Root は受付で
+確定した版を使い、Workspace の書込みリース内でモデル接続前に HEAD と作業ツリーを
+照合する。実際の一時 Git リポジトリで、承認版から HEAD が変わった場合と作業中の
+ファイルが変わった場合に接続前に停止した。不正な版の受付では Workspace 操作が
+0件だった。Root 70件と隔離 TiDB を含む AIP 統合16件が通過した。
+[Workspace の Git 版照合と検証](https://github.com/quantum-box/tachyon-apps/commit/4b6357af859406871f77ebbc01d762957be4c735)
