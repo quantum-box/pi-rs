@@ -200,3 +200,13 @@ Workflow に紐づけ、子は既存の子予算で精算する。統合試験12
 Run 取消後の承認は拒否した。評価用 Workflow の起動設定と、外部ジョブの停止・
 再開への配線が残っている。
 [承認の単回利用と試験](https://github.com/quantum-box/tachyon-apps/commit/67491c7108ec6f8f4bc22c3fec2f64f1e954dcdb)
+
+
+### Workflow Goal の外部操作を同じターンで照会
+
+ジョブ受付後の応答消失を模擬し、保存済みの操作 ID を照会した。結果が未確定の間は
+完了報告を出さず、同じ Goal ターンを取り直して確認済みの結果から続行した。
+ジョブ送信は1件、モデル要求は2件で、使用量は要求ごとに1件だけ精算した。再開時は
+消費済み4トークンを元の出力上限10から差し引いた。実運用の Workflow worker が
+待機枠を超えた場合の保留経路と、Workspace の実停止確認は残っている。
+[Workflow ターンの照会と試験](https://github.com/quantum-box/tachyon-apps/commit/14cfa7c18a2c572759fb6d747cdbd017665ad801)
