@@ -161,3 +161,13 @@ Workflow に紐づけ、子は既存の子予算で精算する。統合試験12
 増えなかった。応答と使用量が確認できない子レビューの引継ぎは拒否した。
 運用環境での停止・再開の受入が残っている。
 [実行権の引継ぎと試験](https://github.com/quantum-box/tachyon-apps/commit/dca333c4e8cc3627b686be59863709159384ae1d)
+
+## Coding Job の委譲予算（PLT-6380、PLT-6382、PLT-6387）
+
+既存 Run 予算から委譲1回分を予約し、Workspace と操作の承認を受付直前に再確認する。
+隔離 TiDB の予算木と実行状態を使い、予算枯渇時の受付は0件だった。受付後に応答を
+失うと、元の操作を使用量確認待ちとして記録した。別 Workspace の照会では精算せず、
+正しい Workspace の受付を照会した時点で同じ操作 ID に1件だけ精算した。停止の
+確認まで再送や完了扱いは発生しなかった。受付、承認と停止確認は試験用で、
+運用 Workspace の受付先と承認元の接続は残っている。
+[Coding Job の予算と試験](https://github.com/quantum-box/tachyon-apps/commit/ab06f831b047b9f44df8e48a8a147048f81b9221)
