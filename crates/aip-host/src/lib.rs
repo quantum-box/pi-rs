@@ -5,6 +5,8 @@ mod model;
 mod review;
 mod tools;
 
+use std::{collections::BTreeSet, sync::Arc};
+
 pub use memory::*;
 pub use model::*;
 pub use review::*;
@@ -59,14 +61,23 @@ impl RunScope {
 pub struct HostRegistry {
     scope: RunScope,
     registry: Registry,
+    delegated: Arc<DelegatedTools>,
 }
 
 impl HostRegistry {
     pub async fn discover(
         scope: &RunScope,
-        port: std::sync::Arc<dyn DelegatedPort>,
-        names: std::collections::BTreeSet<String>,
-        mut extensions: Vec<std::sync::Arc<dyn pi_rs_core::Extension>>,
+        port: Arc<dyn DelegatedPort>,
+        names: BTreeSet<String>,
+        extensions: Vec<Arc<dyn pi_rs_core::Extension>>,
+    ) -> Result<Self> {
+        Self::discover_profiles(scope, [(port, names)], extensions).await
+    }
+
+    pub async fn discover_profiles(
+        scope: &RunScope,
+        profiles: impl IntoIterator<Item = (Arc<dyn DelegatedPort>, BTreeSet<String>)>,
+        mut extensions: Vec<Arc<dyn pi_rs_core::Extension>>,
     ) -> Result<Self> {
         if extensions
             .iter()
@@ -76,9 +87,8 @@ impl HostRegistry {
                 "AIP tools must come from the delegated profile".into(),
             ));
         }
-        extensions.push(std::sync::Arc::new(
-            DelegatedTools::discover(scope, port, names).await?,
-        ));
+        let delegated = Arc::new(DelegatedTools::discover_profiles(scope, profiles).await?);
+        extensions.push(delegated.clone());
         let registry = Registry::compose(extensions, &Default::default())?;
         if registry.has_tool("execute_command") {
             return Err(Error::Config(
@@ -88,6 +98,7 @@ impl HostRegistry {
         Ok(Self {
             scope: scope.clone(),
             registry,
+            delegated,
         })
     }
 }

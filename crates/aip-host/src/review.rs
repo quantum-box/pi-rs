@@ -30,7 +30,13 @@ impl ManagedReview<'_> {
             || child_scope.workspace != parent_scope.workspace
             || child_scope.journal_run_id == parent_scope.journal_run_id
             || child.session_id() == parent.session_id()
-            || !self.child.registry.registry.is_read_only()
+            || !self
+                .child
+                .registry
+                .delegated
+                .is_read_only_subset_of(&self.parent.registry.delegated)
+            || self.child.limits.model_timeout > self.parent.limits.model_timeout
+            || self.child.limits.tool_timeout > self.parent.limits.tool_timeout
             || self.child.limits.output_tokens_per_run > self.parent.limits.output_tokens_per_run
             || self.child.limits.output_tokens_per_request
                 > self.parent.limits.output_tokens_per_request

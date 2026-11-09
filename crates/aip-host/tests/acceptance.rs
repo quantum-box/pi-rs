@@ -40,11 +40,14 @@ fn delegation() -> Delegation {
 #[async_trait::async_trait]
 impl DelegatedPort for Platform {
     async fn discover(&self, _: &RunScope, names: &BTreeSet<String>) -> Result<Vec<Delegation>> {
-        Ok(names
-            .contains("fixture_submit")
-            .then(delegation)
-            .into_iter()
-            .collect())
+        let write = names.contains("fixture_submit").then(delegation);
+        let read = names.contains("fixture_read").then(|| {
+            let mut read = delegation();
+            read.spec.name = "fixture_read".into();
+            read.read_only = true;
+            read
+        });
+        Ok(write.into_iter().chain(read).collect())
     }
 
     async fn authorize(
@@ -367,6 +370,37 @@ async fn hosted_review_keeps_parent_child_identity_and_recovers_a_cancelled_chil
     };
     let mut parent = Session::with_store(MemoryStore::default()).unwrap();
     let mut child = Session::with_store(MemoryStore::default()).unwrap();
+    let extra_profile = HostRegistry::discover(
+        &child_scope,
+        platform.clone(),
+        ["fixture_read".into()].into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let extra_child = HostTurn {
+        registry: &extra_profile,
+        limits: child_turn.limits.clone(),
+        ..child_turn
+    };
+    let review_with_extra_tool = ManagedReview {
+        parent: &parent_turn,
+        child: &extra_child,
+        from_record: parent.head(),
+        task: "review with unauthorized tool",
+        resume: false,
+    };
+    assert!(matches!(
+        review_with_extra_tool
+            .run(
+                &mut parent,
+                &mut child,
+                &CancellationToken::new(),
+                &mut ignore
+            )
+            .await,
+        Err(Error::Config(_))
+    ));
     let (_, mut queue) = tokio::sync::mpsc::channel(1);
     let cancel = CancellationToken::new();
     parent_turn

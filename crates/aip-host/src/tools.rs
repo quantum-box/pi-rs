@@ -68,7 +68,7 @@ pub trait DelegatedPort: Send + Sync {
 }
 
 pub struct DelegatedTools {
-    tools: Vec<Arc<dyn Tool>>,
+    tools: Vec<Arc<RemoteTool>>,
 }
 
 impl DelegatedTools {
@@ -79,24 +79,43 @@ impl DelegatedTools {
         port: Arc<dyn DelegatedPort>,
         names: BTreeSet<String>,
     ) -> Result<Self> {
+        Self::discover_profiles(scope, [(port, names)]).await
+    }
+
+    pub(crate) async fn discover_profiles(
+        scope: &RunScope,
+        profiles: impl IntoIterator<Item = (Arc<dyn DelegatedPort>, BTreeSet<String>)>,
+    ) -> Result<Self> {
         let mut tools = Vec::new();
-        for delegation in port.discover(scope, &names).await? {
-            if !names.contains(&delegation.spec.name)
-                || delegation.resource.is_empty()
-                || delegation.version.is_empty()
-                || delegation.spec.name == "execute_command"
-            {
-                return Err(Error::Config(
-                    "discovery returned an unavailable or unbound tool".into(),
-                ));
+        for (port, names) in profiles {
+            for delegation in port.discover(scope, &names).await? {
+                if !names.contains(&delegation.spec.name)
+                    || delegation.resource.is_empty()
+                    || delegation.version.is_empty()
+                    || delegation.spec.name == "execute_command"
+                {
+                    return Err(Error::Config(
+                        "discovery returned an unavailable or unbound tool".into(),
+                    ));
+                }
+                tools.push(Arc::new(RemoteTool {
+                    scope: scope.clone(),
+                    port: port.clone(),
+                    delegation,
+                }));
             }
-            tools.push(Arc::new(RemoteTool {
-                scope: scope.clone(),
-                port: port.clone(),
-                delegation,
-            }) as Arc<dyn Tool>);
         }
         Ok(Self { tools })
+    }
+
+    pub(crate) fn is_read_only_subset_of(&self, parent: &Self) -> bool {
+        self.tools.iter().all(|tool| {
+            tool.delegation.read_only
+                && parent
+                    .tools
+                    .iter()
+                    .any(|candidate| candidate.delegation == tool.delegation)
+        })
     }
 }
 
@@ -105,7 +124,10 @@ impl Extension for DelegatedTools {
         "aip-delegated-tools"
     }
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        self.tools.clone()
+        self.tools
+            .iter()
+            .map(|tool| tool.clone() as Arc<dyn Tool>)
+            .collect()
     }
 }
 
