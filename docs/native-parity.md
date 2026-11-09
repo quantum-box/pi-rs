@@ -1039,4 +1039,19 @@ PTY fixtures verified blocked model turns with user and tool images for Kitty
 and iTerm2, transition into committed history, draft edits, resize reuse and
 terminal restoration. Fullscreen Kitty clipping and existing image fixtures
 also passed. Workspace tests and all-target Clippy passed on Rust 1.89.
-Partial iTerm2 images remain to be implemented.
+Partial iTerm2 images are covered by the following checkpoint.
+
+### Clipped iTerm2 image checkpoint
+
+iTerm2 images render their visible source rows when clipped at either viewport
+edge. The renderer waits until the last visible image row before drawing, then
+restores the cursor and retains the reserved row count. PNG cropping preserves
+transparency and uses a bounded 4 MiB cache for repeated viewport positions.
+Full committed images retain their original encoded payload.
+
+Pixel-level unit tests verified upper/lower crops, alpha and cache reuse. PTY
+fixtures decoded the actual emitted PNG data while exercising both terminal
+modes, scrolling, resize and terminal restoration. Existing Kitty crop, active
+image and inline-image fixtures also passed, along with workspace tests and
+all-target Clippy on Rust 1.89. Further cell-metric and aspect-ratio fidelity
+work remains in the terminal surface.

@@ -1,5 +1,5 @@
 //! Terminal image placements for the Kitty and iTerm2 protocols used by Pi.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -157,11 +157,17 @@ impl Cleanup {
         ids.clear();
     }
 }
+struct CroppedImage {
+    data: String,
+    bytes: usize,
+}
+
 pub struct Renderer {
     protocol: Option<Protocol>,
     uploaded: BTreeSet<u32>,
     placed: BTreeSet<(u32, u32)>,
     cleanup: Cleanup,
+    crops: BTreeMap<(u32, u32, u32), Arc<CroppedImage>>,
 }
 impl Default for Renderer {
     fn default() -> Self {
@@ -170,6 +176,7 @@ impl Default for Renderer {
             uploaded: BTreeSet::new(),
             placed: BTreeSet::new(),
             cleanup: Cleanup::default(),
+            crops: BTreeMap::new(),
         }
     }
 }
@@ -184,6 +191,7 @@ impl Renderer {
         self.cleanup.clear();
         self.uploaded.clear();
         self.placed.clear();
+        self.crops.clear();
     }
     pub fn clear_placements(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         self.clear_region(out, None)
@@ -242,14 +250,20 @@ impl Renderer {
         if available_rows == 0 || self.placed.contains(&(image.id, placement_id)) {
             return Ok(());
         }
-        if protocol == Protocol::Iterm2
-            && (placement.offset + 1 != placement.rows || row.saturating_add(1) < placement.rows)
-        {
-            return Ok(());
-        }
+        let iterm_rows = if row == usize::MAX {
+            if protocol == Protocol::Iterm2 && placement.offset + 1 != placement.rows {
+                return Ok(());
+            }
+            placement.rows
+        } else {
+            if protocol == Protocol::Iterm2 && available_rows != 1 {
+                return Ok(());
+            }
+            (placement.offset + 1).min(row + 1)
+        };
         queue!(out, SavePosition)?;
-        if protocol == Protocol::Iterm2 && placement.rows > 1 {
-            queue!(out, MoveUp((placement.rows - 1) as u16))?;
+        if protocol == Protocol::Iterm2 && iterm_rows > 1 {
+            queue!(out, MoveUp((iterm_rows - 1) as u16))?;
         }
         queue!(out, MoveToColumn(0))?;
         match protocol {
@@ -286,16 +300,73 @@ impl Renderer {
                 self.placed.insert((image.id, placement_id));
             }
             Protocol::Iterm2 => {
-                write!(
-                    out,
-                    "\x1b]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=1:{}\x07",
-                    image.bytes, placement.columns, placement.rows, image.data
-                )?;
+                let hidden_rows = placement.offset + 1 - iterm_rows;
+                let source_start =
+                    (u64::from(image.height) * hidden_rows as u64) / placement.rows as u64;
+                let source_end = (u64::from(image.height) * (hidden_rows + iterm_rows) as u64)
+                    .div_ceil(placement.rows as u64)
+                    .min(u64::from(image.height));
+                if source_start == 0 && source_end == u64::from(image.height) {
+                    write_iterm(out, &image.data, image.bytes, placement.columns, iterm_rows)?;
+                } else {
+                    let crop = self.cropped_image(
+                        image,
+                        source_start as u32,
+                        (source_end - source_start).max(1) as u32,
+                    )?;
+                    write_iterm(out, &crop.data, crop.bytes, placement.columns, iterm_rows)?;
+                }
                 self.placed.insert((image.id, placement_id));
             }
         }
         queue!(out, RestorePosition)
     }
+
+    fn cropped_image(
+        &mut self,
+        image: &InlineImage,
+        top: u32,
+        height: u32,
+    ) -> std::io::Result<Arc<CroppedImage>> {
+        let key = (image.id, top, height);
+        if let Some(crop) = self.crops.get(&key) {
+            return Ok(crop.clone());
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .map_err(std::io::Error::other)?;
+        let image = image::load_from_memory(&bytes).map_err(std::io::Error::other)?;
+        let cropped = image.crop_imm(0, top, image.width(), height);
+        let mut png = Vec::new();
+        cropped
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(std::io::Error::other)?;
+        let crop = Arc::new(CroppedImage {
+            data: base64::engine::general_purpose::STANDARD.encode(&png),
+            bytes: png.len(),
+        });
+        const CACHE_BYTES: usize = 4 * 1024 * 1024;
+        if crop.data.len() <= CACHE_BYTES {
+            let cached: usize = self.crops.values().map(|crop| crop.data.len()).sum();
+            if cached + crop.data.len() > CACHE_BYTES {
+                self.crops.clear();
+            }
+            self.crops.insert(key, crop.clone());
+        }
+        Ok(crop)
+    }
+}
+fn write_iterm(
+    out: &mut impl Write,
+    data: &str,
+    bytes: usize,
+    columns: usize,
+    rows: usize,
+) -> std::io::Result<()> {
+    write!(
+        out,
+        "\x1b]1337;File=inline=1;size={bytes};width={columns};height={rows};preserveAspectRatio=1:{data}\x07"
+    )
 }
 fn write_kitty_data(out: &mut impl Write, image: &InlineImage) -> std::io::Result<()> {
     let chunks = image.data.as_bytes().chunks(4096);
@@ -322,11 +393,13 @@ mod tests {
     use super::*;
     use image::ImageFormat;
     fn fixture() -> Arc<InlineImage> {
-        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            18,
-            36,
-            image::Rgba([255, 0, 0, 120]),
-        ));
+        let mut pixels = image::RgbaImage::from_pixel(18, 36, image::Rgba([255, 0, 0, 120]));
+        for y in 18..36 {
+            for x in 0..18 {
+                pixels.put_pixel(x, y, image::Rgba([0, 0, 255, 120]));
+            }
+        }
+        let image = image::DynamicImage::ImageRgba8(pixels);
         let mut bytes = Vec::new();
         image
             .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
@@ -343,6 +416,7 @@ mod tests {
             uploaded: BTreeSet::new(),
             placed: BTreeSet::new(),
             cleanup: Cleanup::default(),
+            crops: BTreeMap::new(),
         }
     }
     #[test]
@@ -486,6 +560,45 @@ mod tests {
         assert!(output.contains("width=2;height=1;preserveAspectRatio=1:"));
         assert!(!output.contains("[0A"));
     }
+    #[test]
+    fn iterm_crops_visible_rows_and_reuses_encoded_pixels() {
+        let mut renderer = renderer(Protocol::Iterm2);
+        let image = fixture();
+        for (offset, expected) in [(0, [255, 0, 0, 120]), (1, [0, 0, 255, 120])] {
+            let line = Line {
+                image: Some(Placement {
+                    image: image.clone(),
+                    columns: 2,
+                    rows: 2,
+                    offset,
+                }),
+                ..Default::default()
+            };
+            let mut output = Vec::new();
+            renderer.paint_active(&line, &mut output, 0, 1).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            let encoded = output
+                .split("preserveAspectRatio=1:")
+                .nth(1)
+                .unwrap()
+                .split('\x07')
+                .next()
+                .unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            let pixels = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            assert_eq!(pixels.dimensions(), (18, 18));
+            assert_eq!(pixels.get_pixel(0, 0).0, expected);
+            assert!(output.contains("width=2;height=1;"));
+            renderer.clear_active(&mut Vec::new()).unwrap();
+        }
+        let first = renderer.cropped_image(&image, 0, 18).unwrap();
+        let second = renderer.cropped_image(&image, 0, 18).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(renderer.crops.len(), 2);
+    }
+
     #[test]
     fn kitty_payload_chunks_terminate_the_transfer() {
         let image = InlineImage {
