@@ -191,3 +191,13 @@ before settings change. User and trusted-project declarations support resource
 filters. Packaged extensions, skills, prompts and themes load through the
 normal terminal/CLI/RPC resource paths. TypeScript/npm runtime compatibility is
 outside the requested native Rust equivalence.
+
+### System prompt checkpoint
+
+The native default uses Pi's coding-assistant preamble and separate tool,
+rule, project-context, skills and working-directory sections. The prompt names
+only registered tools. Skill discovery is exposed to the model when a usable
+file-reading tool is registered; manual skill invocation remains available.
+Explicit `--system-prompt` content takes precedence over project SYSTEM.md.
+Skill metadata is XML-escaped and relative-path guidance matches native skill
+loading. Tests cover reader gating and custom-prompt precedence.

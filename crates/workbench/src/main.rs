@@ -27,8 +27,7 @@ mod ui;
 
 static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
 
-const DEFAULT_SYSTEM_PROMPT: &str =
-    "You are a workspace assistant. Use tools when needed and answer accurately.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
 
 #[derive(Parser, Clone)]
 #[command(name = "pi-rs", version, about)]

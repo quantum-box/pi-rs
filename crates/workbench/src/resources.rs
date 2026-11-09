@@ -182,25 +182,69 @@ impl Resources {
         }
         Ok(resources)
     }
-    pub fn system_prompt(&self, base: &str) -> String {
-        let mut text = self.system.as_deref().unwrap_or(base).to_owned();
-        text.push_str(&self.append_system);
-        text.push_str(&self.instructions);
+    pub fn system_prompt(
+        &self,
+        base: &str,
+        custom: bool,
+        tools: &[pi_rs::ToolSpec],
+        workspace: &Path,
+    ) -> String {
+        let mut text = if custom {
+            base
+        } else {
+            self.system.as_deref().unwrap_or(base)
+        }
+        .to_owned();
+        if !custom && self.system.is_none() {
+            text.push_str("\n\n<tools>\n");
+            if tools.is_empty() {
+                text.push_str("(none)\n");
+            }
+            for tool in tools {
+                text.push_str(&format!("- {}: {}\n", tool.name, tool.description));
+            }
+            text.push_str("Additional tools may be available.\n</tools>\n\n<rules>\n");
+            if tools.iter().any(|tool| tool.name == "read") {
+                text.push_str("- Use read to inspect files before editing them.\n");
+            }
+            if tools.iter().any(|tool| tool.name == "edit") {
+                text.push_str("- Use edit for targeted changes. Batch changes to one file in a single call.\n- Each edits[].oldText must exactly and uniquely match the original file. Keep matches short and non-overlapping; merge nearby changes without including large unchanged regions.\n");
+            }
+            if tools.iter().any(|tool| tool.name == "write") {
+                text.push_str("- Use write only for new files or complete rewrites.\n");
+            }
+            text.push_str("- Be concise in your responses.\n- Show file paths clearly when working with files.\n</rules>");
+        }
+        if !self.append_system.is_empty() {
+            text.push_str(&format!(
+                "\n\n<addendum>\n{}\n</addendum>",
+                self.append_system
+            ));
+        }
+        if !self.instructions.is_empty() {
+            text.push_str(&format!(
+                "\n\n<project_context>\n{}\n</project_context>",
+                self.instructions
+            ));
+        }
+        let reader = ["read", "bash", "powershell"]
+            .into_iter()
+            .find(|name| tools.iter().any(|tool| tool.name == *name));
         let automatic = self
             .skills
             .iter()
             .filter(|(_, skill)| skill.automatic)
             .collect::<Vec<_>>();
-        if !automatic.is_empty() {
-            text.push_str("\n\nAvailable skills. Read a matching SKILL.md before following its instructions.\n");
+        if let Some(reader) = reader
+            && !automatic.is_empty()
+        {
+            text.push_str(&format!("\n\n<skills>\nThe following skills provide specialized instructions for specific tasks.\nUse {reader} to load a skill's file when the task matches its description.\nResolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.\n\n<available_skills>\n"));
             for (name, skill) in automatic {
-                text.push_str(&format!(
-                    "- {name}: {} ({})\n",
-                    skill.description,
-                    skill.path.display()
-                ));
+                text.push_str(&format!("  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n", xml(name), xml(&skill.description), xml(&skill.path.to_string_lossy())));
             }
+            text.push_str("</available_skills>\n</skills>");
         }
+        text.push_str(&format!("\n\n<cwd>\n{}\n</cwd>", workspace.display()));
         text
     }
     pub fn expand(&self, input: &str) -> Result<Option<String>> {
@@ -225,6 +269,14 @@ impl Resources {
         };
         Ok(Some(expand_arguments(&prompt.body, arguments)?))
     }
+}
+fn xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 fn resource_path(workspace: &Path, path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/")
@@ -337,6 +389,36 @@ fn expand_arguments(body: &str, arguments: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prompt_uses_available_readers_and_preserves_custom_precedence() {
+        let mut resources = Resources::default();
+        resources.skills.insert(
+            "demo&skill".into(),
+            Skill {
+                path: "/tmp/SKILL.md".into(),
+                description: "specific <task>".into(),
+                automatic: true,
+            },
+        );
+        let no_reader = resources.system_prompt("default", false, &[], Path::new("/workspace"));
+        assert!(!no_reader.contains("available_skills"));
+        let tools = [pi_rs::ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({}),
+        }];
+        let prompt = resources.system_prompt("default", false, &tools, Path::new("/workspace"));
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("demo&amp;skill"));
+        assert!(prompt.contains("specific &lt;task&gt;"));
+        resources.system = Some("project system".into());
+        let custom =
+            resources.system_prompt("explicit system", true, &tools, Path::new("/workspace"));
+        assert!(custom.starts_with("explicit system"));
+        assert!(!custom.contains("project system"));
+        assert!(!custom.contains("<rules>"));
+        assert!(custom.contains("<skills>"));
+    }
     #[test]
     fn templates_preserve_quoted_arguments_defaults_and_slices() {
         assert_eq!(

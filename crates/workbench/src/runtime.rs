@@ -62,18 +62,12 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
     for warning in &local_resources.warnings {
         eprintln!("{warning}");
     }
-    let mut system_prompt = args
+    let base_prompt = args
         .system_prompt
         .as_ref()
         .map(std::fs::read_to_string)
         .transpose()?
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into());
-    if args.system_prompt.is_some() {
-        system_prompt.push_str(&local_resources.append_system);
-        system_prompt.push_str(&local_resources.instructions);
-    } else {
-        system_prompt = local_resources.system_prompt(&system_prompt);
-    }
     let mcp_connections = mcp_config::connect_all(args, false).await?;
     let result = async {
         let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
@@ -133,6 +127,12 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
                 &args.workspace,
             )?))?;
         }
+        let system_prompt = local_resources.system_prompt(
+            &base_prompt,
+            args.system_prompt.is_some(),
+            &registry.tool_specs(),
+            &args.workspace,
+        );
         let show_reasoning = args.trace;
         let provider = Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?
             .with_reasoning_effort(args.thinking.as_deref())
