@@ -36,6 +36,8 @@ pub struct RecordedReply {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Keep the public journal event shape stable as optional provider metadata grows.
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     Created {
         session_id: Uuid,

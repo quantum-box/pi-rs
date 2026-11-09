@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use pi_rs::{
     Agent, CancellationToken, Compaction, Error, Event, InputKind, Limits, Notification,
     OperationState, Outcome, ProjectResources, QueuedInput, Registry, Result, Session,
@@ -16,9 +16,11 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod config;
 mod interactive;
 mod process;
 mod rpc;
+mod ui;
 
 static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
 
@@ -28,6 +30,8 @@ const DEFAULT_SYSTEM_PROMPT: &str =
 #[derive(Parser)]
 #[command(name = "pi-rs", version, about)]
 struct Cli {
+    #[arg(skip)]
+    settings: config::Settings,
     /// Path to the private append-only session journal.
     #[arg(long, default_value_os_t = interactive::new_session_path())]
     session: PathBuf,
@@ -72,6 +76,13 @@ struct Cli {
     /// Enable a bundled extension or a native extension executable. Repeatable.
     #[arg(long = "extension", global = true)]
     extensions: Vec<String>,
+    /// Theme name, or a light/dark theme pair for automatic appearance.
+    #[arg(long, global = true)]
+    use_theme: Option<String>,
+    /// Additional theme file or directory. Repeatable.
+    #[arg(long = "theme", global = true)]
+    themes: Vec<PathBuf>,
+    /// Terminal presentation mode.
     /// Optional read-only order API collection URL.
     #[arg(long, global = true)]
     orders: Option<String>,
@@ -178,8 +189,29 @@ enum Control {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let args = Cli::parse();
-    if let Err(err) = execute(args).await {
+    let matches = Cli::command().get_matches();
+    let result = async {
+        let mut args =
+            Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        args.settings = config::Settings::load(&args.workspace, args.project.is_some())?;
+        if matches.value_source("model") != Some(clap::parser::ValueSource::CommandLine)
+            && let Some(model) = args.settings.string("defaultModel")
+        {
+            args.model = model.into();
+        }
+        args.themes.extend(
+            args.settings
+                .strings("themes")
+                .into_iter()
+                .map(PathBuf::from),
+        );
+        if args.use_theme.is_none() {
+            args.use_theme = args.settings.string("theme").map(str::to_owned);
+        }
+        execute(args).await
+    }
+    .await;
+    if let Err(err) = result {
         eprintln!("{err}");
         std::process::exit(if matches!(err, Error::Cancelled) {
             130
@@ -335,8 +367,14 @@ async fn execute(mut args: Cli) -> Result<()> {
             &args.workspace,
         )?))?;
     }
+    let show_reasoning = args.trace;
     let provider = Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?
-        .with_progress(|stage| output(json!({"type":"model_progress","stage":stage})));
+        .with_progress(|stage| output(json!({"type":"model_progress","stage":stage})))
+        .with_reasoning(move |delta| {
+            if show_reasoning {
+                output(json!({"type":"reasoning_delta","delta":delta}));
+            }
+        });
     let agent = Agent {
         model: &provider,
         model_name: &args.model,
@@ -553,6 +591,8 @@ fn metadata(record: &pi_rs::Record) -> Value {
             failure,
             ..
         } => {
+            let mut metadata = metadata.clone();
+            metadata.reasoning = None;
             json!({"event": "model_finished", "request_id": request_id, "metadata": metadata, "usage": usage, "failure": failure})
         }
         Event::TurnFinished { assistant_record } => {

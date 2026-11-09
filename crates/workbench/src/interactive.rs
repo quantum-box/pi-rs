@@ -3,14 +3,20 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::ui::{
+    editor::Editor,
+    keys::Keys,
+    render::{Entry, Line},
+    theme::Theme,
+};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::style::ResetColor;
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use pi_rs::{Error, Message, Result, Session};
+use pi_rs::{Error, Result, Session};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
@@ -19,10 +25,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{Cli, process::Worker};
 
 pub(super) fn new_session_path() -> PathBuf {
-    let home = std::env::var_os("PI_RS_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi-rs")))
-        .unwrap_or_else(|| std::env::temp_dir().join("pi-rs"));
+    let home = crate::config::agent_dir();
     // Group local sessions without including the working directory in filenames.
     let workspace = std::env::current_dir().unwrap_or_default();
     let hash = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
@@ -85,48 +88,11 @@ impl Drop for Terminal {
 }
 
 #[derive(Default)]
-struct Editor {
-    text: String,
-    cursor: usize,
-}
-impl Editor {
-    fn insert(&mut self, text: &str) {
-        let text = clean(text);
-        self.text.insert_str(self.cursor, &text);
-        self.cursor += text.len();
-    }
-    fn left(&mut self) {
-        self.cursor = self.text[..self.cursor]
-            .grapheme_indices(true)
-            .next_back()
-            .map_or(0, |(index, _)| index);
-    }
-    fn right(&mut self) {
-        self.cursor += self.text[self.cursor..]
-            .graphemes(true)
-            .next()
-            .map_or(0, str::len);
-    }
-    fn backspace(&mut self) {
-        let end = self.cursor;
-        self.left();
-        self.text.replace_range(self.cursor..end, "");
-    }
-    fn delete(&mut self) {
-        let start = self.cursor;
-        self.right();
-        self.text.replace_range(start..self.cursor, "");
-        self.cursor = start;
-    }
-    fn take(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.text)
-    }
-}
-
-#[derive(Default)]
 struct View {
-    lines: Vec<String>,
+    lines: Vec<Entry>,
+    thinking: String,
+    expand_tools: bool,
+    hide_thinking: bool,
     streaming: String,
     editor: Editor,
     scroll: usize,
@@ -138,7 +104,7 @@ struct View {
 }
 impl View {
     fn append(&mut self, text: &str) {
-        self.lines.extend(clean(text).lines().map(str::to_owned));
+        self.lines.push(Entry::Notice(clean(text)));
         if self.lines.len() > 4000 {
             self.lines.drain(..self.lines.len() - 4000);
         }
@@ -152,30 +118,84 @@ impl View {
         }
         self.lines.clear();
         self.streaming.clear();
+        self.thinking.clear();
+        self.history.clear();
+        self.history_index = None;
         self.tokens = 0;
         for record in session.branch() {
-            if let pi_rs::Event::ModelFinished {
-                usage: pi_rs::UsageReport::Measured { usage },
-                ..
-            } = &record.event
-            {
-                self.tokens = self
-                    .tokens
-                    .saturating_add(usage.input_tokens)
-                    .saturating_add(usage.output_tokens);
-            }
-        }
-        for message in session.conversation_at(session.head())? {
-            match message {
-                Message::User { content } => self.append(&format!("You › {content}")),
-                Message::Assistant { content, .. } if !content.is_empty() => {
-                    self.append(&format!("Pi › {content}\n"))
+            match &record.event {
+                pi_rs::Event::User { content, .. } => {
+                    self.history.push(content.clone());
+                    self.lines.push(Entry::User(content.clone()));
+                }
+                pi_rs::Event::ModelFinished {
+                    metadata, usage, ..
+                } => {
+                    if let Some(reasoning) = &metadata.reasoning {
+                        self.lines.push(Entry::Thinking(reasoning.clone()));
+                    }
+                    if let pi_rs::UsageReport::Measured { usage } = usage {
+                        self.tokens = self
+                            .tokens
+                            .saturating_add(usage.input_tokens)
+                            .saturating_add(usage.output_tokens);
+                    }
+                }
+                pi_rs::Event::Assistant {
+                    content,
+                    invocations,
+                    ..
+                } => {
+                    if !content.is_empty() {
+                        self.lines.push(Entry::Assistant(content.clone()));
+                    }
+                    for invocation in invocations {
+                        self.lines.push(Entry::Tool {
+                            id: invocation.operation_id.to_string(),
+                            name: invocation.call.name.clone(),
+                            arguments: invocation.call.arguments.clone(),
+                            output: String::new(),
+                            failed: false,
+                            finished: false,
+                        });
+                    }
+                }
+                pi_rs::Event::ToolFinished {
+                    operation_id,
+                    outcome,
+                    ..
+                }
+                | pi_rs::Event::ToolReconciled {
+                    operation_id,
+                    outcome,
+                } => {
+                    self.finish_tool(&operation_id.to_string(), outcome);
                 }
                 _ => {}
             }
         }
-        self.append("Enter to send · Alt+Enter to queue · Esc to stop · /help for commands");
+        self.append("Enter to send · Alt+Enter to queue · Ctrl+O tools · Ctrl+T thinking · /help");
         Ok(())
+    }
+    fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
+        if let Some(Entry::Tool {
+            output,
+            failed,
+            finished,
+            ..
+        }) = self
+            .lines
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == operation))
+        {
+            *output = outcome.tool_content();
+            *failed = !matches!(
+                outcome,
+                pi_rs::Outcome::Succeeded(_) | pi_rs::Outcome::Structured { .. }
+            );
+            *finished = true;
+        }
     }
     fn receive(&mut self, value: Value) {
         match value["type"].as_str() {
@@ -188,16 +208,12 @@ impl View {
                     _ => "モデル応答待ち",
                 });
             }
+            Some("reasoning_delta") => self
+                .thinking
+                .push_str(value["delta"].as_str().unwrap_or_default()),
             Some("text_delta") => self
                 .streaming
                 .push_str(value["delta"].as_str().unwrap_or_default()),
-            Some("answer" | "review_answer") => {
-                self.streaming.clear();
-                self.append(&format!(
-                    "Pi › {}\n",
-                    value["content"].as_str().unwrap_or_default()
-                ));
-            }
             Some("error") => self.append(&format!(
                 "Error › {}",
                 value["message"].as_str().unwrap_or_default()
@@ -210,24 +226,42 @@ impl View {
                         self.phase = Some("モデル応答待ち");
                     }
                     Some("assistant") => {
+                        self.streaming.clear();
+                        let thinking = std::mem::take(&mut self.thinking);
+                        if !thinking.is_empty() {
+                            self.lines.push(Entry::Thinking(thinking));
+                        }
+                        let content = event["content"].as_str().unwrap_or_default();
+                        if !content.is_empty() {
+                            self.lines.push(Entry::Assistant(content.into()));
+                        }
                         if let Some(calls) = event["invocations"].as_array() {
                             if !calls.is_empty() {
                                 self.phase = Some("ツール実行中");
                             }
                             for call in calls {
-                                self.append(&format!(
-                                    "Tool › {}",
-                                    call["call"]["name"].as_str().unwrap_or("tool")
-                                ));
+                                self.lines.push(Entry::Tool {
+                                    id: call["operation_id"].as_str().unwrap_or_default().into(),
+                                    name: call["call"]["name"].as_str().unwrap_or("tool").into(),
+                                    arguments: call["call"]["arguments"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .into(),
+                                    output: String::new(),
+                                    failed: false,
+                                    finished: false,
+                                });
                             }
                         }
                     }
-                    Some("tool_finished") => {
+                    Some("tool_finished" | "tool_reconciled") => {
                         self.phase = Some("処理を継続中");
-                        self.append(&format!(
-                            "Tool › {}",
-                            event["outcome"]["status"].as_str().unwrap_or("finished")
-                        ));
+                        if let Ok(outcome) = serde_json::from_value(event["outcome"].clone()) {
+                            self.finish_tool(
+                                event["operation_id"].as_str().unwrap_or_default(),
+                                &outcome,
+                            );
+                        }
                     }
                     Some("model_finished") => {
                         self.phase = Some("結果を保存中");
@@ -238,29 +272,39 @@ impl View {
                             .saturating_add(usage["output_tokens"].as_u64().unwrap_or(0));
                     }
                     Some("input_queued") => self.append("Input queued"),
-                    Some("extension_states") => self.append("Extension state saved"),
                     _ => {}
                 }
             }
             _ => {}
         }
     }
-    fn draw(&self, args: &Cli, busy: bool) -> Result<()> {
+    fn draw(&self, args: &Cli, theme: &Theme, busy: bool) -> Result<()> {
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
-        let height = usize::from(height.max(4));
-        let prompt = wrap(&format!("> {}", self.editor.text), width);
-        let prompt_height = prompt.len().clamp(1, 6).min(height.saturating_sub(3));
-        let body_height = height.saturating_sub(prompt_height + 3);
-        let mut lines: Vec<String> = self
+        let height = usize::from(height.max(7));
+        let prompt = wrap(&self.editor.text, width);
+        let prompt_height = prompt.len().clamp(1, 6).min(height.saturating_sub(5));
+        let body_height = height.saturating_sub(prompt_height + 5);
+        let mut lines: Vec<Line> = self
             .lines
             .iter()
-            .flat_map(|line| wrap(line, width))
+            .flat_map(|entry| entry.render(theme, width, self.expand_tools, !self.hide_thinking))
             .collect();
-        if !self.streaming.is_empty() {
-            lines.extend(wrap(&format!("Pi › {}", self.streaming), width));
+        if !self.thinking.is_empty() {
+            lines.extend(Entry::Thinking(self.thinking.clone()).render(
+                theme,
+                width,
+                false,
+                !self.hide_thinking,
+            ));
         }
-        let end = lines.len().saturating_sub(self.scroll);
+        if !self.streaming.is_empty() {
+            lines
+                .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
+        }
+        let end = lines
+            .len()
+            .saturating_sub(self.scroll.min(lines.len().saturating_sub(body_height)));
         let start = end.saturating_sub(body_height);
         let mut out = std::io::stdout().lock();
         let elapsed = self
@@ -270,56 +314,64 @@ impl View {
         let status = if busy {
             let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             format!(
-                "{} {} {:.1}s · Escで取消",
+                "{} {} {:.1}s · Escで取消 ",
                 spinner[(elapsed.as_millis() / 100) as usize % spinner.len()],
                 self.phase.unwrap_or("処理中"),
                 elapsed.as_secs_f32()
             )
         } else {
-            "ready".into()
+            String::new()
         };
-        queue!(
-            out,
-            Hide,
-            MoveTo(0, 0),
-            Clear(ClearType::All),
-            SetForegroundColor(Color::Cyan),
-            Print(clip(
-                &format!("pi-rs · {}", args.workspace.display()),
-                width
-            )),
-            ResetColor
-        )?;
+        queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+        Line::plain(
+            &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
+            theme.color("accent"),
+        )
+        .draw(&mut out, width)?;
         for (row, line) in lines[start..end].iter().enumerate() {
-            queue!(out, MoveTo(0, (row + 1) as u16), Print(line))?;
+            queue!(out, MoveTo(0, (row + 1) as u16))?;
+            line.draw(&mut out, width)?;
         }
-        let status_row = height - prompt_height - 2;
-        queue!(
-            out,
-            MoveTo(0, status_row as u16),
-            SetForegroundColor(Color::DarkGrey),
-            Print(clip(
-                &format!("{} · {} · 確定 {} tokens", args.model, status, self.tokens),
-                width
-            )),
-            ResetColor
-        )?;
-        let cursor_prefix = wrap(
-            &format!("> {}", &self.editor.text[..self.editor.cursor]),
-            width,
-        );
+        let border_row = height - prompt_height - 4;
+        queue!(out, MoveTo(0, border_row as u16))?;
+        Line::plain(
+            &format!(
+                "{}{}",
+                status,
+                "─".repeat(width.saturating_sub(UnicodeWidthStr::width(status.as_str())))
+            ),
+            theme.color("border"),
+        )
+        .draw(&mut out, width)?;
+        let cursor_prefix = wrap(&self.editor.text[..self.editor.cursor], width);
         let cursor_row = cursor_prefix.len().saturating_sub(1);
         let offset = cursor_row.saturating_sub(prompt_height - 1);
         for (row, line) in prompt.iter().skip(offset).take(prompt_height).enumerate() {
-            queue!(out, MoveTo(0, (status_row + 1 + row) as u16), Print(line))?;
+            queue!(out, MoveTo(0, (border_row + 1 + row) as u16))?;
+            Line::plain(line, theme.color("text")).draw(&mut out, width)?;
         }
+        queue!(out, MoveTo(0, (height - 3) as u16))?;
+        Line::plain(&"─".repeat(width), theme.color("border")).draw(&mut out, width)?;
+        queue!(out, MoveTo(0, (height - 2) as u16))?;
+        Line::plain(&args.workspace.display().to_string(), theme.color("dim"))
+            .draw(&mut out, width)?;
+        queue!(out, MoveTo(0, (height - 1) as u16))?;
+        let model_width = UnicodeWidthStr::width(args.model.as_str());
+        let usage = format!("↑↓ 確定 {} tokens", self.tokens);
+        let usage = clip(&usage, width.saturating_sub(model_width + 1));
+        let padding = width.saturating_sub(UnicodeWidthStr::width(usage.as_str()) + model_width);
+        Line::plain(
+            &format!("{usage}{}{model}", " ".repeat(padding), model = args.model),
+            theme.color("dim"),
+        )
+        .draw(&mut out, width)?;
         let column = cursor_prefix
             .last()
             .map_or(0, |line| UnicodeWidthStr::width(line.as_str()))
             .min(width - 1);
         queue!(
             out,
-            MoveTo(column as u16, (status_row + 1 + cursor_row - offset) as u16),
+            MoveTo(column as u16, (border_row + 1 + cursor_row - offset) as u16),
             Show
         )?;
         out.flush()?;
@@ -461,8 +513,19 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    let mut view = View::default();
+    let mut theme = Theme::load(
+        args.use_theme.as_deref().unwrap_or("system"),
+        &args.themes,
+        &args.workspace,
+        args.project.is_some(),
+    )?;
+    let mut view = View {
+        expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
+        hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
+        ..View::default()
+    };
     view.restore(&args)?;
+    let mut keys = Keys::load()?;
     let _terminal = Terminal::enter()?;
     let mut worker: Option<Worker> = None;
     let mut dirty = true;
@@ -484,9 +547,13 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 for value in finished.events.try_iter() {
                     view.receive(value);
                 }
+                if !view.thinking.is_empty() {
+                    let partial = std::mem::take(&mut view.thinking);
+                    view.lines.push(Entry::Thinking(partial));
+                }
                 if !view.streaming.is_empty() {
                     let partial = std::mem::take(&mut view.streaming);
-                    view.append(&format!("Pi › {partial}"));
+                    view.lines.push(Entry::Assistant(partial));
                 }
                 if !status.success() {
                     view.append(&format!(
@@ -499,7 +566,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
         }
         if dirty || (worker.is_some() && last_frame.elapsed() >= Duration::from_millis(100)) {
-            view.draw(&args, worker.is_some())?;
+            view.draw(&args, &theme, worker.is_some())?;
             dirty = false;
             last_frame = Instant::now();
         }
@@ -514,13 +581,19 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
-                match key.code {
-                    KeyCode::Esc if worker.is_some() => {
+                let action = keys.action(key, view.editor.text.is_empty()).unwrap_or("");
+                if view.editor.action(action) {
+                    continue;
+                }
+                match action {
+                    "app.interrupt" if worker.is_some() => {
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
                         }
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    "app.tools.expand" => view.expand_tools = !view.expand_tools,
+                    "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
+                    "app.clear" => {
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
                         } else if view.editor.text.is_empty() {
@@ -529,16 +602,17 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                             view.editor.take();
                         }
                     }
-                    KeyCode::Char('d')
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && view.editor.text.is_empty() =>
-                    {
-                        break;
+                    "app.exit" => break,
+                    "app.editor.external" => {
+                        if let Err(error) = external_editor(&args, &mut view.editor) {
+                            view.append(&error.to_string());
+                        }
                     }
-                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        view.editor.insert("\n")
+                    "tui.input.tab" => complete_input(&args, &mut view),
+                    "app.model.select" => {
+                        view.editor.replace("/model ".into());
                     }
-                    KeyCode::Enter => {
+                    "tui.input.submit" | "app.message.followUp" => {
                         let input = view.editor.take();
                         if input.trim().is_empty() {
                             continue;
@@ -550,7 +624,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         view.history.push(input.clone());
                         view.history_index = None;
                         if let Some(active) = &mut worker {
-                            let kind = if key.modifiers.contains(KeyModifiers::ALT) {
+                            let kind = if action == "app.message.followUp" {
                                 "followup"
                             } else {
                                 "steer"
@@ -558,48 +632,94 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                             if let Err(error) = active.send(json!({"type":kind,"content":input})) {
                                 view.append(&error.to_string());
                             }
+                        } else if input.trim() == "/theme" {
+                            view.append(&format!(
+                                "Theme › {}{} · /theme <name>",
+                                theme.name,
+                                theme
+                                    .path
+                                    .as_ref()
+                                    .map(|path| format!(" ({})", path.display()))
+                                    .unwrap_or_default()
+                            ));
+                        } else if let Some(name) = input.strip_prefix("/theme ") {
+                            match Theme::load(
+                                name.trim(),
+                                &args.themes,
+                                &args.workspace,
+                                args.project.is_some(),
+                            ) {
+                                Ok(next) => {
+                                    args.settings.set_user("theme", json!(name.trim()))?;
+                                    args.use_theme = Some(name.trim().into());
+                                    theme = next;
+                                }
+                                Err(error) => view.append(&error.to_string()),
+                            }
+                        } else if input.trim() == "/reload" {
+                            match Keys::load() {
+                                Ok(next) => keys = next,
+                                Err(error) => view.append(&error.to_string()),
+                            }
+                            match Theme::load(
+                                args.use_theme.as_deref().unwrap_or("system"),
+                                &args.themes,
+                                &args.workspace,
+                                args.project.is_some(),
+                            ) {
+                                Ok(next) => theme = next,
+                                Err(error) => view.append(&error.to_string()),
+                            }
+                            view.append("Reloaded keybindings and theme");
+                        } else if input.trim() == "/hotkeys" {
+                            view.append(&keys.describe());
+                        } else if input.trim() == "/settings" {
+                            view.append(&serde_json::to_string_pretty(args.settings.value())?);
                         } else if input.starts_with('/') {
                             match slash(&input, &mut args, &mut view) {
                                 Ok(next) => worker = next,
                                 Err(error) => view.append(&error.to_string()),
                             }
                         } else {
-                            view.append(&format!("You › {input}"));
+                            view.lines.push(Entry::User(input.clone()));
                             match Worker::start(&args, &["run", &input]) {
                                 Ok(next) => worker = Some(next),
                                 Err(error) => view.append(&error.to_string()),
                             }
                         }
                     }
-                    KeyCode::Left => view.editor.left(),
-                    KeyCode::Right => view.editor.right(),
-                    KeyCode::Home => view.editor.cursor = 0,
-                    KeyCode::End => view.editor.cursor = view.editor.text.len(),
-                    KeyCode::Backspace => view.editor.backspace(),
-                    KeyCode::Delete => view.editor.delete(),
-                    KeyCode::PageUp => view.scroll = (view.scroll + 10).min(view.lines.len()),
-                    KeyCode::PageDown => view.scroll = view.scroll.saturating_sub(10),
-                    KeyCode::Up if !view.history.is_empty() => {
+                    "tui.altScreen.pageUp" => view.scroll = view.scroll.saturating_add(10),
+                    "tui.altScreen.pageDown" => view.scroll = view.scroll.saturating_sub(10),
+                    "tui.altScreen.top" => view.scroll = usize::MAX,
+                    "tui.altScreen.bottom" => view.scroll = 0,
+                    "tui.editor.cursorUp" if view.editor.vertical(false) => {}
+                    "tui.editor.cursorDown" if view.editor.vertical(true) => {}
+                    "tui.editor.cursorUp" | "tui.editor.historyPrevious"
+                        if !view.history.is_empty() =>
+                    {
                         let index = view
                             .history_index
                             .unwrap_or(view.history.len())
                             .saturating_sub(1);
-                        view.editor.text = view.history[index].clone();
-                        view.editor.cursor = view.editor.text.len();
+                        view.editor.replace(view.history[index].clone());
                         view.history_index = Some(index);
                     }
-                    KeyCode::Down if view.history_index.is_some() => {
+                    "tui.editor.cursorDown" | "tui.editor.historyNext"
+                        if view.history_index.is_some() =>
+                    {
                         let index = view.history_index.unwrap() + 1;
-                        view.editor.text = view.history.get(index).cloned().unwrap_or_default();
-                        view.editor.cursor = view.editor.text.len();
+                        view.editor
+                            .replace(view.history.get(index).cloned().unwrap_or_default());
                         view.history_index = (index < view.history.len()).then_some(index);
                     }
-                    KeyCode::Char(character)
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        view.editor.insert(&character.to_string())
+                    "" => {
+                        if let KeyCode::Char(character) = key.code
+                            && !key.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            )
+                        {
+                            view.editor.insert(&character.to_string());
+                        }
                     }
                     _ => {}
                 }
@@ -609,6 +729,140 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     }
     drop(worker);
     Ok(())
+}
+
+fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
+    let command = args
+        .settings
+        .string("externalEditor")
+        .map(str::to_owned)
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".into()
+            } else {
+                "nano".into()
+            }
+        });
+    let parts = shell_words::split(&command).map_err(|error| Error::Config(error.to_string()))?;
+    let Some((program, arguments)) = parts.split_first() else {
+        return Err(Error::Config("external editor is empty".into()));
+    };
+    let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
+    file.write_all(editor.text.as_bytes())?;
+    execute!(
+        std::io::stdout(),
+        Show,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
+    terminal::disable_raw_mode()?;
+    let result = std::process::Command::new(program)
+        .args(arguments)
+        .arg(file.path())
+        .status();
+    terminal::enable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        Hide
+    )?;
+    if !result?.success() {
+        return Err(Error::Config(
+            "external editor exited unsuccessfully".into(),
+        ));
+    }
+    editor.replace(std::fs::read_to_string(file.path())?);
+    Ok(())
+}
+
+fn complete_input(args: &Cli, view: &mut View) {
+    let prefix = &view.editor.text[..view.editor.cursor];
+    let start = prefix
+        .rfind(char::is_whitespace)
+        .map_or(0, |index| index + 1);
+    let word = &prefix[start..];
+    let candidates = if start == 0 && word.starts_with('/') {
+        [
+            "/help",
+            "/hotkeys",
+            "/new",
+            "/resume",
+            "/session",
+            "/model",
+            "/compact",
+            "/tree",
+            "/checkout",
+            "/quit",
+            "/extensions",
+            "/extension",
+            "/notes",
+            "/todo",
+            "/plan",
+            "/review",
+            "/theme",
+            "/settings",
+            "/reload",
+        ]
+        .into_iter()
+        .filter(|name| name.starts_with(word))
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    } else {
+        let file_word = word.strip_prefix('@').unwrap_or(word);
+        let path = std::path::Path::new(file_word);
+        let parent = path.parent().unwrap_or(std::path::Path::new(""));
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let directory = if file_word.ends_with('/') {
+            args.workspace.join(path)
+        } else {
+            args.workspace.join(parent)
+        };
+        std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let file_name = entry.file_name().into_string().ok()?;
+                if !file_word.ends_with('/') && !file_name.starts_with(name) {
+                    return None;
+                }
+                let parent = if file_word.ends_with('/') {
+                    path
+                } else {
+                    parent
+                };
+                let suffix = if entry.file_type().ok()?.is_dir() {
+                    "/"
+                } else {
+                    ""
+                };
+                Some(format!(
+                    "{}{}{suffix}",
+                    if word.starts_with('@') { "@" } else { "" },
+                    parent.join(file_name).display()
+                ))
+            })
+            .take(100)
+            .collect::<Vec<_>>()
+    };
+    if candidates.len() == 1 {
+        let end = view.editor.cursor;
+        let mut text = view.editor.text.clone();
+        text.replace_range(start..end, &candidates[0]);
+        let cursor = start + candidates[0].len();
+        view.editor.replace(text);
+        view.editor.cursor = cursor;
+    } else if !candidates.is_empty() {
+        let mut candidates = candidates;
+        candidates.sort();
+        view.append(&candidates.join("  "));
+    }
 }
 
 fn clean(text: &str) -> String {

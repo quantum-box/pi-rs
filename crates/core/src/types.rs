@@ -115,6 +115,9 @@ pub struct ModelMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<ResolvedModelIdentity>,
     pub finish_reason: Option<String>,
+    /// Provider-supplied visible reasoning, retained for session presentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Canonical provider and model names reported by the host adapter.

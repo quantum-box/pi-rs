@@ -14,12 +14,15 @@ use pi_rs_core::{
     Usage,
 };
 
+type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Ollama {
     client: Client,
     endpoint: Url,
     token: Option<String>,
     progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
+    reasoning: Option<ReasoningObserver>,
 }
 
 /// Transient presentation signals, separate from the durable model result.
@@ -75,6 +78,7 @@ impl Ollama {
             endpoint,
             token,
             progress: None,
+            reasoning: None,
         })
     }
 
@@ -83,6 +87,12 @@ impl Ollama {
         observer: impl Fn(ModelProgress) + Send + Sync + 'static,
     ) -> Self {
         self.progress = Some(Arc::new(observer));
+        self
+    }
+
+    /// Observe provider-supplied reasoning deltas separately from the answer.
+    pub fn with_reasoning(mut self, observer: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.reasoning = Some(Arc::new(observer));
         self
     }
 
@@ -183,6 +193,7 @@ impl Model for Ollama {
         }
 
         let progress = self.progress.clone();
+        let reasoning = self.reasoning.clone();
         let loading_probe = self.clone();
         Ok(Box::pin(async_stream::try_stream! {
             let mut bytes = 0usize;
@@ -197,6 +208,7 @@ impl Model for Ollama {
             let mut calls = BTreeMap::<usize, CallDelta>::new();
             let mut usage = None;
             let mut metadata = ModelMetadata::default();
+            let mut reasoning_text = String::new();
             loop {
                 let event = tokio::select! {
                     event = events.next() => event,
@@ -222,6 +234,10 @@ impl Model for Ollama {
                     let calls = calls.into_values().map(|call| ToolCall {
                         id: call.id, name: call.name, arguments: call.arguments,
                     }).collect();
+                    if !reasoning_text.is_empty() {
+                        metadata.reasoning = Some(reasoning_text);
+                        yield ModelEvent::Metadata(metadata);
+                    }
                     yield ModelEvent::Complete { calls, usage };
                     return;
                 }
@@ -244,9 +260,10 @@ impl Model for Ollama {
                     if choice.index != 0 || metadata.finish_reason.is_some() {
                         Err(Error::Model("unexpected choice in model stream".into()))?;
                     }
-                    if choice.delta.reasoning.as_ref().or(choice.delta.reasoning_content.as_ref())
-                        .is_some_and(|text| !text.is_empty()) {
+                    if let Some(text) = choice.delta.reasoning.as_ref().or(choice.delta.reasoning_content.as_ref()).filter(|text| !text.is_empty()) {
                         report_progress(&progress, &mut last_progress, ModelProgress::Thinking);
+                        reasoning_text.push_str(text);
+                        if let Some(observer) = &reasoning { observer(text); }
                     }
                     if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
                         report_progress(&progress, &mut last_progress, ModelProgress::Generating);
