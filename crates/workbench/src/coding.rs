@@ -646,6 +646,11 @@ pub fn normalize_image<R: std::io::BufRead + std::io::Seek>(
     let original = reader
         .decode()
         .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
+    prepare_image(original)
+}
+
+/// Normalize a decoded image under the same limits as file and clipboard input.
+pub fn prepare_image(original: image::DynamicImage) -> Result<PreparedImage> {
     let source_width = original.width();
     let source_height = original.height();
     let mut resized = if source_width > 2000 || source_height > 2000 {

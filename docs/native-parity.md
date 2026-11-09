@@ -14,7 +14,7 @@ remaining acceptance work for that surface.
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
-| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
+| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, text/image clipboard paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, threaded session selectors, Radius sharing |
@@ -621,3 +621,17 @@ fullscreen redraws decreased from 100 frames to two. Kitty and iTerm2 image
 fixtures passed all four mode/protocol combinations on three successive runs.
 Markdown, edit output, regular-history redraw and session selectors also passed
 their PTY regressions.
+
+### Clipboard attachment checkpoint
+
+Ctrl+V pastes clipboard images or text into the terminal draft. Windows uses
+Alt+V for this action. Clipboard reads run off the UI thread and report progress.
+Images use the same bounded PNG preparation as local file reads, retain alpha,
+and can be sent alone or with text as a prompt, steering input or follow-up.
+Prompt-template and skill expansion retain draft images. Ctrl+C clears an idle
+draft, including its attachments. User keybindings can override the action.
+
+Tests cover pixel validation, alpha preservation, draft delivery and image-only
+input validation. The live clipboard check exercised the empty/unavailable
+clipboard error and clean terminal exit. A populated OS image clipboard has not
+yet been exercised in this environment.

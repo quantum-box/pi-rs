@@ -142,6 +142,8 @@ struct View {
     hide_thinking: bool,
     streaming: String,
     editor: Editor,
+    draft_images: Vec<pi_rs::ImageContent>,
+    clipboard: Option<std::sync::mpsc::Receiver<Result<super::clipboard::Content>>>,
     scroll: usize,
     tokens: u64,
     history: Vec<String>,
@@ -150,6 +152,62 @@ struct View {
     phase: Option<&'static str>,
 }
 impl View {
+    fn draft_status(&self) -> String {
+        if self.clipboard.is_some() {
+            "Reading clipboard · ".into()
+        } else if !self.draft_images.is_empty() {
+            format!("{} image(s) attached · ", self.draft_images.len())
+        } else {
+            String::new()
+        }
+    }
+    fn draft_message(&self, content: &str) -> pi_rs::QueuedMessage {
+        pi_rs::QueuedMessage {
+            input: pi_rs::QueuedInput {
+                id: uuid::Uuid::nil(),
+                kind: pi_rs::InputKind::FollowUp,
+                content: content.into(),
+            },
+            images: self.draft_images.clone(),
+        }
+    }
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.clipboard = Some(receiver);
+        std::thread::spawn(move || {
+            let _ = sender.send(super::clipboard::read());
+        });
+    }
+    fn poll_clipboard(&mut self) -> bool {
+        let Some(receiver) = self.clipboard.take() else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.clipboard = Some(receiver);
+                return false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(Error::Config("clipboard reader stopped".into()))
+            }
+        };
+        match result {
+            Ok(super::clipboard::Content::Text(text)) => self.editor.insert(&text),
+            Ok(super::clipboard::Content::Image(image)) => {
+                self.draft_images.push(image);
+                if let Err(error) = self.draft_message(&self.editor.text).validate() {
+                    self.draft_images.pop();
+                    self.append(&error.to_string());
+                }
+            }
+            Err(error) => self.append(&error.to_string()),
+        }
+        true
+    }
     fn append(&mut self, text: &str) {
         self.lines.push(Entry::Notice(clean(text)));
         if self.lines.len() > 4000 {
@@ -172,6 +230,8 @@ impl View {
         self.lines.clear();
         self.streaming.clear();
         self.thinking.clear();
+        self.draft_images.clear();
+        self.clipboard = None;
         self.history.clear();
         self.history_index = None;
         self.tokens = 0;
@@ -475,6 +535,7 @@ impl View {
         } else {
             String::new()
         };
+        let status = format!("{status}{}", self.draft_status());
         self.graphics.clear_placements(&mut out)?;
         queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
         Line::plain(
@@ -674,6 +735,7 @@ impl View {
         } else {
             String::new()
         };
+        let status = format!("{status}{}", self.draft_status());
         Line::plain(
             &format!(
                 "{}{}",
@@ -1281,6 +1343,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
         }
+        dirty |= view.poll_clipboard();
         if (dirty && last_frame.elapsed() >= frame_interval)
             || (is_busy(&worker) && last_frame.elapsed() >= Duration::from_millis(100))
         {
@@ -1337,7 +1400,12 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     }
                     continue;
                 }
-                let action = keys.action(key, view.editor.text.is_empty()).unwrap_or("");
+                let action = keys
+                    .action(
+                        key,
+                        view.editor.text.is_empty() && view.draft_images.is_empty(),
+                    )
+                    .unwrap_or("");
                 if view.editor.action(action) {
                     continue;
                 }
@@ -1387,13 +1455,19 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     }
                     "app.tools.expand" => view.expand_tools = !view.expand_tools,
                     "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
+                    "app.clipboard.pasteImage" => view.paste_clipboard(),
                     "app.clear" => {
                         if let Some(active) = worker.as_mut().filter(|active| active.busy) {
                             let _ = active.send(json!({"type":"cancel"}));
-                        } else if view.editor.text.is_empty() {
+                        } else if view.editor.text.is_empty()
+                            && view.draft_images.is_empty()
+                            && view.clipboard.is_none()
+                        {
                             break;
                         } else {
                             view.editor.take();
+                            view.draft_images.clear();
+                            view.clipboard = None;
                         }
                     }
                     "app.exit" => break,
@@ -1409,8 +1483,17 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     "tui.input.tab" => complete_input(&args, &mut view),
                     "app.model.select" if !is_busy(&worker) => start_model_picker(&args, &mut view),
                     "tui.input.submit" | "app.message.followUp" => {
+                        if view.clipboard.is_some() {
+                            continue;
+                        }
+                        if !view.draft_images.is_empty()
+                            && let Err(error) = view.draft_message(&view.editor.text).validate()
+                        {
+                            view.append(&error.to_string());
+                            continue;
+                        }
                         let input = view.editor.take();
-                        if input.trim().is_empty() {
+                        if input.trim().is_empty() && view.draft_images.is_empty() {
                             continue;
                         }
                         if matches!(input.trim(), "/quit" | "/exit") {
@@ -1425,8 +1508,11 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             } else {
                                 "steer"
                             };
-                            if let Err(error) = active.send(json!({"type":kind,"content":input})) {
-                                view.append(&error.to_string());
+                            match active.send(
+                                json!({"type":kind,"content":input,"images":view.draft_images}),
+                            ) {
+                                Ok(()) => view.draft_images.clear(),
+                                Err(error) => view.append(&error.to_string()),
                             }
                         } else if input.trim() == "/theme" {
                             let names = Theme::discover(
@@ -1547,19 +1633,25 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             match slash(&input, &mut args, &mut view) {
                                 Ok(Some(next)) => worker = Some(next),
                                 Ok(None) => {
-                                    if let Some(request) = view.pending_request.take()
-                                        && let Err(error) =
-                                            start_request(&args, request, &mut worker)
-                                    {
-                                        view.append(&error.to_string());
+                                    if let Some(mut request) = view.pending_request.take() {
+                                        let prompt = request["type"] == "prompt";
+                                        if prompt {
+                                            request["images"] = json!(view.draft_images);
+                                        }
+                                        match start_request(&args, request, &mut worker) {
+                                            Ok(()) if prompt => view.draft_images.clear(),
+                                            Ok(()) => {}
+                                            Err(error) => view.append(&error.to_string()),
+                                        }
                                     }
                                 }
                                 Err(error) => view.append(&error.to_string()),
                             }
                         } else {
                             view.lines.push(Entry::User(input.clone()));
-                            if let Err(error) = start_prompt(&args, &input, &mut worker) {
-                                view.append(&error.to_string());
+                            match start_prompt(&args, &input, &view.draft_images, &mut worker) {
+                                Ok(()) => view.draft_images.clear(),
+                                Err(error) => view.append(&error.to_string()),
                             }
                         }
                     }
@@ -1613,8 +1705,17 @@ fn is_busy(worker: &Option<Worker>) -> bool {
     worker.as_ref().is_some_and(|worker| worker.busy)
 }
 
-fn start_prompt(args: &Cli, input: &str, worker: &mut Option<Worker>) -> Result<()> {
-    start_request(args, json!({"type":"prompt","content":input}), worker)
+fn start_prompt(
+    args: &Cli,
+    input: &str,
+    images: &[pi_rs::ImageContent],
+    worker: &mut Option<Worker>,
+) -> Result<()> {
+    start_request(
+        args,
+        json!({"type":"prompt","content":input,"images":images}),
+        worker,
+    )
 }
 fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Result<()> {
     Worker::submit(worker, args, request)
@@ -2025,6 +2126,49 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clipboard_results_update_the_draft_and_keep_image_only_input_valid() {
+        let mut view = View::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        view.clipboard = Some(receiver);
+        assert!(!view.poll_clipboard());
+        assert!(view.draft_status().contains("Reading clipboard"));
+        sender
+            .send(Ok(super::super::clipboard::Content::Image(
+                pi_rs::ImageContent {
+                    data: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                },
+            )))
+            .unwrap();
+        assert!(view.poll_clipboard());
+        assert!(view.clipboard.is_none());
+        assert_eq!(view.draft_images.len(), 1);
+        assert!(view.draft_status().contains("1 image(s)"));
+        assert!(view.draft_message("").validate().is_ok());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        view.clipboard = Some(receiver);
+        sender
+            .send(Ok(super::super::clipboard::Content::Text(
+                "こんにちは".into(),
+            )))
+            .unwrap();
+        assert!(view.poll_clipboard());
+        assert_eq!(view.editor.text, "こんにちは");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        view.clipboard = Some(receiver);
+        sender
+            .send(Ok(super::super::clipboard::Content::Image(
+                pi_rs::ImageContent {
+                    data: "invalid".into(),
+                    mime_type: "image/png".into(),
+                },
+            )))
+            .unwrap();
+        assert!(view.poll_clipboard());
+        assert_eq!(view.draft_images.len(), 1);
+    }
+
     #[test]
     fn progress_distinguishes_loading_thinking_and_generation() {
         let mut view = View::default();

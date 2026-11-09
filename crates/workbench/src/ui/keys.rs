@@ -56,6 +56,14 @@ impl Keys {
             ("app.model.cycleForward", &["ctrl+p"]),
             ("app.model.cycleBackward", &["ctrl+shift+p"]),
             ("app.message.copy", &["ctrl+x"]),
+            (
+                "app.clipboard.pasteImage",
+                if cfg!(windows) {
+                    &["alt+v"]
+                } else {
+                    &["ctrl+v"]
+                },
+            ),
             ("app.session.rename", &["ctrl+r"]),
             ("app.session.delete", &["ctrl+d"]),
             ("app.session.deleteNoninvasive", &["ctrl+backspace"]),

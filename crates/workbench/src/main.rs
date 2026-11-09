@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 mod attachments;
 mod backend;
+mod clipboard;
 mod config;
 mod interactive;
 mod mcp_config;
