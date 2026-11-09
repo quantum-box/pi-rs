@@ -14,7 +14,7 @@ remaining acceptance work for that surface.
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
-| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, inline image display, regular-mode history redraw and remaining application actions |
+| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, inline image display and remaining application actions |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity, Windows runtime validation |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, session picker rename/delete/sort, Radius sharing |
@@ -150,8 +150,9 @@ model/thinking defaults. `/settings-json` displays the resolved settings.
 normal terminal scrollback. The fullscreen default remains available. Both
 modes passed the same PTY sequence for project trust, quoted prompt expansion,
 model/thinking selection, settings, tools, exports and terminal restoration.
-Changing display options does not redraw history already committed to normal
-terminal scrollback. Full regular-mode redraw fidelity remains open.
+Display options, theme changes and terminal resizing now redraw the retained
+history in regular mode. Full redraws clear the viewport and scrollback before
+replaying the transcript, matching the reference renderer.
 
 Ctrl+P / Ctrl+Shift+P cycle discovered models. Custom session-action bindings
 and Ctrl+X copying use the same journal operations as their slash commands.
@@ -403,3 +404,12 @@ as data URLs under an image-only data policy.
 model discovery and persistent CLI/RPC workers. The credential remains
 process-local. Regression tests verify the selected bearer header and check
 that session records and command output contain no key value.
+
+### Regular-mode redraw checkpoint
+
+Regular mode replays committed entries when visibility settings, theme colors
+or terminal dimensions change. It also restores the view after an external
+editor exits. The normal append path retains existing scrollback. A PTY fixture
+verifies hide/show of existing thinking content, resizing, live theme changes
+and terminal restoration. History eviction keeps the pending-entry boundary
+consistent, so new messages continue to appear after the transcript limit.

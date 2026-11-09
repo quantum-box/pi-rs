@@ -101,12 +101,22 @@ impl Drop for Terminal {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct RegularLayout {
+    width: usize,
+    height: usize,
+    theme: Theme,
+    expand_tools: bool,
+    hide_thinking: bool,
+}
 #[derive(Default)]
 struct RegularState {
     committed: usize,
     cursor_row: usize,
     region_height: usize,
     started: bool,
+    redraw: bool,
+    layout: Option<RegularLayout>,
 }
 
 #[derive(Default)]
@@ -136,7 +146,9 @@ impl View {
     fn append(&mut self, text: &str) {
         self.lines.push(Entry::Notice(clean(text)));
         if self.lines.len() > 4000 {
-            self.lines.drain(..self.lines.len() - 4000);
+            let removed = self.lines.len() - 4000;
+            self.lines.drain(..removed);
+            self.regular.committed = self.regular.committed.saturating_sub(removed);
         }
     }
     fn restore(&mut self, args: &Cli) -> Result<()> {
@@ -148,6 +160,7 @@ impl View {
         }
         self.session_name = session.name().map(str::to_owned);
         self.regular.committed = 0;
+        self.regular.redraw = true;
         self.lines.clear();
         self.streaming.clear();
         self.thinking.clear();
@@ -487,11 +500,35 @@ impl View {
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
+        let layout = RegularLayout {
+            width,
+            height,
+            theme: theme.clone(),
+            expand_tools: self.expand_tools,
+            hide_thinking: self.hide_thinking,
+        };
+        let redraw = self.regular.layout.is_some()
+            && (self.regular.redraw
+                || self.regular.layout.as_ref() != Some(&layout)
+                || self.lines.len() < self.regular.committed);
+        self.regular.layout = Some(layout);
+        self.regular.redraw = false;
+        if self.lines.len() < self.regular.committed {
+            self.regular.committed = 0;
+        }
         let prompt = wrap(&self.editor.text, width);
         let prompt_height = prompt.len().clamp(1, 6).min(height - 5);
         let mut out = std::io::stdout().lock();
+        if redraw {
+            queue!(
+                out,
+                Clear(ClearType::All),
+                MoveTo(0, 0),
+                Clear(ClearType::Purge)
+            )?;
+        }
         queue!(out, Hide, MoveToColumn(0))?;
-        if self.regular.started {
+        if self.regular.started && !redraw {
             queue!(
                 out,
                 MoveUp(self.regular.cursor_row as u16),
@@ -499,7 +536,7 @@ impl View {
             )?;
         } else {
             queue!(out, Print("\r\n"))?;
-            if self.regular.committed == 0 {
+            if self.regular.committed == 0 || redraw {
                 Line::plain(
                     &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
                     theme.color("accent"),
@@ -508,8 +545,13 @@ impl View {
                 queue!(out, Print("\r\n"))?;
             }
         }
-        if self.lines.len() < self.regular.committed {
-            self.regular.committed = 0;
+        if redraw {
+            for entry in &self.lines[..self.regular.committed] {
+                for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
+                    line.draw(&mut out, width)?;
+                    queue!(out, Print("\r\n"))?;
+                }
+            }
         }
         let mut active = Vec::new();
         if !busy && self.picker.is_none() && self.scroll == 0 {
@@ -1296,6 +1338,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         if let Err(error) = external_editor(&args, &mut view.editor) {
                             view.append(&error.to_string());
                         }
+                        view.regular.redraw = true;
                     }
                     "tui.input.tab" => complete_input(&args, &mut view),
                     "app.model.select" if !is_busy(&worker) => start_model_picker(&args, &mut view),
@@ -1917,5 +1960,16 @@ mod tests {
     fn wrapping_counts_terminal_columns_and_removes_controls() {
         assert_eq!(wrap("日本abc", 4), vec!["日本", "abc"]);
         assert!(!clean("hello\x1b[31m\x07").contains('\x1b'));
+    }
+    #[test]
+    fn regular_history_eviction_preserves_the_uncommitted_entry_boundary() {
+        let mut view = View::default();
+        for _ in 0..4000 {
+            view.append("old");
+        }
+        view.regular.committed = 4000;
+        view.append("new");
+        assert_eq!(view.lines.len(), 4000);
+        assert_eq!(view.regular.committed, 3999);
     }
 }
