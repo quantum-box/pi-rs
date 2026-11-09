@@ -220,3 +220,15 @@ Workflow Goal の実行口で最初の照会期限を超えても、同じター
 間はジャーナルに終端結果を記録しなかった。ジョブの受付、照会、取消は試験用。
 実 Workspace で停止を確認する経路は残っている。
 [Workflow worker の待機と取消試験](https://github.com/quantum-box/tachyon-apps/commit/1168e51b1f760c576ebbaae4be3a9f53829b9fe7)
+
+
+### Workflow からの Coding Job と Workspace の停止確認
+
+対象の Workflow 評価設定で Coding Job を有効にすると、承認済みレビューを
+照合し、既存の署名付き Root 受付へ委譲する。隔離 TiDB で別操作の取消を拒否し、
+同じ取消の再送を許可した。ジョブ行を閉じた時点では Workspace の停止を未確認とし、
+Root が元の操作の Cancelled を確認したときだけ停止確認を保存した。Root の
+Workspace 試験38件、AIP 統合16件、評価設定6件、署名付きクライアント9件が通過した。
+稼働中コマンドの確認経路を検証済み。操作 ID をまだ取得できない段階の取消と、
+実環境での一連の受入は残っている。
+[Coding Job の配線と Workspace 停止試験](https://github.com/quantum-box/tachyon-apps/commit/c21de04b8cddae4aeeb51d0ea5c7ecb268a02bd9)
