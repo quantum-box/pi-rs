@@ -800,3 +800,16 @@ PowerShell quoting, and Unix uses POSIX shell quoting.
 Tests cover file-list insertion, surrounding text, shell quoting, validation and
 existing image/text draft behavior. A populated system file-list clipboard has
 not been exercised in this environment.
+
+### Durable queue controls checkpoint
+
+The core session exposes pending inputs, durable queue clearing and separate
+steering/follow-up modes. A mode can consume all pending messages or one per
+safe boundary. Existing embedded callers retain the previous all-at-once
+default. Queue removals and mode choices follow branch history and survive
+reopening or forking. The owned SDK exposes these operations while idle and
+counts both buffered and journaled pending inputs. Text-only queued messages
+now use the same size bound as image-bearing messages.
+
+Tests cover one-at-a-time consumption, cleared messages, historical forks and
+SDK queue removal. Active TUI/RPC queue controls remain to be connected.

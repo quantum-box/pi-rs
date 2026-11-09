@@ -106,6 +106,13 @@ pub enum Event {
     InputQueued {
         input: QueuedInput,
     },
+    InputQueueCleared {
+        ids: Vec<Uuid>,
+    },
+    QueueModeSelected {
+        kind: crate::InputKind,
+        mode: crate::QueueMode,
+    },
     ModelRequested {
         model: String,
         messages: usize,
@@ -472,6 +479,67 @@ impl Session {
             return Err(Error::Config("user input exceeds size limit".into()));
         }
         self.append(event)?;
+        Ok(())
+    }
+
+    pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
+        let branch = self.branch();
+        let mut consumed = std::collections::HashSet::new();
+        for record in &branch {
+            match &record.event {
+                Event::User {
+                    input_id: Some(id), ..
+                }
+                | Event::UserWithImages {
+                    input_id: Some(id), ..
+                } => {
+                    consumed.insert(*id);
+                }
+                Event::InputQueueCleared { ids } => consumed.extend(ids),
+                _ => {}
+            }
+        }
+        branch
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::InputQueued { input } if !consumed.contains(&input.id) => {
+                    Some(input.clone().into())
+                }
+                Event::InputQueuedWithImages { input } if !consumed.contains(&input.input.id) => {
+                    Some(input.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    pub fn clear_queued_inputs(&mut self) -> Result<Vec<crate::QueuedMessage>> {
+        let pending = self.queued_inputs();
+        if !pending.is_empty() {
+            self.append(Event::InputQueueCleared {
+                ids: pending.iter().map(|input| input.input.id).collect(),
+            })?;
+        }
+        Ok(pending)
+    }
+    pub fn queue_mode(&self, kind: crate::InputKind) -> crate::QueueMode {
+        self.selected_queue_mode(kind).unwrap_or_default()
+    }
+    fn selected_queue_mode(&self, kind: crate::InputKind) -> Option<crate::QueueMode> {
+        self.branch()
+            .iter()
+            .rev()
+            .find_map(|record| match record.event {
+                Event::QueueModeSelected {
+                    kind: selected,
+                    mode,
+                } if kind == selected => Some(mode),
+                _ => None,
+            })
+    }
+    pub fn set_queue_mode(&mut self, kind: crate::InputKind, mode: crate::QueueMode) -> Result<()> {
+        if self.selected_queue_mode(kind) != Some(mode) {
+            self.append(Event::QueueModeSelected { kind, mode })?;
+        }
         Ok(())
     }
 

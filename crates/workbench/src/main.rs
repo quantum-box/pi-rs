@@ -954,6 +954,10 @@ fn output(event: Value) {
 
 fn metadata(record: &pi_rs::Record) -> Value {
     let mut value = match &record.event {
+        Event::InputQueueCleared { ids } => json!({"event":"input_queue_cleared","ids":ids}),
+        Event::QueueModeSelected { kind, mode } => {
+            json!({"event":"queue_mode_selected","kind":kind,"mode":mode})
+        }
         Event::BashExecution { execution } => {
             json!({"event":"bash_execution","exitCode":execution.exit_code,"cancelled":execution.cancelled,"truncated":execution.truncated})
         }

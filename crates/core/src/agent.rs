@@ -1525,7 +1525,7 @@ fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> R
     Ok(())
 }
 
-fn queue_inputs<T: Into<QueuedMessage>>(
+pub(crate) fn queue_inputs<T: Into<QueuedMessage>>(
     session: &mut Session,
     followups: &mut mpsc::Receiver<T>,
     observer: &mut Observer<'_>,
@@ -1586,28 +1586,27 @@ fn apply_inputs(
     include_followups: bool,
     observer: &mut Observer<'_>,
 ) -> Result<bool> {
-    let branch = session.branch();
-    let consumed: HashSet<_> = branch
-        .iter()
-        .filter_map(|record| match record.event {
-            Event::User { input_id, .. } | Event::UserWithImages { input_id, .. } => input_id,
-            _ => None,
-        })
+    let pending: Vec<_> = session
+        .queued_inputs()
+        .into_iter()
+        .filter(|message| include_followups || message.input.kind == InputKind::Steer)
         .collect();
-    let pending: Vec<QueuedMessage> = branch
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::InputQueued { input } => Some(input.clone().into()),
-            Event::InputQueuedWithImages { input } => Some(input.clone()),
-            _ => None,
-        })
-        .filter(|message: &QueuedMessage| {
-            !consumed.contains(&message.input.id)
-                && (include_followups || message.input.kind == InputKind::Steer)
-        })
-        .collect();
-    let accepted = !pending.is_empty();
+    let mut accepted = false;
+    let steering_mode = session.queue_mode(InputKind::Steer);
+    let follow_up_mode = session.queue_mode(InputKind::FollowUp);
+    let mut seen = HashSet::new();
     for message in pending {
+        let kind = message.input.kind;
+        let seen_kind = if kind == InputKind::Steer { 0 } else { 1 };
+        let mode = if kind == InputKind::Steer {
+            steering_mode
+        } else {
+            follow_up_mode
+        };
+        if mode == crate::QueueMode::OneAtATime && !seen.insert(seen_kind) {
+            continue;
+        }
+        accepted = true;
         message.validate()?;
         let event = if message.images.is_empty() {
             Event::User {
@@ -1698,5 +1697,55 @@ mod nested_host_tests {
         });
         assert!(matches!(outcomes[0], Outcome::Skipped(_)));
         assert_eq!(outcomes[1], Outcome::Succeeded("done".into()));
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    #[test]
+    fn text_only_queued_messages_obey_the_same_size_limit() {
+        let message = QueuedMessage::from("x".repeat(8 * 1024 * 1024));
+        assert!(message.validate().is_err());
+    }
+    #[test]
+    fn queue_modes_and_cleared_messages_follow_the_session_branch() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .set_queue_mode(InputKind::FollowUp, crate::QueueMode::OneAtATime)
+            .unwrap();
+        let (sender, mut inputs) = mpsc::channel(4);
+        for content in ["first", "second", "third"] {
+            sender
+                .try_send(QueuedMessage::from(crate::QueuedInput {
+                    id: Uuid::new_v4(),
+                    kind: InputKind::FollowUp,
+                    content: content.into(),
+                }))
+                .unwrap();
+        }
+        queue_inputs(&mut session, &mut inputs, &mut |_| {}).unwrap();
+        assert_eq!(session.queued_inputs().len(), 3);
+        assert!(apply_inputs(&mut session, true, &mut |_| {}).unwrap());
+        assert_eq!(session.queued_inputs().len(), 2);
+        let before_clear = session.head();
+        let removed = session.clear_queued_inputs().unwrap();
+        assert_eq!(
+            removed
+                .iter()
+                .map(|input| input.input.content.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "third"]
+        );
+        assert!(!apply_inputs(&mut session, true, &mut |_| {}).unwrap());
+        let earlier = Session::from_records(session.fork_records(before_clear).unwrap()).unwrap();
+        assert_eq!(earlier.queued_inputs().len(), 2);
+        let fork = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+        assert!(fork.queued_inputs().is_empty());
+        assert_eq!(
+            fork.queue_mode(InputKind::FollowUp),
+            crate::QueueMode::OneAtATime
+        );
+        assert_eq!(fork.queue_mode(InputKind::Steer), crate::QueueMode::All);
     }
 }

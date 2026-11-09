@@ -38,6 +38,15 @@ pub enum InputKind {
     FollowUp,
 }
 
+/// Controls whether a safe boundary consumes one pending message or every message.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueueMode {
+    #[default]
+    All,
+    OneAtATime,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueuedInput {
     pub id: Uuid,
@@ -71,7 +80,7 @@ impl QueuedMessage {
         for image in &self.images {
             image.validate()?;
         }
-        if !self.images.is_empty() && serde_json::to_vec(self)?.len() > 8 * 1024 * 1024 {
+        if serde_json::to_vec(self)?.len() > 8 * 1024 * 1024 {
             return Err(Error::Config("queued input exceeds size limit".into()));
         }
         Ok(())

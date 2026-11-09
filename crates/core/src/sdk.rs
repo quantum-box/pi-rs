@@ -203,7 +203,29 @@ impl AgentSession {
         self.registry.tool_specs()
     }
     pub fn pending_inputs(&self) -> usize {
-        self.input.len()
+        self.input.len() + self.session.queued_inputs().len()
+    }
+    /// Clear pending input while this owned session is idle, retaining each removal in the journal.
+    pub fn clear_queued_inputs(&mut self) -> Result<Vec<QueuedMessage>> {
+        self.ensure_open()?;
+        let events = self.events.as_ref().expect("open session").clone();
+        crate::agent::queue_inputs(&mut self.session, &mut self.input, &mut |event| {
+            emit(&events, &event)
+        })?;
+        let pending = self.session.clear_queued_inputs()?;
+        if !pending.is_empty() {
+            self.emit_last();
+        }
+        Ok(pending)
+    }
+    pub fn set_queue_mode(&mut self, kind: InputKind, mode: crate::QueueMode) -> Result<()> {
+        self.ensure_open()?;
+        let count = self.session.records().len();
+        self.session.set_queue_mode(kind, mode)?;
+        if count != self.session.records().len() {
+            self.emit_last();
+        }
+        Ok(())
     }
     pub fn model_name(&self) -> &str {
         &self.model_name
@@ -512,6 +534,19 @@ mod tests {
     use super::*;
     use crate::{ModelEvent, ModelStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn idle_queue_clear_returns_messages_and_records_the_removal() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model, "fixture").in_memory().unwrap();
+        session.controls().follow_up("queued").await.unwrap();
+        assert_eq!(session.pending_inputs(), 1);
+        let removed = session.clear_queued_inputs().unwrap();
+        assert_eq!(removed[0].input.content, "queued");
+        assert_eq!(session.pending_inputs(), 0);
+        assert!(session.messages().unwrap().is_empty());
+        session.close().await.unwrap();
+    }
 
     struct EchoModel(AtomicUsize);
     #[async_trait::async_trait]
