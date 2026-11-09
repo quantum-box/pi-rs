@@ -41,11 +41,11 @@ AIP の予算と作業状態には既存の SQLx 実装を使い、MCP は既存
 
 ## 既存 Workflow Goal からの起動（PLT-6382）
 
-AIP API の評価構成では、運用側が既存の tenant／Run／step と予算を指定する。
-既存 Workflow が Goal の実行権を取得してから Rust Harness を呼ぶ。選択結果は
-Goal セッションに記録する。AIP の統合試験9件と既存 Goal の回帰試験5件を確認した。
-評価構成には外部ツールを登録していない。運用で使うにはワーカー間で共有する
-非公開の永続ジャーナルと、既存の認可を通ったツールプロファイルが必要。
+隔離した AIP の評価構成では、既存 Workflow が Goal の実行権を取得してから Rust
+Harness を呼ぶ。選択結果は Goal セッションに記録する。AIP API は評価構成の
+設定がある場合に起動を拒否する。評価ストリームは Run の予算予約を使うため、
+運用への組込みには既存 Payment 原票、価格版、Field 配送を通る Gateway 接続が
+必要。共有の非公開永続ジャーナルと、認可済みツールプロファイルも必要。
 [実装と検証記録](https://github.com/quantum-box/tachyon-apps/commit/5b46814a3c64403d7f1bcccc2be3da39e6adb4b2)
 
 
@@ -53,3 +53,10 @@ Goal セッションに記録する。AIP の統合試験9件と既存 Goal の�
 一時停止では現在のターンが終わってから次のターンを止める。Workflow ワーカーの
 試験22件と AIP 統合試験10件を確認した。
 [取消の実装と検証記録](https://github.com/quantum-box/tachyon-apps/commit/a2148425702a40a5719e231a2bc8d0cbfbc9d4c3)
+
+
+Field の隔離結合試験では、Workflow Run、Harness Run、セッション、モデル要求、
+外部操作 UUID が監査ログで一致した。書込み応答の消失後に、同じ操作 UUID で
+再照会と確定を追跡した。入力、応答、認証トークン、外部の参照値はログに出なかった。
+AIP 統合試験10件と課金入口の検査58件が通過した。
+[監査と課金境界の実装](https://github.com/quantum-box/tachyon-apps/commit/030c4d569ff7c3a11ddf763b7f437a10a51adaf8)
