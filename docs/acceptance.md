@@ -232,3 +232,13 @@ Workspace 試験38件、AIP 統合16件、評価設定6件、署名付きクラ�
 稼働中コマンドの確認経路を検証済み。操作 ID をまだ取得できない段階の取消と、
 実環境での一連の受入は残っている。
 [Coding Job の配線と Workspace 停止試験](https://github.com/quantum-box/tachyon-apps/commit/c21de04b8cddae4aeeb51d0ea5c7ecb268a02bd9)
+
+
+### Root 受付後の起動前取消とチェックアウト中の取消
+
+受付直後にジョブを閉じた場合は、Workspace 操作の起動0件と起動前の停止確認を
+記録した。チェックアウトの起動応答を遅らせた場合は、元の操作が Cancelled に
+確定してから実際の操作IDを記録し、Agent コマンドを起動しなかった。Root 40件と
+隔離 TiDB を含む AIP 16件が通過した。AIP がジョブIDを得る前の取消競合と、
+実環境の通し検証は残っている。
+[起動前とチェックアウト中の取消試験](https://github.com/quantum-box/tachyon-apps/commit/4c85b7c48d7ecabfc7eafd47bd32d1b00b6454ae)
