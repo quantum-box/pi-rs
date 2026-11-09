@@ -12,9 +12,8 @@ pub struct Runtime {
     provider: Ollama,
     pub registry: Registry,
     system_prompt: String,
-    base_prompt: String,
     pub resources: resources::Resources,
-    servers: Vec<Arc<pi_rs_workbench::mcp::McpExtension>>,
+    catalog: Arc<LiveMcpCatalog>,
 }
 impl Runtime {
     pub fn command_catalog(&self, args: &Cli) -> serde_json::Value {
@@ -95,12 +94,9 @@ impl Runtime {
         }
     }
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
+        let servers = self.catalog.servers.lock().expect("MCP catalogs");
         for (name, value) in mcp_config::configurations(args)? {
-            if let Some(server) = self
-                .servers
-                .iter()
-                .find(|server| server.server_name == name)
-            {
+            if let Some(server) = servers.iter().find(|server| server.server_name == name) {
                 output(
                     json!({"type":"mcp_server","name":name,"status":"connected","tools":server.tool_count(),"description":server.description}),
                 );
@@ -112,32 +108,15 @@ impl Runtime {
         }
         Ok(())
     }
-    pub async fn refresh_mcp(&mut self, args: &Cli) -> Result<()> {
-        if self.servers.is_empty() {
-            return Ok(());
+    pub async fn refresh_mcp(&mut self, _args: &Cli) -> Result<()> {
+        if let Some(update) =
+            pi_rs::RegistryRefresher::refresh(self.catalog.as_ref(), &self.registry).await?
+        {
+            self.registry = update.registry;
+            if let Some(prompt) = update.system_prompt {
+                self.system_prompt = prompt;
+            }
         }
-        let mut servers = Vec::with_capacity(self.servers.len());
-        let mut registry = self.registry.clone();
-        for server in &self.servers {
-            let refreshed = Arc::new(server.refresh().await?);
-            registry.replace(refreshed.clone())?;
-            servers.push(refreshed);
-        }
-        let (selection, documents, hidden) = tool_discovery(args, &servers)?;
-        registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
-            documents,
-        )))?;
-        let system_prompt = select_tools(
-            &mut registry,
-            &selection,
-            &hidden,
-            (&self.resources, &self.base_prompt),
-            args,
-            &servers,
-        )?;
-        self.registry = registry;
-        self.servers = servers;
-        self.system_prompt = system_prompt;
         Ok(())
     }
 
@@ -146,6 +125,46 @@ impl Runtime {
     }
     pub async fn close(&self) -> Result<()> {
         self.registry.shutdown().await
+    }
+}
+
+struct LiveMcpCatalog {
+    args: Cli,
+    resources: resources::Resources,
+    base_prompt: String,
+    servers: std::sync::Mutex<Vec<Arc<pi_rs_workbench::mcp::McpExtension>>>,
+}
+#[async_trait::async_trait]
+impl pi_rs::RegistryRefresher for LiveMcpCatalog {
+    async fn refresh(&self, current: &Registry) -> Result<Option<pi_rs::RegistryUpdate>> {
+        let previous = self.servers.lock().expect("MCP catalogs").clone();
+        if previous.is_empty() {
+            return Ok(None);
+        }
+        let mut servers = Vec::with_capacity(previous.len());
+        let mut registry = current.clone();
+        for server in previous {
+            let refreshed = Arc::new(server.refresh().await?);
+            registry.replace(refreshed.clone())?;
+            servers.push(refreshed);
+        }
+        let (selection, documents, hidden) = tool_discovery(&self.args, &servers)?;
+        registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
+            documents,
+        )))?;
+        let system_prompt = select_tools(
+            &mut registry,
+            &selection,
+            &hidden,
+            (&self.resources, &self.base_prompt),
+            &self.args,
+            &servers,
+        )?;
+        *self.servers.lock().expect("MCP catalogs") = servers;
+        Ok(Some(pi_rs::RegistryUpdate {
+            registry,
+            system_prompt: Some(system_prompt),
+        }))
     }
 }
 
@@ -289,6 +308,13 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             args,
             &mcp_connections,
         )?;
+        let catalog = Arc::new(LiveMcpCatalog {
+            args: args.clone(),
+            resources: local_resources.clone(),
+            base_prompt: base_prompt.clone(),
+            servers: std::sync::Mutex::new(mcp_connections.clone()),
+        });
+        registry.set_refresher(catalog.clone());
         let show_reasoning = args.trace;
         let provider = Ollama::new(&args.endpoint, args.model_token())?
             .with_reasoning_effort(args.thinking.as_deref())
@@ -307,9 +333,8 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             provider,
             registry,
             system_prompt,
-            base_prompt,
             resources: local_resources,
-            servers: mcp_connections.clone(),
+            catalog,
         })
     }
     .await;

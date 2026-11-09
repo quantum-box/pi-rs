@@ -1841,3 +1841,248 @@ fn discovered_command_names_match_pi_collisions_and_invoke_the_correct_owner() {
     .unwrap();
     assert_eq!(filtered.registered_commands()[0].invocation_name, "set");
 }
+
+struct CatalogTool {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl Tool for CatalogTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.into(),
+            description: self.name.into(),
+            parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+        }
+    }
+    fn execution(&self) -> ToolExecution {
+        ToolExecution::ParallelRead
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Outcome::Succeeded(self.name.into())
+    }
+}
+struct CatalogExtension {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+impl Extension for CatalogExtension {
+    fn id(&self) -> &str {
+        "catalog"
+    }
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![Arc::new(CatalogTool {
+            name: self.name,
+            calls: self.calls.clone(),
+        })]
+    }
+}
+struct ChangingCatalog {
+    refreshes: AtomicUsize,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl RegistryRefresher for ChangingCatalog {
+    async fn refresh(&self, current: &Registry) -> Result<Option<RegistryUpdate>> {
+        if self.calls.load(Ordering::SeqCst) == 0
+            || self.refreshes.fetch_add(1, Ordering::SeqCst) != 0
+        {
+            return Ok(None);
+        }
+        let mut registry = current.clone();
+        registry.replace(Arc::new(CatalogExtension {
+            name: "new_tool",
+            calls: self.calls.clone(),
+        }))?;
+        registry.set_active_tools(["new_tool".into()])?;
+        Ok(Some(RegistryUpdate {
+            registry,
+            system_prompt: Some("updated catalog".into()),
+        }))
+    }
+}
+#[tokio::test]
+async fn tool_catalog_refresh_changes_advertising_and_dispatch_inside_one_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(CatalogExtension {
+            name: "old_tool",
+            calls: calls.clone(),
+        }))
+        .unwrap();
+    registry.set_refresher(Arc::new(ChangingCatalog {
+        refreshes: AtomicUsize::new(0),
+        calls: calls.clone(),
+    }));
+    let call = |name: &str| {
+        vec![ModelEvent::Complete {
+            calls: vec![ToolCall {
+                id: name.into(),
+                name: name.into(),
+                arguments: "{}".into(),
+            }],
+            usage: Some(Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            }),
+        }]
+    };
+    let model = Script::new(vec![call("old_tool"), call("new_tool"), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_sender, mut inputs) = mpsc::channel::<String>(1);
+    assert_eq!(
+        agent(&model, &registry)
+            .run(
+                &mut session,
+                Some("refresh".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore
+            )
+            .await
+            .unwrap(),
+        "done"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests[0].tools[0].name, "old_tool");
+        assert_eq!(requests[1].tools.len(), 1);
+        assert_eq!(requests[1].tools[0].name, "new_tool");
+        assert!(
+            matches!(&requests[1].messages[0], Message::System {content} if content=="updated catalog")
+        );
+    }
+    let read_only = registry
+        .read_only_subset(&["old_tool".into()].into())
+        .unwrap();
+    assert!(read_only.refreshed().await.unwrap().is_none());
+}
+
+struct RemovingCatalog(AtomicUsize);
+#[async_trait::async_trait]
+impl RegistryRefresher for RemovingCatalog {
+    async fn refresh(&self, current: &Registry) -> Result<Option<RegistryUpdate>> {
+        if self.0.fetch_add(1, Ordering::SeqCst) != 1 {
+            return Ok(None);
+        }
+        let mut registry = current.clone();
+        registry.retain_tools(|tool| tool.name != "old_tool");
+        Ok(Some(RegistryUpdate {
+            registry,
+            system_prompt: None,
+        }))
+    }
+}
+#[tokio::test]
+async fn removed_tools_are_not_dispatched_after_the_model_returns() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(CatalogExtension {
+            name: "old_tool",
+            calls: calls.clone(),
+        }))
+        .unwrap();
+    registry.set_refresher(Arc::new(RemovingCatalog(AtomicUsize::new(0))));
+    let model = Script::new(vec![
+        vec![ModelEvent::Complete {
+            calls: vec![ToolCall {
+                id: "old".into(),
+                name: "old_tool".into(),
+                arguments: "{}".into(),
+            }],
+            usage: None,
+        }],
+        answer("done"),
+    ]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_sender, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("remove it".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(model.requests.lock().unwrap()[1].tools.is_empty());
+    assert!(matches!(
+        &session.operations()[0].1,
+        OperationState::Finished(Outcome::Skipped(_))
+    ));
+}
+
+struct HangingCatalog;
+#[async_trait::async_trait]
+impl RegistryRefresher for HangingCatalog {
+    async fn refresh(&self, _: &Registry) -> Result<Option<RegistryUpdate>> {
+        std::future::pending().await
+    }
+}
+#[tokio::test]
+async fn catalog_refresh_can_be_cancelled_before_a_model_request() {
+    let mut registry = Registry::default();
+    registry.set_refresher(Arc::new(HangingCatalog));
+    let model = Script::new(vec![]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_sender, mut inputs) = mpsc::channel::<String>(1);
+    let cancel = CancellationToken::new();
+    let signal = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        signal.cancel();
+    });
+    assert!(matches!(
+        agent(&model, &registry)
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &cancel,
+                &mut ignore
+            )
+            .await,
+        Err(Error::Cancelled)
+    ));
+    assert!(model.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_catalog_refresh_settles_unstarted_tools() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(CatalogExtension {
+            name: "old_tool",
+            calls: calls.clone(),
+        }))
+        .unwrap();
+    let model = Script::new(vec![vec![ModelEvent::Complete {
+        calls: vec![ToolCall {
+            id: "old".into(),
+            name: "old_tool".into(),
+            arguments: "{}".into(),
+        }],
+        usage: None,
+    }]]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_sender, mut inputs) = mpsc::channel::<String>(1);
+    let cancel = CancellationToken::new();
+    let result=agent(&model,&registry).run(&mut session,Some("hello".into()),&mut inputs,&cancel,&mut |event| {
+        if matches!(event,Notification::Committed(record) if matches!(record.event,Event::Assistant {..})) {cancel.cancel();}
+    }).await;
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        session
+            .operations()
+            .iter()
+            .all(|(_, state)| matches!(state, OperationState::Finished(Outcome::Skipped(_))))
+    );
+}

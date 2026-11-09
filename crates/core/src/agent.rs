@@ -363,10 +363,31 @@ impl Agent<'_> {
             apply_inputs(session, true, observer)?;
         }
 
+        let mut runtime_registry = self.registry.clone();
+        let mut runtime_prompt = self.system_prompt.to_owned();
         let mut budget = self.limits.output_tokens_per_run;
         let mut compacted = false;
         let mut retry_attempt = 0;
         for request_index in 0..self.limits.model_requests {
+            let update = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                update = tokio::time::timeout(self.limits.model_timeout, runtime_registry.refreshed()) => update.map_err(|_| Error::Config("tool catalog refresh timed out".into()))??,
+            };
+            if let Some(update) = update {
+                runtime_registry = update.registry;
+                if let Some(prompt) = update.system_prompt {
+                    runtime_prompt = prompt;
+                }
+            }
+            let active = Agent {
+                registry: &runtime_registry,
+                system_prompt: &runtime_prompt,
+                model: self.model,
+                model_name: self.model_name,
+                limits: self.limits.clone(),
+            };
+
             queue_inputs(session, followups, observer)?;
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -374,10 +395,10 @@ impl Agent<'_> {
             let (reply, advertised, allowance) = if let Some((request, metadata, usage, recorded)) =
                 pending.take()
             {
-                self.settle_usage(request, &usage, &metadata).await?;
+                active.settle_usage(request, &usage, &metadata).await?;
                 let allowance = recorded
                     .max_output_tokens
-                    .min(self.limits.output_tokens_per_request)
+                    .min(active.limits.output_tokens_per_request)
                     .min(budget);
                 let measured = match usage {
                     UsageReport::Measured { usage } => Some(usage),
@@ -400,11 +421,11 @@ impl Agent<'_> {
                 )
             } else {
                 apply_inputs(session, false, observer)?;
-                let max_output_tokens = self.limits.output_tokens_per_request.min(budget);
+                let max_output_tokens = active.limits.output_tokens_per_request.min(budget);
                 if max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
-                let mut request = self
+                let mut request = active
                     .request(
                         session,
                         &states,
@@ -419,7 +440,7 @@ impl Agent<'_> {
                 if request.max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
-                let capacity = self.context_capacity(&request, cancel).await?;
+                let capacity = active.context_capacity(&request, cancel).await?;
                 let estimate = session.context_usage_estimate();
                 let input_tokens = if estimate.last_usage_record.is_some() {
                     estimate.tokens
@@ -447,7 +468,7 @@ impl Agent<'_> {
                     || (control.enabled()
                         && !compacted
                         && budget > 1
-                        && request_index + 1 < self.limits.model_requests
+                        && request_index + 1 < active.limits.model_requests
                         && reserve_reached
                         && has_prefix)
                 {
@@ -456,13 +477,13 @@ impl Agent<'_> {
                             "context does not fit and automatic compaction is disabled".into(),
                         ));
                     }
-                    if compacted || request_index + 1 >= self.limits.model_requests {
+                    if compacted || request_index + 1 >= active.limits.model_requests {
                         return Err(Error::Model(
                             "context does not fit after the bounded compaction attempt".into(),
                         ));
                     }
                     let summary_limit = max_output_tokens.min(512).min(budget / 2);
-                    let spent = self
+                    let spent = active
                         .summarize_prefix(
                             session,
                             &states,
@@ -484,7 +505,7 @@ impl Agent<'_> {
                 let advertised: HashSet<_> =
                     request.tools.iter().map(|spec| spec.name.clone()).collect();
                 let allowance = request.max_output_tokens;
-                let result = self
+                let result = active
                     .reply(session, request, true, cancel, observer, Some(followups))
                     .await?
                     .outcome;
@@ -493,7 +514,7 @@ impl Agent<'_> {
                 if let Err(Error::RetryableModel(message)) = &result
                     && settings.enabled
                     && retry_attempt < settings.max_retries
-                    && request_index + 1 < self.limits.model_requests
+                    && request_index + 1 < active.limits.model_requests
                 {
                     retry_attempt += 1;
                     let delay_ms = settings.delay_ms(retry_attempt);
@@ -553,7 +574,32 @@ impl Agent<'_> {
                 observer,
             )?;
 
-            if let Err(err) = self
+            let dispatch_update = if invocations.is_empty() {
+                Ok(None)
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(Error::Cancelled),
+                    update = tokio::time::timeout(active.limits.model_timeout, active.registry.refreshed()) => update.unwrap_or_else(|_| Err(Error::Config("tool catalog refresh timed out".into()))),
+                }
+            };
+            let dispatch_update = match dispatch_update {
+                Ok(update) => update,
+                Err(error) => {
+                    recover_unstarted(session, observer)?;
+                    return Err(error);
+                }
+            };
+            let dispatcher = Agent {
+                registry: dispatch_update
+                    .as_ref()
+                    .map_or(active.registry, |update| &update.registry),
+                system_prompt: active.system_prompt,
+                model: active.model,
+                model_name: active.model_name,
+                limits: active.limits.clone(),
+            };
+            if let Err(err) = dispatcher
                 .tool_batch(
                     session,
                     &invocations,
@@ -571,6 +617,13 @@ impl Agent<'_> {
             {
                 recover_unstarted(session, observer)?;
                 return Err(err);
+            }
+
+            if let Some(update) = dispatch_update {
+                runtime_registry = update.registry;
+                if let Some(prompt) = update.system_prompt {
+                    runtime_prompt = prompt;
+                }
             }
 
             if let Some(answer) = answer {

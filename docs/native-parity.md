@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands | In-flight tool-list updates, interactive scope upgrades |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands | Interactive scope upgrades and push-notification optimization |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and Unix terminal appearance notifications | Windows appearance notifications and remaining palette synchronization |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
@@ -1527,3 +1527,28 @@ operations, then repeats message/statistics/tree reads while a shell tool runs.
 It verifies pending calls are visible and final results appear after completion.
 Existing cost, statistics, retry and command-discovery RPC checks also pass,
 along with the full workspace tests and all-target Clippy.
+
+### In-flight MCP catalog checkpoint
+
+The agent can refresh its registry and system prompt at model-request boundaries
+and refresh again before tool dispatch. The local MCP host re-lists definitions
+on the established connection, atomically replaces the server extensions and
+search index, and reapplies tool selection and exposure settings. This polling
+also detects changes from servers that do not deliver list-change notifications.
+
+Added tools and changed schemas are available within the same run. Removed tools
+are rejected before dispatch, even when a model response was based on the older
+catalog. Read-only child profiles retain their fixed capability set and do not
+inherit the refresher. Refresh waits obey model timeouts and cancellation.
+
+Core tests cover same-run advertising and dispatch updates, removal between
+request and dispatch, fixed read-only profiles and cancellation. Interactive
+OAuth scope upgrades and push-notification optimization remain open.
+
+Loopback runs verify a direct tool replacement, a same-name schema change,
+explicit exclusion of an added tool, and deferred discovery of a replacement
+within one turn. Each run uses one MCP initialization. Existing codemode,
+resource-template, prompt, authentication-header and redaction checks also pass.
+
+The full workspace tests and all-target Clippy pass. Cancellation after a model
+response also settles its unstarted tool operations before returning.

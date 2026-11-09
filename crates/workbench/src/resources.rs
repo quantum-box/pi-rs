@@ -18,7 +18,7 @@ pub struct Prompt {
     pub body: String,
     pub description: String,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Resources {
     pub instructions: String,
     pub system: Option<String>,

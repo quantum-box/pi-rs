@@ -265,15 +265,37 @@ pub(crate) struct RegisteredTool {
     pub validator: jsonschema::Validator,
 }
 
+pub struct RegistryUpdate {
+    pub registry: Registry,
+    pub system_prompt: Option<String>,
+}
+
+/// Refresh runtime tool definitions at model-request boundaries.
+#[async_trait::async_trait]
+pub trait RegistryRefresher: Send + Sync {
+    async fn refresh(&self, current: &Registry) -> Result<Option<RegistryUpdate>>;
+}
+
 #[derive(Clone, Default)]
 pub struct Registry {
     pub(crate) extensions: Vec<Arc<dyn Extension>>,
     pub(crate) tools: BTreeMap<String, Arc<RegisteredTool>>,
     active: Option<BTreeSet<String>>,
     pub(crate) ui: Option<Arc<dyn crate::ExtensionUi>>,
+    refresher: Option<Arc<dyn RegistryRefresher>>,
 }
 
 impl Registry {
+    pub fn set_refresher(&mut self, refresher: Arc<dyn RegistryRefresher>) {
+        self.refresher = Some(refresher);
+    }
+    pub async fn refreshed(&self) -> Result<Option<RegistryUpdate>> {
+        match &self.refresher {
+            Some(refresher) => refresher.refresh(self).await,
+            None => Ok(None),
+        }
+    }
+
     /// Resolve command collisions in extension registration order, as Pi does.
     pub fn registered_commands(&self) -> Vec<RegisteredCommand> {
         let mut commands = Vec::new();
@@ -419,6 +441,7 @@ impl Registry {
             tools,
             active: None,
             ui: self.ui.clone(),
+            refresher: None,
         })
     }
 
