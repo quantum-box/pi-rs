@@ -7,7 +7,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pi_rs::{Error, Extension, Outcome, Result, Tool, ToolContext, ToolExecution, ToolSpec};
+use pi_rs::{
+    Error, Extension, Outcome, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolReply,
+    ToolSpec,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -182,6 +185,36 @@ impl Tool for CodingTool {
         match result {
             Ok(value) => Outcome::Succeeded(value),
             Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+    async fn invoke_programmatic(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _state: Option<&pi_rs::ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
+            return match self.shell(&args).await {
+                Ok(result) => Outcome::Structured { data: json!({"output":result.output,"truncated":result.truncated,"exit_code":result.status.code(),"wall_time_seconds":result.elapsed}), attachments: vec![] }.into(),
+                Err(error) => Outcome::Failed(error.to_string()).into(),
+            };
+        }
+        let outcome = self.invoke(args, context).await;
+        match outcome {
+            Outcome::Structured { data, attachments } if matches!(self.kind, Kind::Read) => {
+                let image = data["content"]
+                    .as_array()
+                    .and_then(|blocks| blocks.iter().find(|block| block["type"] == "image"))
+                    .cloned()
+                    .unwrap_or(data);
+                Outcome::Structured {
+                    data: image,
+                    attachments,
+                }
+                .into()
+            }
+            outcome => outcome.into(),
         }
     }
 }
@@ -483,6 +516,23 @@ impl CodingTool {
     }
 
     async fn bash(&self, args: &Value) -> Result<String> {
+        let result = self.shell(args).await?;
+        let truncation = if result.truncated {
+            "\n[Output truncated at 50 KiB per stream]"
+        } else {
+            ""
+        };
+        let output = format!(
+            "{}{truncation}\nExit status: {}",
+            result.output, result.status
+        );
+        if !result.status.success() {
+            return Err(Error::Config(output));
+        }
+        Ok(output)
+    }
+    async fn shell(&self, args: &Value) -> Result<ShellResult> {
+        let started = std::time::Instant::now();
         let mut command = if matches!(self.kind, Kind::PowerShell) {
             let executable = std::env::var_os("PATH")
                 .into_iter()
@@ -516,22 +566,24 @@ impl CodingTool {
         .await
         .map_err(|_| Error::Config("command timed out".into()))??;
         process.finished = true;
-        let truncation = if result.1.truncated || result.2.truncated {
-            "\n[Output truncated at 50 KiB per stream]"
-        } else {
-            ""
-        };
-        let output = format!(
-            "{}{}{truncation}\nExit status: {}",
-            String::from_utf8_lossy(&result.1.bytes),
-            String::from_utf8_lossy(&result.2.bytes),
-            result.0
-        );
-        if !result.0.success() {
-            return Err(Error::Config(output));
-        }
-        Ok(output)
+        Ok(ShellResult {
+            output: format!(
+                "{}{}",
+                String::from_utf8_lossy(&result.1.bytes),
+                String::from_utf8_lossy(&result.2.bytes)
+            ),
+            truncated: result.1.truncated || result.2.truncated,
+            status: result.0,
+            elapsed: started.elapsed().as_secs_f64(),
+        })
     }
+}
+
+struct ShellResult {
+    output: String,
+    truncated: bool,
+    status: std::process::ExitStatus,
+    elapsed: f64,
 }
 
 fn string<'a>(value: &'a Value, name: &str) -> Result<&'a str> {

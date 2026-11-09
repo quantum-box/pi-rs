@@ -98,6 +98,18 @@ impl Selection {
     pub fn declares_mcp(&self) -> bool {
         self.allow.is_none() || self.mcp_selected
     }
+    pub fn callable(&self, name: &str) -> bool {
+        if self.exclude.iter().any(|pattern| pattern.is_match(name)) {
+            return false;
+        }
+        if name.starts_with("mcp__") && self.mcp_selected {
+            return self
+                .allow
+                .as_ref()
+                .is_none_or(|allow| allow.iter().any(|pattern| pattern.is_match(name)));
+        }
+        true
+    }
     pub fn includes(&self, name: &str) -> bool {
         if self.exclude.iter().any(|pattern| pattern.is_match(name)) || self.removed.contains(name)
         {
@@ -116,7 +128,7 @@ impl Selection {
         if self.no_builtin && matches!(name, "read_text" | "count_lines" | "lookup_order") {
             return false;
         }
-        if BUILTINS.contains(&name) || name == "tool_search" {
+        if BUILTINS.contains(&name) || matches!(name, "tool_search" | "codemode") {
             return false;
         }
         true

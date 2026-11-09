@@ -4,7 +4,9 @@ use std::sync::Arc;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{CancellationToken, Error, ExtensionState, ModelRequest, Outcome, Result, ToolSpec};
+use crate::{
+    CancellationToken, Error, ExtensionState, ModelRequest, Outcome, Result, ToolReply, ToolSpec,
+};
 
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
@@ -58,6 +60,29 @@ pub trait Tool: Send + Sync {
         _host: Arc<dyn ToolHost>,
     ) -> Outcome {
         self.invoke_with_state(arguments, context, state).await
+    }
+    /// Return output and a private owning-state update for one atomic journal commit.
+    async fn invoke_transaction(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        self.invoke_with_host(arguments, context, state, host)
+            .await
+            .into()
+    }
+    /// Programmatic callers may request a structured form of a tool's output.
+    async fn invoke_programmatic(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        self.invoke_transaction(arguments, context, state, host)
+            .await
     }
     /// Explicitly opt into automatic pending-job polling.
     fn can_poll(&self) -> bool {
@@ -204,6 +229,7 @@ pub(crate) struct RegisteredTool {
 pub struct Registry {
     pub(crate) extensions: Vec<Arc<dyn Extension>>,
     pub(crate) tools: BTreeMap<String, Arc<RegisteredTool>>,
+    active: Option<BTreeSet<String>>,
 }
 
 impl Registry {
@@ -249,6 +275,26 @@ impl Registry {
         self.tools.retain(|_, tool| keep(&tool.spec));
     }
 
+    /// Select model-facing tools while retaining callable tools for orchestration.
+    pub fn set_active_tools(&mut self, names: impl IntoIterator<Item = String>) -> Result<()> {
+        let names: BTreeSet<_> = names.into_iter().collect();
+        if names.iter().any(|name| !self.has_tool(name)) {
+            return Err(Error::Config("active tool is not registered".into()));
+        }
+        self.active = Some(names);
+        Ok(())
+    }
+    pub fn active_tool_specs(&self) -> Vec<ToolSpec> {
+        self.tools
+            .iter()
+            .filter(|(name, _)| {
+                self.active
+                    .as_ref()
+                    .is_none_or(|active| active.contains(*name))
+            })
+            .map(|(_, tool)| tool.spec.clone())
+            .collect()
+    }
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|tool| tool.spec.clone()).collect()
     }
@@ -290,6 +336,7 @@ impl Registry {
         Ok(Self {
             extensions: self.extensions.clone(),
             tools,
+            active: None,
         })
     }
 

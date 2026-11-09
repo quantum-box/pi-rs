@@ -1,4 +1,5 @@
 //! Native extensions whose state follows the durable session branch.
+pub mod codemode;
 mod process;
 pub mod tool_search;
 pub use process::{ExecutableExtension, serve_extension};

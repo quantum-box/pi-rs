@@ -16,7 +16,7 @@ use crate::{
     CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind, Invocation,
     Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest, OperationState, Outcome,
     QueuedInput, Record, RecordedReply, Registry, RequestPurpose, Result, RunState, Session,
-    ToolContext, ToolExecution, ToolHost, ToolSpec, Usage, UsageReport,
+    ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, Usage, UsageReport,
 };
 
 #[derive(Clone, Debug)]
@@ -451,12 +451,7 @@ impl Agent<'_> {
         let mut request = ModelRequest {
             model: self.model_name.into(),
             messages,
-            tools: self
-                .registry
-                .tools
-                .values()
-                .map(|tool| tool.spec.clone())
-                .collect(),
+            tools: self.registry.active_tool_specs(),
             max_output_tokens,
         };
         for extension in &self.registry.extensions {
@@ -689,7 +684,7 @@ impl Agent<'_> {
                     depth: scope.depth,
                     call_count: scope.call_count.clone(),
                 });
-                self.invoke(prepared, cancel, host)
+                self.invoke(prepared, cancel, host, scope.depth > 0)
             });
             let outcomes = futures_util::future::join_all(invocations);
             tokio::pin!(outcomes);
@@ -889,7 +884,7 @@ impl Agent<'_> {
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
                 result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.poll(&reference, context)) => result.ok().flatten().ok_or(Error::PendingOperation(operation_id))?,
             };
-            self.finish_tool(session, &invocation, outcome, states, observer)?;
+            self.finish_tool(session, &invocation, outcome.into(), states, observer)?;
         }
         Ok(())
     }
@@ -948,10 +943,14 @@ impl Agent<'_> {
         &self,
         session: &mut Session,
         invocation: &Invocation,
-        outcome: Outcome,
+        reply: ToolReply,
         states: &mut ExtensionStates,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
+        let ToolReply {
+            outcome,
+            state: update,
+        } = reply;
         const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
         let outcome = match outcome {
             Outcome::Succeeded(output) if output.len() > MAX_OUTPUT_BYTES => Outcome::Truncated {
@@ -989,7 +988,7 @@ impl Agent<'_> {
             Outcome::Pending { .. } => Some(Error::PendingOperation(operation_id)),
             _ => None,
         };
-        let changes = self.tool_state_changes(&invocation.call.name, &outcome, states);
+        let changes = self.tool_state_changes(&invocation.call.name, &outcome, states, update);
         let persisted = changes.as_ref().cloned().unwrap_or_default();
         commit(
             session,
@@ -1012,12 +1011,31 @@ impl Agent<'_> {
         name: &str,
         outcome: &Outcome,
         states: &ExtensionStates,
+        update: Option<crate::ExtensionState>,
     ) -> Result<ExtensionStates> {
         let mut changes = ExtensionStates::new();
+        if let Some(update) = update {
+            if serde_json::to_vec(&update)?.len() > 4 * 1024 * 1024 {
+                return Err(Error::Config("tool state exceeds size limit".into()));
+            }
+            let owner = &self
+                .registry
+                .tools
+                .get(name)
+                .ok_or_else(|| Error::Config("tool state has no owning extension".into()))?
+                .owner;
+            changes.insert(owner.clone(), update);
+        }
         for extension in &self.registry.extensions {
             if let Some(state) = hook(
                 extension.as_ref(),
-                extension.after_tool(name, outcome, states.get(extension.id())),
+                extension.after_tool(
+                    name,
+                    outcome,
+                    changes
+                        .get(extension.id())
+                        .or_else(|| states.get(extension.id())),
+                ),
             )? {
                 changes.insert(extension.id().into(), state);
             }
@@ -1051,7 +1069,8 @@ impl Agent<'_> {
         preparation: Preparation<'_>,
         cancel: &CancellationToken,
         host: Arc<dyn ToolHost>,
-    ) -> Outcome {
+        programmatic: bool,
+    ) -> ToolReply {
         let (tool, args, context, state, _guard) = match preparation {
             Preparation::Ready {
                 tool,
@@ -1060,13 +1079,24 @@ impl Agent<'_> {
                 state,
                 guard,
             } => (tool, args, context, state, guard),
-            Preparation::Skipped(reason) => return Outcome::Skipped(reason),
+            Preparation::Skipped(reason) => return Outcome::Skipped(reason).into(),
+        };
+        let invocation = async {
+            if programmatic {
+                tool.tool
+                    .invoke_programmatic(args, context, state.as_ref(), host)
+                    .await
+            } else {
+                tool.tool
+                    .invoke_transaction(args, context, state.as_ref(), host)
+                    .await
+            }
         };
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()),
-            result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.invoke_with_host(args, context, state.as_ref(), host)) =>
-                result.unwrap_or_else(|_| Outcome::Unknown("tool timed out".into())),
+            _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()).into(),
+            result = tokio::time::timeout(self.limits.tool_timeout, invocation) =>
+                result.unwrap_or_else(|_| Outcome::Unknown("tool timed out".into()).into()),
         }
     }
 

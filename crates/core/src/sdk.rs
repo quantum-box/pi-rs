@@ -946,6 +946,69 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         session.close().await.unwrap();
     }
+    struct StatefulBundle;
+    #[async_trait::async_trait]
+    impl crate::Tool for StatefulBundle {
+        fn spec(&self) -> crate::ToolSpec {
+            Bundle.spec()
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            crate::Outcome::Succeeded("child result".into())
+        }
+        async fn invoke_transaction(
+            &self,
+            _: serde_json::Value,
+            _: crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ToolReply {
+            crate::ToolReply {
+                outcome: crate::Outcome::Succeeded("child result".into()),
+                state: Some(crate::ExtensionState {
+                    version: 1,
+                    data: serde_json::json!({"secret":"private state"}),
+                }),
+            }
+        }
+    }
+    struct StatefulExtension;
+    impl Extension for StatefulExtension {
+        fn id(&self) -> &str {
+            "stateful"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(StatefulBundle)]
+        }
+        fn after_tool(
+            &self,
+            _: &str,
+            _: &crate::Outcome,
+            state: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Option<crate::ExtensionState>> {
+            assert_eq!(state.unwrap().data["secret"], "private state");
+            Ok(None)
+        }
+    }
+    #[tokio::test]
+    async fn tool_state_commits_with_output_and_stays_out_of_model_messages() {
+        let mut session = SessionBuilder::new(Arc::new(NestedModel), "stateful")
+            .extension(Arc::new(StatefulExtension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.prompt("save state").await.unwrap(), "done");
+        assert_eq!(
+            session.journal().extension_states()["stateful"].data["secret"],
+            "private state"
+        );
+        assert!(
+            !serde_json::to_string(&session.messages().unwrap())
+                .unwrap()
+                .contains("private state")
+        );
+        assert!(session.journal().records().iter().any(|record| matches!(&record.event, crate::Event::ToolFinished { states, outcome: crate::Outcome::Succeeded(_), .. } if states.contains_key("stateful"))));
+        session.close().await.unwrap();
+    }
     struct WaitingModel;
     #[async_trait::async_trait]
     impl Model for WaitingModel {

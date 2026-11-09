@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use pi_rs_core::{
     CancellationToken, Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState,
-    ModelRequest, Outcome, RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolSpec,
+    ModelRequest, Outcome, RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost,
+    ToolReply, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,6 +49,10 @@ enum ProtocolRequest {
         operation_id: String,
         #[serde(default)]
         state: Option<ExtensionState>,
+        #[serde(default)]
+        transaction: bool,
+        #[serde(default)]
+        programmatic: bool,
     },
     Poll {
         name: String,
@@ -88,6 +93,8 @@ struct DescriptionTool {
     execution: ToolExecution,
     #[serde(default)]
     can_poll: bool,
+    #[serde(default)]
+    transactional: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DecisionValue {
@@ -178,6 +185,7 @@ impl Extension for ExecutableExtension {
                     spec: tool.spec.clone(),
                     execution: tool.execution,
                     can_poll: tool.can_poll,
+                    transactional: tool.transactional,
                 }) as Arc<dyn Tool>
             })
             .collect()
@@ -299,6 +307,46 @@ struct ExecutableTool {
     spec: ToolSpec,
     execution: ToolExecution,
     can_poll: bool,
+    transactional: bool,
+}
+impl ExecutableTool {
+    async fn request<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        request: ProtocolRequest,
+        cancellation: CancellationToken,
+    ) -> ExtensionResult<T> {
+        let path = self.executable.clone();
+        let guard = CancelOnDrop(cancellation.child_token());
+        let cancelled = guard.0.clone();
+        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+    async fn invoke_remote(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        programmatic: bool,
+    ) -> ToolReply {
+        if !self.transactional {
+            return self
+                .invoke_with_state(arguments, context, state)
+                .await
+                .into();
+        }
+        let request = ProtocolRequest::Invoke {
+            name: self.spec.name.clone(),
+            arguments,
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+            transaction: true,
+            programmatic,
+        };
+        self.request(request, context.cancellation)
+            .await
+            .unwrap_or_else(|error| Outcome::Unknown(error).into())
+    }
 }
 #[async_trait::async_trait]
 impl Tool for ExecutableTool {
@@ -325,17 +373,30 @@ impl Tool for ExecutableTool {
             arguments,
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
+            transaction: false,
+            programmatic: false,
         };
-        let path = self.executable.clone();
-        let guard = CancelOnDrop(context.cancellation.child_token());
-        let cancelled = guard.0.clone();
-        let result =
-            tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled))).await;
-        match result {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => Outcome::Unknown(error),
-            Err(error) => Outcome::Unknown(error.to_string()),
-        }
+        self.request(request, context.cancellation)
+            .await
+            .unwrap_or_else(Outcome::Unknown)
+    }
+    async fn invoke_transaction(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        self.invoke_remote(arguments, context, state, false).await
+    }
+    async fn invoke_programmatic(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        self.invoke_remote(arguments, context, state, true).await
     }
     async fn poll(&self, reference: &str, context: ToolContext) -> Option<Outcome> {
         let request = ProtocolRequest::Poll {
@@ -353,6 +414,17 @@ impl Tool for ExecutableTool {
             .flatten()
     }
 }
+struct DetachedHost;
+#[async_trait::async_trait]
+impl ToolHost for DetachedHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        vec![]
+    }
+    async fn call(&self, _: &str, _: Value) -> Outcome {
+        Outcome::Skipped("host tool calls are unavailable through this executable protocol".into())
+    }
+}
+
 struct CancelOnDrop(CancellationToken);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -519,6 +591,7 @@ async fn dispatch(
                     spec: tool.spec(),
                     execution: tool.execution(),
                     can_poll: tool.can_poll(),
+                    transactional: true,
                 })
                 .collect(),
         })),
@@ -571,15 +644,30 @@ async fn dispatch(
             arguments,
             operation_id,
             state,
+            transaction,
+            programmatic,
         } => {
             let tool = extension
                 .tools()
                 .into_iter()
                 .find(|tool| tool.spec().name == name)
                 .ok_or_else(|| "unknown extension tool".to_owned())?;
-            encode(Ok(tool
-                .invoke_with_state(arguments, context(&operation_id)?, state.as_ref())
-                .await))
+            if transaction {
+                let context = context(&operation_id)?;
+                let host = Arc::new(DetachedHost);
+                let reply = if programmatic {
+                    tool.invoke_programmatic(arguments, context, state.as_ref(), host)
+                        .await
+                } else {
+                    tool.invoke_transaction(arguments, context, state.as_ref(), host)
+                        .await
+                };
+                encode(Ok(reply))
+            } else {
+                encode(Ok(tool
+                    .invoke_with_state(arguments, context(&operation_id)?, state.as_ref())
+                    .await))
+            }
         }
         ProtocolRequest::Poll {
             name,
@@ -665,6 +753,21 @@ mod tests {
         ) -> Outcome {
             Outcome::Succeeded(state.unwrap().data["text"].as_str().unwrap().into())
         }
+        async fn invoke_transaction(
+            &self,
+            arguments: Value,
+            context: ToolContext,
+            state: Option<&ExtensionState>,
+            _: Arc<dyn ToolHost>,
+        ) -> ToolReply {
+            ToolReply {
+                outcome: self.invoke_with_state(arguments, context, state).await,
+                state: Some(ExtensionState {
+                    version: 1,
+                    data: serde_json::json!({"saved":true}),
+                }),
+            }
+        }
         async fn poll(&self, reference: &str, _: ToolContext) -> Option<Outcome> {
             Some(Outcome::Succeeded(reference.into()))
         }
@@ -692,6 +795,8 @@ mod tests {
                 version: 1,
                 data: serde_json::json!({"text":"own state"}),
             }),
+            transaction: false,
+            programmatic: false,
         };
         let result = runtime
             .block_on(dispatch(Arc::new(PollExtension), request))
@@ -700,6 +805,30 @@ mod tests {
             serde_json::from_value::<Outcome>(result).unwrap(),
             Outcome::Succeeded("own state".into())
         );
+    }
+    #[test]
+    fn protocol_preserves_private_transactional_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let request = ProtocolRequest::Invoke {
+            name: "polling".into(),
+            arguments: serde_json::json!({}),
+            operation_id: "00000000-0000-0000-0000-000000000001".into(),
+            state: Some(ExtensionState {
+                version: 1,
+                data: serde_json::json!({"text":"result"}),
+            }),
+            transaction: true,
+            programmatic: false,
+        };
+        let result = runtime
+            .block_on(dispatch(Arc::new(PollExtension), request))
+            .unwrap();
+        let result: ToolReply = serde_json::from_value(result).unwrap();
+        assert_eq!(result.outcome, Outcome::Succeeded("result".into()));
+        assert_eq!(result.state.unwrap().data["saved"], true);
     }
     #[test]
     fn protocol_advertises_and_forwards_polling_without_invocation() {

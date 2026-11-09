@@ -79,6 +79,8 @@ pub struct McpExtension {
     id: String,
     tools: Vec<Arc<dyn Tool>>,
     deferred: BTreeSet<String>,
+    has_codemode: bool,
+    has_deferred: bool,
     pub server_name: String,
     pub description: String,
     connection: Arc<Connection>,
@@ -230,6 +232,8 @@ impl McpExtension {
         }
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let mut deferred = BTreeSet::new();
+        let mut has_codemode = false;
+        let mut has_deferred = false;
         for definition in definitions {
             if !tool_enabled(config, &definition.name) {
                 continue;
@@ -249,6 +253,11 @@ impl McpExtension {
                 parameters: Value::Object((*definition.input_schema).clone()),
             };
             if is_deferred(config, &definition.name) {
+                has_deferred |= exposure(config, &definition.name) == "deferred";
+                has_codemode |= matches!(
+                    exposure(config, &definition.name),
+                    "codemode" | "codemode-deferred"
+                );
                 deferred.insert(spec.name.clone());
             }
             tools.push(Arc::new(McpTool {
@@ -287,6 +296,9 @@ impl McpExtension {
                     exposed.push_str("_resource");
                 }
                 if is_deferred(config, name) {
+                    has_deferred |= exposure(config, name) == "deferred";
+                    has_codemode |=
+                        matches!(exposure(config, name), "codemode" | "codemode-deferred");
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -325,6 +337,9 @@ impl McpExtension {
                     exposed.push_str("_prompt");
                 }
                 if is_deferred(config, name) {
+                    has_deferred |= exposure(config, name) == "deferred";
+                    has_codemode |=
+                        matches!(exposure(config, name), "codemode" | "codemode-deferred");
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -357,10 +372,18 @@ impl McpExtension {
             id: format!("mcp-{}", normalize(name)),
             tools,
             deferred,
+            has_codemode,
+            has_deferred,
             server_name: name.into(),
             description,
             connection,
         })
+    }
+    pub fn has_deferred(&self) -> bool {
+        self.has_deferred
+    }
+    pub fn has_codemode(&self) -> bool {
+        self.has_codemode
     }
     pub fn deferred_tools(&self) -> Vec<ToolSpec> {
         self.tools
@@ -493,7 +516,7 @@ fn exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
         })
         .or(config.exposure.as_ref())
         .map(String::as_str)
-        .unwrap_or("direct")
+        .unwrap_or("codemode")
 }
 fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
     !matches!(exposure(config, name), "hidden" | "off")

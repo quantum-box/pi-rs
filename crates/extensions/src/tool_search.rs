@@ -77,6 +77,19 @@ impl Extension for ToolSearch {
                     .iter()
                     .any(|document| document.tool.name == tool.name)
         });
+        for document in self
+            .documents
+            .iter()
+            .filter(|document| loaded.contains(&document.tool.name))
+        {
+            if !request
+                .tools
+                .iter()
+                .any(|tool| tool.name == document.tool.name)
+            {
+                request.tools.push(document.tool.clone());
+            }
+        }
         Ok(())
     }
     fn after_tool(

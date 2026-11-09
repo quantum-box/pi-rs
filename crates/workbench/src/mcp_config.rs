@@ -19,6 +19,8 @@ pub enum McpCommand {
         url: Option<String>,
         #[arg(long)]
         bearer_token_env_var: Option<String>,
+        #[arg(long, value_parser = ["direct", "deferred", "codemode", "hidden"])]
+        exposure: Option<String>,
         #[arg(long = "env")]
         environment: Vec<String>,
         #[arg(last = true)]
@@ -62,6 +64,22 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
         }
     }
     Ok(servers.into_iter().collect())
+}
+
+pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
+    let mut value = true;
+    let mut paths = vec![config::agent_dir().join("mcp.json")];
+    if args.trusted {
+        paths.push(args.workspace.join(".pi/mcp.json"));
+    }
+    for path in paths {
+        if let Some(setting) = config::read_object(&path)?.get("autoEnableCodemode") {
+            value = setting
+                .as_bool()
+                .ok_or_else(|| Error::Config("autoEnableCodemode must be a boolean".into()))?;
+        }
+    }
+    Ok(value)
 }
 
 pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtension>>> {
@@ -151,6 +169,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             local,
             url,
             bearer_token_env_var,
+            exposure,
             environment,
             command,
         } => {
@@ -171,6 +190,9 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             } else {
                 json!({"command":command[0],"args":command[1..]})
             };
+            if let Some(exposure) = exposure {
+                value["exposure"] = json!(exposure);
+            }
             if let Some(variable) = bearer_token_env_var {
                 if !variable
                     .bytes()

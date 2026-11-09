@@ -229,6 +229,23 @@ pub struct Invocation {
     pub call: ToolCall,
 }
 
+/// A tool result and an optional replacement for its owning extension state.
+/// Both are committed together; the state is excluded from model-facing output.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolReply {
+    pub outcome: Outcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ExtensionState>,
+}
+impl From<Outcome> for ToolReply {
+    fn from(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            state: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ExtensionState {
     pub version: u32,

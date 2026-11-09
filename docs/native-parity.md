@@ -22,8 +22,8 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface, explicit hot reload |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI, resource globs and complete validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery and task polling; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, codemode exposure and elicitation |
-| Codemode | Core tool invocation APIs and shared BM25 tool discovery | Sandboxed code execution and non-chat model invocation |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, elicitation |
+| Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation, complete output/image fidelity and limits |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Published-crate resource bundles and complete source/filter compatibility |
@@ -272,3 +272,29 @@ operations retain individual journal records, use the same validation and
 policies, and preserve uncertainty after cancellation. Tests cover denied and
 invalid calls, concurrent reads and blocked replay after interruption. This is
 the execution boundary for the pending codemode sandbox.
+
+### Native codemode checkpoint
+
+The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
+fresh QuickJS context. Scripts can call registered tools through `tools`, use
+`searchTools`, `describeTool` and `describeNamespace`, emit `text` or `image`,
+and retain JSON values with `store` / `load`. Store changes commit with a
+successful tool result and follow journal branches. Failed scripts retain
+partial output without committing their store. Filesystem, network and Node
+APIs are absent from the script context. Memory, stack, execution time and
+output have explicit bounds. Large text output is saved to a local file.
+
+MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
+`codemode` and `hidden` select another mode when adding a server. The root
+`autoEnableCodemode` MCP setting controls automatic activation. Explicit tool
+exclusions also prevent script access. Programmatic shell calls return output,
+exit status, truncation and elapsed time, including nonzero exit statuses.
+Nested calls retain their own validation, policy checks and journal entries.
+
+CLI fixtures verify file read/write and shell execution through scripts,
+private-store persistence across processes, and default MCP discovery and
+execution. Tests cover rollback, interruption, memory/stack limits, output
+truncation and parallel script calls through the core execution host. The
+native JSON code argument differs from Pi's provider-specific raw-code input.
+Non-chat model APIs, complete image ordering and large-image behavior remain
+open. Executable extensions still lack bidirectional host-tool invocation.
