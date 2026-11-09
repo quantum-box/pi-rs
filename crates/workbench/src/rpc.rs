@@ -196,7 +196,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 Worker::submit(
                     &mut worker,
                     &args,
-                    json!({"type":"compact","summary":null,"keep_turns":1,"instructions":instructions,"rpc":true,"id":request.get("id")}),
+                    json!({"type":"compact","summary":null,"keep_turns":1,"use_token_settings":true,"instructions":instructions,"rpc":true,"id":request.get("id")}),
                 )
             })();
             match result {

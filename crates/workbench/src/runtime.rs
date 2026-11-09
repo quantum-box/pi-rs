@@ -17,6 +17,8 @@ pub struct Runtime {
 }
 impl Runtime {
     pub fn agent<'a>(&'a self, args: &'a Cli) -> Agent<'a> {
+        self.auto_compaction
+            .set_token_settings(args.settings.compaction_tokens(&args.model));
         Agent {
             model: &self.provider,
             model_name: &args.model,

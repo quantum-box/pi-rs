@@ -1325,8 +1325,9 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             switch_session(args, view, path)?;
         }
         "/compact" => {
-            view.pending_request =
-                Some(json!({"type":"compact","summary":null,"keep_turns":1,"instructions":rest}))
+            view.pending_request = Some(
+                json!({"type":"compact","summary":null,"keep_turns":1,"use_token_settings":true,"instructions":rest}),
+            )
         }
         "/mcp" => view.pending_request = Some(json!({"type":"mcp_status"})),
         "/trust" => {
@@ -2065,6 +2066,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 "themes",
                                 "packages",
                                 "codemode",
+                                "compaction",
                             ] {
                                 items.push(Item {
                                     label: format!(
@@ -2371,6 +2373,7 @@ fn select(
                 "modelThinkingLevels" => json!({}),
                 "steeringMode" | "followUpMode" => json!("one-at-a-time"),
                 "codemode" => json!({"mode":"on", "inlineBudget":3000}),
+                "compaction" => json!({"enabled":args.settings.auto_compaction_enabled()}),
                 _ => json!([]),
             };
             let value = args.settings.value().get(&key).unwrap_or(&default);

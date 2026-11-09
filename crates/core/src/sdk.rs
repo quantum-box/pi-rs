@@ -36,6 +36,13 @@ impl SessionControl {
         self.auto_compaction.set_enabled(enabled);
         Ok(())
     }
+    pub fn set_compaction_tokens(&self, settings: crate::CompactionTokens) -> Result<()> {
+        if self.input.is_closed() {
+            return Err(Error::Config("session is closed".into()));
+        }
+        self.auto_compaction.set_token_settings(settings);
+        Ok(())
+    }
     pub async fn steer(&self, content: impl Into<String>) -> Result<Uuid> {
         self.enqueue(InputKind::Steer, content.into(), Vec::new())
             .await
@@ -366,6 +373,9 @@ impl AgentSession {
         session
             .auto_compaction_control()
             .set_enabled(self.auto_compaction_enabled());
+        session
+            .auto_compaction_control()
+            .set_token_settings(self.session.auto_compaction_control().token_settings());
         let mut fork = SessionBuilder::new(self.model.clone(), model_name)
             .system_prompt(self.system_prompt.clone())
             .limits(self.limits.clone())
@@ -650,15 +660,73 @@ mod tests {
         assert!(session.auto_compaction_enabled());
         control.set_auto_compaction_enabled(false).unwrap();
         assert!(!session.auto_compaction_enabled());
+        control
+            .set_compaction_tokens(crate::CompactionTokens {
+                reserve_tokens: Some(123),
+                keep_recent_tokens: Some(456),
+            })
+            .unwrap();
         session.prompt("fork point").await.unwrap();
         let mut fork = session.fork_at(session.journal().head()).unwrap();
         assert!(!fork.auto_compaction_enabled());
+        assert_eq!(
+            fork.journal()
+                .auto_compaction_control()
+                .token_settings()
+                .reserve_tokens,
+            Some(123)
+        );
+        fork.controls()
+            .set_compaction_tokens(crate::CompactionTokens::default())
+            .unwrap();
+        assert_eq!(
+            session
+                .journal()
+                .auto_compaction_control()
+                .token_settings()
+                .reserve_tokens,
+            Some(123)
+        );
         fork.controls().set_auto_compaction_enabled(true).unwrap();
         assert!(fork.auto_compaction_enabled());
         assert!(!session.auto_compaction_enabled());
         fork.close().await.unwrap();
         session.close().await.unwrap();
         assert!(control.set_auto_compaction_enabled(true).is_err());
+    }
+
+    #[tokio::test]
+    async fn token_retention_counts_shell_context_without_creating_extra_turns() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .in_memory()
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        session.prompt("second").await.unwrap();
+        session
+            .session
+            .append_bash_execution(crate::BashExecution {
+                command: "report".into(),
+                output: "x".repeat(600),
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+                full_output_path: None,
+                exclude_from_context: false,
+            })
+            .unwrap();
+        let messages = session.messages().unwrap();
+        let target = serde_json::to_vec(messages.last().unwrap())
+            .unwrap()
+            .len()
+            .div_ceil(3) as u64
+            + 1;
+        let control = session.journal().auto_compaction_control();
+        control.set_token_settings(crate::CompactionTokens {
+            reserve_tokens: None,
+            keep_recent_tokens: Some(target),
+        });
+        assert_eq!(control.retained_turns(session.journal(), 1).unwrap(), 1);
+        session.close().await.unwrap();
     }
 
     struct EchoModel(AtomicUsize);

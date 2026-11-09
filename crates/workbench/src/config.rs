@@ -92,6 +92,20 @@ impl Settings {
             .as_bool()
             .unwrap_or(true)
     }
+    pub fn compaction_tokens(&self, model: &str) -> pi_rs::CompactionTokens {
+        let compaction = &self.value["compaction"];
+        let overrides = &compaction["modelOverrides"][format!("ollama/{model}")];
+        let token_value = |name: &str| {
+            overrides
+                .get(name)
+                .or_else(|| compaction.get(name))
+                .and_then(Value::as_u64)
+        };
+        pi_rs::CompactionTokens {
+            reserve_tokens: token_value("reserveTokens"),
+            keep_recent_tokens: token_value("keepRecentTokens"),
+        }
+    }
     pub fn set_auto_compaction_enabled(&mut self, enabled: bool) -> Result<()> {
         let path = agent_dir().join("settings.json");
         let update = |settings: &mut Map<String, Value>| -> Result<()> {
@@ -399,6 +413,42 @@ mod tests {
         assert_eq!(base["skills"], json!(["first", "second"]));
     }
     #[test]
+    fn compaction_tokens_resolve_each_model_override_independently() {
+        let settings = Settings {
+            value: json!({"compaction":{"reserveTokens":200,"keepRecentTokens":300,"modelOverrides":{
+                "ollama/first":{"reserveTokens":50},"ollama/second":{"keepRecentTokens":0}
+            }}}),
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.compaction_tokens("first"),
+            pi_rs::CompactionTokens {
+                reserve_tokens: Some(50),
+                keep_recent_tokens: Some(300)
+            }
+        );
+        assert_eq!(
+            settings.compaction_tokens("second"),
+            pi_rs::CompactionTokens {
+                reserve_tokens: Some(200),
+                keep_recent_tokens: Some(0)
+            }
+        );
+        assert_eq!(
+            settings.compaction_tokens("other"),
+            pi_rs::CompactionTokens {
+                reserve_tokens: Some(200),
+                keep_recent_tokens: Some(300)
+            }
+        );
+        assert_eq!(
+            Settings::default().compaction_tokens("first"),
+            pi_rs::CompactionTokens::default()
+        );
+        validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+    }
+
+    #[test]
     fn model_thinking_defaults_prefer_the_provider_key_then_global_default() {
         let settings = Settings {
             value: json!({"defaultThinkingLevel":"low", "modelThinkingLevels":{"ollama/a":"high", "a":"medium", "b":"max"}}),
@@ -419,6 +469,11 @@ mod tests {
             json!({"codemode":{"inlineBudget":-1}}),
             json!({"hideThinkingBlock":"false"}),
             json!({"compaction": false}),
+            json!({"compaction":{"reserveTokens":-1}}),
+            json!({"compaction":{"keepRecentTokens":1.5}}),
+            json!({"compaction":{"reserveTokens":9007199254740992_u64}}),
+            json!({"compaction":{"modelOverrides":{"ollama/test":false}}}),
+            json!({"compaction":{"modelOverrides":{"ollama/test":{"reserveTokens":"3"}}}}),
             json!({"compaction": {"enabled": "false"}}),
             json!({"packages":[{"extensions":[]}]}),
             json!({"modelThinkingLevels":{"model":"unknown"}}),

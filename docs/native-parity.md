@@ -1153,7 +1153,7 @@ cloned controls, fork isolation and closed-session handling. Loopback
 Ollama-adapter checks cover live RPC changes during a held model request,
 settings persistence, field preservation, validation and manual summaries.
 Both terminal layouts were exercised with a model request still running.
-Model-specific reserve/retention settings, unloaded-model context-window discovery
+Reference compaction defaults, partial-turn retention, unloaded-model context-window discovery
 and broader provider recovery behavior remain open.
 
 
@@ -1180,3 +1180,31 @@ cover an initially unloaded model, authenticated proxy paths, runtime capacity,
 explicit overrides, malformed/oversized replies, unavailable endpoints and
 metadata timeouts. Existing chat-only fixtures retain their inference checks
 and now reject unsupported metadata requests explicitly.
+
+
+### Configured compaction token policy checkpoint
+
+Explicit `compaction.reserveTokens` and `compaction.keepRecentTokens` settings
+now reach the agent. Each field resolves independently through
+`compaction.modelOverrides["ollama/<model>"]`, then the ordinary setting.
+Values are validated as non-negative JavaScript-safe integers. Zero is valid,
+and unrelated settings remain preserved.
+
+A configured reserve can start compaction before the hard context limit is
+reached. Manual TUI, RPC and CLI summaries use configured token retention;
+CLI `--keep-turns` remains an explicit override. Configured recent-token retention selects complete conversation turns,
+so tool calls and their results stay together. A soft threshold only starts a
+summary when an older prefix exists and enough request budget remains. The
+existing one-compaction-per-run bound still applies. Native SDK controls expose
+the same optional token settings, and forks receive an independent copy.
+
+Omitted token fields continue to use the native bounded policy. The reference
+built-in token defaults and cuts within a conversation turn remain open.
+`/settings` exposes the compaction object for editing, with reload/startup
+application for token-policy changes.
+
+Core tests cover early reserve pressure, retained recent turns and shell
+output within its real conversation turn. Settings
+tests cover per-field model overrides, zero, invalid numbers and malformed
+model overrides. The RPC fixture exercises model changes, early compaction and
+preserved user settings through the normal worker path.

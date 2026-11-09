@@ -308,8 +308,9 @@ enum Command {
         /// Additional focus for the model-generated summary.
         #[arg(long, conflicts_with = "summary")]
         instructions: Option<String>,
-        #[arg(long, default_value_t = 1)]
-        keep_turns: usize,
+        /// Override token-based retention with an exact number of recent turns.
+        #[arg(long)]
+        keep_turns: Option<usize>,
     },
     Checkout {
         record_id: u64,
@@ -846,6 +847,10 @@ async fn execute(mut args: Cli) -> Result<()> {
             keep_turns,
             ..
         } => {
+            let keep_turns = match keep_turns {
+                Some(turns) => turns,
+                None => runtime.auto_compaction.retained_turns(&session, 1)?,
+            };
             return agent.compact(
                 &mut session,
                 Compaction {
@@ -860,6 +865,10 @@ async fn execute(mut args: Cli) -> Result<()> {
             keep_turns,
             instructions,
         } => {
+            let keep_turns = match keep_turns {
+                Some(turns) => turns,
+                None => runtime.auto_compaction.retained_turns(&session, 1)?,
+            };
             return agent
                 .summarize_with_instructions::<pi_rs::AgentInput>(&mut session, keep_turns, &cancel, &mut observer, None, instructions.as_deref())
                 .await;

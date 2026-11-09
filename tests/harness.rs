@@ -868,6 +868,68 @@ async fn automatic_compaction_can_be_disabled_and_reenabled_without_removing_the
 }
 
 #[tokio::test]
+async fn configured_reserve_compacts_early_and_preserves_recent_complete_turns() {
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let model = Script::new(vec![
+        answer(&"a".repeat(1500)),
+        answer(&"b".repeat(1500)),
+        answer("summary of first"),
+        answer("latest answer"),
+    ]);
+    let registry = Registry::default();
+    let mut harness = agent(&model, &registry);
+    harness.limits.output_tokens_per_request = 128;
+    let (_, mut inputs) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    for prompt in ["first question", "second question"] {
+        harness
+            .run(
+                &mut session,
+                Some(prompt.into()),
+                &mut inputs,
+                &cancel,
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+    }
+    harness.limits.context_window = Some(2000);
+    session
+        .auto_compaction_control()
+        .set_token_settings(CompactionTokens {
+            reserve_tokens: Some(1500),
+            keep_recent_tokens: Some(400),
+        });
+    harness
+        .run(
+            &mut session,
+            Some("latest question".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].messages.contains(&Message::User {
+        content: "first question".into()
+    }));
+    assert!(!requests[2].messages.contains(&Message::User {
+        content: "second question".into()
+    }));
+    assert!(requests[3].messages.contains(&Message::User {
+        content: "second question".into()
+    }));
+    assert!(requests[3].messages.contains(&Message::User {
+        content: "latest question".into()
+    }));
+    assert!(!requests[3].messages.contains(&Message::User {
+        content: "first question".into()
+    }));
+}
+
+#[tokio::test]
 async fn bounded_automatic_compaction_leaves_the_latest_input_unchanged() {
     for discover in [false, true] {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();

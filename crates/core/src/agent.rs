@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -22,19 +22,48 @@ use crate::{
 
 /// Shared switch checked before each automatic context compaction.
 #[derive(Clone, Debug)]
-pub struct AutoCompactionControl(Arc<AtomicBool>);
+pub struct AutoCompactionControl {
+    enabled: Arc<AtomicBool>,
+    tokens: Arc<RwLock<CompactionTokens>>,
+}
+
+/// Explicit token settings. None preserves the host's existing bounded policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompactionTokens {
+    pub reserve_tokens: Option<u64>,
+    pub keep_recent_tokens: Option<u64>,
+}
 
 impl AutoCompactionControl {
     pub fn new(enabled: bool) -> Self {
-        Self(Arc::new(AtomicBool::new(enabled)))
+        Self {
+            enabled: Arc::new(AtomicBool::new(enabled)),
+            tokens: Arc::new(RwLock::new(CompactionTokens::default())),
+        }
     }
 
     pub fn enabled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.enabled.load(Ordering::Acquire)
     }
 
     pub fn set_enabled(&self, enabled: bool) {
-        self.0.store(enabled, Ordering::Release);
+        self.enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn token_settings(&self) -> CompactionTokens {
+        *self.tokens.read().expect("compaction settings")
+    }
+
+    /// Select complete recent turns using the configured token target.
+    pub fn retained_turns(&self, session: &Session, fallback: usize) -> Result<usize> {
+        match self.token_settings().keep_recent_tokens {
+            Some(target) => retained_turn_count(session, Some(target)),
+            None => Ok(fallback),
+        }
+    }
+
+    pub fn set_token_settings(&self, settings: CompactionTokens) {
+        *self.tokens.write().expect("compaction settings") = settings;
     }
 }
 
@@ -353,8 +382,34 @@ impl Agent<'_> {
                     if request.max_output_tokens == 0 {
                         return Err(Error::Budget);
                     }
-                    if self.exceeds_context(&request, cancel).await? {
-                        if !session.auto_compaction_control().enabled() {
+                    let capacity = self.context_capacity(&request, cancel).await?;
+                    let input_tokens = serde_json::to_vec(&request)?.len().div_ceil(3) as u64;
+                    let exceeds = capacity.is_some_and(|window| {
+                        input_tokens.saturating_add(u64::from(request.max_output_tokens))
+                            > u64::from(window)
+                    });
+                    let control = session.auto_compaction_control();
+                    let tokens = control.token_settings();
+                    let keep_turns = retained_turn_count(session, tokens.keep_recent_tokens)?;
+                    let reserve_reached =
+                        capacity
+                            .zip(tokens.reserve_tokens)
+                            .is_some_and(|(window, reserve)| {
+                                input_tokens > u64::from(window).saturating_sub(reserve)
+                            });
+                    let has_prefix = reserve_reached && {
+                        let branch = session.branch();
+                        retain_from(&branch, keep_turns) != retain_from(&branch, usize::MAX)
+                    };
+                    if exceeds
+                        || (control.enabled()
+                            && !compacted
+                            && budget > 1
+                            && request_index + 1 < self.limits.model_requests
+                            && reserve_reached
+                            && has_prefix)
+                    {
+                        if !control.enabled() {
                             return Err(Error::Model(
                                 "context does not fit and automatic compaction is disabled".into(),
                             ));
@@ -370,7 +425,7 @@ impl Agent<'_> {
                                 session,
                                 &states,
                                 SummaryScope {
-                                    keep_turns: 1,
+                                    keep_turns,
                                     instructions: None,
                                     output_limit: summary_limit,
                                     cancellation: cancel,
@@ -1405,11 +1460,11 @@ impl Agent<'_> {
         Ok(output as u32)
     }
 
-    async fn exceeds_context(
+    async fn context_capacity(
         &self,
         request: &ModelRequest,
         cancel: &CancellationToken,
-    ) -> Result<bool> {
+    ) -> Result<Option<u32>> {
         let window = match self.limits.context_window {
             Some(window) => Some(window),
             None => tokio::select! {
@@ -1418,10 +1473,17 @@ impl Agent<'_> {
                 result = tokio::time::timeout(self.limits.model_timeout, self.model.context_window(&request.model)) => result.ok().flatten().filter(|window| *window > 0),
             },
         };
-        let Some(window) = window else {
+        Ok(window)
+    }
+
+    async fn exceeds_context(
+        &self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+    ) -> Result<bool> {
+        let Some(window) = self.context_capacity(request, cancel).await? else {
             return Ok(false);
         };
-        // Conservative approximation of the JSON input and role/tool overhead.
         let bytes = serde_json::to_vec(request)?.len();
         Ok(bytes.div_ceil(3) + request.max_output_tokens as usize > window as usize)
     }
@@ -1477,6 +1539,47 @@ impl Agent<'_> {
             observer,
         )
     }
+}
+
+fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> {
+    let Some(target) = target else {
+        return Ok(1);
+    };
+    let branch = session.branch();
+    let floor = retain_from(&branch, usize::MAX).unwrap_or(u64::MAX);
+    let turns: Vec<_> = branch
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            (record.id >= floor
+                && matches!(
+                    record.event,
+                    Event::User { .. } | Event::UserWithImages { .. }
+                ))
+            .then_some(index)
+        })
+        .collect();
+    let operations = session.operations();
+    let mut low = 0;
+    let mut high = turns.len();
+    // Find the newest complete turn meeting the target without scanning every
+    // increasingly large suffix. Shell results count as context, not new turns.
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let messages = conversation(&branch[turns[middle]..], operations.clone());
+        let tokens = serde_json::to_vec(&messages)?.len().div_ceil(3) as u64;
+        if tokens >= target {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(turns
+        .len()
+        .saturating_sub(low)
+        .saturating_add(1)
+        .min(turns.len())
+        .max(1))
 }
 
 fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {

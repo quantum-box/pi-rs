@@ -42,6 +42,8 @@ enum Request {
         keep_turns: usize,
         instructions: Option<String>,
         #[serde(default)]
+        use_token_settings: bool,
+        #[serde(default)]
         rpc: bool,
         id: Option<serde_json::Value>,
     },
@@ -267,8 +269,12 @@ pub async fn run(mut args: Cli) -> Result<()> {
                     summary: None,
                     keep_turns,
                     instructions,
+                    use_token_settings,
                     ..
                 } => {
+                    let keep_turns = if use_token_settings {
+                        runtime.auto_compaction.retained_turns(&session, keep_turns)?
+                    } else { keep_turns };
                     let tokens_before = serde_json::to_vec(
                         &session.conversation_at(session.head())?,
                     )?.len().div_ceil(3);
