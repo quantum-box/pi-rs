@@ -20,16 +20,17 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     // Validate and release the journal before starting any child process.
-    let session = Session::open(&args.session)?;
+    let mut session = Session::open(&args.session)?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),
         ));
     }
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking);
+    if session.working_directory().is_none() {
+        session.set_working_directory(&args.workspace)?;
     }
     drop(session);
+    interactive::restore_workspace(&mut args)?;
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -421,10 +422,11 @@ fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
             "a managed session must be opened by its host".into(),
         ));
     }
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking);
-    }
-    args.session = path.to_path_buf();
+    drop(session);
+    let mut next = args.clone();
+    next.session = path.to_path_buf();
+    interactive::restore_workspace(&mut next)?;
+    *args = next;
     Ok(())
 }
 
@@ -569,6 +571,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn switching_workspaces_restores_directory_and_rejects_missing_directories_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("other");
+        std::fs::create_dir(&workspace).unwrap();
+        let path = root.path().join("other.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session.set_working_directory(&workspace).unwrap();
+        session.select_model("other-model", None).unwrap();
+        drop(session);
+        let mut args = Cli::try_parse_from(["pi", "--no-trust"]).unwrap();
+        switch_session(&mut args, &path).unwrap();
+        assert_eq!(args.workspace, workspace.canonicalize().unwrap());
+        assert_eq!(args.model, "other-model");
+        assert!(!args.trusted);
+        let previous = args.session.clone();
+        let invalid = root.path().join("invalid.jsonl");
+        let mut session = Session::open(&invalid).unwrap();
+        let missing = root.path().join("missing");
+        std::fs::create_dir(&missing).unwrap();
+        session.set_working_directory(&missing).unwrap();
+        std::fs::remove_dir(&missing).unwrap();
+        session.select_model("invalid-model", None).unwrap();
+        drop(session);
+        assert!(switch_session(&mut args, &invalid).is_err());
+        assert_eq!(args.workspace, workspace.canonicalize().unwrap());
+        assert_eq!(args.session, previous);
+        assert_eq!(args.model, "other-model");
     }
 
     #[test]

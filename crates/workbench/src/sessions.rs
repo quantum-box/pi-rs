@@ -70,6 +70,42 @@ pub fn resolve_reference(input: &Path, directory: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Include the active storage directory and other workspace groups in local storage.
+pub fn stored_paths(current: &Path) -> Result<Vec<PathBuf>> {
+    let root = super::config::agent_dir().join("sessions");
+    let mut directories = vec![current.to_path_buf()];
+    if root.is_dir() {
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() && !directories.contains(&entry.path()) {
+                directories.push(entry.path());
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    for directory in directories.into_iter().filter(|path| path.is_dir()) {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.sort_by_key(|path| {
+        std::cmp::Reverse(
+            path.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+        )
+    });
+    Ok(paths)
+}
+
 fn stored_id(path: &Path) -> Option<String> {
     use std::io::{BufRead, Read};
     let mut line = String::new();

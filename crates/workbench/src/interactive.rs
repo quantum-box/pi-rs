@@ -923,23 +923,16 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         }
         "/resume" if rest.is_empty() => {
             let mut items = Vec::new();
+            let mut named = std::collections::HashSet::new();
             if let Some(parent) = args.session.parent() {
-                let mut entries = std::fs::read_dir(parent)?
-                    .filter_map(|entry| entry.ok())
-                    .collect::<Vec<_>>();
-                entries.sort_by_key(|entry| {
-                    std::cmp::Reverse(
-                        entry
-                            .metadata()
-                            .and_then(|metadata| metadata.modified())
-                            .ok(),
-                    )
-                });
-                for entry in entries {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "jsonl")
-                        && let Ok(session) = Session::open(&path)
-                    {
+                for path in sessions::stored_paths(parent)? {
+                    if let Ok(session) = Session::open(&path) {
+                        if session.host_binding().is_some() {
+                            continue;
+                        }
+                        if session.name().is_some_and(|name| !name.is_empty()) {
+                            named.insert(path.clone());
+                        }
                         let title = session
                             .name()
                             .map(str::to_owned)
@@ -966,7 +959,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     }
                 }
             }
-            view.picker = Some(Picker::sessions(items, args.session.clone()));
+            view.picker = Some(Picker::sessions(items, args.session.clone(), named));
         }
         "/resume" => {
             let path = PathBuf::from(rest);
@@ -1813,7 +1806,7 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     session.select_model(&args.model, args.thinking.as_deref())?;
     Ok(())
 }
-fn restore_workspace(args: &mut Cli) -> Result<()> {
+pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = Session::open(&args.session)?;
     if let Some((model, thinking)) = session.model_selection() {
         args.restore_model_selection(model, thinking);

@@ -29,6 +29,10 @@ pub struct Picker {
     session_action: Option<SessionAction>,
     session_error: Option<String>,
     relevance_sort: bool,
+    all_workspaces: bool,
+    named_only: bool,
+    show_path: bool,
+    named_sessions: std::collections::HashSet<PathBuf>,
 }
 #[derive(Clone)]
 enum SessionAction {
@@ -52,11 +56,20 @@ impl Picker {
             session_action: None,
             session_error: None,
             relevance_sort: false,
+            all_workspaces: false,
+            named_only: false,
+            show_path: false,
+            named_sessions: Default::default(),
         }
     }
-    pub fn sessions(items: Vec<Item>, active: PathBuf) -> Self {
+    pub fn sessions(
+        items: Vec<Item>,
+        active: PathBuf,
+        named: std::collections::HashSet<PathBuf>,
+    ) -> Self {
         Self {
             active_session: Some(active),
+            named_sessions: named,
             ..Self::new("Resume session", items)
         }
     }
@@ -66,6 +79,13 @@ impl Picker {
             .items
             .iter()
             .filter(|item| {
+                if let (Some(active), Selection::Resume(path)) =
+                    (&self.active_session, &item.selection)
+                    && ((!self.all_workspaces && path.parent() != active.parent())
+                        || (self.named_only && !self.named_sessions.contains(path)))
+                {
+                    return false;
+                }
                 let label = item.label.to_lowercase();
                 if self.active_session.is_some() {
                     crate::model_selection::fuzzy(&query, &label)
@@ -106,6 +126,20 @@ impl Picker {
             }
         } else if self.active_session.is_some() {
             self.session_error = None;
+            if key.code == KeyCode::Tab {
+                self.all_workspaces = !self.all_workspaces;
+                self.selected = 0;
+                return Input::Continue;
+            }
+            if keys.matches("app.session.toggleNamedFilter", key) {
+                self.named_only = !self.named_only;
+                self.selected = 0;
+                return Input::Continue;
+            }
+            if keys.matches("app.session.togglePath", key) {
+                self.show_path = !self.show_path;
+                return Input::Continue;
+            }
             if keys.matches("app.session.toggleSort", key) {
                 self.relevance_sort = !self.relevance_sort;
                 self.selected = 0;
@@ -202,7 +236,10 @@ impl Picker {
         )];
         let items = self.matches();
         let available = height
-            .saturating_sub(3 + usize::from(self.session_error.is_some()))
+            .saturating_sub(
+                3 + usize::from(self.session_error.is_some())
+                    + usize::from(self.active_session.is_some()),
+            )
             .max(1);
         let start = self.selected.saturating_sub(available - 1);
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
@@ -210,7 +247,16 @@ impl Picker {
                 &format!(
                     "{} {}",
                     if index == self.selected { "›" } else { " " },
-                    item.label
+                    if self.show_path {
+                        match &item.selection {
+                            Selection::Resume(path) => {
+                                format!("{} · {}", item.label, path.display())
+                            }
+                            _ => item.label.clone(),
+                        }
+                    } else {
+                        item.label.clone()
+                    }
                 ),
                 theme.color("text"),
             );
@@ -224,6 +270,24 @@ impl Picker {
         }
         if let Some(error) = &self.session_error {
             lines.push(Line::plain(error, theme.color("error")));
+        }
+        if self.active_session.is_some() {
+            lines.push(Line::plain(
+                &format!(
+                    "{} · {} · Tab scope · Ctrl+N named · Ctrl+P paths",
+                    if self.all_workspaces {
+                        "All workspaces"
+                    } else {
+                        "Current workspace"
+                    },
+                    if self.named_only {
+                        "Named sessions"
+                    } else {
+                        "All sessions"
+                    }
+                ),
+                theme.color("dim"),
+            ));
         }
         let hint = if self.active_session.is_some() {
             if self.relevance_sort {
@@ -243,6 +307,37 @@ impl Picker {
 mod tests {
     use super::*;
     #[test]
+    fn session_scope_and_name_filters_compose_and_reset_selection() {
+        let local = PathBuf::from("one/local.jsonl");
+        let remote = PathBuf::from("two/remote.jsonl");
+        let mut picker = Picker::sessions(
+            vec![
+                Item {
+                    label: "local".into(),
+                    selection: Selection::Resume(local.clone()),
+                },
+                Item {
+                    label: "remote".into(),
+                    selection: Selection::Resume(remote.clone()),
+                },
+            ],
+            local.clone(),
+            std::collections::HashSet::from([remote]),
+        );
+        let keys = super::super::keys::Keys::load().unwrap();
+        assert_eq!(picker.matches().len(), 1);
+        picker.input(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &keys);
+        assert_eq!(picker.matches().len(), 2);
+        picker.input(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert_eq!(picker.matches().len(), 1);
+        assert_eq!(picker.matches()[0].label, "remote");
+        picker.input(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &keys);
+        assert!(picker.matches().is_empty());
+    }
+    #[test]
     fn cancelling_deletion_retains_the_search_and_selection() {
         let path = PathBuf::from("victim.jsonl");
         let mut picker = Picker::sessions(
@@ -251,6 +346,7 @@ mod tests {
                 selection: Selection::Resume(path.clone()),
             }],
             PathBuf::from("active.jsonl"),
+            Default::default(),
         );
         picker.query = "Victim".into();
         picker.session_action = Some(SessionAction::Delete(path.clone()));

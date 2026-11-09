@@ -16,8 +16,8 @@ remaining acceptance work for that surface.
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
 | Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
-| Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity, Windows runtime validation |
-| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, threaded and cross-workspace session selectors, Radius sharing |
+| Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity |
+| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, threaded session selectors, Radius sharing |
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface |
@@ -132,8 +132,7 @@ Kitty and iTerm2 terminals display supported images inline.
 
 `edit` accepts both batch and legacy single replacements, emits a unified diff,
 and serializes cooperating file mutations across processes. The Windows coding
-profile selects PowerShell. That platform-specific branch has not yet been
-exercised on Windows.
+profile selects PowerShell. Windows CI exercises PowerShell output, timeout and descendant-process cleanup.
 
 ### Model-selection checkpoint
 
@@ -484,7 +483,7 @@ explicit confirmation, and recent/fuzzy ordering with Ctrl+S. Session-specific
 keybinding overrides apply inside the selector. Active and managed sessions
 are protected from deletion. Renaming the active session updates its title.
 Editor Ctrl+D behavior remains separate from selector controls. Threaded
-parent/child grouping and cross-workspace selection remain open.
+parent/child grouping remains open.
 
 ### Native reload checkpoint
 
@@ -553,3 +552,20 @@ Git sources accept `@tag`, `@branch` and branch names containing slashes, while
 retaining existing `#ref` syntax. Transport usernames remain part of the URL.
 A CLI fixture verifies pinned tags, branch selection, local changes, resource
 loading with automatic discovery disabled and cached offline startup.
+
+### Cross-workspace selector checkpoint
+
+The resume selector switches between current-workspace and all stored sessions
+with Tab. Ctrl+N filters named sessions and Ctrl+P displays their storage paths.
+User keybinding overrides apply to both new named actions. Managed sessions
+remain outside the selector. Session renaming and confirmed deletion retain
+their existing controls.
+
+RPC stores the working directory when creating its initial journal and restores
+workspace settings and trust when switching sessions. Missing working directories
+leave the previous selection intact. PTY fixtures verify both terminal modes,
+remote-workspace resumption, filters, path display and terminal restoration.
+
+The Rust 1.89 CI matrix passed formatting, all-target Clippy and workspace tests
+on Linux, macOS and Windows at commit `706a249`. Subsequent changes receive the
+same matrix on main.

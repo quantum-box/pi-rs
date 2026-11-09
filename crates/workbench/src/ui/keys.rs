@@ -60,6 +60,8 @@ impl Keys {
             ("app.session.delete", &["ctrl+d"]),
             ("app.session.deleteNoninvasive", &["ctrl+backspace"]),
             ("app.session.toggleSort", &["ctrl+s"]),
+            ("app.session.toggleNamedFilter", &["ctrl+n"]),
+            ("app.session.togglePath", &["ctrl+p"]),
         ];
         let mut bindings = BTreeMap::new();
         for (action, keys) in defaults {
@@ -118,6 +120,8 @@ impl Keys {
                         | "app.session.delete"
                         | "app.session.deleteNoninvasive"
                         | "app.session.toggleSort"
+                        | "app.session.toggleNamedFilter"
+                        | "app.session.togglePath"
                 ) {
                     return false;
                 }
