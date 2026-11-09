@@ -64,6 +64,12 @@ struct Cli {
     /// Path to the private append-only session journal.
     #[arg(long, default_value_os_t = interactive::new_session_path())]
     session: PathBuf,
+    /// Open or create a named session in this workspace's session directory.
+    #[arg(long, conflicts_with_all = ["session", "continue_session", "resume_session", "no_session"], value_parser = sessions::validate_id)]
+    session_id: Option<String>,
+    /// Fork a session file or ID into a new session for this workspace.
+    #[arg(long = "fork", conflicts_with_all = ["session", "continue_session", "resume_session", "no_session"])]
+    fork_session: Option<PathBuf>,
     /// Resume a session file, or open the session selector when omitted.
     #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["session", "continue_session", "no_session"])]
     resume_session: Option<PathBuf>,
@@ -489,15 +495,28 @@ async fn execute(mut args: Cli) -> Result<()> {
         return mcp_config::command(&args, command.clone()).await;
     }
 
-    if let Some(path) = args
+    let directory = interactive::session_path(&args.workspace, args.session_dir.as_deref())
+        .parent()
+        .expect("session directory")
+        .to_path_buf();
+    if let Some(id) = &args.session_id {
+        args.session = directory.join(format!("{id}.jsonl"));
+    } else if let Some(path) = args
         .resume_session
         .as_ref()
         .filter(|path| !path.as_os_str().is_empty())
     {
-        if !path.is_file() {
+        args.session = sessions::resolve_reference(path, &directory)?;
+        if !args.session.is_file() {
             return Err(Error::Config("session file not found".into()));
         }
-        args.session = path.clone();
+    } else if args.fork_session.is_none() {
+        args.session = sessions::resolve_reference(&args.session, &directory)?;
+    }
+    if let Some(source) = &args.fork_session {
+        let source = sessions::resolve_reference(source, &directory)?;
+        let source = session_import::read(&source)?;
+        sessions::fork(&source, source.head(), &args.session, &args.workspace)?;
     }
     let temporary = args.no_session.then(tempfile::tempdir).transpose()?;
     if let Some(directory) = &temporary {

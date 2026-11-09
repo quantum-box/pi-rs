@@ -465,3 +465,16 @@ Source journals remain intact. `get_entries` accepts a native record ID in
 
 The reported thinking levels are the native selectable levels. Provider-specific
 capability filtering and full upstream RPC message/event schemas remain open.
+
+### Session reference checkpoint
+
+`--session-id` opens or creates a named journal in the workspace's session
+storage. `--session` and `--resume` resolve stored filename or native UUID
+prefixes, with ambiguity checks. `--fork` reads a native or imported Pi snapshot
+and creates an independent branch in the current workspace. Source reads stay
+read-only and existing destinations remain protected.
+
+The named ID is a storage alias. Native journals retain their UUID identity.
+Aliases allow 1–128 ASCII letters, digits, dots, underscores and hyphens, with
+an alphanumeric first and last character. Argument conflicts are checked before
+opening a session. RPC restoration shares the CLI's model/scope selection logic.

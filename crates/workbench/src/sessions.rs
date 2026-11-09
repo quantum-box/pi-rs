@@ -6,6 +6,82 @@ use std::process::{Command, Stdio};
 use pi_rs::{Error, Event, Result, Session};
 use serde::Serialize;
 
+pub fn validate_id(id: &str) -> std::result::Result<String, String> {
+    let valid = !id.is_empty()
+        && id.len() <= 128
+        && id.as_bytes()[0].is_ascii_alphanumeric()
+        && id.as_bytes()[id.len() - 1].is_ascii_alphanumeric()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(id.to_owned())
+    } else {
+        Err("session ID must be 1-128 ASCII letters, numbers, dots, underscores or hyphens, beginning and ending with a letter or number".into())
+    }
+}
+
+/// Resolve a stored filename or journal ID without opening it for mutation.
+pub fn resolve_reference(input: &Path, directory: &Path) -> Result<PathBuf> {
+    if input.is_file() || input.components().count() != 1 {
+        return Ok(input.to_path_buf());
+    }
+    let Some(query) = input.to_str().filter(|query| !query.is_empty()) else {
+        return Ok(input.to_path_buf());
+    };
+    if !directory.is_dir() {
+        return Ok(input.to_path_buf());
+    }
+    let mut matches = Vec::new();
+    let mut exact_ids = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "jsonl")
+            || !path.is_file()
+        {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        if stem == query {
+            return Ok(path);
+        }
+        let id = stored_id(&path).unwrap_or_default();
+        if id == query {
+            exact_ids.push(path.clone());
+        }
+        if stem.starts_with(query) || id.starts_with(query) {
+            matches.push(path);
+        }
+    }
+    if !exact_ids.is_empty() {
+        matches = exact_ids;
+    }
+    match matches.len() {
+        0 => Ok(input.to_path_buf()),
+        1 => Ok(matches.remove(0)),
+        _ => Err(Error::Config(format!(
+            "ambiguous session ID {query:?}; use a longer ID or a file path"
+        ))),
+    }
+}
+
+fn stored_id(path: &Path) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?).take(1024 * 1024);
+    reader.read_line(&mut line).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&line).ok()?;
+    record["event"]["session_id"]
+        .as_str()
+        .or_else(|| record["id"].as_str())
+        .map(str::to_owned)
+}
+
 #[derive(Serialize)]
 pub struct SessionSummary {
     pub path: PathBuf,
@@ -276,6 +352,41 @@ pub fn share_gist(session: &Session) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_ids_and_prefixes_resolve_without_changing_journals() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("work-1.jsonl");
+        let session = Session::open(&path).unwrap();
+        let id = session.session_id().to_string();
+        drop(session);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            resolve_reference(Path::new("work-1"), root.path()).unwrap(),
+            path
+        );
+        assert_eq!(
+            resolve_reference(Path::new(&id[..12]), root.path()).unwrap(),
+            path
+        );
+        std::fs::copy(&path, root.path().join("work-2.jsonl")).unwrap();
+        assert!(resolve_reference(Path::new("work-"), root.path()).is_err());
+        assert!(resolve_reference(Path::new(&id), root.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        for invalid in [
+            "",
+            "../escape",
+            ".hidden",
+            "trailing-",
+            "two words",
+            "日本語",
+        ] {
+            assert!(validate_id(invalid).is_err());
+        }
+        for valid in ["one", "Run_2.3", "a-b"] {
+            assert!(validate_id(valid).is_ok());
+        }
+    }
+
     #[test]
     fn exports_and_forks_preserve_session_and_escape_html() {
         let directory = tempfile::tempdir().unwrap();

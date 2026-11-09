@@ -27,14 +27,8 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         ));
     }
     if let Some((model, thinking)) = session.model_selection() {
-        if !args.model_explicit {
-            args.model = model;
-        }
-        if !args.thinking_explicit {
-            args.thinking = thinking;
-        }
+        args.restore_model_selection(model, thinking);
     }
-    constrain_model_scope(&mut args);
     drop(session);
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -428,26 +422,10 @@ fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
         ));
     }
     if let Some((model, thinking)) = session.model_selection() {
-        args.model = model;
-        args.thinking = thinking;
+        args.restore_model_selection(model, thinking);
     }
-    constrain_model_scope(args);
     args.session = path.to_path_buf();
     Ok(())
-}
-
-fn constrain_model_scope(args: &mut Cli) {
-    if !args.model_scope.is_empty()
-        && !args
-            .model_scope
-            .iter()
-            .any(|choice| choice.model == args.model)
-    {
-        args.model = args.model_scope[0].model.clone();
-        if args.model_scope[0].thinking.is_some() {
-            args.thinking = args.model_scope[0].thinking.clone();
-        }
-    }
 }
 
 fn session_tree(session: &Session) -> Vec<Value> {
