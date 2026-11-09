@@ -49,7 +49,7 @@ impl Resources {
         directories.reverse();
         directories.insert(0, agent.clone());
         let mut seen = std::collections::BTreeSet::new();
-        for directory in directories {
+        for directory in directories.into_iter().filter(|_| !args.no_context_files) {
             // Explicit --project continues to use the core's project-scoped loader.
             if args.project.is_some() && directory.starts_with(&workspace) {
                 continue;
@@ -101,6 +101,23 @@ impl Resources {
         );
         skill_roots.extend(resources.packages.skills.iter().cloned());
         prompt_roots.extend(resources.packages.prompts.iter().cloned());
+        if args.no_skills {
+            skill_roots.clear();
+        }
+        if args.no_prompt_templates {
+            prompt_roots.clear();
+        }
+        skill_roots.extend(args.skill.iter().filter_map(|path| {
+            let path = resource_path(&workspace, path);
+            (args.project.is_none() || path.exists()).then_some(path)
+        }));
+        prompt_roots.extend(args.prompt_template.iter().map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                workspace.join(path)
+            }
+        }));
         for directory in config_directories {
             let system = directory.join("SYSTEM.md");
             if system.is_file() {
@@ -439,6 +456,57 @@ mod tests {
         assert!(!custom.contains("project system"));
         assert!(!custom.contains("<rules>"));
         assert!(custom.contains("<skills>"));
+    }
+    #[test]
+    fn disabled_discovery_keeps_explicit_resource_paths() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        std::fs::create_dir_all(workspace.join(".pi/skills/discovered")).unwrap();
+        std::fs::create_dir_all(workspace.join(".pi/prompts")).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "excluded context marker").unwrap();
+        std::fs::write(
+            workspace.join(".pi/skills/discovered/SKILL.md"),
+            "---\nname: discovered\ndescription: discovered skill\n---\nHidden",
+        )
+        .unwrap();
+        std::fs::write(workspace.join(".pi/prompts/discovered.md"), "Hidden").unwrap();
+        std::fs::write(
+            workspace.join("explicit-skill.md"),
+            "---\nname: explicit\ndescription: explicit skill\n---\nVisible",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("explicit-prompt.md"), "Visible $1").unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--skill",
+            "explicit-skill.md",
+            "--prompt-template",
+            "explicit-prompt.md",
+        ])
+        .unwrap();
+        args.workspace = workspace.to_path_buf();
+        args.trusted = true;
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.instructions.is_empty());
+        assert_eq!(
+            resources.skills.keys().collect::<Vec<_>>(),
+            vec!["explicit"]
+        );
+        assert_eq!(
+            resources.prompts.keys().collect::<Vec<_>>(),
+            vec!["explicit-prompt"]
+        );
+        args.no_skills = false;
+        args.no_prompt_templates = false;
+        args.no_context_files = false;
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.instructions.contains("excluded context marker"));
+        assert!(resources.skills.contains_key("discovered"));
+        assert!(resources.prompts.contains_key("discovered"));
     }
     #[test]
     fn templates_preserve_quoted_arguments_defaults_and_slices() {

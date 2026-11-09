@@ -1002,13 +1002,16 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     restore_workspace(&mut args)?;
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
-    args.themes
-        .extend(initial_resources.packages.themes.iter().cloned());
+    if !args.no_themes {
+        args.themes
+            .extend(initial_resources.packages.themes.iter().cloned());
+    }
     let mut theme = Theme::load(
         args.use_theme.as_deref().unwrap_or("system"),
         &args.themes,
         &args.workspace,
         args.trusted,
+        !args.no_themes,
     )?;
     let mut view = View {
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
@@ -1268,8 +1271,12 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 view.append(&error.to_string());
                             }
                         } else if input.trim() == "/theme" {
-                            let names =
-                                Theme::discover(&args.themes, &args.workspace, args.trusted);
+                            let names = Theme::discover(
+                                &args.themes,
+                                &args.workspace,
+                                args.trusted,
+                                !args.no_themes,
+                            );
                             let title = format!(
                                 "Select theme · {}",
                                 theme
@@ -1294,6 +1301,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 &args.themes,
                                 &args.workspace,
                                 args.trusted,
+                                !args.no_themes,
                             ) {
                                 Ok(next) => {
                                     args.settings.set_user("theme", json!(name.trim()))?;
@@ -1310,7 +1318,13 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             args.themes
                                 .retain(|path| !view.resources.packages.themes.contains(path));
                             view.resources = super::resources::Resources::load(&args)?;
-                            for path in &view.resources.packages.themes {
+                            for path in view
+                                .resources
+                                .packages
+                                .themes
+                                .iter()
+                                .filter(|_| !args.no_themes)
+                            {
                                 if !args.themes.contains(path) {
                                     args.themes.push(path.clone());
                                 }
@@ -1324,6 +1338,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 &args.themes,
                                 &args.workspace,
                                 args.trusted,
+                                !args.no_themes,
                             ) {
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
@@ -1555,7 +1570,13 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
             });
         }
         Selection::Theme(name) => {
-            let next = Theme::load(&name, &args.themes, &args.workspace, args.trusted)?;
+            let next = Theme::load(
+                &name,
+                &args.themes,
+                &args.workspace,
+                args.trusted,
+                !args.no_themes,
+            )?;
             args.settings.set_user("theme", json!(name))?;
             args.use_theme = Some(name);
             *theme = next;

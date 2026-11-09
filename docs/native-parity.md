@@ -298,3 +298,14 @@ truncation and parallel script calls through the core execution host. The
 native JSON code argument differs from Pi's provider-specific raw-code input.
 Non-chat model APIs, complete image ordering and large-image behavior remain
 open. Executable extensions still lack bidirectional host-tool invocation.
+
+### Resource selection checkpoint
+
+`--no-skills`, `--no-prompt-templates`, `--no-context-files`, `--no-themes`,
+`--no-extensions` and `--no-mcp` control automatic resource loading. Explicit
+`--skill`, `--prompt-template`, `--theme` and `--extension` entries remain
+available. Skills accept file or directory paths without `--project`; the
+existing named project-skill mode remains supported. Native built-ins can be
+selected with `builtin:codemode`, `builtin:tool-search` and `builtin:mcp`.
+These selections propagate to persistent CLI workers. The settings editor,
+resource glob expansion and remaining CLI aliases still require parity work.

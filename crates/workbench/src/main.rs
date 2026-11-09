@@ -97,11 +97,32 @@ struct Cli {
     /// Load AGENTS.md from the workspace root through this workspace-relative directory.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
-    /// Load a named project skill. Requires --project.
-    #[arg(long, global = true, requires = "project")]
+    /// Load a skill file or directory, or a named skill with --project.
+    #[arg(long, global = true)]
     skill: Vec<String>,
     #[arg(long, global = true)]
     allow_commands: bool,
+    /// Disable automatic extensions, retaining explicit --extension entries.
+    #[arg(long, global = true)]
+    no_extensions: bool,
+    /// Disable discovered themes, retaining explicit --theme paths.
+    #[arg(long, global = true)]
+    no_themes: bool,
+    /// Disable discovered skills, retaining explicit --skill paths.
+    #[arg(long, global = true)]
+    no_skills: bool,
+    /// Load a prompt-template file or directory. Repeatable.
+    #[arg(long, global = true)]
+    prompt_template: Vec<PathBuf>,
+    /// Disable discovered prompt templates, retaining explicit paths.
+    #[arg(long, global = true)]
+    no_prompt_templates: bool,
+    /// Disable AGENTS.md and CLAUDE.md discovery.
+    #[arg(long, global = true)]
+    no_context_files: bool,
+    /// Disable MCP server connections for this run.
+    #[arg(long, global = true)]
+    no_mcp: bool,
     /// Enable local read, write, edit, bash, grep, find, and ls tools.
     #[arg(long, global = true)]
     coding_tools: bool,
@@ -312,12 +333,14 @@ async fn main() {
                 .string("defaultThinkingLevel")
                 .map(str::to_owned);
         }
-        args.themes.extend(
-            args.settings
-                .strings("themes")
-                .into_iter()
-                .map(PathBuf::from),
-        );
+        if !args.no_themes {
+            args.themes.extend(
+                args.settings
+                    .strings("themes")
+                    .into_iter()
+                    .map(PathBuf::from),
+            );
+        }
         if args.use_theme.is_none() {
             args.use_theme = args.settings.string("theme").map(str::to_owned);
         }

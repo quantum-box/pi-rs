@@ -70,6 +70,21 @@ impl Worker {
         if let Some(tools) = &args.exclude_tools {
             command.arg("--exclude-tools").arg(tools);
         }
+        for (disabled, flag) in [
+            (args.no_extensions, "--no-extensions"),
+            (args.no_themes, "--no-themes"),
+            (args.no_skills, "--no-skills"),
+            (args.no_prompt_templates, "--no-prompt-templates"),
+            (args.no_context_files, "--no-context-files"),
+            (args.no_mcp, "--no-mcp"),
+        ] {
+            if disabled {
+                command.arg(flag);
+            }
+        }
+        for path in &args.prompt_template {
+            command.arg("--prompt-template").arg(path);
+        }
         for extension in &args.extensions {
             command.arg("--extension").arg(extension);
         }
@@ -185,6 +200,8 @@ fn configuration(args: &Cli) -> Value {
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
         "system_prompt":args.system_prompt,"append_system_prompt":args.append_system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
         "tools":args.tools,"exclude_tools":args.exclude_tools,"no_tools":args.no_tools,"no_builtin_tools":args.no_builtin_tools,
+        "no_extensions":args.no_extensions,"no_themes":args.no_themes,"no_skills":args.no_skills,"no_prompt_templates":args.no_prompt_templates,
+        "no_context_files":args.no_context_files,"no_mcp":args.no_mcp,"prompt_templates":args.prompt_template,
         "coding_tools":args.coding_tools,"requests":args.max_requests,"output_tokens":args.max_output_tokens,
         "output_budget":args.output_budget,"context_window":args.context_window,
         "model_timeout":args.model_timeout_secs,"tool_timeout":args.tool_timeout_secs

@@ -100,7 +100,7 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         if mcp_connections.iter().any(|connection| connection.has_deferred()) {
             selection.enable_automatic("tool_search");
         }
-        if mcp_config::auto_enable_codemode(args)? && mcp_connections.iter().any(|connection| connection.has_codemode()) {
+        if mcp_connections.iter().any(|connection| connection.has_codemode()) && mcp_config::auto_enable_codemode(args)? {
             selection.enable_automatic("codemode");
         }
         let only_code = match args.settings.value()["codemode"]["mode"].as_str().unwrap_or("on") {
@@ -108,40 +108,51 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             "on" => false,
             _ => return Err(pi_rs::Error::Config("codemode.mode must be on or only".into())),
         };
-        let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = vec![
-            Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(documents)),
-            Arc::new(pi_rs_extensions::codemode::Codemode {
+        let enabled = |name: &str| !args.no_extensions || args.extensions.iter().any(|entry| entry == name);
+        let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
+        if enabled("builtin:tool-search") || !mcp_connections.is_empty() {
+            extensions.push(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(documents)));
+        }
+        if enabled("builtin:codemode") || mcp_connections.iter().any(|connection| connection.has_codemode()) {
+            extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
                 inline_budget: args.settings.value()["codemode"]["inlineBudget"].as_u64().unwrap_or(3000).min(100_000) as usize,
                 timeout: Duration::from_secs(args.tool_timeout_secs),
-            }),
-        ];
-        if let Some(project) = &args.project {
+            }));
+        }
+        if let Some(project) = &args.project
+            && !args.no_context_files
+        {
             extensions.push(Arc::new(ProjectInstructions {
                 resources: ProjectResources::open(&args.workspace, args.workspace.join(project))?,
                 skills: args.skill.clone(),
             }));
         }
-        extensions.push(Arc::new(WorkbenchContext {
-            instruction: args.instruction.clone(),
-        }));
-        extensions.push(Arc::new(pi_rs_plan_mode::PlanMode::new(
-            ["read_text", "lookup_order", "read", "grep", "find", "ls"].map(str::to_owned),
-        )));
-        extensions.push(Arc::new(pi_rs_review::ReviewContext));
+        if !args.no_extensions {
+            extensions.push(Arc::new(WorkbenchContext {
+                instruction: args.instruction.clone(),
+            }));
+            extensions.push(Arc::new(pi_rs_plan_mode::PlanMode::new(
+                ["read_text", "lookup_order", "read", "grep", "find", "ls"].map(str::to_owned),
+            )));
+            extensions.push(Arc::new(pi_rs_review::ReviewContext));
+        }
         let mut extension_names = args.extensions.clone();
-        extension_names.extend(
-            local_resources
-                .packages
-                .extensions
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned()),
-        );
+        if !args.no_extensions {
+            extension_names.extend(
+                local_resources
+                    .packages
+                    .extensions
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            );
+        }
         for name in extension_names
             .iter()
             .collect::<std::collections::BTreeSet<_>>()
         {
             match name.as_str() {
+                "builtin:mcp" | "builtin:codemode" | "builtin:tool-search" => {},
                 "notes" => extensions.push(Arc::new(pi_rs_extensions::Notes)),
                 "todo" => extensions.push(Arc::new(pi_rs_extensions::TodoList)),
                 _ => extensions.push(Arc::new(pi_rs_extensions::ExecutableExtension::load(name)?)),

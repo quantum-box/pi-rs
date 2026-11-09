@@ -34,6 +34,11 @@ pub enum McpCommand {
 }
 
 pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
+    if args.no_mcp
+        || (args.no_extensions && !args.extensions.iter().any(|name| name == "builtin:mcp"))
+    {
+        return Ok(BTreeMap::new());
+    }
     let user = config::read_object(&config::agent_dir().join("mcp.json"))?;
     let mut servers = user
         .get("mcpServers")

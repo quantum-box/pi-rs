@@ -57,7 +57,13 @@ struct Definition {
     colors: BTreeMap<String, Value>,
 }
 impl Theme {
-    pub fn load(name: &str, extra: &[PathBuf], workspace: &Path, trusted: bool) -> Result<Self> {
+    pub fn load(
+        name: &str,
+        extra: &[PathBuf],
+        workspace: &Path,
+        trusted: bool,
+        discover: bool,
+    ) -> Result<Self> {
         let dark = !std::env::var("COLORFGBG")
             .ok()
             .and_then(|v| v.rsplit(';').next()?.parse::<u8>().ok())
@@ -77,7 +83,10 @@ impl Theme {
                         .join("themes")
                         .join(format!("{name}.json")),
                 ];
-                if trusted {
+                if !discover {
+                    paths.clear();
+                }
+                if trusted && discover {
                     paths.push(workspace.join(".pi/themes").join(format!("{name}.json")));
                 }
                 for path in extra {
@@ -100,11 +109,18 @@ impl Theme {
             }
         }
     }
-    pub fn discover(extra: &[PathBuf], workspace: &Path, trusted: bool) -> Vec<String> {
+    pub fn discover(
+        extra: &[PathBuf],
+        workspace: &Path,
+        trusted: bool,
+        discover: bool,
+    ) -> Vec<String> {
         let mut names = vec!["system".into(), "dark".into(), "light".into()];
         let mut paths = extra.to_vec();
-        paths.push(crate::config::agent_dir().join("themes"));
-        if trusted {
+        if discover {
+            paths.push(crate::config::agent_dir().join("themes"));
+        }
+        if trusted && discover {
             paths.push(workspace.join(".pi/themes"));
         }
         for path in paths {
