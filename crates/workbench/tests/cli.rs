@@ -344,3 +344,67 @@ fn plan_mode_changes_are_branch_local_and_can_be_discarded() {
         "normal"
     );
 }
+
+#[test]
+fn persistent_worker_accepts_multiple_prompts_and_releases_the_journal() {
+    let (endpoint, server) = model_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("persistent.jsonl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", directory.path().join("home"))
+        .arg("--session")
+        .arg(&path)
+        .args(["--endpoint", &endpoint, "--trace", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                let _ = sender.send(value);
+            }
+        }
+    });
+    for _ in 0..2 {
+        writeln!(
+            input,
+            "{}",
+            serde_json::json!({"type":"prompt","content":"same input"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        let mut answered = false;
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            answered |= event["type"] == "answer";
+            if event["type"] == "agent_settled" {
+                assert_eq!(event["success"], true);
+                break;
+            }
+        }
+        assert!(answered);
+        assert!(child.try_wait().unwrap().is_none());
+        drop(Session::open(&path).unwrap());
+    }
+    writeln!(input, "{}", serde_json::json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("persistent worker did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(child.wait().unwrap().success());
+    reader.join().unwrap();
+    server.join().unwrap();
+}

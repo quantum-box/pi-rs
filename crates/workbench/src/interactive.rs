@@ -118,6 +118,7 @@ struct View {
     resources: super::resources::Resources,
     model_list: Option<std::sync::mpsc::Receiver<Result<Vec<String>>>>,
     available_models: Vec<String>,
+    pending_request: Option<Value>,
     model_cycle: Option<bool>,
     thinking: String,
     expand_tools: bool,
@@ -314,6 +315,18 @@ impl View {
             }
             _ => {}
         }
+    }
+    fn settle(&mut self) {
+        if !self.thinking.is_empty() {
+            self.lines
+                .push(Entry::Thinking(std::mem::take(&mut self.thinking)));
+        }
+        if !self.streaming.is_empty() {
+            self.lines
+                .push(Entry::Assistant(std::mem::take(&mut self.streaming)));
+        }
+        self.request_started = None;
+        self.phase = None;
     }
     fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool) -> Result<()> {
         if args.tui_mode == Some(TuiMode::Regular) {
@@ -804,8 +817,10 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             }
             switch_session(args, view, path)?;
         }
-        "/compact" => return Worker::start(args, &["compact"]).map(Some),
-        "/mcp" => return Worker::start(args, &["mcp", "list"]).map(Some),
+        "/compact" => {
+            view.pending_request = Some(json!({"type":"compact","summary":null,"keep_turns":1}))
+        }
+        "/mcp" => view.pending_request = Some(json!({"type":"mcp_status"})),
         "/trust" => {
             view.picker = Some(Picker::new(
                 "Load project configuration?",
@@ -848,7 +863,9 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 .next()
                 .ok_or_else(|| Error::Config("use /extension <id> <command> [arguments]".into()))?;
             let arguments = parts.next().unwrap_or_default();
-            return Worker::start(args, &["extension", id, command, arguments]).map(Some);
+            view.pending_request = Some(
+                json!({"type":"extension","extension_id":id,"command":command,"arguments":arguments}),
+            );
         }
         "/notes" | "/todo" if rest.is_empty() => {
             let id = if name == "/notes" {
@@ -865,22 +882,33 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     .unwrap_or_else(|| "No saved state".into()),
             );
         }
-        "/notes" => return Worker::start(args, &["extension", "notes", "set", rest]).map(Some),
-        "/todo" => return Worker::start(args, &["extension", "todo-list", "set", rest]).map(Some),
+        "/notes" => {
+            view.pending_request = Some(
+                json!({"type":"extension","extension_id":"notes","command":"set","arguments":rest}),
+            )
+        }
+        "/todo" => {
+            view.pending_request = Some(
+                json!({"type":"extension","extension_id":"todo-list","command":"set","arguments":rest}),
+            )
+        }
         "/plan" if !rest.is_empty() => {
             let (command, input) = match rest {
                 "accept" => ("accept", ""),
                 "discard" => ("discard", ""),
                 _ => ("start", rest),
             };
-            return Worker::start(args, &["extension", "plan-mode", command, input]).map(Some);
+            view.pending_request = Some(
+                json!({"type":"extension","extension_id":"plan-mode","command":command,"arguments":input}),
+            );
         }
         "/review" if !rest.is_empty() => {
             let child = args
                 .session
                 .with_file_name(format!("review-{}.jsonl", uuid::Uuid::new_v4()));
-            return Worker::start(args, &["review", "--child", &child.to_string_lossy(), rest])
-                .map(Some);
+            view.pending_request = Some(
+                json!({"type":"review","child":child,"from_record":null,"resume":false,"task":rest}),
+            );
         }
         "/tree" => {
             let session = Session::open(&args.session)?;
@@ -925,7 +953,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         _ => {
             if let Some(expanded) = view.resources.expand(input)? {
                 view.lines.push(Entry::User(expanded.clone()));
-                return Worker::start(args, &["run", input]).map(Some);
+                view.pending_request = Some(json!({"type":"prompt","content":input}));
+                return Ok(None);
             }
             view.append("Unknown command. Use /help.");
         }
@@ -984,6 +1013,12 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut dirty = true;
     let mut last_frame = Instant::now();
     loop {
+        if worker
+            .as_ref()
+            .is_some_and(|active| !active.busy && !active.matches(&args))
+        {
+            worker.take();
+        }
         if let Some(receiver) = &view.model_list {
             match receiver.try_recv() {
                 Ok(Ok(models)) => {
@@ -1027,11 +1062,19 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
         }
         if let Some(active) = &mut worker {
-            if view.request_started.is_none() {
+            if active.busy && view.request_started.is_none() {
                 view.request_started = Some(Instant::now());
             }
             for value in active.events.try_iter() {
+                let settled = value["type"] == "agent_settled";
+                if value["type"] == "agent_started" {
+                    active.busy = true;
+                }
                 view.receive(value);
+                if settled {
+                    active.busy = false;
+                    view.settle();
+                }
                 dirty = true;
             }
             if let Some(status) = active.child.try_wait()? {
@@ -1042,14 +1085,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 for value in finished.events.try_iter() {
                     view.receive(value);
                 }
-                if !view.thinking.is_empty() {
-                    let partial = std::mem::take(&mut view.thinking);
-                    view.lines.push(Entry::Thinking(partial));
-                }
-                if !view.streaming.is_empty() {
-                    let partial = std::mem::take(&mut view.streaming);
-                    view.lines.push(Entry::Assistant(partial));
-                }
+                view.settle();
                 if !status.success() {
                     view.append(&format!(
                         "Run stopped ({status}). Use /session to inspect its saved journal."
@@ -1060,8 +1096,8 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
         }
-        if dirty || (worker.is_some() && last_frame.elapsed() >= Duration::from_millis(100)) {
-            view.draw(&args, &theme, worker.is_some())?;
+        if dirty || (is_busy(&worker) && last_frame.elapsed() >= Duration::from_millis(100)) {
+            view.draw(&args, &theme, is_busy(&worker))?;
             dirty = false;
             last_frame = Instant::now();
         }
@@ -1114,14 +1150,14 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     continue;
                 }
                 match action {
-                    "app.interrupt" if worker.is_some() => {
+                    "app.interrupt" if is_busy(&worker) => {
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
                         }
                     }
                     "app.session.new" | "app.session.tree" | "app.session.fork"
                     | "app.session.resume"
-                        if worker.is_none() =>
+                        if !is_busy(&worker) =>
                     {
                         let command = match action {
                             "app.session.new" => "/new",
@@ -1133,19 +1169,19 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                             view.append(&error.to_string());
                         }
                     }
-                    "app.message.copy" if worker.is_none() => {
+                    "app.message.copy" if !is_busy(&worker) => {
                         if let Err(error) = sessions::copy_last(&Session::open(&args.session)?) {
                             view.append(&error.to_string());
                         }
                     }
-                    "app.model.cycleForward" | "app.model.cycleBackward" if worker.is_none() => {
+                    "app.model.cycleForward" | "app.model.cycleBackward" if !is_busy(&worker) => {
                         if let Err(error) =
                             cycle_model(&mut args, &mut view, action == "app.model.cycleBackward")
                         {
                             view.append(&error.to_string());
                         }
                     }
-                    "app.thinking.cycle" if worker.is_none() => {
+                    "app.thinking.cycle" if !is_busy(&worker) => {
                         let next = args
                             .thinking
                             .as_deref()
@@ -1160,7 +1196,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     "app.tools.expand" => view.expand_tools = !view.expand_tools,
                     "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
                     "app.clear" => {
-                        if let Some(active) = &mut worker {
+                        if let Some(active) = worker.as_mut().filter(|active| active.busy) {
                             let _ = active.send(json!({"type":"cancel"}));
                         } else if view.editor.text.is_empty() {
                             break;
@@ -1178,7 +1214,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         }
                     }
                     "tui.input.tab" => complete_input(&args, &mut view),
-                    "app.model.select" if worker.is_none() => start_model_picker(&args, &mut view),
+                    "app.model.select" if !is_busy(&worker) => start_model_picker(&args, &mut view),
                     "tui.input.submit" | "app.message.followUp" => {
                         let input = view.editor.take();
                         if input.trim().is_empty() {
@@ -1190,7 +1226,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         view.scroll = 0;
                         view.history.push(input.clone());
                         view.history_index = None;
-                        if let Some(active) = &mut worker {
+                        if let Some(active) = worker.as_mut().filter(|active| active.busy) {
                             let kind = if action == "app.message.followUp" {
                                 "followup"
                             } else {
@@ -1235,6 +1271,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                                 Err(error) => view.append(&error.to_string()),
                             }
                         } else if input.trim() == "/reload" {
+                            worker.take();
                             args.settings =
                                 crate::config::Settings::load(&args.workspace, args.trusted)?;
                             view.resources = super::resources::Resources::load(&args)?;
@@ -1307,14 +1344,21 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                             ));
                         } else if input.starts_with('/') {
                             match slash(&input, &mut args, &mut view) {
-                                Ok(next) => worker = next,
+                                Ok(Some(next)) => worker = Some(next),
+                                Ok(None) => {
+                                    if let Some(request) = view.pending_request.take()
+                                        && let Err(error) =
+                                            start_request(&args, request, &mut worker)
+                                    {
+                                        view.append(&error.to_string());
+                                    }
+                                }
                                 Err(error) => view.append(&error.to_string()),
                             }
                         } else {
                             view.lines.push(Entry::User(input.clone()));
-                            match Worker::start(&args, &["run", &input]) {
-                                Ok(next) => worker = Some(next),
-                                Err(error) => view.append(&error.to_string()),
+                            if let Err(error) = start_prompt(&args, &input, &mut worker) {
+                                view.append(&error.to_string());
                             }
                         }
                     }
@@ -1362,6 +1406,17 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         view.finish_regular()?;
     }
     Ok(())
+}
+
+fn is_busy(worker: &Option<Worker>) -> bool {
+    worker.as_ref().is_some_and(|worker| worker.busy)
+}
+
+fn start_prompt(args: &Cli, input: &str, worker: &mut Option<Worker>) -> Result<()> {
+    start_request(args, json!({"type":"prompt","content":input}), worker)
+}
+fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Result<()> {
+    Worker::submit(worker, args, request)
 }
 
 fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {

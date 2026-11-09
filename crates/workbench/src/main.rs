@@ -1,27 +1,26 @@
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use pi_rs::{
-    Agent, CancellationToken, Compaction, Error, Event, InputKind, Limits, Notification,
-    OperationState, Outcome, ProjectResources, QueuedInput, Registry, Result, Session,
-    ollama::Ollama,
+    CancellationToken, Compaction, Error, Event, InputKind, Notification, OperationState, Outcome,
+    QueuedInput, Result, Session,
 };
-use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod backend;
 mod config;
 mod interactive;
 mod mcp_config;
 mod process;
 mod resources;
 mod rpc;
+mod runtime;
 mod sessions;
 mod ui;
 
@@ -174,6 +173,8 @@ enum OutputMode {
 enum Command {
     /// Open the interactive terminal interface.
     Interactive,
+    #[command(hide = true)]
+    Serve,
     Mcp {
         #[command(subcommand)]
         command: mcp_config::McpCommand,
@@ -324,6 +325,9 @@ async fn main() {
 }
 
 async fn execute(mut args: Cli) -> Result<()> {
+    if matches!(args.command, Some(Command::Serve)) {
+        return backend::run(args).await;
+    }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
         return mcp_config::command(&args, command.clone()).await;
     }
@@ -530,113 +534,15 @@ async fn execute(mut args: Cli) -> Result<()> {
         }
     }
     session.select_model(&args.model, args.thinking.as_deref())?;
-    let local_resources = resources::Resources::load(&args)?;
-    for warning in &local_resources.warnings {
-        eprintln!("{warning}");
-    }
-    if let Command::Run { prompt } = &mut command
-        && let Some(expanded) = local_resources.expand(prompt)?
-    {
-        *prompt = expanded;
-    }
-    let mut system_prompt = args
-        .system_prompt
-        .as_ref()
-        .map(std::fs::read_to_string)
-        .transpose()?
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into());
-    if args.system_prompt.is_some() {
-        system_prompt.push_str(&local_resources.append_system);
-        system_prompt.push_str(&local_resources.instructions);
-    } else {
-        system_prompt = local_resources.system_prompt(&system_prompt);
-    }
-    let mcp_connections = mcp_config::connect_all(&args, false).await?;
+    let runtime = runtime::configure(&args).await?;
     let result = async {
-    let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
-    if let Some(project) = &args.project {
-        extensions.push(Arc::new(ProjectInstructions {
-            resources: ProjectResources::open(&args.workspace, args.workspace.join(project))?,
-            skills: args.skill,
-        }));
-    }
-    extensions.push(Arc::new(WorkbenchContext {
-        instruction: args.instruction,
-    }));
-    extensions.push(Arc::new(pi_rs_plan_mode::PlanMode::new(
-        ["read_text", "lookup_order", "read", "grep", "find", "ls"].map(str::to_owned),
-    )));
-    extensions.push(Arc::new(pi_rs_review::ReviewContext));
-    for name in args
-        .extensions
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>()
-    {
-        match name.as_str() {
-            "notes" => extensions.push(Arc::new(pi_rs_extensions::Notes)),
-            "todo" => extensions.push(Arc::new(pi_rs_extensions::TodoList)),
-            _ => extensions.push(Arc::new(pi_rs_extensions::ExecutableExtension::load(name)?)),
-        }
-    }
-    #[cfg(feature = "evaluation-fixtures")]
-    if let Some(endpoint) = args.fixtures.as_deref() {
-        extensions.push(Arc::new(pi_rs_fixture_tools::Fixtures::new(endpoint)?));
-    }
-    for connection in &mcp_connections {
-        extensions.push(connection.clone());
-    }
+        if let Command::Run { prompt } = &mut command
+            && let Some(expanded) = runtime.resources.expand(prompt)?
+        { *prompt = expanded; }
+        let registry = &runtime.registry;
+        let agent = runtime.agent(&args);
+        let mut observer = |event: Notification<'_>| observe(event, args.trace);
 
-    let mut registry =
-        Registry::compose(extensions, &args.disable_extension.into_iter().collect())?;
-    registry.register(Arc::new(CommandPolicy {
-        allow_commands: args.allow_commands,
-    }))?;
-    let order_config = args
-        .orders
-        .as_deref()
-        .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
-    registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
-    if args.coding_tools {
-        registry.register(Arc::new(pi_rs_workbench::coding::CodingTools::local(
-            &args.workspace,
-        )?))?;
-    }
-    let show_reasoning = args.trace;
-    let provider = Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?
-        .with_reasoning_effort(args.thinking.as_deref())
-        .with_progress(|stage| output(json!({"type":"model_progress","stage":stage})))
-        .with_reasoning(move |delta| {
-            if show_reasoning {
-                output(json!({"type":"reasoning_delta","delta":delta}));
-            }
-        });
-    let agent = Agent {
-        model: &provider,
-        model_name: &args.model,
-        registry: &registry,
-        system_prompt: &system_prompt,
-        limits: Limits {
-            model_requests: args.max_requests,
-            output_tokens_per_request: args.max_output_tokens,
-            output_tokens_per_run: args.output_budget,
-            model_timeout: Duration::from_secs(args.model_timeout_secs),
-            tool_timeout: Duration::from_secs(args.tool_timeout_secs),
-            context_window: args.context_window,
-        },
-    };
-    let mut observer = |event: Notification<'_>| match event {
-        Notification::Committed(record) if args.trace => {
-            output(json!({"type": "record", "record": record}))
-        }
-        Notification::Committed(record) => output(metadata(record)),
-        Notification::Request(request) if args.trace => {
-            output(json!({"type": "request", "request": request}))
-        }
-        Notification::Text(delta) if args.trace => {
-            output(json!({"type": "text_delta", "delta": delta}))
-        }
-        _ => {}
-    };
 
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
@@ -748,10 +654,22 @@ async fn execute(mut args: Cli) -> Result<()> {
     output(json!({"type": "answer", "content": answer}));
     Ok(())
     }.await;
-    for connection in mcp_connections {
-        connection.close().await;
+    let cleanup = runtime.close().await;
+    result.and(cleanup)
+}
+
+fn observe(event: Notification<'_>, trace: bool) {
+    match event {
+        Notification::Committed(record) if trace => {
+            output(json!({"type": "record", "record": record}))
+        }
+        Notification::Committed(record) => output(metadata(record)),
+        Notification::Request(request) if trace => {
+            output(json!({"type": "request", "request": request}))
+        }
+        Notification::Text(delta) if trace => output(json!({"type": "text_delta", "delta": delta})),
+        _ => {}
     }
-    result
 }
 
 fn read_controls(sender: mpsc::Sender<QueuedInput>, cancel: CancellationToken) {

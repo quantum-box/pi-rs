@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 pub(super) struct Worker {
     pub(super) compacting: bool,
+    pub(super) busy: bool,
+    persistent: bool,
+    configuration: Value,
     pub(super) child: Child,
     stdin: Option<ChildStdin>,
     pub(super) events: Receiver<Value>,
@@ -110,13 +113,44 @@ impl Worker {
                 }
             }),
         ];
+        let persistent = operation.first() == Some(&"serve");
         Ok(Self {
             compacting: operation.first() == Some(&"compact"),
+            busy: !persistent,
+            persistent,
+            configuration: configuration(args),
             child,
             stdin,
             events,
             readers,
         })
+    }
+    pub(super) fn start_request(args: &Cli, request: Value) -> Result<Self> {
+        let mut worker = Self::start(args, &["serve"])?;
+        worker.request(args, request)?;
+        Ok(worker)
+    }
+    pub(super) fn submit(slot: &mut Option<Self>, args: &Cli, request: Value) -> Result<()> {
+        if let Some(active) = slot.as_mut().filter(|worker| worker.matches(args)) {
+            if active.busy {
+                return Err(Error::Config("worker is still running".into()));
+            }
+            active.request(args, request)
+        } else {
+            slot.take();
+            *slot = Some(Self::start_request(args, request)?);
+            Ok(())
+        }
+    }
+    pub(super) fn matches(&self, args: &Cli) -> bool {
+        self.persistent && self.configuration == configuration(args)
+    }
+    pub(super) fn request(&mut self, args: &Cli, request: Value) -> Result<()> {
+        self.send(json!({"type":"configure","model":args.model,"thinking":args.thinking,"session":args.session}))?;
+        self.compacting = request["type"] == "compact";
+        self.send(request)?;
+        self.busy = true;
+        Ok(())
     }
     pub(super) fn send(&mut self, value: Value) -> Result<()> {
         let stdin = self
@@ -129,12 +163,25 @@ impl Worker {
         Ok(())
     }
 }
+fn configuration(args: &Cli) -> Value {
+    json!({
+        "workspace":args.workspace,
+        "endpoint":args.endpoint,"extensions":args.extensions,"disabled":args.disable_extension,
+        "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
+        "system_prompt":args.system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
+        "coding_tools":args.coding_tools,"requests":args.max_requests,"output_tokens":args.max_output_tokens,
+        "output_budget":args.output_budget,"context_window":args.context_window,
+        "model_timeout":args.model_timeout_secs,"tool_timeout":args.tool_timeout_secs
+    })
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.send(json!({"type":"cancel"}));
+            let _ = self.send(json!({"type": if self.persistent { "shutdown" } else { "cancel" }}));
             self.stdin.take();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline =
+                Instant::now() + Duration::from_secs(if self.persistent { 30 } else { 5 });
             while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }

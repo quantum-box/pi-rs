@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading | Full Pi event and interactive UI surface, explicit hot reload, scaffolding and package distribution |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, resource reload | Complete settings editor UI, package resource integration, resource globs and complete validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools and resources; environment/command credentials; add/remove/list commands | Persistent session connections, OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior, elicitation and task polling |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools and resources; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior, elicitation and task polling |
 | Codemode | Core tool invocation APIs | Sandboxed code execution and dynamic tool search |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload` | Automatic system appearance notifications, live file-watch reload |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory forks, compaction and lifecycle shutdown | Complete resource/model/auth factories, persistent fork/export helpers and remaining Pi SDK equivalents |
@@ -169,3 +169,16 @@ use the existing host API.
 
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
+
+### Persistent runtime checkpoint
+
+Terminal and RPC prompts now reuse a runtime rather than rebuilding model and
+MCP clients for every input. Journal locks are released while idle, so session
+inspection and naming remain usable. Model/thinking changes, new sessions,
+extension commands, compaction and review can use that runtime; `/reload`
+rebuilds it for changed configuration.
+
+A stateful MCP fixture retained counter values 1, 2 and 3 across prompts, a
+notes command and cancellation, using one server process. A separate RPC
+fixture retained its connection across `new_session`, verified idle abort,
+and shut down cleanly. Fullscreen and regular-mode PTY regression checks pass.

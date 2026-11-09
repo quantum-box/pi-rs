@@ -40,7 +40,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     loop {
         if let Some(active) = &mut worker {
             for event in active.events.try_iter() {
-                emit_event(event)?;
+                forward_event(event, &mut active.busy, &mut pending_abort)?;
             }
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
@@ -48,10 +48,12 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     let _ = reader.join();
                 }
                 for event in finished.events.try_iter() {
-                    emit_event(event)?;
+                    forward_event(event, &mut finished.busy, &mut pending_abort)?;
                 }
-                emit(json!({"type":"agent_end","success":status.success()}))?;
-                emit(json!({"type":"agent_settled"}))?;
+                if finished.busy {
+                    emit(json!({"type":"agent_end","success":status.success()}))?;
+                    emit(json!({"type":"agent_settled"}))?;
+                }
                 if let Some(request) = pending_abort.take() {
                     response(&request, Ok(None))?;
                 }
@@ -72,7 +74,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 continue;
             }
         };
-        if request["type"] == "abort" && worker.is_some() {
+        if request["type"] == "abort" && busy(&worker) {
             if pending_abort.is_some() {
                 response(&request, Err(Error::Config("abort already pending".into())))?;
             } else if let Some(active) = &mut worker {
@@ -111,7 +113,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .as_str()
                 .filter(|text| !text.is_empty())
                 .ok_or_else(|| Error::Config("message must be a nonempty string".into()))?;
-            if let Some(active) = worker {
+            if let Some(active) = worker.as_mut().filter(|worker| worker.busy) {
                 let kind = match name {
                     "steer" => "steer",
                     "follow_up" => "followup",
@@ -128,21 +130,21 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 active.send(json!({"type":kind,"content":message}))?;
                 Ok(Some(json!({"disposition":"queued"})))
             } else {
-                *worker = Some(Worker::start(args, &["run", message])?);
+                Worker::submit(worker, args, json!({"type":"prompt","content":message}))?;
                 Ok(Some(json!({"disposition":"started"})))
             }
         }
         "abort" => Ok(None),
         "get_state" => Ok(Some(
-            json!({"sessionFile":args.session,"isStreaming":worker.is_some(),"isCompacting":worker.as_ref().is_some_and(|worker| worker.compacting),"model":{"id":args.model,"provider":"ollama"}}),
+            json!({"sessionFile":args.session,"isStreaming":busy(worker),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"model":{"id":args.model,"provider":"ollama"}}),
         )),
-        "get_messages" if worker.is_none() => {
+        "get_messages" if !busy(worker) => {
             let session = Session::open(&args.session)?;
             Ok(Some(
                 json!({"messages":session.conversation_at(session.head())?}),
             ))
         }
-        "new_session" if worker.is_none() => {
+        "new_session" if !busy(worker) => {
             args.session = if args.no_session {
                 args.session
                     .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
@@ -156,26 +158,31 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             session.set_working_directory(&args.workspace)?;
             Ok(Some(json!({"cancelled":false})))
         }
-        "set_model" if worker.is_none() => {
+        "set_model" if !busy(worker) => {
             let model = request["modelId"]
                 .as_str()
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| Error::Config("modelId is required".into()))?;
             args.model = model.to_owned();
+            Session::open(&args.session)?.select_model(model, args.thinking.as_deref())?;
             Ok(Some(json!({"id":model,"provider":"ollama"})))
         }
-        "compact" if worker.is_none() => {
-            *worker = Some(Worker::start(args, &["compact"])?);
+        "compact" if !busy(worker) => {
+            Worker::submit(
+                worker,
+                args,
+                json!({"type":"compact","summary":null,"keep_turns":1}),
+            )?;
             Ok(Some(json!({"disposition":"started"})))
         }
-        "set_session_name" if worker.is_none() => {
+        "set_session_name" if !busy(worker) => {
             let name = request["name"]
                 .as_str()
                 .ok_or_else(|| Error::Config("name is required".into()))?;
             Session::open(&args.session)?.set_name(name)?;
             Ok(None)
         }
-        "export_html" if worker.is_none() => {
+        "export_html" if !busy(worker) => {
             let path = request["outputPath"]
                 .as_str()
                 .map(std::path::PathBuf::from)
@@ -186,7 +193,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             sessions::export(&Session::open(&args.session)?, &path)?;
             Ok(Some(json!({"path":path})))
         }
-        "get_session_stats" if worker.is_none() => {
+        "get_session_stats" if !busy(worker) => {
             let session = Session::open(&args.session)?;
             let stats = sessions::summary(&args.session, &session);
             Ok(Some(
@@ -196,6 +203,30 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         _ => Err(Error::Config(format!(
             "command {name:?} is unavailable in the current state"
         ))),
+    }
+}
+
+fn busy(worker: &Option<Worker>) -> bool {
+    worker.as_ref().is_some_and(|worker| worker.busy)
+}
+
+fn forward_event(event: Value, busy: &mut bool, pending_abort: &mut Option<Value>) -> Result<()> {
+    match event["type"].as_str() {
+        Some("backend_ready") => Ok(()),
+        Some("agent_started") => {
+            *busy = true;
+            emit(json!({"type":"agent_start"}))
+        }
+        Some("agent_settled") => {
+            *busy = false;
+            emit(json!({"type":"agent_end","success":event["success"]}))?;
+            emit(json!({"type":"agent_settled"}))?;
+            if let Some(request) = pending_abort.take() {
+                response(&request, Ok(None))?;
+            }
+            Ok(())
+        }
+        _ => emit_event(event),
     }
 }
 
