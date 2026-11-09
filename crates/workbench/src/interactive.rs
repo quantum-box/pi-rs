@@ -89,7 +89,7 @@ impl Terminal {
             execute!(std::io::stdout(), EnterAlternateScreen)?;
         }
         execute!(std::io::stdout(), EnableBracketedPaste, Hide)?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
         Ok(guard)
     }
@@ -127,7 +127,7 @@ impl Drop for Terminal {
         if self.alternate {
             self.images.clear();
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
@@ -1686,14 +1686,14 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         };
         let event = match input.next(input_wait)? {
             Some(crate::ui::input::InputEvent::Event(event)) => event,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::CellSize { width, height }) => {
                 if images::set_cell_dimensions(width, height) {
                     dirty = true;
                 }
                 continue;
             }
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::Appearance { dark }) => {
                 if crate::ui::theme::set_appearance(dark) {
                     let selection = args.use_theme.as_deref().unwrap_or("system");

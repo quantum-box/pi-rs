@@ -2200,6 +2200,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "crossterm",
+ "crossterm_winapi",
  "futures-util",
  "globset",
  "grep-regex",
@@ -2233,6 +2234,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "uuid",
+ "winapi",
 ]
 
 [[package]]

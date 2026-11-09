@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 static APPEARANCE: AtomicU8 = AtomicU8::new(0);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn set_appearance(dark: bool) -> bool {
     let value = if dark { 1 } else { 2 };
     APPEARANCE.swap(value, Ordering::Relaxed) != value

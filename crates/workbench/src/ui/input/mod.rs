@@ -4,33 +4,41 @@ use std::time::Duration;
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     Event(crossterm::event::Event),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     CellSize {
         width: u16,
         height: u16,
     },
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Appearance {
         dark: bool,
     },
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     CursorPosition(u16, u16),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     KeyboardEnhancementFlags(crossterm::event::KeyboardEnhancementFlags),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     PrimaryDeviceAttributes,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+mod decoder;
+#[cfg(any(unix, windows))]
 mod parse;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+mod windows_keys;
+#[cfg(windows)]
+pub use windows::Reader;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
 pub use unix::Reader;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub struct Reader;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl Reader {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self)
@@ -44,7 +52,7 @@ impl Reader {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn escape_delay() -> Duration {
     Duration::from_millis(25)
 }

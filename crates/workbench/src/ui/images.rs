@@ -111,11 +111,11 @@ impl InlineImage {
             .collect()
     }
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 static REPORTED_CELL: AtomicU32 = AtomicU32::new(0);
 
 pub fn query_cell_size() -> std::io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         REPORTED_CELL.store(0, Ordering::Relaxed);
         let mut out = std::io::stdout().lock();
@@ -125,7 +125,7 @@ pub fn query_cell_size() -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn set_cell_dimensions(width: u16, height: u16) -> bool {
     if width == 0 || height == 0 || width > 1024 || height > 1024 {
         return false;
@@ -135,7 +135,7 @@ pub fn set_cell_dimensions(width: u16, height: u16) -> bool {
 }
 
 pub fn cell_dimensions() -> (f64, f64) {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let reported = REPORTED_CELL.load(Ordering::Relaxed);
         if reported != 0 {

@@ -60,3 +60,7 @@ uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi = "0.9.1"
+winapi = { version = "0.3.9", features = ["winuser", "winerror", "synchapi"] }

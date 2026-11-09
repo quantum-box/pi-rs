@@ -1070,7 +1070,7 @@ cell sizes. A PTY fixture changed pixel dimensions while preserving the characte
 grid and verified image placement dimensions, retained draft input, PNG reuse
 and terminal restoration. Existing clipping and active-image fixtures passed
 for both protocols. Workspace tests and all-target Clippy passed on Rust 1.89.
-Unix terminal-reported CSI cell-size responses are covered by the following checkpoint. Windows response handling remains open.
+Unix terminal-reported CSI cell-size responses are covered by the following checkpoint. Windows response handling is covered by the following Windows checkpoint.
 
 ### Unix terminal-response checkpoint
 
@@ -1078,8 +1078,7 @@ The Unix input reader now separates terminal replies from keyboard input. Its
 key decoder is adapted from the existing Crossterm 0.29 implementation, with
 the original MIT notice in `assets/CROSSTERM-LICENSE`. Startup, resize and resume
 request CSI cell dimensions. Valid replies update image layout, while malformed
-replies are consumed without entering the draft. Windows uses the native
-Crossterm input backend.
+replies are consumed without entering the draft.
 
 Unix terminals can also report appearance changes through mode 2031. The
 reader consumes CSI 997 reports and updates light/dark theme pairs. Fixed
@@ -1091,3 +1090,20 @@ control keys, literal bracketed paste and Escape handling. PTY fixtures verified
 cell queries, theme-pair updates, fixed themes, invalid reports, queue controls,
 settings editing, shell execution, images, resize, suspend and terminal cleanup.
 Workspace tests and all-target Clippy passed on Rust 1.89.
+
+
+### Windows terminal-response checkpoint
+
+The Windows reader now handles console input records directly, preserving
+Crossterm's native key, modifier, Unicode-surrogate, mouse and focus mappings.
+Synthetic records without physical key information pass through the shared VT
+decoder before key mapping, which preserves response ESC characters. CSI cell
+size and appearance reports therefore use the same layout and theme-pair path
+as Unix. Native resize records use the visible window dimensions, excluding
+scrollback. Exit disables appearance reporting on both platforms.
+
+Regression cases cover synthetic cell and appearance reports, native Enter
+press/release, repeated response characters, Unicode surrogate pairs and literal bracketed paste. The input
+module and its tests pass Windows-target compilation and Clippy independently.
+Native Windows execution is checked by the repository's CI matrix. Interactive
+verification in a real Windows Terminal remains outstanding.
