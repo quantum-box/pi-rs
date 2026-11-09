@@ -488,6 +488,14 @@ impl AgentSession {
         })
     }
     pub async fn summarize(&mut self, keep_turns: usize) -> Result<()> {
+        self.summarize_with_instructions(keep_turns, None).await
+    }
+
+    pub async fn summarize_with_instructions(
+        &mut self,
+        keep_turns: usize,
+        instructions: Option<&str>,
+    ) -> Result<()> {
         self.ensure_open()?;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
@@ -500,12 +508,13 @@ impl AgentSession {
         };
         let mut observer = |event: Notification<'_>| emit(&events, &event);
         let result = agent
-            .summarize_with_inputs(
+            .summarize_with_instructions(
                 &mut self.session,
                 keep_turns,
                 &active.token,
                 &mut observer,
                 Some(&mut self.input),
+                instructions,
             )
             .await;
         let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
@@ -1363,6 +1372,37 @@ mod tests {
         let (result, ()) = tokio::join!(session.summarize(1), driver);
         assert!(matches!(result, Err(Error::Cancelled)));
         assert_eq!(session.pending_inputs(), 0);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn summary_focus_reaches_the_model_without_entering_user_history() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .in_memory()
+            .unwrap();
+        for input in ["first", "second", "third"] {
+            session.prompt(input).await.unwrap();
+        }
+        let mut events = session.subscribe();
+        session
+            .summarize_with_instructions(1, Some("Preserve the deployment decision."))
+            .await
+            .unwrap();
+        let mut summary_request = None;
+        while let Ok(event) = events.try_recv() {
+            if let SessionEvent::Request(request) = event {
+                summary_request = Some(request);
+            }
+        }
+        let request = summary_request.expect("summary request");
+        assert!(request.tools.is_empty());
+        assert!(
+            matches!(request.messages.last(), Some(crate::Message::User { content }) if content.ends_with("Additional focus: Preserve the deployment decision."))
+        );
+        assert!(!session.journal().records().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content.contains("deployment decision"))));
+        assert!(
+            matches!(&session.journal().records().last().unwrap().event, crate::Event::Compacted { summary, .. } if summary == "answer 4")
+        );
         session.close().await.unwrap();
     }
 

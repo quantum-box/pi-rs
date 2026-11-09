@@ -342,6 +342,7 @@ impl Agent<'_> {
                                 &states,
                                 SummaryScope {
                                     keep_turns: 1,
+                                    instructions: None,
                                     output_limit: summary_limit,
                                     cancellation: cancel,
                                 },
@@ -1262,6 +1263,20 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
         inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<()> {
+        self.summarize_with_instructions(session, keep_turns, cancel, observer, inputs, None)
+            .await
+    }
+
+    /// Summarize older turns with optional user-supplied focus instructions.
+    pub async fn summarize_with_instructions<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        keep_turns: usize,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        inputs: Option<&mut mpsc::Receiver<T>>,
+        instructions: Option<&str>,
+    ) -> Result<()> {
         ensure_settled(session.operations())?;
         let states = self.migrate(session, observer)?;
         let limit = self
@@ -1273,6 +1288,7 @@ impl Agent<'_> {
             &states,
             SummaryScope {
                 keep_turns,
+                instructions,
                 output_limit: limit,
                 cancellation: cancel,
             },
@@ -1293,6 +1309,7 @@ impl Agent<'_> {
     ) -> Result<u32> {
         let SummaryScope {
             keep_turns,
+            instructions,
             output_limit: limit,
             cancellation: cancel,
         } = scope;
@@ -1316,6 +1333,12 @@ impl Agent<'_> {
         }
         request.tools.clear();
         request.messages.push(Message::User { content: "Summarize only this older conversation. Record confirmed facts, decisions, and explicitly unresolved items. Preserve useful tool outcomes. Do not infer the current work status or invent open tasks. Omit credentials. Return only the summary.".into() });
+        if let Some(instructions) = instructions.filter(|value| !value.is_empty())
+            && let Some(Message::User { content }) = request.messages.last_mut()
+        {
+            content.push_str("\n\nAdditional focus: ");
+            content.push_str(instructions);
+        }
         if self.exceeds_context(&request)? {
             return Err(Error::Model(
                 "older context does not fit the summary request".into(),
@@ -1454,6 +1477,7 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
 
 struct SummaryScope<'a> {
     keep_turns: usize,
+    instructions: Option<&'a str>,
     output_limit: u32,
     cancellation: &'a CancellationToken,
 }

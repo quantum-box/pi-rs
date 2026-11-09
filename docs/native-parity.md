@@ -1107,3 +1107,26 @@ press/release, repeated response characters, Unicode surrogate pairs and literal
 module and its tests pass Windows-target compilation and Clippy independently.
 Native Windows execution is checked by the repository's CI matrix. Interactive
 verification in a real Windows Terminal remains outstanding.
+
+
+### Compaction focus and RPC completion checkpoint
+
+`/compact <instructions>`, `compact --instructions`, RPC `compact` with
+`customInstructions`, and the native SDK's `summarize_with_instructions` now
+pass the requested focus into the tool-free summary request. Existing summary
+APIs retain their behavior. Focus text does not become a user-history entry.
+
+RPC compaction replies after the summary checkpoint is committed, with
+`summary`, `firstKeptEntryId` and `tokensBefore`. The token count uses the native
+runtime's approximate three-bytes-per-token estimate. Compaction errors,
+cancellation and unexpected worker exit return failed responses. The worker
+stays busy until that response, and `get_state` reports compaction separately
+from streaming. Queue controls retain their existing behavior.
+
+A native SDK regression verifies the summary request and committed history.
+Loopback Ollama-adapter checks exercised deferred RPC completion, Unicode
+focus text, state, invalid arguments, model failure, cancellation, single
+responses and atomic checkpoints. Fullscreen and regular PTY checks exercised
+focused compaction and terminal restoration. The direct CLI path and existing
+RPC user-shell checks also passed. These checks do not cover the remaining
+automatic-compaction settings or full provider token accounting.

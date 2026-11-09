@@ -305,6 +305,9 @@ enum Command {
         /// Supply a summary, or omit to request a tool-free model summary.
         #[arg(long)]
         summary: Option<String>,
+        /// Additional focus for the model-generated summary.
+        #[arg(long, conflicts_with = "summary")]
+        instructions: Option<String>,
         #[arg(long, default_value_t = 1)]
         keep_turns: usize,
     },
@@ -839,6 +842,7 @@ async fn execute(mut args: Cli) -> Result<()> {
         Command::Compact {
             summary: Some(summary),
             keep_turns,
+            ..
         } => {
             return agent.compact(
                 &mut session,
@@ -852,9 +856,10 @@ async fn execute(mut args: Cli) -> Result<()> {
         Command::Compact {
             summary: None,
             keep_turns,
+            instructions,
         } => {
             return agent
-                .summarize(&mut session, keep_turns, &cancel, &mut observer)
+                .summarize_with_instructions::<pi_rs::AgentInput>(&mut session, keep_turns, &cancel, &mut observer, None, instructions.as_deref())
                 .await;
         }
         Command::Run { prompt } => Some(prompt),

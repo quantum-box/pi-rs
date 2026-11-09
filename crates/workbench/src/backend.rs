@@ -40,6 +40,10 @@ enum Request {
     Compact {
         summary: Option<String>,
         keep_turns: usize,
+        instructions: Option<String>,
+        #[serde(default)]
+        rpc: bool,
+        id: Option<serde_json::Value>,
     },
     Steer {
         content: String,
@@ -158,6 +162,11 @@ pub async fn run(mut args: Cli) -> Result<()> {
             &request,
             Request::Prompt { .. } | Request::Compact { .. } | Request::Review { .. }
         );
+        let compact_response = match &request {
+            Request::Compact { rpc: true, id, .. } => Some(id.clone()),
+            _ => None,
+        };
+        let mut compact_result = serde_json::Value::Null;
         let cancel = CancellationToken::new();
         {
             let mut state = active.lock().expect("worker control");
@@ -233,6 +242,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
                 Request::Compact {
                     summary: Some(summary),
                     keep_turns,
+                    ..
                 } => agent.compact(
                     &mut session,
                     Compaction {
@@ -244,10 +254,31 @@ pub async fn run(mut args: Cli) -> Result<()> {
                 Request::Compact {
                     summary: None,
                     keep_turns,
+                    instructions,
+                    ..
                 } => {
+                    let tokens_before = serde_json::to_vec(
+                        &session.conversation_at(session.head())?,
+                    )?.len().div_ceil(3);
                     agent
-                        .summarize_with_inputs(&mut session, keep_turns, &cancel, &mut observer, Some(&mut queued))
-                        .await?
+                        .summarize_with_instructions(
+                            &mut session,
+                            keep_turns,
+                            &cancel,
+                            &mut observer,
+                            Some(&mut queued),
+                            instructions.as_deref(),
+                        )
+                        .await?;
+                    if let Some(record) = session.records().last()
+                        && let pi_rs::Event::Compacted { summary, retain_from, .. } = &record.event
+                    {
+                        compact_result = json!({
+                            "summary": summary,
+                            "firstKeptEntryId": retain_from.unwrap_or(record.id).to_string(),
+                            "tokensBefore": tokens_before,
+                        });
+                    }
                 }
                 Request::McpStatus => runtime.mcp_status(&args)?,
                 Request::Bash { command, exclude_from_context, request_id } => {
@@ -307,6 +338,16 @@ pub async fn run(mut args: Cli) -> Result<()> {
             output(json!({"type":"error","message":error.to_string()}));
         }
         output(json!({"type":"agent_settled","success":result.is_ok()}));
+        if let Some(id) = compact_response {
+            control_response(
+                "compact",
+                id,
+                result
+                    .as_ref()
+                    .map(|_| compact_result)
+                    .map_err(|error| Error::Config(error.to_string())),
+            );
+        }
     }
     runtime.close().await
 }

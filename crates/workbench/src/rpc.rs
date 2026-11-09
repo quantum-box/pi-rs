@@ -43,6 +43,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut worker: Option<Worker> = None;
     let mut pending_abort: Option<Value> = None;
     let mut pending_bash: Option<Value> = None;
+    let mut pending_compact: Option<Value> = None;
     loop {
         if let Some(active) = &mut worker {
             for event in active.events.try_iter() {
@@ -51,6 +52,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     &mut active.busy,
                     &mut pending_abort,
                     &mut pending_bash,
+                    &mut pending_compact,
                 )?;
             }
             if let Some(status) = active.child.try_wait()? {
@@ -64,6 +66,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         &mut finished.busy,
                         &mut pending_abort,
                         &mut pending_bash,
+                        &mut pending_compact,
                     )?;
                 }
                 if finished.busy {
@@ -72,6 +75,14 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 }
                 if let Some(request) = pending_abort.take() {
                     response(&request, Ok(None))?;
+                }
+                if let Some(request) = pending_compact.take() {
+                    response(
+                        &request,
+                        Err(Error::Config(
+                            "compaction worker exited before returning a result".into(),
+                        )),
+                    )?;
                 }
                 if let Some(request) = pending_bash.take() {
                     response(
@@ -145,6 +156,33 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             })();
             if let Err(error) = result {
                 response(&request, Err(error))?;
+            }
+            continue;
+        }
+        if request["type"] == "compact" {
+            let result = (|| {
+                if busy(&worker) {
+                    return Err(Error::Config(
+                        "wait for the current operation before compacting".into(),
+                    ));
+                }
+                let instructions = request
+                    .get("customInstructions")
+                    .map(|value| {
+                        value.as_str().ok_or_else(|| {
+                            Error::Config("customInstructions must be a string".into())
+                        })
+                    })
+                    .transpose()?;
+                Worker::submit(
+                    &mut worker,
+                    &args,
+                    json!({"type":"compact","summary":null,"keep_turns":1,"instructions":instructions,"rpc":true,"id":request.get("id")}),
+                )
+            })();
+            match result {
+                Ok(()) => pending_compact = Some(request),
+                Err(error) => response(&request, Err(error))?,
             }
             continue;
         }
@@ -244,7 +282,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         }
         "abort" | "abort_bash" => Ok(None),
         "get_state" => {
-            let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+            let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing && !worker.compacting),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
             state["steeringMode"] = json!(
                 worker
                     .as_ref()
@@ -431,14 +469,6 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Session::open(&args.session)?.select_model(model, args.thinking.as_deref())?;
             Ok(Some(model_value(model)))
         }
-        "compact" if !busy(worker) => {
-            Worker::submit(
-                worker,
-                args,
-                json!({"type":"compact","summary":null,"keep_turns":1}),
-            )?;
-            Ok(Some(json!({"disposition":"started"})))
-        }
         "edit_context" if !busy(worker) => {
             let target = request["target"]
                 .as_u64()
@@ -565,8 +595,18 @@ fn forward_event(
     busy: &mut bool,
     pending_abort: &mut Option<Value>,
     pending_bash: &mut Option<Value>,
+    pending_compact: &mut Option<Value>,
 ) -> Result<()> {
     match event["type"].as_str() {
+        Some("response") if event["command"] == "compact" => {
+            pending_compact.take();
+            *busy = false;
+            emit(event)?;
+            if let Some(request) = pending_abort.take() {
+                response(&request, Ok(None))?;
+            }
+            Ok(())
+        }
         Some("backend_ready" | "bash_execution_start") => Ok(()),
         Some("bash_execution_end") => {
             if let Some(request) = pending_bash.take() {
@@ -584,7 +624,7 @@ fn forward_event(
             emit(json!({"type":"agent_start"}))
         }
         Some("agent_settled") => {
-            *busy = false;
+            *busy = pending_compact.is_some();
             emit(json!({"type":"agent_end","success":event["success"]}))?;
             emit(json!({"type":"agent_settled"}))?;
             if let Some(request) = pending_abort.take() {
@@ -630,6 +670,33 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn compaction_stays_busy_until_its_completion_response() {
+        let mut busy = true;
+        let mut abort = None;
+        let mut bash = None;
+        let mut compact = Some(json!({"type":"compact","id":"focus"}));
+        forward_event(
+            json!({"type":"agent_settled","success":true}),
+            &mut busy,
+            &mut abort,
+            &mut bash,
+            &mut compact,
+        )
+        .unwrap();
+        assert!(busy);
+        assert!(compact.is_some());
+        abort = Some(json!({"type":"abort","id":"late-abort"}));
+        let response = json!({
+            "type": "response", "command": "compact", "id": "focus",
+            "success": true, "data": {"summary": "done"},
+        });
+        forward_event(response, &mut busy, &mut abort, &mut bash, &mut compact).unwrap();
+        assert!(!busy);
+        assert!(compact.is_none());
+        assert!(abort.is_none());
+    }
 
     #[test]
     fn native_session_commands_preserve_sources_and_restore_selection() {

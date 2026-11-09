@@ -1325,7 +1325,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             switch_session(args, view, path)?;
         }
         "/compact" => {
-            view.pending_request = Some(json!({"type":"compact","summary":null,"keep_turns":1}))
+            view.pending_request =
+                Some(json!({"type":"compact","summary":null,"keep_turns":1,"instructions":rest}))
         }
         "/mcp" => view.pending_request = Some(json!({"type":"mcp_status"})),
         "/trust" => {
