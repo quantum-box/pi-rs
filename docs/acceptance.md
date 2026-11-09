@@ -42,10 +42,10 @@ AIP の予算と作業状態には既存の SQLx 実装を使い、MCP は既存
 ## 既存 Workflow Goal からの起動（PLT-6382）
 
 隔離した AIP の評価構成では、既存 Workflow が Goal の実行権を取得してから Rust
-Harness を呼ぶ。選択結果は Goal セッションに記録する。AIP API は評価構成の
-設定がある場合に起動を拒否する。評価ストリームは Run の予算予約を使うため、
-運用への組込みには既存 Payment 原票、価格版、Field 配送を通る Gateway 接続が
-必要。共有の非公開永続ジャーナルと、認可済みツールプロファイルも必要。
+Harness を呼ぶ。選択結果は Goal セッションに記録する。AIP API はビルド機能と
+運用設定の両方を指定した評価 Run だけを対象にし、既存の Gateway Payment と
+料金方針を使う。共有の非公開永続ジャーナルが必要。外部ツールは別途、ホストの
+認可済みプロファイルに登録する。
 [実装と検証記録](https://github.com/quantum-box/tachyon-apps/commit/5b46814a3c64403d7f1bcccc2be3da39e6adb4b2)
 
 
@@ -89,3 +89,13 @@ Run 予算の精算は1件だった。通常の Workflow Goal 経路では、同
 回帰試験を含め MySQL の対象3件が通過した。料金表と受信先は試験用で、運用テナント
 の認可と実際の Field 側の受入検証は残っている。
 [SQL 原票と配送の結合試験](https://github.com/quantum-box/tachyon-apps/commit/12a554b4b47a3c02d5d525918e5495705bec7985)
+
+
+## AIP API での対象 Run の指定
+
+`pi-rs-evaluation` のビルド機能と明示的な評価設定を使い、テナント、Run、ステップ、
+実行ユーザー、モデルを照合する。モデル送信前には既存の AI プラン、Gateway の
+モデル認可、Run の予算予約と Payment の事前審査を通す。API の試験211件が通過し、
+評価機能を省いたビルドの確認も通過した。外部ツールの登録は空で、運用環境への
+適用と実際の Field での受入検証は残っている。
+[AIP API の接続と試験](https://github.com/quantum-box/tachyon-apps/commit/15123aa4c510a2274862859d44ad680d4705ab8e)
