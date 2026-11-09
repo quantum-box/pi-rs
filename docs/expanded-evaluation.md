@@ -35,9 +35,11 @@ Pi v1.5.0 `f9a26365568127461c47a07a37dcb42c140a3ac5`、Ollama v0.40.15、Qwen2.5
 ```sh
 # pi-rs
 node evaluation/aip-input.mjs > /tmp/pi-rs-aip-input.json
-# tachyon-apps の Rust Harness 評価対応ブランチ
+# tachyon-apps の PR #13288 のブランチ
 cargo run --locked -p aip-composition --features pi-rs-evaluation --example pi_rs_quality_gate -- /tmp/pi-rs-aip-input.json
 ```
+
+[AIP 評価例の実装](https://github.com/quantum-box/tachyon-apps/pull/13288)
 
 ## 拡張追加と復帰
 
