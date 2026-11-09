@@ -3,6 +3,12 @@
   "title": "Native Pi settings",
   "type": "object",
   "properties": {
+    "compaction": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
     "theme": {
       "type": "string"
     },

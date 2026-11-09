@@ -26,8 +26,16 @@ pub enum SessionEvent {
 pub struct SessionControl {
     input: mpsc::Sender<crate::AgentInput>,
     active: Arc<Mutex<Option<CancellationToken>>>,
+    auto_compaction: crate::AutoCompactionControl,
 }
 impl SessionControl {
+    pub fn set_auto_compaction_enabled(&self, enabled: bool) -> Result<()> {
+        if self.input.is_closed() {
+            return Err(Error::Config("session is closed".into()));
+        }
+        self.auto_compaction.set_enabled(enabled);
+        Ok(())
+    }
     pub async fn steer(&self, content: impl Into<String>) -> Result<Uuid> {
         self.enqueue(InputKind::Steer, content.into(), Vec::new())
             .await
@@ -182,6 +190,7 @@ impl SessionBuilder {
         }
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
+        let auto_compaction = session.auto_compaction_control();
         Ok(AgentSession {
             model: self.model,
             model_name: self.model_name,
@@ -194,6 +203,7 @@ impl SessionBuilder {
             control: SessionControl {
                 input: sender,
                 active: Arc::new(Mutex::new(None)),
+                auto_compaction,
             },
             closed: false,
         })
@@ -215,6 +225,9 @@ pub struct AgentSession {
     closed: bool,
 }
 impl AgentSession {
+    pub fn auto_compaction_enabled(&self) -> bool {
+        self.session.auto_compaction_control().enabled()
+    }
     pub fn controls(&self) -> SessionControl {
         self.control.clone()
     }
@@ -350,6 +363,9 @@ impl AgentSession {
             .model_selection()
             .map(|selection| selection.0)
             .unwrap_or_else(|| self.model_name.clone());
+        session
+            .auto_compaction_control()
+            .set_enabled(self.auto_compaction_enabled());
         let mut fork = SessionBuilder::new(self.model.clone(), model_name)
             .system_prompt(self.system_prompt.clone())
             .limits(self.limits.clone())
@@ -623,6 +639,26 @@ mod tests {
         assert_eq!(session.pending_inputs(), 0);
         assert!(session.messages().unwrap().is_empty());
         session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_controls_are_shared_with_the_run_but_isolated_on_fork() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        assert!(session.auto_compaction_enabled());
+        control.set_auto_compaction_enabled(false).unwrap();
+        assert!(!session.auto_compaction_enabled());
+        session.prompt("fork point").await.unwrap();
+        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        assert!(!fork.auto_compaction_enabled());
+        fork.controls().set_auto_compaction_enabled(true).unwrap();
+        assert!(fork.auto_compaction_enabled());
+        assert!(!session.auto_compaction_enabled());
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+        assert!(control.set_auto_compaction_enabled(true).is_err());
     }
 
     struct EchoModel(AtomicUsize);

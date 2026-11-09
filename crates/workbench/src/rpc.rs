@@ -159,6 +159,25 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
             continue;
         }
+        if request["type"] == "set_auto_compaction" {
+            let result = (|| {
+                let enabled = request["enabled"]
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("enabled must be a boolean".into()))?;
+                args.settings.set_auto_compaction_enabled(enabled)?;
+                Worker::control(
+                    &mut worker,
+                    &args,
+                    json!({
+                        "type":"set_auto_compaction", "enabled":enabled, "id":request.get("id"),
+                    }),
+                )
+            })();
+            if let Err(error) = result {
+                response(&request, Err(error))?;
+            }
+            continue;
+        }
         if request["type"] == "compact" {
             let result = (|| {
                 if busy(&worker) {
@@ -283,6 +302,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         "abort" | "abort_bash" => Ok(None),
         "get_state" => {
             let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing && !worker.compacting),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+            state["autoCompactionEnabled"] = json!(args.settings.auto_compaction_enabled());
             state["steeringMode"] = json!(
                 worker
                     .as_ref()

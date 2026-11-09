@@ -234,6 +234,7 @@ impl SessionStore for MemoryStore {
 }
 
 pub struct Session {
+    auto_compaction: crate::AutoCompactionControl,
     store: Box<dyn SessionStore>,
     records: Vec<Record>,
     head: u64,
@@ -242,6 +243,16 @@ pub struct Session {
 }
 
 impl Session {
+    /// Clone this control to change automatic compaction during an active run.
+    pub fn auto_compaction_control(&self) -> crate::AutoCompactionControl {
+        self.auto_compaction.clone()
+    }
+
+    /// Attach a host-owned control across successive openings of this session.
+    pub fn set_auto_compaction_control(&mut self, control: crate::AutoCompactionControl) {
+        self.auto_compaction = control;
+    }
+
     /// Hold an exclusive OS lock for the lifetime of the session.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::with_store(FileStore::open(path.as_ref())?)
@@ -256,6 +267,7 @@ impl Session {
         let records = store.load()?;
         let head = validated_head(&records)?;
         let mut session = Self {
+            auto_compaction: crate::AutoCompactionControl::default(),
             store: Box::new(store),
             records,
             head,

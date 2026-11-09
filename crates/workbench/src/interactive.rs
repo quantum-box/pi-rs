@@ -1748,6 +1748,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                         &mut args,
                                         &mut view,
                                         &mut theme,
+                                        &mut worker,
                                     )
                                 },
                             );
@@ -1796,7 +1797,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             view.picker = Some(picker);
                         }
                         Input::Select(selection) => {
-                            if let Err(error) = select(selection, &mut args, &mut view, &mut theme)
+                            if let Err(error) =
+                                select(selection, &mut args, &mut view, &mut theme, &mut worker)
                             {
                                 view.append(&error.to_string());
                             }
@@ -2031,6 +2033,20 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                         json!(args.thinking),
                                     ),
                                 },
+                                Item {
+                                    label: format!(
+                                        "Auto-compaction · {} (toggle)",
+                                        if args.settings.auto_compaction_enabled() {
+                                            "on"
+                                        } else {
+                                            "off"
+                                        },
+                                    ),
+                                    selection: Selection::Setting(
+                                        "autoCompactionEnabled".into(),
+                                        json!(!args.settings.auto_compaction_enabled()),
+                                    ),
+                                },
                             ];
                             for name in [
                                 "theme",
@@ -2260,7 +2276,13 @@ fn start_model_picker(args: &Cli, view: &mut View) {
     view.append("Loading available models…");
 }
 
-fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut Theme) -> Result<()> {
+fn select(
+    selection: Selection,
+    args: &mut Cli,
+    view: &mut View,
+    theme: &mut Theme,
+    worker: &mut Option<Worker>,
+) -> Result<()> {
     match selection {
         Selection::RenameSession(path, name) => {
             let mut session = Session::open(&path)?;
@@ -2370,7 +2392,17 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
             view.setting_editor = Some((key, dialog));
         }
         Selection::Setting(key, value) => {
-            if key == "theme" {
+            if key == "autoCompactionEnabled" {
+                let enabled = value
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("auto-compaction must be a boolean".into()))?;
+                args.settings.set_auto_compaction_enabled(enabled)?;
+                Worker::control(
+                    worker,
+                    args,
+                    json!({"type":"set_auto_compaction","enabled":enabled}),
+                )?;
+            } else if key == "theme" {
                 let next = Theme::load(
                     value
                         .as_str()

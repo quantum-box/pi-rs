@@ -798,6 +798,70 @@ async fn parallel_read_results_keep_their_original_call_ids() {
 }
 
 #[tokio::test]
+async fn automatic_compaction_can_be_disabled_and_reenabled_without_removing_the_context_limit() {
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let model = Script::new(vec![
+        answer(&"z".repeat(1500)),
+        answer("older facts"),
+        answer("continued"),
+    ]);
+    let registry = Registry::default();
+    let mut harness = agent(&model, &registry);
+    harness.limits.output_tokens_per_request = 768;
+    let (_, mut inputs) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    harness
+        .run(
+            &mut session,
+            Some("old question".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    harness.limits.context_window = Some(1350);
+    let control = session.auto_compaction_control();
+    control.set_enabled(false);
+    let result = harness
+        .run(
+            &mut session,
+            Some("This is the exact latest request.".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await;
+    assert!(
+        matches!(&result, Err(Error::Model(message)) if message.contains("automatic compaction is disabled")),
+        "{result:?}"
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert!(
+        !session
+            .records()
+            .iter()
+            .any(|record| matches!(record.event, Event::Compacted { .. }))
+    );
+    control.set_enabled(true);
+    harness
+        .run(&mut session, None, &mut inputs, &cancel, &mut ignore)
+        .await
+        .unwrap();
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].messages.contains(&Message::User {
+        content: "This is the exact latest request.".into()
+    }));
+    assert!(
+        session
+            .records()
+            .iter()
+            .any(|record| matches!(record.event, Event::Compacted { .. }))
+    );
+}
+
+#[tokio::test]
 async fn bounded_automatic_compaction_leaves_the_latest_input_unchanged() {
     let mut session = Session::with_store(MemoryStore::default()).unwrap();
     let model = Script::new(vec![

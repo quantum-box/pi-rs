@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -19,6 +19,30 @@ use crate::{
     Result, RunState, Session, ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, Usage,
     UsageReport,
 };
+
+/// Shared switch checked before each automatic context compaction.
+#[derive(Clone, Debug)]
+pub struct AutoCompactionControl(Arc<AtomicBool>);
+
+impl AutoCompactionControl {
+    pub fn new(enabled: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(enabled)))
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.0.store(enabled, Ordering::Release);
+    }
+}
+
+impl Default for AutoCompactionControl {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -330,6 +354,11 @@ impl Agent<'_> {
                         return Err(Error::Budget);
                     }
                     if self.exceeds_context(&request)? {
+                        if !session.auto_compaction_control().enabled() {
+                            return Err(Error::Model(
+                                "context does not fit and automatic compaction is disabled".into(),
+                            ));
+                        }
                         if compacted || request_index + 1 >= self.limits.model_requests {
                             return Err(Error::Model(
                                 "context does not fit after the bounded compaction attempt".into(),

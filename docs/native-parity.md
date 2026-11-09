@@ -37,7 +37,7 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `get_available_thinking_levels`, `switch_session`, `fork`, `clone`,
 `get_fork_messages`, `get_entries`, `get_tree`, `get_last_assistant_text`,
 `edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
-`set_follow_up_mode`, and `shutdown`. Responses carry the request ID and a
+`set_follow_up_mode`, `set_auto_compaction`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance is separate from completion; wait for
 `agent_settled`. The interface emits native journal events plus text updates.
 Additional Pi RPC commands and complete event-schema parity remain in progress.
@@ -1130,3 +1130,28 @@ responses and atomic checkpoints. Fullscreen and regular PTY checks exercised
 focused compaction and terminal restoration. The direct CLI path and existing
 RPC user-shell checks also passed. These checks do not cover the remaining
 automatic-compaction settings or full provider token accounting.
+
+
+### Live automatic-compaction control checkpoint
+
+`compaction.enabled` is loaded from user and trusted-project settings, defaults
+to true, and is reported by RPC `get_state` as `autoCompactionEnabled`.
+`set_auto_compaction` validates its boolean argument, preserves unrelated user
+settings and nested compaction fields, and updates the running worker without
+waiting for an active model call to finish. `/settings` exposes the same live
+switch. Changes persist across restarts.
+
+The core session exposes a shared `AutoCompactionControl`. Native SDK controls
+can change it while a run is active. Forked SDK sessions copy the current value
+into an independent switch. Existing `Limits` construction remains unchanged.
+Disabling automatic compaction preserves context-limit checks and manual
+summaries. Enabling it again permits the existing bounded automatic-summary
+path to proceed.
+
+Core and SDK regressions cover the context limit, recovery after re-enabling,
+cloned controls, fork isolation and closed-session handling. Loopback
+Ollama-adapter checks cover live RPC changes during a held model request,
+settings persistence, field preservation, validation and manual summaries.
+Both terminal layouts were exercised with a model request still running.
+Model-specific reserve/retention settings, automatic context-window discovery
+and broader provider recovery behavior remain open.

@@ -87,6 +87,35 @@ impl Settings {
     pub fn value(&self) -> &Value {
         &self.value
     }
+    pub fn auto_compaction_enabled(&self) -> bool {
+        self.value["compaction"]["enabled"]
+            .as_bool()
+            .unwrap_or(true)
+    }
+    pub fn set_auto_compaction_enabled(&mut self, enabled: bool) -> Result<()> {
+        let path = agent_dir().join("settings.json");
+        let update = |settings: &mut Map<String, Value>| -> Result<()> {
+            let compaction = settings
+                .entry("compaction")
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| Error::Config("compaction must be an object".into()))?;
+            compaction.insert("enabled".into(), Value::Bool(enabled));
+            Ok(())
+        };
+        update_object(&path, |settings| {
+            update(settings)?;
+            validate_settings(&Value::Object(settings.clone()), &path)
+        })?;
+        if !self.value.is_object() {
+            self.value = Value::Object(Map::new());
+        }
+        update(self.value.as_object_mut().expect("settings object"))?;
+        if let Some((_, layer)) = self.resource_layers.first_mut() {
+            update(layer.as_object_mut().expect("settings layer"))?;
+        }
+        Ok(())
+    }
     pub fn set_user(&mut self, key: &str, value: Value) -> Result<()> {
         let path = agent_dir().join("settings.json");
         std::fs::create_dir_all(path.parent().expect("agent directory"))?;
@@ -389,6 +418,8 @@ mod tests {
             json!({"codemode":{"mode":"invalid"}}),
             json!({"codemode":{"inlineBudget":-1}}),
             json!({"hideThinkingBlock":"false"}),
+            json!({"compaction": false}),
+            json!({"compaction": {"enabled": "false"}}),
             json!({"packages":[{"extensions":[]}]}),
             json!({"modelThinkingLevels":{"model":"unknown"}}),
             json!({"skills":[false]}),

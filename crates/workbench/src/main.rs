@@ -758,6 +758,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     }
     session.select_model(&args.model, args.thinking.as_deref())?;
     let runtime = runtime::configure(&args).await?;
+    session.set_auto_compaction_control(runtime.auto_compaction.clone());
     let result = async {
         if let Command::Run { prompt } = &mut command
             && let Some(expanded) = runtime.resources.expand(prompt)?
@@ -786,6 +787,7 @@ async fn execute(mut args: Cli) -> Result<()> {
             task,
         } => {
             let mut child = Session::open(child)?;
+            child.set_auto_compaction_control(runtime.auto_compaction.clone());
             let review = pi_rs_review::Review {
                 task: &task,
                 from_record,
