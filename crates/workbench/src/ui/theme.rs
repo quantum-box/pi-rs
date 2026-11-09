@@ -64,6 +64,38 @@ impl Theme {
             }
         }
     }
+    pub fn discover(extra: &[PathBuf], workspace: &Path, trusted: bool) -> Vec<String> {
+        let mut names = vec!["system".into(), "dark".into(), "light".into()];
+        let mut paths = extra.to_vec();
+        paths.push(crate::config::agent_dir().join("themes"));
+        if trusted {
+            paths.push(workspace.join(".pi/themes"));
+        }
+        for path in paths {
+            let files = if path.is_dir() {
+                std::fs::read_dir(path)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![path]
+            };
+            for file in files {
+                if let Ok(text) = std::fs::read_to_string(&file)
+                    && let Ok(theme) = Self::parse(&text, Some(file))
+                {
+                    names.push(theme.name);
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn parse(text: &str, path: Option<PathBuf>) -> Result<Self> {
         let value: Value = serde_json::from_str(text)?;
         let schema: Value = serde_json::from_str(include_str!("../../assets/theme.schema.json"))?;

@@ -20,6 +20,7 @@ mod config;
 mod interactive;
 mod process;
 mod rpc;
+mod sessions;
 mod ui;
 
 static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
@@ -35,6 +36,15 @@ struct Cli {
     /// Path to the private append-only session journal.
     #[arg(long, default_value_os_t = interactive::new_session_path())]
     session: PathBuf,
+    /// Resume a session file, or open the session selector when omitted.
+    #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["session", "continue_session", "no_session"])]
+    resume_session: Option<PathBuf>,
+    /// Name the current session.
+    #[arg(long, global = true)]
+    name: Option<String>,
+    /// Override the directory in which sessions are stored.
+    #[arg(long, global = true)]
+    session_dir: Option<PathBuf>,
     /// Continue the latest session for this working directory.
     #[arg(short = 'c', long = "continue", conflicts_with = "session")]
     continue_session: bool,
@@ -151,6 +161,29 @@ enum Command {
         record_id: u64,
     },
     Inspect,
+    Name {
+        name: String,
+    },
+    Label {
+        record_id: u64,
+        label: Option<String>,
+    },
+    Export {
+        path: PathBuf,
+    },
+    Import {
+        path: PathBuf,
+    },
+    #[command(name = "clone")]
+    CloneSession {
+        destination: Option<PathBuf>,
+    },
+    Fork {
+        record_id: u64,
+        destination: Option<PathBuf>,
+    },
+    Copy,
+    Share,
     Review {
         #[arg(long)]
         child: PathBuf,
@@ -208,6 +241,14 @@ async fn main() {
         if args.use_theme.is_none() {
             args.use_theme = args.settings.string("theme").map(str::to_owned);
         }
+        if args.session_dir.is_none() {
+            args.session_dir = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
+                .map(PathBuf::from)
+                .or_else(|| args.settings.string("sessionDir").map(PathBuf::from));
+        }
+        if matches.value_source("session") != Some(clap::parser::ValueSource::CommandLine) {
+            args.session = interactive::session_path(&args.workspace, args.session_dir.as_deref());
+        }
         execute(args).await
     }
     .await;
@@ -222,6 +263,16 @@ async fn main() {
 }
 
 async fn execute(mut args: Cli) -> Result<()> {
+    if let Some(path) = args
+        .resume_session
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        if !path.is_file() {
+            return Err(Error::Config("session file not found".into()));
+        }
+        args.session = path.clone();
+    }
     let temporary = args.no_session.then(tempfile::tempdir).transpose()?;
     if let Some(directory) = &temporary {
         args.session = directory.path().join("session.jsonl");
@@ -266,13 +317,86 @@ async fn execute(mut args: Cli) -> Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
+    if let Command::Import { path } = &command {
+        sessions::import(path, &args.session)?;
+        output(json!({"type":"imported","path":args.session}));
+        return Ok(());
+    }
     let mut session = Session::open(&args.session)?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),
         ));
     }
+    let requested_workspace = args.workspace.clone();
+    if let Some(cwd) = session.working_directory() {
+        args.workspace = PathBuf::from(cwd);
+        if !args.workspace.is_dir() {
+            return Err(Error::Config(
+                "session working directory no longer exists".into(),
+            ));
+        }
+    } else if !matches!(
+        command,
+        Command::Inspect
+            | Command::Export { .. }
+            | Command::CloneSession { .. }
+            | Command::Fork { .. }
+            | Command::Copy
+            | Command::Share
+    ) {
+        session.set_working_directory(&args.workspace)?;
+    }
+    if let Some(name) = &args.name {
+        session.set_name(name)?;
+    }
+    if matches!(command, Command::Fork { .. }) {
+        args.workspace = requested_workspace;
+    }
+    let fork_target = match &command {
+        Command::Fork { record_id, .. } => *record_id,
+        _ => session.head(),
+    };
     match command {
+        Command::Name { name } => {
+            session.set_name(&name)?;
+            output(json!({"type":"session_name","name":session.name()}));
+            return Ok(());
+        }
+        Command::Label { record_id, label } => {
+            session.set_label(record_id, label)?;
+            output(json!({"type":"labels","labels":session.labels()}));
+            return Ok(());
+        }
+        Command::Export { path } => {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                args.workspace.join(path)
+            };
+            sessions::export(&session, &path)?;
+            output(json!({"type":"exported","path":path}));
+            return Ok(());
+        }
+        Command::CloneSession { destination } | Command::Fork { destination, .. } => {
+            let target = fork_target;
+            let destination = destination.unwrap_or_else(|| {
+                interactive::session_path(&args.workspace, args.session_dir.as_deref())
+            });
+            sessions::fork(&session, target, &destination, &args.workspace)?;
+            output(json!({"type":"forked","path":destination}));
+            return Ok(());
+        }
+        Command::Copy => {
+            sessions::copy_last(&session)?;
+            output(json!({"type":"copied"}));
+            return Ok(());
+        }
+        Command::Share => {
+            let url = sessions::share_gist(&session)?;
+            output(json!({"type":"shared","url":url}));
+            return Ok(());
+        }
         Command::Inspect => {
             for record in session.records() {
                 output(if args.trace {
@@ -563,6 +687,8 @@ fn output(event: Value) {
 fn metadata(record: &pi_rs::Record) -> Value {
     let mut value = match &record.event {
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),
+        Event::SessionInfo { name, cwd } => json!({"event":"session_info","name":name,"cwd":cwd}),
+        Event::Label { target, label } => json!({"event":"label","target":target,"label":label}),
         Event::HostBound { .. } => json!({"event": "host_bound"}),
         Event::HostRunBound { run_id, .. } => {
             json!({"event": "host_run_bound", "bound_run_id": run_id})

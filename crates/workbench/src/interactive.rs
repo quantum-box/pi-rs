@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::ui::{
     editor::Editor,
     keys::Keys,
+    picker::{Input, Item, Picker, Selection},
     render::{Entry, Line},
     theme::Theme,
 };
@@ -22,15 +23,27 @@ use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Cli, process::Worker};
+use super::{Cli, process::Worker, sessions};
 
 pub(super) fn new_session_path() -> PathBuf {
-    let home = crate::config::agent_dir();
-    // Group local sessions without including the working directory in filenames.
-    let workspace = std::env::current_dir().unwrap_or_default();
+    session_path(&std::env::current_dir().unwrap_or_default(), None)
+}
+
+pub(super) fn session_path(
+    workspace: &std::path::Path,
+    directory: Option<&std::path::Path>,
+) -> PathBuf {
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.into());
     let hash = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
-    home.join("sessions")
-        .join(format!("{hash:x}"))
+    directory
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            crate::config::agent_dir()
+                .join("sessions")
+                .join(format!("{hash:x}"))
+        })
         .join(format!("{}.jsonl", uuid::Uuid::new_v4()))
 }
 
@@ -90,6 +103,9 @@ impl Drop for Terminal {
 #[derive(Default)]
 struct View {
     lines: Vec<Entry>,
+    picker: Option<Picker>,
+    session_name: Option<String>,
+    model_list: Option<std::sync::mpsc::Receiver<Result<Vec<String>>>>,
     thinking: String,
     expand_tools: bool,
     hide_thinking: bool,
@@ -116,6 +132,7 @@ impl View {
                 "a managed session must be opened by its host".into(),
             ));
         }
+        self.session_name = session.name().map(str::to_owned);
         self.lines.clear();
         self.streaming.clear();
         self.thinking.clear();
@@ -302,6 +319,9 @@ impl View {
             lines
                 .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
         }
+        if let Some(picker) = &self.picker {
+            lines = picker.render(theme, body_height);
+        }
         let end = lines
             .len()
             .saturating_sub(self.scroll.min(lines.len().saturating_sub(body_height)));
@@ -324,7 +344,11 @@ impl View {
         };
         queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
         Line::plain(
-            &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "pi v{} · {} · /help",
+                env!("CARGO_PKG_VERSION"),
+                self.session_name.as_deref().unwrap_or("new session")
+            ),
             theme.color("accent"),
         )
         .draw(&mut out, width)?;
@@ -386,29 +410,173 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
     let rest = rest.trim();
     match name {
         "/help" | "/hotkeys" => view.append(HELP),
-        "/session" => view.append(&format!("Session › {}", args.session.display())),
-        "/model" if rest.is_empty() => view.append(&format!("Model › {}", args.model)),
+        "/session" => {
+            let session = Session::open(&args.session)?;
+            view.append(&serde_json::to_string_pretty(&sessions::summary(
+                &args.session,
+                &session,
+            ))?);
+        }
+        "/name" => {
+            let mut session = Session::open(&args.session)?;
+            if !rest.is_empty() {
+                session.set_name(rest)?;
+            }
+            view.session_name = session.name().map(str::to_owned);
+            view.append(session.name().unwrap_or("Unnamed session"));
+        }
+        "/label" => {
+            let (id, label) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let mut session = Session::open(&args.session)?;
+            let target = id
+                .parse()
+                .map_err(|_| Error::Config("use /label <record-id> [label]".into()))?;
+            session.set_label(target, (!label.is_empty()).then(|| label.into()))?;
+            view.append("Label saved");
+        }
+        "/fork" if rest.is_empty() => {
+            let session = Session::open(&args.session)?;
+            let items = session
+                .branch()
+                .iter()
+                .filter_map(|record| match &record.event {
+                    pi_rs::Event::User { content, .. } => Some(Item {
+                        label: format!(
+                            "{} {}",
+                            record.id,
+                            content.chars().take(90).collect::<String>()
+                        ),
+                        selection: Selection::Fork(record.id),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            view.picker = Some(Picker::new("Fork from user message", items));
+        }
+        "/clone" | "/fork" => {
+            let session = Session::open(&args.session)?;
+            let (target, input) = if name == "/fork" {
+                let target = rest
+                    .parse::<u64>()
+                    .ok()
+                    .or_else(|| {
+                        session.branch().iter().rev().find_map(|record| {
+                            matches!(record.event, pi_rs::Event::User { .. }).then_some(record.id)
+                        })
+                    })
+                    .ok_or_else(|| {
+                        Error::Config("no user message to fork; use /fork <user-record-id>".into())
+                    })?;
+                let record = session
+                    .records()
+                    .iter()
+                    .find(|record| record.id == target)
+                    .ok_or_else(|| Error::Config("invalid fork record".into()))?;
+                let pi_rs::Event::User { content, .. } = &record.event else {
+                    return Err(Error::Config("fork must select a user message".into()));
+                };
+                (record.parent.unwrap_or(1), Some(content.clone()))
+            } else {
+                (session.head(), None)
+            };
+            let destination = session_path(&args.workspace, args.session_dir.as_deref());
+            sessions::fork(&session, target, &destination, &args.workspace)?;
+            drop(session);
+            args.session = destination;
+            view.restore(args)?;
+            if let Some(input) = input {
+                view.editor.replace(input);
+            }
+        }
+        "/export" => {
+            let destination = if rest.is_empty() {
+                args.workspace
+                    .join(format!("pi-session-{}.html", uuid::Uuid::new_v4()))
+            } else {
+                let path = PathBuf::from(rest);
+                if path.is_absolute() {
+                    path
+                } else {
+                    args.workspace.join(path)
+                }
+            };
+            let session = Session::open(&args.session)?;
+            sessions::export(&session, &destination)?;
+            view.append(&format!("Exported {}", destination.display()));
+        }
+        "/import" => {
+            let destination = session_path(&args.workspace, args.session_dir.as_deref());
+            let source = std::path::Path::new(rest);
+            let source = if source.is_absolute() {
+                source.into()
+            } else {
+                args.workspace.join(source)
+            };
+            sessions::import(&source, &destination)?;
+            args.session = destination;
+            restore_workspace(args)?;
+            view.restore(args)?;
+        }
+        "/copy" => {
+            sessions::copy_last(&Session::open(&args.session)?)?;
+            view.append("Copied last response");
+        }
+        "/share" => view.append(&sessions::share_gist(&Session::open(&args.session)?)?),
+        "/model" if rest.is_empty() => start_model_picker(args, view),
         "/model" => {
             args.model = rest.to_owned();
             view.append(&format!("Model › {rest}"));
         }
         "/new" => {
-            args.session = new_session_path();
+            args.session = session_path(&args.workspace, args.session_dir.as_deref());
+            initialize_session(args)?;
             view.restore(args)?;
         }
         "/resume" if rest.is_empty() => {
+            let mut items = Vec::new();
             if let Some(parent) = args.session.parent() {
                 let mut entries = std::fs::read_dir(parent)?
                     .filter_map(|entry| entry.ok())
-                    .map(|entry| entry.path())
-                    .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
                     .collect::<Vec<_>>();
-                entries.sort();
-                for path in entries {
-                    view.append(&path.display().to_string());
+                entries.sort_by_key(|entry| {
+                    std::cmp::Reverse(
+                        entry
+                            .metadata()
+                            .and_then(|metadata| metadata.modified())
+                            .ok(),
+                    )
+                });
+                for entry in entries {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "jsonl")
+                        && let Ok(session) = Session::open(&path)
+                    {
+                        let title = session
+                            .name()
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                session
+                                    .branch()
+                                    .iter()
+                                    .find_map(|record| match &record.event {
+                                        pi_rs::Event::User { content, .. } => {
+                                            Some(content.chars().take(70).collect())
+                                        }
+                                        _ => None,
+                                    })
+                            })
+                            .unwrap_or_else(|| "Empty session".into());
+                        items.push(Item {
+                            label: format!(
+                                "{title} · {}",
+                                path.file_stem().unwrap_or_default().to_string_lossy()
+                            ),
+                            selection: Selection::Resume(path),
+                        });
+                    }
                 }
             }
-            view.append("Use /resume <path> to open a session.");
+            view.picker = Some(Picker::new("Resume session", items));
         }
         "/resume" => {
             let path = PathBuf::from(rest);
@@ -416,8 +584,10 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 return Err(Error::Config("session file not found".into()));
             }
             let prior = std::mem::replace(&mut args.session, path);
-            if let Err(error) = view.restore(args) {
+            let prior_workspace = args.workspace.clone();
+            if let Err(error) = restore_workspace(args).and_then(|()| view.restore(args)) {
                 args.session = prior;
+                args.workspace = prior_workspace;
                 return Err(error);
             }
         }
@@ -469,16 +639,35 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         }
         "/tree" => {
             let session = Session::open(&args.session)?;
-            for record in session.records() {
-                view.append(&format!(
-                    "{} ← {:?}  {}",
-                    record.id,
-                    record.parent,
-                    super::metadata(record)["event"]
-                        .as_str()
-                        .unwrap_or("record")
-                ));
-            }
+            let labels = session.labels();
+            let items = session
+                .records()
+                .iter()
+                .filter(|record| !matches!(record.event, pi_rs::Event::Checkout { .. }))
+                .map(|record| {
+                    let description = match &record.event {
+                        pi_rs::Event::User { content, .. }
+                        | pi_rs::Event::Assistant { content, .. } => {
+                            content.chars().take(70).collect::<String>()
+                        }
+                        _ => super::metadata(record)["event"]
+                            .as_str()
+                            .unwrap_or("record")
+                            .into(),
+                    };
+                    Item {
+                        label: format!(
+                            "{} ← {:?} {} {}",
+                            record.id,
+                            record.parent,
+                            labels.get(&record.id).map(String::as_str).unwrap_or(""),
+                            description
+                        ),
+                        selection: Selection::Checkout(record.id),
+                    }
+                })
+                .collect();
+            view.picker = Some(Picker::new("Session tree", items));
         }
         "/checkout" => {
             let id = rest
@@ -513,6 +702,8 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
+    initialize_session(&args)?;
+    restore_workspace(&mut args)?;
     let mut theme = Theme::load(
         args.use_theme.as_deref().unwrap_or("system"),
         &args.themes,
@@ -525,12 +716,46 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         ..View::default()
     };
     view.restore(&args)?;
+    if args
+        .resume_session
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        slash("/resume", &mut args, &mut view)?;
+    }
     let mut keys = Keys::load()?;
     let _terminal = Terminal::enter()?;
     let mut worker: Option<Worker> = None;
     let mut dirty = true;
     let mut last_frame = Instant::now();
     loop {
+        if let Some(receiver) = &view.model_list {
+            match receiver.try_recv() {
+                Ok(Ok(models)) => {
+                    view.model_list = None;
+                    view.picker = Some(Picker::new(
+                        "Select model",
+                        models
+                            .into_iter()
+                            .map(|model| Item {
+                                label: model.clone(),
+                                selection: Selection::Model(model),
+                            })
+                            .collect(),
+                    ));
+                    dirty = true;
+                }
+                Ok(Err(error)) => {
+                    view.model_list = None;
+                    view.append(&error.to_string());
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    view.model_list = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(active) = &mut worker {
             if view.request_started.is_none() {
                 view.request_started = Some(Instant::now());
@@ -581,6 +806,19 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
+                if let Some(mut picker) = view.picker.take() {
+                    match picker.input(key) {
+                        Input::Continue => view.picker = Some(picker),
+                        Input::Cancel => {}
+                        Input::Select(selection) => {
+                            if let Err(error) = select(selection, &mut args, &mut view, &mut theme)
+                            {
+                                view.append(&error.to_string());
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let action = keys.action(key, view.editor.text.is_empty()).unwrap_or("");
                 if view.editor.action(action) {
                     continue;
@@ -609,9 +847,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         }
                     }
                     "tui.input.tab" => complete_input(&args, &mut view),
-                    "app.model.select" => {
-                        view.editor.replace("/model ".into());
-                    }
+                    "app.model.select" if worker.is_none() => start_model_picker(&args, &mut view),
                     "tui.input.submit" | "app.message.followUp" => {
                         let input = view.editor.take();
                         if input.trim().is_empty() {
@@ -633,14 +869,28 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                                 view.append(&error.to_string());
                             }
                         } else if input.trim() == "/theme" {
-                            view.append(&format!(
-                                "Theme › {}{} · /theme <name>",
-                                theme.name,
+                            let names = Theme::discover(
+                                &args.themes,
+                                &args.workspace,
+                                args.project.is_some(),
+                            );
+                            let title = format!(
+                                "Select theme · {}",
                                 theme
                                     .path
                                     .as_ref()
-                                    .map(|path| format!(" ({})", path.display()))
-                                    .unwrap_or_default()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_else(|| theme.name.clone())
+                            );
+                            view.picker = Some(Picker::new(
+                                &title,
+                                names
+                                    .into_iter()
+                                    .map(|name| Item {
+                                        label: name.clone(),
+                                        selection: Selection::Theme(name),
+                                    })
+                                    .collect(),
                             ));
                         } else if let Some(name) = input.strip_prefix("/theme ") {
                             match Theme::load(
@@ -728,6 +978,93 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         }
     }
     drop(worker);
+    Ok(())
+}
+
+fn start_model_picker(args: &Cli, view: &mut View) {
+    if view.model_list.is_some() {
+        return;
+    }
+    let endpoint = args.endpoint.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let provider =
+                pi_rs::ollama::Ollama::new(&endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?;
+            runtime.block_on(provider.models())
+        })();
+        let _ = sender.send(result);
+    });
+    view.model_list = Some(receiver);
+    view.append("Loading available models…");
+}
+
+fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut Theme) -> Result<()> {
+    match selection {
+        Selection::Resume(path) => {
+            slash(&format!("/resume {}", path.display()), args, view)?;
+        }
+        Selection::Checkout(id) => {
+            let mut session = Session::open(&args.session)?;
+            let record = &session.records()[id as usize - 1];
+            let (target, input) = match &record.event {
+                pi_rs::Event::User { content, .. } => {
+                    (record.parent.unwrap_or(1), Some(content.clone()))
+                }
+                _ => (id, None),
+            };
+            session.checkout(target)?;
+            drop(session);
+            view.restore(args)?;
+            if let Some(input) = input {
+                view.editor.replace(input);
+            }
+        }
+        Selection::Fork(id) => {
+            slash(&format!("/fork {id}"), args, view)?;
+        }
+        Selection::Model(model) => {
+            args.model = model;
+        }
+        Selection::Theme(name) => {
+            let next = Theme::load(&name, &args.themes, &args.workspace, args.project.is_some())?;
+            args.settings.set_user("theme", json!(name))?;
+            args.use_theme = Some(name);
+            *theme = next;
+        }
+    }
+    Ok(())
+}
+
+fn initialize_session(args: &Cli) -> Result<()> {
+    let mut session = Session::open(&args.session)?;
+    if session.host_binding().is_some() {
+        return Err(Error::Session(
+            "a managed session must be opened by its host".into(),
+        ));
+    }
+    if session.working_directory().is_none() {
+        session.set_working_directory(&args.workspace)?;
+    }
+    if let Some(name) = &args.name {
+        session.set_name(name)?;
+    }
+    Ok(())
+}
+fn restore_workspace(args: &mut Cli) -> Result<()> {
+    let session = Session::open(&args.session)?;
+    if let Some(cwd) = session.working_directory() {
+        let path = PathBuf::from(cwd);
+        if !path.is_dir() {
+            return Err(Error::Config(
+                "session working directory no longer exists".into(),
+            ));
+        }
+        args.workspace = path;
+    }
     Ok(())
 }
 

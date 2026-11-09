@@ -96,6 +96,56 @@ impl Ollama {
         self
     }
 
+    /// Discover models from the configured OpenAI-compatible endpoint.
+    pub async fn models(&self) -> Result<Vec<String>> {
+        let mut endpoint = self.endpoint.clone();
+        let path = endpoint
+            .path()
+            .strip_suffix("chat/completions")
+            .ok_or_else(|| {
+                Error::Config("model discovery requires a chat/completions endpoint".into())
+            })?;
+        let path = format!("{path}models");
+        endpoint.set_path(&path);
+        let mut request = self.client.get(endpoint).timeout(Duration::from_secs(10));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let mut response = request
+            .send()
+            .await
+            .map_err(|_| Error::Model("model discovery request failed".into()))?;
+        if !response.status().is_success() {
+            return Err(Error::Model(format!(
+                "model discovery returned HTTP {}",
+                response.status()
+            )));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| Error::Model("model discovery response interrupted".into()))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 4 * 1024 * 1024 {
+                return Err(Error::Model("model list exceeds size limit".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let response: Value = serde_json::from_slice(&bytes)?;
+        let models = response["data"]
+            .as_array()
+            .ok_or_else(|| Error::Model("invalid model list".into()))?;
+        let mut models: Vec<_> = models
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .map(str::to_owned)
+            .collect();
+        models.sort();
+        models.dedup();
+        Ok(models)
+    }
+
     async fn model_loaded(&self, model: &str) -> Option<bool> {
         let mut endpoint = self.endpoint.clone();
         endpoint.set_path("/api/ps");

@@ -42,6 +42,15 @@ pub enum Event {
     Created {
         session_id: Uuid,
     },
+    /// Presentation metadata does not enter model context.
+    SessionInfo {
+        name: Option<String>,
+        cwd: Option<String>,
+    },
+    Label {
+        target: u64,
+        label: Option<String>,
+    },
     HostBound {
         scope_digest: String,
     },
@@ -323,6 +332,118 @@ impl Session {
             }
         }
         result
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::SessionInfo {
+                    name: Some(name), ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .filter(|name| !name.is_empty())
+    }
+
+    pub fn working_directory(&self) -> Option<&str> {
+        self.records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::SessionInfo { cwd: Some(cwd), .. } => Some(cwd.as_str()),
+                _ => None,
+            })
+    }
+
+    pub fn set_name(&mut self, name: &str) -> Result<()> {
+        self.append(Event::SessionInfo {
+            name: Some(name.trim().into()),
+            cwd: None,
+        })?;
+        Ok(())
+    }
+
+    pub fn set_working_directory(&mut self, path: &Path) -> Result<()> {
+        let cwd = path.canonicalize()?.to_string_lossy().into_owned();
+        self.append(Event::SessionInfo {
+            name: None,
+            cwd: Some(cwd),
+        })?;
+        Ok(())
+    }
+
+    pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
+        if target == 0 || target > self.records.len() as u64 {
+            return Err(Error::Session("invalid label target".into()));
+        }
+        self.append(Event::Label { target, label })?;
+        Ok(())
+    }
+
+    pub fn labels(&self) -> BTreeMap<u64, String> {
+        let mut labels = BTreeMap::new();
+        for record in &self.records {
+            if let Event::Label { target, label } = &record.event {
+                if let Some(label) = label {
+                    labels.insert(*target, label.clone());
+                } else {
+                    labels.remove(target);
+                }
+            }
+        }
+        labels
+    }
+
+    /// Export one settled branch with fresh session identity and remapped record references.
+    pub fn fork_records(&self, target: u64) -> Result<Vec<Record>> {
+        if self.host_binding().is_some() {
+            return Err(Error::Session(
+                "managed sessions must be forked by their host".into(),
+            ));
+        }
+        self.conversation_at(target)?;
+        let branch = self.path(target);
+        let ids: BTreeMap<_, _> = branch
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (record.id, index as u64 + 1))
+            .collect();
+        let mut records = Vec::new();
+        for record in branch {
+            let mut record = record.clone();
+            record.id = ids[&record.id];
+            record.parent = record.parent.and_then(|parent| ids.get(&parent).copied());
+            match &mut record.event {
+                Event::Created { session_id } => *session_id = Uuid::new_v4(),
+                Event::ModelRequested { context_head, .. } => {
+                    *context_head = context_head.and_then(|id| ids.get(&id).copied());
+                }
+                Event::TurnFinished { assistant_record } => {
+                    *assistant_record = *ids
+                        .get(assistant_record)
+                        .ok_or_else(|| Error::Session("missing fork response".into()))?;
+                }
+                Event::Compacted { retain_from, .. } => {
+                    *retain_from = retain_from.and_then(|id| ids.get(&id).copied());
+                }
+                Event::Label { target, .. } => {
+                    if let Some(id) = ids.get(target) {
+                        *target = *id;
+                    } else {
+                        record.event = Event::SessionInfo {
+                            name: None,
+                            cwd: None,
+                        };
+                    }
+                }
+                _ => {}
+            }
+            records.push(record);
+        }
+        validated_head(&records)?;
+        Ok(records)
     }
 
     /// Fork from an existing record. The abandoned branch stays available by ID.
@@ -627,4 +748,74 @@ pub(crate) fn conversation(
         }
     }
     messages
+}
+
+#[cfg(test)]
+mod session_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn fork_remaps_branch_references_and_keeps_the_original_tree() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "question".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::TurnFinished {
+                assistant_record: 3,
+            })
+            .unwrap();
+        session.checkout(2).unwrap();
+        session
+            .append(Event::Assistant {
+                content: "new answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::TurnFinished {
+                assistant_record: 6,
+            })
+            .unwrap();
+        session.set_label(6, Some("chosen".into())).unwrap();
+        session.set_name("experiment").unwrap();
+        let source_records = session.records().len();
+        let records = session.fork_records(session.head()).unwrap();
+        let fork = Session::with_store(MemoryStore { records }).unwrap();
+        assert_ne!(fork.session_id(), session.session_id());
+        assert_eq!(fork.name(), Some("experiment"));
+        assert_eq!(fork.labels().get(&3).map(String::as_str), Some("chosen"));
+        assert!(matches!(
+            fork.records()[3].event,
+            Event::TurnFinished {
+                assistant_record: 3
+            }
+        ));
+        assert_eq!(
+            fork.conversation_at(fork.head()).unwrap(),
+            session.conversation_at(session.head()).unwrap()
+        );
+        assert_eq!(session.records().len(), source_records);
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Assistant { content, .. } if content == "old answer")));
+    }
+
+    #[test]
+    fn host_bound_sessions_cannot_be_forked_as_local_sessions() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.bind_host("tenant-scope").unwrap();
+        assert!(session.fork_records(session.head()).is_err());
+    }
 }

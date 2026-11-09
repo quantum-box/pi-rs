@@ -6,7 +6,7 @@ use std::time::Duration;
 use pi_rs::{Error, Result, Session};
 use serde_json::{Value, json};
 
-use super::{Cli, interactive, process::Worker};
+use super::{Cli, interactive, process::Worker, sessions};
 
 pub(super) fn run(mut args: Cli) -> Result<()> {
     if args.command.is_some() || !args.prompt.is_empty() {
@@ -147,12 +147,13 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 args.session
                     .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
             } else {
-                interactive::new_session_path()
+                interactive::session_path(&args.workspace, args.session_dir.as_deref())
             };
             if let Some(parent) = args.session.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            drop(Session::open(&args.session)?);
+            let mut session = Session::open(&args.session)?;
+            session.set_working_directory(&args.workspace)?;
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" if worker.is_none() => {
@@ -167,10 +168,29 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             *worker = Some(Worker::start(args, &["compact"])?);
             Ok(Some(json!({"disposition":"started"})))
         }
+        "set_session_name" if worker.is_none() => {
+            let name = request["name"]
+                .as_str()
+                .ok_or_else(|| Error::Config("name is required".into()))?;
+            Session::open(&args.session)?.set_name(name)?;
+            Ok(None)
+        }
+        "export_html" if worker.is_none() => {
+            let path = request["outputPath"]
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    args.workspace
+                        .join(format!("pi-session-{}.html", uuid::Uuid::new_v4()))
+                });
+            sessions::export(&Session::open(&args.session)?, &path)?;
+            Ok(Some(json!({"path":path})))
+        }
         "get_session_stats" if worker.is_none() => {
             let session = Session::open(&args.session)?;
+            let stats = sessions::summary(&args.session, &session);
             Ok(Some(
-                json!({"sessionId":session.session_id(),"sessionFile":args.session,"totalMessages":session.conversation_at(session.head())?.len()}),
+                json!({"sessionId":session.session_id(),"sessionFile":args.session,"sessionName":session.name(),"totalMessages":stats.messages,"tokens":{"input":stats.input_tokens,"output":stats.output_tokens,"total":stats.input_tokens.saturating_add(stats.output_tokens)}}),
             ))
         }
         _ => Err(Error::Config(format!(
