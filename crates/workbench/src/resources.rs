@@ -76,10 +76,7 @@ impl Resources {
         let explicit_skills: Vec<_> = args
             .skill
             .iter()
-            .filter_map(|path| {
-                let path = resource_path(&workspace, path);
-                (args.project.is_none() || path.exists()).then_some(path)
-            })
+            .filter_map(|path| resource_paths::skill_path(args, path))
             .collect();
         let transient = super::packages::transient_resources(args)?;
         let explicit_skills: Vec<_> = explicit_skills

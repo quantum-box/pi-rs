@@ -125,7 +125,7 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         {
             extensions.push(Arc::new(ProjectInstructions {
                 resources: ProjectResources::open(&args.workspace, args.workspace.join(project))?,
-                skills: args.skill.clone(),
+                skills: args.skill.iter().filter(|value| super::resource_paths::skill_path(args, value).is_none()).cloned().collect(),
             }));
         }
         if !args.no_extensions {

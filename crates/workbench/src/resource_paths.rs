@@ -52,6 +52,18 @@ fn executable(path: &Path) -> bool {
         path.extension().is_some_and(|extension| extension == "exe")
     }
 }
+fn has_pattern(value: &str) -> bool {
+    value.contains(['*', '?', '[', '{'])
+}
+pub fn skill_path(args: &Cli, value: &str) -> Option<PathBuf> {
+    let workspace = args
+        .workspace
+        .canonicalize()
+        .unwrap_or_else(|_| args.workspace.clone());
+    let path = absolute(&workspace, value);
+    (args.project.is_none() || path.exists() || has_pattern(value) || value.contains(['/', '\\']))
+        .then_some(path)
+}
 pub fn named_extension(value: &str) -> bool {
     value.starts_with("builtin:") || matches!(value, "notes" | "todo")
 }
@@ -94,7 +106,7 @@ pub fn resolve(
     for path in explicit {
         append(
             &mut paths,
-            collect(
+            expand(
                 &absolute(&workspace, &path.to_string_lossy()),
                 kind,
                 true,
@@ -127,20 +139,20 @@ pub fn resolve(
         packages::validate_patterns(&entries)?;
         let patterns: Vec<_> = entries
             .iter()
-            .filter(|entry| entry.starts_with(['+', '-', '!']) || entry.contains(['*', '?']))
+            .filter(|entry| entry.starts_with(['+', '-', '!']))
             .cloned()
             .collect();
         let mut configured = Vec::new();
         for entry in entries
             .iter()
-            .filter(|entry| !entry.starts_with(['+', '-', '!']) && !entry.contains(['*', '?']))
+            .filter(|entry| !entry.starts_with(['+', '-', '!']))
         {
             let path = absolute(&base, entry);
-            if !path.exists() {
+            let found = expand(&path, kind, false, warnings)?;
+            if found.is_empty() && !path.exists() {
                 warnings.push(format!("Resource {} was not found", path.display()));
-                continue;
             }
-            append(&mut configured, collect(&path, kind, false, warnings)?);
+            append(&mut configured, found);
         }
         if !patterns.is_empty() {
             configured.retain(|path| packages::selected(path, &base, &patterns));
@@ -213,11 +225,51 @@ fn absolute(base: &Path, value: &str) -> PathBuf {
         base.join(path)
     }
 }
+fn expand(
+    path: &Path,
+    kind: Kind,
+    required: bool,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<PathBuf>> {
+    if path.exists() || !has_pattern(&path.to_string_lossy()) {
+        return collect(path, kind, required, warnings);
+    }
+    let pattern = path.to_string_lossy().replace('\\', "/");
+    let matcher = globset::GlobBuilder::new(&pattern)
+        .literal_separator(true)
+        .backslash_escape(false)
+        .build()
+        .map_err(|error| Error::Config(format!("invalid resource pattern {pattern:?}: {error}")))?
+        .compile_matcher();
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        if has_pattern(&component.as_os_str().to_string_lossy()) {
+            break;
+        }
+        root.push(component);
+    }
+    let found = collect_matching(&root, kind, false, warnings, Some(&matcher))?;
+    if required && found.is_empty() {
+        return Err(Error::Config(format!(
+            "Resource pattern {pattern:?} matched no files"
+        )));
+    }
+    Ok(found)
+}
 fn collect(
     path: &Path,
     kind: Kind,
     required: bool,
     warnings: &mut Vec<String>,
+) -> Result<Vec<PathBuf>> {
+    collect_matching(path, kind, required, warnings, None)
+}
+fn collect_matching(
+    path: &Path,
+    kind: Kind,
+    required: bool,
+    warnings: &mut Vec<String>,
+    matcher: Option<&globset::GlobMatcher>,
 ) -> Result<Vec<PathBuf>> {
     if path.is_file() {
         return Ok(vec![path.canonicalize()?]);
@@ -253,11 +305,68 @@ fn collect(
                 continue;
             }
         };
-        if entry.file_type().is_some_and(|kind| kind.is_file()) && kind.accepts(entry.path()) {
+        if entry.file_type().is_some_and(|kind| kind.is_file())
+            && kind.accepts(entry.path())
+            && matcher.is_none_or(|matcher| {
+                entry
+                    .path()
+                    .ancestors()
+                    .take_while(|ancestor| ancestor.starts_with(path))
+                    .any(|candidate| {
+                        matcher.is_match(candidate.to_string_lossy().replace('\\', "/"))
+                    })
+            })
+        {
             files.push(entry.path().canonicalize()?);
         }
     }
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::*;
+    #[test]
+    fn resource_globs_expand_files_directories_and_literal_metacharacters() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a/nested")).unwrap();
+        std::fs::create_dir_all(root.path().join("b")).unwrap();
+        for path in ["a/one.md", "a/nested/deep.md", "b/two.md", "[literal].md"] {
+            std::fs::write(root.path().join(path), "text").unwrap();
+        }
+        let mut warnings = Vec::new();
+        let files = expand(
+            &root.path().join("{a,b}/*.md"),
+            Kind::Prompt,
+            true,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(files.len(), 2);
+        let files = expand(&root.path().join("a/*"), Kind::Prompt, true, &mut warnings).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|path| path.ends_with("deep.md")));
+        assert_eq!(
+            expand(
+                &root.path().join("[literal].md"),
+                Kind::Prompt,
+                true,
+                &mut warnings
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(
+            expand(
+                &root.path().join("missing/*.md"),
+                Kind::Prompt,
+                true,
+                &mut warnings
+            )
+            .is_err()
+        );
+    }
 }

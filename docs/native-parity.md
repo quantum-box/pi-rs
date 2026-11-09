@@ -310,7 +310,7 @@ available. Skills accept file or directory paths without `--project`; the
 existing named project-skill mode remains supported. Native built-ins can be
 selected with `builtin:codemode`, `builtin:tool-search` and `builtin:mcp`.
 These selections propagate to persistent CLI workers. The settings editor,
-resource glob expansion and remaining CLI aliases still require parity work.
+remaining CLI aliases still require parity work.
 
 ### Upstream session import checkpoint
 
@@ -649,3 +649,16 @@ Legacy replacements can accompany a batch. All replacements match the same
 original snapshot. Ambiguous normalized matches, overlapping replacements and
 no-op edits fail before publication. CLI fixtures verify these input forms,
 line endings, unchanged lines and failure atomicity through real tool calls.
+
+### Resource glob checkpoint
+
+Explicit skill, prompt, theme and executable-extension paths accept glob and
+brace patterns. Matching directories contribute their supported resources.
+Configured positive patterns expand from their settings directory and coexist
+with exact paths and exclusion overrides. CLI selections still load when their
+automatic discovery is disabled.
+
+A CLI fixture combines a relative workspace, `--project`, explicit skill and
+native-extension globs, prompt brace expansion and settings-based patterns.
+Legacy named project skills remain distinct from explicit skill paths. Empty
+required patterns report an error before starting a model request.
