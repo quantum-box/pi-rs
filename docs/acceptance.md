@@ -107,6 +107,13 @@ Run 予算の精算は1件だった。通常の Workflow Goal 経路では、同
 `list_issues` を指定できる。既存の Runtime が接続を照会し、Linear の読取り専用
 MCP URL を使う。試験では書込み設定と既存接続の差し替えを拒否し、隔離 HTTP
 サーバーで許可取消後の追加送信が0件であることを確認した。AIP 統合試験11件、
-Runtime の接続試験4件、AIP API の試験212件が通過した。実際の Linear 接続、
-読取り操作の予算精算、添付参照は受入が残っている。
+Runtime の接続試験4件、AIP API の試験212件が通過した。
+
+読取り前に既存の Workflow Run 予算から委譲1回分を予約する。隔離 TiDB と HTTP
+MCP の組合せで、許可取消後、同じ操作 ID の再送時、予算枯渇後のいずれも送信が
+増えず、精算は元の操作 ID の1件のみであることを確認した。応答が確認できない場合は
+照会待ちにし、精算済みの操作は照会時も再送しない。AIP 統合試験12件と API 設定
+試験4件が通過した。実際の Linear 接続と添付参照は受入が残っている。
+
+[予算と試験](https://github.com/quantum-box/tachyon-apps/commit/4c55be4bf7134c1a26cff3735fbbecdc3155253f)
 [接続と試験](https://github.com/quantum-box/tachyon-apps/commit/226dd8830ebf47a6a17174b5ffd1d5f9761f2b8f) · [Linear MCP](https://linear.app/docs/mcp)
