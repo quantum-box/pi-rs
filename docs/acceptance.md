@@ -124,3 +124,15 @@ TiDB では、同じ操作 ID の照会で使用量確認待ちの記録が1件�
 [取消通知と試験](https://github.com/quantum-box/tachyon-apps/commit/4e55b9b3acd2666d9574c1863f8f69c25590ec0b)
 
 [接続と試験](https://github.com/quantum-box/tachyon-apps/commit/226dd8830ebf47a6a17174b5ffd1d5f9761f2b8f) · [Linear MCP](https://linear.app/docs/mcp)
+
+## 子レビューの再開と親予算（PLT-6385、PLT-6387）
+
+取消後に親子のジャーナルを開き直し、別の子 Run ID を指定した再開を拒否した。
+元の Run で完了した後、同じ再開要求は保存済みの回答を返し、モデル使用量と
+ジャーナルは変化しなかった。同じファイルを開いている間は2人目の実行者も拒否した。
+
+隔離 TiDB では同じ Run 名を持つ別の親予算を渡しても、子のモデル呼出しと
+ジャーナルへの書込みが0件であることを確認した。正しい親予算では応答切断後に
+両方のジャーナルを開き直して続行し、切断時の未確認使用量を同じ要求 ID で照合した。
+Workflow の Run 所有者から子を開始・停止する経路は受入が残っている。
+[ホストの再開試験](https://github.com/quantum-box/pi-rs/commit/7c371f11a51665c4b9e0edd8fabd6c93e69dedd4) · [AIPの予算試験](https://github.com/quantum-box/tachyon-apps/commit/707ca5784b8ed499722aba6a5d920be0421de7c7)
