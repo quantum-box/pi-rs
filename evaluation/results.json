@@ -1,0 +1,680 @@
+{
+  "pi_version": "1.5.0",
+  "pi_commit": "f9a26365568127461c47a07a37dcb42c140a3ac5",
+  "ollama": "0.40.15",
+  "model": "qwen2.5:7b",
+  "model_digest": "845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e",
+  "arch": "arm64",
+  "os_release": "25.6.0",
+  "max_requests": 6,
+  "max_output_tokens_per_request": 512,
+  "timeout_ms": 60000,
+  "trials": 3,
+  "rows": [
+    {
+      "trial": 1,
+      "harness": "rust",
+      "task": "read",
+      "success": true,
+      "elapsed_ms": 1257,
+      "input_tokens": 549,
+      "output_tokens": 27,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "XR-314",
+      "tools": [
+        "read_text"
+      ],
+      "requests": [
+        {
+          "messages": "5c44ba368faceae56690c512be04368a5f713a835bb1b7e9916390b7385fff2f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 253,
+          "output_tokens": 21
+        },
+        {
+          "messages": "5a8b1f550c46917e13db374f2067e8189e2199dba7926bc091335c4deb6b3dd3",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 296,
+          "output_tokens": 6
+        }
+      ]
+    },
+    {
+      "trial": 1,
+      "harness": "pi",
+      "task": "read",
+      "success": true,
+      "elapsed_ms": 1104,
+      "input_tokens": 549,
+      "output_tokens": 27,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "XR-314",
+      "tools": [
+        "read_text"
+      ],
+      "requests": [
+        {
+          "messages": "5c44ba368faceae56690c512be04368a5f713a835bb1b7e9916390b7385fff2f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 253,
+          "output_tokens": 21
+        },
+        {
+          "messages": "5a8b1f550c46917e13db374f2067e8189e2199dba7926bc091335c4deb6b3dd3",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 296,
+          "output_tokens": 6
+        }
+      ]
+    },
+    {
+      "trial": 1,
+      "harness": "pi",
+      "task": "count",
+      "success": true,
+      "elapsed_ms": 1173,
+      "input_tokens": 547,
+      "output_tokens": 23,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "7",
+      "tools": [
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "7e9be3a5493d35957c0081ef5315c9cc320cd3b90590bbf8bccd5e2676229975",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 254,
+          "output_tokens": 21
+        },
+        {
+          "messages": "1a00fc6617155c8286218a9702c46161895b803eae855d9b40389925e4cff3e0",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 293,
+          "output_tokens": 2
+        }
+      ]
+    },
+    {
+      "trial": 1,
+      "harness": "rust",
+      "task": "count",
+      "success": true,
+      "elapsed_ms": 740,
+      "input_tokens": 547,
+      "output_tokens": 23,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "7",
+      "tools": [
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "7e9be3a5493d35957c0081ef5315c9cc320cd3b90590bbf8bccd5e2676229975",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 254,
+          "output_tokens": 21
+        },
+        {
+          "messages": "1a00fc6617155c8286218a9702c46161895b803eae855d9b40389925e4cff3e0",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 293,
+          "output_tokens": 2
+        }
+      ]
+    },
+    {
+      "trial": 1,
+      "harness": "rust",
+      "task": "order",
+      "success": false,
+      "elapsed_ms": 1775,
+      "input_tokens": 623,
+      "output_tokens": 58,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "carrier|Sable|eta|Friday|count|7",
+      "tools": [
+        "lookup_order",
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "3df7e20f7643b33aadc55229b41df3ac4cba1f20ddd8315d50c7754137e59790",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 267,
+          "output_tokens": 45
+        },
+        {
+          "messages": "ee9c012d68737d4b784eae380afcb3b5c357998155c023225646638dcbbd398f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 356,
+          "output_tokens": 13
+        }
+      ]
+    },
+    {
+      "trial": 1,
+      "harness": "pi",
+      "task": "order",
+      "success": false,
+      "elapsed_ms": 1850,
+      "input_tokens": 623,
+      "output_tokens": 58,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "carrier|Sable|eta|Friday|count|7",
+      "tools": [
+        "lookup_order",
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "3df7e20f7643b33aadc55229b41df3ac4cba1f20ddd8315d50c7754137e59790",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 267,
+          "output_tokens": 45
+        },
+        {
+          "messages": "ee9c012d68737d4b784eae380afcb3b5c357998155c023225646638dcbbd398f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 356,
+          "output_tokens": 13
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "harness": "pi",
+      "task": "read",
+      "success": true,
+      "elapsed_ms": 1313,
+      "input_tokens": 549,
+      "output_tokens": 27,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "XR-314",
+      "tools": [
+        "read_text"
+      ],
+      "requests": [
+        {
+          "messages": "5c44ba368faceae56690c512be04368a5f713a835bb1b7e9916390b7385fff2f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 253,
+          "output_tokens": 21
+        },
+        {
+          "messages": "5a8b1f550c46917e13db374f2067e8189e2199dba7926bc091335c4deb6b3dd3",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 296,
+          "output_tokens": 6
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "harness": "rust",
+      "task": "read",
+      "success": true,
+      "elapsed_ms": 815,
+      "input_tokens": 549,
+      "output_tokens": 27,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "XR-314",
+      "tools": [
+        "read_text"
+      ],
+      "requests": [
+        {
+          "messages": "5c44ba368faceae56690c512be04368a5f713a835bb1b7e9916390b7385fff2f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 253,
+          "output_tokens": 21
+        },
+        {
+          "messages": "5a8b1f550c46917e13db374f2067e8189e2199dba7926bc091335c4deb6b3dd3",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 296,
+          "output_tokens": 6
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "harness": "rust",
+      "task": "count",
+      "success": true,
+      "elapsed_ms": 845,
+      "input_tokens": 547,
+      "output_tokens": 23,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "7",
+      "tools": [
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "7e9be3a5493d35957c0081ef5315c9cc320cd3b90590bbf8bccd5e2676229975",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 254,
+          "output_tokens": 21
+        },
+        {
+          "messages": "1a00fc6617155c8286218a9702c46161895b803eae855d9b40389925e4cff3e0",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 293,
+          "output_tokens": 2
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "harness": "pi",
+      "task": "count",
+      "success": true,
+      "elapsed_ms": 1070,
+      "input_tokens": 547,
+      "output_tokens": 23,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "7",
+      "tools": [
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "7e9be3a5493d35957c0081ef5315c9cc320cd3b90590bbf8bccd5e2676229975",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 254,
+          "output_tokens": 21
+        },
+        {
+          "messages": "1a00fc6617155c8286218a9702c46161895b803eae855d9b40389925e4cff3e0",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 293,
+          "output_tokens": 2
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "harness": "pi",
+      "task": "order",
+      "success": false,
+      "elapsed_ms": 1957,
+      "input_tokens": 623,
+      "output_tokens": 58,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "carrier|Sable|eta|Friday|count|7",
+      "tools": [
+        "lookup_order",
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "3df7e20f7643b33aadc55229b41df3ac4cba1f20ddd8315d50c7754137e59790",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 267,
+          "output_tokens": 45
+        },
+        {
+          "messages": "ee9c012d68737d4b784eae380afcb3b5c357998155c023225646638dcbbd398f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 356,
+          "output_tokens": 13
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "harness": "rust",
+      "task": "order",
+      "success": false,
+      "elapsed_ms": 1612,
+      "input_tokens": 623,
+      "output_tokens": 58,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "carrier|Sable|eta|Friday|count|7",
+      "tools": [
+        "lookup_order",
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "3df7e20f7643b33aadc55229b41df3ac4cba1f20ddd8315d50c7754137e59790",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 267,
+          "output_tokens": 45
+        },
+        {
+          "messages": "ee9c012d68737d4b784eae380afcb3b5c357998155c023225646638dcbbd398f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 356,
+          "output_tokens": 13
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "harness": "rust",
+      "task": "read",
+      "success": true,
+      "elapsed_ms": 933,
+      "input_tokens": 549,
+      "output_tokens": 27,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "XR-314",
+      "tools": [
+        "read_text"
+      ],
+      "requests": [
+        {
+          "messages": "5c44ba368faceae56690c512be04368a5f713a835bb1b7e9916390b7385fff2f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 253,
+          "output_tokens": 21
+        },
+        {
+          "messages": "5a8b1f550c46917e13db374f2067e8189e2199dba7926bc091335c4deb6b3dd3",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 296,
+          "output_tokens": 6
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "harness": "pi",
+      "task": "read",
+      "success": true,
+      "elapsed_ms": 1073,
+      "input_tokens": 549,
+      "output_tokens": 27,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "XR-314",
+      "tools": [
+        "read_text"
+      ],
+      "requests": [
+        {
+          "messages": "5c44ba368faceae56690c512be04368a5f713a835bb1b7e9916390b7385fff2f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 253,
+          "output_tokens": 21
+        },
+        {
+          "messages": "5a8b1f550c46917e13db374f2067e8189e2199dba7926bc091335c4deb6b3dd3",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "43da006745fc4c614985d66fb7700928ad46ab5ecc68d883f3c7e3767242d995",
+          "input_tokens": 296,
+          "output_tokens": 6
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "harness": "pi",
+      "task": "count",
+      "success": true,
+      "elapsed_ms": 1106,
+      "input_tokens": 547,
+      "output_tokens": 23,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "7",
+      "tools": [
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "7e9be3a5493d35957c0081ef5315c9cc320cd3b90590bbf8bccd5e2676229975",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 254,
+          "output_tokens": 21
+        },
+        {
+          "messages": "1a00fc6617155c8286218a9702c46161895b803eae855d9b40389925e4cff3e0",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 293,
+          "output_tokens": 2
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "harness": "rust",
+      "task": "count",
+      "success": true,
+      "elapsed_ms": 686,
+      "input_tokens": 547,
+      "output_tokens": 23,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "7",
+      "tools": [
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "7e9be3a5493d35957c0081ef5315c9cc320cd3b90590bbf8bccd5e2676229975",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 254,
+          "output_tokens": 21
+        },
+        {
+          "messages": "1a00fc6617155c8286218a9702c46161895b803eae855d9b40389925e4cff3e0",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "29f3175c069e5820b79c302e98506455268a02a8949fc0b489fcac322ec70c23",
+          "input_tokens": 293,
+          "output_tokens": 2
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "harness": "rust",
+      "task": "order",
+      "success": false,
+      "elapsed_ms": 1636,
+      "input_tokens": 623,
+      "output_tokens": 58,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "carrier|Sable|eta|Friday|count|7",
+      "tools": [
+        "lookup_order",
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "3df7e20f7643b33aadc55229b41df3ac4cba1f20ddd8315d50c7754137e59790",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 267,
+          "output_tokens": 45
+        },
+        {
+          "messages": "ee9c012d68737d4b784eae380afcb3b5c357998155c023225646638dcbbd398f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 356,
+          "output_tokens": 13
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "harness": "pi",
+      "task": "order",
+      "success": false,
+      "elapsed_ms": 1829,
+      "input_tokens": 623,
+      "output_tokens": 58,
+      "model_api_cost_usd": 0,
+      "human_interventions": 0,
+      "answer": "carrier|Sable|eta|Friday|count|7",
+      "tools": [
+        "lookup_order",
+        "count_lines"
+      ],
+      "requests": [
+        {
+          "messages": "3df7e20f7643b33aadc55229b41df3ac4cba1f20ddd8315d50c7754137e59790",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 267,
+          "output_tokens": 45
+        },
+        {
+          "messages": "ee9c012d68737d4b784eae380afcb3b5c357998155c023225646638dcbbd398f",
+          "tools": "f9c3568a9e7428d1eac7d41e535bb207b904e65f2f962b39738dfd415ff38bd3",
+          "system": "6e2220d6090663a13a8da3c60f98e8e0bf2c100d9c59aab55aa826d4cae96bc8",
+          "user": "844ba58c840e1dc7ddb4b02c71a101ddea666536249f3903e1700f093c8e3104",
+          "input_tokens": 356,
+          "output_tokens": 13
+        }
+      ]
+    }
+  ],
+  "parity": [
+    {
+      "trial": 1,
+      "task": "read",
+      "initial_prompt_match": true,
+      "initial_tools_match": true,
+      "all_contexts_match": true
+    },
+    {
+      "trial": 1,
+      "task": "count",
+      "initial_prompt_match": true,
+      "initial_tools_match": true,
+      "all_contexts_match": true
+    },
+    {
+      "trial": 1,
+      "task": "order",
+      "initial_prompt_match": true,
+      "initial_tools_match": true,
+      "all_contexts_match": true
+    },
+    {
+      "trial": 2,
+      "task": "read",
+      "initial_prompt_match": true,
+      "initial_tools_match": true,
+      "all_contexts_match": true
+    },
+    {
+      "trial": 2,
+      "task": "count",
+      "initial_prompt_match": true,
+      "initial_tools_match": true,
+      "all_contexts_match": true
+    },
+    {
+      "trial": 2,
+      "task": "order",
+      "initial_prompt_match": true,
+      "initial_tools_match": true,
+      "all_contexts_match": true
+    },
+    {
+      "trial": 3,
+      "task": "read",
+      "initial_prompt_match": true,
+      "initial_tools_match": true,
+      "all_contexts_match": true
+    },
+    {
+      "trial": 3,
+      "task": "count",
+      "initial_prompt_match": true,
+      "initial_tools_match": true,
+      "all_contexts_match": true
+    },
+    {
+      "trial": 3,
+      "task": "order",
+      "initial_prompt_match": true,
+      "initial_tools_match": true,
+      "all_contexts_match": true
+    }
+  ]
+}

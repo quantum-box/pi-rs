@@ -1,0 +1,21 @@
+[package]
+name = "pi-rs-workbench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "pi-rs"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+pi-rs = { path = "../.." }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "process", "signal", "sync", "time", "fs", "io-util", "io-std"] }
+uuid = { version = "1", features = ["serde"] }
