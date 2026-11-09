@@ -5,12 +5,18 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Native acceptance platform
+        type: choice
+        default: all
+        options: [all, ubuntu-latest, macos-latest, windows-latest]
 
 permissions:
   contents: read
 
 concurrency:
-  group: rust-parity-${{ github.ref }}
+  group: rust-parity-${{ github.ref }}-${{ inputs.platform || 'all' }}
   cancel-in-progress: true
 
 jobs:
@@ -21,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(inputs.platform && inputs.platform != 'all' && format('["{0}"]', inputs.platform) || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
