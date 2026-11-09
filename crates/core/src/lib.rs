@@ -13,7 +13,7 @@ pub use context::*;
 pub use extension::*;
 pub use journal::*;
 pub use sdk::*;
-pub use tokens::{estimate_message_tokens, estimate_request_tokens};
+pub use tokens::{ContextUsageEstimate, estimate_message_tokens, estimate_request_tokens};
 pub use tokio_util::sync::CancellationToken;
 pub use types::*;
 pub use ui::*;

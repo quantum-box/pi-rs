@@ -146,6 +146,14 @@ fn tool_reply(args: &[&str]) -> Vec<ModelEvent> {
     }]
 }
 
+fn unmetered_answer(value: &str) -> Vec<ModelEvent> {
+    let mut reply = answer(value);
+    if let Some(ModelEvent::Complete { usage, .. }) = reply.last_mut() {
+        *usage = None;
+    }
+    reply
+}
+
 fn answer(value: &str) -> Vec<ModelEvent> {
     vec![
         ModelEvent::Text(value.into()),
@@ -804,12 +812,204 @@ async fn parallel_read_results_keep_their_original_call_ids() {
 }
 
 #[tokio::test]
+async fn measured_context_tracks_trailing_input_edits_compaction_and_checkout() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("measured.jsonl");
+    let mut session = Session::open(&path).unwrap();
+    let model = Script::new(vec![answer("reply"), answer("next reply")]);
+    let registry = Registry::default();
+    let harness = agent(&model, &registry);
+    let (_, mut inputs) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    harness
+        .run(
+            &mut session,
+            Some("first".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let first_head = session.head();
+    assert_eq!(session.context_usage_estimate().usage_tokens, 28);
+    session
+        .append_user_with_images("tail".into(), vec![], None)
+        .unwrap();
+    let estimate = session.context_usage_estimate();
+    assert_eq!(estimate.tokens, 29);
+    assert_eq!(estimate.trailing_tokens, 1);
+    let user = session
+        .records()
+        .iter()
+        .find(|record| matches!(record.event, Event::User { .. }))
+        .unwrap()
+        .id;
+    session
+        .edit_context(user, Some(ContextContent::Text("x".repeat(200))))
+        .unwrap();
+    let edited = session.context_usage_estimate();
+    assert_eq!(edited.last_usage_record, None);
+    assert_eq!(
+        edited.tokens,
+        session
+            .conversation_at(session.head())
+            .unwrap()
+            .iter()
+            .map(estimate_message_tokens)
+            .sum::<u64>()
+    );
+    harness
+        .run(&mut session, None, &mut inputs, &cancel, &mut ignore)
+        .await
+        .unwrap();
+    assert_eq!(session.context_usage_estimate().tokens, 28);
+    harness
+        .compact(
+            &mut session,
+            Compaction {
+                summary: "summary".into(),
+                keep_turns: 0,
+            },
+            &mut ignore,
+        )
+        .unwrap();
+    assert_eq!(session.context_usage_estimate().tokens, 2);
+    assert_eq!(session.context_usage_estimate().last_usage_record, None);
+    session.checkout(first_head).unwrap();
+    assert_eq!(session.context_usage_estimate().tokens, 28);
+    drop(session);
+    let mut session = Session::open(&path).unwrap();
+    assert_eq!(session.context_usage_estimate().tokens, 28);
+    session.select_model("other", None).unwrap();
+    assert_eq!(session.context_usage_estimate().last_usage_record, None);
+}
+
+#[tokio::test]
+async fn zero_reported_usage_falls_back_to_visible_content() {
+    let mut reply = answer("visible reply");
+    if let Some(ModelEvent::Complete { usage, .. }) = reply.last_mut() {
+        *usage = Some(Usage::default());
+    }
+    let model = Script::new(vec![reply]);
+    let registry = Registry::default();
+    let harness = agent(&model, &registry);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    harness
+        .run(
+            &mut session,
+            Some("first".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let estimate = session.context_usage_estimate();
+    assert_eq!(estimate.last_usage_record, None);
+    assert_eq!(
+        estimate.tokens,
+        session
+            .conversation_at(session.head())
+            .unwrap()
+            .iter()
+            .map(estimate_message_tokens)
+            .sum::<u64>()
+    );
+}
+
+#[tokio::test]
+async fn measured_context_triggers_reserve_even_when_text_estimate_is_small() {
+    let mut first = answer("short");
+    if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+        *usage = Some(Usage {
+            input_tokens: 1500,
+            output_tokens: 20,
+        });
+    }
+    let model = Script::new(vec![first, answer("summary"), answer("done")]);
+    let registry = Registry::default();
+    let mut harness = agent(&model, &registry);
+    harness.limits.output_tokens_per_request = 128;
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    harness
+        .run(
+            &mut session,
+            Some("first".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    harness.limits.context_window = Some(2000);
+    session
+        .auto_compaction_control()
+        .set_token_settings(CompactionTokens {
+            reserve_tokens: Some(1000),
+            keep_recent_tokens: Some(1),
+        });
+    harness
+        .run(
+            &mut session,
+            Some("next".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    assert!(
+        session
+            .records()
+            .iter()
+            .any(|record| matches!(record.event, Event::Compacted { .. }))
+    );
+}
+
+#[tokio::test]
+async fn measured_context_uses_raw_prompt_counts_without_adding_cache_twice() {
+    for (prompt, expected) in [(None, 28), (Some(0), 28), (Some(30), 38)] {
+        let mut reply = answer("reply");
+        reply.insert(
+            0,
+            ModelEvent::Metadata(ModelMetadata {
+                cached_input_tokens: Some(7),
+                cache_creation_input_tokens: Some(4),
+                provider_prompt_tokens: prompt,
+                ..ModelMetadata::default()
+            }),
+        );
+        let model = Script::new(vec![reply]);
+        let registry = Registry::default();
+        let harness = agent(&model, &registry);
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let (_, mut inputs) = mpsc::channel(1);
+        harness
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, expected);
+    }
+}
+
+#[tokio::test]
 async fn automatic_compaction_can_be_disabled_and_reenabled_without_removing_the_context_limit() {
     let mut session = Session::with_store(MemoryStore::default()).unwrap();
     let model = Script::new(vec![
-        answer(&"z".repeat(1500)),
-        answer("older facts"),
-        answer("continued"),
+        unmetered_answer(&"z".repeat(1500)),
+        unmetered_answer("older facts"),
+        unmetered_answer("continued"),
     ]);
     let registry = Registry::default();
     let mut harness = agent(&model, &registry);
@@ -871,10 +1071,10 @@ async fn automatic_compaction_can_be_disabled_and_reenabled_without_removing_the
 async fn configured_reserve_compacts_early_and_preserves_recent_messages() {
     let mut session = Session::with_store(MemoryStore::default()).unwrap();
     let model = Script::new(vec![
-        answer(&"a".repeat(1500)),
-        answer(&"b".repeat(1500)),
-        answer("summary of first"),
-        answer("latest answer"),
+        unmetered_answer(&"a".repeat(1500)),
+        unmetered_answer(&"b".repeat(1500)),
+        unmetered_answer("summary of first"),
+        unmetered_answer("latest answer"),
     ]);
     let registry = Registry::default();
     let mut harness = agent(&model, &registry);
@@ -1041,9 +1241,9 @@ async fn bounded_automatic_compaction_leaves_the_latest_input_unchanged() {
     for discover in [false, true] {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
         let model = Script::new(vec![
-            answer(&"z".repeat(1500)),
-            answer("older facts"),
-            answer("continued"),
+            unmetered_answer(&"z".repeat(1500)),
+            unmetered_answer("older facts"),
+            unmetered_answer("continued"),
         ]);
         let registry = Registry::default();
         let mut harness = agent(&model, &registry);

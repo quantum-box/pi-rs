@@ -1282,5 +1282,33 @@ tool-call examples. Tests also cover image-size independence and existing
 provider image output. Loopback checks exercised configured compaction,
 explicit limits, loaded-model discovery and fallback behavior. Test context
 budgets were updated to continue exercising the same boundaries with the new
-estimator. Provider-usage anchoring and provider-specific reasoning accounting
+estimator. Provider-usage anchoring is covered below. Provider-specific reasoning
+accounting remains open.
+
+
+### Measured context usage checkpoint
+
+Context estimates now use the latest visible assistant message with nonzero,
+successful measured usage, then add character-based estimates for subsequent
+messages. Native input totals include cached input; cache counters are not
+added again. A nonzero raw provider prompt total takes precedence when supplied.
+The public `ContextUsageEstimate` reports the measured portion, trailing portion
+and source record as well as the total.
+
+Later context edits, compaction, system checkpoints or model-selection changes
+invalidate an older measurement. Estimation then uses the visible journal until
+a new measured assistant response becomes available. Branch checkout and file
+reopening reconstruct the appropriate measurement from that branch. Estimated,
+zero-usage and failed responses do not create measured anchors.
+
+Automatic compaction uses measured context when available, including cases
+where a short text response consumed a large provider context. RPC
+`tokensBefore` uses the same estimate. Summary requests themselves retain
+prefix-specific character estimates rather than borrowing usage for the whole
+conversation.
+
+Tests cover trailing input, edits, compaction, model changes, checkout, reopening,
+zero usage and cached-input accounting. Loopback Ollama checks verify early
+compaction from usage, measured RPC counts and fallback counts after an edit.
+Provider-specific reasoning handling and complete native prompt checkpointing
 remain open.

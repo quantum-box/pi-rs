@@ -393,7 +393,12 @@ impl Agent<'_> {
                         return Err(Error::Budget);
                     }
                     let capacity = self.context_capacity(&request, cancel).await?;
-                    let input_tokens = crate::estimate_request_tokens(&request);
+                    let estimate = session.context_usage_estimate();
+                    let input_tokens = if estimate.last_usage_record.is_some() {
+                        estimate.tokens
+                    } else {
+                        crate::estimate_request_tokens(&request)
+                    };
                     let exceeds = capacity.is_some_and(|window| {
                         input_tokens.saturating_add(u64::from(request.max_output_tokens))
                             > u64::from(window)

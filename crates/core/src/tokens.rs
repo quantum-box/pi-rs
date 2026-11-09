@@ -1,6 +1,15 @@
 //! Character-based estimates for native model-visible content.
 use crate::{Event, Message, ModelRequest, extract_tool_images};
 
+/// Latest usable measured context plus estimates for messages that followed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextUsageEstimate {
+    pub tokens: u64,
+    pub usage_tokens: u64,
+    pub trailing_tokens: u64,
+    pub last_usage_record: Option<u64>,
+}
+
 const ESTIMATED_IMAGE_CHARS: u64 = 4800;
 
 fn text_chars(text: &str) -> u64 {
