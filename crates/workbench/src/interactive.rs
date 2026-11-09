@@ -1475,7 +1475,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
                             }
-                            view.append("Reloaded settings, context, skills, prompts, keybindings and theme");
+                            view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
                         } else if input.trim() == "/settings" {

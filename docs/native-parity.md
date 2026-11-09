@@ -20,7 +20,7 @@ remaining acceptance work for that surface.
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, threaded and cross-workspace session selectors, Radius sharing |
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
-| Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface, explicit hot reload |
+| Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, elicitation |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation, complete output/image fidelity and limits |
@@ -72,8 +72,8 @@ non-trace CLI output.
 
 User settings and keybindings use the existing `~/.pi-rs` agent directory (or
 `PI_RS_HOME` / `PI_CODING_AGENT_DIR`). `/theme <name>` persists the selected
-theme. `/reload` currently reloads themes and keybindings. Other resource reload
-and unimplemented application key actions remain in the acceptance backlog.
+theme. `/reload` reloads settings, context, skills, prompts, native extensions, MCP,
+keybindings and themes. Remaining application key actions are tracked above.
 
 ### Session checkpoint
 
@@ -87,8 +87,7 @@ The CLI now exposes `--name`, `--session-dir`, `--resume [file]`, `name`, `label
 commands include searchable `/resume`, `/tree`, `/fork`, `/model` and `/theme`
 selectors. Export refuses to overwrite an existing file. `share` currently uses
 the authenticated GitHub CLI to create a secret gist and only uploads when that
-command is invoked. Native JSONL imports preserve the complete journal. Import
-of the upstream TypeScript Pi format remains unimplemented.
+command is invoked. Native JSONL imports preserve the complete journal. The upstream Pi JSONL import is covered in the later import checkpoint.
 
 The checkpoint passed 63 workspace tests. Its PTY fixture exercised streamed
 reasoning, a local read tool, theme and session-name persistence, native branch
@@ -487,3 +486,11 @@ keybinding overrides apply inside the selector. Active and managed sessions
 are protected from deletion. Renaming the active session updates its title.
 Editor Ctrl+D behavior remains separate from selector controls. Threaded
 parent/child grouping and cross-workspace selection remain open.
+
+### Native reload checkpoint
+
+A rebuilt Rust extension is reloaded through `/reload`, including its changed
+tool definitions. Journaled extension state remains available after the worker
+and registry restart. A PTY fixture built two versions of a Rust executable,
+invoked each version's tool through a model round trip, and verified that the
+same saved notes reached both requests.
