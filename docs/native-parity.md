@@ -753,3 +753,15 @@ whole-image rendering behavior.
 Unit tests and a PTY fixture cover upper/lower clipping, scrolling, cached resize
 and terminal restoration. The existing Kitty/iTerm2 fixture passed both modes.
 Regular-mode active-region images and iTerm2 partial-image behavior remain open.
+
+### Package autoload checkpoint
+
+A native package declaration with `autoload: false` starts with no resources
+and applies only its explicit patterns. Project declarations in this mode apply
+ordered additions/removals over a matching user package declaration. Missing or
+empty per-resource arrays leave the inherited selection intact. An ordinary
+project declaration still replaces the matching user selection.
+
+Unit and CLI fixtures cover standalone explicit selection, exclusions, ordered
+re-inclusion, inherited user filters and an ordinary empty-array replacement.
+The existing Git revision, transient reload and offline-cache fixture passes.

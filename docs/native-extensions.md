@@ -173,3 +173,9 @@ Ask the agent to call `interactive_review` to exercise the dialogs. The native
 executable exchanges correlated UI frames with the host. RPC clients receive
 `extension_ui_request` and answer with `extension_ui_response`. Embedded Rust
 applications install their own `ExtensionUi` on `SessionBuilder` or `Registry`.
+
+Set `autoload` to `false` in a package declaration to load only explicitly
+selected resources. When a trusted project uses this declaration for a package
+already selected by the user, its patterns apply as ordered changes to that
+user selection. For example, a project can remove one prompt with
+`"prompts": ["-prompts/example.md"]` and retain the other user-selected resources.

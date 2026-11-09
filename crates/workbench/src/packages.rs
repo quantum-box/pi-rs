@@ -56,6 +56,7 @@ struct Installed {
 struct Declaration {
     source: String,
     value: Value,
+    inherited: Option<Value>,
     transient: bool,
 }
 
@@ -193,20 +194,17 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
             ("prompts", &package.resources.prompts, &mut result.prompts),
             ("themes", &package.resources.themes, &mut result.themes),
         ] {
-            let filters = declaration
-                .value
-                .get(name)
-                .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+            let filter = ResourceFilter::new(&declaration.value, name)?;
+            let inherited = declaration
+                .inherited
+                .as_ref()
+                .map(|value| ResourceFilter::new(value, name))
                 .transpose()?;
-            if let Some(filters) = &filters {
-                validate_patterns(filters)?;
-            }
             for path in paths {
-                if filters
+                let base_enabled = inherited
                     .as_ref()
-                    .is_none_or(|filters| selected(path, &package.root, filters))
-                    && !target.contains(path)
-                {
+                    .is_some_and(|filter| filter.includes(path, &package.root, false));
+                if filter.includes(path, &package.root, base_enabled) && !target.contains(path) {
                     target.push(path.clone());
                 }
             }
@@ -214,6 +212,51 @@ fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
     }
     Ok(result)
 }
+struct ResourceFilter {
+    patterns: Option<Vec<String>>,
+    autoload: bool,
+}
+impl ResourceFilter {
+    fn new(value: &Value, resource: &str) -> Result<Self> {
+        let patterns = value
+            .get(resource)
+            .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+            .transpose()?;
+        if let Some(patterns) = &patterns {
+            validate_patterns(patterns)?;
+        }
+        Ok(Self {
+            patterns,
+            autoload: value["autoload"] != false,
+        })
+    }
+    fn includes(&self, path: &Path, root: &Path, inherited: bool) -> bool {
+        if self.autoload {
+            return self
+                .patterns
+                .as_ref()
+                .is_none_or(|patterns| selected(path, root, patterns));
+        }
+        self.patterns
+            .iter()
+            .flatten()
+            .fold(inherited, |enabled, pattern| {
+                let prefix = pattern.chars().next();
+                let override_pattern = matches!(prefix, Some('+' | '-' | '!'));
+                let target = if override_pattern {
+                    &pattern[1..]
+                } else {
+                    pattern.as_str()
+                };
+                if resource_matches(path, root, target, matches!(prefix, Some('+' | '-')), false) {
+                    !matches!(prefix, Some('-' | '!'))
+                } else {
+                    enabled
+                }
+            })
+    }
+}
+
 pub(crate) fn validate_patterns(patterns: &[String]) -> Result<()> {
     for pattern in patterns
         .iter()
@@ -324,17 +367,20 @@ fn source_field(value: &Value) -> Option<&str> {
 }
 fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     let mut result = BTreeMap::new();
+    let mut global = BTreeMap::new();
     let mut files = vec![(
         config::agent_dir().join("settings.json"),
         config::agent_dir(),
+        false,
     )];
     if args.trusted {
         files.push((
             args.workspace.join(".pi/settings.json"),
             args.workspace.join(".pi"),
+            true,
         ));
     }
-    for (file, base) in files {
+    for (file, base, project) in files {
         let document = config::read_object(&file)?;
         if let Some(packages) = document.get("packages") {
             for value in packages
@@ -344,11 +390,20 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                 let source = source_field(value)
                     .ok_or_else(|| Error::Config("package needs a source".into()))?;
                 let source = normalize(source, &base)?;
+                if !project {
+                    global.insert(source.clone(), value.clone());
+                }
+                let inherited = if project && value["autoload"] == false {
+                    global.get(&source).cloned()
+                } else {
+                    None
+                };
                 result.insert(
                     source.clone(),
                     Declaration {
                         source,
                         value: value.clone(),
+                        inherited,
                         transient: false,
                     },
                 );
@@ -366,6 +421,7 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
             Declaration {
                 value: json!(source),
                 source,
+                inherited: None,
                 transient: true,
             },
         );
@@ -948,6 +1004,27 @@ mod tests {
             std::fs::read_to_string(second.join(".metadata")).unwrap(),
             "included"
         );
+    }
+
+    #[test]
+    fn disabled_autoload_applies_only_explicit_ordered_deltas() {
+        let root = Path::new("/package");
+        let path = root.join("prompts/keep.md");
+        let empty = ResourceFilter::new(&json!({"autoload":false}), "prompts").unwrap();
+        assert!(!empty.includes(&path, root, false));
+        assert!(empty.includes(&path, root, true));
+        let filter = ResourceFilter::new(&json!({"autoload":false,"prompts":["prompts/*.md","-prompts/keep.md","+prompts/keep.md"]}), "prompts").unwrap();
+        assert!(filter.includes(&path, root, false));
+        assert!(!filter.includes(&root.join("other.md"), root, false));
+        let filter = ResourceFilter::new(
+            &json!({"autoload":false,"prompts":["!prompts/*.md"]}),
+            "prompts",
+        )
+        .unwrap();
+        assert!(!filter.includes(&path, root, true));
+        assert!(filter.includes(&root.join("other.md"), root, true));
+        let normal = ResourceFilter::new(&json!({"prompts":[]}), "prompts").unwrap();
+        assert!(!normal.includes(&path, root, true));
     }
 
     #[test]
