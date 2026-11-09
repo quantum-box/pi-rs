@@ -30,6 +30,8 @@ enum Request {
         #[serde(default)]
         queued_only: bool,
         #[serde(default)]
+        require_command: bool,
+        #[serde(default)]
         images: Vec<pi_rs::ImageContent>,
     },
     Extension {
@@ -93,9 +95,18 @@ enum Request {
     AbortRetry {
         id: Option<serde_json::Value>,
     },
+    GetCommands {
+        id: Option<serde_json::Value>,
+    },
     Cancel,
     Shutdown,
 }
+struct ReaderControls {
+    auto_compaction: pi_rs::AutoCompactionControl,
+    retry: pi_rs::RetryControl,
+    command_catalog: serde_json::Value,
+}
+
 #[derive(Default)]
 struct ControlState {
     token: Option<CancellationToken>,
@@ -118,8 +129,11 @@ pub async fn run(mut args: Cli) -> Result<()> {
         active.clone(),
         stopping.clone(),
         ui,
-        runtime.auto_compaction.clone(),
-        runtime.retry.clone(),
+        ReaderControls {
+            auto_compaction: runtime.auto_compaction.clone(),
+            retry: runtime.retry.clone(),
+            command_catalog: runtime.command_catalog(&args),
+        },
     );
     let signal_active = active.clone();
     let signal_stopping = stopping.clone();
@@ -154,14 +168,14 @@ pub async fn run(mut args: Cli) -> Result<()> {
                         Ok(starts_run && !session.queued_inputs().is_empty())
                     });
                     match result {
-                        Ok(true) => (Request::Prompt { content: None, images: vec![], queued_only: true }, false),
+                        Ok(true) => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false }, false),
                         Ok(false) => continue,
                         Err(error) => { output(json!({"type":"error","message":error.to_string()})); continue; }
                     }
                 }
                 None => break,
             },
-            _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true }, false),
+            _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false }, false),
         };
         continue_queue = false;
         if stopping.load(Ordering::SeqCst) {
@@ -224,14 +238,19 @@ pub async fn run(mut args: Cli) -> Result<()> {
             let agent = runtime.agent(&args);
             let mut observer = |event: pi_rs::Notification<'_>| observe(event, args.trace);
             match request {
-                Request::Prompt { content, images, queued_only } => {
+                Request::Prompt { content, images, queued_only, require_command } => {
                     if queued_only && !agent.apply_queued_inputs(&mut session, &mut observer)? { return Ok(()); }
+                    if images.is_empty()
+                        && let Some(input) = content.as_deref()
+                        && agent.try_extension_command(&mut session, input, &mut observer)?
+                    { return Ok(()); }
                     let mut content = content
                         .map(|input| {
-                            runtime
-                                .resources
-                                .expand(&input)
-                                .map(|expanded| expanded.unwrap_or(input))
+                            let expanded = runtime.resources.expand(&input)?;
+                            if require_command && expanded.is_none() {
+                                return Err(Error::Config("Unknown command. Use /help.".into()));
+                            }
+                            Ok(expanded.unwrap_or(input))
                         })
                         .transpose()?;
                     let run_id = Uuid::new_v4();
@@ -380,9 +399,13 @@ fn read_requests(
     active: Arc<Mutex<ControlState>>,
     stopping: Arc<AtomicBool>,
     ui: Arc<super::extension_ui::Broker>,
-    auto_compaction: pi_rs::AutoCompactionControl,
-    retry: pi_rs::RetryControl,
+    controls: ReaderControls,
 ) {
+    let ReaderControls {
+        auto_compaction,
+        retry,
+        command_catalog,
+    } = controls;
     let runtime = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -398,6 +421,9 @@ fn read_requests(
             };
             let steering = matches!(&request, Request::Steer { .. });
             match request {
+                Request::GetCommands { id } => {
+                    control_response("get_commands", id, Ok(command_catalog.clone()));
+                }
                 Request::SetAutoRetry { enabled, id } => {
                     retry.set_enabled(enabled);
                     control_response("set_auto_retry", id, Ok(serde_json::Value::Null));

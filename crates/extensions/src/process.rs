@@ -176,6 +176,9 @@ impl Extension for ExecutableExtension {
             .map(String::as_str)
             .collect()
     }
+    fn command_source(&self) -> Option<&Path> {
+        Some(&self.executable)
+    }
     fn command_names(&self) -> Vec<&str> {
         self.description
             .commands

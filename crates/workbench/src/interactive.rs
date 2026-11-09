@@ -1477,7 +1477,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 view.pending_request = Some(json!({"type":"prompt","content":input}));
                 return Ok(None);
             }
-            view.append("Unknown command. Use /help.");
+            view.pending_request =
+                Some(json!({"type":"prompt","content":input,"require_command":true}));
         }
     }
     Ok(None)

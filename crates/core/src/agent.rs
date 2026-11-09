@@ -1382,6 +1382,35 @@ impl Agent<'_> {
         }
     }
 
+    /// Execute a discovered slash command before treating input as model text.
+    pub fn try_extension_command(
+        &self,
+        session: &mut Session,
+        input: &str,
+        observer: &mut Observer<'_>,
+    ) -> Result<bool> {
+        let (name, arguments) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+        let Some(name) = name.strip_prefix('/') else {
+            return Ok(false);
+        };
+        let Some(command) = self
+            .registry
+            .registered_commands()
+            .into_iter()
+            .find(|command| command.invocation_name == name)
+        else {
+            return Ok(false);
+        };
+        self.extension_command(
+            session,
+            &command.extension_id,
+            &command.name,
+            arguments.trim_start(),
+            observer,
+        )?;
+        Ok(true)
+    }
+
     /// Run a host-only extension command against this branch's durable state.
     pub fn extension_command(
         &self,

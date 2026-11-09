@@ -44,9 +44,13 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut pending_abort: Option<Value> = None;
     let mut pending_bash: Option<Value> = None;
     let mut pending_compact: Option<Value> = None;
+    let mut pending_catalogs: Vec<Value> = Vec::new();
     loop {
         if let Some(active) = &mut worker {
             for event in active.events.try_iter() {
+                if event["type"] == "response" && event["command"] == "get_commands" {
+                    pending_catalogs.retain(|request| request["id"] != event["id"]);
+                }
                 match event["type"].as_str() {
                     Some("auto_retry_start") => active.retrying = true,
                     Some("auto_retry_end" | "agent_settled" | "request") => active.retrying = false,
@@ -66,12 +70,23 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     let _ = reader.join();
                 }
                 for event in finished.events.try_iter() {
+                    if event["type"] == "response" && event["command"] == "get_commands" {
+                        pending_catalogs.retain(|request| request["id"] != event["id"]);
+                    }
                     forward_event(
                         event,
                         &mut finished.busy,
                         &mut pending_abort,
                         &mut pending_bash,
                         &mut pending_compact,
+                    )?;
+                }
+                for request in pending_catalogs.drain(..) {
+                    response(
+                        &request,
+                        Err(Error::Config(
+                            "command discovery worker exited before returning a result".into(),
+                        )),
                     )?;
                 }
                 if finished.busy {
@@ -98,6 +113,11 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     )?;
                 }
             }
+        }
+        // Keep a following session change from replacing the discovery worker.
+        if !pending_catalogs.is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
         }
         let line = match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(line) => line?,
@@ -161,6 +181,13 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             })();
             if let Err(error) = result {
                 response(&request, Err(error))?;
+            }
+            continue;
+        }
+        if request["type"] == "get_commands" {
+            match Worker::control(&mut worker, &args, request.clone()) {
+                Ok(()) => pending_catalogs.push(request),
+                Err(error) => response(&request, Err(error))?,
             }
             continue;
         }

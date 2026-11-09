@@ -762,12 +762,14 @@ async fn execute(mut args: Cli) -> Result<()> {
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
     session.set_retry_control(runtime.retry.clone());
     let result = async {
-        if let Command::Run { prompt } = &mut command
-            && let Some(expanded) = runtime.resources.expand(prompt)?
-        { *prompt = expanded; }
         let registry = &runtime.registry;
         let agent = runtime.agent(&args);
         let mut observer = |event: Notification<'_>| observe(event, args.trace);
+        if let Command::Run { prompt } = &mut command {
+            if args.initial_images.is_empty() && agent.try_extension_command(&mut session, prompt, &mut observer)? { return Ok(()); }
+            if let Some(expanded) = runtime.resources.expand(prompt)? { *prompt = expanded; }
+        }
+
 
 
     let cancel = CancellationToken::new();

@@ -17,6 +17,65 @@ pub struct Runtime {
     servers: Vec<Arc<pi_rs_workbench::mcp::McpExtension>>,
 }
 impl Runtime {
+    pub fn command_catalog(&self, args: &Cli) -> serde_json::Value {
+        let user_root = super::config::agent_dir();
+        let user_root = user_root.canonicalize().unwrap_or(user_root);
+        let workspace = args
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| args.workspace.clone());
+        let source_info = |path: &std::path::Path, packages: &[std::path::PathBuf]| {
+            let scope = if path.starts_with(&user_root) {
+                "user"
+            } else if path.starts_with(&workspace) {
+                "project"
+            } else {
+                "temporary"
+            };
+            let origin = if packages.iter().any(|root| path.starts_with(root)) {
+                "package"
+            } else {
+                "top-level"
+            };
+            json!({"path":path,"source":"local","scope":scope,"origin":origin})
+        };
+        let mut commands = Vec::new();
+        for command in self.registry.registered_commands() {
+            let source = match command.source_path.as_deref() {
+                Some(path) => source_info(path, &self.resources.packages.extensions),
+                None => json!({
+                    "path": format!("builtin:{}", command.extension_id),
+                    "source": "builtin",
+                    "scope": "user",
+                    "origin": "top-level",
+                }),
+            };
+            let mut entry =
+                json!({"name":command.invocation_name,"source":"extension","sourceInfo":source});
+            if let Some(description) = command.description {
+                entry["description"] = json!(description);
+            }
+            commands.push(entry);
+        }
+        for (name, prompt) in &self.resources.prompts {
+            commands.push(json!({
+                "name": name,
+                "description": prompt.description,
+                "source": "prompt",
+                "sourceInfo": source_info(&prompt.path, &self.resources.packages.prompts),
+            }));
+        }
+        for (name, skill) in &self.resources.skills {
+            commands.push(json!({
+                "name": format!("skill:{name}"),
+                "description": skill.description,
+                "source": "skill",
+                "sourceInfo": source_info(&skill.path, &self.resources.packages.skills),
+            }));
+        }
+        json!({"commands":commands})
+    }
+
     pub fn agent<'a>(&'a self, args: &'a Cli) -> Agent<'a> {
         self.auto_compaction
             .set_token_settings(args.settings.compaction_tokens(&args.model));

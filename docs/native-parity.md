@@ -35,7 +35,7 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `get_session_stats`, `set_session_name`, `export_html`, `get_available_models`,
 `cycle_model`, `set_thinking_level`, `cycle_thinking_level`,
 `get_available_thinking_levels`, `switch_session`, `fork`, `clone`,
-`get_fork_messages`, `get_entries`, `get_tree`, `get_last_assistant_text`,
+`get_fork_messages`, `get_entries`, `get_tree`, `get_last_assistant_text`, `get_commands`,
 `edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
 `set_follow_up_mode`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance is separate from completion; wait for
@@ -1429,3 +1429,25 @@ PTY checks cover fullscreen and regular layouts, disabling retry before a 503
 response, opening the retry editor and restoring the terminal. Settings tests
 cover Pi defaults, explicit zero values, integral JSON numbers and invalid
 retry settings. Workspace tests and all-target Clippy pass.
+
+### RPC command discovery checkpoint
+
+`get_commands` returns enabled extension commands, prompt templates and skills,
+including source kind, descriptions when available and native source metadata.
+The worker serves this read-only catalog during an active model request. A
+worker startup failure produces a correlated error response. Discovery finishes
+before a following request can replace its worker.
+
+The native registry resolves duplicate names with Pi's occurrence suffixes and
+avoids collisions with literal suffixed names. The same resolved names execute
+through RPC prompts, print mode and the TUI before model invocation. Existing
+explicit extension commands remain available. The TUI forwards unknown names
+for worker validation and does not send them to the model.
+
+Core tests cover collisions, disabled extensions and dispatch to the correct
+owner. Loopback checks cover the catalog during an active model request, native
+command execution, prompt and skill expansion, print mode and startup failures.
+A PTY check covers native command execution and rejection of an unknown command.
+Workspace tests and all-target Clippy pass. Remaining work includes complete package source identity, command
+execution during an already-active model turn and further extension event/UI
+parity.

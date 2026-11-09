@@ -1764,3 +1764,80 @@ async fn failed_reply_settlement_errors_do_not_retry_the_provider() {
     assert_eq!(model.requests.lock().unwrap().len(), 1);
     assert_eq!(retries, 0);
 }
+
+struct SlashCommands(&'static str, &'static [&'static str]);
+impl Extension for SlashCommands {
+    fn id(&self) -> &str {
+        self.0
+    }
+    fn commands(&self) -> &[&str] {
+        self.1
+    }
+    fn command_description(&self, _: &str) -> Option<&str> {
+        Some("Set test state")
+    }
+    fn command(
+        &self,
+        name: &str,
+        arguments: &str,
+        _: Option<&ExtensionState>,
+    ) -> ExtensionResult<ExtensionState> {
+        Ok(ExtensionState {
+            version: 1,
+            data: json!({"name":name,"arguments":arguments}),
+        })
+    }
+}
+
+#[test]
+fn discovered_command_names_match_pi_collisions_and_invoke_the_correct_owner() {
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(SlashCommands("first", &["set", "set:1"])))
+        .unwrap();
+    registry
+        .register(Arc::new(SlashCommands("second", &["set", "other"])))
+        .unwrap();
+    let commands = registry.registered_commands();
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command.invocation_name.as_str())
+            .collect::<Vec<_>>(),
+        ["set:1", "set:1:2", "set:2", "other"]
+    );
+    assert_eq!(commands[2].description.as_deref(), Some("Set test state"));
+    let model = Script::new(vec![]);
+    let harness = agent(&model, &registry);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    assert!(
+        harness
+            .try_extension_command(&mut session, "/set:2  hello world", &mut ignore)
+            .unwrap()
+    );
+    assert!(!session.extension_states().contains_key("first"));
+    assert_eq!(
+        session.extension_states()["second"].data,
+        json!({"name":"set","arguments":"hello world"})
+    );
+    assert!(
+        !harness
+            .try_extension_command(&mut session, "/unknown hello", &mut ignore)
+            .unwrap()
+    );
+    assert!(
+        !harness
+            .try_extension_command(&mut session, "ordinary text", &mut ignore)
+            .unwrap()
+    );
+    assert!(model.requests.lock().unwrap().is_empty());
+    let filtered = Registry::compose(
+        vec![
+            Arc::new(SlashCommands("first", &["set"])),
+            Arc::new(SlashCommands("second", &["set"])),
+        ],
+        &["first".into()].into(),
+    )
+    .unwrap();
+    assert_eq!(filtered.registered_commands()[0].invocation_name, "set");
+}

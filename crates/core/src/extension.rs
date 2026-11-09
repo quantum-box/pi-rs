@@ -161,6 +161,14 @@ pub trait Extension: Send + Sync {
         self.commands().to_vec()
     }
 
+    /// Optional metadata for command discovery.
+    fn command_description(&self, _name: &str) -> Option<&str> {
+        None
+    }
+    fn command_source(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Host-only command. Returns a state change to commit on the active branch.
     fn command(
         &self,
@@ -241,6 +249,15 @@ pub trait Extension: Send + Sync {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RegisteredCommand {
+    pub extension_id: String,
+    pub name: String,
+    pub invocation_name: String,
+    pub description: Option<String>,
+    pub source_path: Option<std::path::PathBuf>,
+}
+
 pub(crate) struct RegisteredTool {
     pub owner: String,
     pub tool: Arc<dyn Tool>,
@@ -257,6 +274,42 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Resolve command collisions in extension registration order, as Pi does.
+    pub fn registered_commands(&self) -> Vec<RegisteredCommand> {
+        let mut commands = Vec::new();
+        let mut counts = BTreeMap::new();
+        for extension in &self.extensions {
+            for name in extension.command_names() {
+                *counts.entry(name.to_owned()).or_insert(0_usize) += 1;
+                commands.push(RegisteredCommand {
+                    extension_id: extension.id().into(),
+                    name: name.into(),
+                    invocation_name: String::new(),
+                    description: extension.command_description(name).map(str::to_owned),
+                    source_path: extension.command_source().map(std::path::Path::to_path_buf),
+                });
+            }
+        }
+        let mut seen = BTreeMap::new();
+        let mut taken = BTreeSet::new();
+        for command in &mut commands {
+            let occurrence = seen.entry(command.name.clone()).or_insert(0_usize);
+            *occurrence += 1;
+            command.invocation_name = if counts[&command.name] > 1 {
+                format!("{}:{}", command.name, occurrence)
+            } else {
+                command.name.clone()
+            };
+            let mut suffix = *occurrence;
+            while taken.contains(&command.invocation_name) {
+                suffix += 1;
+                command.invocation_name = format!("{}:{suffix}", command.name);
+            }
+            taken.insert(command.invocation_name.clone());
+        }
+        commands
+    }
+
     /// Attach the embedding application's optional interaction surface.
     pub fn set_ui(&mut self, ui: Arc<dyn crate::ExtensionUi>) {
         self.ui = Some(ui);

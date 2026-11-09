@@ -14,6 +14,7 @@ pub struct Skill {
 }
 #[derive(Clone)]
 pub struct Prompt {
+    pub path: PathBuf,
     pub body: String,
     pub description: String,
 }
@@ -203,6 +204,7 @@ impl Resources {
                 let text = read(&path)?;
                 let (metadata, body) = frontmatter(&text)?;
                 resources.prompts.entry(name.into()).or_insert(Prompt {
+                    path: path.clone(),
                     description: metadata.description.unwrap_or_else(|| {
                         body.lines()
                             .find(|line| !line.trim().is_empty())
