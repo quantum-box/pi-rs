@@ -111,7 +111,40 @@ impl InlineImage {
             .collect()
     }
 }
+#[cfg(unix)]
+static REPORTED_CELL: AtomicU32 = AtomicU32::new(0);
+
+pub fn query_cell_size() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        REPORTED_CELL.store(0, Ordering::Relaxed);
+        let mut out = std::io::stdout().lock();
+        out.write_all(b"\x1b[16t")?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn set_cell_dimensions(width: u16, height: u16) -> bool {
+    if width == 0 || height == 0 || width > 1024 || height > 1024 {
+        return false;
+    }
+    let dimensions = (u32::from(width) << 16) | u32::from(height);
+    REPORTED_CELL.swap(dimensions, Ordering::Relaxed) != dimensions
+}
+
 pub fn cell_dimensions() -> (f64, f64) {
+    #[cfg(unix)]
+    {
+        let reported = REPORTED_CELL.load(Ordering::Relaxed);
+        if reported != 0 {
+            return (
+                f64::from((reported >> 16) as u16),
+                f64::from(reported as u16),
+            );
+        }
+    }
     crossterm::terminal::window_size()
         .ok()
         .and_then(|size| reported_cell_dimensions(&size))

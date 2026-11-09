@@ -13,7 +13,7 @@ use crate::ui::{
 };
 use crossterm::cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
 use crossterm::style::{Print, ResetColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
@@ -89,6 +89,8 @@ impl Terminal {
             execute!(std::io::stdout(), EnterAlternateScreen)?;
         }
         execute!(std::io::stdout(), EnableBracketedPaste, Hide)?;
+        #[cfg(unix)]
+        execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
         Ok(guard)
     }
     #[cfg(unix)]
@@ -125,6 +127,8 @@ impl Drop for Terminal {
         if self.alternate {
             self.images.clear();
         }
+        #[cfg(unix)]
+        let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
             let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
@@ -1524,6 +1528,10 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     let _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
     #[cfg(unix)]
     let mut _terminal = _terminal;
+    let mut input = crate::ui::input::Reader::new()?;
+    if view.graphics.enabled() {
+        crate::ui::images::query_cell_size()?;
+    }
     let mut worker: Option<Worker> = None;
     let mut initial = args
         .initial_prompt
@@ -1676,11 +1684,42 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         } else {
             Duration::from_millis(40)
         };
-        if !event::poll(input_wait)? {
-            continue;
-        }
-        match event::read()? {
+        let event = match input.next(input_wait)? {
+            Some(crate::ui::input::InputEvent::Event(event)) => event,
+            #[cfg(unix)]
+            Some(crate::ui::input::InputEvent::CellSize { width, height }) => {
+                if images::set_cell_dimensions(width, height) {
+                    dirty = true;
+                }
+                continue;
+            }
+            #[cfg(unix)]
+            Some(crate::ui::input::InputEvent::Appearance { dark }) => {
+                if crate::ui::theme::set_appearance(dark) {
+                    let selection = args.use_theme.as_deref().unwrap_or("system");
+                    if selection.contains('/') {
+                        match Theme::load(
+                            selection,
+                            &args.theme_paths,
+                            &args.workspace,
+                            args.trusted,
+                            false,
+                        ) {
+                            Ok(next) => theme = next,
+                            Err(error) => view.append(&format!("Theme reload: {error}")),
+                        }
+                    }
+                    dirty = true;
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        match event {
             Event::Resize(..) => {
+                if view.graphics.enabled() {
+                    images::query_cell_size()?;
+                }
                 if args.tui_mode == Some(TuiMode::Regular) {
                     view.finish_regular()?;
                 }
@@ -1786,6 +1825,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 view.graphics.cleanup(),
                             ) {
                                 view.append(&error.to_string());
+                            }
+                            if view.graphics.enabled() {
+                                images::query_cell_size()?;
                             }
                             view.graphics.reset();
                             view.regular.redraw = true;

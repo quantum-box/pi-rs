@@ -6,6 +6,15 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+static APPEARANCE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(unix)]
+pub fn set_appearance(dark: bool) -> bool {
+    let value = if dark { 1 } else { 2 };
+    APPEARANCE.swap(value, Ordering::Relaxed) != value
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Theme {
@@ -64,10 +73,14 @@ impl Theme {
         trusted: bool,
         discover: bool,
     ) -> Result<Self> {
-        let dark = !std::env::var("COLORFGBG")
-            .ok()
-            .and_then(|v| v.rsplit(';').next()?.parse::<u8>().ok())
-            .is_some_and(|v| v == 7 || v == 15);
+        let dark = match APPEARANCE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => !std::env::var("COLORFGBG")
+                .ok()
+                .and_then(|v| v.rsplit(';').next()?.parse::<u8>().ok())
+                .is_some_and(|v| v == 7 || v == 15),
+        };
         let name = if let Some((light, dark_name)) = name.split_once('/') {
             if dark { dark_name } else { light }
         } else {

@@ -14,3 +14,6 @@ follows Pi v1.5.0 Markdown rendering conventions.
 Edit-diff word highlighting follows Pi v1.5.0 diff.ts presentation conventions.
 Edit normalization and unchanged-line preservation in src/text_edit.rs follow
 Pi v1.5.0 edit-diff.ts under the same MIT license.
+
+The Unix input decoder adapts Crossterm 0.29.0 (MIT).
+See CROSSTERM-LICENSE for its license and copyright notice.

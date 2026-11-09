@@ -24,7 +24,7 @@ remaining acceptance work for that surface.
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands | In-flight tool-list updates, interactive scope upgrades |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
-| Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
+| Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and Unix terminal appearance notifications | Windows appearance notifications and remaining palette synchronization |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
@@ -1070,4 +1070,24 @@ cell sizes. A PTY fixture changed pixel dimensions while preserving the characte
 grid and verified image placement dimensions, retained draft input, PNG reuse
 and terminal restoration. Existing clipping and active-image fixtures passed
 for both protocols. Workspace tests and all-target Clippy passed on Rust 1.89.
-Terminal-reported CSI cell-size responses still need integration.
+Unix terminal-reported CSI cell-size responses are covered by the following checkpoint. Windows response handling remains open.
+
+### Unix terminal-response checkpoint
+
+The Unix input reader now separates terminal replies from keyboard input. Its
+key decoder is adapted from the existing Crossterm 0.29 implementation, with
+the original MIT notice in `assets/CROSSTERM-LICENSE`. Startup, resize and resume
+request CSI cell dimensions. Valid replies update image layout, while malformed
+replies are consumed without entering the draft. Windows uses the native
+Crossterm input backend.
+
+Unix terminals can also report appearance changes through mode 2031. The
+reader consumes CSI 997 reports and updates light/dark theme pairs. Fixed
+themes and saved theme settings are preserved. Exit and suspension disable
+notifications, and resume enables them again.
+
+Tests cover the inherited keyboard decoder, split Unicode and replies, Alt and
+control keys, literal bracketed paste and Escape handling. PTY fixtures verified
+cell queries, theme-pair updates, fixed themes, invalid reports, queue controls,
+settings editing, shell execution, images, resize, suspend and terminal cleanup.
+Workspace tests and all-target Clippy passed on Rust 1.89.
