@@ -797,6 +797,12 @@ fn metadata(record: &pi_rs::Record) -> Value {
                 .collect();
             json!({"event": "assistant", "tools": tools, "usage": usage})
         }
+        Event::ToolPlanned {
+            invocation,
+            parent_operation,
+        } => {
+            json!({"event":"tool_planned","operation_id":invocation.operation_id,"name":invocation.call.name,"parent_operation":parent_operation})
+        }
         Event::ToolStarted { operation_id } => {
             json!({"event": "tool_started", "operation_id": operation_id})
         }

@@ -26,6 +26,13 @@ pub enum ToolExecution {
     ExternalJob,
 }
 
+/// Mediates nested tool calls through the same journal and policies as model calls.
+#[async_trait::async_trait]
+pub trait ToolHost: Send + Sync {
+    fn tools(&self) -> Vec<ToolSpec>;
+    async fn call(&self, name: &str, arguments: Value) -> Outcome;
+}
+
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
@@ -41,6 +48,16 @@ pub trait Tool: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> Outcome {
         self.invoke(arguments, context).await
+    }
+    /// Override for tools that orchestrate other tools, such as codemode.
+    async fn invoke_with_host(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> Outcome {
+        self.invoke_with_state(arguments, context, state).await
     }
     /// Explicitly opt into automatic pending-job polling.
     fn can_poll(&self) -> bool {

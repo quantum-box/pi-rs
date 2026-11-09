@@ -1,9 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::extension::{RegisteredTool, hook};
@@ -12,7 +16,7 @@ use crate::{
     CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind, Invocation,
     Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest, OperationState, Outcome,
     QueuedInput, Record, RecordedReply, Registry, RequestPurpose, Result, RunState, Session,
-    ToolContext, ToolExecution, Usage, UsageReport,
+    ToolContext, ToolExecution, ToolHost, ToolSpec, Usage, UsageReport,
 };
 
 #[derive(Clone, Debug)]
@@ -359,7 +363,11 @@ impl Agent<'_> {
                 .tool_batch(
                     session,
                     &invocations,
-                    &advertised,
+                    &DispatchScope {
+                        advertised: &advertised,
+                        depth: 0,
+                        call_count: Arc::new(AtomicUsize::new(0)),
+                    },
                     &mut states,
                     cancel,
                     observer,
@@ -607,7 +615,7 @@ impl Agent<'_> {
         &self,
         session: &mut Session,
         invocations: &[Invocation],
-        advertised: &HashSet<String>,
+        scope: &DispatchScope<'_>,
         states: &mut ExtensionStates,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
@@ -630,7 +638,7 @@ impl Agent<'_> {
             let mut prepared = Vec::with_capacity(count);
             for invocation in group {
                 prepared.push(
-                    self.prepare_tool(invocation, advertised, states, cancel)
+                    self.prepare_tool(invocation, scope.advertised, states, cancel)
                         .await?,
                 );
             }
@@ -666,12 +674,59 @@ impl Agent<'_> {
                     dispatches.push(invocation.operation_id);
                 }
             }
-            let outcomes = futures_util::future::join_all(
-                prepared
-                    .into_iter()
-                    .map(|prepared| self.invoke(prepared, cancel)),
-            )
-            .await;
+            let (requests, mut incoming) = mpsc::channel(32);
+            let specs = Arc::new(self.registry.tool_specs());
+            let invocations = group.iter().zip(prepared).map(|(invocation, prepared)| {
+                let cancellation = match &prepared {
+                    Preparation::Ready { context, .. } => context.cancellation.clone(),
+                    Preparation::Skipped(_) => cancel.child_token(),
+                };
+                let host = Arc::new(NestedHost {
+                    requests: requests.clone(),
+                    specs: specs.clone(),
+                    parent_operation: invocation.operation_id,
+                    cancellation,
+                    depth: scope.depth,
+                    call_count: scope.call_count.clone(),
+                });
+                self.invoke(prepared, cancel, host)
+            });
+            let outcomes = futures_util::future::join_all(invocations);
+            tokio::pin!(outcomes);
+            let mut nested_error = None;
+            let mut pending_requests = VecDeque::<NestedRequest>::new();
+            let outcomes = loop {
+                tokio::select! {
+                    completed = &mut outcomes => break completed,
+                    Some(request) = async {
+                        match pending_requests.pop_front() {
+                            Some(request) => Some(request),
+                            None => incoming.recv().await,
+                        }
+                    } => {
+                        let parent = request.parent_operation;
+                        let mut batch = vec![request];
+                        while batch.len() < 8 {
+                            match incoming.try_recv() {
+                                Ok(request) if request.parent_operation == parent => batch.push(request),
+                                Ok(request) => { pending_requests.push_back(request); break; }
+                                Err(_) => break,
+                            }
+                        }
+                        let nested = self.nested_tools(session, batch, states, observer);
+                        tokio::pin!(nested);
+                        tokio::select! {
+                            result = &mut nested => {
+                                if let Err(error) = result { nested_error.get_or_insert(error); }
+                            },
+                            completed = &mut outcomes => {
+                                if let Err(error) = nested.await { nested_error.get_or_insert(error); }
+                                break completed;
+                            }
+                        }
+                    }
+                }
+            };
             let mut first_error = None;
             // All started outcomes are recorded even if one parallel member failed.
             for (invocation, outcome) in group.iter().zip(outcomes) {
@@ -690,9 +745,108 @@ impl Agent<'_> {
                 Some(error) => return Err(error),
                 None => {}
             }
+            if let Some(error) = nested_error {
+                return Err(error);
+            }
             remaining = next;
         }
         Ok(())
+    }
+
+    async fn nested_tools(
+        &self,
+        session: &mut Session,
+        requests: Vec<NestedRequest>,
+        states: &mut ExtensionStates,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let invocations: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let operation_id = Uuid::new_v4();
+                Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: operation_id.to_string(),
+                        name: request.name.clone(),
+                        arguments: request.arguments.to_string(),
+                    },
+                }
+            })
+            .collect();
+        let execute = async {
+            for (request, invocation) in requests.iter().zip(&invocations) {
+                commit(
+                    session,
+                    Event::ToolPlanned {
+                        invocation: invocation.clone(),
+                        parent_operation: request.parent_operation,
+                    },
+                    observer,
+                )?;
+            }
+            let advertised = self.registry.tools.keys().cloned().collect();
+            Box::pin(self.tool_batch(
+                session,
+                &invocations,
+                &DispatchScope {
+                    advertised: &advertised,
+                    depth: requests[0].depth,
+                    call_count: requests[0].call_count.clone(),
+                },
+                states,
+                &requests[0].cancellation,
+                observer,
+            ))
+            .await
+        }
+        .await;
+        if execute.is_err() {
+            requests[0].cancellation.cancel();
+        }
+        for (request, invocation) in requests.into_iter().zip(invocations) {
+            let operation_id = invocation.operation_id;
+            let operation = session
+                .operations()
+                .into_iter()
+                .find(|(current, _)| current.operation_id == operation_id);
+            if matches!(
+                operation.as_ref().map(|(_, state)| state),
+                Some(OperationState::Planned)
+            ) {
+                let reason = execute
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "nested dispatch did not start".into());
+                commit(
+                    session,
+                    Event::ToolFinished {
+                        operation_id,
+                        outcome: Outcome::Skipped(reason),
+                        states: ExtensionStates::new(),
+                    },
+                    observer,
+                )?;
+            }
+            let outcome = session
+                .operations()
+                .into_iter()
+                .find_map(|(current, state)| {
+                    if current.operation_id != operation_id {
+                        return None;
+                    }
+                    match state {
+                        OperationState::Finished(outcome) => Some(outcome),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| {
+                    Outcome::Unknown("nested tool produced no durable result".into())
+                });
+            let _ = request.reply.send(outcome);
+        }
+        execute
     }
 
     async fn poll_pending(
@@ -892,7 +1046,12 @@ impl Agent<'_> {
         Ok(Decision::Allow)
     }
 
-    async fn invoke(&self, preparation: Preparation<'_>, cancel: &CancellationToken) -> Outcome {
+    async fn invoke(
+        &self,
+        preparation: Preparation<'_>,
+        cancel: &CancellationToken,
+        host: Arc<dyn ToolHost>,
+    ) -> Outcome {
         let (tool, args, context, state, _guard) = match preparation {
             Preparation::Ready {
                 tool,
@@ -906,7 +1065,7 @@ impl Agent<'_> {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()),
-            result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.invoke_with_state(args, context, state.as_ref())) =>
+            result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.invoke_with_host(args, context, state.as_ref(), host)) =>
                 result.unwrap_or_else(|_| Outcome::Unknown("tool timed out".into())),
         }
     }
@@ -1131,6 +1290,61 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
         }
     }
     Some(start)
+}
+
+struct DispatchScope<'a> {
+    advertised: &'a HashSet<String>,
+    depth: usize,
+    call_count: Arc<AtomicUsize>,
+}
+struct NestedRequest {
+    name: String,
+    arguments: serde_json::Value,
+    parent_operation: Uuid,
+    cancellation: CancellationToken,
+    depth: usize,
+    call_count: Arc<AtomicUsize>,
+    reply: oneshot::Sender<Outcome>,
+}
+struct NestedHost {
+    requests: mpsc::Sender<NestedRequest>,
+    specs: Arc<Vec<ToolSpec>>,
+    parent_operation: Uuid,
+    cancellation: CancellationToken,
+    depth: usize,
+    call_count: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl ToolHost for NestedHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.specs.as_ref().clone()
+    }
+    async fn call(&self, name: &str, arguments: serde_json::Value) -> Outcome {
+        if self.depth >= 8 || self.call_count.fetch_add(1, Ordering::Relaxed) >= 4096 {
+            return Outcome::Skipped("nested tool execution limit reached".into());
+        }
+        if arguments.to_string().len() > 1024 * 1024 {
+            return Outcome::Skipped("nested tool arguments exceed size limit".into());
+        }
+        let (reply, result) = oneshot::channel();
+        let request = NestedRequest {
+            name: name.into(),
+            arguments,
+            parent_operation: self.parent_operation,
+            cancellation: self.cancellation.clone(),
+            depth: self.depth + 1,
+            call_count: self.call_count.clone(),
+            reply,
+        };
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => return Outcome::Skipped("cancelled before nested dispatch".into()),
+            sent = self.requests.send(request) => if sent.is_err() { return Outcome::Skipped("parent tool has finished".into()); }
+        }
+        result
+            .await
+            .unwrap_or_else(|_| Outcome::Unknown("nested tool response was lost".into()))
+    }
 }
 
 enum Preparation<'a> {

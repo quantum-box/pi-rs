@@ -185,16 +185,10 @@ impl View {
                         self.lines.push(Entry::Assistant(content.clone()));
                     }
                     for invocation in invocations {
-                        self.lines.push(Entry::Tool {
-                            id: invocation.operation_id.to_string(),
-                            name: invocation.call.name.clone(),
-                            arguments: invocation.call.arguments.clone(),
-                            output: String::new(),
-                            failed: false,
-                            finished: false,
-                        });
+                        self.add_tool(invocation);
                     }
                 }
+                pi_rs::Event::ToolPlanned { invocation, .. } => self.add_tool(invocation),
                 pi_rs::Event::ToolFinished {
                     operation_id,
                     outcome,
@@ -211,6 +205,16 @@ impl View {
         }
         self.append("Enter to send · Alt+Enter to queue · Ctrl+O tools · Ctrl+T thinking · /help");
         Ok(())
+    }
+    fn add_tool(&mut self, invocation: &pi_rs::Invocation) {
+        self.lines.push(Entry::Tool {
+            id: invocation.operation_id.to_string(),
+            name: invocation.call.name.clone(),
+            arguments: invocation.call.arguments.clone(),
+            output: String::new(),
+            failed: false,
+            finished: false,
+        });
     }
     fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
         if let Some(Entry::Tool {
@@ -293,6 +297,13 @@ impl View {
                                     finished: false,
                                 });
                             }
+                        }
+                    }
+                    Some("tool_planned") => {
+                        self.phase = Some("ツール実行中");
+                        if let Ok(invocation) = serde_json::from_value(event["invocation"].clone())
+                        {
+                            self.add_tool(&invocation);
                         }
                     }
                     Some("tool_finished" | "tool_reconciled") => {

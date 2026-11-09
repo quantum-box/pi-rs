@@ -643,6 +643,309 @@ mod tests {
         assert_eq!(job.polls.load(Ordering::SeqCst), 2);
         session.close().await.unwrap();
     }
+    struct NestedModel;
+    #[async_trait::async_trait]
+    impl Model for NestedModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            let finished = request.messages.iter().any(|message| matches!(message, Message::Tool { content, .. } if content == "child result"));
+            let events = if finished {
+                assert_eq!(
+                    request
+                        .messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::Tool { .. }))
+                        .count(),
+                    1
+                );
+                vec![
+                    Ok(ModelEvent::Text("done".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ]
+            } else {
+                vec![Ok(ModelEvent::Complete {
+                    calls: vec![crate::ToolCall {
+                        id: "bundle-call".into(),
+                        name: "bundle".into(),
+                        arguments: "{}".into(),
+                    }],
+                    usage: None,
+                })]
+            };
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+    struct Bundle;
+    #[async_trait::async_trait]
+    impl crate::Tool for Bundle {
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: "bundle".into(),
+                description: "Orchestrate tools".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            crate::Outcome::Failed("host required".into())
+        }
+        async fn invoke_with_host(
+            &self,
+            _: serde_json::Value,
+            _: crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::Outcome {
+            let result = host.call("child", serde_json::json!({"value":"ok"})).await;
+            assert!(matches!(
+                host.call("blocked", serde_json::json!({"value":"ok"}))
+                    .await,
+                crate::Outcome::Skipped(_)
+            ));
+            assert!(matches!(
+                host.call("child", serde_json::json!({})).await,
+                crate::Outcome::Skipped(_)
+            ));
+            result
+        }
+    }
+    struct Child {
+        name: &'static str,
+        count: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Tool for Child {
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: self.name.into(),
+                description: "Child".into(),
+                parameters: serde_json::json!({"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            crate::Outcome::Succeeded("child result".into())
+        }
+    }
+    struct BundleExtension(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Extension for BundleExtension {
+        fn id(&self) -> &str {
+            "bundle-extension"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![
+                Arc::new(Bundle),
+                Arc::new(Child {
+                    name: "child",
+                    count: self.0.clone(),
+                }),
+                Arc::new(Child {
+                    name: "blocked",
+                    count: self.0.clone(),
+                }),
+            ]
+        }
+        async fn before_tool(
+            &self,
+            name: &str,
+            _: &serde_json::Value,
+            _: &crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::Decision> {
+            Ok(if name == "blocked" {
+                crate::Decision::Deny("blocked".into())
+            } else {
+                crate::Decision::Allow
+            })
+        }
+    }
+    #[tokio::test]
+    async fn nested_tools_are_journaled_and_cannot_bypass_policy_or_schema() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut session = SessionBuilder::new(Arc::new(NestedModel), "nested")
+            .extension(Arc::new(BundleExtension(count.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.prompt("run bundle").await.unwrap(), "done");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let plans = session
+            .journal()
+            .records()
+            .iter()
+            .filter(|record| matches!(record.event, crate::Event::ToolPlanned { .. }))
+            .count();
+        assert_eq!(plans, 3);
+        assert_eq!(session.journal().operations().len(), 4);
+        assert!(
+            session
+                .journal()
+                .operations()
+                .iter()
+                .all(|(_, state)| matches!(state, crate::OperationState::Finished(_)))
+        );
+        session.close().await.unwrap();
+    }
+    struct ParallelBundle;
+    #[async_trait::async_trait]
+    impl crate::Tool for ParallelBundle {
+        fn spec(&self) -> crate::ToolSpec {
+            Bundle.spec()
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            crate::Outcome::Failed("host required".into())
+        }
+        async fn invoke_with_host(
+            &self,
+            _: serde_json::Value,
+            _: crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::Outcome {
+            let results = futures_util::future::join_all(
+                (0..2).map(|_| host.call("barrier", serde_json::json!({}))),
+            )
+            .await;
+            assert!(
+                results
+                    .iter()
+                    .all(|outcome| matches!(outcome, crate::Outcome::Succeeded(_)))
+            );
+            crate::Outcome::Succeeded("child result".into())
+        }
+    }
+    struct BarrierTool(Arc<tokio::sync::Barrier>);
+    #[async_trait::async_trait]
+    impl crate::Tool for BarrierTool {
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: "barrier".into(),
+                description: "Parallel read".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> crate::ToolExecution {
+            crate::ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            self.0.wait().await;
+            crate::Outcome::Succeeded("read".into())
+        }
+    }
+    struct ParallelExtension;
+    impl Extension for ParallelExtension {
+        fn id(&self) -> &str {
+            "parallel-bundle"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![
+                Arc::new(ParallelBundle),
+                Arc::new(BarrierTool(Arc::new(tokio::sync::Barrier::new(2)))),
+            ]
+        }
+    }
+    #[tokio::test]
+    async fn nested_parallel_reads_can_progress_together() {
+        let mut session = SessionBuilder::new(Arc::new(NestedModel), "nested")
+            .extension(Arc::new(ParallelExtension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session.prompt("parallel"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, "done");
+        assert_eq!(session.journal().operations().len(), 3);
+        session.close().await.unwrap();
+    }
+    struct BlockingChild {
+        started: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Tool for BlockingChild {
+        fn spec(&self) -> crate::ToolSpec {
+            Child {
+                name: "child",
+                count: self.calls.clone(),
+            }
+            .spec()
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            context: crate::ToolContext,
+        ) -> crate::Outcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            context.cancellation.cancelled().await;
+            crate::Outcome::Unknown("cancelled after starting".into())
+        }
+    }
+    struct BlockingExtension {
+        started: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Extension for BlockingExtension {
+        fn id(&self) -> &str {
+            "blocking-bundle"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![
+                Arc::new(Bundle),
+                Arc::new(BlockingChild {
+                    started: self.started.clone(),
+                    calls: self.calls.clone(),
+                }),
+            ]
+        }
+    }
+    #[tokio::test]
+    async fn cancelling_nested_dispatch_records_unknown_and_blocks_replay() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut session = SessionBuilder::new(Arc::new(NestedModel), "nested")
+            .extension(Arc::new(BlockingExtension {
+                started: started.clone(),
+                calls: calls.clone(),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let controls = session.controls();
+        let (result, ()) = tokio::join!(session.prompt("cancel"), async {
+            started.notified().await;
+            controls.abort();
+        });
+        assert!(matches!(
+            result,
+            Err(Error::Reconciliation(_)) | Err(Error::Cancelled)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(session.journal().operations().len(), 2);
+        assert!(
+            session
+                .journal()
+                .operations()
+                .iter()
+                .all(|(_, state)| matches!(
+                    state,
+                    crate::OperationState::Finished(crate::Outcome::Unknown(_))
+                ))
+        );
+        assert!(matches!(
+            session.resume().await,
+            Err(Error::Reconciliation(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        session.close().await.unwrap();
+    }
     struct WaitingModel;
     #[async_trait::async_trait]
     impl Model for WaitingModel {

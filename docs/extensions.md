@@ -163,3 +163,16 @@ Tools that keep the default `can_poll() == false` continue to use host-owned
 reconciliation. MCP tasks use this API and bind each reference to the configured
 server identity. Cancelling local polling leaves the remote job available for
 later status checks.
+
+## Tools that call other tools
+
+An in-process orchestrating tool can override `invoke_with_host` and use
+`ToolHost::call`. Nested calls use the registry's schemas, pre-tool policies,
+execution ordering and state hooks. The journal records each nested operation
+with its parent operation ID. Only the parent tool result enters model context.
+Consecutive nested parallel reads may overlap; mutating calls stay ordered.
+
+Cancellation after dispatch leaves the affected operations unknown and blocks
+automatic replay. Calls are bounded to eight nesting levels, 4096 nested calls
+per batch, and 1 MiB of arguments. Existing tools continue through their
+original invocation methods.

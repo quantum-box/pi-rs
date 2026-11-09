@@ -266,3 +266,9 @@ Exact exposure overrides and wildcard matching are supported. CLI allowlists
 without MCP names keep MCP discovery available without declaring all schemas.
 Tools receive only their owning extension state through an optional invocation
 hook; existing implementations continue through the original hook.
+
+The core now supplies an orchestrating `ToolHost` for nested calls. Nested
+operations retain individual journal records, use the same validation and
+policies, and preserve uncertainty after cancellation. Tests cover denied and
+invalid calls, concurrent reads and blocked replay after interruption. This is
+the execution boundary for the pending codemode sandbox.

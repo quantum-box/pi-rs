@@ -110,6 +110,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<Uuid>,
     },
+    /// A tool requested by another tool. Only the outer result enters model context.
+    ToolPlanned {
+        invocation: Invocation,
+        parent_operation: Uuid,
+    },
     ToolStarted {
         operation_id: Uuid,
     },
@@ -722,6 +727,10 @@ fn operations(path: &[&Record]) -> Vec<(Invocation, OperationState)> {
                     indices.insert(inv.operation_id, ops.len());
                     ops.push((inv.clone(), OperationState::Planned));
                 }
+            }
+            Event::ToolPlanned { invocation, .. } => {
+                indices.insert(invocation.operation_id, ops.len());
+                ops.push((invocation.clone(), OperationState::Planned));
             }
             Event::ToolStarted { operation_id } => {
                 if let Some(&index) = indices.get(operation_id) {
