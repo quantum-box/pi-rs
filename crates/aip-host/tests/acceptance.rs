@@ -269,6 +269,7 @@ async fn pending_operation_survives_restart_and_is_neither_replayed_nor_double_s
         ..scope
     };
     assert!(another_run_identity.bind(&mut session).is_err());
+    drop(session);
     let contents = std::fs::read_to_string(path).unwrap();
     assert!(!contents.contains("private-fixture-capability"));
     assert!(contents.contains("provider-call-1"));
