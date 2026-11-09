@@ -76,12 +76,20 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                     .or_insert_with(|| json!([]))
                     .as_array_mut()
                     .ok_or_else(|| Error::Config("packages must be an array".into()))?;
-                if !packages
+                let base = settings.parent().expect("settings directory");
+                let mut entry = packages
                     .iter()
-                    .any(|entry| source_field(entry) == Some(source.as_str()))
-                {
-                    packages.push(json!(source));
+                    .rev()
+                    .find(|entry| matches_source(entry, &source, base))
+                    .cloned()
+                    .unwrap_or_else(|| json!(source));
+                if entry.is_object() {
+                    entry["source"] = json!(source);
+                } else {
+                    entry = json!(source);
                 }
+                packages.retain(|entry| !matches_source(entry, &source, base));
+                packages.push(entry);
                 Ok(())
             })?;
             output(json!({"type":"package_installed","source":source}));
@@ -99,7 +107,8 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                     return Err(Error::Config("package is not configured".into()));
                 };
                 let previous = packages.len();
-                packages.retain(|entry| source_field(entry) != Some(target.as_str()));
+                let base = settings.parent().expect("settings directory");
+                packages.retain(|entry| !matches_source(entry, &target, base));
                 if packages.len() == previous {
                     return Err(Error::Config(
                         "package is not configured in this scope".into(),
@@ -115,17 +124,16 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                 .transpose()?;
             let declarations = declarations(args)?;
             if let Some(source) = &requested
-                && !declarations
-                    .iter()
-                    .any(|declaration| &declaration.source == source)
+                && !declarations.iter().any(|declaration| {
+                    source_identity(&declaration.source) == source_identity(source)
+                })
             {
                 return Err(Error::Config("package is not configured".into()));
             }
             for declaration in declarations {
-                if requested
-                    .as_ref()
-                    .is_none_or(|requested| requested == &declaration.source)
-                {
+                if requested.as_ref().is_none_or(|requested| {
+                    source_identity(requested) == source_identity(&declaration.source)
+                }) {
                     install(&declaration.source).await?;
                     output(json!({"type":"package_updated","source":declaration.source}));
                 }
@@ -390,16 +398,17 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                 let source = source_field(value)
                     .ok_or_else(|| Error::Config("package needs a source".into()))?;
                 let source = normalize(source, &base)?;
+                let identity = source_identity(&source);
                 if !project {
-                    global.insert(source.clone(), value.clone());
+                    global.insert(identity.clone(), value.clone());
                 }
                 let inherited = if project && value["autoload"] == false {
-                    global.get(&source).cloned()
+                    global.get(&identity).cloned()
                 } else {
                     None
                 };
                 result.insert(
-                    source.clone(),
+                    identity,
                     Declaration {
                         source,
                         value: value.clone(),
@@ -417,7 +426,7 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     {
         let source = normalize(entry, &args.workspace)?;
         result.insert(
-            source.clone(),
+            source_identity(&source),
             Declaration {
                 value: json!(source),
                 source,
@@ -438,6 +447,9 @@ pub fn is_package_source(source: &str, workspace: &Path) -> bool {
             || normalize(source, workspace).is_ok_and(|path| Path::new(&path).is_dir()))
 }
 fn normalize(source: &str, base: &Path) -> Result<String> {
+    if source.trim().is_empty() {
+        return Err(Error::Config("package source is empty".into()));
+    }
     if let Some(source) = source.strip_prefix("git:") {
         let source = if source.contains("://") || source.starts_with("git@") {
             source.to_owned()
@@ -458,7 +470,8 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
             "native packages use Cargo, git, or local paths".into(),
         ));
     }
-    let path = if let Some(path) = source.strip_prefix("~/") {
+    let path = if source == "~" || source.starts_with("~/") {
+        let path = source.strip_prefix("~/").unwrap_or("");
         PathBuf::from(
             std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
@@ -468,7 +481,56 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
     } else {
         base.join(source)
     };
-    Ok(path.canonicalize()?.to_string_lossy().into_owned())
+    Ok(resolve_source_path(&path)?.to_string_lossy().into_owned())
+}
+fn resolve_source_path(path: &Path) -> Result<PathBuf> {
+    let mut prefix = std::path::absolute(path)?;
+    let mut suffix = Vec::new();
+    loop {
+        match prefix.canonicalize() {
+            Ok(mut resolved) => {
+                for component in suffix.into_iter().rev() {
+                    if component == std::ffi::OsStr::new("..") {
+                        resolved.pop();
+                    } else if component != std::ffi::OsStr::new(".") {
+                        resolved.push(component);
+                    }
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = prefix
+                    .components()
+                    .next_back()
+                    .ok_or(Error::Io(error))?
+                    .as_os_str()
+                    .to_os_string();
+                suffix.push(component);
+                if !prefix.pop() {
+                    return Err(Error::Config(
+                        "package source has no existing parent".into(),
+                    ));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+fn source_identity(source: &str) -> String {
+    if let Some(package) = source.strip_prefix("cargo:") {
+        return format!("cargo:{}", package.split('@').next().unwrap_or(package));
+    }
+    if let Some(source) = source.strip_prefix("git:") {
+        let (url, _) = git_reference(source);
+        let url = url.trim_end_matches('/');
+        return format!("git:{}", url.strip_suffix(".git").unwrap_or(url));
+    }
+    source.into()
+}
+fn matches_source(entry: &Value, source: &str, base: &Path) -> bool {
+    source_field(entry)
+        .and_then(|entry| normalize(entry, base).ok())
+        .is_some_and(|entry| source_identity(&entry) == source_identity(source))
 }
 fn git_reference(source: &str) -> (&str, &str) {
     if let Some(parts) = source.split_once('#') {
@@ -497,6 +559,11 @@ fn index() -> Result<serde_json::Map<String, Value>> {
 }
 
 async fn install(source: &str) -> Result<Installed> {
+    if !source.starts_with("cargo:") && !source.starts_with("git:") && !Path::new(source).exists() {
+        return Err(Error::Config(format!(
+            "local package source does not exist: {source}"
+        )));
+    }
     let directory = config::agent_dir().join("packages").join(key(source));
     std::fs::create_dir_all(&directory)?;
     let lock = std::fs::OpenOptions::new()
@@ -1004,6 +1071,30 @@ mod tests {
             std::fs::read_to_string(second.join(".metadata")).unwrap(),
             "included"
         );
+    }
+
+    #[test]
+    fn identities_ignore_revisions_and_missing_paths_keep_their_identity() {
+        assert_eq!(
+            source_identity("cargo:example@1.2.3"),
+            source_identity("cargo:example@2")
+        );
+        assert_eq!(
+            source_identity("git:https://user@host/repo.git@main"),
+            source_identity("git:https://user@host/repo#feature/next")
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let missing = root.join("deleted");
+        assert_eq!(
+            normalize("deleted/../deleted", &root).unwrap(),
+            missing.to_string_lossy()
+        );
+        assert!(matches_source(
+            &json!({"source":"./deleted", "prompts":[]}),
+            &missing.to_string_lossy(),
+            &root
+        ));
     }
 
     #[test]

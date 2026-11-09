@@ -873,3 +873,16 @@ Unit tests and fullscreen/regular PTY fixtures cover branch navigation,
 folding, search, labels, checkout and terminal restoration. Session and queue
 selector regressions pass. Tree timestamps and richer branch summaries remain
 in the outstanding session work.
+
+### Package identity checkpoint
+
+Cargo version suffixes and Git revisions no longer create separate configured
+identities for the same source. Installing a replacement preserves resource
+filters. Project and transient declarations override the corresponding user
+package even when they select another revision. Removal accepts an unversioned
+source and leaves cached artifacts intact.
+
+Missing local paths retain their resolved identity for listing and removal.
+Installing a missing source fails before settings change. CLI fixtures cover
+version replacement, cross-scope revision overrides, inherited resource deltas,
+deleted-source cleanup and the existing transient/offline behaviors.
