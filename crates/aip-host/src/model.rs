@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use pi_rs_core::{Error, Event, Model, ModelRequest, ModelStream, Result, Session, UsageReport};
+use pi_rs_core::{Error, Event, Model, ModelRequest, ModelStream, Record, Result, UsageReport};
 use uuid::Uuid;
 
 use crate::RunScope;
@@ -46,12 +46,11 @@ impl Model for BudgetedModel<'_> {
 }
 
 impl BudgetedModel<'_> {
-    pub async fn settle_session(&self, session: &Session) -> Result<()> {
+    pub async fn settle_session(&self, records: &[Record]) -> Result<()> {
         let mut requests = BTreeMap::new();
         // Use every record of this AIP run, including a branch the host left
         // after a settled attempt. A model call remains billable after checkout.
-        for record in session
-            .records()
+        for record in records
             .iter()
             .filter(|record| record.run_id == Some(self.scope.journal_run_id))
         {

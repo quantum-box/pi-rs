@@ -157,7 +157,7 @@ impl HostTurn<'_> {
             inner: self.model,
             budget: self.budget,
         };
-        model.settle_session(session).await?;
+        model.settle_session(session.records()).await?;
         let agent = Agent {
             model: &model,
             model_name: self.model_name,
@@ -175,7 +175,7 @@ impl HostTurn<'_> {
                 observer,
             )
             .await;
-        model.settle_session(session).await?;
+        model.settle_session(session.records()).await?;
         result
     }
 }
