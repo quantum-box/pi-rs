@@ -69,3 +69,11 @@ Payment キーはジャーナルのモデル要求 UUID と一致した。Gatewa
 14件と AIP 統合試験10件が通過した。Payment と料金表には試験用実装を使った。
 実際の請求記録、課金結果が不明な場合の復旧、Field への配送は受入が残っている。
 [Payment 接続と検証記録](https://github.com/quantum-box/tachyon-apps/commit/afd3d0bcda2fd1a9487135fbab3e769345aebc07)
+
+モデルが報告した使用量とキャッシュ内訳は、Payment の書込みより先にジャーナルへ
+確定する。AIP の試験では初回の Payment 書込みを失敗させ、セッションを開き直して
+同じモデル要求 UUID と使用量を再送した。モデル呼出しは1回、Run 予算の精算は
+1件だった。再照合以降の実行を止めるため、試験は取消済みのトークンを渡している。
+AIP 統合試験11件が通過した。元の回答の復元、実際の Payment 原票と Field への
+配送は受入が残っている。
+[Payment 書込み失敗後の復旧試験](https://github.com/quantum-box/tachyon-apps/commit/0a43bb9d01750fd04482bc319f231978884fb559)
