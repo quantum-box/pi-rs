@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::ui::{
     editor::Editor,
-    images::{Cleanup, InlineImage, Renderer},
+    images::{self, Cleanup, InlineImage, Renderer},
     keys::Keys,
     picker::{Input, Item, Picker, Selection},
     render::{Entry, Line, ToolPart},
@@ -775,8 +775,12 @@ impl View {
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + 1) as u16))?;
             line.draw(&mut out, width)?;
-            self.graphics
-                .paint(line, &mut out, row, body_height - row)?;
+            self.graphics.paint(
+                line,
+                &mut out,
+                row,
+                images::visible_rows(&lines[start + row..end]),
+            )?;
         }
         let border_row = height - prompt_height - 4 - below.len();
         queue!(out, MoveTo(0, border_row as u16))?;
@@ -897,6 +901,9 @@ impl View {
                 Clear(ClearType::Purge)
             )?;
         }
+        if !redraw {
+            self.graphics.clear_active(&mut out)?;
+        }
         queue!(out, Hide, MoveToColumn(0))?;
         if self.regular.started && !redraw {
             queue!(
@@ -979,8 +986,14 @@ impl View {
             }
             active.extend(widgets);
         }
-        for line in &active {
+        for (row, line) in active.iter().enumerate() {
             line.draw(&mut out, width)?;
+            self.graphics.paint_active(
+                line,
+                &mut out,
+                row,
+                images::visible_rows(&active[row..]),
+            )?;
             queue!(out, Print("\r\n"))?;
         }
         let elapsed = self

@@ -1026,3 +1026,17 @@ refresh, invalid metadata URLs, conflicting options, and fallback to
 confidential dynamic registration. The hosted document is supplied by the
 caller and interpreted by the authorization server. Browser interaction was
 verified with the isolated test launcher.
+
+### Active terminal-image checkpoint
+
+Regular terminal mode now paints images while an agent turn is still active.
+Kitty committed-history and active-region placements use separate placement
+IDs, and active redraws delete only the active placements. Visible-row counts
+stop at image boundaries so cropped images do not cover following widgets.
+The implementation follows the [Kitty placement deletion protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol.html).
+
+PTY fixtures verified blocked model turns with user and tool images for Kitty
+and iTerm2, transition into committed history, draft edits, resize reuse and
+terminal restoration. Fullscreen Kitty clipping and existing image fixtures
+also passed. Workspace tests and all-target Clippy passed on Rust 1.89.
+Partial iTerm2 images remain to be implemented.

@@ -125,6 +125,22 @@ pub struct Placement {
     rows: usize,
     offset: usize,
 }
+/// Count the contiguous visible portion of one image, excluding following text or widgets.
+pub fn visible_rows(lines: &[Line]) -> usize {
+    let Some(first) = lines.first().and_then(|line| line.image.as_ref()) else {
+        return 0;
+    };
+    lines
+        .iter()
+        .enumerate()
+        .take_while(|(index, line)| {
+            line.image.as_ref().is_some_and(|image| {
+                image.image.id == first.image.id && image.offset == first.offset + index
+            })
+        })
+        .count()
+}
+
 #[derive(Clone, Default)]
 pub struct Cleanup(Arc<Mutex<BTreeSet<u32>>>);
 impl Cleanup {
@@ -144,7 +160,7 @@ impl Cleanup {
 pub struct Renderer {
     protocol: Option<Protocol>,
     uploaded: BTreeSet<u32>,
-    placed: BTreeSet<u32>,
+    placed: BTreeSet<(u32, u32)>,
     cleanup: Cleanup,
 }
 impl Default for Renderer {
@@ -170,12 +186,24 @@ impl Renderer {
         self.placed.clear();
     }
     pub fn clear_placements(&mut self, out: &mut impl Write) -> std::io::Result<()> {
-        if self.protocol == Some(Protocol::Kitty) {
-            for id in &self.placed {
-                write!(out, "\x1b_Ga=d,d=i,i={id},q=2\x1b\\")?;
+        self.clear_region(out, None)
+    }
+    pub fn clear_active(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        self.clear_region(out, Some(2))
+    }
+    fn clear_region(&mut self, out: &mut impl Write, region: Option<u32>) -> std::io::Result<()> {
+        let placements: Vec<_> = self
+            .placed
+            .iter()
+            .copied()
+            .filter(|(_, placement)| region.is_none_or(|region| region == *placement))
+            .collect();
+        for (id, placement) in placements {
+            if self.protocol == Some(Protocol::Kitty) {
+                write!(out, "\x1b_Ga=d,d=i,i={id},p={placement},q=2\x1b\\")?;
             }
+            self.placed.remove(&(id, placement));
         }
-        self.placed.clear();
         Ok(())
     }
     pub fn paint(
@@ -185,6 +213,25 @@ impl Renderer {
         row: usize,
         available_rows: usize,
     ) -> std::io::Result<()> {
+        self.paint_region(line, out, row, available_rows, 1)
+    }
+    pub fn paint_active(
+        &mut self,
+        line: &Line,
+        out: &mut impl Write,
+        row: usize,
+        available_rows: usize,
+    ) -> std::io::Result<()> {
+        self.paint_region(line, out, row, available_rows, 2)
+    }
+    fn paint_region(
+        &mut self,
+        line: &Line,
+        out: &mut impl Write,
+        row: usize,
+        available_rows: usize,
+        placement_id: u32,
+    ) -> std::io::Result<()> {
         let Some(placement) = &line.image else {
             return Ok(());
         };
@@ -192,7 +239,7 @@ impl Renderer {
             return Ok(());
         };
         let image = &placement.image;
-        if available_rows == 0 || self.placed.contains(&image.id) {
+        if available_rows == 0 || self.placed.contains(&(image.id, placement_id)) {
             return Ok(());
         }
         if protocol == Protocol::Iterm2
@@ -228,10 +275,15 @@ impl Renderer {
                     .max(1);
                 write!(
                     out,
-                    "\x1b_Ga=p,i={},p=1,c={},r={},y={},h={},C=1,q=2;\x1b\\",
-                    image.id, placement.columns, visible_rows, source_start, source_height
+                    "\x1b_Ga=p,i={},p={},c={},r={},y={},h={},C=1,q=2;\x1b\\",
+                    image.id,
+                    placement_id,
+                    placement.columns,
+                    visible_rows,
+                    source_start,
+                    source_height
                 )?;
-                self.placed.insert(image.id);
+                self.placed.insert((image.id, placement_id));
             }
             Protocol::Iterm2 => {
                 write!(
@@ -239,7 +291,7 @@ impl Renderer {
                     "\x1b]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=1:{}\x07",
                     image.bytes, placement.columns, placement.rows, image.data
                 )?;
-                self.placed.insert(image.id);
+                self.placed.insert((image.id, placement_id));
             }
         }
         queue!(out, RestorePosition)
@@ -359,6 +411,62 @@ mod tests {
         assert!(!next.contains("a=t,f=100"));
         assert!(next.contains("C=1,q=2"));
     }
+    #[test]
+    fn active_placements_preserve_committed_scrollback_images() {
+        let mut renderer = renderer(Protocol::Kitty);
+        let image = fixture();
+        let line = Line {
+            image: Some(Placement {
+                image: image.clone(),
+                columns: 2,
+                rows: 2,
+                offset: 0,
+            }),
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        renderer.paint(&line, &mut output, usize::MAX, 2).unwrap();
+        renderer.paint_active(&line, &mut output, 0, 2).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(&format!("i={},p=1", image.id)));
+        assert!(output.contains(&format!("i={},p=2", image.id)));
+        assert_eq!(output.matches("a=t,f=100").count(), 1);
+        let mut cleared = Vec::new();
+        renderer.clear_active(&mut cleared).unwrap();
+        assert_eq!(
+            String::from_utf8(cleared).unwrap(),
+            format!("\x1b_Ga=d,d=i,i={},p=2,q=2\x1b\\", image.id)
+        );
+        let mut unchanged = Vec::new();
+        renderer
+            .paint(&line, &mut unchanged, usize::MAX, 2)
+            .unwrap();
+        assert!(unchanged.is_empty());
+        renderer.clear_placements(&mut unchanged).unwrap();
+        assert!(
+            String::from_utf8(unchanged)
+                .unwrap()
+                .contains(&format!("i={},p=1", image.id))
+        );
+    }
+
+    #[test]
+    fn visible_image_rows_stop_before_widgets_and_offset_gaps() {
+        let image = fixture();
+        let line = |offset| Line {
+            image: Some(Placement {
+                image: image.clone(),
+                columns: 2,
+                rows: 3,
+                offset,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(visible_rows(&[line(1), line(2), Line::default()]), 2);
+        assert_eq!(visible_rows(&[line(0), line(2)]), 1);
+        assert_eq!(visible_rows(&[Line::default(), line(0)]), 0);
+    }
+
     #[test]
     fn iterm_uses_inline_data_and_restores_the_cursor() {
         let mut renderer = renderer(Protocol::Iterm2);
