@@ -26,6 +26,8 @@ futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 globset = "0.4"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.16"
 ignore = "0.4"
 libc = "0.2"
 jsonschema = { version = "0.33", default-features = false }

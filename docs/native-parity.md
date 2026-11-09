@@ -494,3 +494,17 @@ tool definitions. Journaled extension state remains available after the worker
 and registry restart. A PTY fixture built two versions of a Rust executable,
 invoked each version's tool through a model round trip, and verified that the
 same saved notes reached both requests.
+
+### Streaming search checkpoint
+
+`grep` streams files with the native ripgrep libraries, supports surrounding
+context lines, bounds long displayed lines at 500 characters, and reports match
+and byte limits. Large text files remain searchable. Adjacent context ranges
+are combined. Search memory is bounded at 64 MiB, and the configurable context
+radius is limited to 1,000 lines.
+
+`find` uses a 1,000-result default and reports result limits. `ls` sorts names
+case-insensitively, identifies linked directories, reports entry limits and
+labels empty directories. Head truncation preserves complete lines where they
+fit. Fixtures cover large-file search, Unicode and literal patterns, context,
+empty directory output and continuation notices.

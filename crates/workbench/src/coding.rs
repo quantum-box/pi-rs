@@ -154,19 +154,19 @@ impl Tool for CodingTool {
             Kind::Grep => (
                 "grep",
                 "Search UTF-8 file contents. Respects ignore files and returns path, line number, and matching text.",
-                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":1000}}),
+                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0,"maximum":1000},"limit":{"type":"integer","minimum":1,"maximum":100000}}),
                 vec!["pattern"],
             ),
             Kind::Find => (
                 "find",
                 "Find workspace files matching a glob. Respects ignore files.",
-                json!({"pattern":{"type":"string"},"path":path,"limit":{"type":"integer","minimum":1,"maximum":1000}}),
+                json!({"pattern":{"type":"string"},"path":path,"limit":{"type":"integer","minimum":1,"maximum":100000}}),
                 vec!["pattern"],
             ),
             Kind::List => (
                 "ls",
                 "List the immediate entries in a workspace directory.",
-                json!({"path":path,"limit":{"type":"integer","minimum":1,"maximum":1000}}),
+                json!({"path":path,"limit":{"type":"integer","minimum":1,"maximum":100000}}),
                 vec![],
             ),
         };
@@ -432,31 +432,48 @@ impl CodingTool {
 
     fn list(&self, args: &Value) -> Result<String> {
         let path = self.path(args["path"].as_str().unwrap_or("."))?;
-        let limit = args["limit"].as_u64().unwrap_or(500).min(1000) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         let mut entries = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        Ok(bounded(
+        entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let metadata = std::fs::metadata(entry.path()).ok()?;
+                Some(format!(
+                    "{}{}",
+                    entry.file_name().to_string_lossy(),
+                    if metadata.is_dir() { "/" } else { "" }
+                ))
+            })
+            .collect();
+        if entries.is_empty() {
+            return Ok("(empty directory)".into());
+        }
+        let mut output = bounded(
             entries
-                .into_iter()
+                .iter()
                 .take(limit)
-                .map(|entry| {
-                    let suffix = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                        "/"
-                    } else {
-                        ""
-                    };
-                    format!("{}{suffix}", entry.file_name().to_string_lossy())
-                })
+                .cloned()
                 .collect::<Vec<_>>()
                 .join("\n"),
-        ))
+        );
+        if entries.len() > limit {
+            output.push_str(&format!(
+                "\n\n[{limit} entries limit reached. Use limit={} for more.]",
+                limit.saturating_mul(2)
+            ));
+        }
+        Ok(output)
     }
 
     fn search(&self, args: &Value) -> Result<String> {
         let base = self.path(args["path"].as_str().unwrap_or("."))?;
-        let limit = args["limit"].as_u64().unwrap_or(100).min(1000) as usize;
-        let pattern = string(args, "pattern")?;
         let is_find = matches!(self.kind, Kind::Find);
+        let limit = args["limit"]
+            .as_u64()
+            .unwrap_or(if is_find { 1000 } else { 100 })
+            .min(100_000) as usize;
+        let pattern = string(args, "pattern")?;
         let glob = if is_find {
             Some(pattern)
         } else {
@@ -466,20 +483,10 @@ impl CodingTool {
         .transpose()
         .map_err(|error| Error::Config(error.to_string()))?
         .map(|glob| glob.compile_matcher());
-        let pattern = if args["literal"] == true {
-            regex::escape(pattern)
-        } else {
-            pattern.to_owned()
-        };
-        let regex = if is_find {
+        let mut grep = if is_find {
             None
         } else {
-            Some(
-                regex::RegexBuilder::new(&pattern)
-                    .case_insensitive(args["ignoreCase"] == true)
-                    .build()
-                    .map_err(|error| Error::Config(error.to_string()))?,
-            )
+            Some(crate::file_search::Grep::new(args, limit)?)
         };
         let mut results = Vec::new();
         for entry in ignore::WalkBuilder::new(&base)
@@ -503,23 +510,34 @@ impl CodingTool {
             {
                 continue;
             }
-            if is_find {
+            if let Some(grep) = &mut grep {
+                if !grep.search(entry.path(), &relative.to_string_lossy())? {
+                    break;
+                }
+            } else {
                 results.push(relative.display().to_string());
-            } else if let Ok(content) = self.text(entry.path()) {
-                for (line, text) in content.lines().enumerate() {
-                    if regex.as_ref().is_some_and(|regex| regex.is_match(text)) {
-                        results.push(format!("{}:{}:{text}", relative.display(), line + 1));
-                    }
-                    if results.len() >= limit {
-                        break;
-                    }
+                if results.len() >= limit {
+                    break;
                 }
             }
-            if results.len() >= limit {
-                break;
-            }
         }
-        Ok(bounded(results.join("\n")))
+        Ok(match grep {
+            Some(grep) => grep.finish(),
+            None => {
+                if results.is_empty() {
+                    return Ok("No files found matching pattern".into());
+                }
+                let reached = results.len() >= limit;
+                let mut output = bounded(results.join("\n"));
+                if reached {
+                    output.push_str(&format!(
+                        "\n\n[{limit} results limit reached. Use limit={} for more.]",
+                        limit.saturating_mul(2)
+                    ));
+                }
+                output
+            }
+        })
     }
 
     async fn bash(&self, args: &Value) -> Result<String> {
@@ -711,6 +729,9 @@ fn bounded(mut output: String) -> String {
         let mut end = MAX_OUTPUT_BYTES;
         while !output.is_char_boundary(end) {
             end -= 1;
+        }
+        if let Some(newline) = output[..end].rfind('\n') {
+            end = newline;
         }
         output.truncate(end);
         output.push_str("\n[Output truncated at 50 KiB]");
@@ -944,6 +965,24 @@ mod tests {
     }
 
     #[test]
+    fn directory_output_sorts_case_insensitively_and_reports_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: false,
+            kind: Kind::List,
+        };
+        assert_eq!(tool.list(&json!({})).unwrap(), "(empty directory)");
+        std::fs::write(root.path().join("Zeta"), "").unwrap();
+        std::fs::write(root.path().join("alpha"), "").unwrap();
+        std::fs::create_dir(root.path().join("Beta")).unwrap();
+        assert_eq!(tool.list(&json!({})).unwrap(), "alpha\nBeta/\nZeta");
+        let output = tool.list(&json!({"limit":1})).unwrap();
+        assert!(output.starts_with("alpha\n"));
+        assert!(output.contains("1 entries limit reached"));
+    }
+
+    #[test]
     fn glob_search_and_file_scoped_grep_use_the_correct_matcher() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
@@ -964,7 +1003,7 @@ mod tests {
         assert_eq!(
             tool.search(&json!({"pattern":"fn", "path":"main.rs"}))
                 .unwrap(),
-            "main.rs:1:fn main() {}"
+            "main.rs:1: fn main() {}"
         );
     }
 

@@ -16,6 +16,7 @@ const MAX_FILE: u64 = 64 * 1024;
 const MAX_COMMAND_INPUT: u64 = 1024 * 1024;
 
 pub mod coding;
+mod file_search;
 pub mod mcp;
 mod shell_output;
 mod text_page;
