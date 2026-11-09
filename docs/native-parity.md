@@ -1312,3 +1312,19 @@ zero usage and cached-input accounting. Loopback Ollama checks verify early
 compaction from usage, measured RPC counts and fallback counts after an edit.
 Provider-specific reasoning handling and complete native prompt checkpointing
 remain open.
+
+### Directory listing limits checkpoint
+
+Directory listings now use the reference's combined notice when both the entry
+limit and 50 KB output limit are reached. The byte limit retains whole output
+lines, including an entry ending exactly at 50 KB, and the limit-only notice
+matches Pi's wording and punctuation. Listing
+stops reading entry metadata after the requested number of successful entries,
+and a file supplied as the directory reports `Not a directory`.
+
+The boundary regression creates 301 long filenames and verifies entry-only,
+byte-only and combined limits. The same cases were executed against the pinned
+Pi distribution, which returned the same 254 retained lines and notices. A
+second fixture verifies 256 entries ending exactly at the byte boundary. This
+covers listing limits; complete locale collation, structured tool details and
+other local-tool output/error parity remain open.

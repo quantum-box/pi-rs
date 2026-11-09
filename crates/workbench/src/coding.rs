@@ -234,7 +234,7 @@ impl Tool for CodingTool {
             ),
             Kind::List => (
                 "ls",
-                "List the immediate entries in a workspace directory.",
+                "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
                 json!({"path":path,"limit":{"type":"integer","minimum":1,"maximum":100000}}),
                 vec![],
             ),
@@ -472,35 +472,56 @@ impl CodingTool {
     fn list(&self, args: &Value) -> Result<String> {
         let path = self.path(args["path"].as_str().unwrap_or("."))?;
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
-        let mut entries = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+        if !path.is_dir() {
+            return Err(Error::Config(format!(
+                "Not a directory: {}",
+                path.display()
+            )));
+        }
+        let mut entries = std::fs::read_dir(&path)
+            .map_err(|error| Error::Config(format!("Cannot read directory: {error}")))?
+            .collect::<std::io::Result<Vec<_>>>()?;
         entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
-        let entries: Vec<_> = entries
-            .into_iter()
-            .filter_map(|entry| {
-                let metadata = std::fs::metadata(entry.path()).ok()?;
-                Some(format!(
+        let mut results = Vec::new();
+        let mut entry_limit_reached = false;
+        for entry in entries {
+            if results.len() >= limit {
+                entry_limit_reached = true;
+                break;
+            }
+            if let Ok(metadata) = std::fs::metadata(entry.path()) {
+                results.push(format!(
                     "{}{}",
                     entry.file_name().to_string_lossy(),
                     if metadata.is_dir() { "/" } else { "" }
-                ))
-            })
-            .collect();
-        if entries.is_empty() {
+                ));
+            }
+        }
+        if results.is_empty() {
             return Ok("(empty directory)".into());
         }
-        let mut output = bounded(
-            entries
+        let mut output = results.join("\n");
+        let byte_limit_reached = output.len() > MAX_OUTPUT_BYTES;
+        if byte_limit_reached {
+            // Pi retains complete output lines and adds one combined notice.
+            let end = output.as_bytes()[..=MAX_OUTPUT_BYTES]
                 .iter()
-                .take(limit)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        if entries.len() > limit {
-            output.push_str(&format!(
-                "\n\n[{limit} entries limit reached. Use limit={} for more.]",
+                .rposition(|byte| *byte == b'\n')
+                .unwrap_or(0);
+            output.truncate(end);
+        }
+        let mut notices = Vec::new();
+        if entry_limit_reached {
+            notices.push(format!(
+                "{limit} entries limit reached. Use limit={} for more",
                 limit.saturating_mul(2)
             ));
+        }
+        if byte_limit_reached {
+            notices.push("50.0KB limit reached".into());
+        }
+        if !notices.is_empty() {
+            output.push_str(&format!("\n\n[{}]", notices.join(". ")));
         }
         Ok(output)
     }
@@ -1155,6 +1176,72 @@ mod tests {
         let output = tool.list(&json!({"limit":1})).unwrap();
         assert!(output.starts_with("alpha\n"));
         assert!(output.contains("1 entries limit reached"));
+    }
+
+    #[test]
+    fn directory_byte_limit_keeps_complete_entries_and_combines_notices() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: false,
+            kind: Kind::List,
+        };
+        let names: Vec<_> = (0..301)
+            .map(|index| format!("{index:03}-{}", "x".repeat(196)))
+            .collect();
+        for name in &names {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        let output = tool.list(&json!({"limit":300})).unwrap();
+        let (body, notice) = output.rsplit_once("\n\n").unwrap();
+        assert!(body.len() <= MAX_OUTPUT_BYTES);
+        assert_eq!(body.lines().collect::<Vec<_>>(), names[..254]);
+        assert_eq!(
+            notice,
+            "[300 entries limit reached. Use limit=600 for more. 50.0KB limit reached]"
+        );
+        let output = tool.list(&json!({"limit":301})).unwrap();
+        assert!(output.ends_with("\n\n[50.0KB limit reached]"));
+        let output = tool.list(&json!({"limit":1})).unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "{}\n\n[1 entries limit reached. Use limit=2 for more]",
+                names[0]
+            )
+        );
+        assert!(
+            tool.list(&json!({"path":names[0]}))
+                .unwrap_err()
+                .to_string()
+                .contains("Not a directory:")
+        );
+    }
+
+    #[test]
+    fn directory_byte_limit_includes_an_entry_ending_exactly_at_the_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: false,
+            kind: Kind::List,
+        };
+        let names: Vec<_> = (0..257)
+            .map(|index| {
+                format!(
+                    "{index:03}-{}",
+                    "x".repeat(if index < 255 { 195 } else { 196 })
+                )
+            })
+            .collect();
+        for name in &names {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        let output = tool.list(&json!({})).unwrap();
+        let (body, notice) = output.rsplit_once("\n\n").unwrap();
+        assert_eq!(body.len(), MAX_OUTPUT_BYTES);
+        assert_eq!(body.lines().collect::<Vec<_>>(), names[..256]);
+        assert_eq!(notice, "[50.0KB limit reached]");
     }
 
     #[test]
