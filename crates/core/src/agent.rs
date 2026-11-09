@@ -962,7 +962,8 @@ impl Agent<'_> {
         }) {
             8 * 1024 * 1024
         } else {
-            1024 * 1024
+            self.registry.tools.get(&invocation.call.name)
+                .map_or(1024 * 1024, |tool| tool.tool.output_limit().min(8 * 1024 * 1024))
         };
         let outcome = match outcome {
             Outcome::Succeeded(output) if output.len() > max_output_bytes => Outcome::Truncated {

@@ -25,7 +25,7 @@ impl Runtime {
                 output_tokens_per_request: args.max_output_tokens,
                 output_tokens_per_run: args.output_budget,
                 model_timeout: Duration::from_secs(args.model_timeout_secs),
-                tool_timeout: Duration::from_secs(args.tool_timeout_secs),
+                tool_timeout: args.tool_timeout(),
                 context_window: args.context_window,
             },
         }
@@ -117,7 +117,7 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
                 inline_budget: args.settings.value()["codemode"]["inlineBudget"].as_u64().unwrap_or(3000).min(100_000) as usize,
-                timeout: Duration::from_secs(args.tool_timeout_secs),
+                timeout: args.tool_timeout(),
             }));
         }
         if let Some(project) = &args.project

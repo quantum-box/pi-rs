@@ -98,6 +98,9 @@ struct ScriptTool {
 }
 #[async_trait::async_trait]
 impl Tool for ScriptTool {
+    fn output_limit(&self) -> usize {
+        8 * 1024 * 1024
+    }
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ID.into(),
@@ -158,15 +161,12 @@ impl Tool for ScriptTool {
             Ok(result) => (result.ok, result.changed, result.store, result.error),
             Err(error) => (false, false, json!({}), Some(error)),
         };
-        let output = match sink.lock().expect("codemode output").finish(
+        let output = sink.lock().expect("codemode output").finish(
             success,
             started.elapsed(),
             error.as_deref(),
             options.max_output_tokens,
-        ) {
-            Ok(output) => output,
-            Err(error) => return Outcome::Failed(error.to_string()).into(),
-        };
+        );
         let outcome = if success {
             Outcome::Structured {
                 data: output,
@@ -174,10 +174,13 @@ impl Tool for ScriptTool {
             }
         } else {
             Outcome::Failed(
-                output["content"][0]["text"]
-                    .as_str()
-                    .unwrap_or("Script failed")
-                    .into(),
+                output["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             )
         };
         ToolReply {
@@ -441,13 +444,14 @@ struct Output {
     console: Vec<String>,
     bytes: usize,
     calls: usize,
+    saved_images: std::collections::BTreeMap<String, std::result::Result<String, String>>,
 }
 enum Item {
     Text(String),
     Image {
         mime: String,
         data: String,
-        path: String,
+        path: std::result::Result<String, String>,
     },
 }
 impl Output {
@@ -485,17 +489,17 @@ impl Output {
                 if !valid {
                     return Err("Image data does not match its MIME type".into());
                 }
-                let mut file = tempfile::Builder::new()
-                    .prefix("pi-image-")
-                    .suffix(suffix)
-                    .tempfile()
-                    .map_err(|error| error.to_string())?;
-                file.write_all(&bytes).map_err(|error| error.to_string())?;
-                let (_, path) = file.keep().map_err(|error| error.to_string())?;
+                let path = self
+                    .saved_images
+                    .entry(data.to_owned())
+                    .or_insert_with(|| {
+                        save_output("pi-image-", suffix, &bytes).map_err(|error| error.to_string())
+                    })
+                    .clone();
                 self.items.push(Item::Image {
                     mime: mime.into(),
                     data: data.into(),
-                    path: path.to_string_lossy().into(),
+                    path,
                 });
             }
             _ => return Err("Unknown output kind".into()),
@@ -508,12 +512,11 @@ impl Output {
         elapsed: Duration,
         error: Option<&str>,
         tokens: usize,
-    ) -> std::io::Result<Value> {
-        let mut report = format!(
+    ) -> Value {
+        let mut content = vec![json!({"type":"text","text":format!(
             "Script {}\nWall time: {:.3}s\n",
-            if success { "completed" } else { "failed" },
-            elapsed.as_secs_f64()
-        );
+            if success { "completed" } else { "failed" }, elapsed.as_secs_f64()
+        )})];
         let text_count = self
             .items
             .iter()
@@ -524,65 +527,108 @@ impl Output {
             match item {
                 Item::Text(text) => {
                     index += 1;
-                    if text_count > 1 {
-                        report.push_str(&format!("==> text {index}/{text_count} <==\n"));
-                    }
-                    report.push_str(text);
-                    report.push('\n');
+                    let text = if text_count > 1 {
+                        format!("==> text {index}/{text_count} <==\n{text}")
+                    } else {
+                        text.clone()
+                    };
+                    content.push(json!({"type":"text","text":text}));
                 }
-                Item::Image { path, .. } => {
-                    report.push_str(&format!("Image saved to {path}\n"));
+                Item::Image { mime, data, path } => {
+                    let label = match path {
+                        Ok(path) => format!("Image saved to {path}"),
+                        Err(error) => format!("Image could not be saved: {error}"),
+                    };
+                    content.push(json!({"type":"text","text":label}));
+                    content.push(json!({"type":"image","mimeType":mime,"data":data}));
                 }
             }
         }
         if !self.console.is_empty() {
-            report.push_str("<console_output>\n");
-            report.push_str(&self.console.join("\n"));
-            report.push_str("\n</console_output>\n");
+            content.push(json!({"type":"text","text":format!("<console_output>\n{}\n</console_output>", self.console.join("\n"))}));
         }
         if let Some(error) = error {
-            report.push_str("Script error: ");
-            report.push_str(error);
+            content.push(json!({"type":"text","text":format!("Script error: {error}")}));
         }
+        let mut merged: Vec<Value> = Vec::new();
+        for block in content {
+            if block["type"] == "text"
+                && let Some(last) = merged.last_mut().filter(|last| last["type"] == "text")
+                && let Some(Value::String(text)) = last.get_mut("text")
+            {
+                let next = block["text"].as_str().unwrap_or_default();
+                if !text.ends_with('\n') && !next.starts_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(next);
+            } else {
+                merged.push(block);
+            }
+        }
+        let mut content = merged;
+        let report = content
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let maximum = tokens.saturating_mul(4).min(100 * 1024);
         let characters: Vec<_> = report.chars().collect();
-        let full_output_path = if characters.len() > maximum {
-            let mut file = tempfile::Builder::new()
-                .prefix("pi-output-")
-                .suffix(".txt")
-                .tempfile()?;
-            file.write_all(report.as_bytes())?;
-            let (_, path) = file.keep().map_err(|error| error.error)?;
-            let half = (maximum / 2).min(characters.len());
-            report = format!(
-                "{}\n… output omitted …\n{}",
-                characters[..half].iter().collect::<String>(),
-                characters[characters.len() - half..]
+        let mut full_output_path = None;
+        if characters.len() > maximum {
+            let (location, path) = match save_output("pi-output-", ".txt", report.as_bytes()) {
+                Ok(path) => (format!("Full output: {path}"), Some(path)),
+                Err(error) => (format!("Could not save the full output: {error}"), None),
+            };
+            full_output_path = path;
+            let head = maximum / 2;
+            let tail = maximum - head;
+            let report = format!(
+                "Warning: truncated output (original token count: {})\nTotal output lines: {}\n\n{}…{} tokens truncated…{}\n\n[{location}]",
+                characters.len().div_ceil(4),
+                report.lines().count(),
+                characters[..head].iter().collect::<String>(),
+                (characters.len() - maximum).div_ceil(4),
+                characters[characters.len() - tail..]
                     .iter()
                     .collect::<String>()
             );
-            Some(path.to_string_lossy().into_owned())
-        } else {
-            None
-        };
-        if let Some(path) = &full_output_path {
-            report.push_str(&format!("\nFull output: {path}"));
+            content.retain(|block| block["type"] == "image");
+            content.insert(0, json!({"type":"text","text":report}));
         }
-        let mut content = vec![json!({"type":"text","text":report})];
-        let mut image_budget =
-            (900usize * 1024).saturating_sub(serde_json::to_vec(&content).unwrap().len());
-        for item in &self.items {
-            if let Item::Image { mime, data, .. } = item
-                && data.len() + 100 <= image_budget
-            {
-                image_budget -= data.len() + 100;
-                content.push(json!({"type":"image","mimeType":mime,"data":data}));
+        let text_size = content
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .map(|block| block.to_string().len())
+            .sum::<usize>();
+        let mut image_budget = (7 * 1024 * 1024_usize).saturating_sub(text_size);
+        let mut omitted = 0;
+        content.retain(|block| {
+            if block["type"] != "image" {
+                return true;
             }
+            let size = block.to_string().len();
+            if size > image_budget {
+                omitted += 1;
+                return false;
+            }
+            image_budget -= size;
+            true
+        });
+        if omitted != 0 {
+            content.push(json!({"type":"text","text":format!("{omitted} image(s) omitted from inline output because of the result size limit. Image locations and save errors are included in the text output.")}));
         }
-        Ok(
-            json!({"content":content,"isError":!success,"full_output_path":full_output_path,"wall_time_seconds":elapsed.as_secs_f64()}),
-        )
+        json!({"content":content,"isError":!success,"full_output_path":full_output_path,"wall_time_seconds":elapsed.as_secs_f64()})
     }
+}
+
+fn save_output(prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<String> {
+    let mut file = tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(suffix)
+        .tempfile()?;
+    file.write_all(bytes)?;
+    let (_, path) = file.keep().map_err(|error| error.error)?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -696,7 +742,7 @@ mod tests {
             data["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("omitted")
+                .contains("Warning: truncated output")
         );
         std::fs::remove_file(path).unwrap();
     }
@@ -713,6 +759,127 @@ mod tests {
             Outcome::Failed(_)
         ));
     }
+    #[test]
+    fn images_preserve_output_order_and_reuse_saved_files() {
+        let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
+        let image = json!({"type":"image","mimeType":"image/png","data":data}).to_string();
+        let mut output = Output::default();
+        output.emit("text", "before".into()).unwrap();
+        output.emit("image", image.clone()).unwrap();
+        output.emit("text", "between".into()).unwrap();
+        output.emit("image", image).unwrap();
+        output.emit("text", "after".into()).unwrap();
+        let value = output.finish(true, Duration::ZERO, None, 10000);
+        let blocks = value["content"].as_array().unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["text", "image", "text", "image", "text"]
+        );
+        assert!(blocks[0]["text"].as_str().unwrap().contains("before"));
+        assert!(blocks[2]["text"].as_str().unwrap().contains("between"));
+        assert!(blocks[4]["text"].as_str().unwrap().contains("after"));
+        assert_eq!(output.saved_images.len(), 1);
+        std::fs::remove_file(
+            output
+                .saved_images
+                .values()
+                .next()
+                .unwrap()
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn image_save_failures_keep_successful_output_and_inline_content() {
+        let output = Output {
+            items: vec![Item::Image {
+                mime: "image/png".into(),
+                data: "image".into(),
+                path: Err("disk unavailable".into()),
+            }],
+            ..Output::default()
+        };
+        let value = output.finish(true, Duration::ZERO, None, 10000);
+        assert_eq!(value["isError"], false);
+        assert!(
+            value["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not be saved")
+        );
+        assert_eq!(value["content"][1]["type"], "image");
+    }
+
+    struct LargeImageModel;
+    #[async_trait::async_trait]
+    impl pi_rs_core::Model for LargeImageModel {
+        async fn stream(
+            &self,
+            request: ModelRequest,
+        ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+            use pi_rs_core::{Message, ModelEvent, ToolCall};
+            let events = if let Some(content) = request.messages.iter().find_map(|message| {
+                if let Message::Tool { content, .. } = message {
+                    Some(content)
+                } else {
+                    None
+                }
+            }) {
+                let value: Value = serde_json::from_str(content).unwrap();
+                let blocks = value["data"]["content"].as_array().unwrap();
+                let image = blocks
+                    .iter()
+                    .find(|block| block["type"] == "image")
+                    .unwrap();
+                assert!(image["data"].as_str().unwrap().len() > 1024 * 1024);
+                let label = blocks[0]["text"].as_str().unwrap();
+                let path = label
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Image saved to "))
+                    .unwrap();
+                std::fs::remove_file(path).unwrap();
+                vec![
+                    Ok(ModelEvent::Text("done".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ]
+            } else {
+                let prefix =
+                    base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
+                let code = format!(
+                    "image({{type:'image',mimeType:'image/png',data:'{prefix}'+'AAAA'.repeat(300000)}}); store('saved',true);"
+                );
+                vec![Ok(ModelEvent::Complete {
+                    calls: vec![ToolCall {
+                        id: "image-script".into(),
+                        name: "codemode".into(),
+                        arguments: json!({"code":code}).to_string(),
+                    }],
+                    usage: None,
+                })]
+            };
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+    #[tokio::test]
+    async fn large_inline_images_survive_the_journal_result_limit() {
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(LargeImageModel), "image")
+            .extension(Arc::new(Codemode::default()))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.prompt("image").await.unwrap(), "done");
+        assert_eq!(session.journal().extension_states()[ID].data["saved"], true);
+        session.close().await.unwrap();
+    }
+
     struct ParallelTool(Arc<tokio::sync::Barrier>);
     #[async_trait::async_trait]
     impl Tool for ParallelTool {

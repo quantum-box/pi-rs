@@ -45,9 +45,10 @@ impl Worker {
             .arg("--output-budget")
             .arg(args.output_budget.to_string())
             .arg("--model-timeout-secs")
-            .arg(args.model_timeout_secs.to_string())
-            .arg("--tool-timeout-secs")
-            .arg(args.tool_timeout_secs.to_string());
+            .arg(args.model_timeout_secs.to_string());
+        if let Some(timeout) = args.tool_timeout_secs {
+            command.arg("--tool-timeout-secs").arg(timeout.to_string());
+        }
         if let Some(thinking) = &args.thinking {
             command.arg("--thinking").arg(thinking);
         }

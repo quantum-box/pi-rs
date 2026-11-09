@@ -8,7 +8,7 @@ use crate::ui::{
     images::{Cleanup, InlineImage, Renderer},
     keys::Keys,
     picker::{Input, Item, Picker, Selection},
-    render::{Entry, Line},
+    render::{Entry, Line, ToolPart},
     theme::{Theme, ThemeWatcher},
 };
 use crossterm::cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show};
@@ -254,20 +254,33 @@ impl View {
             output: String::new(),
             failed: false,
             finished: false,
-            images: Vec::new(),
+            parts: Vec::new(),
         });
     }
     fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
-        let rendered_images = if self.graphics.enabled() {
+        let rendered_parts = if self.graphics.enabled() {
             match outcome {
                 pi_rs::Outcome::Structured { data, .. } => data["content"]
                     .as_array()
+                    .filter(|blocks| blocks.iter().any(|block| block["type"] == "image"))
                     .into_iter()
                     .flatten()
-                    .filter_map(|value| {
-                        serde_json::from_value::<pi_rs::ImageContent>(value.clone()).ok()
+                    .filter_map(|value| match value["type"].as_str() {
+                        Some("text") => value["text"]
+                            .as_str()
+                            .map(|text| ToolPart::Text(text.into())),
+                        Some("image") => {
+                            let image =
+                                serde_json::from_value::<pi_rs::ImageContent>(value.clone())
+                                    .ok()
+                                    .and_then(|content| InlineImage::decode(&content));
+                            Some(match image {
+                                Some(image) => ToolPart::Image(image),
+                                None => ToolPart::Text("[image unavailable]".into()),
+                            })
+                        }
+                        _ => None,
                     })
-                    .filter_map(|content| InlineImage::decode(&content))
                     .collect(),
                 _ => Vec::new(),
             }
@@ -278,7 +291,7 @@ impl View {
             output,
             failed,
             finished,
-            images,
+            parts,
             ..
         }) = self
             .lines
@@ -286,7 +299,7 @@ impl View {
             .rev()
             .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == operation))
         {
-            *images = rendered_images;
+            *parts = rendered_parts;
             *output = display_tool_result(outcome);
             *failed = !matches!(
                 outcome,
@@ -361,7 +374,7 @@ impl View {
                                     output: String::new(),
                                     failed: false,
                                     finished: false,
-                                    images: Vec::new(),
+                                    parts: Vec::new(),
                                 });
                             }
                         }

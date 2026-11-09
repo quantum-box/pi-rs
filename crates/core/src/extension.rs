@@ -41,6 +41,10 @@ pub trait Tool: Send + Sync {
     fn execution(&self) -> ToolExecution {
         ToolExecution::Sequential
     }
+    /// Maximum serialized result bytes, bounded by the agent's 8 MiB ceiling.
+    fn output_limit(&self) -> usize {
+        1024 * 1024
+    }
     async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome;
     /// Invoke with this tool's owning extension state from the active branch.
     async fn invoke_with_state(

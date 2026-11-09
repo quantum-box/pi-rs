@@ -23,7 +23,7 @@ remaining acceptance work for that surface.
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; add/remove/list commands | OAuth, reconnect and live tool-list updates, elicitation |
-| Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation, complete output/image fidelity and limits |
+| Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
@@ -300,8 +300,7 @@ private-store persistence across processes, and default MCP discovery and
 execution. Tests cover rollback, interruption, memory/stack limits, output
 truncation and parallel script calls through the core execution host. The
 native JSON code argument differs from Pi's provider-specific raw-code input.
-Non-chat model APIs, complete image ordering and large-image behavior remain
-open. Executable extensions still lack bidirectional host-tool invocation.
+Non-chat model APIs and remaining execution-limit differences remain open. Executable extensions still lack bidirectional host-tool invocation.
 
 ### Resource selection checkpoint
 
@@ -521,3 +520,23 @@ previous index and executable, while successful updates keep build-cache reuse.
 Fixtures cover a local sparse registry, version and resource discovery, resource
 use after Cargo cache removal, and a failed Rust rebuild followed by continued
 use of the previous executable.
+
+### Codemode image output checkpoint
+
+Untruncated script output preserves interleaved text and images, including in
+expanded terminal tool panels. Repeated image bytes share one saved file. Large
+images can remain inline within a bounded 7 MiB result budget; omitted images
+carry a visible notice and retain their file references. Other native tools keep
+their existing default result limit through a source-compatible tool hook.
+
+Image-save and full-output-save failures report diagnostics while preserving a
+successful script's state commit. Truncated text retains its beginning and end,
+a token-count notice and a full-output file when saving succeeds. A real PNG
+fixture verifies large images from MCP through a script, ordered content,
+multimodal forwarding and durable private state.
+
+Local CLI tool deadlines are optional through `--tool-timeout-secs`. Without an
+explicit deadline, scripts and their nested tools can continue beyond 30 seconds,
+up to an internal ceiling of about 24 days. Embedded agents retain their existing
+host-controlled deadline defaults. A CLI fixture verifies a 31-second nested
+shell call and successful continuation of the script.

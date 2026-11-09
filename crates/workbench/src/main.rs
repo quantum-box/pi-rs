@@ -202,8 +202,9 @@ struct Cli {
     output_budget: u32,
     #[arg(long, default_value_t = 120, global = true)]
     model_timeout_secs: u64,
-    #[arg(long, default_value_t = 30, global = true)]
-    tool_timeout_secs: u64,
+    /// Bound tool calls in seconds. Unset permits long-running local operations.
+    #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(0..=2_147_483))]
+    tool_timeout_secs: Option<u64>,
     /// Estimated model context window. Enables bounded automatic compaction.
     #[arg(long, global = true)]
     context_window: Option<u32>,
@@ -224,6 +225,9 @@ struct Cli {
 }
 
 impl Cli {
+    fn tool_timeout(&self) -> Duration {
+        Duration::from_secs(self.tool_timeout_secs.unwrap_or(2_147_483))
+    }
     fn model_token(&self) -> Option<String> {
         self.api_key
             .clone()
@@ -1044,5 +1048,20 @@ fn outcome_status(outcome: &Outcome) -> &'static str {
         Outcome::Pending { .. } => "pending",
         Outcome::Truncated { .. } => "truncated",
         Outcome::Structured { .. } => "succeeded",
+    }
+}
+
+#[cfg(test)]
+mod cli_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn local_tools_have_an_optional_explicit_deadline() {
+        let args = Cli::try_parse_from(["pi"]).unwrap();
+        assert!(args.tool_timeout_secs.is_none());
+        assert!(args.tool_timeout() > Duration::from_secs(30));
+        let args = Cli::try_parse_from(["pi", "--tool-timeout-secs", "1"]).unwrap();
+        assert_eq!(args.tool_timeout(), Duration::from_secs(1));
+        assert!(Cli::try_parse_from(["pi", "--tool-timeout-secs", "2147484"]).is_err());
     }
 }

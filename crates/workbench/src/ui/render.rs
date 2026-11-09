@@ -94,6 +94,12 @@ impl Line {
 }
 
 #[derive(Clone)]
+pub enum ToolPart {
+    Text(String),
+    Image(std::sync::Arc<super::images::InlineImage>),
+}
+
+#[derive(Clone)]
 pub enum Entry {
     Notice(String),
     User(String),
@@ -107,7 +113,7 @@ pub enum Entry {
         output: String,
         failed: bool,
         finished: bool,
-        images: Vec<std::sync::Arc<super::images::InlineImage>>,
+        parts: Vec<ToolPart>,
     },
 }
 impl Entry {
@@ -153,7 +159,7 @@ impl Entry {
                 output,
                 failed,
                 finished,
-                images,
+                parts,
                 ..
             } => {
                 let role = if *failed {
@@ -179,19 +185,28 @@ impl Entry {
                 let mut lines = wrap(&[title], inner);
                 let output_lines: Vec<_> = output.lines().collect();
                 let limit = if expand_tools { output_lines.len() } else { 10 };
-                for text in output_lines.iter().take(limit) {
-                    let color = if name == "edit" && text.starts_with('+') {
-                        "toolDiffAdded"
-                    } else if name == "edit" && text.starts_with('-') {
-                        "toolDiffRemoved"
-                    } else {
-                        "toolOutput"
-                    };
-                    lines.extend(wrap(&[Span::new(*text, theme.color(color))], inner));
-                }
-                if expand_tools {
-                    for image in images {
-                        lines.extend(image.lines(inner));
+                let render_text = |text: &str, lines: &mut Vec<Line>| {
+                    for text in text.split('\n') {
+                        let color = if name == "edit" && text.starts_with('+') {
+                            "toolDiffAdded"
+                        } else if name == "edit" && text.starts_with('-') {
+                            "toolDiffRemoved"
+                        } else {
+                            "toolOutput"
+                        };
+                        lines.extend(wrap(&[Span::new(text, theme.color(color))], inner));
+                    }
+                };
+                if expand_tools && !parts.is_empty() {
+                    for part in parts {
+                        match part {
+                            ToolPart::Text(text) => render_text(text, &mut lines),
+                            ToolPart::Image(image) => lines.extend(image.lines(inner)),
+                        }
+                    }
+                } else {
+                    for text in output_lines.iter().take(limit) {
+                        render_text(text, &mut lines);
                     }
                 }
                 if output_lines.len() > limit {
@@ -547,6 +562,50 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expanded_tools_keep_text_and_images_in_sequence() {
+        use base64::Engine;
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let image = super::super::images::InlineImage::decode(&pi_rs::ImageContent {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
+            mime_type: "image/png".into(),
+        })
+        .unwrap();
+        let entry = Entry::Tool {
+            id: "test".into(),
+            name: "codemode".into(),
+            arguments: "{}".into(),
+            output: "before\n[image]\nafter".into(),
+            failed: false,
+            finished: true,
+            parts: vec![
+                ToolPart::Text("before".into()),
+                ToolPart::Image(image),
+                ToolPart::Text("after".into()),
+            ],
+        };
+        let lines = entry.render(&Theme::system(), 80, true, true);
+        let before = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.text.contains("before")))
+            .unwrap();
+        let image = lines.iter().position(|line| line.image.is_some()).unwrap();
+        let after = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.text.contains("after")))
+            .unwrap();
+        assert!(before < image && image < after);
+        assert!(
+            entry
+                .render(&Theme::system(), 80, false, true)
+                .iter()
+                .all(|line| line.image.is_none())
+        );
+    }
+
     #[test]
     fn tables_align_unicode_cells_and_wrap_at_terminal_width() {
         let source = "| Name | Count |\n| :--- | ---: |\n| 日本語 | 12 |\n| long description | 3 |";
