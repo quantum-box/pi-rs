@@ -81,6 +81,23 @@ impl Resources {
                 (args.project.is_none() || path.exists()).then_some(path)
             })
             .collect();
+        let transient = super::packages::transient_resources(args)?;
+        let explicit_skills: Vec<_> = explicit_skills
+            .into_iter()
+            .chain(transient.skills)
+            .collect();
+        let explicit_prompts: Vec<_> = args
+            .prompt_template
+            .iter()
+            .cloned()
+            .chain(transient.prompts)
+            .collect();
+        let explicit_themes: Vec<_> = args
+            .themes
+            .iter()
+            .cloned()
+            .chain(transient.themes)
+            .collect();
         let skill_roots = resource_paths::resolve(
             args,
             Kind::Skill,
@@ -92,14 +109,18 @@ impl Resources {
             args,
             Kind::Prompt,
             &resources.packages.prompts,
-            &args.prompt_template,
+            &explicit_prompts,
             &mut resources.warnings,
         )?;
         let explicit_extensions: Vec<_> = args
             .extensions
             .iter()
-            .filter(|entry| !resource_paths::named_extension(entry))
+            .filter(|entry| {
+                !resource_paths::named_extension(entry)
+                    && !super::packages::is_package_source(entry, &workspace)
+            })
             .map(PathBuf::from)
+            .chain(transient.extensions)
             .collect();
         resources.extensions = resource_paths::resolve(
             args,
@@ -112,7 +133,7 @@ impl Resources {
             args,
             Kind::Theme,
             &resources.packages.themes,
-            &args.themes,
+            &explicit_themes,
             &mut resources.warnings,
         )?;
         let mut config_directories = vec![agent.clone()];

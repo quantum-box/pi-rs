@@ -56,6 +56,7 @@ struct Installed {
 struct Declaration {
     source: String,
     value: Value,
+    transient: bool,
 }
 
 pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
@@ -150,12 +151,14 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
 pub async fn prepare(args: &Cli) -> Result<()> {
     let mut installed = index()?;
     for declaration in declarations(args)? {
-        if !installed.contains_key(&key(&declaration.source)) {
+        let cached = installed.contains_key(&key(&declaration.source));
+        if declaration.transient || !cached {
             eprintln!("Preparing native package {}", declaration.source);
             match install(&declaration.source).await {
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
+                Err(error) if declaration.transient && !cached => return Err(error),
                 Err(error) => eprintln!("Package {}: {error}", declaration.source),
             }
         }
@@ -164,9 +167,18 @@ pub async fn prepare(args: &Cli) -> Result<()> {
 }
 
 pub fn resources(args: &Cli) -> Result<PackageResources> {
+    resources_for(args, false)
+}
+pub fn transient_resources(args: &Cli) -> Result<PackageResources> {
+    resources_for(args, true)
+}
+fn resources_for(args: &Cli, transient: bool) -> Result<PackageResources> {
     let installed = index()?;
     let mut result = PackageResources::default();
-    for declaration in declarations(args)? {
+    for declaration in declarations(args)?
+        .into_iter()
+        .filter(|entry| entry.transient == transient)
+    {
         let Some(package) = installed.get(&key(&declaration.source)) else {
             continue;
         };
@@ -337,12 +349,37 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
                     Declaration {
                         source,
                         value: value.clone(),
+                        transient: false,
                     },
                 );
             }
         }
     }
+    for entry in args
+        .extensions
+        .iter()
+        .filter(|entry| is_package_source(entry, &args.workspace))
+    {
+        let source = normalize(entry, &args.workspace)?;
+        result.insert(
+            source.clone(),
+            Declaration {
+                value: json!(source),
+                source,
+                transient: true,
+            },
+        );
+    }
     Ok(result.into_values().collect())
+}
+pub fn is_package_source(source: &str, workspace: &Path) -> bool {
+    !super::resource_paths::named_extension(source)
+        && (source.starts_with("cargo:")
+            || source.starts_with("git:")
+            || source.starts_with("https://")
+            || source.starts_with("ssh://")
+            || source.starts_with("git@")
+            || normalize(source, workspace).is_ok_and(|path| Path::new(&path).is_dir()))
 }
 fn normalize(source: &str, base: &Path) -> Result<String> {
     if let Some(source) = source.strip_prefix("git:") {
@@ -376,6 +413,20 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
         base.join(source)
     };
     Ok(path.canonicalize()?.to_string_lossy().into_owned())
+}
+fn git_reference(source: &str) -> (&str, &str) {
+    if let Some(parts) = source.split_once('#') {
+        return parts;
+    }
+    let path_start = if let Some((scheme, rest)) = source.split_once("://") {
+        scheme.len() + 3 + rest.find('/').unwrap_or(rest.len())
+    } else {
+        source.find(':').map_or(0, |index| index + 1)
+    };
+    match source.rfind('@').filter(|index| *index >= path_start) {
+        Some(index) => (&source[..index], &source[index + 1..]),
+        None => (source, "HEAD"),
+    }
 }
 fn key(source: &str) -> String {
     format!("{:x}", Sha256::digest(source.as_bytes()))
@@ -448,9 +499,7 @@ async fn install(source: &str) -> Result<Installed> {
             })?;
         installed_binaries = executable_files(&generation.path().join("cargo/bin"))?;
     } else if let Some(specification) = source.strip_prefix("git:") {
-        let (url, reference) = specification
-            .split_once('#')
-            .unwrap_or((specification, "HEAD"));
+        let (url, reference) = git_reference(specification);
         if let Ok(parsed) = reqwest::Url::parse(url)
             && ((parsed.scheme() != "ssh" && !parsed.username().is_empty())
                 || parsed.password().is_some())
@@ -848,6 +897,31 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn git_revisions_preserve_transport_credentials_and_branch_slashes() {
+        for (source, url, reference) in [
+            (
+                "https://github.com/org/repo@v1",
+                "https://github.com/org/repo",
+                "v1",
+            ),
+            (
+                "https://host/repo@feature/new",
+                "https://host/repo",
+                "feature/new",
+            ),
+            ("ssh://git@host/repo", "ssh://git@host/repo", "HEAD"),
+            ("git@host:org/repo@v1", "git@host:org/repo", "v1"),
+            ("git@host:org/repo", "git@host:org/repo", "HEAD"),
+            (
+                "https://user@host/repo#old",
+                "https://user@host/repo",
+                "old",
+            ),
+        ] {
+            assert_eq!(git_reference(source), (url, reference));
+        }
+    }
     #[test]
     fn registry_bundles_survive_source_removal_and_keep_previous_versions() {
         let root = tempfile::tempdir().unwrap();

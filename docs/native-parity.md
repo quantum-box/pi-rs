@@ -540,3 +540,16 @@ explicit deadline, scripts and their nested tools can continue beyond 30 seconds
 up to an internal ceiling of about 24 days. Embedded agents retain their existing
 host-controlled deadline defaults. A CLI fixture verifies a 31-second nested
 shell call and successful continuation of the script.
+
+### Transient package checkpoint
+
+`-e` accepts native package directories, Cargo sources and Git sources for the
+current invocation. Their declared extensions, skills, prompts and themes stay
+available when automatic resource loading is disabled. Package declarations
+remain absent from settings. Startup and reload refresh transient packages,
+retaining a cached installation if the source temporarily becomes unavailable.
+
+Git sources accept `@tag`, `@branch` and branch names containing slashes, while
+retaining existing `#ref` syntax. Transport usernames remain part of the URL.
+A CLI fixture verifies pinned tags, branch selection, local changes, resource
+loading with automatic discovery disabled and cached offline startup.

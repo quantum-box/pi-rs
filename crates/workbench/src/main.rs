@@ -168,7 +168,7 @@ struct Cli {
     /// Comma-separated tool names/patterns to remove from the selection.
     #[arg(long, global = true)]
     exclude_tools: Option<String>,
-    /// Enable a bundled extension or a native extension executable. Repeatable.
+    /// Load a bundled extension, native executable or package for this invocation. Repeatable.
     #[arg(short = 'e', long = "extension", global = true)]
     extensions: Vec<String>,
     /// Theme name, or a light/dark theme pair for automatic appearance.
