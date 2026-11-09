@@ -113,7 +113,7 @@ Runtime の接続試験4件、AIP API の試験212件が通過した。
 MCP の組合せで、許可取消後、同じ操作 ID の再送時、予算枯渇後のいずれも送信が
 増えず、精算は元の操作 ID の1件のみであることを確認した。応答が確認できない場合は
 照会待ちにし、精算済みの操作は照会時も再送しない。AIP 統合試験12件と API 設定
-試験4件が通過した。実際の Linear 接続と添付参照は受入が残っている。
+試験4件が通過した。AIP 経由の実接続と添付本文の取扱いは受入が残っている。
 
 [予算と試験](https://github.com/quantum-box/tachyon-apps/commit/4c55be4bf7134c1a26cff3735fbbecdc3155253f)
 
@@ -124,6 +124,15 @@ TiDB では、同じ操作 ID の照会で使用量確認待ちの記録が1件�
 [取消通知と試験](https://github.com/quantum-box/tachyon-apps/commit/4e55b9b3acd2666d9574c1863f8f69c25590ec0b)
 
 [接続と試験](https://github.com/quantum-box/tachyon-apps/commit/226dd8830ebf47a6a17174b5ffd1d5f9761f2b8f) · [Linear MCP](https://linear.app/docs/mcp)
+
+### Linear 添付参照（PLT-6383）
+
+`get_issue` の添付は取得先 URL と外部添付 ID を除いた参照で返す。
+`lookup_attachment` は既存の読取り MCP に同じ課題を照会し、現在の添付との対応を
+確認する。隔離 HTTP MCP で署名更新後も参照でき、別の課題・Workspace、取得先変更、
+添付削除では照会を拒否した。接続許可の取消後は追加送信0件。既存の Linear
+コネクターでは添付の形を確認した。統合試験13件、AIP 設定試験5件が通過。
+[添付参照と試験](https://github.com/quantum-box/tachyon-apps/commit/018ceaa0438d5f13ec7a1ae9dad57c5241e674ec)
 
 ## 子レビューの再開と親予算（PLT-6385、PLT-6387）
 
