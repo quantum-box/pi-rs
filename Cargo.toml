@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/fixture-tools", "crates/aip-host", "crates/core", "crates/ollama", "crates/plan-mode", "crates/review", "crates/workbench"]
+members = ["crates/fixture-tools", "crates/aip-host", "crates/core", "crates/ollama", "crates/plan-mode", "crates/review", "crates/extensions", "crates/workbench"]
 resolver = "3"
 
 [package]

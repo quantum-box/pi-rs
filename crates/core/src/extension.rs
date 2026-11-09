@@ -15,7 +15,8 @@ pub struct ToolContext {
     pub cancellation: CancellationToken,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolExecution {
     #[default]
     Sequential,
@@ -63,8 +64,18 @@ pub trait Extension: Send + Sync {
         &[]
     }
 
+    /// Dependency names owned by a runtime-loaded extension.
+    fn dependency_ids(&self) -> Vec<&str> {
+        self.dependencies().to_vec()
+    }
+
     fn commands(&self) -> &[&str] {
         &[]
+    }
+
+    /// Command names owned by a runtime-loaded extension.
+    fn command_names(&self) -> Vec<&str> {
+        self.commands().to_vec()
     }
 
     /// Host-only command. Returns a state change to commit on the active branch.
@@ -177,7 +188,7 @@ impl Registry {
             let index = pending
                 .iter()
                 .position(|extension| {
-                    extension.dependencies().iter().all(|dependency| {
+                    extension.dependency_ids().iter().all(|dependency| {
                         registry
                             .extensions
                             .iter()
@@ -230,7 +241,7 @@ impl Registry {
             )));
         }
         if extension
-            .dependencies()
+            .dependency_ids()
             .iter()
             .any(|dependency| !self.extensions.iter().any(|item| item.id() == *dependency))
         {
@@ -238,8 +249,9 @@ impl Registry {
                 "extension {id:?} has an unavailable dependency"
             )));
         }
-        let commands: BTreeSet<_> = extension.commands().iter().copied().collect();
-        if commands.contains("") || commands.len() != extension.commands().len() {
+        let command_names = extension.command_names();
+        let commands: BTreeSet<_> = command_names.iter().copied().collect();
+        if commands.contains("") || commands.len() != command_names.len() {
             return Err(Error::Config(format!(
                 "extension {id:?} has invalid or duplicate commands"
             )));

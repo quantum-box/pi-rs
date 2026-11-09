@@ -1,12 +1,147 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
+use std::process::Stdio;
 use std::time::Duration;
 
 use pi_rs::{
     Agent, CancellationToken, Limits, MemoryStore, Notification, Registry, Session, ollama::Ollama,
 };
 use serde_json::Value;
+
+#[test]
+fn rpc_correlates_commands_and_rejects_unknown_commands() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .args(["--mode", "rpc", "--no-session"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for request in [
+        r#"{"id":"state","type":"get_state"}"#,
+        r#"{"id":"new","type":"new_session"}"#,
+        r#"{"id":"unknown","type":"unsupported"}"#,
+        r#"{"id":"stop","type":"shutdown"}"#,
+    ] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let replies: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 4);
+    assert_eq!(replies[0]["id"], "state");
+    assert_eq!(replies[0]["data"]["isStreaming"], false);
+    assert_eq!(replies[1]["success"], true);
+    assert_eq!(replies[2]["id"], "unknown");
+    assert_eq!(replies[2]["success"], false);
+    assert_eq!(replies[3]["id"], "stop");
+}
+
+#[test]
+fn native_notes_extension_is_saved_and_restored() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
+    for (command, text) in [("set", "Review parser"), ("append", "Test Unicode")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .arg("--session")
+            .arg(&path)
+            .args(["--extension", "notes", "extension", "notes", command, text])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let session = Session::open(path).unwrap();
+    assert_eq!(
+        session.extension_states()["notes"].data["text"],
+        "Review parser\nTest Unicode"
+    );
+}
+
+#[test]
+fn print_and_json_modes_accept_positional_prompts() {
+    let (endpoint, server) = model_fixture();
+    for mode in ["--print", "--mode"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command.args(["--no-session", "--endpoint", &endpoint, mode]);
+        if mode == "--mode" {
+            command.arg("json");
+        }
+        let output = command.arg("same input").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if mode == "--print" {
+            assert_eq!(stdout, "fixture answer\n");
+        } else {
+            let records: Vec<Value> = stdout
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record["type"] == "answer"
+                        && record["content"] == "fixture answer")
+            );
+        }
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn continue_reopens_the_latest_saved_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", directory.path())
+        .args([
+            "--extension",
+            "notes",
+            "extension",
+            "notes",
+            "set",
+            "remember this",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", directory.path())
+        .args(["--continue", "--trace", "inspect"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("remember this")
+    );
+}
 
 fn model_fixture() -> (String, std::thread::JoinHandle<()>) {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();

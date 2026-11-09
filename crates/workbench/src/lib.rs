@@ -15,6 +15,8 @@ use tokio::io::AsyncReadExt;
 const MAX_FILE: u64 = 64 * 1024;
 const MAX_COMMAND_INPUT: u64 = 1024 * 1024;
 
+pub mod coding;
+
 pub struct Tools {
     root: PathBuf,
     orders: Option<Arc<OrderLookup>>,
@@ -73,11 +75,13 @@ impl Extension for CommandPolicy {
         _: &ToolContext,
         _: Option<&ExtensionState>,
     ) -> ExtensionResult<Decision> {
-        Ok(if name == "count_lines" && !self.allow_commands {
-            Decision::Deny("host command policy requires --allow-commands".into())
-        } else {
-            Decision::Allow
-        })
+        Ok(
+            if matches!(name, "count_lines" | "bash") && !self.allow_commands {
+                Decision::Deny("host command policy requires --allow-commands".into())
+            } else {
+                Decision::Allow
+            },
+        )
     }
 }
 

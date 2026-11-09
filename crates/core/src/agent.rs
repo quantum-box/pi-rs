@@ -847,7 +847,7 @@ impl Agent<'_> {
             .extensions
             .iter()
             .find(|extension| {
-                extension.id() == extension_id && extension.commands().contains(&command)
+                extension.id() == extension_id && extension.command_names().contains(&command)
             })
             .ok_or_else(|| Error::Config("unknown or disabled extension command".into()))?;
         let states = self.migrate(session, observer)?;

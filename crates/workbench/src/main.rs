@@ -1,6 +1,7 @@
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -15,6 +16,12 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod interactive;
+mod process;
+mod rpc;
+
+static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
+
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a workspace assistant. Use tools when needed and answer accurately.";
 
@@ -22,8 +29,19 @@ const DEFAULT_SYSTEM_PROMPT: &str =
 #[command(name = "pi-rs", version, about)]
 struct Cli {
     /// Path to the private append-only session journal.
-    #[arg(long)]
+    #[arg(long, default_value_os_t = interactive::new_session_path())]
     session: PathBuf,
+    /// Continue the latest session for this working directory.
+    #[arg(short = 'c', long = "continue", conflicts_with = "session")]
+    continue_session: bool,
+    /// Keep the session only for this process.
+    #[arg(long, conflicts_with_all = ["session", "continue_session"])]
+    no_session: bool,
+    /// Print the final answer and exit.
+    #[arg(short = 'p', long)]
+    print: bool,
+    #[arg(long, value_enum)]
+    mode: Option<OutputMode>,
     /// Include full requests, tool payloads and streamed text in stdout JSONL.
     #[arg(long, global = true)]
     trace: bool,
@@ -48,6 +66,12 @@ struct Cli {
     skill: Vec<String>,
     #[arg(long, global = true)]
     allow_commands: bool,
+    /// Enable local read, write, edit, bash, grep, find, and ls tools.
+    #[arg(long, global = true)]
+    coding_tools: bool,
+    /// Enable a bundled extension or a native extension executable. Repeatable.
+    #[arg(long = "extension", global = true)]
+    extensions: Vec<String>,
     /// Optional read-only order API collection URL.
     #[arg(long, global = true)]
     orders: Option<String>,
@@ -84,11 +108,23 @@ struct Cli {
     #[arg(long, global = true)]
     disable_extension: Vec<String>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+    /// Initial prompt when no explicit subcommand is used.
+    #[arg(value_name = "PROMPT", num_args = 0.., trailing_var_arg = true)]
+    prompt: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputMode {
+    Text,
+    Json,
+    Rpc,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Open the interactive terminal interface.
+    Interactive,
     Run {
         prompt: String,
     },
@@ -153,14 +189,58 @@ async fn main() {
     }
 }
 
-async fn execute(args: Cli) -> Result<()> {
+async fn execute(mut args: Cli) -> Result<()> {
+    let temporary = args.no_session.then(tempfile::tempdir).transpose()?;
+    if let Some(directory) = &temporary {
+        args.session = directory.path().join("session.jsonl");
+    } else if args.continue_session {
+        args.session = interactive::latest_session(&args.session)?;
+    }
+    if args.mode == Some(OutputMode::Rpc) {
+        return rpc::run(args);
+    }
+    if args.command.is_none() {
+        let mut prompt = args.prompt.join(" ");
+        if !std::io::stdin().is_terminal() && !args.stdin_control {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            if !input.is_empty() {
+                prompt = format!("{input}\n{prompt}");
+            }
+        }
+        if !prompt.trim().is_empty() {
+            args.command = Some(Command::Run { prompt });
+            if args.mode.is_none() {
+                args.mode = Some(OutputMode::Text);
+            }
+        } else if args.print {
+            return Err(Error::Config(
+                "print mode requires a prompt or piped input".into(),
+            ));
+        }
+    }
+    TEXT_OUTPUT.store(
+        args.print || args.mode == Some(OutputMode::Text),
+        Ordering::Relaxed,
+    );
+    let command = args.command.take().unwrap_or(Command::Interactive);
+    if matches!(command, Command::Interactive) {
+        return interactive::run(args);
+    }
+    if let Some(parent) = args
+        .session
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut session = Session::open(&args.session)?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),
         ));
     }
-    match args.command {
+    match command {
         Command::Inspect => {
             for record in session.records() {
                 output(if args.trace {
@@ -221,11 +301,21 @@ async fn execute(args: Cli) -> Result<()> {
     extensions.push(Arc::new(WorkbenchContext {
         instruction: args.instruction,
     }));
-    extensions.push(Arc::new(pi_rs_plan_mode::PlanMode::new([
-        "read_text".into(),
-        "lookup_order".into(),
-    ])));
+    extensions.push(Arc::new(pi_rs_plan_mode::PlanMode::new(
+        ["read_text", "lookup_order", "read", "grep", "find", "ls"].map(str::to_owned),
+    )));
     extensions.push(Arc::new(pi_rs_review::ReviewContext));
+    for name in args
+        .extensions
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        match name.as_str() {
+            "notes" => extensions.push(Arc::new(pi_rs_extensions::Notes)),
+            "todo" => extensions.push(Arc::new(pi_rs_extensions::TodoList)),
+            _ => extensions.push(Arc::new(pi_rs_extensions::ExecutableExtension::load(name)?)),
+        }
+    }
     #[cfg(feature = "evaluation-fixtures")]
     if let Some(endpoint) = args.fixtures.as_deref() {
         extensions.push(Arc::new(pi_rs_fixture_tools::Fixtures::new(endpoint)?));
@@ -240,6 +330,11 @@ async fn execute(args: Cli) -> Result<()> {
         .as_deref()
         .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
     registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
+    if args.coding_tools {
+        registry.register(Arc::new(pi_rs_workbench::coding::CodingTools::new(
+            &args.workspace,
+        )?))?;
+    }
     let provider = Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?;
     let agent = Agent {
         model: &provider,
@@ -276,7 +371,11 @@ async fn execute(args: Cli) -> Result<()> {
             signal.cancel();
         }
     });
-    let input = match args.command {
+    let (sender, mut receiver) = mpsc::channel(32);
+    if args.stdin_control {
+        read_controls(sender, cancel.clone());
+    }
+    let input = match command {
         Command::Review {
             child,
             from_record,
@@ -290,7 +389,7 @@ async fn execute(args: Cli) -> Result<()> {
                 resume,
                 timeout: Duration::from_secs(args.model_timeout_secs),
                 output_budget: args.output_budget,
-                allowed_tools: ["read_text", "lookup_order"]
+                allowed_tools: ["read_text", "lookup_order", "read", "grep", "find", "ls"]
                     .into_iter()
                     .filter(|name| registry.has_tool(name))
                     .map(str::to_owned)
@@ -362,10 +461,6 @@ async fn execute(args: Cli) -> Result<()> {
         Command::Resume => None,
         _ => unreachable!(),
     };
-    let (sender, mut receiver) = mpsc::channel(32);
-    if args.stdin_control {
-        read_controls(sender, cancel.clone());
-    }
     let answer = agent
         .run_correlated(
             &mut session,
@@ -417,7 +512,13 @@ fn read_controls(sender: mpsc::Sender<QueuedInput>, cancel: CancellationToken) {
 
 fn output(event: Value) {
     // The journal remains authoritative if the output consumer closes the pipe.
-    let _ = writeln!(std::io::stdout().lock(), "{event}");
+    if TEXT_OUTPUT.load(Ordering::Relaxed) {
+        if let Some(answer) = event.get("content").and_then(Value::as_str) {
+            let _ = writeln!(std::io::stdout().lock(), "{answer}");
+        }
+    } else {
+        let _ = writeln!(std::io::stdout().lock(), "{event}");
+    }
 }
 
 fn metadata(record: &pi_rs::Record) -> Value {

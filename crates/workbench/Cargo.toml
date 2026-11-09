@@ -5,10 +5,15 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 publish = false
+default-run = "pi-rs"
 
 [[bin]]
 name = "pi-rs"
 path = "src/main.rs"
+
+[[bin]]
+name = "pi"
+path = "src/pi.rs"
 
 [features]
 evaluation-fixtures = ["dep:pi-rs-fixture-tools"]
@@ -16,13 +21,23 @@ evaluation-fixtures = ["dep:pi-rs-fixture-tools"]
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+globset = "0.4"
+ignore = "0.4"
+libc = "0.2"
 pi-rs = { path = "../.." }
+pi-rs-extensions = { path = "../extensions" }
 pi-rs-fixture-tools = { path = "../fixture-tools", optional = true }
 pi-rs-plan-mode = { path = "../plan-mode" }
 pi-rs-review = { path = "../review" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "process", "signal", "sync", "time", "fs", "io-util", "io-std"] }
 uuid = { version = "1", features = ["serde"] }
 

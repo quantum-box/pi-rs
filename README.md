@@ -1,8 +1,64 @@
 # pi-rs
 
 An embeddable Rust agent loop with streaming model responses, tools, an
-append-only session journal, and extensions registered at build time. The
-workbench CLI exercises the library with Ollama and three representative tools.
+append-only session journal, and native Rust extensions. The workbench offers
+an interactive terminal, print and JSON output, and a JSONL control interface.
+
+## Interactive terminal
+
+```sh
+ollama pull qwen2.5:7b
+cargo run --locked -p pi-rs-workbench --bin pi -- --model qwen2.5:7b
+```
+
+Or install the local command with
+`cargo install --locked --path crates/workbench --bin pi`, then run `pi`.
+Sessions are saved under `~/.pi-rs/sessions/`, grouped by working directory.
+`PI_RS_HOME` changes the storage root. `pi --continue` reopens the latest session
+for the working directory, and `pi --session <path>` opens an explicit session.
+
+Enter sends a prompt. Shift+Enter adds a line, Alt+Enter queues a follow-up,
+Escape cancels the current operation, and PageUp/PageDown scroll the transcript.
+`/help` lists the available commands, including `/model`, `/new`, `/resume`,
+`/compact`, `/tree`, `/checkout`, `/plan`, `/review`, `/notes`, and `/todo`.
+The interactive local profile enables `read`, `write`, `edit`, `bash`, `grep`,
+`find`, and `ls`. Shell commands run with the launching user's permissions.
+
+```sh
+pi --print 'Explain this project'
+pi --mode json 'Explain this project'
+pi --mode rpc
+```
+
+The existing `pi-rs ... run <prompt>` interface retains its JSONL output.
+Add `--coding-tools --allow-commands` to that interface to enable the local
+coding profile. The current RPC commands are documented in
+[the parity checklist](docs/native-parity.md).
+
+## Native extensions
+
+The terminal enables notes and a TODO checklist, alongside plan mode and branch
+review. Their state is stored in the session journal and follows its branches.
+
+```text
+/notes Keep the public API compatible
+/todo [{"text":"Inspect the parser","status":"in_progress"}]
+/plan Investigate before making changes
+/plan accept
+/review Check the parser changes
+```
+
+For one-shot use, enable a bundled extension explicitly:
+
+```sh
+pi --session /tmp/example-session.jsonl --extension notes \
+  extension notes set 'Keep the public API compatible'
+```
+
+See [the native extension guide](docs/native-extensions.md) for the catalog,
+configuration, and the Rust API for writing and registering another extension.
+[The parity checklist](docs/native-parity.md) tracks the remaining Pi v1.5.0
+features and distinguishes implemented behavior from planned work.
 
 ## Run locally
 
