@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::ui::{
     editor::Editor,
+    images::{Cleanup, InlineImage, Renderer},
     keys::Keys,
     picker::{Input, Item, Picker, Selection},
     render::{Entry, Line},
@@ -75,12 +76,14 @@ pub(super) fn latest_session(example: &std::path::Path) -> Result<PathBuf> {
 
 struct Terminal {
     alternate: bool,
+    images: Cleanup,
 }
 impl Terminal {
-    fn enter(mode: Option<TuiMode>) -> Result<Self> {
+    fn enter(mode: Option<TuiMode>, images: Cleanup) -> Result<Self> {
         terminal::enable_raw_mode()?;
         let guard = Self {
             alternate: mode != Some(TuiMode::Regular),
+            images,
         };
         if guard.alternate {
             execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -91,6 +94,9 @@ impl Terminal {
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
+        if self.alternate {
+            self.images.clear();
+        }
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
             let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
@@ -122,6 +128,7 @@ struct RegularState {
 #[derive(Default)]
 struct View {
     regular: RegularState,
+    graphics: Renderer,
     lines: Vec<Entry>,
     picker: Option<Picker>,
     session_name: Option<String>,
@@ -158,6 +165,7 @@ impl View {
                 "a managed session must be opened by its host".into(),
             ));
         }
+        self.graphics.reset();
         self.session_name = session.name().map(str::to_owned);
         self.regular.committed = 0;
         self.regular.redraw = true;
@@ -175,10 +183,12 @@ impl View {
                     self.lines.push(Entry::User(content.clone()));
                     if let pi_rs::Event::UserWithImages { images, .. } = &record.event {
                         self.append(&format!("{} attached image(s)", images.len()));
+                        self.add_images(images);
                     }
                 }
                 pi_rs::Event::UserImages { images } => {
                     self.append(&format!("{} attached image(s)", images.len()));
+                    self.add_images(images);
                 }
                 pi_rs::Event::ModelFinished {
                     metadata, usage, ..
@@ -226,6 +236,16 @@ impl View {
         self.append("Enter to send · Alt+Enter to queue · Ctrl+O tools · Ctrl+T thinking · /help");
         Ok(())
     }
+    fn add_images(&mut self, images: &[pi_rs::ImageContent]) {
+        if self.graphics.enabled() {
+            self.lines.extend(
+                images
+                    .iter()
+                    .filter_map(InlineImage::decode)
+                    .map(Entry::Image),
+            );
+        }
+    }
     fn add_tool(&mut self, invocation: &pi_rs::Invocation) {
         self.lines.push(Entry::Tool {
             id: invocation.operation_id.to_string(),
@@ -234,13 +254,31 @@ impl View {
             output: String::new(),
             failed: false,
             finished: false,
+            images: Vec::new(),
         });
     }
     fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
+        let rendered_images = if self.graphics.enabled() {
+            match outcome {
+                pi_rs::Outcome::Structured { data, .. } => data["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| {
+                        serde_json::from_value::<pi_rs::ImageContent>(value.clone()).ok()
+                    })
+                    .filter_map(|content| InlineImage::decode(&content))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         if let Some(Entry::Tool {
             output,
             failed,
             finished,
+            images,
             ..
         }) = self
             .lines
@@ -248,6 +286,7 @@ impl View {
             .rev()
             .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == operation))
         {
+            *images = rendered_images;
             *output = display_tool_result(outcome);
             *failed = !matches!(
                 outcome,
@@ -286,6 +325,13 @@ impl View {
             Some("record") => {
                 let event = &value["record"]["event"];
                 match event["type"].as_str() {
+                    Some("user_with_images" | "user_images") => {
+                        if let Ok(images) = serde_json::from_value::<Vec<pi_rs::ImageContent>>(
+                            event["images"].clone(),
+                        ) {
+                            self.add_images(&images);
+                        }
+                    }
                     Some("model_requested") => {
                         self.request_started = Some(Instant::now());
                         self.phase = Some("モデル応答待ち");
@@ -315,6 +361,7 @@ impl View {
                                     output: String::new(),
                                     failed: false,
                                     finished: false,
+                                    images: Vec::new(),
                                 });
                             }
                         }
@@ -415,6 +462,7 @@ impl View {
         } else {
             String::new()
         };
+        self.graphics.clear_placements(&mut out)?;
         queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
         Line::plain(
             &format!(
@@ -428,6 +476,7 @@ impl View {
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + 1) as u16))?;
             line.draw(&mut out, width)?;
+            self.graphics.paint(line, &mut out, row)?;
         }
         let border_row = height - prompt_height - 4;
         queue!(out, MoveTo(0, border_row as u16))?;
@@ -520,6 +569,7 @@ impl View {
         let prompt_height = prompt.len().clamp(1, 6).min(height - 5);
         let mut out = std::io::stdout().lock();
         if redraw {
+            self.graphics.clear_placements(&mut out)?;
             queue!(
                 out,
                 Clear(ClearType::All),
@@ -549,6 +599,7 @@ impl View {
             for entry in &self.lines[..self.regular.committed] {
                 for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
                     line.draw(&mut out, width)?;
+                    self.graphics.paint(&line, &mut out, usize::MAX)?;
                     queue!(out, Print("\r\n"))?;
                 }
             }
@@ -558,6 +609,7 @@ impl View {
             for entry in &self.lines[self.regular.committed..] {
                 for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
                     line.draw(&mut out, width)?;
+                    self.graphics.paint(&line, &mut out, usize::MAX)?;
                     queue!(out, Print("\r\n"))?;
                 }
             }
@@ -1105,7 +1157,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         slash("/resume", &mut args, &mut view)?;
     }
     let mut keys = Keys::load()?;
-    let _terminal = Terminal::enter(args.tui_mode)?;
+    let _terminal = Terminal::enter(args.tui_mode, view.graphics.cleanup())?;
     let mut worker: Option<Worker> = None;
     let mut initial = args
         .initial_prompt

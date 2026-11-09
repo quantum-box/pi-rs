@@ -14,7 +14,7 @@ remaining acceptance work for that surface.
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
-| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, inline image display and remaining application actions |
+| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity, Windows runtime validation |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, session picker rename/delete/sort, Radius sharing |
@@ -125,7 +125,7 @@ inputs. It preserves alpha, avoids upscaling and reduces large images before
 serialization. The Ollama-compatible adapter forwards image tool results as
 image content blocks in a following user message, keeping the original tool
 call/result pairing. The TUI displays an image placeholder rather than base64.
-Actual inline terminal-image rendering remains unimplemented.
+Kitty and iTerm2 terminals display supported images inline.
 
 `edit` accepts both batch and legacy single replacements, emits a unified diff,
 and serializes cooperating file mutations across processes. The Windows coding
@@ -360,7 +360,7 @@ The owned SDK exposes `prompt_with_images`. Idle RPC `prompt` requests accept
 image blocks, including image-only input. Image-bearing input is committed as
 one journal entry, restored across sessions and preserved in forks. Invalid
 image encodings and oversized input are rejected before that entry is written.
-Inline terminal image rendering remains pending. CLI, RPC and a real terminal
+CLI, RPC and a real terminal
 fixture verify the new input paths.
 
 Image-bearing steering and follow-up messages now use the same durable queue as
@@ -413,3 +413,16 @@ editor exits. The normal append path retains existing scrollback. A PTY fixture
 verifies hide/show of existing thinking content, resizing, live theme changes
 and terminal restoration. History eviction keeps the pending-entry boundary
 consistent, so new messages continue to appear after the transcript limit.
+
+### Inline terminal images checkpoint
+
+Kitty and iTerm2 image protocols render user attachments and expanded tool
+results in both terminal modes. Image normalization shares the local read
+implementation, preserves alpha and avoids upscaling. Kitty uploads are reused
+on redraw and resize. Fullscreen exit releases owned images, while regular
+mode retains them in scrollback. Unsupported terminals retain text notices.
+
+A PTY fixture verifies both protocols, user and tool images, cached redraw,
+cleanup and terminal restoration. Protocol bytes were checked without a GUI
+terminal image comparison. Partially clipped image blocks are skipped, and
+regular-mode images appear when the current turn commits.

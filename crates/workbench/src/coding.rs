@@ -284,43 +284,17 @@ impl CodingTool {
         if !path.is_file() {
             return Err(Error::Config("expected a regular file".into()));
         }
-        let mut reader = image::ImageReader::open(&path)?.with_guessed_format()?;
+        let reader = image::ImageReader::open(&path)?.with_guessed_format()?;
         if reader.format().is_none() {
             return Ok(None);
         }
         if path.metadata()?.len() > 20 * 1024 * 1024 {
             return Err(Error::Config("image exceeds 20 MiB".into()));
         }
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(128 * 1024 * 1024);
-        reader.limits(limits);
-        let original = reader
-            .decode()
-            .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
-        let mut resized = if original.width() > 2000 || original.height() > 2000 {
-            original.thumbnail(2000, 2000)
-        } else {
-            original.clone()
-        };
-        let mut encoded = Vec::new();
-        loop {
-            encoded.clear();
-            resized
-                .write_to(&mut Cursor::new(&mut encoded), image::ImageFormat::Png)
-                .map_err(|error| Error::Config(error.to_string()))?;
-            if encoded.len() <= 512 * 1024 {
-                break;
-            }
-            let width = (resized.width() * 3 / 4).max(1);
-            let height = (resized.height() * 3 / 4).max(1);
-            if width == resized.width() && height == resized.height() {
-                return Err(Error::Config("image cannot fit the output limit".into()));
-            }
-            resized = resized.thumbnail(width, height);
-        }
+        let prepared = normalize_image(reader)?;
         Ok(Some(json!({"content":[
-            {"type":"text","text":format!("Read image {} ({}×{}, provided at {}×{})",path.display(),original.width(),original.height(),resized.width(),resized.height())},
-            {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(encoded)}
+            {"type":"text","text":format!("Read image {} ({}×{}, provided at {}×{})",path.display(),prepared.source_width,prepared.source_height,prepared.width,prepared.height)},
+            {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(prepared.png)}
         ]})))
     }
 
@@ -605,6 +579,55 @@ impl CodingTool {
             elapsed: started.elapsed().as_secs_f64(),
         })
     }
+}
+
+pub struct PreparedImage {
+    pub png: Vec<u8>,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub width: u32,
+    pub height: u32,
+}
+/// Normalize supported image readers under the shared decoding and output limits.
+pub fn normalize_image<R: std::io::BufRead + std::io::Seek>(
+    mut reader: image::ImageReader<R>,
+) -> Result<PreparedImage> {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let original = reader
+        .decode()
+        .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
+    let source_width = original.width();
+    let source_height = original.height();
+    let mut resized = if source_width > 2000 || source_height > 2000 {
+        original.thumbnail(2000, 2000)
+    } else {
+        original
+    };
+    let mut png = Vec::new();
+    loop {
+        png.clear();
+        resized
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(|error| Error::Config(error.to_string()))?;
+        if png.len() <= 512 * 1024 {
+            break;
+        }
+        let width = (resized.width() * 3 / 4).max(1);
+        let height = (resized.height() * 3 / 4).max(1);
+        if width == resized.width() && height == resized.height() {
+            return Err(Error::Config("image cannot fit the output limit".into()));
+        }
+        resized = resized.thumbnail(width, height);
+    }
+    Ok(PreparedImage {
+        png,
+        source_width,
+        source_height,
+        width: resized.width(),
+        height: resized.height(),
+    })
 }
 
 struct ShellResult {

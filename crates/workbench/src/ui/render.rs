@@ -38,12 +38,14 @@ impl Span {
 pub struct Line {
     pub spans: Vec<Span>,
     pub background: Option<Color>,
+    pub image: Option<super::images::Placement>,
 }
 impl Line {
     pub fn plain(text: &str, color: Color) -> Self {
         Self {
             spans: vec![Span::new(text, color)],
             background: None,
+            image: None,
         }
     }
     pub fn draw(&self, out: &mut impl Write, width: usize) -> std::io::Result<()> {
@@ -97,6 +99,7 @@ pub enum Entry {
     User(String),
     Assistant(String),
     Thinking(String),
+    Image(std::sync::Arc<super::images::InlineImage>),
     Tool {
         id: String,
         name: String,
@@ -104,6 +107,7 @@ pub enum Entry {
         output: String,
         failed: bool,
         finished: bool,
+        images: Vec<std::sync::Arc<super::images::InlineImage>>,
     },
 }
 impl Entry {
@@ -132,6 +136,7 @@ impl Entry {
                 lines.push(Line::default());
                 lines
             }
+            Self::Image(image) => image.lines(width),
             Self::Thinking(text) => {
                 if !show_thinking {
                     return vec![];
@@ -148,6 +153,7 @@ impl Entry {
                 output,
                 failed,
                 finished,
+                images,
                 ..
             } => {
                 let role = if *failed {
@@ -182,6 +188,11 @@ impl Entry {
                         "toolOutput"
                     };
                     lines.extend(wrap(&[Span::new(*text, theme.color(color))], inner));
+                }
+                if expand_tools {
+                    for image in images {
+                        lines.extend(image.lines(inner));
+                    }
                 }
                 if output_lines.len() > limit {
                     lines.push(Line::plain(
