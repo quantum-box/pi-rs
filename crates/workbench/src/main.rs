@@ -270,6 +270,14 @@ enum Command {
     Checkout {
         record_id: u64,
     },
+    /// Replace one message in future model context, keeping its original history.
+    ContextEdit {
+        record_id: u64,
+        /// Replacement text. Omit with --delete to remove it from model context.
+        content: Option<String>,
+        #[arg(long, conflicts_with = "content")]
+        delete: bool,
+    },
     Inspect,
     Name {
         name: String,
@@ -603,6 +611,20 @@ async fn execute(mut args: Cli) -> Result<()> {
             output(json!({"type":"shared","url":url}));
             return Ok(());
         }
+        Command::ContextEdit {
+            record_id,
+            content,
+            delete,
+        } => {
+            let replacement = match (content, delete) {
+                (Some(content), false) => Some(pi_rs::ContextContent::Text(content)),
+                (None, true) => None,
+                _ => return Err(Error::Config("provide replacement text or --delete".into())),
+            };
+            session.edit_context(record_id, replacement)?;
+            output(json!({"type":"context_edited","target":record_id}));
+            return Ok(());
+        }
         Command::Inspect => {
             for record in session.records() {
                 output(if args.trace {
@@ -848,6 +870,7 @@ fn metadata(record: &pi_rs::Record) -> Value {
         Event::ModelSelected { model, thinking } => {
             json!({"event":"model_selected","model":model,"thinking":thinking})
         }
+        Event::ContextEdited { target, .. } => json!({"event":"context_edited","target":target}),
         Event::Label { target, label } => json!({"event":"label","target":target,"label":label}),
         Event::HostBound { .. } => json!({"event": "host_bound"}),
         Event::HostRunBound { run_id, .. } => {

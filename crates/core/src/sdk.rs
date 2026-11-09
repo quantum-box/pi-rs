@@ -222,6 +222,17 @@ impl AgentSession {
         self.emit_last();
         Ok(())
     }
+    /// Changes future model context while retaining the original transcript and effects.
+    pub fn edit_context(
+        &mut self,
+        target: u64,
+        replacement: Option<crate::ContextContent>,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        self.session.edit_context(target, replacement)?;
+        self.emit_last();
+        Ok(())
+    }
     pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
         self.ensure_open()?;
         self.session.set_label(target, label)?;

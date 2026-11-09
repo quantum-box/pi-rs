@@ -175,6 +175,23 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             )?;
             Ok(Some(json!({"disposition":"started"})))
         }
+        "edit_context" if !busy(worker) => {
+            let target = request["target"]
+                .as_u64()
+                .ok_or_else(|| Error::Config("target must be a record ID".into()))?;
+            let replacement = request
+                .get("replacement")
+                .ok_or_else(|| Error::Config("replacement is required".into()))?;
+            let replacement = if replacement.is_null() {
+                None
+            } else {
+                Some(serde_json::from_value(
+                    replacement.get("content").unwrap_or(replacement).clone(),
+                )?)
+            };
+            Session::open(&args.session)?.edit_context(target, replacement)?;
+            Ok(None)
+        }
         "set_session_name" if !busy(worker) => {
             let name = request["name"]
                 .as_str()

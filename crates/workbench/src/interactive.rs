@@ -637,7 +637,7 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
 
 const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /compact  /tree  /checkout <id>  /quit\n/extensions  /extension <id> <command> [arguments]\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /compact  /tree  /checkout <id>  /quit\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>> {
     let (name, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
@@ -658,6 +658,19 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             }
             view.session_name = session.name().map(str::to_owned);
             view.append(session.name().unwrap_or("Unnamed session"));
+        }
+        "/context-edit" | "/context-delete" => {
+            let (target, content) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let target = target
+                .parse()
+                .map_err(|_| Error::Config("provide a message record ID".into()))?;
+            let replacement = if name == "/context-delete" {
+                None
+            } else {
+                Some(pi_rs::ContextContent::Text(content.into()))
+            };
+            Session::open(&args.session)?.edit_context(target, replacement)?;
+            view.append("Updated future model context");
         }
         "/label" => {
             let (id, label) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));

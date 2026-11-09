@@ -44,6 +44,11 @@ pub enum Event {
         format: String,
         entry: serde_json::Value,
     },
+    /// Replace or omit one message in future model context, preserving raw history.
+    ContextEdited {
+        target: u64,
+        replacement: Option<crate::ContextContent>,
+    },
     Created {
         session_id: Uuid,
     },
@@ -427,6 +432,25 @@ impl Session {
         Ok(())
     }
 
+    pub fn edit_context(
+        &mut self,
+        target: u64,
+        replacement: Option<crate::ContextContent>,
+    ) -> Result<()> {
+        ensure_settled(self.operations())?;
+        if !self.branch().iter().any(|record| record.id == target) {
+            return Err(Error::Session(
+                "context edit target is outside the active branch".into(),
+            ));
+        }
+        validate_context_edit(&self.records, target, replacement.as_ref())?;
+        self.append(Event::ContextEdited {
+            target,
+            replacement,
+        })?;
+        Ok(())
+    }
+
     pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
         if target == 0 || target > self.records.len() as u64 {
             return Err(Error::Session("invalid label target".into()));
@@ -481,7 +505,7 @@ impl Session {
                 Event::Compacted { retain_from, .. } => {
                     *retain_from = retain_from.and_then(|id| ids.get(&id).copied());
                 }
-                Event::Label { target, .. } => {
+                Event::Label { target, .. } | Event::ContextEdited { target, .. } => {
                     if let Some(id) = ids.get(target) {
                         *target = *id;
                     } else {
@@ -620,6 +644,68 @@ fn publish_snapshot(records: &[Record], destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_context_edit(
+    records: &[Record],
+    target: u64,
+    replacement: Option<&crate::ContextContent>,
+) -> Result<()> {
+    let record = target
+        .checked_sub(1)
+        .and_then(|index| records.get(index as usize))
+        .ok_or_else(|| Error::Session("invalid context edit target".into()))?;
+    let assistant = matches!(record.event, Event::Assistant { .. });
+    if !assistant
+        && !matches!(
+            record.event,
+            Event::User { .. } | Event::ToolFinished { .. } | Event::ToolReconciled { .. }
+        )
+    {
+        return Err(Error::Session(
+            "context edits require a user, assistant or tool-result target".into(),
+        ));
+    }
+    if let Some(replacement) = replacement {
+        if serde_json::to_vec(replacement)?.len() > 8 * 1024 * 1024 {
+            return Err(Error::Session(
+                "context replacement exceeds size limit".into(),
+            ));
+        }
+        if let crate::ContextContent::Blocks(blocks) = replacement {
+            for block in blocks {
+                match block {
+                    crate::ContentBlock::Thinking { .. } | crate::ContentBlock::ToolCall { .. }
+                        if !assistant =>
+                    {
+                        return Err(Error::Session(
+                            "thinking and tool-call blocks require an assistant target".into(),
+                        ));
+                    }
+                    crate::ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } if id.is_empty() || name.is_empty() || !arguments.is_object() => {
+                        return Err(Error::Session("invalid replacement tool call".into()));
+                    }
+                    crate::ContentBlock::Image { mime_type, .. }
+                        if assistant
+                            || !matches!(
+                                mime_type.as_str(),
+                                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                            ) =>
+                    {
+                        return Err(Error::Session(
+                            "invalid image block for context target".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validated_head(records: &[Record]) -> Result<u64> {
     let mut head = 0;
     let mut version = 1;
@@ -631,6 +717,18 @@ fn validated_head(records: &[Record]) -> Result<u64> {
             || matches!(record.event, Event::Created { .. }) != (id == 1)
         {
             return Err(Error::Session(format!("invalid journal record {id}")));
+        }
+        if let Event::ContextEdited {
+            target,
+            replacement,
+        } = &record.event
+        {
+            if *target >= id {
+                return Err(Error::Session(
+                    "context edit target must precede the edit".into(),
+                ));
+            }
+            validate_context_edit(records, *target, replacement.as_ref())?;
         }
         version = record.version;
         head = match record.event {
@@ -804,14 +902,35 @@ pub(crate) fn conversation(
             _ => None,
         })
         .collect();
+    let result_sources: BTreeMap<_, _> = path
+        .iter()
+        .filter_map(|record| match record.event {
+            Event::ToolFinished { operation_id, .. }
+            | Event::ToolReconciled { operation_id, .. } => Some((operation_id, record.id)),
+            _ => None,
+        })
+        .collect();
+    let edits: BTreeMap<_, _> = path
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ContextEdited {
+                target,
+                replacement,
+            } => Some((*target, replacement)),
+            _ => None,
+        })
+        .collect();
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
-            Event::User { content, .. } => messages.push(Message::User {
-                content: content.clone(),
-            }),
+            Event::User { content, .. } => messages.push((
+                record.id,
+                Message::User {
+                    content: content.clone(),
+                },
+            )),
             Event::UserImages { images } => {
-                if let Some(message @ Message::User { .. }) = messages.last_mut() {
+                if let Some((_, message @ Message::User { .. })) = messages.last_mut() {
                     let Message::User { content } = message else {
                         unreachable!()
                     };
@@ -826,34 +945,149 @@ pub(crate) fn conversation(
                 invocations,
                 ..
             } => {
-                messages.push(Message::Assistant {
-                    content: content.clone(),
-                    calls: invocations
-                        .iter()
-                        .map(|inv| {
-                            let mut call = inv.call.clone();
-                            if !serde_json::from_str::<serde_json::Value>(&call.arguments)
-                                .is_ok_and(|value| value.is_object())
-                            {
-                                call.arguments = "{}".into();
-                            }
-                            call
-                        })
-                        .collect(),
-                });
+                messages.push((
+                    record.id,
+                    Message::Assistant {
+                        content: content.clone(),
+                        calls: invocations
+                            .iter()
+                            .map(|inv| {
+                                let mut call = inv.call.clone();
+                                if !serde_json::from_str::<serde_json::Value>(&call.arguments)
+                                    .is_ok_and(|value| value.is_object())
+                                {
+                                    call.arguments = "{}".into();
+                                }
+                                call
+                            })
+                            .collect(),
+                    },
+                ));
                 for inv in invocations {
                     if let Some(outcome) = results.get(&inv.operation_id) {
-                        messages.push(Message::Tool {
-                            call_id: inv.call.id.clone(),
-                            content: outcome.tool_content(),
-                        });
+                        messages.push((
+                            *result_sources.get(&inv.operation_id).unwrap_or(&record.id),
+                            Message::Tool {
+                                call_id: inv.call.id.clone(),
+                                content: outcome.tool_content(),
+                            },
+                        ));
                     }
                 }
             }
             _ => {}
         }
     }
+    let mut messages: Vec<_> = messages
+        .into_iter()
+        .filter_map(|(source, message)| match edits.get(&source) {
+            Some(Some(replacement)) => Some(project_content(message, replacement)),
+            Some(None) => None,
+            None => Some(message),
+        })
+        .collect();
+    if !edits.is_empty() {
+        messages = repair_tool_pairs(messages);
+    }
     messages
+}
+
+fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
+    let mut projected = Vec::new();
+    let mut messages = messages.into_iter().peekable();
+    while let Some(message) = messages.next() {
+        match message {
+            Message::Assistant { content, mut calls } => {
+                let mut results = Vec::new();
+                while matches!(messages.peek(), Some(Message::Tool { .. })) {
+                    results.push(messages.next().expect("peeked tool result"));
+                }
+                let result_ids: std::collections::BTreeSet<_> = results
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::Tool { call_id, .. } => Some(call_id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                calls.retain(|call| result_ids.contains(call.id.as_str()));
+                let call_ids: std::collections::BTreeSet<_> =
+                    calls.iter().map(|call| call.id.clone()).collect();
+                if !content.is_empty() || !calls.is_empty() {
+                    projected.push(Message::Assistant { content, calls });
+                }
+                projected.extend(results.into_iter().filter(|message| matches!(message, Message::Tool { call_id, .. } if call_ids.contains(call_id))));
+            }
+            Message::Tool { .. } => {}
+            message => projected.push(message),
+        }
+    }
+    projected
+}
+
+fn project_content(message: Message, replacement: &crate::ContextContent) -> Message {
+    use crate::{ContentBlock, ContextContent};
+    let blocks = match replacement {
+        ContextContent::Text(text) => vec![ContentBlock::Text { text: text.clone() }],
+        ContextContent::Blocks(blocks) => blocks.clone(),
+    };
+    let text = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let images: Vec<_> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image { data, mime_type } => Some(crate::ImageContent {
+                data: data.clone(),
+                mime_type: mime_type.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    match message {
+        Message::User { .. } | Message::UserWithImages { .. } if images.is_empty() => {
+            Message::User { content: text }
+        }
+        Message::User { .. } | Message::UserWithImages { .. } => Message::UserWithImages {
+            content: text,
+            images,
+        },
+        Message::Assistant { .. } => Message::Assistant {
+            content: text,
+            calls: blocks
+                .into_iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => Some(crate::ToolCall {
+                        id,
+                        name,
+                        arguments: arguments.to_string(),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        },
+        Message::Tool { call_id, .. } => Message::Tool {
+            call_id,
+            content: if images.is_empty() {
+                text
+            } else {
+                Outcome::Structured {
+                    data: serde_json::json!({"content":blocks}),
+                    attachments: Vec::new(),
+                }
+                .tool_content()
+            },
+        },
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -939,5 +1173,137 @@ mod session_metadata_tests {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
         session.bind_host("tenant-scope").unwrap();
         assert!(session.fork_records(session.head()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod context_edit_tests {
+    use super::*;
+    use crate::{ContextContent, ToolCall};
+
+    #[test]
+    fn edits_leave_history_intact_and_follow_forks() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let target = session
+            .append(Event::User {
+                content: "original".into(),
+                input_id: None,
+            })
+            .unwrap()
+            .id;
+        session
+            .edit_context(target, Some(ContextContent::Text("replacement".into())))
+            .unwrap();
+        let edited = session.head();
+        assert_eq!(
+            session.conversation_at(edited).unwrap(),
+            vec![Message::User {
+                content: "replacement".into()
+            }]
+        );
+        assert!(
+            matches!(&session.records()[target as usize - 1].event, Event::User { content, .. } if content == "original")
+        );
+        let fork = Session::from_records(session.fork_records(edited).unwrap()).unwrap();
+        assert_eq!(
+            fork.conversation_at(fork.head()).unwrap(),
+            session.conversation_at(edited).unwrap()
+        );
+        session.checkout(target).unwrap();
+        assert_eq!(
+            session.conversation_at(target).unwrap(),
+            vec![Message::User {
+                content: "original".into()
+            }]
+        );
+        let count = session.records().len();
+        assert!(session.edit_context(1, None).is_err());
+        assert_eq!(session.records().len(), count);
+    }
+
+    #[test]
+    fn fork_remaps_context_targets_after_skipping_an_abandoned_branch() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let root = session
+            .append(Event::User {
+                content: "root".into(),
+                input_id: None,
+            })
+            .unwrap()
+            .id;
+        session
+            .append(Event::User {
+                content: "abandoned".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session.checkout(root).unwrap();
+        let target = session
+            .append(Event::User {
+                content: "kept".into(),
+                input_id: None,
+            })
+            .unwrap()
+            .id;
+        session
+            .edit_context(target, Some(ContextContent::Text("edited".into())))
+            .unwrap();
+        let fork = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+        assert!(
+            matches!(&fork.conversation_at(fork.head()).unwrap()[1], Message::User { content } if content == "edited")
+        );
+        assert!(
+            fork.records()
+                .iter()
+                .any(|record| matches!(record.event, Event::ContextEdited { target: 3, .. }))
+        );
+    }
+
+    #[test]
+    fn deleting_results_preserves_pairs_even_when_call_ids_repeat() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "start".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let mut targets = Vec::new();
+        for output in ["first", "second"] {
+            let operation_id = Uuid::new_v4();
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![Invocation {
+                        operation_id,
+                        call: ToolCall {
+                            id: "reused".into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            targets.push(
+                session
+                    .append(Event::ToolFinished {
+                        operation_id,
+                        outcome: Outcome::Succeeded(output.into()),
+                        states: Default::default(),
+                    })
+                    .unwrap()
+                    .id,
+            );
+        }
+        session.edit_context(targets[0], None).unwrap();
+        let messages = session.conversation_at(session.head()).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(&messages[2], Message::Tool { content, .. } if content == "second"));
+        assert_eq!(session.operations().len(), 2);
+        assert!(
+            matches!(&session.operations()[0].1, OperationState::Finished(Outcome::Succeeded(content)) if content == "first")
+        );
     }
 }

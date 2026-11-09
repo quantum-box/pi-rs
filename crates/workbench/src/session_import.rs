@@ -48,6 +48,7 @@ pub fn read(path: &Path) -> Result<Session> {
 struct Branch {
     head: u64,
     entry_start: u64,
+    context_target: Option<u64>,
     calls: BTreeMap<String, Uuid>,
     model: String,
     thinking: Option<String>,
@@ -168,8 +169,19 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             },
         );
         branch.entry_start = branch.head + u64::from(!events.is_empty());
+        branch.context_target = None;
         for event in events {
-            importer.append(&mut branch, event);
+            let context = matches!(
+                event,
+                Event::User { .. }
+                    | Event::Assistant { .. }
+                    | Event::ToolFinished { .. }
+                    | Event::ToolReconciled { .. }
+            );
+            let id = importer.append(&mut branch, event);
+            if context {
+                branch.context_target = Some(id);
+            }
         }
         branches.insert(id.clone(), branch);
         previous = Some(id);
@@ -478,9 +490,24 @@ fn convert(
         }
         "custom" | "usage" => {}
         "context_edit" => {
-            return Err(Error::Session(
-                "context edits in imported sessions require projection support".into(),
-            ));
+            let source = required(entry, "targetId")?;
+            let target = branches
+                .get(source)
+                .and_then(|branch| branch.context_target)
+                .ok_or_else(|| {
+                    Error::Session(format!("invalid imported context edit target {source}"))
+                })?;
+            let replacement = if entry["replacement"].is_null() {
+                None
+            } else {
+                Some(serde_json::from_value(
+                    entry["replacement"]["content"].clone(),
+                )?)
+            };
+            events.push(Event::ContextEdited {
+                target,
+                replacement,
+            });
         }
         kind => {
             return Err(Error::Session(format!(
@@ -567,6 +594,30 @@ mod tests {
         assert_eq!(
             session.extension_states()["codemode"].data,
             json!({"value":1,"other":3})
+        );
+    }
+    #[test]
+    fn imported_context_edits_are_branch_relative_and_preserve_original_entries() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"user","parentId":null,"message":{"role":"user","content":"original"}}),
+            json!({"type":"context_edit","id":"edit","parentId":"user","targetId":"user","replacement":{"content":"edited"}}),
+            json!({"type":"message","id":"left","parentId":"edit","message":{"role":"user","content":"left"}}),
+            json!({"type":"message","id":"right","parentId":"user","message":{"role":"user","content":"right"}}),
+        ]).unwrap();
+        let left = session
+            .records()
+            .iter()
+            .find(
+                |record| matches!(&record.event, Event::User { content, .. } if content == "left"),
+            )
+            .unwrap()
+            .id;
+        assert!(
+            matches!(&session.conversation_at(left).unwrap()[0], Message::User { content } if content == "edited")
+        );
+        assert!(
+            matches!(&session.conversation_at(session.head()).unwrap()[0], Message::User { content } if content == "original")
         );
     }
     #[test]

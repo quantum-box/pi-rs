@@ -17,7 +17,7 @@ remaining acceptance work for that surface.
 | Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, inline image display, regular-mode history redraw and remaining application actions |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity, Windows runtime validation |
-| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Imported context edits and remaining upstream message variants, richer tree navigation and branch summaries, session picker rename/delete/sort, Radius sharing |
+| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, session picker rename/delete/sort, Radius sharing |
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface, explicit hot reload |
@@ -319,9 +319,10 @@ labels, compaction boundaries and branch-local codemode store values. User and t
 adapter as image content. Previously completed tools remain recorded results;
 unfinished imported calls remain uncertain and require reconciliation.
 
-Unsupported context-edit entries are rejected before publishing a destination.
-Full context-edit projection and remaining specialized message variants are
-still pending. Images currently appear as attachment notices in the terminal.
+Context edits are projected onto future model context while the imported raw
+entries remain available. Remaining specialized message variants and system
+prompt checkpoints still need parity work. Images currently appear as
+attachment notices in the terminal.
 
 ### Model scope checkpoint
 
@@ -332,3 +333,16 @@ picker and cycling use that scope. Known thinking suffixes such as `:high` are
 separated from the model ID, while Ollama tags such as `:4b` remain intact.
 An explicit `--thinking` overrides the startup suffix. Cross-provider lookup
 and capability-aware thinking still await the provider catalog.
+
+### Context editing checkpoint
+
+The core and owned SDK can replace or omit a user, assistant or tool-result
+message from future model context. Edits are journal entries and follow the
+active branch. Original messages, execution outcomes and usage remain intact.
+Forks remap edit targets. Tool calls and results omitted by an edit are removed
+as pairs before sending context to a provider.
+
+Native entry points are `context-edit <id> <text>`, `context-edit <id> --delete`,
+`/context-edit`, `/context-delete` and the RPC `edit_context` request with a
+`target` record ID and `replacement`. Pi `context_edit` entries use the same
+projection when imported, including text and image replacements.
