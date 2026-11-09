@@ -953,7 +953,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     }
                 }
             }
-            view.picker = Some(Picker::new("Resume session", items));
+            view.picker = Some(Picker::sessions(items, args.session.clone()));
         }
         "/resume" => {
             let path = PathBuf::from(rest);
@@ -1296,7 +1296,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
                 if let Some(mut picker) = view.picker.take() {
-                    match picker.input(key) {
+                    match picker.input(key, &keys) {
                         Input::Continue => view.picker = Some(picker),
                         Input::Cancel => {}
                         Input::Save(selection) => {
@@ -1668,6 +1668,34 @@ fn start_model_picker(args: &Cli, view: &mut View) {
 
 fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut Theme) -> Result<()> {
     match selection {
+        Selection::RenameSession(path, name) => {
+            let mut session = Session::open(&path)?;
+            if session.host_binding().is_some() {
+                return Err(Error::Session(
+                    "managed sessions must be renamed by their host".into(),
+                ));
+            }
+            session.set_name(&name)?;
+            if path.canonicalize()? == args.session.canonicalize()? {
+                view.session_name = session.name().map(str::to_owned);
+            }
+            drop(session);
+            slash("/resume", args, view)?;
+        }
+        Selection::DeleteSession(path) => {
+            if path.canonicalize()? == args.session.canonicalize()? {
+                return Err(Error::Config("Cannot delete the active session".into()));
+            }
+            let session = Session::open(&path)?;
+            if session.host_binding().is_some() {
+                return Err(Error::Session(
+                    "managed sessions must be deleted by their host".into(),
+                ));
+            }
+            std::fs::remove_file(&path)?;
+            drop(session);
+            slash("/resume", args, view)?;
+        }
         Selection::Resume(path) => {
             slash(&format!("/resume {}", path.display()), args, view)?;
         }

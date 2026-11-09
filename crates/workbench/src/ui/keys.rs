@@ -4,6 +4,7 @@ use pi_rs::{Error, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+#[derive(Default)]
 pub struct Keys {
     bindings: BTreeMap<String, Vec<KeyEvent>>,
 }
@@ -55,6 +56,10 @@ impl Keys {
             ("app.model.cycleForward", &["ctrl+p"]),
             ("app.model.cycleBackward", &["ctrl+shift+p"]),
             ("app.message.copy", &["ctrl+x"]),
+            ("app.session.rename", &["ctrl+r"]),
+            ("app.session.delete", &["ctrl+d"]),
+            ("app.session.deleteNoninvasive", &["ctrl+backspace"]),
+            ("app.session.toggleSort", &["ctrl+s"]),
         ];
         let mut bindings = BTreeMap::new();
         for (action, keys) in defaults {
@@ -94,18 +99,28 @@ impl Keys {
         }
         Ok(Self { bindings })
     }
-    pub fn action(&self, mut key: KeyEvent, empty: bool) -> Option<&str> {
-        if key.code == KeyCode::BackTab {
-            key.code = KeyCode::Tab;
-            key.modifiers |= KeyModifiers::SHIFT;
-        }
-        if let KeyCode::Char(character) = key.code {
-            key.code = KeyCode::Char(character.to_ascii_lowercase());
-        }
+    pub fn matches(&self, action: &str, key: KeyEvent) -> bool {
+        let key = normalize(key);
+        self.bindings.get(action).is_some_and(|keys| {
+            keys.iter()
+                .any(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
+        })
+    }
+    pub fn action(&self, key: KeyEvent, empty: bool) -> Option<&str> {
+        let key = normalize(key);
         // Exit shares Ctrl+D with forward delete, and applies only to an empty editor.
         self.bindings
             .iter()
             .find(|(action, keys)| {
+                if matches!(
+                    action.as_str(),
+                    "app.session.rename"
+                        | "app.session.delete"
+                        | "app.session.deleteNoninvasive"
+                        | "app.session.toggleSort"
+                ) {
+                    return false;
+                }
                 if (action.as_str() == "app.exit") != empty
                     && matches!(action.as_str(), "app.exit" | "tui.editor.deleteCharForward")
                 {
@@ -133,6 +148,17 @@ impl Keys {
             .join("\n")
     }
 }
+fn normalize(mut key: KeyEvent) -> KeyEvent {
+    if key.code == KeyCode::BackTab {
+        key.code = KeyCode::Tab;
+        key.modifiers |= KeyModifiers::SHIFT;
+    }
+    if let KeyCode::Char(character) = key.code {
+        key.code = KeyCode::Char(character.to_ascii_lowercase());
+    }
+    key
+}
+
 fn parse(text: &str) -> Result<KeyEvent> {
     let lower = text.to_lowercase();
     let mut rest = lower.as_str();
@@ -191,5 +217,31 @@ mod tests {
         );
         assert_eq!(parse("ctrl++").unwrap().code, KeyCode::Char('+'));
         assert!(parse("f99").is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    #[test]
+    fn session_bindings_remain_local_to_the_picker() {
+        let keys = Keys {
+            bindings: [
+                ("app.session.delete".into(), vec![parse("ctrl+d").unwrap()]),
+                ("app.exit".into(), vec![parse("ctrl+d").unwrap()]),
+                (
+                    "tui.editor.deleteCharForward".into(),
+                    vec![parse("ctrl+d").unwrap()],
+                ),
+            ]
+            .into(),
+        };
+        let key = parse("ctrl+d").unwrap();
+        assert!(keys.matches("app.session.delete", key));
+        assert_eq!(keys.action(key, true), Some("app.exit"));
+        assert_eq!(
+            keys.action(key, false),
+            Some("tui.editor.deleteCharForward")
+        );
     }
 }

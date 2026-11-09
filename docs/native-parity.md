@@ -17,7 +17,7 @@ remaining acceptance work for that surface.
 | Terminal | Default `pi` startup, Unicode multiline editor and kill ring, paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity, Windows runtime validation |
-| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, session picker rename/delete/sort, Radius sharing |
+| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, threaded and cross-workspace session selectors, Radius sharing |
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution | Full Pi event and interactive UI surface, explicit hot reload |
@@ -478,3 +478,12 @@ The named ID is a storage alias. Native journals retain their UUID identity.
 Aliases allow 1–128 ASCII letters, digits, dots, underscores and hyphens, with
 an alphanumeric first and last character. Argument conflicts are checked before
 opening a session. RPC restoration shares the CLI's model/scope selection logic.
+
+### Session selector checkpoint
+
+The resume selector supports renaming with Ctrl+R, deletion with Ctrl+D and an
+explicit confirmation, and recent/fuzzy ordering with Ctrl+S. Session-specific
+keybinding overrides apply inside the selector. Active and managed sessions
+are protected from deletion. Renaming the active session updates its title.
+Editor Ctrl+D behavior remains separate from selector controls. Threaded
+parent/child grouping and cross-workspace selection remain open.
