@@ -263,12 +263,17 @@ impl McpExtension {
         self.tools.len()
     }
 }
+#[async_trait::async_trait]
 impl Extension for McpExtension {
     fn id(&self) -> &str {
         &self.id
     }
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         self.tools.clone()
+    }
+    async fn shutdown(&self) -> pi_rs::ExtensionResult<()> {
+        self.close().await;
+        Ok(())
     }
     fn context(
         &self,

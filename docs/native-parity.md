@@ -25,7 +25,7 @@ remaining acceptance work for that surface.
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools and resources; environment/command credentials; add/remove/list commands | Persistent session connections, OAuth, reconnect and live tool-list updates, full exposure/deferred-tool behavior, elicitation and task polling |
 | Codemode | Core tool invocation APIs | Sandboxed code execution and dynamic tool search |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload` | Automatic system appearance notifications, live file-watch reload |
-| SDK | Public Rust agent/session/model/tool/extension interfaces | High-level session builder and complete equivalents of Pi's SDK APIs |
+| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory forks, compaction and lifecycle shutdown | Complete resource/model/auth factories, persistent fork/export helpers and remaining Pi SDK equivalents |
 | Packages | Cargo composition and native extension catalog | Package install/remove/update/list, dependency and resource management |
 
 ## Current RPC subset
@@ -156,3 +156,16 @@ terminal scrollback. Full regular-mode redraw fidelity remains open.
 Ctrl+P / Ctrl+Shift+P cycle discovered models. Custom session-action bindings
 and Ctrl+X copying use the same journal operations as their slash commands.
 The checkpoint passed 76 workspace tests and all-target Clippy.
+
+### Owned SDK checkpoint
+
+`SessionBuilder` and `AgentSession` own a model, registry and journal across
+multiple prompts. `SessionControl` supports steering, follow-up input and abort
+from another task. Subscribers receive bounded, owned events without blocking
+the agent loop. The API also exposes extension commands, compaction, summary,
+checkout and in-memory forks. Explicit asynchronous close releases shared
+extensions after the last fork closes. Managed host-bound sessions continue to
+use the existing host API.
+
+SDK tests cover follow-up consumption, abort during a model stream, shared
+connection lifetime and retaining an independent fork history.

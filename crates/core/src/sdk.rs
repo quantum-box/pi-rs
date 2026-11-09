@@ -1,0 +1,535 @@
+//! Owned session API for embedding the agent in long-lived native applications.
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::{broadcast, mpsc};
+use uuid::Uuid;
+
+use crate::{
+    Agent, CancellationToken, Compaction, Error, Extension, InputKind, Limits, MemoryStore,
+    Message, Model, ModelRequest, Notification, Observer, QueuedInput, Record, Registry, Result,
+    Session,
+};
+
+/// Owned notifications. Request and record payloads can include private context.
+#[derive(Clone, Debug)]
+pub enum SessionEvent {
+    Closed,
+    RunStarted { run_id: Uuid },
+    Record(Arc<Record>),
+    Request(Arc<ModelRequest>),
+    Text(String),
+    RunEnded { run_id: Uuid, succeeded: bool },
+}
+
+#[derive(Clone)]
+pub struct SessionControl {
+    input: mpsc::Sender<QueuedInput>,
+    active: Arc<Mutex<Option<CancellationToken>>>,
+}
+impl SessionControl {
+    pub async fn steer(&self, content: impl Into<String>) -> Result<Uuid> {
+        self.enqueue(InputKind::Steer, content.into()).await
+    }
+    pub async fn follow_up(&self, content: impl Into<String>) -> Result<Uuid> {
+        self.enqueue(InputKind::FollowUp, content.into()).await
+    }
+    async fn enqueue(&self, kind: InputKind, content: String) -> Result<Uuid> {
+        if content.trim().is_empty() {
+            return Err(Error::Config("queued input is empty".into()));
+        }
+        let id = Uuid::new_v4();
+        self.input
+            .send(QueuedInput { id, kind, content })
+            .await
+            .map_err(|_| Error::Config("session is closed".into()))?;
+        Ok(id)
+    }
+    pub fn abort(&self) {
+        if let Some(token) = self.active.lock().expect("session control").as_ref() {
+            token.cancel();
+        }
+    }
+}
+
+/// Builds an owned local session while retaining the provider-neutral core APIs.
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use pi_rs_core::{Model, Result, SessionBuilder};
+///
+/// async fn chat(model: Arc<dyn Model>) -> Result<()> {
+///     let mut session = SessionBuilder::new(model, "my-model")
+///         .system_prompt("You are an expert coding assistant.")
+///         .open("session.jsonl")?;
+///     let _events = session.subscribe();
+///     let answer = session.prompt("Explain this project").await?;
+///     println!("{answer}");
+///     session.close().await
+/// }
+/// ```
+pub struct SessionBuilder {
+    model: Arc<dyn Model>,
+    model_name: String,
+    system_prompt: String,
+    registry: Registry,
+    limits: Limits,
+}
+impl SessionBuilder {
+    pub fn new(model: Arc<dyn Model>, model_name: impl Into<String>) -> Self {
+        Self {
+            model,
+            model_name: model_name.into(),
+            system_prompt: "You are an expert coding assistant.".into(),
+            registry: Registry::default(),
+            limits: Limits::default(),
+        }
+    }
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = prompt.into();
+        self
+    }
+    pub fn registry(mut self, registry: Registry) -> Self {
+        self.registry = registry;
+        self
+    }
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+    pub fn extension(mut self, extension: Arc<dyn Extension>) -> Result<Self> {
+        self.registry.register(extension)?;
+        Ok(self)
+    }
+    pub fn open(self, path: impl AsRef<Path>) -> Result<AgentSession> {
+        self.build(Session::open(path)?)
+    }
+    pub fn in_memory(self) -> Result<AgentSession> {
+        self.build(Session::with_store(MemoryStore::default())?)
+    }
+    pub fn build(self, session: Session) -> Result<AgentSession> {
+        if session.host_binding().is_some() {
+            return Err(Error::Session(
+                "managed sessions must be opened through their host".into(),
+            ));
+        }
+        if self.model_name.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        let (sender, input) = mpsc::channel(32);
+        let (events, _) = broadcast::channel(64);
+        Ok(AgentSession {
+            model: self.model,
+            model_name: self.model_name,
+            system_prompt: self.system_prompt,
+            registry: Arc::new(self.registry),
+            limits: self.limits,
+            session,
+            input,
+            events: Some(events),
+            control: SessionControl {
+                input: sender,
+                active: Arc::new(Mutex::new(None)),
+            },
+            closed: false,
+        })
+    }
+}
+
+/// A session owns its model, registry and journal for its entire lifetime.
+/// Use cloned controls while `prompt` is awaited, and call `close` for asynchronous cleanup.
+pub struct AgentSession {
+    model: Arc<dyn Model>,
+    model_name: String,
+    system_prompt: String,
+    registry: Arc<Registry>,
+    limits: Limits,
+    session: Session,
+    input: mpsc::Receiver<QueuedInput>,
+    control: SessionControl,
+    events: Option<broadcast::Sender<SessionEvent>>,
+    closed: bool,
+}
+impl AgentSession {
+    pub fn controls(&self) -> SessionControl {
+        self.control.clone()
+    }
+    /// A slow subscriber receives a broadcast lag error instead of blocking execution.
+    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+        match &self.events {
+            Some(events) => events.subscribe(),
+            None => {
+                let (sender, receiver) = broadcast::channel(1);
+                drop(sender);
+                receiver
+            }
+        }
+    }
+    pub fn journal(&self) -> &Session {
+        &self.session
+    }
+    pub fn messages(&self) -> Result<Vec<Message>> {
+        self.session.conversation_at(self.session.head())
+    }
+    pub fn tools(&self) -> Vec<crate::ToolSpec> {
+        self.registry.tool_specs()
+    }
+    pub fn pending_inputs(&self) -> usize {
+        self.input.len()
+    }
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    pub fn set_model(&mut self, model: Arc<dyn Model>, name: impl Into<String>) -> Result<()> {
+        self.ensure_open()?;
+        let name = name.into();
+        let count = self.session.records().len();
+        self.session.select_model(&name, None)?;
+        if count != self.session.records().len() {
+            self.emit_last();
+        }
+        self.model = model;
+        self.model_name = name;
+        Ok(())
+    }
+    pub fn set_system_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
+        self.ensure_open()?;
+        self.system_prompt = prompt.into();
+        Ok(())
+    }
+    /// Register before forking. Forks share the existing registry and its connections.
+    pub fn register_extension(&mut self, extension: Arc<dyn Extension>) -> Result<()> {
+        self.ensure_open()?;
+        Arc::get_mut(&mut self.registry)
+            .ok_or_else(|| {
+                Error::Config("register extensions before sharing this session with a fork".into())
+            })?
+            .register(extension)
+    }
+    pub fn checkout(&mut self, record: u64) -> Result<()> {
+        self.ensure_open()?;
+        self.session.checkout(record)?;
+        self.emit_last();
+        if let Some((model, _)) = self.session.model_selection() {
+            self.model_name = model;
+        }
+        Ok(())
+    }
+    pub fn set_name(&mut self, name: &str) -> Result<()> {
+        self.ensure_open()?;
+        self.session.set_name(name)?;
+        self.emit_last();
+        Ok(())
+    }
+    pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
+        self.ensure_open()?;
+        self.session.set_label(target, label)?;
+        self.emit_last();
+        Ok(())
+    }
+    pub fn fork_at(&self, record: u64) -> Result<Self> {
+        self.ensure_open()?;
+        let session = Session::from_records(self.session.fork_records(record)?)?;
+        let model_name = session
+            .model_selection()
+            .map(|selection| selection.0)
+            .unwrap_or_else(|| self.model_name.clone());
+        let mut fork = SessionBuilder::new(self.model.clone(), model_name)
+            .system_prompt(self.system_prompt.clone())
+            .limits(self.limits.clone())
+            .build(session)?;
+        fork.registry = self.registry.clone();
+        Ok(fork)
+    }
+
+    pub async fn prompt(&mut self, input: impl Into<String>) -> Result<String> {
+        self.run(Some(input.into()), Uuid::new_v4(), &mut |_| {})
+            .await
+    }
+    pub async fn prompt_with_observer(
+        &mut self,
+        input: impl Into<String>,
+        observer: &mut Observer<'_>,
+    ) -> Result<String> {
+        self.run(Some(input.into()), Uuid::new_v4(), observer).await
+    }
+    pub async fn resume(&mut self) -> Result<String> {
+        self.run(None, Uuid::new_v4(), &mut |_| {}).await
+    }
+    /// A duplicate run ID follows the core's durable idempotency rules.
+    pub async fn run(
+        &mut self,
+        input: Option<String>,
+        run_id: Uuid,
+        observer: &mut Observer<'_>,
+    ) -> Result<String> {
+        self.ensure_open()?;
+        let active = self.begin_run();
+        let events = self.events.as_ref().expect("open session").clone();
+        let _ = events.send(SessionEvent::RunStarted { run_id });
+        let mut observe = |event: Notification<'_>| {
+            emit(&events, &event);
+            observer(event);
+        };
+        let agent = Agent {
+            model: self.model.as_ref(),
+            model_name: &self.model_name,
+            registry: &self.registry,
+            system_prompt: &self.system_prompt,
+            limits: self.limits.clone(),
+        };
+        let result = agent
+            .run_correlated(
+                &mut self.session,
+                run_id,
+                input,
+                &mut self.input,
+                &active.token,
+                &mut observe,
+            )
+            .await;
+        let _ = events.send(SessionEvent::RunEnded {
+            run_id,
+            succeeded: result.is_ok(),
+        });
+        result
+    }
+    pub fn extension_command(
+        &mut self,
+        extension: &str,
+        command: &str,
+        arguments: &str,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let events = self.events.as_ref().expect("open session").clone();
+        let agent = Agent {
+            model: self.model.as_ref(),
+            model_name: &self.model_name,
+            registry: &self.registry,
+            system_prompt: &self.system_prompt,
+            limits: self.limits.clone(),
+        };
+        agent.extension_command(
+            &mut self.session,
+            extension,
+            command,
+            arguments,
+            &mut |event| emit(&events, &event),
+        )
+    }
+    pub fn compact(&mut self, compaction: Compaction) -> Result<()> {
+        self.ensure_open()?;
+        let events = self.events.as_ref().expect("open session").clone();
+        let agent = Agent {
+            model: self.model.as_ref(),
+            model_name: &self.model_name,
+            registry: &self.registry,
+            system_prompt: &self.system_prompt,
+            limits: self.limits.clone(),
+        };
+        agent.compact(&mut self.session, compaction, &mut |event| {
+            emit(&events, &event)
+        })
+    }
+    pub async fn summarize(&mut self, keep_turns: usize) -> Result<()> {
+        self.ensure_open()?;
+        let active = self.begin_run();
+        let events = self.events.as_ref().expect("open session").clone();
+        let agent = Agent {
+            model: self.model.as_ref(),
+            model_name: &self.model_name,
+            registry: &self.registry,
+            system_prompt: &self.system_prompt,
+            limits: self.limits.clone(),
+        };
+        agent
+            .summarize(&mut self.session, keep_turns, &active.token, &mut |event| {
+                emit(&events, &event)
+            })
+            .await
+    }
+    pub async fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.control.abort();
+        self.input.close();
+        while self.input.try_recv().is_ok() {}
+        let registry = std::mem::replace(&mut self.registry, Arc::new(Registry::default()));
+        let result = if Arc::strong_count(&registry) == 1 {
+            registry.shutdown().await
+        } else {
+            Ok(())
+        };
+        if let Some(events) = self.events.take() {
+            let _ = events.send(SessionEvent::Closed);
+        }
+        result
+    }
+    fn emit_last(&self) {
+        if let (Some(events), Some(record)) = (&self.events, self.session.records().last()) {
+            emit(events, &Notification::Committed(record));
+        }
+    }
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed {
+            Err(Error::Config("session is closed".into()))
+        } else {
+            Ok(())
+        }
+    }
+    fn begin_run(&self) -> ActiveRun {
+        let token = CancellationToken::new();
+        *self.control.active.lock().expect("session control") = Some(token.clone());
+        ActiveRun {
+            token,
+            state: self.control.active.clone(),
+        }
+    }
+}
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        self.control.abort();
+    }
+}
+struct ActiveRun {
+    token: CancellationToken,
+    state: Arc<Mutex<Option<CancellationToken>>>,
+}
+impl Drop for ActiveRun {
+    fn drop(&mut self) {
+        self.token.cancel();
+        *self.state.lock().expect("session control") = None;
+    }
+}
+fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_>) {
+    if events.receiver_count() == 0 {
+        return;
+    }
+    let event = match notification {
+        Notification::Committed(record) => SessionEvent::Record(Arc::new((*record).clone())),
+        Notification::Request(request) => SessionEvent::Request(Arc::new((*request).clone())),
+        Notification::Text(text) => SessionEvent::Text((*text).into()),
+    };
+    let _ = events.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ModelEvent, ModelStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EchoModel(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for EchoModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            let count = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text(format!("answer {count}"))),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+    struct ClosingExtension(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Extension for ClosingExtension {
+        fn id(&self) -> &str {
+            "closing-test"
+        }
+        async fn shutdown(&self) -> crate::ExtensionResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn session_owns_history_and_events_and_consumes_queued_followups() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model, "echo").in_memory().unwrap();
+        let mut events = session.subscribe();
+        session
+            .controls()
+            .follow_up("second question")
+            .await
+            .unwrap();
+        assert_eq!(session.prompt("first question").await.unwrap(), "answer 2");
+        assert_eq!(
+            session
+                .messages()
+                .unwrap()
+                .iter()
+                .filter(|message| matches!(message, Message::User { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(session.pending_inputs(), 0);
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            SessionEvent::RunStarted { .. }
+        ));
+        session.close().await.unwrap();
+        let mut closed = false;
+        while let Ok(event) = events.try_recv() {
+            closed |= matches!(event, SessionEvent::Closed);
+        }
+        assert!(closed);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+        assert!(session.prompt("after close").await.is_err());
+        assert!(session.controls().steer("after close").await.is_err());
+    }
+    #[tokio::test]
+    async fn shared_extensions_close_only_after_the_last_fork() {
+        let closed = Arc::new(AtomicUsize::new(0));
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model, "echo")
+            .extension(Arc::new(ClosingExtension(closed.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        assert_eq!(fork.messages().unwrap(), session.messages().unwrap());
+        assert_ne!(fork.journal().session_id(), session.journal().session_id());
+        session.close().await.unwrap();
+        assert_eq!(closed.load(Ordering::SeqCst), 0);
+        assert_eq!(fork.prompt("continue fork").await.unwrap(), "answer 2");
+        fork.close().await.unwrap();
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        fork.close().await.unwrap();
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+    }
+    struct WaitingModel;
+    #[async_trait::async_trait]
+    impl Model for WaitingModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            Ok(Box::pin(futures_util::stream::pending()))
+        }
+    }
+    #[tokio::test]
+    async fn cloned_control_can_abort_a_running_session() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let mut events = session.subscribe();
+        let abort = async move {
+            while let Ok(event) = events.recv().await {
+                if matches!(event, SessionEvent::Request(_)) {
+                    control.abort();
+                    break;
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(session.prompt("wait for abort"), abort);
+        assert!(matches!(result, Err(Error::Cancelled)));
+        session.close().await.unwrap();
+    }
+}

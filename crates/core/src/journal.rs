@@ -197,6 +197,11 @@ impl Session {
         Self::with_store(FileStore::open(path.as_ref())?)
     }
 
+    /// Restore a validated, in-memory snapshot without mutating its source.
+    pub fn from_records(records: Vec<Record>) -> Result<Self> {
+        Self::with_store(MemoryStore { records })
+    }
+
     pub fn with_store(mut store: impl SessionStore + 'static) -> Result<Self> {
         let records = store.load()?;
         let head = validated_head(&records)?;

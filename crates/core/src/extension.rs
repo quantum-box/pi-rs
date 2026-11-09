@@ -92,6 +92,11 @@ pub trait Extension: Send + Sync {
         Vec::new()
     }
 
+    /// Release long-lived clients and subprocesses owned by this extension.
+    async fn shutdown(&self) -> ExtensionResult<()> {
+        Ok(())
+    }
+
     /// Return the new value only when a state migration is needed.
     fn migrate(
         &self,
@@ -201,6 +206,20 @@ impl Registry {
             registry.register(pending.remove(index))?;
         }
         Ok(registry)
+    }
+
+    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.tools.values().map(|tool| tool.spec.clone()).collect()
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        let mut failure = None;
+        for extension in self.extensions.iter().rev() {
+            if let Err(error) = hook(extension.as_ref(), extension.shutdown().await) {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     pub fn has_tool(&self, name: &str) -> bool {
