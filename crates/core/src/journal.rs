@@ -96,6 +96,10 @@ pub enum Event {
     UserImages {
         images: Vec<crate::ImageContent>,
     },
+    BashExecution {
+        #[serde(flatten)]
+        execution: crate::BashExecution,
+    },
     InputQueuedWithImages {
         input: crate::QueuedMessage,
     },
@@ -466,6 +470,24 @@ impl Session {
         };
         if serde_json::to_vec(&event)?.len() > 8 * 1024 * 1024 {
             return Err(Error::Config("user input exceeds size limit".into()));
+        }
+        self.append(event)?;
+        Ok(())
+    }
+
+    /// Check that no tool invocation needs completion or reconciliation.
+    pub fn ensure_settled(&self) -> Result<()> {
+        ensure_settled(self.operations())
+    }
+
+    pub fn append_bash_execution(&mut self, execution: crate::BashExecution) -> Result<()> {
+        self.ensure_settled()?;
+        if execution.command.trim().is_empty() {
+            return Err(Error::Config("empty shell command".into()));
+        }
+        let event = Event::BashExecution { execution };
+        if serde_json::to_vec(&event)?.len() > 8 * 1024 * 1024 {
+            return Err(Error::Config("shell execution exceeds size limit".into()));
         }
         self.append(event)?;
         Ok(())
@@ -979,6 +1001,14 @@ pub(crate) fn conversation(
                     content: content.clone(),
                 },
             )),
+            Event::BashExecution { execution } if !execution.exclude_from_context => {
+                messages.push((
+                    record.id,
+                    Message::User {
+                        content: execution.context_text(),
+                    },
+                ))
+            }
             Event::UserWithImages {
                 content, images, ..
             } => messages.push((
@@ -1375,6 +1405,49 @@ mod context_edit_tests {
         assert_eq!(session.operations().len(), 2);
         assert!(
             matches!(&session.operations()[0].1, OperationState::Finished(Outcome::Succeeded(content)) if content == "first")
+        );
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+    #[test]
+    fn user_shell_context_exclusions_survive_journal_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let execution = crate::BashExecution {
+            command: "printf visible".into(),
+            output: "visible".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: false,
+        };
+        session.append_bash_execution(execution.clone()).unwrap();
+        session
+            .append_bash_execution(crate::BashExecution {
+                output: "secret".into(),
+                exclude_from_context: true,
+                ..execution
+            })
+            .unwrap();
+        drop(session);
+        let session = Session::open(&path).unwrap();
+        let messages = session.conversation_at(session.head()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(
+            matches!(&messages[0], Message::User { content } if content.contains("visible") && !content.contains("secret"))
+        );
+        assert_eq!(
+            session
+                .branch()
+                .iter()
+                .filter(|record| matches!(record.event, Event::BashExecution { .. }))
+                .count(),
+            2
         );
     }
 }

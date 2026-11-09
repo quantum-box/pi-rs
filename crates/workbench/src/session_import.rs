@@ -365,33 +365,9 @@ fn convert(
                     });
                 }
                 "custom" | "hookMessage" => push_user(&mut events, &message["content"])?,
-                "bashExecution" => {
-                    if message["excludeFromContext"] != true {
-                        let mut text = format!("Ran `{}`\n", required(message, "command")?);
-                        let output = message["output"].as_str().unwrap_or_default();
-                        if output.is_empty() {
-                            text.push_str("(no output)");
-                        } else {
-                            text.push_str(&format!("```\n{output}\n```"));
-                        }
-                        if message["cancelled"] == true {
-                            text.push_str("\n\n(command cancelled)");
-                        } else if let Some(code) =
-                            message["exitCode"].as_i64().filter(|code| *code != 0)
-                        {
-                            text.push_str(&format!("\n\nCommand exited with code {code}"));
-                        }
-                        if message["truncated"] == true
-                            && let Some(path) = message["fullOutputPath"].as_str()
-                        {
-                            text.push_str(&format!("\n\n[Output truncated. Full output: {path}]"));
-                        }
-                        events.push(Event::User {
-                            content: text,
-                            input_id: None,
-                        });
-                    }
-                }
+                "bashExecution" => events.push(Event::BashExecution {
+                    execution: serde_json::from_value(message.clone())?,
+                }),
                 "branchSummary" | "compactionSummary" => events.push(Event::User {
                     content: required(message, "summary")?.into(),
                     input_id: None,

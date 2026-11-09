@@ -36,7 +36,7 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `cycle_model`, `set_thinking_level`, `cycle_thinking_level`,
 `get_available_thinking_levels`, `switch_session`, `fork`, `clone`,
 `get_fork_messages`, `get_entries`, `get_tree`, `get_last_assistant_text`,
-`edit_context`, and `shutdown`. Responses carry the request ID and a
+`edit_context`, `bash`, `abort_bash`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance is separate from completion; wait for
 `agent_settled`. The interface emits native journal events plus text updates.
 Additional Pi RPC commands and complete event-schema parity remain in progress.
@@ -717,3 +717,27 @@ A real PTY fixture covered both modes while a model response was outstanding,
 then exercised invalid input, correction, cancellation and preservation of an
 extension-owned setting. The existing native-dialog and resource fixtures also
 passed after the settings changes.
+
+### User shell execution checkpoint
+
+The terminal accepts `!command` and `!!command`. Both stream output and retain
+a typed shell record. The double-prefix form excludes that record from future
+model context. Shell commands run directly without a model request. Nonzero
+exits retain output and the exit code. Escape cancels the command and reaps its
+process group or Windows job. Timeouts retain a cancelled result.
+
+RPC supports `bash`, streamed `bash_execution_update` events correlated with
+the caller's ID, `abort_bash`, and `isBashRunning` in `get_state`. The caller
+waits for the final command response. Native and imported Pi shell records keep
+context-exclusion flags. The existing journal's pending tool operations must
+be resolved before a direct shell command starts.
+
+The current frontend serializes shell and agent operations. Running a user shell
+concurrently with a model response remains part of the outstanding acceptance
+work. The public workbench shell API and session append API are available to
+Rust embedding applications.
+
+RPC and both terminal modes passed fixtures covering streamed UTF-8 output,
+nonzero exits, included/excluded model context, cancellation, process cleanup
+and durable restoration. Core tests cover exclusion after reopening the journal,
+and shell tests cover partial UTF-8 chunks and timeouts.

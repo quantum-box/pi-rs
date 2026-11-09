@@ -344,6 +344,23 @@ impl View {
                         self.add_images(images);
                     }
                 }
+                pi_rs::Event::BashExecution { execution } => {
+                    self.lines.push(Entry::Tool {
+                        id: format!("shell-{}", record.id),
+                        name: if execution.exclude_from_context {
+                            "bash (excluded)"
+                        } else {
+                            "bash"
+                        }
+                        .into(),
+                        arguments: json!({"command":execution.command}).to_string(),
+                        output: execution.context_text(),
+                        failed: execution.cancelled
+                            || execution.exit_code.is_some_and(|code| code != 0),
+                        finished: true,
+                        parts: Vec::new(),
+                    });
+                }
                 pi_rs::Event::UserImages { images } => {
                     self.append(&format!("{} attached image(s)", images.len()));
                     self.add_images(images);
@@ -468,6 +485,36 @@ impl View {
     }
     fn receive(&mut self, value: Value) {
         match value["type"].as_str() {
+            Some("bash_execution_start") => {
+                self.phase = Some("コマンド実行中");
+                self.lines.push(Entry::Tool {
+                    id: value["executionId"].as_str().unwrap_or_default().into(),
+                    name: if value["excludeFromContext"] == true { "bash (excluded)" } else { "bash" }.into(),
+                    arguments: json!({"command":value["command"]}).to_string(),
+                    output: String::new(),
+                    failed: false,
+                    finished: false,
+                    parts: Vec::new(),
+                });
+            }
+            Some("bash_execution_update") => {
+                if let Some(Entry::Tool { output, .. }) = self.lines.iter_mut().rev().find(|entry| matches!(entry, Entry::Tool { id, .. } if id == value["executionId"].as_str().unwrap_or_default())) {
+                    output.push_str(value["output"].as_str().unwrap_or_default());
+                    if output.len() > 50 * 1024 {
+                        let mut start = output.len() - 50 * 1024;
+                        while !output.is_char_boundary(start) { start += 1; }
+                        output.drain(..start);
+                    }
+                }
+            }
+            Some("bash_execution_end") => {
+                let outcome = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
+                    Ok(execution) if !execution.cancelled && execution.exit_code == Some(0) => pi_rs::Outcome::Succeeded(execution.context_text()),
+                    Ok(execution) => pi_rs::Outcome::Failed(execution.context_text()),
+                    Err(_) => pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
+                };
+                self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome);
+            }
             Some("model_progress") => {
                 self.phase = Some(match value["stage"].as_str() {
                     Some("loading_model") => "モデル読込待ち",
@@ -1842,6 +1889,21 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 });
                             }
                             view.picker = Some(Picker::new("Settings", items));
+                        } else if input.starts_with('!') {
+                            if is_busy(&worker) {
+                                view.append("Wait for the current operation before executing a shell command");
+                                view.editor.replace(input);
+                            } else {
+                                let excluded = input.starts_with("!!");
+                                let command = input[if excluded { 2 } else { 1 }..].trim();
+                                if !command.is_empty() {
+                                    start_request(
+                                        &args,
+                                        json!({"type":"bash","command":command,"exclude_from_context":excluded}),
+                                        &mut worker,
+                                    )?;
+                                }
+                            }
                         } else if let Some(active) = worker.as_mut().filter(|active| active.busy) {
                             let kind = if action == "app.message.followUp" {
                                 "followup"

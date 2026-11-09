@@ -340,3 +340,42 @@ pub struct ExtensionState {
     pub version: u32,
     pub data: Value,
 }
+
+/// User-initiated shell output, retained even when excluded from model context.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashExecution {
+    pub command: String,
+    #[serde(default)]
+    pub output: String,
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub full_output_path: Option<String>,
+    #[serde(default)]
+    pub exclude_from_context: bool,
+}
+impl BashExecution {
+    pub fn context_text(&self) -> String {
+        let mut text = format!("Ran `{}`\n", self.command);
+        if self.output.is_empty() {
+            text.push_str("(no output)");
+        } else {
+            text.push_str(&format!("```\n{}\n```", self.output));
+        }
+        if self.cancelled {
+            text.push_str("\n\n(command cancelled)");
+        } else if let Some(code) = self.exit_code.filter(|code| *code != 0) {
+            text.push_str(&format!("\n\nCommand exited with code {code}"));
+        }
+        if self.truncated
+            && let Some(path) = &self.full_output_path
+        {
+            text.push_str(&format!("\n\n[Output truncated. Full output: {path}]"));
+        }
+        text
+    }
+}

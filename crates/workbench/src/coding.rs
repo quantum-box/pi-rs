@@ -39,6 +39,61 @@ impl CodingTools {
         tools.unrestricted = true;
         Ok(tools)
     }
+    /// Execute an explicit user shell command without making a model request.
+    pub async fn execute_shell(
+        &self,
+        command: &str,
+        timeout: Option<Duration>,
+        cancellation: &pi_rs::CancellationToken,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<pi_rs::BashExecution> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if command.trim().is_empty() || command.len() > 1024 * 1024 {
+            return Err(Error::Config(
+                "shell command must contain 1–1048576 bytes".into(),
+            ));
+        }
+        let tool = CodingTool {
+            root: self.root.clone(),
+            unrestricted: self.unrestricted,
+            kind: if cfg!(windows) {
+                Kind::PowerShell
+            } else {
+                Kind::Bash
+            },
+        };
+        let mut arguments = json!({"command":command});
+        if let Some(timeout) = timeout {
+            arguments["timeout"] = json!(timeout.as_secs_f64());
+        }
+        let result = tool
+            .shell_stream(&arguments, cancellation, progress)
+            .await?;
+        let output = if result.timed_out {
+            format!(
+                "{}\nCommand timed out after {} seconds",
+                result.output.display_without_notice,
+                timeout.expect("elapsed timeout").as_secs_f64()
+            )
+        } else {
+            result.output.display_without_notice
+        };
+        Ok(pi_rs::BashExecution {
+            command: command.into(),
+            output,
+            exit_code: result.status.code(),
+            cancelled: result.cancelled,
+            truncated: result.output.path.is_some(),
+            full_output_path: result
+                .output
+                .path
+                .map(|path| path.to_string_lossy().into_owned()),
+            exclude_from_context: false,
+        })
+    }
+
     /// Read a user-selected attachment using the same image limits as the read tool.
     pub fn read_attachment(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
         let tool = CodingTool {
@@ -533,6 +588,24 @@ impl CodingTool {
         Ok(output)
     }
     async fn shell(&self, args: &Value) -> Result<ShellResult> {
+        let result = self
+            .shell_stream(args, &pi_rs::CancellationToken::new(), &mut |_| {})
+            .await?;
+        if result.timed_out {
+            return Err(Error::Config(format!(
+                "{}\nCommand timed out after {} seconds",
+                result.output.display,
+                shell_timeout(args)?.expect("elapsed timeout").as_secs_f64()
+            )));
+        }
+        Ok(result)
+    }
+    async fn shell_stream(
+        &self,
+        args: &Value,
+        cancellation: &pi_rs::CancellationToken,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<ShellResult> {
         let started = std::time::Instant::now();
         let timeout = shell_timeout(args)?;
         let mut command = if matches!(self.kind, Kind::PowerShell) {
@@ -575,11 +648,20 @@ impl CodingTool {
         let mut stdout_chunk = [0; 8192];
         let mut stderr_chunk = [0; 8192];
         let mut drain_deadline = None;
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let mut stdout_text = ShellStream::default();
+        let mut stderr_text = ShellStream::default();
         while status.is_none() || stdout_open || stderr_open {
             tokio::select! {
-                _ = &mut deadline => {
-                    let output = output.finish()?;
-                    return Err(Error::Config(format!("{}\nCommand timed out after {} seconds", output.display, timeout.expect("deadline needs a timeout").as_secs_f64())));
+                _ = cancellation.cancelled(), if !cancelled => {
+                    cancelled = true;
+                    process.terminate();
+                }
+                _ = &mut deadline, if !cancelled => {
+                    timed_out = true;
+                    cancelled = true;
+                    process.terminate();
                 }
                 result = process.wait(), if status.is_none() => {
                     status = Some(result?);
@@ -591,11 +673,13 @@ impl CodingTool {
                     let count = count?;
                     stdout_open = count != 0;
                     output.append(&stdout_chunk[..count])?;
+                    stdout_text.push(&stdout_chunk[..count], progress);
                 }
                 count = stderr.read(&mut stderr_chunk), if stderr_open => {
                     let count = count?;
                     stderr_open = count != 0;
                     output.append(&stderr_chunk[..count])?;
+                    stderr_text.push(&stderr_chunk[..count], progress);
                 }
                 _ = async {
                     match drain_deadline {
@@ -605,7 +689,11 @@ impl CodingTool {
                 } => break,
             }
         }
+        stdout_text.finish(progress);
+        stderr_text.finish(progress);
         Ok(ShellResult {
+            cancelled,
+            timed_out,
             output: output.finish()?,
             status: status.expect("shell status observed"),
             elapsed: started.elapsed().as_secs_f64(),
@@ -668,9 +756,46 @@ pub fn prepare_image(original: image::DynamicImage) -> Result<PreparedImage> {
 }
 
 struct ShellResult {
+    cancelled: bool,
+    timed_out: bool,
     output: crate::shell_output::Output,
     status: std::process::ExitStatus,
     elapsed: f64,
+}
+
+#[derive(Default)]
+struct ShellStream(Vec<u8>);
+impl ShellStream {
+    fn push(&mut self, bytes: &[u8], progress: &mut (dyn FnMut(&str) + Send)) {
+        self.0.extend_from_slice(bytes);
+        while !self.0.is_empty() {
+            let (valid, invalid) = match std::str::from_utf8(&self.0) {
+                Ok(text) => {
+                    progress(text);
+                    self.0.clear();
+                    return;
+                }
+                Err(error) => (error.valid_up_to(), error.error_len()),
+            };
+            if valid > 0 {
+                progress(std::str::from_utf8(&self.0[..valid]).expect("valid UTF-8 prefix"));
+                self.0.drain(..valid);
+            }
+            match invalid {
+                Some(count) => {
+                    progress("�");
+                    self.0.drain(..count);
+                }
+                None => break,
+            }
+        }
+    }
+    fn finish(&mut self, progress: &mut (dyn FnMut(&str) + Send)) {
+        if !self.0.is_empty() {
+            progress(&String::from_utf8_lossy(&self.0));
+            self.0.clear();
+        }
+    }
 }
 
 fn string<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
@@ -790,6 +915,15 @@ impl ProcessGroup {
             finished: false,
         })
     }
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(id) = self.group {
+            unsafe {
+                libc::kill(-(id as i32), libc::SIGKILL);
+            }
+        }
+        let _ = self.child.start_kill();
+    }
     fn stdout(&mut self) -> tokio::process::ChildStdout {
         #[cfg(windows)]
         {
@@ -817,15 +951,7 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if !self.finished {
-            #[cfg(unix)]
-            if let Some(id) = self.group {
-                // The child is its own process-group leader, so cancellation
-                // also reaches grandchildren such as a shell's sleep process.
-                unsafe {
-                    libc::kill(-(id as i32), libc::SIGKILL);
-                }
-            }
-            let _ = self.child.start_kill();
+            self.terminate();
         }
     }
 }
@@ -833,6 +959,61 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_updates_preserve_multibyte_boundaries() {
+        let mut decoder = ShellStream::default();
+        let mut text = String::new();
+        let mut output = |chunk: &str| text.push_str(chunk);
+        for byte in "日本語".as_bytes() {
+            decoder.push(&[*byte], &mut output);
+        }
+        decoder.finish(&mut output);
+        assert_eq!(text, "日本語");
+    }
+    #[tokio::test]
+    async fn explicit_shell_preserves_failed_output_and_cancelled_processes() {
+        let directory = tempfile::tempdir().unwrap();
+        let tools = CodingTools::local(directory.path()).unwrap();
+        let command = if cfg!(windows) {
+            "Write-Output 'failed'; exit 7"
+        } else {
+            "printf failed; exit 7"
+        };
+        let result = tools
+            .execute_shell(command, None, &pi_rs::CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(7));
+        assert!(result.output.contains("failed"));
+        let cancellation = pi_rs::CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 10"
+        } else {
+            "sleep 10"
+        };
+        let result = tools
+            .execute_shell(command, None, &cancellation, &mut |_| {})
+            .await
+            .unwrap();
+        assert!(result.cancelled);
+        let result = tools
+            .execute_shell(
+                command,
+                Some(Duration::from_millis(10)),
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(result.cancelled);
+        assert!(result.output.contains("Command timed out"));
+    }
 
     #[test]
     fn concurrent_disjoint_edits_are_serialized_and_return_diffs() {

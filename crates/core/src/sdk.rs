@@ -261,6 +261,13 @@ impl AgentSession {
         self.emit_last();
         Ok(())
     }
+    /// Record a user shell result and notify subscribers without requesting a model turn.
+    pub fn append_bash_execution(&mut self, execution: crate::BashExecution) -> Result<()> {
+        self.ensure_open()?;
+        self.session.append_bash_execution(execution)?;
+        self.emit_last();
+        Ok(())
+    }
     pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
         self.ensure_open()?;
         self.session.set_label(target, label)?;

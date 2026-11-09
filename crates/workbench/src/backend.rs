@@ -55,6 +55,12 @@ enum Request {
         task: String,
     },
     McpStatus,
+    Bash {
+        command: String,
+        #[serde(default)]
+        exclude_from_context: bool,
+        request_id: Option<serde_json::Value>,
+    },
     ExtensionUiResponse {
         id: Uuid,
         value: pi_rs::UiResponse,
@@ -196,6 +202,29 @@ pub async fn run(mut args: Cli) -> Result<()> {
                         .await?
                 }
                 Request::McpStatus => runtime.mcp_status(&args)?,
+                Request::Bash { command, exclude_from_context, request_id } => {
+                    let execution_id = Uuid::new_v4();
+                    output(json!({"type":"bash_execution_start","executionId":execution_id,"command":command,"excludeFromContext":exclude_from_context,"id":request_id}));
+                    let result = async {
+                        session.ensure_settled()?;
+                        let tools = pi_rs_workbench::coding::CodingTools::local(&args.workspace)?;
+                        let mut execution = tools.execute_shell(&command, args.tool_timeout_secs.map(std::time::Duration::from_secs), &cancel, &mut |chunk| {
+                            output(json!({"type":"bash_execution_update","executionId":execution_id,"output":chunk,"id":request_id}));
+                        }).await?;
+                        execution.exclude_from_context = exclude_from_context;
+                        session.append_bash_execution(execution.clone())?;
+                        observer(pi_rs::Notification::Committed(session.records().last().expect("saved shell execution")));
+                        Ok::<_, Error>(execution)
+                    }.await;
+                    match result {
+                        Ok(execution) => output(json!({"type":"bash_execution_end","executionId":execution_id,"data":execution,"id":request_id})),
+                        Err(error) => {
+                            output(json!({"type":"bash_execution_end","executionId":execution_id,"error":error.to_string(),"id":request_id}));
+                            return Err(error);
+                        }
+                    }
+                }
+
                 Request::Review { child, from_record, resume, task } => {
                     let mut child = Session::open(child)?;
                     let review = pi_rs_review::Review {

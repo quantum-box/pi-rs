@@ -18,6 +18,7 @@ pub(super) struct Accumulator {
 
 pub(super) struct Output {
     pub display: String,
+    pub display_without_notice: String,
     pub script: String,
     pub script_truncated: bool,
     pub path: Option<PathBuf>,
@@ -102,6 +103,7 @@ impl Accumulator {
         } else {
             None
         };
+        let display_without_notice = display.clone();
         let display = match &path {
             Some(path) => {
                 let shown = display.split_terminator('\n').count();
@@ -117,6 +119,7 @@ impl Accumulator {
         };
         Ok(Output {
             display,
+            display_without_notice,
             script,
             script_truncated,
             path,

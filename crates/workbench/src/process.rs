@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 pub(super) struct Worker {
     pub(super) compacting: bool,
+    pub(super) bashing: bool,
     pub(super) busy: bool,
     persistent: bool,
     configuration: Value,
@@ -151,6 +152,7 @@ impl Worker {
         let persistent = operation.first() == Some(&"serve");
         Ok(Self {
             compacting: operation.first() == Some(&"compact"),
+            bashing: false,
             busy: !persistent,
             persistent,
             configuration: configuration(args),
@@ -183,6 +185,7 @@ impl Worker {
     pub(super) fn request(&mut self, args: &Cli, request: Value) -> Result<()> {
         self.send(json!({"type":"configure","model":args.model,"thinking":args.thinking,"session":args.session}))?;
         self.compacting = request["type"] == "compact";
+        self.bashing = request["type"] == "bash";
         self.send(request)?;
         self.busy = true;
         Ok(())

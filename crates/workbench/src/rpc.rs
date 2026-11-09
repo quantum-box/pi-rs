@@ -41,10 +41,16 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     });
     let mut worker: Option<Worker> = None;
     let mut pending_abort: Option<Value> = None;
+    let mut pending_bash: Option<Value> = None;
     loop {
         if let Some(active) = &mut worker {
             for event in active.events.try_iter() {
-                forward_event(event, &mut active.busy, &mut pending_abort)?;
+                forward_event(
+                    event,
+                    &mut active.busy,
+                    &mut pending_abort,
+                    &mut pending_bash,
+                )?;
             }
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
@@ -52,7 +58,12 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     let _ = reader.join();
                 }
                 for event in finished.events.try_iter() {
-                    forward_event(event, &mut finished.busy, &mut pending_abort)?;
+                    forward_event(
+                        event,
+                        &mut finished.busy,
+                        &mut pending_abort,
+                        &mut pending_bash,
+                    )?;
                 }
                 if finished.busy {
                     emit(json!({"type":"agent_end","success":status.success()}))?;
@@ -60,6 +71,14 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 }
                 if let Some(request) = pending_abort.take() {
                     response(&request, Ok(None))?;
+                }
+                if let Some(request) = pending_bash.take() {
+                    response(
+                        &request,
+                        Err(Error::Config(
+                            "shell worker exited before returning a result".into(),
+                        )),
+                    )?;
                 }
             }
         }
@@ -94,7 +113,37 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
             continue;
         }
-        if request["type"] == "abort" && busy(&worker) {
+        if request["type"] == "bash" {
+            let result = (|| {
+                if busy(&worker) {
+                    return Err(Error::Config(
+                        "wait for the current operation before executing a shell command".into(),
+                    ));
+                }
+                let command = request["command"]
+                    .as_str()
+                    .ok_or_else(|| Error::Config("command must be a string".into()))?;
+                if command.trim().is_empty() || command.len() > 1024 * 1024 {
+                    return Err(Error::Config(
+                        "shell command must contain 1–1048576 bytes".into(),
+                    ));
+                }
+                Worker::submit(
+                    &mut worker,
+                    &args,
+                    json!({"type":"bash","command":command,"exclude_from_context":request["excludeFromContext"] == true,"request_id":request.get("id")}),
+                )
+            })();
+            match result {
+                Ok(()) => pending_bash = Some(request),
+                Err(error) => response(&request, Err(error))?,
+            }
+            continue;
+        }
+        if (request["type"] == "abort"
+            || (request["type"] == "abort_bash" && pending_bash.is_some()))
+            && busy(&worker)
+        {
             if pending_abort.is_some() {
                 response(&request, Err(Error::Config("abort already pending".into())))?;
             } else if let Some(active) = &mut worker {
@@ -158,9 +207,9 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 Ok(Some(json!({"disposition":"started"})))
             }
         }
-        "abort" => Ok(None),
+        "abort" | "abort_bash" => Ok(None),
         "get_state" => {
-            let mut state = json!({"sessionFile":args.session,"isStreaming":busy(worker),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+            let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
             if !busy(worker) {
                 let session = Session::open(&args.session)?;
                 state["sessionId"] = json!(session.session_id());
@@ -467,9 +516,25 @@ fn busy(worker: &Option<Worker>) -> bool {
     worker.as_ref().is_some_and(|worker| worker.busy)
 }
 
-fn forward_event(event: Value, busy: &mut bool, pending_abort: &mut Option<Value>) -> Result<()> {
+fn forward_event(
+    event: Value,
+    busy: &mut bool,
+    pending_abort: &mut Option<Value>,
+    pending_bash: &mut Option<Value>,
+) -> Result<()> {
     match event["type"].as_str() {
-        Some("backend_ready") => Ok(()),
+        Some("backend_ready" | "bash_execution_start") => Ok(()),
+        Some("bash_execution_end") => {
+            if let Some(request) = pending_bash.take() {
+                let result = if let Some(error) = event["error"].as_str() {
+                    Err(Error::Config(error.into()))
+                } else {
+                    Ok(Some(event["data"].clone()))
+                };
+                response(&request, result)?;
+            }
+            Ok(())
+        }
         Some("agent_started") => {
             *busy = true;
             emit(json!({"type":"agent_start"}))
