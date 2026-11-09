@@ -391,3 +391,15 @@ project layers, so a project override can re-enable a user-disabled built-in.
 Theme discovery uses the filtered resource list and preserves live reload.
 Fixtures verify automatic and configured native extensions, trust gating,
 explicit overrides, project template precedence and live theme updates.
+
+### CLI export and transient credentials
+
+`--export <input> [output]` exports native or imported Pi sessions to HTML and
+exits. The default destination uses the input basename with `.html`. Existing
+destinations are preserved. HTML exports embed validated user and tool images
+as data URLs under an image-only data policy.
+
+`--api-key` overrides the model credential for the current process, including
+model discovery and persistent CLI/RPC workers. The credential remains
+process-local. Regression tests verify the selected bearer header and check
+that session records and command output contain no key value.

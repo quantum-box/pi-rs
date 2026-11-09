@@ -157,6 +157,14 @@ fn model_fixture_with_finish(
     effort: Option<&'static str>,
     finish: &'static str,
 ) -> (String, std::thread::JoinHandle<()>) {
+    model_fixture_with_config(effort, finish, None)
+}
+
+fn model_fixture_with_config(
+    effort: Option<&'static str>,
+    finish: &'static str,
+    expected_token: Option<&'static str>,
+) -> (String, std::thread::JoinHandle<()>) {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!(
         "http://{}/v1/chat/completions",
@@ -170,6 +178,7 @@ fn model_fixture_with_finish(
                 .unwrap();
             let mut reader = BufReader::new(&socket);
             let mut content_length = 0;
+            let mut authorization = None;
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -179,6 +188,12 @@ fn model_fixture_with_finish(
                 if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                     content_length = value.trim().parse().unwrap();
                 }
+                if line.to_ascii_lowercase().starts_with("authorization:") {
+                    authorization = Some(line.split_once(':').unwrap().1.trim().to_owned());
+                }
+            }
+            if let Some(token) = expected_token {
+                assert_eq!(authorization, Some(format!("Bearer {token}")));
             }
             let mut body = vec![0; content_length];
             reader.read_exact(&mut body).unwrap();
@@ -448,4 +463,99 @@ fn persistent_worker_accepts_multiple_prompts_and_releases_the_journal() {
     assert!(child.wait().unwrap().success());
     reader.join().unwrap();
     server.join().unwrap();
+}
+
+#[test]
+fn api_key_override_reaches_direct_and_rpc_requests_without_persistence() {
+    let token = "override-test-secret";
+    let (endpoint, server) = model_fixture_with_config(None, "stop", Some(token));
+    let directory = tempfile::tempdir().unwrap();
+    let session = directory.path().join("direct.jsonl");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", directory.path().join("home"))
+        .env("PI_RS_MODEL_TOKEN", "unused-environment-token")
+        .arg("--session")
+        .arg(&session)
+        .args([
+            "--endpoint",
+            &endpoint,
+            "--api-key",
+            token,
+            "--print",
+            "same input",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
+    assert!(!std::fs::read_to_string(session).unwrap().contains(token));
+    let mut rpc = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", directory.path().join("home"))
+        .env("PI_RS_MODEL_TOKEN", "unused-environment-token")
+        .args([
+            "--no-session",
+            "--endpoint",
+            &endpoint,
+            "--api-key",
+            token,
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = rpc.stdin.take().unwrap();
+    writeln!(input, "{{\"type\":\"prompt\",\"message\":\"same input\"}}").unwrap();
+    input.flush().unwrap();
+    let mut reader = BufReader::new(rpc.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        assert!(!line.contains(token));
+        let event: Value = serde_json::from_str(&line).unwrap();
+        if event["type"] == "agent_settled" {
+            break;
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    input.flush().unwrap();
+    let output = rpc.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
+    server.join().unwrap();
+}
+
+#[test]
+fn export_flag_preserves_source_and_refuses_overwrite() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("session.jsonl");
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    session
+        .append_user_with_images("export <marker>".into(), Vec::new(), None)
+        .unwrap();
+    session.export_jsonl(&input).unwrap();
+    let before = std::fs::read(&input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", directory.path().join("home"))
+        .arg("--export")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        std::fs::read_to_string(input.with_extension("html"))
+            .unwrap()
+            .contains("export &lt;marker&gt;")
+    );
+    let again = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", directory.path().join("home"))
+        .arg("--export")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(!again.status.success());
+    assert_eq!(std::fs::read(input).unwrap(), before);
 }

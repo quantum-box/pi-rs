@@ -21,6 +21,10 @@ pub(super) struct Worker {
 impl Worker {
     pub(super) fn start(args: &Cli, operation: &[&str]) -> Result<Self> {
         let mut command = Command::new(std::env::current_exe()?);
+        if let Some(token) = args.model_token() {
+            command.env("PI_RS_MODEL_TOKEN", token);
+        }
+
         command
             .arg("--session")
             .arg(&args.session)
@@ -194,9 +198,13 @@ impl Worker {
     }
 }
 fn configuration(args: &Cli) -> Value {
+    use sha2::{Digest, Sha256};
+    let token_fingerprint = args
+        .model_token()
+        .map(|token| format!("{:x}", Sha256::digest(token.as_bytes())));
     json!({
         "workspace":args.workspace,
-        "endpoint":args.endpoint,"extensions":args.extensions,"disabled":args.disable_extension,
+        "endpoint":args.endpoint,"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
         "system_prompt":args.system_prompt,"append_system_prompt":args.append_system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
         "tools":args.tools,"exclude_tools":args.exclude_tools,"no_tools":args.no_tools,"no_builtin_tools":args.no_builtin_tools,

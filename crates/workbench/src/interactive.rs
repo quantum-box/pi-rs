@@ -1551,14 +1551,14 @@ fn start_model_picker(args: &Cli, view: &mut View) {
     }
     let scope = args.model_scope.clone();
     let endpoint = args.endpoint.clone();
+    let token = args.model_token();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let provider =
-                pi_rs::ollama::Ollama::new(&endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?;
+            let provider = pi_rs::ollama::Ollama::new(&endpoint, token)?;
             if scope.is_empty() {
                 runtime.block_on(provider.models())
             } else {

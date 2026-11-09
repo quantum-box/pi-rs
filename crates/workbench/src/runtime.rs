@@ -193,7 +193,7 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             system_prompt.push_str("</mcp_servers>");
         }
         let show_reasoning = args.trace;
-        let provider = Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?
+        let provider = Ollama::new(&args.endpoint, args.model_token())?
             .with_reasoning_effort(args.thinking.as_deref())
             .with_progress(|stage| output(json!({"type":"model_progress","stage":stage})))
             .with_reasoning(move |delta| {

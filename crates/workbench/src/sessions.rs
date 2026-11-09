@@ -119,16 +119,22 @@ fn escape(text: &str) -> String {
 pub fn html(session: &Session) -> String {
     let title = escape(session.name().unwrap_or("Pi session"));
     let mut html = format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>{title}</title><style>body{{max-width:960px;margin:40px auto;padding:0 20px;font:16px system-ui;background:#16181d;color:#e4e6eb}}article,details{{padding:16px;margin:12px 0;border-radius:8px;background:#252932}}.user{{background:#243448}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}}summary{{cursor:pointer}}.thinking{{color:#a5abb6}}h1{{font-size:24px}}</style><h1>{title}</h1>"
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\"><title>{title}</title><style>body{{max-width:960px;margin:40px auto;padding:0 20px;font:16px system-ui;background:#16181d;color:#e4e6eb}}article,details{{padding:16px;margin:12px 0;border-radius:8px;background:#252932}}.user{{background:#243448}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}}summary{{cursor:pointer}}.thinking{{color:#a5abb6}}h1{{font-size:24px}}</style><h1>{title}</h1>"
     );
     for record in session.branch() {
         match &record.event {
-            Event::User { content, .. } | Event::UserWithImages { content, .. } => {
-                html.push_str(&format!(
-                    "<article class=\"user\"><b>You</b><pre>{}</pre></article>",
-                    escape(content)
-                ))
-            }
+            Event::User { content, .. } => html.push_str(&format!(
+                "<article class=\"user\"><b>You</b><pre>{}</pre></article>",
+                escape(content)
+            )),
+            Event::UserWithImages {
+                content, images, ..
+            } => html.push_str(&format!(
+                "<article class=\"user\"><b>You</b><pre>{}</pre>{}</article>",
+                escape(content),
+                images_html(images)
+            )),
+            Event::UserImages { images } => html.push_str(&images_html(images)),
             Event::Assistant {
                 content,
                 invocations,
@@ -148,11 +154,9 @@ pub fn html(session: &Session) -> String {
                     ));
                 }
             }
-            Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => html
-                .push_str(&format!(
-                    "<details><summary>Tool result</summary><pre>{}</pre></details>",
-                    escape(&outcome.tool_content())
-                )),
+            Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => {
+                html.push_str(&tool_html(outcome))
+            }
             Event::ModelFinished { metadata, .. } => {
                 if let Some(reasoning) = &metadata.reasoning {
                     html.push_str(&format!("<details class=\"thinking\"><summary>Thinking</summary><pre>{}</pre></details>", escape(reasoning)));
@@ -167,6 +171,38 @@ pub fn html(session: &Session) -> String {
     }
     html.push_str("</html>");
     html
+}
+
+fn images_html(images: &[pi_rs::ImageContent]) -> String {
+    images.iter().filter(|image| image.validate().is_ok()).map(|image| format!(
+        "<img alt=\"Attached image\" style=\"max-width:100%;height:auto\" src=\"data:{};base64,{}\">", image.mime_type, image.data
+    )).collect()
+}
+fn tool_html(outcome: &pi_rs::Outcome) -> String {
+    let mut value = serde_json::to_value(outcome).expect("serializable outcome");
+    let mut images = Vec::new();
+    if let Some(blocks) = value
+        .get_mut("data")
+        .and_then(|data| data.get_mut("content"))
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for block in blocks.iter_mut().filter(|block| block["type"] == "image") {
+            if let Ok(image) = serde_json::from_value::<pi_rs::ImageContent>(block.clone()) {
+                images.push(image);
+            }
+            block["data"] = serde_json::json!("[image attached]");
+        }
+    }
+    let text = if images.is_empty() {
+        outcome.tool_content()
+    } else {
+        value.to_string()
+    };
+    format!(
+        "<details><summary>Tool result</summary><pre>{}</pre>{}</details>",
+        escape(&text),
+        images_html(&images)
+    )
 }
 
 pub fn copy_last(session: &Session) -> Result<()> {
@@ -261,5 +297,23 @@ mod tests {
         let imported = directory.path().join("import.jsonl");
         import(&exported, &imported).unwrap();
         assert_eq!(Session::open(imported).unwrap().name(), session.name());
+    }
+    #[test]
+    fn html_embeds_user_images_with_a_data_only_image_policy() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images(
+                "look".into(),
+                vec![pi_rs::ImageContent {
+                    data: "aW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                }],
+                None,
+            )
+            .unwrap();
+        let document = html(&session);
+        assert!(document.contains("img-src data:"));
+        assert!(document.contains("src=\"data:image/png;base64,aW1hZ2U=\""));
+        assert!(!document.contains("https://"));
     }
 }

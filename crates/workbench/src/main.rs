@@ -99,6 +99,12 @@ struct Cli {
     /// List available models, optionally filtered by fuzzy search, then exit.
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     list_models: Option<String>,
+    /// Override the model API key for this process without saving it.
+    #[arg(long, global = true)]
+    api_key: Option<String>,
+    /// Export a native or Pi session to HTML and exit. Output defaults beside input.
+    #[arg(long = "export", num_args = 1..=2, value_names = ["INPUT", "OUTPUT"])]
+    export_session: Option<Vec<PathBuf>>,
     /// Thinking effort for models that support reasoning.
     #[arg(long, global = true, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
     thinking: Option<String>,
@@ -212,6 +218,11 @@ struct Cli {
 }
 
 impl Cli {
+    fn model_token(&self) -> Option<String> {
+        self.api_key
+            .clone()
+            .or_else(|| std::env::var("PI_RS_MODEL_TOKEN").ok())
+    }
     fn restore_model_selection(&mut self, model: String, thinking: Option<String>) {
         if !self.model_explicit
             && (self.model_scope.is_empty()
@@ -412,6 +423,23 @@ async fn main() {
 }
 
 async fn execute(mut args: Cli) -> Result<()> {
+    if let Some(paths) = &args.export_session {
+        let input = &paths[0];
+        let output_path = paths
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| input.with_extension("html"));
+        let session = session_import::read(input)?;
+        if session.host_binding().is_some() {
+            return Err(Error::Session(
+                "managed sessions must be exported by their host".into(),
+            ));
+        }
+        sessions::export(&session, &output_path)?;
+        output(json!({"type":"exported","path":output_path}));
+        return Ok(());
+    }
+
     let selected = model_selection::split(&args.model);
     args.model = selected.model;
     if !args.thinking_explicit && selected.thinking.is_some() {
@@ -419,10 +447,9 @@ async fn execute(mut args: Cli) -> Result<()> {
         args.thinking_explicit = true;
     }
     if args.list_models.is_some() || args.models.is_some() {
-        let available =
-            pi_rs::ollama::Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?
-                .models()
-                .await?;
+        let available = pi_rs::ollama::Ollama::new(&args.endpoint, args.model_token())?
+            .models()
+            .await?;
         if let Some(search) = &args.list_models {
             for model in available
                 .iter()
