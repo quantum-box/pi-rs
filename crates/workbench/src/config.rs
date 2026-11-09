@@ -545,6 +545,25 @@ mod tests {
     }
 
     #[test]
+    fn retry_settings_preserve_defaults_and_accept_zero_delay() {
+        let defaults = Settings::default().retry_settings();
+        assert!(defaults.enabled);
+        assert_eq!(defaults.max_retries, 3);
+        assert_eq!(defaults.base_delay_ms, 2000);
+        assert_eq!(defaults.max_agent_delay_ms, 60000);
+        let settings = Settings {
+            value: json!({"retry":{"enabled":false,"maxRetries":0,"baseDelayMs":0.0,"maxAgentDelayMs":42.0,"provider":{"custom":true}}}),
+            ..Settings::default()
+        };
+        validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+        let retry = settings.retry_settings();
+        assert!(!retry.enabled);
+        assert_eq!(retry.max_retries, 0);
+        assert_eq!(retry.base_delay_ms, 0);
+        assert_eq!(retry.max_agent_delay_ms, 42);
+    }
+
+    #[test]
     fn model_thinking_defaults_prefer_the_provider_key_then_global_default() {
         let settings = Settings {
             value: json!({"defaultThinkingLevel":"low", "modelThinkingLevels":{"ollama/a":"high", "a":"medium", "b":"max"}}),
@@ -565,6 +584,10 @@ mod tests {
             json!({"codemode":{"inlineBudget":-1}}),
             json!({"hideThinkingBlock":"false"}),
             json!({"compaction": false}),
+            json!({"retry":{"enabled":"false"}}),
+            json!({"retry":{"maxRetries":-1}}),
+            json!({"retry":{"baseDelayMs":1.5}}),
+            json!({"retry":{"maxAgentDelayMs":9007199254740992_u64}}),
             json!({"compaction":{"reserveTokens":-1}}),
             json!({"compaction":{"keepRecentTokens":1.5}}),
             json!({"compaction":{"reserveTokens":9007199254740992_u64}}),

@@ -2053,6 +2053,20 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                         json!(!args.settings.auto_compaction_enabled()),
                                     ),
                                 },
+                                Item {
+                                    label: format!(
+                                        "Auto-retry · {} (toggle)",
+                                        if args.settings.retry_settings().enabled {
+                                            "on"
+                                        } else {
+                                            "off"
+                                        }
+                                    ),
+                                    selection: Selection::Setting(
+                                        "autoRetryEnabled".into(),
+                                        json!(!args.settings.retry_settings().enabled),
+                                    ),
+                                },
                             ];
                             for name in [
                                 "theme",
@@ -2072,6 +2086,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 "packages",
                                 "codemode",
                                 "compaction",
+                                "retry",
                             ] {
                                 items.push(Item {
                                     label: format!(
@@ -2378,6 +2393,7 @@ fn select(
                 "modelThinkingLevels" => json!({}),
                 "steeringMode" | "followUpMode" => json!("one-at-a-time"),
                 "codemode" => json!({"mode":"on", "inlineBudget":3000}),
+                "retry" => serde_json::to_value(args.settings.retry_settings())?,
                 "compaction" => {
                     let tokens = args.settings.compaction_tokens(&args.model);
                     json!({"enabled":args.settings.auto_compaction_enabled(), "reserveTokens":tokens.reserve_tokens, "keepRecentTokens":tokens.keep_recent_tokens})
@@ -2403,7 +2419,17 @@ fn select(
             view.setting_editor = Some((key, dialog));
         }
         Selection::Setting(key, value) => {
-            if key == "autoCompactionEnabled" {
+            if key == "autoRetryEnabled" {
+                let enabled = value
+                    .as_bool()
+                    .ok_or_else(|| Error::Config("auto-retry must be a boolean".into()))?;
+                args.settings.set_auto_retry_enabled(enabled)?;
+                Worker::control(
+                    worker,
+                    args,
+                    json!({"type":"set_auto_retry", "enabled":enabled}),
+                )?;
+            } else if key == "autoCompactionEnabled" {
                 let enabled = value
                     .as_bool()
                     .ok_or_else(|| Error::Config("auto-compaction must be a boolean".into()))?;

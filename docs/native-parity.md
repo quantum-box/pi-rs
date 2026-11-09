@@ -1407,7 +1407,7 @@ their control state is cleared when the waiting future is dropped.
 RPC supports `set_auto_retry` and `abort_retry`, with `auto_retry_start` and
 `auto_retry_end` events. The terminal displays the retry wait, attempt count and
 error. Provider-internal retries and Retry-After handling, summary-specific retry
-policy and a settings-editor toggle remain open.
+policy remain open.
 
 Tests cover recovery, request and retry caps, queued input, wait cancellation,
 dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify
@@ -1415,3 +1415,17 @@ dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify
 disabling retry. A PTY check verifies the retry phase and attempt display,
 recovered output and terminal restoration. The complete workspace test suite
 and all-target Clippy also pass.
+
+
+### Retry settings UI checkpoint
+
+`/settings` includes an Auto-retry toggle that persists the enabled flag and
+updates an already-running backend. The retry object also has a JSON editor
+showing Pi defaults when no explicit object exists. Advanced edits apply on
+reload/startup, as indicated by the editor title. Existing provider settings and
+unrelated user keys survive a toggle.
+
+PTY checks cover fullscreen and regular layouts, disabling retry before a 503
+response, opening the retry editor and restoring the terminal. Settings tests
+cover Pi defaults, explicit zero values, integral JSON numbers and invalid
+retry settings. Workspace tests and all-target Clippy pass.
