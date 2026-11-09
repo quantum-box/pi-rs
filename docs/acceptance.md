@@ -285,3 +285,16 @@ AIP 統合16件は並列で3回、評価設定7件、Workflow の HTTP 呼出し
 AIP 統合18件が通過した。Anthropic の全ライブラリ試験は環境の HTTP プロキシを
 外すと74件が通過し、4件はスキップされた。
 [Anthropic 経路の実装と検証](https://github.com/quantum-box/tachyon-apps/commit/cde7dd60db7ff81075d9c39a8d2d63d284bc174b)
+
+
+### 請求の後着と Workspace 終了時の取消
+
+MySQL と TiDB で、同じ秒に後着した請求済み使用量を会計連携が一度だけ
+取り込み、処理位置が巻き戻らないことを確認した。取引 ID は再送時も同じ。
+会計連携18件と請求モードの使用量記録2件が通過した。
+[請求済み使用量の再取得試験](https://github.com/quantum-box/tachyon-apps/commit/91d290a83a4e4f28fb7eebcc7a59d6f203f4eabc)
+
+Workspace の進捗送信を保留し、コマンド終了後に Coding Job を取り消した。
+元の操作 ID に停止確認が付き、後続操作の起動は0件だった。Workspace の
+試験252件が通過し、5件はスキップされた。
+[終了済み Workspace 操作の停止確認試験](https://github.com/quantum-box/tachyon-apps/commit/8feae539722e6f380d5329d61863c797820baebd)
