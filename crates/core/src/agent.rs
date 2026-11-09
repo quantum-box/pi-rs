@@ -345,7 +345,7 @@ impl Agent<'_> {
 
     async fn request(
         &self,
-        session: &Session,
+        session: &mut Session,
         states: &ExtensionStates,
         max_output_tokens: u32,
         before: Option<u64>,
