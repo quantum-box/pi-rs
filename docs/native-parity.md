@@ -26,7 +26,7 @@ remaining acceptance work for that surface.
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation, complete output/image fidelity and limits |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
-| Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Published-crate resource bundles and complete source/filter compatibility |
+| Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
 ## Current RPC subset
 
@@ -508,3 +508,16 @@ case-insensitively, identifies linked directories, reports entry limits and
 labels empty directories. Head truncation preserves complete lines where they
 fit. Fixtures cover large-file search, Unicode and literal patterns, context,
 empty directory output and continuation notices.
+
+### Published native package checkpoint
+
+Cargo registry installs discover the compiled package source from Cargo's JSON
+artifact report and retain its declared skills, prompts and themes in the Pi
+package cache. Clearing Cargo's source cache does not remove those resources.
+Snapshots are content-addressed and bounded to 128 MiB and 20,000 files.
+
+Installed executables use separate generations. A failed update retains the
+previous index and executable, while successful updates keep build-cache reuse.
+Fixtures cover a local sparse registry, version and resource discovery, resource
+use after Cargo cache removal, and a failed Rust rebuild followed by continued
+use of the previous executable.

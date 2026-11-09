@@ -404,6 +404,9 @@ async fn install(source: &str) -> Result<Installed> {
     })
     .await
     .map_err(|error| Error::Config(error.to_string()))??;
+    let generation = tempfile::Builder::new()
+        .prefix("install-")
+        .tempdir_in(&directory)?;
     let mut root = PathBuf::from(source);
     let mut installed_binaries = Vec::new();
     if let Some(specification) = source.strip_prefix("cargo:") {
@@ -414,14 +417,36 @@ async fn install(source: &str) -> Result<Installed> {
             });
         let mut command = tokio::process::Command::new("cargo");
         command
-            .args(["install", name, "--locked", "--root"])
-            .arg(&directory);
+            .args([
+                "install",
+                name,
+                "--locked",
+                "--force",
+                "--message-format=json",
+                "--root",
+            ])
+            .arg(generation.path().join("cargo"));
         if let Some(version) = version {
             command.args(["--version", version]);
         }
-        run(command).await?;
-        root = directory.clone();
-        installed_binaries = executable_files(&directory.join("bin"))?;
+        let artifacts = run(command).await?;
+        root = artifacts
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                let artifact: Value = serde_json::from_slice(line).ok()?;
+                if artifact["reason"] != "compiler-artifact" || !artifact["executable"].is_string()
+                {
+                    return None;
+                }
+                Path::new(artifact["manifest_path"].as_str()?)
+                    .parent()
+                    .map(Path::to_path_buf)
+            })
+            .next_back()
+            .ok_or_else(|| {
+                Error::Config("cargo did not report the installed package source".into())
+            })?;
+        installed_binaries = executable_files(&generation.path().join("cargo/bin"))?;
     } else if let Some(specification) = source.strip_prefix("git:") {
         let (url, reference) = specification
             .split_once('#')
@@ -434,7 +459,7 @@ async fn install(source: &str) -> Result<Installed> {
                 "use a credential helper for git package authentication".into(),
             ));
         }
-        root = directory.join("source");
+        root = generation.path().join("source");
         if !root.exists() {
             let mut command = tokio::process::Command::new("git");
             command
@@ -468,7 +493,7 @@ async fn install(source: &str) -> Result<Installed> {
         .get("version")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if root.join("Cargo.toml").is_file() && !source.starts_with("cargo:") {
+    if root.join("Cargo.toml").is_file() {
         let mut metadata = tokio::process::Command::new("cargo");
         metadata
             .args([
@@ -480,11 +505,14 @@ async fn install(source: &str) -> Result<Installed> {
             ])
             .arg(root.join("Cargo.toml"));
         let metadata: Value = serde_json::from_slice(&run(metadata).await?)?;
+        let expected_manifest = root.join("Cargo.toml").canonicalize()?;
         if let Some(package) = metadata["packages"].as_array().and_then(|packages| {
             packages.iter().find(|package| {
-                package["manifest_path"]
-                    .as_str()
-                    .is_some_and(|path| Path::new(path) == root.join("Cargo.toml"))
+                package["manifest_path"].as_str().is_some_and(|path| {
+                    Path::new(path)
+                        .canonicalize()
+                        .is_ok_and(|path| path == expected_manifest)
+                })
             })
         }) {
             if !root.join("pi-package.json").is_file() {
@@ -492,27 +520,40 @@ async fn install(source: &str) -> Result<Installed> {
             }
             version = package["version"].as_str().map(str::to_owned);
         }
-        let mut build = tokio::process::Command::new("cargo");
-        build
-            .args([
-                "build",
-                "--release",
-                "--message-format=json",
-                "--manifest-path",
-            ])
-            .arg(root.join("Cargo.toml"))
-            .arg("--target-dir")
-            .arg(directory.join("target"));
-        let artifacts = run(build).await?;
-        for line in artifacts.split(|byte| *byte == b'\n') {
-            if let Ok(artifact) = serde_json::from_slice::<Value>(line)
-                && artifact["reason"] == "compiler-artifact"
-                && let Some(executable) = artifact["executable"].as_str()
-            {
-                installed_binaries.push(executable.into());
+        if !source.starts_with("cargo:") {
+            let mut build = tokio::process::Command::new("cargo");
+            build
+                .args([
+                    "build",
+                    "--release",
+                    "--message-format=json",
+                    "--manifest-path",
+                ])
+                .arg(root.join("Cargo.toml"))
+                .arg("--target-dir")
+                .arg(directory.join("target"));
+            let artifacts = run(build).await?;
+            for line in artifacts.split(|byte| *byte == b'\n') {
+                if let Ok(artifact) = serde_json::from_slice::<Value>(line)
+                    && artifact["reason"] == "compiler-artifact"
+                    && let Some(executable) = artifact["executable"].as_str()
+                {
+                    let source = Path::new(executable);
+                    let binaries = generation.path().join("bin");
+                    std::fs::create_dir_all(&binaries)?;
+                    let destination = binaries.join(source.file_name().ok_or_else(|| {
+                        Error::Config("compiled executable has no filename".into())
+                    })?);
+                    std::fs::copy(source, &destination)?;
+                    installed_binaries.push(destination);
+                }
             }
         }
     }
+    if source.starts_with("cargo:") {
+        root = snapshot_registry_source(&root, &directory)?;
+    }
+
     let pi = manifest
         .get("pi")
         .filter(|value| value.is_object())
@@ -580,18 +621,97 @@ async fn install(source: &str) -> Result<Installed> {
     for executable in &resources.extensions {
         pi_rs_extensions::ExecutableExtension::load(executable.to_string_lossy().as_ref())?;
     }
+    let retain_generation = root.starts_with(generation.path())
+        || resources
+            .extensions
+            .iter()
+            .any(|path| path.starts_with(generation.path()));
     let package = Installed {
         source: source.into(),
         root,
         version,
         resources,
     };
+    if retain_generation {
+        let _ = generation.keep();
+    }
     config::update_object(&config::agent_dir().join("packages/index.json"), |index| {
         index.insert(key(source), serde_json::to_value(&package)?);
         Ok(())
     })?;
     Ok(package)
 }
+fn snapshot_registry_source(source: &Path, cache: &Path) -> Result<PathBuf> {
+    use std::io::{Read, Write};
+    let bundles = cache.join("sources");
+    std::fs::create_dir_all(&bundles)?;
+    let staging = tempfile::tempdir_in(&bundles)?;
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut count = 0_usize;
+    for entry in ignore::WalkBuilder::new(source)
+        .hidden(false)
+        .parents(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .filter_entry(|entry| !matches!(entry.file_name().to_str(), Some(".git" | "target")))
+        .build()
+    {
+        let entry = entry.map_err(|error| Error::Config(error.to_string()))?;
+        let relative = entry
+            .path()
+            .strip_prefix(source)
+            .map_err(|error| Error::Config(error.to_string()))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let destination = staging.path().join(relative);
+        let metadata = entry.path().symlink_metadata()?;
+        if metadata.is_dir() {
+            std::fs::create_dir_all(destination)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(Error::Config(
+                "published package contains a non-regular resource".into(),
+            ));
+        }
+        count += 1;
+        size = size.saturating_add(metadata.len());
+        if count > 20_000 || size > 128 * 1024 * 1024 {
+            return Err(Error::Config(
+                "published package resources exceed the bundle limit".into(),
+            ));
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        digest.update(relative.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        digest.update(metadata.len().to_le_bytes());
+        let mut input = std::fs::File::open(entry.path())?;
+        let mut output = std::fs::File::create(&destination)?;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read])?;
+            digest.update(&buffer[..read]);
+        }
+        std::fs::set_permissions(&destination, metadata.permissions())?;
+    }
+    let destination = bundles.join(format!("{:x}", digest.finalize()));
+    if !destination.exists() {
+        std::fs::rename(staging.path(), &destination)?;
+    }
+    Ok(destination)
+}
+
 fn executable_files(path: &Path) -> Result<Vec<PathBuf>> {
     if !path.is_dir() {
         return Ok(Vec::new());
@@ -728,6 +848,34 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registry_bundles_survive_source_removal_and_keep_previous_versions() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("registry");
+        let cache = root.path().join("cache");
+        std::fs::create_dir_all(source.join("prompts")).unwrap();
+        std::fs::write(source.join("prompts/check.md"), "first").unwrap();
+        std::fs::write(source.join(".metadata"), "included").unwrap();
+        let first = snapshot_registry_source(&source, &cache).unwrap();
+        assert_eq!(first, snapshot_registry_source(&source, &cache).unwrap());
+        std::fs::write(source.join("prompts/check.md"), "second").unwrap();
+        let second = snapshot_registry_source(&source, &cache).unwrap();
+        assert_ne!(first, second);
+        std::fs::remove_dir_all(source).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(first.join("prompts/check.md")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.join("prompts/check.md")).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.join(".metadata")).unwrap(),
+            "included"
+        );
+    }
+
     #[test]
     fn filters_include_exclude_and_empty() {
         let root = Path::new("/package");
