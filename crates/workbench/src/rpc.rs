@@ -44,12 +44,15 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut pending_abort: Option<Value> = None;
     let mut pending_bash: Option<Value> = None;
     let mut pending_compact: Option<Value> = None;
-    let mut pending_catalogs: Vec<Value> = Vec::new();
+    let mut pending_queries: Vec<Value> = Vec::new();
     loop {
         if let Some(active) = &mut worker {
             for event in active.events.try_iter() {
-                if event["type"] == "response" && event["command"] == "get_commands" {
-                    pending_catalogs.retain(|request| request["id"] != event["id"]);
+                if event["type"] == "response"
+                    && (event["command"] == "get_commands"
+                        || snapshot_command(event["command"].as_str().unwrap_or_default()))
+                {
+                    pending_queries.retain(|request| request["id"] != event["id"]);
                 }
                 match event["type"].as_str() {
                     Some("auto_retry_start") => active.retrying = true,
@@ -70,8 +73,11 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     let _ = reader.join();
                 }
                 for event in finished.events.try_iter() {
-                    if event["type"] == "response" && event["command"] == "get_commands" {
-                        pending_catalogs.retain(|request| request["id"] != event["id"]);
+                    if event["type"] == "response"
+                        && (event["command"] == "get_commands"
+                            || snapshot_command(event["command"].as_str().unwrap_or_default()))
+                    {
+                        pending_queries.retain(|request| request["id"] != event["id"]);
                     }
                     forward_event(
                         event,
@@ -81,11 +87,11 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         &mut pending_compact,
                     )?;
                 }
-                for request in pending_catalogs.drain(..) {
+                for request in pending_queries.drain(..) {
                     response(
                         &request,
                         Err(Error::Config(
-                            "command discovery worker exited before returning a result".into(),
+                            "session query worker exited before returning a result".into(),
                         )),
                     )?;
                 }
@@ -115,7 +121,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
         }
         // Keep a following session change from replacing the discovery worker.
-        if !pending_catalogs.is_empty() {
+        if !pending_queries.is_empty() {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -186,7 +192,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         }
         if request["type"] == "get_commands" {
             match Worker::control(&mut worker, &args, request.clone()) {
-                Ok(()) => pending_catalogs.push(request),
+                Ok(()) => pending_queries.push(request),
                 Err(error) => response(&request, Err(error))?,
             }
             continue;
@@ -301,6 +307,15 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             response(&request, Ok(None))?;
             break;
         }
+        if busy(&worker) && snapshot_command(request["type"].as_str().unwrap_or_default()) {
+            let state = state_flags(&args, &worker)?;
+            let control = json!({"type":"read_session","request":request,"path":args.session,"context_window":args.context_window,"state":state});
+            match Worker::control(&mut worker, &args, control) {
+                Ok(()) => pending_queries.push(request),
+                Err(error) => response(&request, Err(error))?,
+            }
+            continue;
+        }
         let result = command(&request, &mut args, &mut worker);
         response(&request, result)?;
     }
@@ -350,31 +365,17 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             }
         }
         "abort" | "abort_bash" => Ok(None),
-        "get_state" => {
-            let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
-            state["autoCompactionEnabled"] = json!(args.settings.auto_compaction_enabled());
-            state["steeringMode"] = json!(
-                worker
-                    .as_ref()
-                    .map(|worker| worker.steering_mode)
-                    .unwrap_or(super::backend::configured_queue_mode(args, "steeringMode")?)
-            );
-            state["followUpMode"] = json!(
-                worker
-                    .as_ref()
-                    .map(|worker| worker.follow_up_mode)
-                    .unwrap_or(super::backend::configured_queue_mode(args, "followUpMode")?)
-            );
-            if !busy(worker) {
-                let session = Session::open(&args.session)?;
-                state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
-                state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
-                state["sessionId"] = json!(session.session_id());
-                state["sessionName"] = json!(session.name());
-                state["messageCount"] = json!(session.conversation_at(session.head())?.len());
-            }
-            Ok(Some(state))
+        name if snapshot_command(name) => {
+            let session = Session::snapshot(&args.session)?;
+            Ok(Some(snapshot_response(
+                request,
+                &session,
+                &args.session,
+                args.context_window,
+                state_flags(args, worker)?,
+            )?))
         }
+
         "get_available_models" => Ok(Some(
             json!({"models":available_models(args)?.iter().map(|model| model_value(model)).collect::<Vec<_>>()}),
         )),
@@ -412,54 +413,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
             Ok((name == "cycle_thinking_level").then(|| json!({"level":level})))
         }
-        "get_entries" if !busy(worker) => {
-            let session = Session::open(&args.session)?;
-            let since = request.get("since").map(record_id).transpose()?;
-            if since.is_some_and(|id| !session.records().iter().any(|record| record.id == id)) {
-                return Err(Error::Config("unknown since entry".into()));
-            }
-            let entries: Vec<_> = session
-                .records()
-                .iter()
-                .filter(|record| since.is_none_or(|id| record.id > id))
-                .collect();
-            Ok(Some(
-                json!({"entries":entries,"leafId":session.head().to_string()}),
-            ))
-        }
-        "get_tree" if !busy(worker) => {
-            let session = Session::open(&args.session)?;
-            Ok(Some(
-                json!({"tree":session_tree(&session),"leafId":session.head().to_string()}),
-            ))
-        }
-        "get_fork_messages" if !busy(worker) => {
-            let session = Session::open(&args.session)?;
-            let messages: Vec<_> = session
-                .branch()
-                .iter()
-                .filter_map(|record| match &record.event {
-                    pi_rs::Event::User { content, .. }
-                    | pi_rs::Event::UserWithImages { content, .. } => {
-                        Some(json!({"entryId":record.id.to_string(),"text":content}))
-                    }
-                    _ => None,
-                })
-                .collect();
-            Ok(Some(json!({"messages":messages})))
-        }
-        "get_last_assistant_text" if !busy(worker) => {
-            let session = Session::open(&args.session)?;
-            let text = session
-                .conversation_at(session.head())?
-                .into_iter()
-                .rev()
-                .find_map(|message| match message {
-                    pi_rs::Message::Assistant { content, .. } => Some(content),
-                    _ => None,
-                });
-            Ok(Some(json!({"text":text})))
-        }
+
         "switch_session" if !busy(worker) => {
             let path = request["sessionPath"]
                 .as_str()
@@ -500,12 +454,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 json!({"cancelled":false,"text":text,"sessionFile":args.session}),
             ))
         }
-        "get_messages" if !busy(worker) => {
-            let session = Session::open(&args.session)?;
-            Ok(Some(
-                json!({"messages":session.conversation_at(session.head())?}),
-            ))
-        }
+
         "new_session" if !busy(worker) => {
             args.session = if args.no_session {
                 args.session
@@ -574,21 +523,110 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             sessions::export(&Session::open(&args.session)?, &path)?;
             Ok(Some(json!({"path":path})))
         }
-        "get_session_stats" if !busy(worker) => {
-            let session = Session::open(&args.session)?;
-            let mut stats = serde_json::to_value(session.statistics())?;
-            stats["sessionFile"] = json!(args.session);
-            if let Some(usage) = args
-                .context_window
-                .and_then(|window| session.context_usage(window))
-            {
-                stats["contextUsage"] = serde_json::to_value(usage)?;
-            }
-            Ok(Some(stats))
-        }
+
         _ => Err(Error::Config(format!(
             "command {name:?} is unavailable in the current state"
         ))),
+    }
+}
+
+pub(super) fn snapshot_command(name: &str) -> bool {
+    matches!(
+        name,
+        "get_state"
+            | "get_entries"
+            | "get_tree"
+            | "get_fork_messages"
+            | "get_last_assistant_text"
+            | "get_messages"
+            | "get_session_stats"
+    )
+}
+
+fn state_flags(args: &Cli, worker: &Option<Worker>) -> Result<Value> {
+    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+    state["autoCompactionEnabled"] = json!(args.settings.auto_compaction_enabled());
+    state["steeringMode"] = json!(
+        worker
+            .as_ref()
+            .map(|worker| worker.steering_mode)
+            .unwrap_or(super::backend::configured_queue_mode(args, "steeringMode")?)
+    );
+    state["followUpMode"] = json!(
+        worker
+            .as_ref()
+            .map(|worker| worker.follow_up_mode)
+            .unwrap_or(super::backend::configured_queue_mode(args, "followUpMode")?)
+    );
+    Ok(state)
+}
+
+pub(super) fn snapshot_response(
+    request: &Value,
+    session: &Session,
+    path: &std::path::Path,
+    context_window: Option<u32>,
+    mut state: Value,
+) -> Result<Value> {
+    match request["type"].as_str().unwrap_or_default() {
+        "get_state" => {
+            state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
+            state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
+            state["sessionId"] = json!(session.session_id());
+            state["sessionName"] = json!(session.name());
+            state["messageCount"] = json!(session.current_messages().len());
+            state["pendingMessageCount"] = json!(session.queued_inputs().len());
+            Ok(state)
+        }
+        "get_entries" => {
+            let since = request.get("since").map(record_id).transpose()?;
+            if since.is_some_and(|id| !session.records().iter().any(|record| record.id == id)) {
+                return Err(Error::Config("unknown since entry".into()));
+            }
+            let entries: Vec<_> = session
+                .records()
+                .iter()
+                .filter(|record| since.is_none_or(|id| record.id > id))
+                .collect();
+            Ok(json!({"entries":entries,"leafId":session.head().to_string()}))
+        }
+        "get_tree" => Ok(json!({"tree":session_tree(session),"leafId":session.head().to_string()})),
+        "get_fork_messages" => {
+            let messages: Vec<_> = session
+                .branch()
+                .iter()
+                .filter_map(|record| match &record.event {
+                    pi_rs::Event::User { content, .. }
+                    | pi_rs::Event::UserWithImages { content, .. } => {
+                        Some(json!({"entryId":record.id.to_string(),"text":content}))
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(json!({"messages":messages}))
+        }
+        "get_last_assistant_text" => {
+            let text =
+                session
+                    .current_messages()
+                    .into_iter()
+                    .rev()
+                    .find_map(|message| match message {
+                        pi_rs::Message::Assistant { content, .. } => Some(content),
+                        _ => None,
+                    });
+            Ok(json!({"text":text}))
+        }
+        "get_messages" => Ok(json!({"messages":session.current_messages()})),
+        "get_session_stats" => {
+            let mut stats = serde_json::to_value(session.statistics())?;
+            stats["sessionFile"] = json!(path);
+            if let Some(usage) = context_window.and_then(|window| session.context_usage(window)) {
+                stats["contextUsage"] = serde_json::to_value(usage)?;
+            }
+            Ok(stats)
+        }
+        _ => Err(Error::Config("unsupported snapshot command".into())),
     }
 }
 

@@ -266,6 +266,17 @@ impl Session {
         Self::with_store(FileStore::open(path.as_ref())?)
     }
 
+    /// Read a stable, complete-record prefix without locking or repairing the source.
+    pub fn snapshot(path: impl AsRef<Path>) -> Result<Self> {
+        let file = File::open(path)?;
+        let length = file.metadata()?.len();
+        let (records, _, _) = read_complete_records(file.take(length))?;
+        if records.is_empty() {
+            return Err(Error::Session("journal has no committed header".into()));
+        }
+        Self::from_records(records)
+    }
+
     /// Restore a validated, in-memory snapshot without mutating its source.
     pub fn from_records(records: Vec<Record>) -> Result<Self> {
         Self::with_store(MemoryStore { records })
@@ -384,17 +395,13 @@ impl Session {
         let branch = self.path(record_id);
         let ops = operations(&branch);
         ensure_settled(ops.clone())?;
-        let mut messages = Vec::new();
-        if let Some(summary) = branch.iter().rev().find_map(|record| match &record.event {
-            Event::Compacted { summary, .. } => Some(summary),
-            _ => None,
-        }) {
-            messages.push(Message::User {
-                content: format!("Prior conversation summary:\n{summary}"),
-            });
-        }
-        messages.extend(conversation(&branch, ops));
-        Ok(messages)
+        Ok(project_messages(&branch, ops))
+    }
+
+    /// Current projected messages, including calls whose tools are still running.
+    pub fn current_messages(&self) -> Vec<Message> {
+        let branch = self.branch();
+        project_messages(&branch, operations(&branch))
     }
 
     /// Measured context when usable, otherwise a visible-content estimate.
@@ -1052,33 +1059,40 @@ impl Drop for FileStore {
     }
 }
 
+fn read_complete_records(reader: impl Read) -> Result<(Vec<Record>, u64, bool)> {
+    let mut records = Vec::new();
+    let mut offset = 0;
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    while reader
+        .by_ref()
+        .take(MAX_RECORD_BYTES as u64 + 1)
+        .read_until(b'\n', &mut line)?
+        > 0
+    {
+        if line.len() > MAX_RECORD_BYTES {
+            return Err(Error::Session("journal record exceeds size limit".into()));
+        }
+        if !line.ends_with(b"\n") {
+            if records.is_empty() {
+                return Err(Error::Session("journal has no committed header".into()));
+            }
+            return Ok((records, offset, true));
+        }
+        records.push(serde_json::from_slice(&line)?);
+        offset += line.len() as u64;
+        line.clear();
+    }
+    Ok((records, offset, false))
+}
+
 impl SessionStore for FileStore {
     fn load(&mut self) -> Result<Vec<Record>> {
-        let mut records = Vec::new();
-        let mut offset = 0;
-        let mut reader = BufReader::new(&mut self.file);
-        let mut line = Vec::new();
-        while reader
-            .by_ref()
-            .take(MAX_RECORD_BYTES as u64 + 1)
-            .read_until(b'\n', &mut line)?
-            > 0
-        {
-            if line.len() > MAX_RECORD_BYTES {
-                return Err(Error::Session("journal record exceeds size limit".into()));
-            }
-            if !line.ends_with(b"\n") {
-                if records.is_empty() {
-                    return Err(Error::Session("journal has no committed header".into()));
-                }
-                validated_head(&records)?;
-                self.file.set_len(offset)?;
-                self.file.sync_all()?;
-                break;
-            }
-            records.push(serde_json::from_slice(&line)?);
-            offset += line.len() as u64;
-            line.clear();
+        let (records, offset, incomplete) = read_complete_records(&mut self.file)?;
+        if incomplete {
+            validated_head(&records)?;
+            self.file.set_len(offset)?;
+            self.file.sync_all()?;
         }
         self.file.seek(SeekFrom::End(0))?;
         Ok(records)
@@ -1214,6 +1228,23 @@ pub(crate) fn system_context(
             .filter(|text| !text.is_empty()),
     );
     (content.join("\n\n"), tools)
+}
+
+fn project_messages(
+    branch: &[&Record],
+    operations: Vec<(Invocation, OperationState)>,
+) -> Vec<Message> {
+    let mut messages = Vec::new();
+    if let Some(summary) = branch.iter().rev().find_map(|record| match &record.event {
+        Event::Compacted { summary, .. } => Some(summary),
+        _ => None,
+    }) {
+        messages.push(Message::User {
+            content: format!("Prior conversation summary:\n{summary}"),
+        });
+    }
+    messages.extend(conversation(branch, operations));
+    messages
 }
 
 pub(crate) fn conversation(
@@ -1784,5 +1815,110 @@ mod system_checkpoint_tests {
                 .1
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_ignore_incomplete_tails_without_repairing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_user_with_images("hello".into(), vec![], None)
+            .unwrap();
+        let head = session.head();
+        drop(session);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"incomplete\":\"").unwrap();
+        drop(file);
+        let before = std::fs::read(&path).unwrap();
+        let snapshot = Session::snapshot(&path).unwrap();
+        assert_eq!(snapshot.head(), head);
+        assert_eq!(snapshot.current_messages().len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let repaired = Session::open(&path).unwrap();
+        assert_eq!(repaired.head(), head);
+        assert!(std::fs::read(&path).unwrap().len() < before.len());
+    }
+
+    #[test]
+    fn snapshot_errors_do_not_create_or_modify_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.jsonl");
+        assert!(Session::snapshot(&path).is_err());
+        assert!(!path.exists());
+        std::fs::write(&path, b"").unwrap();
+        assert!(Session::snapshot(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let session = Session::open(&path).unwrap();
+        drop(session);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"invalid\n")
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(Session::snapshot(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn current_messages_include_pending_tool_calls_without_weakening_forks() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("hello".into(), vec![], None)
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        session
+            .append(Event::Assistant {
+                content: "working".into(),
+                invocations: vec![Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session.append(Event::ToolStarted { operation_id }).unwrap();
+        assert!(session.conversation_at(session.head()).is_err());
+        assert!(
+            matches!(&session.current_messages()[1], Message::Assistant { calls, .. } if calls.len()==1)
+        );
+        session
+            .append(Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Succeeded("done".into()),
+                states: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(
+            session.current_messages(),
+            session.conversation_at(session.head()).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_does_not_take_or_release_the_writer_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        assert_eq!(
+            Session::snapshot(&path).unwrap().session_id(),
+            session.session_id()
+        );
+        assert!(Session::open(&path).is_err());
+        drop(session);
+        assert!(Session::open(&path).is_ok());
     }
 }

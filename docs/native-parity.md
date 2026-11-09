@@ -1466,8 +1466,8 @@ Import retains cached usage on assistant and tool-result messages and standalone
 compaction and branch-summary entries. An explicit context window also enables
 `contextUsage`; after compaction, its token count remains unknown until a fresh
 measured response is available. Unknown cost is returned as null; preservation of reported costs is covered
-below. Live statistics while a run owns the
-journal, complete message-variant counting and provider pricing remain open.
+below. Live statistics are covered below. Complete message-variant counting and
+provider pricing remain open.
 
 Tests cover an imported multi-branch session with assistant, tool-result,
 standalone and summary usage. A loopback RPC test covers message and tool counts,
@@ -1503,3 +1503,27 @@ post-compaction unknown context, explicit-window precedence, provider discovery,
 closed sessions and discovery timeouts. Existing RPC statistics and cost checks,
 the complete workspace tests and all-target Clippy also pass. Additional resource/model/auth factories
 and the other SDK equivalents remain open.
+
+### Live RPC session snapshots checkpoint
+
+State, messages, statistics, entries, tree, fork candidates and last-assistant
+queries can read an active run. The backend publishes committed records to an
+independent snapshot, so these queries do not acquire its journal lock. Snapshot
+responses are correlated and finish before a following request can replace the
+worker. State responses include session identity, message count and queued-input
+count while the model runs.
+
+`Session::snapshot` reads a bounded complete-record prefix without creating,
+repairing or changing its source. Normal writable opening still repairs an
+incomplete tail. `Session::current_messages` exposes current projection including
+pending tool calls; the settled-history API retains its existing checks.
+
+Core tests cover incomplete tails, malformed and missing files, preservation of
+writer locks on Unix and pending-tool projection. Platform file-lock rules still
+apply to direct file snapshots; active RPC reads use the backend snapshot.
+
+A loopback RPC check keeps the model response pending, queries all seven read
+operations, then repeats message/statistics/tree reads while a shell tool runs.
+It verifies pending calls are visible and final results appear after completion.
+Existing cost, statistics, retry and command-discovery RPC checks also pass,
+along with the full workspace tests and all-target Clippy.

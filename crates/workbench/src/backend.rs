@@ -98,10 +98,17 @@ enum Request {
     GetCommands {
         id: Option<serde_json::Value>,
     },
+    ReadSession {
+        request: serde_json::Value,
+        path: PathBuf,
+        context_window: Option<u32>,
+        state: serde_json::Value,
+    },
     Cancel,
     Shutdown,
 }
 struct ReaderControls {
+    snapshot: Arc<Mutex<Vec<pi_rs::Record>>>,
     auto_compaction: pi_rs::AutoCompactionControl,
     retry: pi_rs::RetryControl,
     command_catalog: serde_json::Value,
@@ -123,6 +130,8 @@ pub async fn run(mut args: Cli) -> Result<()> {
     let (commands, mut requests) = mpsc::channel(32);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
+    let initial_records = Session::open(&args.session)?.records().to_vec();
+    let snapshot = Arc::new(Mutex::new(initial_records));
     read_requests(
         commands,
         inputs,
@@ -130,6 +139,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
         stopping.clone(),
         ui,
         ReaderControls {
+            snapshot: snapshot.clone(),
             auto_compaction: runtime.auto_compaction.clone(),
             retry: runtime.retry.clone(),
             command_catalog: runtime.command_catalog(&args),
@@ -158,7 +168,8 @@ pub async fn run(mut args: Cli) -> Result<()> {
                     let mut starts_run = matches!(input, AgentInput::Message(_));
                     let result = Session::open(&args.session).and_then(|mut session| {
                         if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
-                        let mut observer = |event: pi_rs::Notification<'_>| observe(event, args.trace);
+                        *snapshot.lock().expect("session snapshot") = session.records().to_vec();
+                        let mut observer = |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
                         input.apply(&mut session, &mut observer)?;
                         for _ in 0..queued.max_capacity() {
                             let Ok(input) = queued.try_recv() else { break; };
@@ -191,6 +202,8 @@ pub async fn run(mut args: Cli) -> Result<()> {
             args.thinking = thinking;
             args.session = session;
             runtime.set_thinking(args.thinking.as_deref());
+            *snapshot.lock().expect("session snapshot") =
+                Session::open(&args.session)?.records().to_vec();
             continue;
         }
         let resume_queued = matches!(
@@ -235,8 +248,9 @@ pub async fn run(mut args: Cli) -> Result<()> {
             }
             session.select_model(&args.model, args.thinking.as_deref())?;
             initialize_queue_modes(&mut session, &args)?;
+            *snapshot.lock().expect("session snapshot") = session.records().to_vec();
             let agent = runtime.agent(&args);
-            let mut observer = |event: pi_rs::Notification<'_>| observe(event, args.trace);
+            let mut observer = |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
             match request {
                 Request::Prompt { content, images, queued_only, require_command } => {
                     if queued_only && !agent.apply_queued_inputs(&mut session, &mut observer)? { return Ok(()); }
@@ -393,6 +407,22 @@ pub async fn run(mut args: Cli) -> Result<()> {
     }
     runtime.close().await
 }
+fn observe_snapshot(
+    event: pi_rs::Notification<'_>,
+    trace: bool,
+    snapshot: &Mutex<Vec<pi_rs::Record>>,
+) {
+    if let pi_rs::Notification::Committed(record) = &event {
+        let mut records = snapshot.lock().expect("session snapshot");
+        if let Some(existing) = records.get_mut(record.id.saturating_sub(1) as usize) {
+            *existing = (*record).clone();
+        } else {
+            records.push((*record).clone());
+        }
+    }
+    observe(event, trace);
+}
+
 fn read_requests(
     commands: mpsc::Sender<Request>,
     inputs: mpsc::Sender<AgentInput>,
@@ -405,6 +435,7 @@ fn read_requests(
         auto_compaction,
         retry,
         command_catalog,
+        snapshot,
     } = controls;
     let runtime = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
@@ -421,6 +452,28 @@ fn read_requests(
             };
             let steering = matches!(&request, Request::Steer { .. });
             match request {
+                Request::ReadSession {
+                    request,
+                    path,
+                    context_window,
+                    state,
+                } => {
+                    let records = snapshot.lock().expect("session snapshot").clone();
+                    let result = Session::from_records(records).and_then(|session| {
+                        super::rpc::snapshot_response(
+                            &request,
+                            &session,
+                            &path,
+                            context_window,
+                            state,
+                        )
+                    });
+                    control_response(
+                        request["type"].as_str().unwrap_or_default(),
+                        request.get("id").cloned(),
+                        result,
+                    );
+                }
                 Request::GetCommands { id } => {
                     control_response("get_commands", id, Ok(command_catalog.clone()));
                 }
