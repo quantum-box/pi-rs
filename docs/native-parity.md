@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; add/remove/list commands | OAuth, live tool-list updates, elicitation |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; add/remove/list commands | OAuth, live tool-list updates, URL-based elicitation |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload | Automatic system appearance notifications |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
@@ -906,3 +906,18 @@ transport changes preserve per-package resource filters and scope precedence.
 Explicit non-default ports and case-sensitive repository paths remain distinct.
 Regression tests cover transport aliases, ports, revisions and missing local
 sources.
+
+### MCP form elicitation checkpoint
+
+MCP form requests now use the active tool call's native interaction surface.
+The JSON editor includes schema defaults, validates JSON and schema constraints,
+and keeps invalid input available for correction. Responses retain the server's
+request correlation. Cancelling the form returns cancellation, and noninteractive
+hosts decline the request. The interaction binding is released after each call
+or interruption. URL-based elicitation remains outstanding.
+
+A stdio server requested a form during an actual tool call. Verification covered
+defaults, malformed JSON, constraint violations, successful values, cancellation
+and noninteractive decline. Existing HTTP resources, URI templates, prompts,
+remote task polling and task resumption passed their regression fixtures.
+Workspace tests and all-target Clippy passed on Rust 1.89.

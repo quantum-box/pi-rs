@@ -44,10 +44,27 @@ pub struct ServerConfig {
 }
 
 #[derive(Clone, Default)]
-struct NativeClient;
+struct NativeClient {
+    interaction: Arc<std::sync::Mutex<Option<Interaction>>>,
+}
+#[derive(Clone)]
+struct Interaction {
+    host: Arc<dyn pi_rs::ToolHost>,
+    cancellation: pi_rs::CancellationToken,
+}
+struct InteractionGuard(Arc<std::sync::Mutex<Option<Interaction>>>);
+impl Drop for InteractionGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
 impl rmcp::ClientHandler for NativeClient {
     fn get_info(&self) -> rmcp::model::ClientConfig {
         let mut info = rmcp::model::ClientConfig::default();
+        info.capabilities.elicitation = Some(
+            rmcp::model::ElicitationCapability::new()
+                .with_form(rmcp::model::FormElicitationCapability::default()),
+        );
         info.capabilities.extensions = Some(
             [(
                 rmcp::model::TASKS_EXTENSION_ID.to_owned(),
@@ -56,6 +73,73 @@ impl rmcp::ClientHandler for NativeClient {
             .into(),
         );
         info
+    }
+
+    async fn create_elicitation(
+        &self,
+        request: rmcp::model::ElicitRequestParams,
+        context: rmcp::service::RequestContext<RoleClient>,
+    ) -> std::result::Result<rmcp::model::ElicitResult, rmcp::model::ErrorData> {
+        use rmcp::model::{ElicitRequestParams, ElicitResult, ElicitationAction};
+        let interaction = self
+            .interaction
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let Some(interaction) = interaction.filter(|interaction| interaction.host.has_ui()) else {
+            return Ok(ElicitResult::new(ElicitationAction::Decline));
+        };
+        let ElicitRequestParams::FormElicitationParams {
+            message,
+            requested_schema,
+            ..
+        } = request
+        else {
+            return Ok(ElicitResult::new(ElicitationAction::Decline));
+        };
+        let schema = serde_json::to_value(requested_schema).map_err(|_| {
+            rmcp::model::ErrorData::invalid_params("invalid elicitation schema", None)
+        })?;
+        let validator = jsonschema::validator_for(&schema).map_err(|_| {
+            rmcp::model::ErrorData::invalid_params("invalid elicitation schema", None)
+        })?;
+        let defaults: serde_json::Map<String, Value> = schema["properties"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, property)| {
+                property
+                    .get("default")
+                    .map(|value| (name.clone(), value.clone()))
+            })
+            .collect();
+        let mut text = serde_json::to_string_pretty(&defaults).unwrap_or_default();
+        let mut title = format!("{message}\nEnter values matching this schema:\n{schema}");
+        loop {
+            let response = tokio::select! {
+                biased;
+                _ = interaction.cancellation.cancelled() => return Ok(ElicitResult::new(ElicitationAction::Cancel)),
+                _ = context.ct.cancelled() => return Ok(ElicitResult::new(ElicitationAction::Cancel)),
+                response = interaction.host.ui(pi_rs::UiRequest::Editor {
+                    title: title.clone(), initial_value: Some(text.clone()), timeout: None,
+                }) => response,
+            };
+            let Ok(pi_rs::UiResponse::Text(value)) = response else {
+                return Ok(ElicitResult::new(ElicitationAction::Cancel));
+            };
+            text = value;
+            match serde_json::from_str::<Value>(&text) {
+                Ok(value) => match validator.validate(&value) {
+                    Ok(()) => {
+                        return Ok(ElicitResult::new(ElicitationAction::Accept).with_content(value));
+                    }
+                    Err(error) => {
+                        title = format!("{message}\nInvalid values: {error}\nSchema: {schema}")
+                    }
+                },
+                Err(error) => title = format!("{message}\nInvalid JSON: {error}\nSchema: {schema}"),
+            }
+        }
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -188,7 +272,7 @@ impl McpExtension {
             let transport = TokioChildProcess::new(wrapped)?;
             tokio::time::timeout(
                 timeout.min(Duration::from_secs(10)),
-                NativeClient.serve(transport),
+                NativeClient::default().serve(transport),
             )
             .await
             .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
@@ -235,7 +319,7 @@ impl McpExtension {
             );
             tokio::time::timeout(
                 timeout.min(Duration::from_secs(10)),
-                NativeClient.serve(transport),
+                NativeClient::default().serve(transport),
             )
             .await
             .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
@@ -482,6 +566,59 @@ struct McpTool {
     resource: bool,
 }
 impl McpTool {
+    async fn invoke_call(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        host: Option<Arc<dyn pi_rs::ToolHost>>,
+    ) -> Outcome {
+        let call = async {
+            if self.resource {
+                self.invoke_resource(arguments).await.map(CallResult::Data)
+            } else {
+                let params = serde_json::from_value(
+                    json!({"name":self.remote_name,"arguments":arguments,"_meta":{"operationId":context.operation_id.to_string()}}),
+                )?;
+                let service = self.connection.active_service().await?;
+                let interaction = service.service().interaction.clone();
+                *interaction
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = host.map(|host| Interaction {
+                    host,
+                    cancellation: context.cancellation.clone(),
+                });
+                let _interaction = InteractionGuard(interaction);
+                let result = service
+                    .call_tool_once(params)
+                    .await
+                    .map_err(|error| Error::Config(error.to_string()))?;
+                match result {
+                    CallToolResponse::Complete(result) => {
+                        Ok(CallResult::Data(serde_json::to_value(result)?))
+                    }
+                    CallToolResponse::Task(task) => {
+                        Ok(CallResult::Task(serde_json::to_string(&TaskReference {
+                            connection: self.connection.identity.clone(),
+                            task_id: task.task.task_id,
+                        })?))
+                    }
+                    _ => Err(Error::Config(
+                        "MCP tool requires additional client input".into(),
+                    )),
+                }
+            }
+        };
+        tokio::select! {
+            _ = context.cancellation.cancelled() => Outcome::Unknown("MCP request cancelled after dispatch".into()),
+            result = tokio::time::timeout(self.connection.timeout, call) => match result {
+                Ok(Ok(CallResult::Data(data))) if data["isError"] == true => Outcome::Failed(data.to_string()),
+                Ok(Ok(CallResult::Data(data))) => Outcome::Structured { data, attachments: vec![] },
+                Ok(Ok(CallResult::Task(reference))) => Outcome::Pending { reference },
+                Ok(Err(error)) => Outcome::Unknown(error.to_string()),
+                Err(_) => Outcome::Unknown("MCP request timed out after dispatch".into()),
+            }
+        }
+    }
     async fn invoke_resource(&self, arguments: Value) -> Result<Value> {
         let service = self.connection.active_service().await?;
         match self.remote_name.as_str() {
@@ -579,46 +716,16 @@ impl Tool for McpTool {
         self.spec.clone()
     }
     async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome {
-        let call = async {
-            if self.resource {
-                self.invoke_resource(arguments).await.map(CallResult::Data)
-            } else {
-                let params = serde_json::from_value(
-                    json!({"name":self.remote_name,"arguments":arguments,"_meta":{"operationId":context.operation_id.to_string()}}),
-                )?;
-                let result = self
-                    .connection
-                    .active_service()
-                    .await?
-                    .call_tool_once(params)
-                    .await
-                    .map_err(|error| Error::Config(error.to_string()))?;
-                match result {
-                    CallToolResponse::Complete(result) => {
-                        Ok(CallResult::Data(serde_json::to_value(result)?))
-                    }
-                    CallToolResponse::Task(task) => {
-                        Ok(CallResult::Task(serde_json::to_string(&TaskReference {
-                            connection: self.connection.identity.clone(),
-                            task_id: task.task.task_id,
-                        })?))
-                    }
-                    _ => Err(Error::Config(
-                        "MCP tool requires additional client input".into(),
-                    )),
-                }
-            }
-        };
-        tokio::select! {
-            _ = context.cancellation.cancelled() => Outcome::Unknown("MCP request cancelled after dispatch".into()),
-            result = tokio::time::timeout(self.connection.timeout, call) => match result {
-                Ok(Ok(CallResult::Data(data))) if data["isError"] == true => Outcome::Failed(data.to_string()),
-                Ok(Ok(CallResult::Data(data))) => Outcome::Structured { data, attachments: vec![] },
-                Ok(Ok(CallResult::Task(reference))) => Outcome::Pending { reference },
-                Ok(Err(error)) => Outcome::Unknown(error.to_string()),
-                Err(_) => Outcome::Unknown("MCP request timed out after dispatch".into()),
-            }
-        }
+        self.invoke_call(arguments, context, None).await
+    }
+    async fn invoke_with_host(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        _state: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn pi_rs::ToolHost>,
+    ) -> Outcome {
+        self.invoke_call(arguments, context, Some(host)).await
     }
     async fn poll(&self, reference: &str, context: ToolContext) -> Option<Outcome> {
         let task: TaskReference = serde_json::from_str(reference).ok()?;
