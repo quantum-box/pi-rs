@@ -183,7 +183,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             {
                 return Err(Error::Config("invalid MCP server name".into()));
             }
-            if url.is_some() == !command.is_empty() {
+            if url.is_some() != command.is_empty() {
                 return Err(Error::Config(
                     "choose either --url or a command after --".into(),
                 ));
