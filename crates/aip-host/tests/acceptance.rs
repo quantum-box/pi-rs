@@ -563,3 +563,106 @@ async fn revoked_reference_stops_dispatch_after_a_branch_reopens() {
     ));
     assert_eq!(platform.reservations.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn hosted_recovery_replays_durable_usage_before_any_new_model_request() {
+    struct MeteredModel {
+        sends: AtomicUsize,
+        receipts: Mutex<Vec<(Uuid, UsageReport, ModelMetadata)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for MeteredModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            assert_eq!(self.sends.fetch_add(1, Ordering::SeqCst), 0);
+            let events = [
+                Ok(ModelEvent::Text("measured".into())),
+                Ok(ModelEvent::Metadata(ModelMetadata {
+                    cached_input_tokens: Some(7),
+                    cache_creation_input_tokens: Some(4),
+                    resolved_model: Some(ResolvedModelIdentity {
+                        provider: "fixture".into(),
+                        model: "resolved".into(),
+                    }),
+                    ..Default::default()
+                })),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 21,
+                        output_tokens: 8,
+                    }),
+                }),
+            ];
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+
+        async fn record_usage_with_metadata(
+            &self,
+            request: Uuid,
+            usage: &UsageReport,
+            metadata: &ModelMetadata,
+        ) -> Result<()> {
+            let mut receipts = self.receipts.lock().unwrap();
+            receipts.push((request, usage.clone(), metadata.clone()));
+            if receipts.len() == 1 {
+                return Err(Error::RetryableModel(
+                    "receipt temporarily unavailable".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    let platform = Arc::new(Platform::default());
+    let scope = scope();
+    let registry = HostRegistry::discover(&scope, platform.clone(), BTreeSet::new(), vec![])
+        .await
+        .unwrap();
+    let model = MeteredModel {
+        sends: AtomicUsize::new(0),
+        receipts: Mutex::new(Vec::new()),
+    };
+    let host = HostTurn {
+        scope: &scope,
+        budget: platform.as_ref(),
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "fixture",
+        limits: Limits::default(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("usage.jsonl");
+    let mut session = Session::open(&path).unwrap();
+    let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+    assert!(matches!(
+        host.run(
+            &mut session,
+            Some("measure".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore
+        )
+        .await,
+        Err(Error::RetryableModel(_))
+    ));
+    assert_eq!(model.receipts.lock().unwrap().len(), 1);
+    drop(session);
+
+    let mut session = Session::open(&path).unwrap();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(matches!(
+        host.run(&mut session, None, &mut inputs, &cancelled, &mut ignore)
+            .await,
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(model.sends.load(Ordering::SeqCst), 1);
+    let receipts = model.receipts.lock().unwrap();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0], receipts[1]);
+    assert_eq!(receipts[1].2.cached_input_tokens, Some(7));
+    assert_eq!(receipts[1].2.cache_creation_input_tokens, Some(4));
+    assert_eq!(platform.usage.lock().unwrap().len(), 1);
+}

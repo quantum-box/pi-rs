@@ -107,7 +107,18 @@ pub struct ModelRequest {
 pub struct ModelMetadata {
     pub provider_request_id: Option<String>,
     pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<ResolvedModelIdentity>,
     pub finish_reason: Option<String>,
+}
+
+/// Canonical provider and model names reported by the host adapter.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedModelIdentity {
+    pub provider: String,
+    pub model: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -146,6 +157,17 @@ pub trait Model: Send + Sync {
     /// Called after the usage record is durable and before tools or another request.
     async fn record_usage(&self, _request_id: Uuid, _usage: &UsageReport) -> Result<()> {
         Ok(())
+    }
+
+    /// Settle usage with the metadata already committed in the journal.
+    /// Hosted implementations must be idempotent for a request ID.
+    async fn record_usage_with_metadata(
+        &self,
+        request_id: Uuid,
+        usage: &UsageReport,
+        _metadata: &ModelMetadata,
+    ) -> Result<()> {
+        self.record_usage(request_id, usage).await
     }
 }
 

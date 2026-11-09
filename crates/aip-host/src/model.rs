@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use pi_rs_core::{Error, Event, Model, ModelRequest, ModelStream, Record, Result, UsageReport};
+use pi_rs_core::{
+    Error, Event, Model, ModelMetadata, ModelRequest, ModelStream, Record, Result, UsageReport,
+};
 use uuid::Uuid;
 
 use crate::RunScope;
@@ -43,11 +45,24 @@ impl Model for BudgetedModel<'_> {
     async fn record_usage(&self, request_id: Uuid, usage: &UsageReport) -> Result<()> {
         self.budget.settle(self.scope, request_id, usage).await
     }
+
+    async fn record_usage_with_metadata(
+        &self,
+        request_id: Uuid,
+        usage: &UsageReport,
+        metadata: &ModelMetadata,
+    ) -> Result<()> {
+        self.record_usage(request_id, usage).await?;
+        self.inner
+            .record_usage_with_metadata(request_id, usage, metadata)
+            .await
+    }
 }
 
 impl BudgetedModel<'_> {
-    pub async fn settle_session(&self, records: &[Record]) -> Result<()> {
+    pub async fn settle_session(&self, records: &[Record], recover: bool) -> Result<()> {
         let mut requests = BTreeMap::new();
+        let mut finished = None;
         // Use every record of this AIP run, including a branch the host left
         // after a settled attempt. A model call remains billable after checkout.
         for record in records
@@ -59,18 +74,37 @@ impl BudgetedModel<'_> {
                     request_id: Some(id),
                     ..
                 } => {
-                    requests.insert(*id, &UsageReport::Unconfirmed);
+                    finished = None;
+                    requests.insert(*id, (&UsageReport::Unconfirmed, None));
                 }
                 Event::ModelFinished {
-                    request_id, usage, ..
+                    request_id,
+                    usage,
+                    metadata,
+                    ..
                 } => {
-                    requests.insert(*request_id, usage);
+                    finished = Some(*request_id);
+                    requests.insert(*request_id, (usage, Some(metadata)));
+                }
+                Event::Assistant { .. } | Event::Compacted { .. } => {
+                    // The core commits a response only after its usage hook succeeds.
+                    if let Some((_, metadata)) =
+                        finished.take().and_then(|id| requests.get_mut(&id))
+                    {
+                        *metadata = None;
+                    }
                 }
                 _ => {}
             }
         }
-        for (request_id, usage) in requests {
-            self.budget.settle(self.scope, request_id, usage).await?;
+        for (request_id, (usage, metadata)) in requests {
+            match metadata.filter(|_| recover) {
+                Some(metadata) => {
+                    self.record_usage_with_metadata(request_id, usage, metadata)
+                        .await?
+                }
+                None => self.record_usage(request_id, usage).await?,
+            }
         }
         Ok(())
     }

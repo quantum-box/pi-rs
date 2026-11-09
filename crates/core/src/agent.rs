@@ -499,7 +499,7 @@ impl Agent<'_> {
             session,
             Event::ModelFinished {
                 request_id,
-                metadata,
+                metadata: metadata.clone(),
                 usage: usage.clone(),
                 failure,
                 partial: content,
@@ -508,7 +508,8 @@ impl Agent<'_> {
         )?;
         tokio::time::timeout(
             self.limits.model_timeout,
-            self.model.record_usage(request_id, &usage),
+            self.model
+                .record_usage_with_metadata(request_id, &usage, &metadata),
         )
         .await
         .map_err(|_| Error::RetryableModel("model usage settlement timed out".into()))??;
