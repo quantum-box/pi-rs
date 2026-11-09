@@ -8,7 +8,7 @@ use crate::ui::{
     keys::Keys,
     picker::{Input, Item, Picker, Selection},
     render::{Entry, Line},
-    theme::Theme,
+    theme::{Theme, ThemeWatcher},
 };
 use crossterm::cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::event::{
@@ -1016,7 +1016,19 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     let mut worker: Option<Worker> = None;
     let mut dirty = true;
     let mut last_frame = Instant::now();
+    let mut theme_watcher = ThemeWatcher::new(&theme);
+    let mut last_theme_check = Instant::now();
     loop {
+        if last_theme_check.elapsed() >= Duration::from_millis(500) {
+            match theme_watcher.poll(&mut theme) {
+                Ok(changed) => dirty |= changed,
+                Err(error) => {
+                    view.append(&format!("Theme reload: {error}"));
+                    dirty = true;
+                }
+            }
+            last_theme_check = Instant::now();
+        }
         if worker
             .as_ref()
             .is_some_and(|active| !active.busy && !active.matches(&args))

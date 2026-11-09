@@ -13,6 +13,42 @@ pub struct Theme {
     pub path: Option<PathBuf>,
     colors: BTreeMap<String, Color>,
 }
+/// Watches the selected custom file while retaining the last valid theme.
+pub struct ThemeWatcher {
+    path: Option<PathBuf>,
+    fingerprint: Option<Vec<u8>>,
+}
+impl ThemeWatcher {
+    pub fn new(theme: &Theme) -> Self {
+        Self {
+            path: theme.path.clone(),
+            fingerprint: theme
+                .path
+                .as_ref()
+                .and_then(|path| std::fs::read(path).ok()),
+        }
+    }
+    pub fn poll(&mut self, theme: &mut Theme) -> Result<bool> {
+        if self.path != theme.path {
+            *self = Self::new(theme);
+            return Ok(false);
+        }
+        let Some(path) = &self.path else {
+            return Ok(false);
+        };
+        let contents = std::fs::read(path);
+        let fingerprint = contents.as_ref().ok().cloned();
+        if fingerprint == self.fingerprint {
+            return Ok(false);
+        }
+        self.fingerprint = fingerprint;
+        let text =
+            String::from_utf8(contents?).map_err(|error| Error::Config(error.to_string()))?;
+        let next = Theme::parse(&text, Some(path.clone()))?;
+        *theme = next;
+        Ok(true)
+    }
+}
 #[derive(Deserialize)]
 struct Definition {
     name: String,
@@ -268,6 +304,27 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_watch_applies_valid_changes_and_retains_last_valid_theme() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("theme.json");
+        let original = include_str!("../../assets/themes/dark.json");
+        std::fs::write(&path, original).unwrap();
+        let mut theme = Theme::parse(original, Some(path.clone())).unwrap();
+        let mut watcher = ThemeWatcher::new(&theme);
+        assert!(!watcher.poll(&mut theme).unwrap());
+        let updated = original.replace("\"name\": \"dark\"", "\"name\": \"custom\"");
+        std::fs::write(&path, updated).unwrap();
+        assert!(watcher.poll(&mut theme).unwrap());
+        assert_eq!(theme.name, "custom");
+        std::fs::write(&path, "{").unwrap();
+        assert!(watcher.poll(&mut theme).is_err());
+        assert_eq!(theme.name, "custom");
+        assert!(!watcher.poll(&mut theme).unwrap());
+        std::fs::write(&path, original).unwrap();
+        assert!(watcher.poll(&mut theme).unwrap());
+        assert_eq!(theme.name, "dark");
+    }
     #[test]
     fn upstream_themes_validate_and_resolve_all_color_formats() {
         for source in [
