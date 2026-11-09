@@ -1055,3 +1055,19 @@ modes, scrolling, resize and terminal restoration. Existing Kitty crop, active
 image and inline-image fixtures also passed, along with workspace tests and
 all-target Clippy on Rust 1.89. Further cell-metric and aspect-ratio fidelity
 work remains in the terminal surface.
+
+### Image cell-sizing checkpoint
+
+Image cell sizing now follows the pinned Pi calculation, including small-image
+upscaling, width/height bounds and Kitty's lower-distortion rounding. Default
+image height follows the cell aspect ratio instead of shrinking to terminal
+height. Native terminal pixel dimensions determine fractional cell sizes when
+available, with the reference 9×18 fallback. Regular layouts invalidate when
+cell dimensions change even if the row and column counts stay fixed.
+
+A comparison matrix matches both reference rounding modes, including fractional
+cell sizes. A PTY fixture changed pixel dimensions while preserving the character
+grid and verified image placement dimensions, retained draft input, PNG reuse
+and terminal restoration. Existing clipping and active-image fixtures passed
+for both protocols. Workspace tests and all-target Clippy passed on Rust 1.89.
+Terminal-reported CSI cell-size responses still need integration.

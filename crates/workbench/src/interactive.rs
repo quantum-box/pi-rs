@@ -135,10 +135,11 @@ impl Drop for Terminal {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq)]
 struct RegularLayout {
     width: usize,
     height: usize,
+    cell: (f64, f64),
     theme: Theme,
     expand_tools: bool,
     hide_thinking: bool,
@@ -871,6 +872,7 @@ impl View {
         let layout = RegularLayout {
             width,
             height,
+            cell: images::cell_dimensions(),
             theme: theme.clone(),
             expand_tools: self.expand_tools,
             hide_thinking: self.hide_thinking,

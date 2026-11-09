@@ -87,12 +87,17 @@ impl InlineImage {
     }
     pub fn lines(self: &Arc<Self>, width: usize) -> Vec<Line> {
         let maximum_columns = width.saturating_sub(2).clamp(1, 60);
-        let maximum_rows = crossterm::terminal::size()
-            .map(|(_, rows)| usize::from(rows).saturating_sub(8))
-            .unwrap_or(20)
-            .max(1)
-            .min(maximum_columns.div_ceil(2).max(1));
-        let (columns, rows) = dimensions(self.width, self.height, maximum_columns, maximum_rows);
+        let cell = cell_dimensions();
+        let maximum_rows = ((maximum_columns as f64 * cell.0) / cell.1).ceil().max(1.0) as usize;
+        let optimize = detect(|key| std::env::var(key).ok()) == Some(Protocol::Kitty);
+        let (columns, rows) = dimensions(
+            self.width,
+            self.height,
+            maximum_columns,
+            maximum_rows,
+            cell,
+            optimize,
+        );
         (0..rows)
             .map(|offset| Line {
                 image: Some(Placement {
@@ -106,18 +111,65 @@ impl InlineImage {
             .collect()
     }
 }
-fn dimensions(width: u32, height: u32, max_columns: usize, max_rows: usize) -> (usize, usize) {
-    let width = u64::from(width.max(1));
-    let height = u64::from(height.max(1));
-    let max_width = (max_columns.max(1) as u64) * 9;
-    let max_height = (max_rows.max(1) as u64) * 18;
-    let scale = (max_width as f64 / width as f64)
-        .min(max_height as f64 / height as f64)
-        .min(1.0);
-    let columns = ((width as f64 * scale / 9.0).ceil() as usize).clamp(1, max_columns.max(1));
-    let rows = ((height as f64 * scale / 18.0).ceil() as usize).clamp(1, max_rows.max(1));
+pub fn cell_dimensions() -> (f64, f64) {
+    crossterm::terminal::window_size()
+        .ok()
+        .and_then(|size| reported_cell_dimensions(&size))
+        .unwrap_or((9.0, 18.0))
+}
+
+fn reported_cell_dimensions(size: &crossterm::terminal::WindowSize) -> Option<(f64, f64)> {
+    if size.columns == 0 || size.rows == 0 {
+        return None;
+    }
+    let width = f64::from(size.width) / f64::from(size.columns);
+    let height = f64::from(size.height) / f64::from(size.rows);
+    ((1.0..=1024.0).contains(&width) && (1.0..=1024.0).contains(&height)).then_some((width, height))
+}
+
+fn dimensions(
+    width: u32,
+    height: u32,
+    max_columns: usize,
+    max_rows: usize,
+    cell: (f64, f64),
+    optimize: bool,
+) -> (usize, usize) {
+    let width = f64::from(width.max(1));
+    let height = f64::from(height.max(1));
+    let max_columns = max_columns.max(1);
+    let max_rows = max_rows.max(1);
+    let width_scale = max_columns as f64 * cell.0 / width;
+    let height_scale = max_rows as f64 * cell.1 / height;
+    let scale = width_scale.min(height_scale);
+    let mut columns = (width * scale / cell.0).ceil().max(1.0) as usize;
+    let mut rows = (height * scale / cell.1).ceil().max(1.0) as usize;
+    columns = columns.min(max_columns);
+    rows = rows.min(max_rows);
+    if optimize {
+        if width_scale <= height_scale {
+            rows = less_distorted(rows, columns as f64 * cell.0 * height / (width * cell.1));
+        } else {
+            columns = less_distorted(columns, rows as f64 * cell.1 * width / (height * cell.0));
+        }
+    }
     (columns, rows)
 }
+
+fn less_distorted(upper: usize, ideal: f64) -> usize {
+    if upper <= 1 {
+        return upper;
+    }
+    let lower = upper - 1;
+    let upper_error = (upper as f64 / ideal).max(ideal / upper as f64);
+    let lower_error = (lower as f64 / ideal).max(ideal / lower as f64);
+    if lower_error < upper_error {
+        lower
+    } else {
+        upper
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Placement {
     image: Arc<InlineImage>,
@@ -443,8 +495,8 @@ mod tests {
     }
     #[test]
     fn sizing_and_transcoding_preserve_bounds_and_alpha() {
-        assert_eq!(dimensions(2, 2, 60, 20), (1, 1));
-        assert_eq!(dimensions(600, 1200, 60, 20), (20, 20));
+        assert_eq!(dimensions(2, 2, 60, 20, (9.0, 18.0), false), (40, 20));
+        assert_eq!(dimensions(600, 1200, 60, 20, (9.0, 18.0), false), (20, 20));
         let image = fixture();
         assert_eq!((image.width, image.height), (18, 36));
         let decoded = image::load_from_memory(
@@ -456,6 +508,49 @@ mod tests {
         .to_rgba8();
         assert_eq!(decoded.get_pixel(0, 0).0[3], 120);
     }
+    #[test]
+    fn image_dimensions_match_the_pinned_reference() {
+        for (width, height, columns, rows, cell, ordinary, optimized) in [
+            (2, 2, 60, 20, (9.0, 18.0), (40, 20), (40, 20)),
+            (600, 1200, 60, 20, (9.0, 18.0), (20, 20), (20, 20)),
+            (201, 101, 60, 30, (9.0, 18.0), (60, 16), (60, 15)),
+            (321, 200, 58, 28, (9.5, 19.75), (58, 18), (58, 17)),
+            (100, 333, 41, 19, (7.0, 17.0), (14, 19), (14, 19)),
+            (888, 151, 58, 25, (11.0, 21.0), (58, 6), (58, 5)),
+            (1, 1000, 60, 30, (8.0, 16.0), (1, 30), (1, 30)),
+            (1000, 1, 60, 30, (8.0, 16.0), (60, 1), (60, 1)),
+        ] {
+            assert_eq!(
+                dimensions(width, height, columns, rows, cell, false),
+                ordinary
+            );
+            assert_eq!(
+                dimensions(width, height, columns, rows, cell, true),
+                optimized
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_pixel_metrics_keep_fractional_cells_and_reject_missing_values() {
+        let size = crossterm::terminal::WindowSize {
+            columns: 100,
+            rows: 40,
+            width: 950,
+            height: 790,
+        };
+        assert_eq!(reported_cell_dimensions(&size), Some((9.5, 19.75)));
+        for size in [
+            crossterm::terminal::WindowSize { width: 0, ..size },
+            crossterm::terminal::WindowSize { height: 0, ..size },
+            crossterm::terminal::WindowSize { columns: 0, ..size },
+            crossterm::terminal::WindowSize { rows: 0, ..size },
+            crossterm::terminal::WindowSize { width: 1, ..size },
+        ] {
+            assert_eq!(reported_cell_dimensions(&size), None);
+        }
+    }
+
     #[test]
     fn kitty_uploads_once_and_crops_the_visible_source_rows() {
         let mut renderer = renderer(Protocol::Kitty);
