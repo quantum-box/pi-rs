@@ -137,7 +137,11 @@ impl ProjectResources {
             return Err(Error::Config("project resource exceeds size limit".into()));
         }
         Ok(Resource {
-            id: path.to_string_lossy().into_owned(),
+            id: path
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
             version: format!("{:x}", Sha256::digest(text.as_bytes())),
             text,
         })
