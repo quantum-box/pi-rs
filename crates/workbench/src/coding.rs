@@ -12,7 +12,7 @@ use pi_rs::{
     ToolSpec,
 };
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncReadExt;
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
@@ -147,8 +147,8 @@ impl Tool for CodingTool {
                 } else {
                     "bash"
                 },
-                "Run a shell command in the workspace and return its bounded output and exit status.",
-                json!({"command":{"type":"string"},"timeout":{"type":"integer","minimum":1,"maximum":120}}),
+                "Run a shell command in the workspace. Returns the last 2000 lines or 50 KiB and saves complete output to a temporary file when truncated.",
+                json!({"command":{"type":"string"},"timeout":{"type":"number","exclusiveMinimum":0,"maximum":2147483.647}}),
                 vec!["command"],
             ),
             Kind::Grep => (
@@ -224,7 +224,17 @@ impl Tool for CodingTool {
     ) -> ToolReply {
         if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
             return match self.shell(&args).await {
-                Ok(result) => Outcome::Structured { data: json!({"output":result.output,"truncated":result.truncated,"exit_code":result.status.code(),"wall_time_seconds":result.elapsed}), attachments: vec![] }.into(),
+                Ok(result) => {
+                    let mut data = json!({"output":result.output.script,"truncated":result.output.script_truncated,"exit_code":exit_code(result.status),"wall_time_seconds":result.elapsed});
+                    if result.output.script_truncated {
+                        data["full_output_path"] = json!(result.output.path);
+                    }
+                    Outcome::Structured {
+                        data,
+                        attachments: vec![],
+                    }
+                    .into()
+                }
                 Err(error) => Outcome::Failed(error.to_string()).into(),
             };
         }
@@ -519,15 +529,7 @@ impl CodingTool {
 
     async fn bash(&self, args: &Value) -> Result<String> {
         let result = self.shell(args).await?;
-        let truncation = if result.truncated {
-            "\n[Output truncated at 50 KiB per stream]"
-        } else {
-            ""
-        };
-        let output = format!(
-            "{}{truncation}\nExit status: {}",
-            result.output, result.status
-        );
+        let output = format!("{}\nExit status: {}", result.output.display, result.status);
         if !result.status.success() {
             return Err(Error::Config(output));
         }
@@ -535,6 +537,7 @@ impl CodingTool {
     }
     async fn shell(&self, args: &Value) -> Result<ShellResult> {
         let started = std::time::Instant::now();
+        let timeout = shell_timeout(args)?;
         let mut command = if matches!(self.kind, Kind::PowerShell) {
             let executable = std::env::var_os("PATH")
                 .into_iter()
@@ -559,23 +562,55 @@ impl CodingTool {
         #[cfg(unix)]
         command.process_group(0);
         let mut process = ProcessGroup::new(command.spawn()?);
-        let stdout = process.child.stdout.take().expect("piped stdout");
-        let stderr = process.child.stderr.take().expect("piped stderr");
-        let timeout = Duration::from_secs(args["timeout"].as_u64().unwrap_or(30).clamp(1, 120));
-        let result = tokio::time::timeout(timeout, async {
-            tokio::try_join!(process.child.wait(), capture(stdout), capture(stderr))
-        })
-        .await
-        .map_err(|_| Error::Config("command timed out".into()))??;
-        process.finished = true;
+        let mut stdout = process.child.stdout.take().expect("piped stdout");
+        let mut stderr = process.child.stderr.take().expect("piped stderr");
+        let deadline = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        let mut output = crate::shell_output::Accumulator::default();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut status = None;
+        let mut stdout_chunk = [0; 8192];
+        let mut stderr_chunk = [0; 8192];
+        let mut drain_deadline = None;
+        while status.is_none() || stdout_open || stderr_open {
+            tokio::select! {
+                _ = &mut deadline => {
+                    let output = output.finish()?;
+                    return Err(Error::Config(format!("{}\nCommand timed out after {} seconds", output.display, timeout.expect("deadline needs a timeout").as_secs_f64())));
+                }
+                result = process.child.wait(), if status.is_none() => {
+                    status = Some(result?);
+                    process.finished = true;
+                    // Descendants may retain inherited pipes after the shell exits.
+                    drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                }
+                count = stdout.read(&mut stdout_chunk), if stdout_open => {
+                    let count = count?;
+                    stdout_open = count != 0;
+                    output.append(&stdout_chunk[..count])?;
+                }
+                count = stderr.read(&mut stderr_chunk), if stderr_open => {
+                    let count = count?;
+                    stderr_open = count != 0;
+                    output.append(&stderr_chunk[..count])?;
+                }
+                _ = async {
+                    match drain_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => break,
+            }
+        }
         Ok(ShellResult {
-            output: format!(
-                "{}{}",
-                String::from_utf8_lossy(&result.1.bytes),
-                String::from_utf8_lossy(&result.2.bytes)
-            ),
-            truncated: result.1.truncated || result.2.truncated,
-            status: result.0,
+            output: output.finish()?,
+            status: status.expect("shell status observed"),
             elapsed: started.elapsed().as_secs_f64(),
         })
     }
@@ -631,8 +666,7 @@ pub fn normalize_image<R: std::io::BufRead + std::io::Seek>(
 }
 
 struct ShellResult {
-    output: String,
-    truncated: bool,
+    output: crate::shell_output::Output,
     status: std::process::ExitStatus,
     elapsed: f64,
 }
@@ -689,28 +723,34 @@ fn bounded(mut output: String) -> String {
     output
 }
 
-struct CapturedOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
+fn shell_timeout(args: &Value) -> Result<Option<Duration>> {
+    let Some(value) = args.get("timeout") else {
+        return Ok(None);
+    };
+    let seconds = value
+        .as_f64()
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0 && *seconds <= 2_147_483.647)
+        .ok_or_else(|| {
+            Error::Config(
+                "timeout must be a positive number no greater than 2147483.647 seconds".into(),
+            )
+        })?;
+    Ok(Some(Duration::from_secs_f64(seconds)))
 }
 
-async fn capture(mut stream: impl AsyncRead + Unpin) -> std::io::Result<CapturedOutput> {
-    let mut output = Vec::new();
-    let mut truncated = false;
-    let mut chunk = [0; 8192];
-    loop {
-        let count = stream.read(&mut chunk).await?;
-        if count == 0 {
-            break;
-        }
-        let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
-        truncated |= count > remaining;
-        output.extend_from_slice(&chunk[..count.min(remaining)]);
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
     }
-    Ok(CapturedOutput {
-        bytes: output,
-        truncated,
-    })
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        128 + status.signal().unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        1
+    }
 }
 
 struct ProcessGroup {
@@ -894,6 +934,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_timeout_retains_partial_output_and_rejects_invalid_values() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: false,
+            kind: Kind::Bash,
+        };
+        let error = tool
+            .bash(&json!({"command":"printf before; sleep 5", "timeout":0.05}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("before"));
+        assert!(error.contains("timed out after 0.05"));
+        assert_eq!(shell_timeout(&json!({})).unwrap(), None);
+        for value in [json!(0), json!(-1), json!(null), json!("1"), json!(2147484)] {
+            assert!(shell_timeout(&json!({"timeout":value})).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_does_not_wait_for_inherited_background_pipes() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: false,
+            kind: Kind::Bash,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tool.shell(&json!({"command":"sleep 1 & printf done"})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.output.script, "done");
+        assert!(result.status.success());
+    }
+
+    #[tokio::test]
     async fn shell_drains_both_streams_and_reports_failure() {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
@@ -906,7 +986,8 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(output.contains("outerr"));
+        assert!(output.contains("out"));
+        assert!(output.contains("err"));
         assert!(output.contains('7'));
     }
 }

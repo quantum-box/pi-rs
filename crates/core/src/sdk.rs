@@ -767,6 +767,9 @@ mod tests {
             host: Arc<dyn crate::ToolHost>,
         ) -> crate::Outcome {
             let result = host.call("child", serde_json::json!({"value":"ok"})).await;
+            assert!(
+                matches!(&result, crate::Outcome::Structured { data, .. } if data["output"].as_str().unwrap().len() == 1024 * 1024)
+            );
             assert!(matches!(
                 host.call("blocked", serde_json::json!({"value":"ok"}))
                     .await,
@@ -776,7 +779,7 @@ mod tests {
                 host.call("child", serde_json::json!({})).await,
                 crate::Outcome::Skipped(_)
             ));
-            result
+            crate::Outcome::Succeeded("child result".into())
         }
     }
     struct Child {
@@ -795,6 +798,20 @@ mod tests {
         async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
             self.count.fetch_add(1, Ordering::SeqCst);
             crate::Outcome::Succeeded("child result".into())
+        }
+        async fn invoke_programmatic(
+            &self,
+            _: serde_json::Value,
+            _: crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ToolReply {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            crate::Outcome::Structured {
+                data: serde_json::json!({"output":"\u{0001}".repeat(1024 * 1024)}),
+                attachments: vec![],
+            }
+            .into()
         }
     }
     struct BundleExtension(Arc<AtomicUsize>);

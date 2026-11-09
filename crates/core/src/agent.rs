@@ -955,14 +955,22 @@ impl Agent<'_> {
             outcome,
             state: update,
         } = reply;
-        const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+        // Programmatic results remain in the journal but are not injected into
+        // model context. Leave room for a 1 MiB string and its JSON escaping.
+        let max_output_bytes = if session.records().iter().any(|record| {
+            matches!(&record.event, Event::ToolPlanned { invocation: nested, .. } if nested.operation_id == invocation.operation_id)
+        }) {
+            8 * 1024 * 1024
+        } else {
+            1024 * 1024
+        };
         let outcome = match outcome {
-            Outcome::Succeeded(output) if output.len() > MAX_OUTPUT_BYTES => Outcome::Truncated {
+            Outcome::Succeeded(output) if output.len() > max_output_bytes => Outcome::Truncated {
                 original_bytes: output.len(),
             },
             outcome @ Outcome::Structured { .. } => {
                 let size = outcome.tool_content().len();
-                if size > MAX_OUTPUT_BYTES {
+                if size > max_output_bytes {
                     Outcome::Truncated {
                         original_bytes: size,
                     }
@@ -970,13 +978,13 @@ impl Agent<'_> {
                     outcome
                 }
             }
-            Outcome::Failed(reason) if reason.len() > MAX_OUTPUT_BYTES => {
+            Outcome::Failed(reason) if reason.len() > max_output_bytes => {
                 Outcome::Failed("failure detail exceeds size limit".into())
             }
-            Outcome::Skipped(reason) if reason.len() > MAX_OUTPUT_BYTES => {
+            Outcome::Skipped(reason) if reason.len() > max_output_bytes => {
                 Outcome::Skipped("skip detail exceeds size limit".into())
             }
-            Outcome::Unknown(reason) if reason.len() > MAX_OUTPUT_BYTES => {
+            Outcome::Unknown(reason) if reason.len() > max_output_bytes => {
                 Outcome::Unknown("uncertain result detail exceeds size limit".into())
             }
             Outcome::Pending { reference }

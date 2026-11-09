@@ -17,6 +17,7 @@ const MAX_COMMAND_INPUT: u64 = 1024 * 1024;
 
 pub mod coding;
 pub mod mcp;
+mod shell_output;
 
 pub struct Tools {
     root: PathBuf,
