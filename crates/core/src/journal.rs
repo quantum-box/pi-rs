@@ -818,6 +818,14 @@ impl FileStore {
     }
 }
 
+impl Drop for FileStore {
+    fn drop(&mut self) {
+        // Release the lock even when a concurrently spawned child still holds a
+        // duplicate file descriptor until its exec completes.
+        let _ = self.file.unlock();
+    }
+}
+
 impl SessionStore for FileStore {
     fn load(&mut self) -> Result<Vec<Record>> {
         let mut records = Vec::new();
@@ -1144,6 +1152,18 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
 #[cfg(test)]
 mod session_metadata_tests {
     use super::*;
+
+    #[test]
+    fn dropping_the_store_unlocks_duplicated_file_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let store = FileStore::open(&path).unwrap();
+        let duplicate = store.file.try_clone().unwrap();
+        drop(store);
+        let session = Session::open(&path).unwrap();
+        drop(session);
+        drop(duplicate);
+    }
 
     #[test]
     fn model_and_thinking_selection_follow_the_active_branch() {
