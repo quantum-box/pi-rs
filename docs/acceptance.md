@@ -116,4 +116,11 @@ MCP の組合せで、許可取消後、同じ操作 ID の再送時、予算枯
 試験4件が通過した。実際の Linear 接続と添付参照は受入が残っている。
 
 [予算と試験](https://github.com/quantum-box/tachyon-apps/commit/4c55be4bf7134c1a26cff3735fbbecdc3155253f)
+
+応答待ちを中断したときは、元の接続で元の要求 ID に対する MCP 取消を通知する。
+隔離 HTTP MCP で、応答を返さない操作の取消通知を受信したことを確認した。隔離
+TiDB では、同じ操作 ID の照会で使用量確認待ちの記録が1件、同じ操作 ID への再送が
+0件、確定済みの別操作の精算が1件だった。サーバー側の停止確認は運用接続での受入に残る。
+[取消通知と試験](https://github.com/quantum-box/tachyon-apps/commit/4e55b9b3acd2666d9574c1863f8f69c25590ec0b)
+
 [接続と試験](https://github.com/quantum-box/tachyon-apps/commit/226dd8830ebf47a6a17174b5ffd1d5f9761f2b8f) · [Linear MCP](https://linear.app/docs/mcp)
