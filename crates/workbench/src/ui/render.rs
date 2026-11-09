@@ -21,6 +21,7 @@ pub struct Span {
     pub color: Color,
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
     pub strikethrough: bool,
 }
 impl Span {
@@ -30,6 +31,7 @@ impl Span {
             color,
             bold: false,
             italic: false,
+            underline: false,
             strikethrough: false,
         }
     }
@@ -68,6 +70,11 @@ impl Line {
                     Attribute::Italic
                 } else {
                     Attribute::NoItalic
+                }),
+                SetAttribute(if span.underline {
+                    Attribute::Underlined
+                } else {
+                    Attribute::NoUnderline
                 }),
                 SetAttribute(if span.strikethrough {
                     Attribute::CrossedOut
@@ -395,24 +402,39 @@ impl Table {
 }
 
 pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
+    markdown_at_depth(text, theme, width, 0)
+}
+fn markdown_at_depth(text: &str, theme: &Theme, width: usize, depth: usize) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut bold = 0usize;
     let mut italic = 0usize;
     let mut strikethrough = 0usize;
-    let mut heading = false;
+    let mut heading = 0usize;
+    let mut quote_skip = 0usize;
     let mut code: Option<String> = None;
     let mut code_text = String::new();
     let mut lists: Vec<Option<u64>> = Vec::new();
+    let mut item_prefixes = Vec::new();
     let mut table: Option<Table> = None;
     let mut links = Vec::new();
-    for event in Parser::new_ext(
+    for (event, range) in Parser::new_ext(
         text,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
-    ) {
+    )
+    .into_offset_iter()
+    {
+        if quote_skip > 0 {
+            match event {
+                Event::Start(Tag::BlockQuote(_)) => quote_skip += 1,
+                Event::End(TagEnd::BlockQuote(_)) => quote_skip -= 1,
+                _ => {}
+            }
+            continue;
+        }
         match event {
             Event::Start(Tag::Table(alignments)) => {
-                flush(&mut spans, &mut lines, width);
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
                 table = Some(Table {
                     alignments,
                     ..Table::default()
@@ -445,19 +467,37 @@ pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
             Event::End(TagEnd::Strong) => bold = bold.saturating_sub(1),
             Event::Start(Tag::Emphasis) => italic += 1,
             Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
-            Event::Start(Tag::Heading { .. }) => heading = true,
+            Event::Start(Tag::Heading { level, .. }) => {
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
+                heading = level as usize;
+                if heading >= 3 {
+                    let mut prefix = Span::new(
+                        format!("{} ", "#".repeat(heading)),
+                        theme.color("mdHeading"),
+                    );
+                    prefix.bold = true;
+                    spans.push(prefix);
+                }
+            }
             Event::End(TagEnd::Heading(_)) => {
-                heading = false;
-                flush(&mut spans, &mut lines, width);
+                heading = 0;
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
             }
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush(&mut spans, &mut lines, width);
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
                 code = Some(match kind {
                     CodeBlockKind::Fenced(language) => {
                         language.split_whitespace().next().unwrap_or("").to_owned()
                     }
                     CodeBlockKind::Indented => String::new(),
                 });
+                lines.extend(wrap(
+                    &[Span::new(
+                        format!("```{}", code.as_deref().unwrap_or_default()),
+                        theme.color("mdCodeBlockBorder"),
+                    )],
+                    width,
+                ));
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some(language) = code.take() {
@@ -486,8 +526,19 @@ pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
                                 )
                             })
                             .collect::<Vec<_>>();
-                        lines.extend(wrap(&pieces, width));
+                        let indent = width.saturating_sub(1).min(2);
+                        for mut line in wrap(&pieces, width.saturating_sub(indent)) {
+                            line.spans.insert(
+                                0,
+                                Span::new(" ".repeat(indent), theme.color("mdCodeBlock")),
+                            );
+                            lines.push(line);
+                        }
                     }
+                    lines.extend(wrap(
+                        &[Span::new("```", theme.color("mdCodeBlockBorder"))],
+                        width,
+                    ));
                     code_text.clear();
                 }
             }
@@ -496,7 +547,7 @@ pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
                 lists.pop();
             }
             Event::Start(Tag::Item) => {
-                flush(&mut spans, &mut lines, width);
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
                 let prefix = match lists.last_mut() {
                     Some(Some(index)) => {
                         let prefix = format!("{index}. ");
@@ -505,13 +556,51 @@ pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
                     }
                     _ => "• ".into(),
                 };
-                spans.push(Span::new(
+                let prefix = Span::new(
                     format!("{}{prefix}", "  ".repeat(lists.len().saturating_sub(1))),
                     theme.color("mdListBullet"),
-                ));
+                );
+                item_prefixes.push(prefix.clone());
+                spans.push(prefix);
             }
             Event::Start(Tag::BlockQuote(_)) => {
-                spans.push(Span::new("│ ", theme.color("mdQuoteBorder")))
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
+                let body = text[range]
+                    .lines()
+                    .map(|line| {
+                        let trimmed = line.trim_start_matches(' ');
+                        if line.len() - trimmed.len() <= 3 {
+                            trimmed
+                                .strip_prefix('>')
+                                .map(|line| line.strip_prefix(' ').unwrap_or(line))
+                                .unwrap_or(line)
+                        } else {
+                            line
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let bordered = width >= 3;
+                let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
+                let quoted = if depth < 32 {
+                    markdown_at_depth(&body, theme, content_width, depth + 1)
+                } else {
+                    wrap(&[Span::new(body, theme.color("mdQuote"))], content_width)
+                };
+                for mut line in quoted {
+                    for span in &mut line.spans {
+                        span.italic = true;
+                        if span.color == theme.color("text") {
+                            span.color = theme.color("mdQuote");
+                        }
+                    }
+                    if bordered {
+                        line.spans
+                            .insert(0, Span::new("│ ", theme.color("mdQuoteBorder")));
+                    }
+                    lines.push(line);
+                }
+                quote_skip = 1;
             }
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
                 if code.is_some() {
@@ -519,7 +608,7 @@ pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
                 } else {
                     let mut span = Span::new(
                         text,
-                        theme.color(if heading {
+                        theme.color(if heading > 0 {
                             "mdHeading"
                         } else if !links.is_empty() {
                             "mdLink"
@@ -527,20 +616,30 @@ pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
                             "text"
                         }),
                     );
-                    span.bold = bold > 0 || heading;
+                    span.bold = bold > 0 || heading > 0;
+                    span.underline = heading == 1;
                     span.italic = italic > 0;
                     span.strikethrough = strikethrough > 0;
                     spans.push(span);
                 }
             }
-            Event::Code(text) => spans.push(Span::new(text, theme.color("mdCode"))),
+            Event::Code(text) => {
+                let mut span = Span::new(text, theme.color("mdCode"));
+                span.underline = heading == 1;
+                span.bold = heading > 0;
+                spans.push(span);
+            }
             Event::SoftBreak => spans.push(Span::new(" ", theme.color("text"))),
-            Event::HardBreak | Event::End(TagEnd::Paragraph | TagEnd::Item) => {
-                flush(&mut spans, &mut lines, width)
+            Event::End(TagEnd::Item) => {
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
+                item_prefixes.pop();
+            }
+            Event::HardBreak | Event::End(TagEnd::Paragraph) => {
+                flush(&mut spans, &mut lines, width, item_prefixes.last())
             }
             Event::Rule => {
-                flush(&mut spans, &mut lines, width);
-                lines.push(Line::plain(&"─".repeat(width), theme.color("mdHr")));
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
+                lines.push(Line::plain(&"─".repeat(width.min(80)), theme.color("mdHr")));
             }
             Event::TaskListMarker(checked) => spans.push(Span::new(
                 if checked { "☑ " } else { "☐ " },
@@ -549,19 +648,121 @@ pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
             _ => {}
         }
     }
-    flush(&mut spans, &mut lines, width);
+    flush(&mut spans, &mut lines, width, item_prefixes.last());
     lines
 }
-fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize) {
-    if !spans.is_empty() {
-        lines.extend(wrap(spans, width));
-        spans.clear();
+fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Option<&Span>) {
+    if spans.is_empty() {
+        return;
     }
+    if let Some(prefix) = prefix {
+        let has_marker = spans.first() == Some(prefix);
+        let indent = UnicodeWidthStr::width(prefix.text.as_str()).min(width.saturating_sub(1));
+        let body = if has_marker {
+            &spans[1..]
+        } else {
+            spans.as_slice()
+        };
+        for (index, mut line) in wrap(body, width.saturating_sub(indent))
+            .into_iter()
+            .enumerate()
+        {
+            let mut marker = prefix.clone();
+            marker.text = if index == 0 && has_marker {
+                marker.text.chars().take(indent).collect()
+            } else {
+                " ".repeat(indent)
+            };
+            line.spans.insert(0, marker);
+            lines.push(line);
+        }
+    } else {
+        lines.extend(wrap(spans, width));
+    }
+    spans.clear();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn list_continuations_keep_indent_and_deep_quotes_are_bounded() {
+        let theme = Theme::system();
+        let lines = markdown("- abcdefghijkl", &theme, 8);
+        let text = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(text(&lines[0]), "• abcdef");
+        assert_eq!(text(&lines[1]), "  ghijkl");
+        let deep = format!("{}text", "> ".repeat(128));
+        let lines = markdown(&deep, &theme, 1);
+        assert!(!lines.is_empty());
+        assert!(lines.len() <= deep.len());
+        assert!(
+            lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(text(line).as_str()) <= 1)
+        );
+    }
+
+    #[test]
+    fn reference_headings_fences_and_quote_continuations() {
+        let theme = Theme::system();
+        let lines = markdown(
+            "# Top\n\n### Third\n\n```rust\nlet x = 1;\n```\n\n> A long quoted sentence wraps.\n>\n> > nested quote\n",
+            &theme,
+            16,
+        );
+        let texts: Vec<_> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text == "Top" && span.underline)
+        );
+        assert!(texts.iter().any(|line| line == "### Third"));
+        assert!(texts.iter().any(|line| line == "```rust"));
+        assert!(texts.iter().any(|line| line == "  let x = 1;"));
+        assert!(texts.iter().any(|line| line == "```"));
+        let quote_lines: Vec<_> = texts.iter().filter(|line| line.starts_with("│ ")).collect();
+        assert!(quote_lines.len() >= 3, "{texts:?}");
+        assert!(
+            quote_lines.iter().any(|line| line.starts_with("│ │ ")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 16)
+        );
+        for width in 1..=3 {
+            let narrow = markdown("> > > nested quote", &theme, width);
+            assert!(narrow.len() < 20);
+            assert!(narrow.iter().all(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                    .sum::<usize>()
+                    <= width
+            }));
+        }
+        assert_eq!(
+            markdown("---", &theme, 120)[0].spans[0].text.len() / "─".len(),
+            80
+        );
+    }
+
     #[test]
     fn expanded_tools_keep_text_and_images_in_sequence() {
         use base64::Engine;

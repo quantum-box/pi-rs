@@ -7,3 +7,6 @@ in src/resources.rs and src/main.rs are adapted from that same Pi release.
 
 Native terminal-image capability detection follows Pi v1.5.0 terminal-image.ts.
 The Rust renderer implements the documented Kitty and iTerm2 protocols.
+
+Markdown heading, fenced code, quote and list presentation in src/ui/render.rs
+follows Pi v1.5.0 Markdown rendering conventions.

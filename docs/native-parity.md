@@ -584,3 +584,15 @@ round trip and individual journal entries. A cancellation fixture verifies that
 the native process and nested shell stop before a delayed side effect. Frames
 are bounded to 4 MiB. Native invocation uses the host's tool deadline, while
 legacy metadata hooks retain their existing bounded execution.
+
+### Markdown presentation checkpoint
+
+Level-one headings use underlining, lower-level headings retain their markers,
+and code blocks show language-labelled fences with indented syntax highlighting.
+Wrapped list content keeps its indentation. Quotes render borders and quote
+styling on every continuation line, including nested quotes and narrow terminals.
+Recursive quote rendering stops at 32 levels and preserves deeper content as text.
+Horizontal rules use the reference 80-column maximum.
+
+Unit tests cover these layouts and Unicode widths. A PTY fixture verifies both
+terminal modes, heading decoration, code fences, nested quotes and clean exit.
