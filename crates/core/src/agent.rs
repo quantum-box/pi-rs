@@ -337,7 +337,17 @@ impl Agent<'_> {
                         }
                         let summary_limit = max_output_tokens.min(512).min(budget / 2);
                         let spent = self
-                            .summarize_prefix(session, &states, 1, summary_limit, cancel, observer)
+                            .summarize_prefix(
+                                session,
+                                &states,
+                                SummaryScope {
+                                    keep_turns: 1,
+                                    output_limit: summary_limit,
+                                    cancellation: cancel,
+                                },
+                                observer,
+                                Some(followups),
+                            )
                             .await?;
                         budget -= spent;
                         states = session.extension_states();
@@ -1235,26 +1245,52 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
+        self.summarize_with_inputs::<AgentInput>(session, keep_turns, cancel, observer, None)
+            .await
+    }
+
+    pub async fn summarize_with_inputs<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        keep_turns: usize,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        inputs: Option<&mut mpsc::Receiver<T>>,
+    ) -> Result<()> {
         ensure_settled(session.operations())?;
         let states = self.migrate(session, observer)?;
         let limit = self
             .limits
             .output_tokens_per_request
             .min(self.limits.output_tokens_per_run);
-        self.summarize_prefix(session, &states, keep_turns, limit, cancel, observer)
-            .await?;
+        self.summarize_prefix(
+            session,
+            &states,
+            SummaryScope {
+                keep_turns,
+                output_limit: limit,
+                cancellation: cancel,
+            },
+            observer,
+            inputs,
+        )
+        .await?;
         Ok(())
     }
 
-    async fn summarize_prefix(
+    async fn summarize_prefix<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         states: &ExtensionStates,
-        keep_turns: usize,
-        limit: u32,
-        cancel: &CancellationToken,
+        scope: SummaryScope<'_>,
         observer: &mut Observer<'_>,
+        inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<u32> {
+        let SummaryScope {
+            keep_turns,
+            output_limit: limit,
+            cancellation: cancel,
+        } = scope;
         if limit == 0 || self.limits.model_requests == 0 {
             return Err(Error::Budget);
         }
@@ -1282,7 +1318,7 @@ impl Agent<'_> {
         }
         let allowance = request.max_output_tokens;
         let reply = self
-            .reply::<AgentInput>(session, request, false, cancel, observer, None)
+            .reply(session, request, false, cancel, observer, inputs)
             .await?;
         if !reply.invocations.is_empty() {
             return Err(Error::Model(
@@ -1411,6 +1447,11 @@ fn retain_from(branch: &[&Record], keep_turns: usize) -> Option<u64> {
     Some(start)
 }
 
+struct SummaryScope<'a> {
+    keep_turns: usize,
+    output_limit: u32,
+    cancellation: &'a CancellationToken,
+}
 struct DispatchScope<'a> {
     cancellation: &'a CancellationToken,
     advertised: &'a HashSet<String>,

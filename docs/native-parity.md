@@ -831,9 +831,21 @@ behavior unless configured otherwise.
 Alt+Up restores queued messages in the TUI, with Alt+Q on Windows/WSL. Escape
 restores the queue before stopping the active run. An RPC abort retains queued
 messages and continues them without repeating the interrupted request first.
-Compaction and review operations still require their separate queue handling.
+Compaction queue handling is covered below. Review operations still require
+their separate queue handling.
 
 RPC fixtures verify acknowledgements while HTTP/model and shell-tool execution
 are pending, one-at-a-time delivery, persisted defaults on a new session and
 continuation after abort. Both terminal modes pass queue-restoration checks.
 Core and SDK tests cover active controls, branch history and idle operations.
+
+### Compaction queue checkpoint
+
+Explicit and automatic compaction accept queue controls while awaiting their
+summary response. SDK and frontend callers use the same acknowledged control
+channel, and late SDK controls are drained before the operation closes. Existing
+callers of `Agent::summarize` keep the original interface.
+
+SDK and RPC fixtures verify clearing pending input during a blocked summary,
+cancelling that summary, and completing a later compaction without restoring the
+removed message. Workspace tests and all-target Clippy pass.

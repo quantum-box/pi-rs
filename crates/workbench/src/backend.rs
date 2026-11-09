@@ -235,7 +235,7 @@ pub async fn run(mut args: Cli) -> Result<()> {
                     keep_turns,
                 } => {
                     agent
-                        .summarize(&mut session, keep_turns, &cancel, &mut observer)
+                        .summarize_with_inputs(&mut session, keep_turns, &cancel, &mut observer, Some(&mut queued))
                         .await?
                 }
                 Request::McpStatus => runtime.mcp_status(&args)?,
