@@ -196,6 +196,12 @@ impl Registry {
         self.tools.contains_key(name)
     }
 
+    pub fn is_read_only(&self) -> bool {
+        self.tools
+            .values()
+            .all(|tool| tool.tool.execution() == ToolExecution::ParallelRead)
+    }
+
     /// Build a child tool profile with the same policy hooks and only
     /// explicitly allowed tools attested to be read-only by the host.
     pub fn read_only_subset(&self, names: &BTreeSet<String>) -> Result<Self> {

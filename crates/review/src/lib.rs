@@ -13,28 +13,35 @@ pub const ID: &str = "branch-review";
 pub struct ReviewContext;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Link {
-    child: Uuid,
-    parent_record: u64,
-    task: String,
-    status: ReviewStatus,
+pub struct ReviewLink {
+    pub child: Uuid,
+    pub parent_record: u64,
+    pub task: String,
+    pub status: ReviewStatus,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum ReviewStatus {
+pub enum ReviewStatus {
     Running,
     Done { answer: String },
     Stopped,
 }
 
-fn decode(state: Option<&ExtensionState>) -> ExtensionResult<BTreeMap<Uuid, Link>> {
+fn decode(state: Option<&ExtensionState>) -> ExtensionResult<BTreeMap<Uuid, ReviewLink>> {
     match state {
         None => Ok(BTreeMap::new()),
         Some(state) if state.version == 1 => {
             serde_json::from_value(state.data.clone()).map_err(|_| "invalid review state".into())
         }
         Some(_) => Err("unsupported review state version".into()),
+    }
+}
+
+impl ReviewContext {
+    pub fn find(session: &Session, child: Uuid) -> Result<Option<ReviewLink>> {
+        let mut links = decode(session.extension_states().get(ID)).map_err(Error::Config)?;
+        Ok(links.remove(&child))
     }
 }
 
@@ -54,7 +61,8 @@ impl Extension for ReviewContext {
         previous: Option<&ExtensionState>,
     ) -> ExtensionResult<ExtensionState> {
         let mut links = decode(previous)?;
-        let link: Link = serde_json::from_str(arguments).map_err(|_| "invalid review record")?;
+        let link: ReviewLink =
+            serde_json::from_str(arguments).map_err(|_| "invalid review record")?;
         if links.len() >= 32 && !links.contains_key(&link.child) {
             return Err("review record limit reached".into());
         }
@@ -142,7 +150,7 @@ impl Review<'_> {
                     "review already exists; resume the same review explicitly".into(),
                 ));
             }
-            None if child.records().len() == 1 && !self.resume => Link {
+            None if child.records().len() == 1 && !self.resume => ReviewLink {
                 child: child_id,
                 parent_record: self.from_record.unwrap_or_else(|| parent.head()),
                 task: self.task.into(),
@@ -248,7 +256,7 @@ impl Review<'_> {
             parent,
             ID,
             "record",
-            &serde_json::to_string(&Link { status, ..link })?,
+            &serde_json::to_string(&ReviewLink { status, ..link })?,
             observer,
         )?;
         result

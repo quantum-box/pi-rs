@@ -2,10 +2,12 @@
 //! permission checks, charging, and continuation. This crate holds no credentials.
 mod memory;
 mod model;
+mod review;
 mod tools;
 
 pub use memory::*;
 pub use model::*;
+pub use review::*;
 pub use tools::*;
 
 use pi_rs_core::{

@@ -39,8 +39,12 @@ fn delegation() -> Delegation {
 
 #[async_trait::async_trait]
 impl DelegatedPort for Platform {
-    async fn discover(&self, _: &RunScope, _: &BTreeSet<String>) -> Result<Vec<Delegation>> {
-        Ok(vec![delegation()])
+    async fn discover(&self, _: &RunScope, names: &BTreeSet<String>) -> Result<Vec<Delegation>> {
+        Ok(names
+            .contains("fixture_submit")
+            .then(delegation)
+            .into_iter()
+            .collect())
     }
 
     async fn authorize(
@@ -313,4 +317,203 @@ async fn revocation_stale_approval_version_change_and_budget_stop_before_externa
         }
         assert!(platform.effects.lock().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn hosted_review_keeps_parent_child_identity_and_recovers_a_cancelled_child() {
+    let platform = Arc::new(Platform::default());
+    let parent_scope = RunScope {
+        parent_run: None,
+        ..scope()
+    };
+    let child_scope = RunScope {
+        journal_run_id: Uuid::new_v4(),
+        aip_run: "independent-review".into(),
+        parent_run: Some(parent_scope.aip_run.clone()),
+        audit_id: "child-audit".into(),
+        ..parent_scope.clone()
+    };
+    let parent_profile = HostRegistry::discover(
+        &parent_scope,
+        platform.clone(),
+        BTreeSet::new(),
+        vec![Arc::new(pi_rs_review::ReviewContext)],
+    )
+    .await
+    .unwrap();
+    let child_profile =
+        HostRegistry::discover(&child_scope, platform.clone(), BTreeSet::new(), vec![])
+            .await
+            .unwrap();
+    let parent_model = ModelFixture(Mutex::new(vec![vec![]].into()));
+    let child_model = ModelFixture(Mutex::new(vec![vec![]].into()));
+    let parent_turn = HostTurn {
+        scope: &parent_scope,
+        budget: platform.as_ref(),
+        model: &parent_model,
+        model_name: "fixture",
+        registry: &parent_profile,
+        system_prompt: "parent",
+        limits: Limits::default(),
+    };
+    let child_turn = HostTurn {
+        scope: &child_scope,
+        budget: platform.as_ref(),
+        model: &child_model,
+        model_name: "fixture",
+        registry: &child_profile,
+        system_prompt: "review",
+        limits: Limits::default(),
+    };
+    let mut parent = Session::with_store(MemoryStore::default()).unwrap();
+    let mut child = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut queue) = tokio::sync::mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    parent_turn
+        .run(
+            &mut parent,
+            Some("review this decision".into()),
+            &mut queue,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let from_record = parent.head();
+    let stopped = CancellationToken::new();
+    stopped.cancel();
+    let mut review = ManagedReview {
+        parent: &parent_turn,
+        child: &child_turn,
+        from_record,
+        task: "check the original evidence",
+        resume: false,
+    };
+    assert!(matches!(
+        review
+            .run(&mut parent, &mut child, &stopped, &mut ignore)
+            .await,
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(
+        pi_rs_review::ReviewContext::find(&parent, child.session_id())
+            .unwrap()
+            .unwrap()
+            .status,
+        pi_rs_review::ReviewStatus::Stopped
+    ));
+    review.resume = true;
+    assert_eq!(
+        review
+            .run(&mut parent, &mut child, &cancel, &mut ignore)
+            .await
+            .unwrap(),
+        "done"
+    );
+    assert!(
+        child
+            .records()
+            .iter()
+            .any(|record| record.run_id == Some(child_scope.journal_run_id))
+    );
+    assert_eq!(platform.usage.lock().unwrap().len(), 2);
+    assert!(matches!(
+        pi_rs_review::ReviewContext::find(&parent, child.session_id())
+            .unwrap()
+            .unwrap()
+            .status,
+        pi_rs_review::ReviewStatus::Done { .. }
+    ));
+}
+
+struct References(AtomicBool);
+#[async_trait::async_trait]
+impl ReferencePort for References {
+    async fn load(
+        &self,
+        scope: &RunScope,
+        key: &ReferenceKey,
+    ) -> Result<Option<AuthorizedReference>> {
+        Ok(self.0.load(Ordering::SeqCst).then(|| AuthorizedReference {
+            key: key.clone(),
+            tenant: scope.tenant.clone(),
+            workspace: scope.workspace.clone(),
+            fresh_until: SystemTime::now() + Duration::from_secs(30),
+            text: "authorized workspace decision".into(),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn revoked_reference_stops_dispatch_after_a_branch_reopens() {
+    let platform = Arc::new(Platform::default());
+    let scope = scope();
+    let source = Arc::new(References(AtomicBool::new(true)));
+    let registry = HostRegistry::discover(
+        &scope,
+        platform.clone(),
+        BTreeSet::new(),
+        vec![Arc::new(ReferenceMemory {
+            scope: scope.clone(),
+            source: source.clone(),
+            keep_turns: 1,
+        })],
+    )
+    .await
+    .unwrap();
+    let model = ModelFixture(Mutex::new(vec![vec![]].into()));
+    let host = HostTurn {
+        scope: &scope,
+        budget: platform.as_ref(),
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "fixture",
+        limits: Limits::default(),
+    };
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    host.extension_command(
+        &mut session,
+        "aip-reference-memory",
+        "select",
+        r#"[{"id":"decision:fixture","version":"1"}]"#,
+        &mut ignore,
+    )
+    .unwrap();
+    let (_, mut queue) = tokio::sync::mpsc::channel::<QueuedInput>(2);
+    let stop = CancellationToken::new();
+    host.run(
+        &mut session,
+        Some("check the decision".into()),
+        &mut queue,
+        &stop,
+        &mut |event: Notification<'_>| {
+            if let Notification::Request(request) = event {
+                assert!(
+                    serde_json::to_string(request)
+                        .unwrap()
+                        .contains("decision:fixture version 1")
+                );
+            }
+        },
+    )
+    .await
+    .unwrap();
+    source.0.store(false, Ordering::SeqCst);
+    let anchor = session.head();
+    session.checkout(anchor).unwrap();
+    let (sender, mut queue) = tokio::sync::mpsc::channel(2);
+    sender
+        .try_send(QueuedInput {
+            id: Uuid::new_v4(),
+            kind: InputKind::Steer,
+            content: "check it again".into(),
+        })
+        .unwrap();
+    assert!(matches!(
+        host.run(&mut session, None, &mut queue, &stop, &mut ignore)
+            .await,
+        Err(Error::Extension { .. })
+    ));
+    assert_eq!(platform.reservations.lock().unwrap().len(), 1);
 }

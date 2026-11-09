@@ -8,6 +8,7 @@ description = "Host composition for AIP-owned runs, reservations and delegated t
 
 [dependencies]
 async-trait = "0.1"
+pi-rs-review = { path = "../review", version = "0.1.0" }
 pi-rs-core = { path = "../core", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

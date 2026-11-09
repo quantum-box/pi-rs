@@ -140,8 +140,8 @@ impl Extension for ReferenceMemory {
 
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 128
+        && value.len() <= 200
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
 }
