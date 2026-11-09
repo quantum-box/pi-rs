@@ -756,7 +756,13 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         "/share" => view.append(&sessions::share_gist(&Session::open(&args.session)?)?),
         "/model" if rest.is_empty() => start_model_picker(args, view),
         "/model" => {
-            args.model = rest.to_owned();
+            let selected = super::model_selection::split(rest);
+            args.model = selected.model;
+            if selected.thinking.is_some() {
+                args.thinking = selected.thinking;
+            } else {
+                apply_scoped_thinking(args);
+            }
             Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
             view.append(&format!("Model › {rest}"));
         }
@@ -1477,6 +1483,17 @@ fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Res
     Worker::submit(worker, args, request)
 }
 
+fn apply_scoped_thinking(args: &mut Cli) {
+    if let Some(choice) = args
+        .model_scope
+        .iter()
+        .find(|choice| choice.model == args.model)
+        && choice.thinking.is_some()
+    {
+        args.thinking = choice.thinking.clone();
+    }
+}
+
 fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     if view.available_models.is_empty() {
         view.model_cycle = Some(reverse);
@@ -1495,6 +1512,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
         (None, false) => 0,
     };
     args.model = view.available_models[next].clone();
+    apply_scoped_thinking(args);
     Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
     Ok(())
 }
@@ -1503,6 +1521,7 @@ fn start_model_picker(args: &Cli, view: &mut View) {
     if view.model_list.is_some() {
         return;
     }
+    let scope = args.model_scope.clone();
     let endpoint = args.endpoint.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1512,7 +1531,11 @@ fn start_model_picker(args: &Cli, view: &mut View) {
                 .build()?;
             let provider =
                 pi_rs::ollama::Ollama::new(&endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?;
-            runtime.block_on(provider.models())
+            if scope.is_empty() {
+                runtime.block_on(provider.models())
+            } else {
+                Ok(scope.into_iter().map(|choice| choice.model).collect())
+            }
         })();
         let _ = sender.send(result);
     });
@@ -1546,6 +1569,7 @@ fn select(selection: Selection, args: &mut Cli, view: &mut View, theme: &mut The
         }
         Selection::Model(model) => {
             args.model = model;
+            apply_scoped_thinking(args);
             Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
         }
         Selection::Thinking(thinking) => {
@@ -1618,12 +1642,7 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
         session.set_name(name)?;
     }
     if let Some((model, thinking)) = session.model_selection() {
-        if !args.model_explicit {
-            args.model = model;
-        }
-        if !args.thinking_explicit {
-            args.thinking = thinking;
-        }
+        args.restore_model_selection(model, thinking);
     }
     session.select_model(&args.model, args.thinking.as_deref())?;
     Ok(())
@@ -1631,12 +1650,7 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
 fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = Session::open(&args.session)?;
     if let Some((model, thinking)) = session.model_selection() {
-        if !args.model_explicit {
-            args.model = model;
-        }
-        if !args.thinking_explicit {
-            args.thinking = thinking;
-        }
+        args.restore_model_selection(model, thinking);
     }
     if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);

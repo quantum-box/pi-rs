@@ -17,6 +17,7 @@ mod backend;
 mod config;
 mod interactive;
 mod mcp_config;
+mod model_selection;
 mod packages;
 mod process;
 mod resources;
@@ -40,6 +41,8 @@ struct Cli {
     model_explicit: bool,
     #[arg(skip)]
     thinking_explicit: bool,
+    #[arg(skip)]
+    model_scope: Vec<model_selection::Choice>,
     #[arg(skip)]
     trusted: bool,
     #[arg(skip)]
@@ -82,6 +85,12 @@ struct Cli {
     /// Model served by the Ollama endpoint.
     #[arg(long, default_value = "qwen2.5:7b", global = true)]
     model: String,
+    /// Comma-separated model IDs or patterns used for startup and cycling.
+    #[arg(long, global = true)]
+    models: Option<String>,
+    /// List available models, optionally filtered by fuzzy search, then exit.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    list_models: Option<String>,
     /// Thinking effort for models that support reasoning.
     #[arg(long, global = true, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
     thinking: Option<String>,
@@ -192,6 +201,34 @@ struct Cli {
     /// Initial prompt when no explicit subcommand is used.
     #[arg(value_name = "PROMPT", num_args = 0.., trailing_var_arg = true)]
     prompt: Vec<String>,
+}
+
+impl Cli {
+    fn restore_model_selection(&mut self, model: String, thinking: Option<String>) {
+        if !self.model_explicit
+            && (self.model_scope.is_empty()
+                || self.model_scope.iter().any(|choice| choice.model == model))
+        {
+            self.model = model.clone();
+        }
+        if !self.thinking_explicit {
+            if self.model_scope.is_empty() {
+                self.thinking = thinking;
+            } else if let Some(choice) = self
+                .model_scope
+                .iter()
+                .find(|choice| choice.model == self.model)
+            {
+                self.thinking = choice.thinking.clone().or_else(|| {
+                    if self.model == model {
+                        thinking
+                    } else {
+                        self.thinking.clone()
+                    }
+                });
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -367,6 +404,46 @@ async fn main() {
 }
 
 async fn execute(mut args: Cli) -> Result<()> {
+    let selected = model_selection::split(&args.model);
+    args.model = selected.model;
+    if !args.thinking_explicit && selected.thinking.is_some() {
+        args.thinking = selected.thinking;
+        args.thinking_explicit = true;
+    }
+    if args.list_models.is_some() || args.models.is_some() {
+        let available =
+            pi_rs::ollama::Ollama::new(&args.endpoint, std::env::var("PI_RS_MODEL_TOKEN").ok())?
+                .models()
+                .await?;
+        if let Some(search) = &args.list_models {
+            for model in available
+                .iter()
+                .filter(|model| model_selection::fuzzy(search, model))
+            {
+                if args.mode == Some(OutputMode::Json) {
+                    output(json!({"type":"model","model":model}));
+                } else {
+                    println!("{model}");
+                }
+            }
+            return Ok(());
+        }
+        if let Some(patterns) = &args.models {
+            args.model_scope = model_selection::scope(patterns, &available)?;
+            if !args.model_explicit {
+                let choice = args
+                    .model_scope
+                    .iter()
+                    .find(|choice| choice.model == args.model)
+                    .unwrap_or(&args.model_scope[0]);
+                args.model = choice.model.clone();
+                if !args.thinking_explicit && choice.thinking.is_some() {
+                    args.thinking = choice.thinking.clone();
+                }
+            }
+        }
+    }
+
     if let Some(Command::Package(command)) = args.command.as_ref() {
         return packages::command(&args, command.clone()).await;
     }
@@ -571,12 +648,7 @@ async fn execute(mut args: Cli) -> Result<()> {
         _ => {}
     }
     if let Some((model, thinking)) = session.model_selection() {
-        if !args.model_explicit {
-            args.model = model;
-        }
-        if !args.thinking_explicit {
-            args.thinking = thinking;
-        }
+        args.restore_model_selection(model, thinking);
     }
     session.select_model(&args.model, args.thinking.as_deref())?;
     let runtime = runtime::configure(&args).await?;

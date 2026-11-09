@@ -322,3 +322,13 @@ unfinished imported calls remain uncertain and require reconciliation.
 Unsupported context-edit entries are rejected before publishing a destination.
 Full context-edit projection and remaining specialized message variants are
 still pending. Images currently appear as attachment notices in the terminal.
+
+### Model scope checkpoint
+
+`--list-models [search]` lists models from the configured endpoint, with fuzzy
+filtering and JSON output support. `--models` selects an ordered, deduplicated
+scope using exact IDs, case-insensitive globs or fuzzy matches. The terminal
+picker and cycling use that scope. Known thinking suffixes such as `:high` are
+separated from the model ID, while Ollama tags such as `:4b` remain intact.
+An explicit `--thinking` overrides the startup suffix. Cross-provider lookup
+and capability-aware thinking still await the provider catalog.
