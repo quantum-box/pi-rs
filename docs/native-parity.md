@@ -1914,3 +1914,16 @@ A loopback model and PTY verified custom instructions, common-ancestor
 exclusion, a tool-free request, atomic attachment, cancellation and terminal
 restoration. A second fixture covers a retryable HTTP 503 and cumulative file
 metadata. The journal test checks the summary's parent and branch replay.
+
+### Interactive model scope checkpoint
+
+`/scoped-models` opens the Ollama catalog and lets the user search, toggle and
+reorder the models used by Ctrl+P. Enter toggles a model. Ctrl+A and Ctrl+X
+operate on the current search results, and Ctrl+P within the picker toggles
+the provider. Changes apply immediately for the running session. Ctrl+S
+persists the ordered selection in `enabledModels`.
+
+The PTY fixture verified that changing the scope leaves the settings file
+alone until saving, preserves the chosen order for cycling, and selects the
+first configured model after restarting. Unavailable catalog entries and
+cross-provider selection remain separate work.

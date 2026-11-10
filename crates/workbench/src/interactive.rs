@@ -176,6 +176,18 @@ enum LocalEditor {
     BranchSummary(u64),
 }
 
+#[derive(Clone, Copy)]
+enum ModelListIntent {
+    Select,
+    Cycle { reverse: bool },
+    Scope,
+}
+
+struct ModelDiscovery {
+    receiver: std::sync::mpsc::Receiver<Result<Vec<String>>>,
+    intent: ModelListIntent,
+}
+
 #[derive(Default)]
 struct View {
     regular: RegularState,
@@ -191,10 +203,9 @@ struct View {
     picker: Option<Picker>,
     session_name: Option<String>,
     resources: super::resources::Resources,
-    model_list: Option<std::sync::mpsc::Receiver<Result<Vec<String>>>>,
+    model_list: Option<ModelDiscovery>,
     available_models: Vec<String>,
     pending_request: Option<Value>,
-    model_cycle: Option<bool>,
     thinking: String,
     expand_tools: bool,
     hide_thinking: bool,
@@ -1158,7 +1169,7 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /compact  /tree  /checkout <id>  /quit\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>> {
     let (name, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
@@ -1295,7 +1306,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             view.append("Copied last response");
         }
         "/share" => view.append(&sessions::share_gist(&Session::open(&args.session)?)?),
-        "/model" if rest.is_empty() => start_model_picker(args, view),
+        "/model" if rest.is_empty() => start_model_picker(args, view, ModelListIntent::Select),
+        "/scoped-models" => start_model_picker(args, view, ModelListIntent::Scope),
         "/model" => {
             let selected = super::model_selection::split(rest, &view.available_models)?;
             args.model = selected.model;
@@ -1693,44 +1705,56 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         {
             worker.take();
         }
-        if let Some(receiver) = &view.model_list {
-            match receiver.try_recv() {
+        if let Some(discovery) = &view.model_list {
+            let intent = discovery.intent;
+            match discovery.receiver.try_recv() {
                 Ok(Ok(models)) => {
                     view.model_list = None;
-                    view.available_models = models.clone();
                     if models.is_empty() {
-                        view.model_cycle = None;
                         view.append("No models available");
-                        dirty = true;
-                        continue;
-                    }
-                    if let Some(reverse) = view.model_cycle.take() {
-                        if let Err(error) = cycle_model(&mut args, &mut view, reverse) {
-                            view.append(&error.to_string());
-                        }
                     } else {
-                        view.picker = Some(Picker::new(
-                            "Select model",
-                            models
-                                .into_iter()
-                                .map(|model| Item {
-                                    label: model.clone(),
-                                    selection: Selection::Model(model),
-                                })
-                                .collect(),
-                        ));
+                        match intent {
+                            ModelListIntent::Scope => {
+                                let enabled = if args.model_scope.is_empty() {
+                                    models.clone()
+                                } else {
+                                    args.model_scope
+                                        .iter()
+                                        .map(|choice| choice.model.clone())
+                                        .collect()
+                                };
+                                view.picker = Some(Picker::scoped_models(models, enabled));
+                            }
+                            ModelListIntent::Cycle { reverse } => {
+                                view.available_models = models;
+                                if let Err(error) = cycle_model(&mut args, &mut view, reverse) {
+                                    view.append(&error.to_string());
+                                }
+                            }
+                            ModelListIntent::Select => {
+                                view.available_models = models.clone();
+                                view.picker = Some(Picker::new(
+                                    "Select model",
+                                    models
+                                        .into_iter()
+                                        .map(|model| Item {
+                                            label: model.clone(),
+                                            selection: Selection::Model(model),
+                                        })
+                                        .collect(),
+                                ));
+                            }
+                        }
                     }
                     dirty = true;
                 }
                 Ok(Err(error)) => {
                     view.model_list = None;
-                    view.model_cycle = None;
                     view.append(&error.to_string());
                     dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     view.model_list = None;
-                    view.model_cycle = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -1963,6 +1987,21 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             );
                             view.picker = Some(picker);
                         }
+                        Input::UpdateModelScope { save } => {
+                            if let Some((catalog, enabled)) = picker.model_scope() {
+                                let result = update_model_scope(
+                                    &mut args, &mut view, catalog, enabled, save,
+                                );
+                                if save {
+                                    picker.show_feedback(
+                                        result
+                                            .map(|()| "Model selection saved to settings".into())
+                                            .map_err(|error| error.to_string()),
+                                    );
+                                }
+                            }
+                            view.picker = Some(picker);
+                        }
                         Input::Save(selection) => {
                             let result = match selection {
                                 Selection::Model(model) => {
@@ -2125,7 +2164,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         view.regular.redraw = true;
                     }
                     "tui.input.tab" => complete_input(&args, &mut view),
-                    "app.model.select" if !is_busy(&worker) => start_model_picker(&args, &mut view),
+                    "app.model.select" if !is_busy(&worker) => {
+                        start_model_picker(&args, &mut view, ModelListIntent::Select)
+                    }
                     "tui.input.submit" | "app.message.followUp" => {
                         if view.branch_summary.is_some() {
                             continue;
@@ -2477,8 +2518,7 @@ fn apply_scoped_thinking(args: &mut Cli) {
 
 fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     if view.available_models.is_empty() {
-        view.model_cycle = Some(reverse);
-        start_model_picker(args, view);
+        start_model_picker(args, view, ModelListIntent::Cycle { reverse });
         return Ok(());
     }
     let index = view
@@ -2499,7 +2539,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     Ok(())
 }
 
-fn start_model_picker(args: &Cli, view: &mut View) {
+fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
     if view.model_list.is_some() {
         return;
     }
@@ -2514,7 +2554,7 @@ fn start_model_picker(args: &Cli, view: &mut View) {
                 .enable_all()
                 .build()?;
             let provider = provider.connect(&endpoint, token)?;
-            if scope.is_empty() {
+            if scope.is_empty() || matches!(intent, ModelListIntent::Scope) {
                 runtime.block_on(provider.models())
             } else {
                 Ok(scope.into_iter().map(|choice| choice.model).collect())
@@ -2522,8 +2562,59 @@ fn start_model_picker(args: &Cli, view: &mut View) {
         })();
         let _ = sender.send(result);
     });
-    view.model_list = Some(receiver);
+    view.model_list = Some(ModelDiscovery { receiver, intent });
     view.append("Loading available models…");
+}
+
+fn update_model_scope(
+    args: &mut Cli,
+    view: &mut View,
+    catalog: &[String],
+    enabled: &[String],
+    save: bool,
+) -> Result<()> {
+    let unrestricted = enabled.is_empty() || enabled.len() == catalog.len();
+    let scope: Vec<_> = if unrestricted {
+        Vec::new()
+    } else {
+        let previous: std::collections::HashMap<_, _> = args
+            .model_scope
+            .iter()
+            .map(|choice| (choice.model.as_str(), choice))
+            .collect();
+        enabled
+            .iter()
+            .map(|model| {
+                previous
+                    .get(model.as_str())
+                    .map(|&choice| choice.clone())
+                    .unwrap_or_else(|| super::model_selection::Choice {
+                        model: model.clone(),
+                        thinking: None,
+                    })
+            })
+            .collect()
+    };
+    if save {
+        let patterns: Vec<_> = scope
+            .iter()
+            .map(|choice| {
+                let id = format!("{}/{}", args.provider.id(), choice.model);
+                choice
+                    .thinking
+                    .as_ref()
+                    .map_or(id.clone(), |level| format!("{id}:{level}"))
+            })
+            .collect();
+        args.settings.set_user("enabledModels", json!(patterns))?;
+    }
+    args.model_scope = scope;
+    view.available_models = if unrestricted {
+        catalog.to_vec()
+    } else {
+        enabled.to_vec()
+    };
+    Ok(())
 }
 
 fn reopen_tree(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
@@ -2932,6 +3023,7 @@ fn complete_input(args: &Cli, view: &mut View) {
             "/resume",
             "/session",
             "/model",
+            "/scoped-models",
             "/compact",
             "/tree",
             "/checkout",

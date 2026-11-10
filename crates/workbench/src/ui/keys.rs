@@ -104,6 +104,12 @@ impl Keys {
             ("app.tree.filter.all", &["ctrl+a"]),
             ("app.tree.filter.cycleForward", &["ctrl+o"]),
             ("app.tree.filter.cycleBackward", &["ctrl+shift+o"]),
+            ("app.models.save", &["ctrl+s"]),
+            ("app.models.enableAll", &["ctrl+a"]),
+            ("app.models.clearAll", &["ctrl+x"]),
+            ("app.models.toggleProvider", &["ctrl+p"]),
+            ("app.models.reorderUp", &["alt+up"]),
+            ("app.models.reorderDown", &["alt+down"]),
             ("app.session.rename", &["ctrl+r"]),
             ("app.session.delete", &["ctrl+d"]),
             ("app.session.deleteNoninvasive", &["ctrl+backspace"]),
@@ -163,6 +169,7 @@ impl Keys {
             .iter()
             .find(|(action, keys)| {
                 if action.starts_with("app.tree.")
+                    || action.starts_with("app.models.")
                     || matches!(
                         action.as_str(),
                         "app.session.rename"

@@ -113,6 +113,12 @@ pub struct Picker {
     named_sessions: std::collections::HashSet<PathBuf>,
     session_documents: std::collections::BTreeMap<PathBuf, super::session_search::Document>,
     tree: Option<TreeState>,
+    model_scope: Option<ModelScope>,
+}
+
+struct ModelScope {
+    catalog: Vec<String>,
+    enabled: Vec<String>,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum SessionSort {
@@ -132,6 +138,7 @@ pub enum Input {
     Select(Selection),
     Save(Selection),
     CopyTreeRecord(u64),
+    UpdateModelScope { save: bool },
 }
 impl Picker {
     pub fn new(title: &str, items: Vec<Item>) -> Self {
@@ -150,8 +157,127 @@ impl Picker {
             named_sessions: Default::default(),
             session_documents: Default::default(),
             tree: None,
+            model_scope: None,
         }
     }
+    pub fn scoped_models(catalog: Vec<String>, mut enabled: Vec<String>) -> Self {
+        let available: std::collections::HashSet<_> = catalog.iter().collect();
+        enabled.retain(|model| available.contains(model));
+        let mut picker = Self {
+            model_scope: Some(ModelScope { catalog, enabled }),
+            ..Self::new("Model Configuration", vec![])
+        };
+        picker.refresh_model_scope(None);
+        picker
+    }
+
+    pub fn model_scope(&self) -> Option<(&[String], &[String])> {
+        self.model_scope
+            .as_ref()
+            .map(|scope| (scope.catalog.as_slice(), scope.enabled.as_slice()))
+    }
+
+    fn refresh_model_scope(&mut self, selected: Option<&str>) {
+        let scope = self.model_scope.as_ref().expect("model scope picker");
+        let enabled: std::collections::HashSet<_> = scope.enabled.iter().collect();
+        self.items = scope
+            .enabled
+            .iter()
+            .chain(
+                scope
+                    .catalog
+                    .iter()
+                    .filter(|model| !enabled.contains(model)),
+            )
+            .map(|model| Item {
+                label: format!(
+                    "{} {model} [ollama]",
+                    if enabled.contains(model) { "✓" } else { " " }
+                ),
+                selection: Selection::Model(model.clone()),
+            })
+            .collect();
+        let matches = self.matches();
+        self.selected = selected
+            .and_then(|selected| {
+                matches.iter().position(
+                    |item| matches!(&item.selection, Selection::Model(model) if model == selected),
+                )
+            })
+            .unwrap_or_else(|| self.selected.min(matches.len().saturating_sub(1)));
+    }
+
+    fn model_scope_input(&mut self, key: KeyEvent, keys: &super::keys::Keys) -> Option<Input> {
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !self.query.is_empty()
+        {
+            self.query.clear();
+            self.selected = 0;
+            return Some(Input::Continue);
+        }
+        if keys.matches("app.models.save", key) {
+            return Some(Input::UpdateModelScope { save: true });
+        }
+        let toggle = key.code == KeyCode::Enter;
+        let enable = keys.matches("app.models.enableAll", key);
+        let clear = keys.matches("app.models.clearAll", key);
+        let provider = keys.matches("app.models.toggleProvider", key);
+        let up = keys.matches("app.models.reorderUp", key);
+        let down = keys.matches("app.models.reorderDown", key);
+        if !(toggle || enable || clear || provider || up || down) {
+            return None;
+        }
+        let visible: Vec<_> = self
+            .matches()
+            .into_iter()
+            .filter_map(|item| match &item.selection {
+                Selection::Model(model) => Some(model.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = visible.get(self.selected);
+        let scope = self.model_scope.as_mut().expect("model scope picker");
+        if up || down {
+            if scope.enabled.len() != scope.catalog.len()
+                && let Some(index) =
+                    selected.and_then(|model| scope.enabled.iter().position(|id| id == model))
+            {
+                let neighbor = if up {
+                    index.checked_sub(1)
+                } else {
+                    Some(index + 1)
+                };
+                if let Some(neighbor) = neighbor.filter(|index| *index < scope.enabled.len()) {
+                    scope.enabled.swap(index, neighbor);
+                }
+            }
+        } else {
+            let targets = if toggle {
+                selected.into_iter().cloned().collect()
+            } else if provider {
+                scope.catalog.clone()
+            } else {
+                visible.clone()
+            };
+            let mut enabled: std::collections::HashSet<_> = scope.enabled.iter().cloned().collect();
+            if clear
+                || ((provider || toggle) && targets.iter().all(|model| enabled.contains(model)))
+            {
+                let targets: std::collections::HashSet<_> = targets.into_iter().collect();
+                scope.enabled.retain(|model| !targets.contains(model));
+            } else {
+                scope.enabled.extend(
+                    targets
+                        .into_iter()
+                        .filter(|model| enabled.insert(model.clone())),
+                );
+            }
+        }
+        self.refresh_model_scope(selected.map(String::as_str));
+        Some(Input::UpdateModelScope { save: false })
+    }
+
     pub fn show_feedback(&mut self, feedback: Result<String, String>) {
         self.feedback = Some(feedback);
     }
@@ -260,7 +386,7 @@ impl Picker {
                     return session_query.score(document).is_some();
                 }
                 let label = item.label.to_lowercase();
-                if self.active_session.is_some() {
+                if self.active_session.is_some() || self.model_scope.is_some() {
                     crate::model_selection::fuzzy(&query, &label)
                 } else {
                     label.contains(&query)
@@ -268,6 +394,7 @@ impl Picker {
             })
             .collect();
         if self.tree.is_none()
+            && self.model_scope.is_none()
             && self.session_sort != SessionSort::Recent
             && !query.trim().is_empty()
         {
@@ -315,6 +442,11 @@ impl Picker {
     }
     pub fn input(&mut self, key: KeyEvent, keys: &super::keys::Keys) -> Input {
         self.feedback = None;
+        if self.model_scope.is_some()
+            && let Some(input) = self.model_scope_input(key, keys)
+        {
+            return input;
+        }
         if let Some(action) = self.session_action.clone() {
             if key.code == KeyCode::Esc {
                 self.session_action = None;
@@ -743,6 +875,8 @@ impl Picker {
                     "Relevance · Ctrl+S threaded · Ctrl+R rename · Ctrl+D delete · Esc cancel"
                 }
             }
+        } else if self.model_scope.is_some() {
+            "Enter toggle · Alt+↑/↓ reorder · Ctrl+A enable · Ctrl+X clear · Ctrl+S save"
         } else if self.tree.is_some() {
             "Ctrl+O filter · Alt+←/→ navigate · Shift+L label · Ctrl+X copy · Enter checkout"
         } else {
@@ -996,6 +1130,31 @@ mod tests {
         assert_eq!(picker.selected, 1);
         picker.input(control('d'), &keys);
         assert_eq!(rows(&picker), [2, 4, 5]);
+    }
+
+    #[test]
+    fn scoped_models_reorder_and_filter_the_enabled_set() {
+        let catalog = ["alpha", "beta", "gamma"].map(str::to_owned).to_vec();
+        let mut picker = Picker::scoped_models(catalog.clone(), catalog);
+        let keys = super::super::keys::Keys::load().unwrap();
+        picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
+        assert_eq!(picker.model_scope().unwrap().1, ["beta", "gamma"]);
+        picker.query = "gam".into();
+        picker.selected = 0;
+        picker.input(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &keys);
+        assert_eq!(picker.model_scope().unwrap().1, ["gamma", "beta"]);
+        assert!(matches!(
+            picker.input(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &keys
+            ),
+            Input::UpdateModelScope { save: true }
+        ));
+        picker.input(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert_eq!(picker.model_scope().unwrap().1, ["beta"]);
     }
 
     #[test]
