@@ -1,10 +1,161 @@
 //! Model scopes and thinking suffixes shared by startup and terminal cycling.
 use pi_rs::{Error, Result};
 
+use super::{Cli, Provider};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Choice {
     pub model: String,
     pub thinking: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct ScopedChoice {
+    pub provider: Provider,
+    pub model: String,
+    pub thinking: Option<String>,
+}
+
+impl ScopedChoice {
+    pub fn qualified(&self) -> String {
+        format!("{}/{}", self.provider.id(), self.model)
+    }
+
+    pub fn pattern(&self) -> String {
+        let mut name = self.qualified();
+        if let Some(level) = &self.thinking {
+            name.push(':');
+            name.push_str(level);
+        }
+        name
+    }
+}
+
+pub fn qualified_model(value: &str) -> Option<(Provider, &str)> {
+    let (provider, model) = value.split_once('/')?;
+    Some((Provider::named(provider)?, model))
+}
+
+pub struct Catalog {
+    pub provider: Provider,
+    pub client: super::providers::Client,
+    pub models: Vec<String>,
+}
+
+pub async fn catalogs(args: &Cli, automatic: bool) -> Result<Vec<Catalog>> {
+    let providers = std::iter::once(args.provider).chain(
+        Provider::ALL
+            .into_iter()
+            .filter(|provider| *provider != args.provider),
+    );
+    let discovered = futures_util::future::join_all(providers.filter_map(|provider| {
+        let endpoint = args.endpoint_for(provider);
+        (!automatic || args.allow_endpoint_probes(endpoint)).then_some(async move {
+            let client = provider.connect(endpoint, args.model_token_for(provider, endpoint))?;
+            let models = client.models().await?;
+            Ok::<_, Error>(Catalog {
+                provider,
+                client,
+                models,
+            })
+        })
+    }))
+    .await;
+    let mut catalogs = Vec::new();
+    let mut first_error = None;
+    for entry in discovered {
+        match entry {
+            Ok(catalog) => catalogs.push(catalog),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if catalogs.is_empty()
+        && (!automatic || !args.offline)
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    Ok(catalogs)
+}
+
+pub fn scoped_choices<'a>(
+    patterns: impl IntoIterator<Item = &'a str>,
+    catalogs: &[Catalog],
+) -> (Vec<ScopedChoice>, Vec<String>) {
+    let mut selected: Vec<ScopedChoice> = Vec::new();
+    let mut warnings = Vec::new();
+    for pattern in patterns
+        .into_iter()
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+    {
+        let glob = pattern.contains(['*', '?', '[']);
+        let qualified = qualified_model(pattern)
+            .map(|(provider, _)| provider)
+            .or_else(|| {
+                if glob {
+                    return None;
+                }
+                catalogs
+                    .iter()
+                    .find(|catalog| {
+                        exact(pattern, &catalog.models, catalog.provider.id()).is_some()
+                            || thinking_suffix(pattern).is_some_and(|(model, _)| {
+                                exact(model, &catalog.models, catalog.provider.id()).is_some()
+                            })
+                    })
+                    .map(|catalog| catalog.provider)
+            });
+        let mut matched = false;
+        for catalog in catalogs
+            .iter()
+            .filter(|catalog| qualified.is_none_or(|provider| provider == catalog.provider))
+        {
+            let resolved = scope([pattern], &catalog.models, catalog.provider.id());
+            if resolved.choices.is_empty() {
+                continue;
+            }
+            matched = true;
+            warnings.extend(resolved.warnings);
+            for choice in resolved.choices {
+                if selected.iter().all(|existing| {
+                    existing.provider != catalog.provider || existing.model != choice.model
+                }) {
+                    selected.push(ScopedChoice {
+                        provider: catalog.provider,
+                        model: choice.model,
+                        thinking: choice.thinking,
+                    });
+                }
+            }
+            if !glob {
+                break;
+            }
+        }
+        if !matched {
+            warnings.push(format!("No models match pattern \"{pattern}\""));
+        }
+    }
+    (selected, warnings)
+}
+
+pub fn next_model(args: &Cli, available: &[ScopedChoice], reverse: bool) -> Option<ScopedChoice> {
+    let count = available.len();
+    if count == 0 {
+        return None;
+    }
+    let current = available
+        .iter()
+        .position(|model| model.provider == args.provider && model.model == args.model);
+    let next = match (current, reverse) {
+        (Some(index), true) => (index + count - 1) % count,
+        (Some(index), false) => (index + 1) % count,
+        (None, true) => count - 1,
+        (None, false) => 0,
+    };
+    Some(available[next].clone())
 }
 fn unqualified<'a>(value: &'a str, provider: &str) -> &'a str {
     let value = value.trim();
@@ -193,6 +344,52 @@ pub fn fuzzy(query: &str, value: &str) -> bool {
 mod tests {
     use super::{Choice, Scope};
 
+    #[test]
+    fn scope_keeps_provider_identity_and_pattern_order() {
+        use super::{Catalog, Provider, scoped_choices};
+        let catalogs = [
+            Catalog {
+                provider: Provider::Ollama,
+                client: Provider::Ollama
+                    .connect(Provider::Ollama.default_endpoint(), None)
+                    .unwrap(),
+                models: vec!["same".into(), "exact-extra".into()],
+            },
+            Catalog {
+                provider: Provider::Anthropic,
+                client: Provider::Anthropic
+                    .connect(
+                        Provider::Anthropic.default_endpoint(),
+                        Some("fixture".into()),
+                    )
+                    .unwrap(),
+                models: vec!["same".into(), "exact".into()],
+            },
+        ];
+        let (choices, warnings) = scoped_choices(
+            [
+                "anthropic/same:high",
+                "ollama/same:off",
+                "exact",
+                "ollama/*",
+            ],
+            &catalogs,
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(
+            choices
+                .iter()
+                .map(super::ScopedChoice::pattern)
+                .collect::<Vec<_>>(),
+            [
+                "anthropic/same:high",
+                "ollama/same:off",
+                "anthropic/exact",
+                "ollama/exact-extra"
+            ]
+        );
+    }
+
     fn split(value: &str, available: &[String]) -> pi_rs::Result<Choice> {
         super::split(value, available, "ollama")
     }
@@ -312,7 +509,8 @@ mod tests {
     fn restored_sessions_stay_inside_the_requested_scope() {
         use clap::Parser;
         let mut args = super::super::Cli::try_parse_from(["pi"]).unwrap();
-        args.model_scope = vec![Choice {
+        args.model_scope = vec![super::ScopedChoice {
+            provider: super::Provider::Ollama,
             model: "beta:4b".into(),
             thinking: Some("high".into()),
         }];

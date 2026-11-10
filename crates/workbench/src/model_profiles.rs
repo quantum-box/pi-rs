@@ -167,14 +167,15 @@ mod tests {
         args.endpoint = args.model_profiles.endpoint(Provider::Ollama).into();
         args.initial_connection = Some((Provider::Ollama, args.endpoint.clone()));
         args.model_scope
-            .push(super::super::model_selection::Choice {
+            .push(super::super::model_selection::ScopedChoice {
+                provider: Provider::Ollama,
                 model: "local-scoped".into(),
                 thinking: None,
             });
         assert_eq!(args.endpoint, "http://127.0.0.1:7000/v1/chat/completions");
         assert_eq!(args.model_token().as_deref(), Some("local-override"));
         args.activate_provider(Provider::Anthropic).unwrap();
-        assert!(args.model_scope.is_empty());
+        assert_eq!(args.model_scope[0].provider.id(), "ollama");
         assert_eq!(args.endpoint, "http://127.0.0.1:7001/v1/messages");
         assert_eq!(args.model_token().as_deref(), Some("anthropic-profile"));
         assert!(
@@ -184,5 +185,9 @@ mod tests {
         args.activate_provider(Provider::Ollama).unwrap();
         assert_eq!(args.model_scope[0].model, "local-scoped");
         assert_eq!(args.model_token().as_deref(), Some("local-override"));
+        args.model = "local-scoped".into();
+        args.restore_model_selection("outside-scope".into(), None, Some("anthropic"));
+        assert_eq!(args.provider.id(), "ollama");
+        assert_eq!(args.model, "local-scoped");
     }
 }

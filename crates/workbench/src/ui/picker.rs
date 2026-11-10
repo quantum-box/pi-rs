@@ -200,13 +200,18 @@ impl Picker {
                     .iter()
                     .filter(|model| !enabled.contains(model)),
             )
-            .map(|model| Item {
-                label: format!(
-                    "{} {model} [{}]",
-                    if enabled.contains(model) { "✓" } else { " " },
-                    scope.provider
-                ),
-                selection: Selection::Model(model.clone()),
+            .map(|model| {
+                let (id, provider) = crate::model_selection::qualified_model(model)
+                    .map_or((model.as_str(), scope.provider), |(provider, id)| {
+                        (id, provider.id())
+                    });
+                Item {
+                    label: format!(
+                        "{} {id} [{provider}]",
+                        if enabled.contains(model) { "✓" } else { " " }
+                    ),
+                    selection: Selection::Model(model.clone()),
+                }
             })
             .collect();
         let matches = self.matches();
@@ -251,9 +256,8 @@ impl Picker {
         let selected = visible.get(self.selected);
         let scope = self.model_scope.as_mut().expect("model scope picker");
         if up || down {
-            if scope.enabled.len() != scope.catalog.len()
-                && let Some(index) =
-                    selected.and_then(|model| scope.enabled.iter().position(|id| id == model))
+            if let Some(index) =
+                selected.and_then(|model| scope.enabled.iter().position(|id| id == model))
             {
                 let neighbor = if up {
                     index.checked_sub(1)
@@ -268,7 +272,19 @@ impl Picker {
             let targets = if toggle {
                 selected.into_iter().cloned().collect()
             } else if provider {
-                scope.catalog.clone()
+                let provider_id = |model: &str| {
+                    crate::model_selection::qualified_model(model)
+                        .map_or(scope.provider, |(provider, _)| provider.id())
+                };
+                selected.map_or_else(Vec::new, |model| {
+                    let selected_provider = provider_id(model);
+                    scope
+                        .catalog
+                        .iter()
+                        .filter(|model| provider_id(model) == selected_provider)
+                        .cloned()
+                        .collect()
+                })
             } else {
                 visible.clone()
             };

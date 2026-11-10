@@ -75,9 +75,7 @@ struct Cli {
     #[arg(skip)]
     theme_paths: Vec<PathBuf>,
     #[arg(skip)]
-    model_scope: Vec<model_selection::Choice>,
-    #[arg(skip)]
-    inactive_model_scopes: std::collections::BTreeMap<&'static str, Vec<model_selection::Choice>>,
+    model_scope: Vec<model_selection::ScopedChoice>,
     #[arg(skip)]
     trusted: bool,
     #[arg(skip)]
@@ -274,8 +272,12 @@ struct Cli {
 
 impl Cli {
     fn allow_model_probes(&self) -> bool {
+        self.allow_endpoint_probes(&self.endpoint)
+    }
+
+    fn allow_endpoint_probes(&self, endpoint: &str) -> bool {
         !self.offline
-            || reqwest::Url::parse(&self.endpoint).ok().is_some_and(|url| {
+            || reqwest::Url::parse(endpoint).ok().is_some_and(|url| {
                 matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
             })
     }
@@ -322,12 +324,6 @@ impl Cli {
         }
         let endpoint = self.endpoint_for(provider).to_owned();
         provider.connect(&endpoint, self.model_token_for(provider, &endpoint))?;
-        self.inactive_model_scopes
-            .insert(self.provider.id(), std::mem::take(&mut self.model_scope));
-        self.model_scope = self
-            .inactive_model_scopes
-            .remove(provider.id())
-            .unwrap_or_default();
         self.provider = provider;
         self.endpoint = endpoint;
         self.thinking_profile = None;
@@ -381,7 +377,7 @@ impl Cli {
         self.thinking = self
             .model_scope
             .iter()
-            .find(|choice| choice.model == self.model)
+            .find(|choice| choice.provider == self.provider && choice.model == self.model)
             .and_then(|choice| choice.thinking.clone())
             .or_else(|| {
                 self.settings
@@ -411,24 +407,27 @@ impl Cli {
         let Some(provider) = Provider::named(provider.unwrap_or("ollama")) else {
             return;
         };
+        let in_scope = self.model_scope.is_empty()
+            || self
+                .model_scope
+                .iter()
+                .any(|choice| choice.provider == provider && choice.model == model);
         if provider != self.provider
             && (self.model_explicit
                 || self.connection_explicit
+                || !in_scope
                 || self.activate_provider(provider).is_err())
         {
             return;
         }
-        if !self.model_explicit
-            && (self.model_scope.is_empty()
-                || self.model_scope.iter().any(|choice| choice.model == model))
-        {
+        if !self.model_explicit && in_scope {
             self.model = model.clone();
         }
         if !self.thinking_explicit {
             self.thinking = self
                 .model_scope
                 .iter()
-                .find(|choice| choice.model == self.model)
+                .find(|choice| choice.provider == self.provider && choice.model == self.model)
                 .and_then(|choice| choice.thinking.clone())
                 .or_else(|| (self.model == model).then_some(thinking).flatten())
                 .or_else(|| {
@@ -726,46 +725,64 @@ async fn execute(mut args: Cli) -> Result<()> {
                     | Command::Review { .. }
             )
         );
-    let available = if args.allow_model_probes()
-        && (needs_default_model || patterns.iter().any(|pattern| !pattern.trim().is_empty()))
-    {
-        args.provider
-            .connect(&args.endpoint, args.model_token())?
-            .models()
-            .await?
+    let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
+    let catalogs = if has_patterns {
+        model_selection::catalogs(&args, true).await?
+    } else if needs_default_model && args.allow_model_probes() {
+        let client = args.provider.connect(&args.endpoint, args.model_token())?;
+        let models = client.models().await?;
+        vec![model_selection::Catalog {
+            provider: args.provider,
+            client,
+            models,
+        }]
     } else {
         Vec::new()
     };
-    if needs_default_model {
-        args.model = available.first().cloned().ok_or_else(|| {
-            Error::Config("no model is available for the selected provider; pass --model".into())
-        })?;
-    }
+    let available = catalogs
+        .iter()
+        .find(|catalog| catalog.provider == args.provider)
+        .map_or(&[][..], |catalog| catalog.models.as_slice());
     // The hidden worker command receives an already-resolved, literal model ID.
     if !args.model.is_empty() && !matches!(args.command, Some(Command::Serve)) {
-        let selected = model_selection::split(&args.model, &available, args.provider.id())?;
+        let selected = model_selection::split(&args.model, available, args.provider.id())?;
         args.model = selected.model;
         if !args.thinking_explicit && selected.thinking.is_some() {
             args.thinking = selected.thinking;
             args.thinking_explicit = true;
         }
     }
-    let scope = model_selection::scope(patterns, &available, args.provider.id());
-    for warning in scope.warnings {
+    let (scope, warnings) = model_selection::scoped_choices(patterns, &catalogs);
+    for warning in warnings {
         eprintln!("Warning: {warning}");
     }
-    args.model_scope = scope.choices;
-    if !args.model_explicit
-        && let Some(choice) = args
+    args.model_scope = scope;
+    if !args.model_explicit {
+        let selected = args
             .model_scope
             .iter()
-            .find(|choice| choice.model == args.model)
-            .or_else(|| args.model_scope.first())
-    {
-        args.model = choice.model.clone();
-        if !args.thinking_explicit && choice.thinking.is_some() {
-            args.thinking = choice.thinking.clone();
+            .find(|choice| choice.provider == args.provider && choice.model == args.model)
+            .or_else(|| {
+                args.model_scope
+                    .iter()
+                    .find(|choice| !args.connection_explicit || choice.provider == args.provider)
+            })
+            .cloned();
+        if let Some(choice) = selected {
+            let previous_thinking = args.thinking.clone();
+            args.activate_provider(choice.provider)?;
+            args.model = choice.model;
+            if args.thinking_explicit {
+                args.thinking = previous_thinking;
+            } else if choice.thinking.is_some() {
+                args.thinking = choice.thinking;
+            }
         }
+    }
+    if needs_default_model && args.model.is_empty() {
+        args.model = available.first().cloned().ok_or_else(|| {
+            Error::Config("no model is available for the selected provider; pass --model".into())
+        })?;
     }
 
     if !args.thinking_explicit {

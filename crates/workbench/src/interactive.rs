@@ -187,7 +187,6 @@ enum ModelListIntent {
 struct ModelDiscovery {
     receiver: std::sync::mpsc::Receiver<Result<Vec<String>>>,
     intent: ModelListIntent,
-    provider: super::Provider,
 }
 
 #[derive(Default)]
@@ -531,10 +530,7 @@ impl View {
             let scope = args
                 .model_scope
                 .iter()
-                .map(|choice| match &choice.thinking {
-                    Some(level) => format!("{}:{level}", choice.model),
-                    None => choice.model.clone(),
-                })
+                .map(super::model_selection::ScopedChoice::pattern)
                 .collect::<Vec<_>>()
                 .join(", ");
             self.append(&format!("Models in scope · {scope}"));
@@ -1762,13 +1758,10 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         }
         if let Some(discovery) = &view.model_list {
             let intent = discovery.intent;
-            let provider = discovery.provider;
             match discovery.receiver.try_recv() {
                 Ok(Ok(models)) => {
                     view.model_list = None;
-                    if provider != args.provider && !matches!(intent, ModelListIntent::Select) {
-                        // The active provider changed while the scoped catalog was loading.
-                    } else if models.is_empty() {
+                    if models.is_empty() {
                         view.append("No models available");
                     } else {
                         match intent {
@@ -1778,7 +1771,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 } else {
                                     args.model_scope
                                         .iter()
-                                        .map(|choice| choice.model.clone())
+                                        .map(super::model_selection::ScopedChoice::qualified)
                                         .collect()
                                 };
                                 view.picker = Some(Picker::scoped_models(
@@ -1794,13 +1787,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 }
                             }
                             ModelListIntent::Select => {
-                                let prefix = format!("{}/", args.provider.id());
-                                view.available_models = models
-                                    .iter()
-                                    .filter_map(|model| {
-                                        model.strip_prefix(&prefix).map(str::to_owned)
-                                    })
-                                    .collect();
+                                view.available_models = models.clone();
                                 view.picker = Some(Picker::new(
                                     "Select model",
                                     models
@@ -2623,10 +2610,6 @@ fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Res
     Worker::submit(worker, args, request)
 }
 
-fn apply_scoped_thinking(args: &mut Cli) {
-    args.apply_model_thinking_defaults();
-}
-
 fn edit_provider_key(provider: super::Provider, view: &mut View) {
     view.local_editor = Some((
         LocalEditor::ProviderKey(provider),
@@ -2650,44 +2633,44 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
 }
 
 fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
-    let provider = input
-        .split_once('/')
-        .and_then(|(prefix, _)| super::Provider::named(prefix))
-        .unwrap_or(args.provider);
-    let changing_provider = provider != args.provider;
-    let available = if changing_provider {
-        &[][..]
-    } else {
-        view.available_models.as_slice()
-    };
-    let selected = super::model_selection::split(input, available, provider.id())?;
-    args.change_model(provider, selected.model, selected.thinking)?;
-    if changing_provider {
-        view.available_models.clear();
-    }
-    Ok(())
+    let provider = super::model_selection::qualified_model(input)
+        .map_or(args.provider, |(provider, _)| provider);
+    let available = view
+        .available_models
+        .iter()
+        .filter_map(|model| super::model_selection::qualified_model(model))
+        .filter(|(candidate, _)| *candidate == provider)
+        .map(|(_, model)| model.to_owned())
+        .collect::<Vec<_>>();
+    let selected = super::model_selection::split(input, &available, provider.id())?;
+    args.change_model(provider, selected.model, selected.thinking)
 }
 
 fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
-    if view.available_models.is_empty() {
-        start_model_picker(args, view, ModelListIntent::Cycle { reverse });
-        return Ok(());
-    }
-    let index = view
-        .available_models
-        .iter()
-        .position(|model| model == &args.model);
-    let count = view.available_models.len();
-    let next = match (index, reverse) {
-        (Some(index), true) => (index + count - 1) % count,
-        (Some(index), false) => (index + 1) % count,
-        (None, true) => count - 1,
-        (None, false) => 0,
+    use super::model_selection::{ScopedChoice, next_model, qualified_model};
+    let discovered;
+    let choices = if args.model_scope.is_empty() {
+        if view.available_models.is_empty() {
+            start_model_picker(args, view, ModelListIntent::Cycle { reverse });
+            return Ok(());
+        }
+        discovered = view
+            .available_models
+            .iter()
+            .filter_map(|model| qualified_model(model))
+            .map(|(provider, model)| ScopedChoice {
+                provider,
+                model: model.to_owned(),
+                thinking: None,
+            })
+            .collect::<Vec<_>>();
+        discovered.as_slice()
+    } else {
+        args.model_scope.as_slice()
     };
-    args.model = view.available_models[next].clone();
-    apply_scoped_thinking(args);
-    super::thinking::adjust(args);
-    args.record_model_selection(&mut Session::open(&args.session)?)?;
+    if let Some(choice) = next_model(args, choices, reverse) {
+        args.change_model(choice.provider, choice.model, choice.thinking)?;
+    }
     Ok(())
 }
 
@@ -2696,70 +2679,27 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
         return;
     }
     let args = args.clone();
-    let provider = args.provider;
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            if matches!(intent, ModelListIntent::Select) {
-                runtime.block_on(model_picker_catalog(&args))
-            } else if args.model_scope.is_empty() || matches!(intent, ModelListIntent::Scope) {
-                let provider = provider.connect(&args.endpoint, args.model_token())?;
-                runtime.block_on(provider.models())
-            } else {
-                Ok(args
-                    .model_scope
-                    .into_iter()
-                    .map(|choice| choice.model)
-                    .collect())
-            }
+            let catalogs = runtime.block_on(super::model_selection::catalogs(&args, false))?;
+            Ok(catalogs
+                .into_iter()
+                .flat_map(|catalog| {
+                    catalog
+                        .models
+                        .into_iter()
+                        .map(move |model| format!("{}/{model}", catalog.provider.id()))
+                })
+                .collect())
         })();
         let _ = sender.send(result);
     });
-    view.model_list = Some(ModelDiscovery {
-        receiver,
-        intent,
-        provider,
-    });
+    view.model_list = Some(ModelDiscovery { receiver, intent });
     view.append("Loading available models…");
-}
-
-async fn model_picker_catalog(args: &Cli) -> Result<Vec<String>> {
-    use super::Provider;
-    let catalog = |provider: Provider| async move {
-        let endpoint = args.endpoint_for(provider);
-        let client = provider.connect(endpoint, args.model_token_for(provider, endpoint))?;
-        let models = client.models().await?;
-        Ok::<_, Error>(
-            models
-                .into_iter()
-                .map(|model| format!("{}/{model}", provider.id()))
-                .collect::<Vec<_>>(),
-        )
-    };
-    let alternate = Provider::ALL
-        .into_iter()
-        .filter(|provider| *provider != args.provider)
-        .map(catalog);
-    let (active, alternates) = tokio::join!(
-        catalog(args.provider),
-        futures_util::future::join_all(alternate)
-    );
-    let alternates: Vec<_> = alternates
-        .into_iter()
-        .filter_map(Result::ok)
-        .flatten()
-        .collect();
-    match active {
-        Ok(mut active) => {
-            active.extend(alternates);
-            Ok(active)
-        }
-        Err(_) if !alternates.is_empty() => Ok(alternates),
-        Err(error) => Err(error),
-    }
 }
 
 fn update_model_scope(
@@ -2769,47 +2709,42 @@ fn update_model_scope(
     enabled: &[String],
     save: bool,
 ) -> Result<()> {
-    let unrestricted = enabled.is_empty() || enabled.len() == catalog.len();
+    use super::model_selection::{ScopedChoice, qualified_model};
+    let unrestricted = enabled.is_empty()
+        || (enabled == catalog
+            && args
+                .model_scope
+                .iter()
+                .all(|choice| choice.thinking.is_none()));
     let scope: Vec<_> = if unrestricted {
         Vec::new()
     } else {
         let previous: std::collections::HashMap<_, _> = args
             .model_scope
             .iter()
-            .map(|choice| (choice.model.as_str(), choice))
+            .map(|choice| (choice.qualified(), choice))
             .collect();
         enabled
             .iter()
-            .map(|model| {
-                previous
-                    .get(model.as_str())
-                    .map(|&choice| choice.clone())
-                    .unwrap_or_else(|| super::model_selection::Choice {
-                        model: model.clone(),
+            .filter_map(|key| {
+                let (provider, model) = qualified_model(key)?;
+                Some(previous.get(key).map_or_else(
+                    || ScopedChoice {
+                        provider,
+                        model: model.into(),
                         thinking: None,
-                    })
+                    },
+                    |choice| (*choice).clone(),
+                ))
             })
             .collect()
     };
     if save {
-        let patterns: Vec<_> = scope
-            .iter()
-            .map(|choice| {
-                let id = format!("{}/{}", args.provider.id(), choice.model);
-                choice
-                    .thinking
-                    .as_ref()
-                    .map_or(id.clone(), |level| format!("{id}:{level}"))
-            })
-            .collect();
+        let patterns: Vec<_> = scope.iter().map(ScopedChoice::pattern).collect();
         args.settings.set_user("enabledModels", json!(patterns))?;
     }
     args.model_scope = scope;
-    view.available_models = if unrestricted {
-        catalog.to_vec()
-    } else {
-        enabled.to_vec()
-    };
+    view.available_models = catalog.to_vec();
     Ok(())
 }
 

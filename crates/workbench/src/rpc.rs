@@ -401,31 +401,15 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         }
 
         "get_available_models" => {
-            let (models, details) = available_models(args, true)?;
-            let models: Vec<_> = models
-                .iter()
-                .map(|model| {
-                    super::model_listing::with_details(
-                        model_value(args.provider, model),
-                        details.get(model),
-                    )
-                })
-                .collect();
+            let (_, models) = available_models(args, true)?;
             Ok(Some(json!({"models":models})))
         }
         "cycle_model" if !busy(worker) => {
             let (available, _) = available_models(args, false)?;
-            if available.is_empty() {
+            let Some(next) = super::model_selection::next_model(args, &available, false) else {
                 return Ok(Some(Value::Null));
-            }
-            let next = available
-                .iter()
-                .position(|model| *model == args.model)
-                .map_or(0, |index| (index + 1) % available.len());
-            args.model = available[next].clone();
-            args.apply_model_thinking_defaults();
-            super::thinking::adjust(args);
-            args.record_model_selection(&mut Session::open(&args.session)?)?;
+            };
+            args.change_model(next.provider, next.model, next.thinking)?;
             Ok(Some(
                 json!({"model":model_value(args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
             ))
@@ -682,37 +666,51 @@ fn model_value(provider: super::Provider, model: &str) -> Value {
     json!({"id":model,"name":model,"provider":provider.id()})
 }
 
-type CatalogDetails = std::collections::BTreeMap<String, pi_rs::ollama::ModelDetails>;
-
-fn available_models(args: &Cli, include_details: bool) -> Result<(Vec<String>, CatalogDetails)> {
-    let scope: Vec<_> = args
-        .model_scope
-        .iter()
-        .map(|choice| choice.model.clone())
-        .collect();
-    if !include_details && !scope.is_empty() {
-        return Ok((scope, CatalogDetails::new()));
+fn available_models(
+    args: &Cli,
+    include_details: bool,
+) -> Result<(Vec<super::model_selection::ScopedChoice>, Vec<Value>)> {
+    use super::model_selection::ScopedChoice;
+    if !include_details && !args.model_scope.is_empty() {
+        return Ok((args.model_scope.clone(), Vec::new()));
     }
-    let provider = args.provider;
-    let endpoint = args.endpoint.clone();
-    let token = args.model_token();
+    let args = args.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            let provider = provider.connect(&endpoint, token)?;
-            let models = if scope.is_empty() {
-                provider.models().await?
-            } else {
-                scope
-            };
-            let details = if include_details {
-                provider.model_details(&models).await
-            } else {
-                CatalogDetails::new()
-            };
-            Ok((models, details))
+            let mut catalogs = super::model_selection::catalogs(&args, false).await?;
+            if !include_details {
+                catalogs.sort_by_key(|catalog| {
+                    super::Provider::ALL
+                        .iter()
+                        .position(|provider| *provider == catalog.provider)
+                });
+            }
+            let mut choices = Vec::new();
+            let mut rows = Vec::new();
+            for catalog in catalogs {
+                let details = if include_details {
+                    catalog.client.model_details(&catalog.models).await
+                } else {
+                    Default::default()
+                };
+                for model in catalog.models {
+                    if include_details {
+                        rows.push(super::model_listing::with_details(
+                            model_value(catalog.provider, &model),
+                            details.get(&model),
+                        ));
+                    }
+                    choices.push(ScopedChoice {
+                        provider: catalog.provider,
+                        model,
+                        thinking: None,
+                    });
+                }
+            }
+            Ok((choices, rows))
         })
     })
     .join()
@@ -1118,11 +1116,13 @@ mod tests {
         args.session = root.path().join("thinking.jsonl");
         args.endpoint = "http://127.0.0.1:9/chat/completions".into();
         args.model_scope = vec![
-            crate::model_selection::Choice {
+            crate::model_selection::ScopedChoice {
+                provider: super::super::Provider::Ollama,
                 model: "a".into(),
                 thinking: Some("low".into()),
             },
-            crate::model_selection::Choice {
+            crate::model_selection::ScopedChoice {
+                provider: super::super::Provider::Ollama,
                 model: "b".into(),
                 thinking: Some("high".into()),
             },
