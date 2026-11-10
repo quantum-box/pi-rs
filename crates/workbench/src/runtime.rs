@@ -325,7 +325,9 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         registry.set_refresher(catalog.clone());
         let show_reasoning = args.trace;
         let provider = reasoning_effort(
-            args.provider.connect(&args.endpoint, args.model_token())?,
+            args.provider
+                .connect(&args.endpoint, args.model_token())?
+                .with_native_probes(args.allow_model_probes()),
             args.thinking.as_deref(),
             super::thinking::reported(args).is_some(),
         )

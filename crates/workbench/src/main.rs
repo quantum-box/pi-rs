@@ -180,6 +180,9 @@ struct Cli {
     /// Disable MCP server connections for this run.
     #[arg(long, global = true)]
     no_mcp: bool,
+    /// Skip automatic remote catalog and package downloads.
+    #[arg(long, global = true)]
+    offline: bool,
     /// Enable local read, write, edit, bash, grep, find, and ls tools.
     #[arg(long, global = true)]
     coding_tools: bool,
@@ -252,6 +255,13 @@ struct Cli {
 }
 
 impl Cli {
+    fn allow_model_probes(&self) -> bool {
+        !self.offline
+            || reqwest::Url::parse(&self.endpoint).ok().is_some_and(|url| {
+                matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+            })
+    }
+
     fn tool_timeout(&self) -> Duration {
         Duration::from_secs(self.tool_timeout_secs.unwrap_or(2_147_483))
     }
@@ -433,6 +443,12 @@ async fn main() {
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        args.offline |= std::env::var("PI_OFFLINE").ok().is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        });
         args.model_explicit =
             matches.value_source("model") == Some(clap::parser::ValueSource::CommandLine);
         args.thinking_explicit =
@@ -534,14 +550,15 @@ async fn execute(mut args: Cli) -> Result<()> {
     if let Some(search) = &args.list_models {
         return model_listing::list(&args, search).await;
     }
-    let available = if patterns.iter().any(|pattern| !pattern.trim().is_empty()) {
-        args.provider
-            .connect(&args.endpoint, args.model_token())?
-            .models()
-            .await?
-    } else {
-        Vec::new()
-    };
+    let available =
+        if args.allow_model_probes() && patterns.iter().any(|pattern| !pattern.trim().is_empty()) {
+            args.provider
+                .connect(&args.endpoint, args.model_token())?
+                .models()
+                .await?
+        } else {
+            Vec::new()
+        };
     // The hidden worker command receives an already-resolved, literal model ID.
     if !matches!(args.command, Some(Command::Serve)) {
         let selected = model_selection::split(&args.model, &available)?;

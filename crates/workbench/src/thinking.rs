@@ -16,6 +16,9 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if let Some(levels) = reported(args) {
         return levels.to_vec();
     }
+    if !args.allow_model_probes() {
+        return LEVELS.iter().map(|level| (*level).into()).collect();
+    }
     let model = args.model.clone();
     let provider = args.provider;
     let endpoint = args.endpoint.clone();

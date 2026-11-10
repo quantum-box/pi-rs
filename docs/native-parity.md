@@ -14,17 +14,17 @@ remaining acceptance work for that surface.
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
-| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, text/image clipboard paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
+| Terminal | Default `pi` startup, Unicode multiline editor and kill ring, text/image clipboard paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, Radius sharing |
-| Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
+| Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, Ollama capability-aware thinking levels, agent retry configuration | Full provider catalog, provider-native adapters and thinking capabilities for additional providers |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands | Interactive scope upgrades and push-notification optimization |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
-| Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and Unix terminal appearance notifications | Windows appearance notifications and remaining palette synchronization |
+| Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
@@ -1868,3 +1868,21 @@ Both defaults can be changed in `/settings`. The native `all` view includes
 journal bookkeeping. A PTY fixture exercised all three interrupt settings,
 filter shortcuts and settings persistence, and the existing branch navigation
 fixture verified folding, label editing, checkout and terminal restoration.
+
+### Offline startup and native package update checkpoint
+
+`pi update --extensions` reconciles configured native packages, and
+`pi update <source>` still updates a single source. `--offline` and
+`PI_OFFLINE=1` suppress automatic Cargo registry and Git package downloads,
+including refreshes of temporary packages, and reuse the installed resources.
+Uncached remote packages are skipped with a diagnostic. Local packages can
+build with Cargo's offline dependency resolution.
+
+Offline startup also skips automatic model catalog and capability probes for a
+remote endpoint. Loopback Ollama discovery, explicit model listing and model
+requests remain available. Remote wildcard model scopes fall back when a
+catalog is unavailable.
+
+A fixture verified the update flag, cached Git resource loading and skipped
+uncached installations with a sentinel Git executable. It also verified RPC
+startup without a remote catalog and model listing against local Ollama.

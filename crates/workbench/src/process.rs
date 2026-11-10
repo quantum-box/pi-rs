@@ -93,6 +93,7 @@ impl Worker {
             (args.no_prompt_templates, "--no-prompt-templates"),
             (args.no_context_files, "--no-context-files"),
             (args.no_mcp, "--no-mcp"),
+            (args.offline, "--offline"),
         ] {
             if disabled {
                 command.arg(flag);

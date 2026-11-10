@@ -22,6 +22,7 @@ pub struct Ollama {
     endpoint: Url,
     token: Option<String>,
     reasoning_effort: Option<String>,
+    native_probes: bool,
     progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -93,9 +94,16 @@ impl Ollama {
             endpoint,
             token,
             reasoning_effort: None,
+            native_probes: true,
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Enable or suppress auxiliary native endpoint probes.
+    pub fn with_native_probes(mut self, enabled: bool) -> Self {
+        self.native_probes = enabled;
+        self
     }
 
     /// Override provider thinking effort. None preserves the model default.
@@ -220,6 +228,9 @@ impl Ollama {
     }
 
     fn native_endpoint(&self, operation: &str) -> Option<Url> {
+        if !self.native_probes {
+            return None;
+        }
         let prefix = self.endpoint.path().strip_suffix("/v1/chat/completions")?;
         let mut endpoint = self.endpoint.clone();
         endpoint.set_path(&format!("{prefix}/api/{operation}"));

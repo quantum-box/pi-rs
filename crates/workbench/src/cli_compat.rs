@@ -132,6 +132,21 @@ mod tests {
     }
 
     #[test]
+    fn package_update_and_global_extension_flags_do_not_share_an_argument() {
+        use super::super::{Command, packages::PackageCommand};
+
+        let args = cli(&["pi", "-e", "local-extension", "update", "--extensions"]);
+        assert_eq!(args.extensions, ["local-extension"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Package(PackageCommand::Update {
+                source: None,
+                update_extensions: true,
+            }))
+        ));
+    }
+
+    #[test]
     fn both_version_flags_print_the_version() {
         for flag in ["-v", "-V", "--version"] {
             let result = parse(["pi", flag].into_iter().map(OsString::from));

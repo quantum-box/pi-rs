@@ -27,6 +27,9 @@ pub enum PackageCommand {
     },
     Update {
         source: Option<String>,
+        /// Reconcile every configured native package.
+        #[arg(long = "extensions", conflicts_with = "source")]
+        update_extensions: bool,
     },
     List,
     InitExtension {
@@ -64,7 +67,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
     match command {
         PackageCommand::Install { source, local } => {
             let source = normalize(&source, &args.workspace)?;
-            install(&source).await?;
+            install(&source, args.offline).await?;
             let settings = if local {
                 args.workspace.join(".pi/settings.json")
             } else {
@@ -118,7 +121,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
             })?;
             output(json!({"type":"package_removed","source":target}));
         }
-        PackageCommand::Update { source } => {
+        PackageCommand::Update { source, .. } => {
             let requested = source
                 .map(|source| normalize(&source, &args.workspace))
                 .transpose()?;
@@ -134,7 +137,7 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
                 if requested.as_ref().is_none_or(|requested| {
                     source_identity(requested) == source_identity(&declaration.source)
                 }) {
-                    install(&declaration.source).await?;
+                    install(&declaration.source, args.offline).await?;
                     output(json!({"type":"package_updated","source":declaration.source}));
                 }
             }
@@ -161,9 +164,15 @@ pub async fn prepare(args: &Cli) -> Result<()> {
     let mut installed = index()?;
     for declaration in declarations(args)? {
         let cached = installed.contains_key(&key(&declaration.source));
+        if args.offline && remote(&declaration.source) {
+            if !cached {
+                eprintln!("Package {}: skipped in offline mode", declaration.source);
+            }
+            continue;
+        }
         if declaration.transient || !cached {
             eprintln!("Preparing native package {}", declaration.source);
-            match install(&declaration.source).await {
+            match install(&declaration.source, args.offline).await {
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
@@ -578,8 +587,17 @@ fn index() -> Result<serde_json::Map<String, Value>> {
     )
 }
 
-async fn install(source: &str) -> Result<Installed> {
-    if !source.starts_with("cargo:") && !source.starts_with("git:") && !Path::new(source).exists() {
+fn remote(source: &str) -> bool {
+    source.starts_with("cargo:") || source.starts_with("git:")
+}
+
+async fn install(source: &str, offline: bool) -> Result<Installed> {
+    if offline && remote(source) {
+        return Err(Error::Config(format!(
+            "cannot install package in offline mode: {source}"
+        )));
+    }
+    if !remote(source) && !Path::new(source).exists() {
         return Err(Error::Config(format!(
             "local package source does not exist: {source}"
         )));
@@ -724,6 +742,9 @@ async fn install(source: &str) -> Result<Installed> {
                 .arg(root.join("Cargo.toml"))
                 .arg("--target-dir")
                 .arg(directory.join("target"));
+            if offline {
+                build.arg("--offline");
+            }
             let artifacts = run(build).await?;
             for line in artifacts.split(|byte| *byte == b'\n') {
                 if let Ok(artifact) = serde_json::from_slice::<Value>(line)
