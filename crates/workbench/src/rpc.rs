@@ -30,6 +30,9 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         session.set_working_directory(&args.workspace)?;
     }
     super::backend::initialize_queue_modes(&mut session, &args)?;
+    if let Some(name) = &args.name {
+        session.set_name(name)?;
+    }
     drop(session);
     interactive::restore_workspace(&mut args)?;
     let (sender, receiver) = mpsc::channel();
@@ -525,7 +528,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             let name = request["name"]
                 .as_str()
                 .ok_or_else(|| Error::Config("name is required".into()))?;
-            Session::open(&args.session)?.set_name(name)?;
+            let name = sessions::validate_name(name).map_err(Error::Config)?;
+            Session::open(&args.session)?.set_name(&name)?;
             Ok(None)
         }
         "export_html" if !busy(worker) => {
@@ -825,6 +829,43 @@ mod tests {
         assert!(!busy);
         assert!(compact.is_none());
         assert!(abort.is_none());
+    }
+
+    #[test]
+    fn invalid_names_leave_the_existing_session_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session.set_name("original").unwrap();
+        drop(session);
+        let before = std::fs::read(&path).unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.session = path.clone();
+        let mut worker = None;
+        for name in [
+            json!(""),
+            json!(" \t\n"),
+            json!("\u{3000}"),
+            json!(null),
+            json!(42),
+        ] {
+            assert!(
+                command(
+                    &json!({"type":"set_session_name", "name":name}),
+                    &mut args,
+                    &mut worker
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        command(
+            &json!({"type":"set_session_name", "name":"  設計  "}),
+            &mut args,
+            &mut worker,
+        )
+        .unwrap();
+        assert_eq!(Session::snapshot(&path).unwrap().name(), Some("設計"));
     }
 
     #[test]

@@ -604,7 +604,7 @@ impl Session {
 
     pub fn set_name(&mut self, name: &str) -> Result<()> {
         self.append(Event::SessionInfo {
-            name: Some(name.trim().into()),
+            name: Some(sanitize_session_name(name)),
             cwd: None,
         })?;
         Ok(())
@@ -1841,9 +1841,40 @@ mod system_checkpoint_tests {
     }
 }
 
+/// Normalize a display name using Pi's line-break and ECMAScript whitespace rules.
+pub fn sanitize_session_name(name: &str) -> String {
+    name.split(['\r', '\n'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|character| {
+            matches!(character,
+                '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' |
+                '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' |
+                '\u{205f}' | '\u{3000}' | '\u{feff}'
+            )
+        })
+        .to_owned()
+}
+
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+
+    #[test]
+    fn display_names_sanitize_line_breaks_and_allow_explicit_clearing() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .set_name("\u{feff}  first\r\n\nsecond  \u{3000}")
+            .unwrap();
+        assert_eq!(session.name(), Some("first second"));
+        session.set_name("\u{0085}title\u{0085}").unwrap();
+        assert_eq!(session.name(), Some("\u{0085}title\u{0085}"));
+        session.set_name("\u{feff}\t ").unwrap();
+        assert!(session.name().is_none());
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(restored.name().is_none());
+    }
 
     #[test]
     fn snapshots_ignore_incomplete_tails_without_repairing_files() {

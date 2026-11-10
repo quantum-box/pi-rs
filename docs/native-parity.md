@@ -1569,3 +1569,16 @@ A CLI RPC smoke check covers creation and persistence through normal commands.
 CLI, terminal and RPC fork/clone operations record their immediate source as the
 parent, replacing inherited ancestry metadata when a child is forked again.
 This preserves the copied conversation while retaining the correct origin path.
+
+### Session-name validation checkpoint
+
+CLI `--name`, the native `name` command and RPC `set_session_name` reject empty
+or whitespace-only names before changing the journal. RPC startup now applies
+`--name`, matching the other execution modes. Shared core normalization collapses
+runs of CR/LF to one space and trims ECMAScript whitespace, including the BOM,
+while preserving U+0085. The SDK can still clear a name explicitly.
+
+The pinned reference's in-memory session manager confirms the normalization
+cases. Tests cover rejected inputs leaving existing records unchanged, Unicode
+names, line-break handling, explicit clearing and reopened sessions. A CLI/RPC
+smoke check verifies startup naming, error responses and a subsequent valid rename.

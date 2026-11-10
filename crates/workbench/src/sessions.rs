@@ -6,6 +6,14 @@ use std::process::{Command, Stdio};
 use pi_rs::{Error, Event, Result, Session};
 use serde::Serialize;
 
+pub fn validate_name(value: &str) -> std::result::Result<String, String> {
+    let name = pi_rs::sanitize_session_name(value);
+    if name.is_empty() {
+        return Err("Session name cannot be empty".into());
+    }
+    Ok(name)
+}
+
 pub fn validate_id(id: &str) -> std::result::Result<String, String> {
     let valid = !id.is_empty()
         && id.len() <= 128

@@ -76,7 +76,7 @@ struct Cli {
     #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["session", "continue_session", "no_session"])]
     resume_session: Option<PathBuf>,
     /// Name the current session.
-    #[arg(short = 'n', long, global = true)]
+    #[arg(short = 'n', long, global = true, value_parser = sessions::validate_name)]
     name: Option<String>,
     /// Override the directory in which sessions are stored.
     #[arg(long, global = true)]
@@ -325,6 +325,7 @@ enum Command {
     },
     Inspect,
     Name {
+        #[arg(value_parser = sessions::validate_name)]
         name: String,
     },
     Label {
@@ -1112,6 +1113,18 @@ fn outcome_status(outcome: &Outcome) -> &'static str {
 #[cfg(test)]
 mod cli_timeout_tests {
     use super::*;
+
+    #[test]
+    fn session_names_reject_empty_input_and_trim_surrounding_whitespace() {
+        for name in ["", " ", "\t\r\n", "\u{3000}"] {
+            assert!(Cli::try_parse_from(["pi", "--name", name]).is_err());
+            assert!(Cli::try_parse_from(["pi", "name", name]).is_err());
+        }
+        let args = Cli::try_parse_from(["pi", "--name", "  設計メモ  "]).unwrap();
+        assert_eq!(args.name.as_deref(), Some("設計メモ"));
+        let args = Cli::try_parse_from(["pi", "name", "  notes  "]).unwrap();
+        assert!(matches!(args.command, Some(Command::Name {name}) if name == "notes"));
+    }
 
     #[test]
     fn local_tools_have_an_optional_explicit_deadline() {
