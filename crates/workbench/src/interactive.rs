@@ -186,6 +186,7 @@ enum ModelListIntent {
 struct ModelDiscovery {
     receiver: std::sync::mpsc::Receiver<Result<Vec<String>>>,
     intent: ModelListIntent,
+    provider: super::Provider,
 }
 
 #[derive(Default)]
@@ -1333,16 +1334,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         "/model" if rest.is_empty() => start_model_picker(args, view, ModelListIntent::Select),
         "/scoped-models" => start_model_picker(args, view, ModelListIntent::Scope),
         "/model" => {
-            let selected =
-                super::model_selection::split(rest, &view.available_models, args.provider.id())?;
-            args.model = selected.model;
-            if selected.thinking.is_some() {
-                args.thinking = selected.thinking;
-            } else {
-                apply_scoped_thinking(args);
-            }
-            super::thinking::adjust(args);
-            args.record_model_selection(&mut Session::open(&args.session)?)?;
+            select_model_input(args, view, rest)?;
             view.append(&format!("Model › {rest}"));
         }
         "/thinking" if rest.is_empty() => {
@@ -1726,16 +1718,19 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         }
         if worker
             .as_ref()
-            .is_some_and(|active| !active.busy && !active.matches(&args))
+            .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
         {
             worker.take();
         }
         if let Some(discovery) = &view.model_list {
             let intent = discovery.intent;
+            let provider = discovery.provider;
             match discovery.receiver.try_recv() {
                 Ok(Ok(models)) => {
                     view.model_list = None;
-                    if models.is_empty() {
+                    if provider != args.provider && !matches!(intent, ModelListIntent::Select) {
+                        // The active provider changed while the scoped catalog was loading.
+                    } else if models.is_empty() {
                         view.append("No models available");
                     } else {
                         match intent {
@@ -1761,7 +1756,13 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 }
                             }
                             ModelListIntent::Select => {
-                                view.available_models = models.clone();
+                                let prefix = format!("{}/", args.provider.id());
+                                view.available_models = models
+                                    .iter()
+                                    .filter_map(|model| {
+                                        model.strip_prefix(&prefix).map(str::to_owned)
+                                    })
+                                    .collect();
                                 view.picker = Some(Picker::new(
                                     "Select model",
                                     models
@@ -2042,7 +2043,13 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             let result = match selection {
                                 Selection::Model(model) => args.settings.set_user(
                                     "defaultModel",
-                                    json!(args.configured_model_name(&model)),
+                                    json!(if model.split_once('/').is_some_and(|(name, _)| {
+                                        super::Provider::named(name).is_some()
+                                    }) {
+                                        model
+                                    } else {
+                                        args.configured_model_name(&model)
+                                    }),
                                 ),
                                 Selection::Thinking(thinking) => args
                                     .settings
@@ -2565,6 +2572,25 @@ fn apply_scoped_thinking(args: &mut Cli) {
     args.apply_model_thinking_defaults();
 }
 
+fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
+    let provider = input
+        .split_once('/')
+        .and_then(|(prefix, _)| super::Provider::named(prefix))
+        .unwrap_or(args.provider);
+    let changing_provider = provider != args.provider;
+    let available = if changing_provider {
+        &[][..]
+    } else {
+        view.available_models.as_slice()
+    };
+    let selected = super::model_selection::split(input, available, provider.id())?;
+    args.change_model(provider, selected.model, selected.thinking)?;
+    if changing_provider {
+        view.available_models.clear();
+    }
+    Ok(())
+}
+
 fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     if view.available_models.is_empty() {
         start_model_picker(args, view, ModelListIntent::Cycle { reverse });
@@ -2592,27 +2618,64 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
     if view.model_list.is_some() {
         return;
     }
-    let scope = args.model_scope.clone();
+    let args = args.clone();
     let provider = args.provider;
-    let endpoint = args.endpoint.clone();
-    let token = args.model_token();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let provider = provider.connect(&endpoint, token)?;
-            if scope.is_empty() || matches!(intent, ModelListIntent::Scope) {
+            if matches!(intent, ModelListIntent::Select) {
+                runtime.block_on(model_picker_catalog(&args))
+            } else if args.model_scope.is_empty() || matches!(intent, ModelListIntent::Scope) {
+                let provider = provider.connect(&args.endpoint, args.model_token())?;
                 runtime.block_on(provider.models())
             } else {
-                Ok(scope.into_iter().map(|choice| choice.model).collect())
+                Ok(args
+                    .model_scope
+                    .into_iter()
+                    .map(|choice| choice.model)
+                    .collect())
             }
         })();
         let _ = sender.send(result);
     });
-    view.model_list = Some(ModelDiscovery { receiver, intent });
+    view.model_list = Some(ModelDiscovery {
+        receiver,
+        intent,
+        provider,
+    });
     view.append("Loading available models…");
+}
+
+async fn model_picker_catalog(args: &Cli) -> Result<Vec<String>> {
+    use super::Provider;
+    let alternate = match args.provider {
+        Provider::Ollama => Provider::Anthropic,
+        Provider::Anthropic => Provider::Ollama,
+    };
+    let catalog = |provider: Provider| async move {
+        let endpoint = args.endpoint_for(provider);
+        let client = provider.connect(endpoint, args.model_token_for(provider, endpoint))?;
+        let models = client.models().await?;
+        Ok::<_, Error>(
+            models
+                .into_iter()
+                .map(|model| format!("{}/{model}", provider.id()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (active, alternate) = tokio::join!(catalog(args.provider), catalog(alternate));
+    match (active, alternate) {
+        (Ok(mut active), Ok(alternate)) => {
+            active.extend(alternate);
+            Ok(active)
+        }
+        (Ok(active), Err(_)) => Ok(active),
+        (Err(_), Ok(alternate)) if !alternate.is_empty() => Ok(alternate),
+        (Err(error), _) => Err(error),
+    }
 }
 
 fn update_model_scope(
@@ -2823,10 +2886,7 @@ fn select(
             slash(&format!("/fork {id}"), args, view)?;
         }
         Selection::Model(model) => {
-            args.model = model;
-            apply_scoped_thinking(args);
-            super::thinking::adjust(args);
-            args.record_model_selection(&mut Session::open(&args.session)?)?;
+            select_model_input(args, view, &model)?;
         }
         Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
         Selection::EditSetting(key) => {

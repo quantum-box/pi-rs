@@ -517,23 +517,18 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" if !busy(worker) => {
-            if request["provider"]
-                .as_str()
-                .is_some_and(|provider| !provider.eq_ignore_ascii_case(args.provider.id()))
-            {
-                return Err(Error::Config(format!(
-                    "this endpoint uses the {} provider",
-                    args.provider.id()
-                )));
-            }
+            let provider = match request.get("provider") {
+                None => args.provider,
+                Some(value) => value
+                    .as_str()
+                    .and_then(super::Provider::named)
+                    .ok_or_else(|| Error::Config("unsupported model provider".into()))?,
+            };
             let model = request["modelId"]
                 .as_str()
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| Error::Config("modelId is required".into()))?;
-            args.model = model.to_owned();
-            args.apply_model_thinking_defaults();
-            super::thinking::adjust(args);
-            args.record_model_selection(&mut Session::open(&args.session)?)?;
+            args.change_model(provider, model.to_owned(), None)?;
             Ok(Some(model_value(args.provider, model)))
         }
         "edit_context" if !busy(worker) => {

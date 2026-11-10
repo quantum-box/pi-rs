@@ -14,6 +14,13 @@ pub(super) enum Provider {
 }
 
 impl Provider {
+    pub fn api(self) -> &'static str {
+        match self {
+            Self::Ollama => "openai-completions",
+            Self::Anthropic => "anthropic-messages",
+        }
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Self::Ollama => "ollama",

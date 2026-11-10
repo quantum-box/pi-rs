@@ -28,6 +28,7 @@ impl Worker {
         let steering_mode = super::backend::configured_queue_mode(args, "steeringMode")?;
         let follow_up_mode = super::backend::configured_queue_mode(args, "followUpMode")?;
         let mut command = Command::new(std::env::current_exe()?);
+        command.env_remove("PI_RS_MODEL_TOKEN");
         if let Some(token) = args.model_token() {
             command.env("PI_RS_MODEL_TOKEN", token);
         }

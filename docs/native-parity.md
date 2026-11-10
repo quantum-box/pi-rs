@@ -18,7 +18,7 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius sharing |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint and native Anthropic Messages, API keys and bearer tokens, asynchronous searchable model selector, branch-local model/thinking selection, Ollama capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, provider-specific thinking for other services and live provider switching |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint and native Anthropic Messages, API keys and bearer tokens, searchable catalog and live switching between native providers, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, cross-provider cycling scopes and remaining model configuration fields |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
@@ -1982,3 +1982,24 @@ A loopback fixture verified adaptive effort, signed and redacted block replay
 through a real tool call, and replay after reopening the journal. Pi JSONL
 imports also recover signed blocks from native Anthropic Messages history.
 Live account verification remains separate work.
+
+### Live provider selection checkpoint
+
+The terminal model picker searches the available Ollama and Anthropic catalogs.
+Use `/model anthropic/<id>` or `/model ollama/<id>` to select a model directly,
+or send the provider and model ID with RPC `set_model`. The worker reconnects
+for the next prompt and keeps the current session. Reopening a session
+restores the recorded provider when its connection is available and the CLI
+has no explicit provider, model, or endpoint override.
+
+User-level `models.json` supports `providers.ollama` and `providers.anthropic`
+connection profiles with `baseUrl`, `api`, and `apiKey`. Profile keys can be
+literal strings or refer to environment variables. The active provider's
+`--endpoint` takes precedence over its profile. A runtime key stays with its
+original provider and endpoint. A profile key is used only for that profile's
+endpoint. Named custom providers, per-model overrides and credential
+commands remain in progress.
+
+Loopback RPC and PTY checks switched providers in one session, verified
+conversation continuity and credential isolation between the endpoints,
+and reopened a session with its saved provider.

@@ -22,6 +22,7 @@ mod extension_ui;
 mod interactive;
 mod mcp_config;
 mod model_listing;
+mod model_profiles;
 mod model_selection;
 mod packages;
 mod process;
@@ -53,6 +54,12 @@ struct Cli {
     #[arg(skip)]
     settings: config::Settings,
     #[arg(skip)]
+    model_profiles: model_profiles::Profiles,
+    #[arg(skip)]
+    initial_connection: Option<(Provider, String)>,
+    #[arg(skip)]
+    connection_explicit: bool,
+    #[arg(skip)]
     model_explicit: bool,
     #[arg(skip)]
     thinking_explicit: bool,
@@ -66,6 +73,8 @@ struct Cli {
     theme_paths: Vec<PathBuf>,
     #[arg(skip)]
     model_scope: Vec<model_selection::Choice>,
+    #[arg(skip)]
+    inactive_model_scopes: std::collections::BTreeMap<&'static str, Vec<model_selection::Choice>>,
     #[arg(skip)]
     trusted: bool,
     #[arg(skip)]
@@ -272,17 +281,86 @@ impl Cli {
         Duration::from_secs(self.tool_timeout_secs.unwrap_or(2_147_483))
     }
     fn model_token(&self) -> Option<String> {
-        self.api_key
-            .clone()
-            .or_else(|| std::env::var("PI_RS_MODEL_TOKEN").ok())
+        self.model_token_for(self.provider, &self.endpoint)
+    }
+
+    fn model_token_for(&self, provider: Provider, endpoint: &str) -> Option<String> {
+        let initial = self
+            .initial_connection
+            .as_ref()
+            .is_none_or(|(original, address)| *original == provider && address == endpoint);
+        let override_key = initial
+            .then(|| {
+                self.api_key
+                    .clone()
+                    .or_else(|| std::env::var("PI_RS_MODEL_TOKEN").ok())
+            })
+            .flatten();
+        override_key
+            .or_else(|| self.model_profiles.api_key(provider, endpoint))
             .or_else(|| {
-                (self.provider == Provider::Anthropic
-                    && reqwest::Url::parse(&self.endpoint).ok().is_some_and(|url| {
+                (provider == Provider::Anthropic
+                    && reqwest::Url::parse(endpoint).ok().is_some_and(|url| {
                         url.scheme() == "https" && url.host_str() == Some("api.anthropic.com")
                     }))
                 .then(|| std::env::var("ANTHROPIC_API_KEY").ok())
                 .flatten()
             })
+    }
+
+    fn activate_provider(&mut self, provider: Provider) -> Result<()> {
+        if provider == self.provider {
+            return Ok(());
+        }
+        let endpoint = self.endpoint_for(provider).to_owned();
+        provider.connect(&endpoint, self.model_token_for(provider, &endpoint))?;
+        self.inactive_model_scopes
+            .insert(self.provider.id(), std::mem::take(&mut self.model_scope));
+        self.model_scope = self
+            .inactive_model_scopes
+            .remove(provider.id())
+            .unwrap_or_default();
+        self.provider = provider;
+        self.endpoint = endpoint;
+        self.thinking_profile = None;
+        self.thinking = self
+            .settings
+            .string("defaultThinkingLevel")
+            .map(str::to_owned);
+        Ok(())
+    }
+
+    fn endpoint_for(&self, provider: Provider) -> &str {
+        if provider == self.provider {
+            return &self.endpoint;
+        }
+        self.initial_connection
+            .as_ref()
+            .filter(|(original, _)| *original == provider)
+            .map_or_else(
+                || self.model_profiles.endpoint(provider),
+                |(_, endpoint)| endpoint,
+            )
+    }
+
+    fn change_model(
+        &mut self,
+        provider: Provider,
+        model: String,
+        thinking: Option<String>,
+    ) -> Result<()> {
+        let mut selected = self.clone();
+        selected.activate_provider(provider)?;
+        selected.model = model;
+        if thinking.is_some() {
+            selected.thinking = thinking;
+        } else {
+            selected.apply_model_thinking_defaults();
+        }
+        thinking::adjust(&mut selected);
+        selected.record_model_selection(&mut Session::open(&selected.session)?)?;
+        *self = selected;
+        Ok(())
     }
     fn configured_model_name(&self, model: &str) -> String {
         match self.provider {
@@ -322,9 +400,13 @@ impl Cli {
         thinking: Option<String>,
         provider: Option<&str>,
     ) {
-        if !provider
-            .unwrap_or("ollama")
-            .eq_ignore_ascii_case(self.provider.id())
+        let Some(provider) = Provider::named(provider.unwrap_or("ollama")) else {
+            return;
+        };
+        if provider != self.provider
+            && (self.model_explicit
+                || self.connection_explicit
+                || self.activate_provider(provider).is_err())
         {
             return;
         }
@@ -508,6 +590,7 @@ async fn run_cli() {
         args.trusted = decision.unwrap_or(false);
         args.trust_pending = decision.is_none();
         args.settings = config::Settings::load(&args.workspace, args.trusted)?;
+        args.model_profiles = model_profiles::Profiles::load()?;
         let configured_model = args.settings.string("defaultModel");
         let provider_prefix = |model: &str| {
             model
@@ -529,9 +612,14 @@ async fn run_cli() {
                 configured_provider
             };
         }
-        if matches.value_source("endpoint") != Some(clap::parser::ValueSource::CommandLine) {
-            args.endpoint = args.provider.default_endpoint().into();
+        let explicit_endpoint =
+            matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
+        args.connection_explicit = explicit_endpoint
+            || matches.value_source("provider") == Some(clap::parser::ValueSource::CommandLine);
+        if !explicit_endpoint {
+            args.endpoint = args.model_profiles.endpoint(args.provider).into();
         }
+        args.initial_connection = Some((args.provider, args.endpoint.clone()));
         if !args.model_explicit {
             if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
                 args.model = model.into();

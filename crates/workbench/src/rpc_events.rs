@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{Cli, Provider};
+use super::Cli;
 
 #[derive(Default)]
 pub(super) struct Stream {
@@ -101,10 +101,7 @@ impl Stream {
                 self.metadata = ModelMetadata::default();
                 self.assistant = json!({
                     "role":"assistant", "content":[],
-                    "api": match args.provider {
-                        Provider::Ollama => "openai-completions",
-                        Provider::Anthropic => "anthropic-messages",
-                    },
+                    "api": args.provider.api(),
                     "provider":args.provider.id(), "model":model,
                     "thinkingLevel":args.thinking.as_deref().unwrap_or("off"),
                     "timestamp":timestamp(), "stopReason":"stop",
