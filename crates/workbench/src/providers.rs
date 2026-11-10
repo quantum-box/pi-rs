@@ -154,15 +154,29 @@ impl Client {
         }
     }
 
-    pub fn with_thinking(self, thinking: Option<&str>, reported: bool) -> Self {
-        match self {
-            Self::Ollama(client) if reported => {
-                Self::Ollama(client.with_reported_reasoning_effort(thinking))
+    pub fn with_model_options(self, args: &super::Cli, reported: bool) -> Result<Self> {
+        let thinking = args.provider_thinking();
+        Ok(match self {
+            Self::Ollama(client) => {
+                let configured = args.model_profiles.model(args.provider, &args.model);
+                let mapped = configured
+                    .as_ref()
+                    .and_then(|model| model.mapped_effort(thinking?));
+                let client = if let Some(mapped) = mapped {
+                    client.with_mapped_reasoning_effort(mapped)
+                } else if reported {
+                    client.with_reported_reasoning_effort(thinking)
+                } else {
+                    client.with_reasoning_effort(thinking)
+                };
+                let sampling = configured
+                    .map(|model| model.sampling(thinking.unwrap_or("off")))
+                    .unwrap_or_default();
+                Self::Ollama(client.with_sampling(sampling)?)
             }
-            Self::Ollama(client) => Self::Ollama(client.with_reasoning_effort(thinking)),
             Self::Anthropic(client) => Self::Anthropic(client.with_thinking(thinking)),
             Self::Google(client) => Self::Google(client.with_thinking(thinking)),
-        }
+        })
     }
 
     pub async fn thinking_levels(&self, model: &str) -> Option<Vec<String>> {

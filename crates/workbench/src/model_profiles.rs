@@ -49,6 +49,12 @@ pub(super) struct ModelMetadata {
     pub max_tokens: Option<u32>,
     pub reasoning: Option<bool>,
     input: Option<Vec<Modality>>,
+    #[serde(default)]
+    thinking_level_map: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    sampling_params: BTreeMap<String, Value>,
+    #[serde(default)]
+    sampling_params_by_thinking_level: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -67,13 +73,24 @@ impl ModelMetadata {
         self
     }
 
-    fn overlay(self, overrides: &Self) -> Self {
+    fn overlay(mut self, overrides: &Self) -> Self {
+        self.thinking_level_map
+            .extend(overrides.thinking_level_map.clone());
+        self.sampling_params
+            .extend(overrides.sampling_params.clone());
+        for (level, parameters) in &overrides.sampling_params_by_thinking_level {
+            self.sampling_params_by_thinking_level
+                .entry(level.clone())
+                .or_default()
+                .extend(parameters.clone());
+        }
         Self {
             name: overrides.name.clone().or(self.name),
             context_window: overrides.context_window.or(self.context_window),
             max_tokens: overrides.max_tokens.or(self.max_tokens),
             reasoning: overrides.reasoning.or(self.reasoning),
             input: overrides.input.clone().or(self.input),
+            ..self
         }
     }
 
@@ -91,18 +108,73 @@ impl ModelMetadata {
                 provider.id()
             )));
         }
+        if provider == Provider::Ollama {
+            pi_rs::ollama::validate_sampling(&self.sampling_params)?;
+            for (level, parameters) in &self.sampling_params_by_thinking_level {
+                if !super::thinking::LEVELS.contains(&level.as_str()) {
+                    return Err(Error::Config(format!(
+                        "unknown sampling thinking level {level:?}"
+                    )));
+                }
+                pi_rs::ollama::validate_sampling(parameters)?;
+            }
+            for (level, value) in &self.thinking_level_map {
+                if !super::thinking::LEVELS.contains(&level.as_str())
+                    || value.as_ref().is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(Error::Config(format!(
+                        "invalid mapping for thinking level {level:?}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
-    pub fn apply(&self, details: &mut pi_rs::ollama::ModelDetails) {
+    pub fn levels(&self, provider: Provider) -> Option<Vec<String>> {
+        if self.reasoning == Some(false) {
+            return Some(vec!["off".into()]);
+        }
+        if provider != Provider::Ollama || self.thinking_level_map.is_empty() {
+            return None;
+        }
+        Some(
+            super::thinking::LEVELS
+                .iter()
+                .copied()
+                .filter(|level| {
+                    *level == "off"
+                        || self
+                            .thinking_level_map
+                            .get(*level)
+                            .map_or(!matches!(*level, "xhigh" | "max"), Option::is_some)
+                })
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+
+    pub fn mapped_effort(&self, level: &str) -> Option<Option<&str>> {
+        self.thinking_level_map.get(level).map(Option::as_deref)
+    }
+
+    pub fn sampling(&self, level: &str) -> BTreeMap<String, Value> {
+        let mut sampling = self.sampling_params.clone();
+        if let Some(overrides) = self.sampling_params_by_thinking_level.get(level) {
+            sampling.extend(overrides.clone());
+        }
+        sampling
+    }
+
+    pub fn apply(&self, provider: Provider, details: &mut pi_rs::ollama::ModelDetails) {
         details.context_window = self.context_window.or(details.context_window);
         details.max_output_tokens = self.max_tokens.or(details.max_output_tokens);
         details.reasoning = self.reasoning.or(details.reasoning);
         if let Some(input) = &self.input {
             details.images = Some(input.contains(&Modality::Image));
         }
-        if self.reasoning == Some(false) {
-            details.thinking_levels = Some(vec!["off".into()]);
+        if let Some(levels) = self.levels(provider) {
+            details.thinking_levels = Some(levels);
         }
     }
 }
@@ -322,11 +394,45 @@ mod tests {
         assert_eq!(custom.max_tokens, Some(100));
         assert_eq!(custom.context_window, Some(128_000));
         let mut details = pi_rs::ollama::ModelDetails::default();
-        custom.apply(&mut details);
+        custom.apply(Provider::Ollama, &mut details);
         assert_eq!(details.images, Some(true));
         assert_eq!(details.thinking_levels, Some(vec!["off".into()]));
         let existing = profiles.model(Provider::Ollama, "existing").unwrap();
         assert_eq!(existing.context_window, Some(32000));
         assert_eq!(existing.max_tokens, None);
+    }
+
+    #[test]
+    fn sampling_layers_merge_without_overriding_agent_fields() {
+        let profiles = Profiles::parse(&json!({"providers":{"ollama":{
+            "models":[{"id":"custom","reasoning":true,
+                "thinkingLevelMap":{"medium":null,"xhigh":"strong"},
+                "samplingParams":{"temperature":0.7,"top_p":0.9},
+                "samplingParamsByThinkingLevel":{"xhigh":{"temperature":0.5,"top_k":20}}
+            }],
+            "modelOverrides":{"custom":{"samplingParamsByThinkingLevel":{"xhigh":{"temperature":0.2}}}}
+        }}})).unwrap();
+        let model = profiles.model(Provider::Ollama, "custom").unwrap();
+        let levels = model.levels(Provider::Ollama).unwrap();
+        assert!(
+            !levels
+                .iter()
+                .any(|level| level == "medium" || level == "max")
+        );
+        assert_eq!(model.mapped_effort("xhigh"), Some(Some("strong")));
+        assert_eq!(
+            model.sampling("xhigh"),
+            BTreeMap::from([
+                ("temperature".into(), json!(0.2)),
+                ("top_k".into(), json!(20)),
+                ("top_p".into(), json!(0.9)),
+            ])
+        );
+        assert!(
+            Profiles::parse(&json!({"providers":{"ollama":{
+                "models":[{"id":"invalid","samplingParams":{"messages":[]}}]
+            }}}))
+            .is_err()
+        );
     }
 }

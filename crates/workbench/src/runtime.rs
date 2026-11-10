@@ -217,8 +217,9 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn set_thinking(&mut self, thinking: Option<&str>, reported: bool) {
-        self.provider = self.provider.clone().with_thinking(thinking, reported);
+    pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
+        self.provider = self.provider.clone().with_model_options(args, reported)?;
+        Ok(())
     }
     pub async fn close(&self) -> Result<()> {
         self.registry.shutdown().await
@@ -419,10 +420,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             .provider
             .connect(&args.endpoint, args.model_token())?
             .with_context_probes(args.allow_model_probes())
-            .with_thinking(
-                args.provider_thinking(),
-                super::thinking::reported(args).is_some(),
-            )
+            .with_model_options(args, super::thinking::reported(args).is_some())?
             .observe(args.trace);
 
         Ok(Runtime {

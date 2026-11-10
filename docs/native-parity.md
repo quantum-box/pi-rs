@@ -2132,3 +2132,16 @@ stays bound to its endpoint when the file changes.
 
 Loopback checks covered aliases, model overrides, unavailable discovery,
 actual request limits, and updated configuration in a real terminal picker.
+
+### Compatible model sampling
+
+The chat-completions adapter applies `samplingParams` and the effective
+thinking level's `samplingParamsByThinkingLevel`. Model overrides merge
+per level and per field. `thinkingLevelMap` can disable unsupported levels
+and send an explicit value for a supported level. Request fields owned by the
+agent, including the conversation, tool definitions, streaming and token
+limits, are protected from sampling overrides.
+
+The loopback fixture exercised level clamping, the actual request payload,
+and clearing the previous model's sampling configuration when switching
+models on the same connection.

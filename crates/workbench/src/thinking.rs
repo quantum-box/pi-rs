@@ -16,12 +16,11 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if let Some(levels) = reported(args) {
         return levels.to_vec();
     }
-    if args
+    if let Some(levels) = args
         .model_profiles
         .model(args.provider, &args.model)
-        .is_some_and(|model| model.reasoning == Some(false))
+        .and_then(|model| model.levels(args.provider))
     {
-        let levels = vec!["off".into()];
         args.thinking_profile = Some((args.model.clone(), levels.clone()));
         return levels;
     }

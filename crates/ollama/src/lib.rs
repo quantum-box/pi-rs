@@ -22,6 +22,7 @@ pub struct Ollama {
     endpoint: Url,
     token: Option<String>,
     reasoning_effort: Option<String>,
+    sampling: BTreeMap<String, Value>,
     native_probes: bool,
     progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
@@ -96,6 +97,7 @@ impl Ollama {
             endpoint,
             token,
             reasoning_effort: None,
+            sampling: BTreeMap::new(),
             native_probes: true,
             progress: None,
             reasoning: None,
@@ -128,6 +130,18 @@ impl Ollama {
         self.reasoning_effort =
             effort.map(|level| if level == "off" { "none" } else { level }.to_owned());
         self
+    }
+
+    /// Apply the provider value from an explicit thinking-level map.
+    pub fn with_mapped_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.reasoning_effort = effort.map(str::to_owned);
+        self
+    }
+
+    pub fn with_sampling(mut self, sampling: BTreeMap<String, Value>) -> Result<Self> {
+        validate_sampling(&sampling)?;
+        self.sampling = sampling;
+        Ok(self)
     }
 
     pub fn with_progress(
@@ -275,6 +289,33 @@ impl Ollama {
     }
 }
 
+/// Sampling parameters can extend a request without replacing its managed fields.
+pub fn validate_sampling(sampling: &BTreeMap<String, Value>) -> Result<()> {
+    if let Some(key) = sampling.keys().find(|key| {
+        matches!(
+            key.as_str(),
+            "model"
+                | "messages"
+                | "tools"
+                | "tool_choice"
+                | "functions"
+                | "function_call"
+                | "stream"
+                | "stream_options"
+                | "max_tokens"
+                | "max_completion_tokens"
+                | "max_output_tokens"
+                | "reasoning_effort"
+                | "n"
+        )
+    }) {
+        return Err(Error::Config(format!(
+            "sampling parameter {key:?} is managed by the agent"
+        )));
+    }
+    Ok(())
+}
+
 async fn read_native_response(request: reqwest::RequestBuilder) -> Option<Value> {
     let mut response = request.send().await.ok()?.error_for_status().ok()?;
     let mut bytes = Vec::new();
@@ -387,6 +428,11 @@ impl Model for Ollama {
         if let Some(effort) = &self.reasoning_effort {
             body["reasoning_effort"] = json!(effort);
         }
+        body.as_object_mut().expect("chat request object").extend(
+            self.sampling
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         let mut builder = self.client.post(self.endpoint.clone()).json(&body);
         if let Some(token) = &self.token {
             builder = builder.bearer_auth(token);

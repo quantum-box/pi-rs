@@ -298,7 +298,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             args.model = model;
             args.thinking = thinking;
             args.session = session;
-            runtime.set_thinking(args.provider_thinking(), reported_thinking);
+            runtime.configure_model_options(&args, reported_thinking)?;
             snapshot
                 .lock()
                 .expect("session snapshot")

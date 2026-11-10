@@ -57,7 +57,7 @@ impl Catalog {
         };
         for model in models {
             if let Some(metadata) = profiles.model(self.provider, model) {
-                metadata.apply(details.entry(model.clone()).or_default());
+                metadata.apply(self.provider, details.entry(model.clone()).or_default());
             }
         }
         details

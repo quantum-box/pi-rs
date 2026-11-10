@@ -775,7 +775,7 @@ fn model_value(args: &Cli, provider: super::Provider, model: &str) -> Value {
     let value = json!({"id":model,"name":name,"provider":provider.id()});
     if let Some(configured) = configured {
         let mut details = pi_rs::ollama::ModelDetails::default();
-        configured.apply(&mut details);
+        configured.apply(provider, &mut details);
         super::model_listing::with_details(value, Some(&details))
     } else {
         value
