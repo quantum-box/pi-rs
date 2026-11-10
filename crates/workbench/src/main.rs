@@ -303,12 +303,16 @@ impl Cli {
             .or_else(|| self.model_keys.get(provider, endpoint).map(str::to_owned))
             .or_else(|| self.model_profiles.api_key(provider, endpoint))
             .or_else(|| {
-                (provider == Provider::Anthropic
-                    && reqwest::Url::parse(endpoint).ok().is_some_and(|url| {
-                        url.scheme() == "https" && url.host_str() == Some("api.anthropic.com")
-                    }))
-                .then(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .flatten()
+                let url = reqwest::Url::parse(endpoint).ok()?;
+                match (provider, url.scheme(), url.host_str()) {
+                    (Provider::Anthropic, "https", Some("api.anthropic.com")) => {
+                        std::env::var("ANTHROPIC_API_KEY").ok()
+                    }
+                    (Provider::Google, "https", Some("generativelanguage.googleapis.com")) => {
+                        std::env::var("GEMINI_API_KEY").ok()
+                    }
+                    _ => None,
+                }
             })
     }
 
@@ -369,7 +373,7 @@ impl Cli {
     fn configured_model_name(&self, model: &str) -> String {
         match self.provider {
             Provider::Ollama => model.into(),
-            Provider::Anthropic => format!("anthropic/{model}"),
+            provider => format!("{}/{model}", provider.id()),
         }
     }
 
@@ -628,7 +632,7 @@ async fn run_cli() {
         if !args.model_explicit {
             if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
                 args.model = model.into();
-            } else if args.provider == Provider::Anthropic {
+            } else if args.provider != Provider::Ollama {
                 args.model.clear();
             }
         }

@@ -108,6 +108,12 @@ fn endpoint_from_base(provider: Provider, base: &str) -> Result<String> {
     let suffix = match provider {
         Provider::Ollama => "/chat/completions",
         Provider::Anthropic => "/messages",
+        Provider::Google => {
+            if url.path() == "/" {
+                url.set_path("/v1beta");
+            }
+            return Ok(url.to_string());
+        }
     };
     let path = url.path().trim_end_matches('/');
     let path = if path.ends_with(suffix) {

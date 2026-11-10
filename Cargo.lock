@@ -2081,6 +2081,7 @@ dependencies = [
  "futures-util",
  "pi-rs-anthropic",
  "pi-rs-core",
+ "pi-rs-google",
  "pi-rs-ollama",
  "pi-rs-review",
  "serde_json",
@@ -2168,6 +2169,21 @@ dependencies = [
  "pi-rs-core",
  "reqwest 0.12.28",
  "serde_json",
+]
+
+[[package]]
+name = "pi-rs-google"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "eventsource-stream",
+ "futures-util",
+ "pi-rs-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

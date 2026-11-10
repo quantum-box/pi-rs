@@ -16,12 +16,10 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if let Some(levels) = reported(args) {
         return levels.to_vec();
     }
-    let fallback = || {
-        if args.provider == super::Provider::Anthropic {
-            vec!["off".into()]
-        } else {
-            LEVELS.iter().map(|level| (*level).into()).collect()
-        }
+    let fallback = || match args.provider {
+        super::Provider::Ollama => LEVELS.iter().map(|level| (*level).into()).collect(),
+        super::Provider::Anthropic => vec!["off".into()],
+        super::Provider::Google => pi_rs::google::model_thinking_levels(&args.model),
     };
     if !args.allow_model_probes() {
         return fallback();
@@ -68,7 +66,7 @@ fn clamp<'a>(requested: &str, levels: &'a [String]) -> &'a str {
 pub(super) fn adjust(args: &mut Cli) {
     if let Some(requested) = args.thinking.clone() {
         let levels = available(args);
-        if reported(args).is_some() || args.provider == super::Provider::Anthropic {
+        if reported(args).is_some() || args.provider != super::Provider::Ollama {
             args.thinking = Some(clamp(&requested, &levels).into());
         }
     }

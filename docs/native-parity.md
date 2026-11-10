@@ -18,7 +18,7 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius sharing |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint and native Anthropic Messages, API keys and bearer tokens, searchable catalog and live switching between native providers, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, cross-provider cycling scopes and remaining model configuration fields |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, API keys and bearer tokens, searchable catalog and live switching between native providers, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, cross-provider cycling scopes and remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage | Model-provider OAuth and credential refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
@@ -1985,14 +1985,14 @@ Live account verification remains separate work.
 
 ### Live provider selection checkpoint
 
-The terminal model picker searches the available Ollama and Anthropic catalogs.
+The terminal model picker searches the available Ollama, Anthropic, and Google catalogs.
 Use `/model anthropic/<id>` or `/model ollama/<id>` to select a model directly,
 or send the provider and model ID with RPC `set_model`. The worker reconnects
 for the next prompt and keeps the current session. Reopening a session
 restores the recorded provider when its connection is available and the CLI
 has no explicit provider, model, or endpoint override.
 
-User-level `models.json` supports `providers.ollama` and `providers.anthropic`
+User-level `models.json` supports `providers.ollama`, `providers.anthropic`, and `providers.google`
 connection profiles with `baseUrl`, `api`, and `apiKey`. Profile keys can be
 literal strings or refer to environment variables. The active provider's
 `--endpoint` takes precedence over its profile. A runtime key stays with its
@@ -2017,3 +2017,22 @@ credential. `/reload` refreshes the saved-key view.
 Both terminal modes passed key masking, invalid input, cancellation, restart,
 and logout checks against a loopback Anthropic endpoint. The saved file used
 mode 0600 on Unix, and the transcript and terminal output excluded the key.
+
+### Google Gemini checkpoint
+
+Use `--provider google --model <id>` or `--model google/<id>`. Google uses
+the Generate Content REST API. Its `--endpoint` or `models.json` `baseUrl`
+is an API base such as `https://generativelanguage.googleapis.com/v1beta`.
+The official endpoint can use `GEMINI_API_KEY`. Custom endpoints can use a
+matching profile key, saved key, or explicit `--api-key`.
+
+The adapter discovers chat models through the paginated Models API and
+streams text, thought summaries, and tool calls. It encodes image inputs and
+tool results, records measured usage including thought tokens, and preserves
+ordered signed response parts for the same model across tools and journal
+reopening. Gemini 2.5 and newer model families use their budget or level
+controls. A truncated response keeps its text and does not dispatch its calls.
+
+Loopback checks covered these paths and a PTY showed thinking, generation,
+and the final answer. [Generate Content API](https://ai.google.dev/api/generate-content?hl=en)
+· [Thought signatures](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures?hl=en)

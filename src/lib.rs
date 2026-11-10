@@ -6,3 +6,6 @@ pub use pi_rs_ollama as ollama;
 
 #[cfg(feature = "anthropic")]
 pub use pi_rs_anthropic as anthropic;
+
+#[cfg(feature = "google")]
+pub use pi_rs_google as google;

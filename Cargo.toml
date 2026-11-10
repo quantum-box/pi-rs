@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/anthropic", "crates/fixture-tools", "crates/aip-host", "crates/core", "crates/ollama", "crates/plan-mode", "crates/review", "crates/extensions", "crates/workbench"]
+members = ["crates/anthropic", "crates/fixture-tools", "crates/aip-host", "crates/core", "crates/google", "crates/ollama", "crates/plan-mode", "crates/review", "crates/extensions", "crates/workbench"]
 resolver = "3"
 
 [package]
@@ -14,10 +14,12 @@ description = "Embeddable agent harness with recoverable sessions and Rust exten
 default = ["ollama"]
 ollama = ["dep:pi-rs-ollama"]
 anthropic = ["dep:pi-rs-anthropic"]
+google = ["dep:pi-rs-google"]
 
 [dependencies]
 pi-rs-core = { path = "crates/core", version = "0.1.0" }
 pi-rs-anthropic = { path = "crates/anthropic", version = "0.1.0", optional = true }
+pi-rs-google = { path = "crates/google", version = "0.1.0", optional = true }
 pi-rs-ollama = { path = "crates/ollama", version = "0.1.0", optional = true }
 
 [dev-dependencies]

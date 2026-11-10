@@ -2728,10 +2728,6 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
 
 async fn model_picker_catalog(args: &Cli) -> Result<Vec<String>> {
     use super::Provider;
-    let alternate = match args.provider {
-        Provider::Ollama => Provider::Anthropic,
-        Provider::Anthropic => Provider::Ollama,
-    };
     let catalog = |provider: Provider| async move {
         let endpoint = args.endpoint_for(provider);
         let client = provider.connect(endpoint, args.model_token_for(provider, endpoint))?;
@@ -2743,15 +2739,26 @@ async fn model_picker_catalog(args: &Cli) -> Result<Vec<String>> {
                 .collect::<Vec<_>>(),
         )
     };
-    let (active, alternate) = tokio::join!(catalog(args.provider), catalog(alternate));
-    match (active, alternate) {
-        (Ok(mut active), Ok(alternate)) => {
-            active.extend(alternate);
+    let alternate = Provider::ALL
+        .into_iter()
+        .filter(|provider| *provider != args.provider)
+        .map(catalog);
+    let (active, alternates) = tokio::join!(
+        catalog(args.provider),
+        futures_util::future::join_all(alternate)
+    );
+    let alternates: Vec<_> = alternates
+        .into_iter()
+        .filter_map(Result::ok)
+        .flatten()
+        .collect();
+    match active {
+        Ok(mut active) => {
+            active.extend(alternates);
             Ok(active)
         }
-        (Ok(active), Err(_)) => Ok(active),
-        (Err(_), Ok(alternate)) if !alternate.is_empty() => Ok(alternate),
-        (Err(error), _) => Err(error),
+        Err(_) if !alternates.is_empty() => Ok(alternates),
+        Err(error) => Err(error),
     }
 }
 
