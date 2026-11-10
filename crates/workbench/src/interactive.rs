@@ -1140,8 +1140,6 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
 const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /compact  /tree  /checkout <id>  /quit\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>> {
@@ -1294,28 +1292,23 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             } else {
                 apply_scoped_thinking(args);
             }
+            super::thinking::adjust(args);
             Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
             view.append(&format!("Model › {rest}"));
         }
         "/thinking" if rest.is_empty() => {
             view.picker = Some(Picker::new(
                 "Thinking level",
-                THINKING_LEVELS
-                    .iter()
+                super::thinking::available(args)
+                    .into_iter()
                     .map(|level| Item {
-                        label: (*level).into(),
-                        selection: Selection::Thinking((*level).into()),
+                        label: level.clone(),
+                        selection: Selection::Thinking(level),
                     })
                     .collect(),
             ));
         }
-        "/thinking" => {
-            if !THINKING_LEVELS.contains(&rest) {
-                return Err(Error::Config("unknown thinking level".into()));
-            }
-            args.thinking = Some(rest.into());
-            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
-        }
+        "/thinking" => super::thinking::set(args, rest)?,
         "/new" => {
             args.session = session_path(&args.workspace, args.session_dir.as_deref());
             initialize_session(args)?;
@@ -1968,16 +1961,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         }
                     }
                     "app.thinking.cycle" if !is_busy(&worker) => {
-                        let next = args
-                            .thinking
-                            .as_deref()
-                            .and_then(|level| {
-                                THINKING_LEVELS.iter().position(|value| *value == level)
-                            })
-                            .map_or(0, |index| (index + 1) % THINKING_LEVELS.len());
-                        args.thinking = Some(THINKING_LEVELS[next].into());
-                        Session::open(&args.session)?
-                            .select_model(&args.model, args.thinking.as_deref())?;
+                        if let Err(error) = super::thinking::cycle(&mut args) {
+                            view.append(&error.to_string());
+                        }
                     }
                     "app.tools.expand" => view.expand_tools = !view.expand_tools,
                     "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
@@ -2346,6 +2332,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     };
     args.model = view.available_models[next].clone();
     apply_scoped_thinking(args);
+    super::thinking::adjust(args);
     Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
     Ok(())
 }
@@ -2446,12 +2433,10 @@ fn select(
         Selection::Model(model) => {
             args.model = model;
             apply_scoped_thinking(args);
+            super::thinking::adjust(args);
             Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
         }
-        Selection::Thinking(thinking) => {
-            args.thinking = Some(thinking);
-            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
-        }
+        Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
                 "theme" => json!(args.use_theme.as_deref().unwrap_or("system")),
@@ -2601,6 +2586,7 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     if let Some((model, thinking)) = session.model_selection() {
         args.restore_model_selection(model, thinking);
     }
+    super::thinking::adjust(args);
     session.select_model(&args.model, args.thinking.as_deref())?;
     Ok(())
 }
@@ -2631,6 +2617,8 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
     args.settings = crate::config::Settings::load(&args.workspace, args.trusted)?;
+    drop(session);
+    super::thinking::adjust(args);
     Ok(())
 }
 

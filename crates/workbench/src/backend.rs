@@ -23,6 +23,8 @@ enum Request {
     Configure {
         model: String,
         thinking: Option<String>,
+        #[serde(default)]
+        reported_thinking: bool,
         session: PathBuf,
     },
     Prompt {
@@ -195,13 +197,14 @@ pub async fn run(mut args: Cli) -> Result<()> {
         if let Request::Configure {
             model,
             thinking,
+            reported_thinking,
             session,
         } = request
         {
             args.model = model;
             args.thinking = thinking;
             args.session = session;
-            runtime.set_thinking(args.thinking.as_deref());
+            runtime.set_thinking(args.thinking.as_deref(), reported_thinking);
             *snapshot.lock().expect("session snapshot") =
                 Session::open(&args.session)?.records().to_vec();
             continue;

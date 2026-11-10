@@ -36,6 +36,8 @@ pub struct ModelDetails {
     pub reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_levels: Option<Vec<String>>,
 }
 
 /// Transient presentation signals, separate from the durable model result.
@@ -108,6 +110,13 @@ impl Ollama {
             }
             .to_owned()
         });
+        self
+    }
+
+    /// Set an effort already resolved against the model's advertised controls.
+    pub fn with_reported_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.reasoning_effort =
+            effort.map(|level| if level == "off" { "none" } else { level }.to_owned());
         self
     }
 
@@ -278,10 +287,35 @@ fn decode_model_details(value: &Value) -> ModelDetails {
             .as_array()
             .map(|items| items.iter().any(|item| item.as_str() == Some(name)))
     };
+    let mut levels = Vec::new();
+    if let Some(values) = value["thinking"]["values"].as_array() {
+        for value in values {
+            let level = match value {
+                Value::Bool(false) => Some("off"),
+                Value::Bool(true) => Some("high"),
+                Value::String(level) if !level.trim().is_empty() => Some(level.as_str()),
+                _ => None,
+            };
+            if let Some(level) = level
+                && levels.iter().all(|existing| existing != level)
+            {
+                levels.push(level.to_owned());
+            }
+        }
+    }
+    let reasoning = if levels.is_empty() {
+        capability("thinking")
+    } else {
+        Some(levels.iter().any(|level| level != "off"))
+    };
+    if levels.is_empty() && reasoning == Some(false) {
+        levels.push("off".into());
+    }
     ModelDetails {
         context_window,
-        reasoning: capability("thinking"),
+        reasoning,
         images: capability("vision"),
+        thinking_levels: (!levels.is_empty()).then_some(levels),
     }
 }
 

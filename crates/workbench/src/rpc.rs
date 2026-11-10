@@ -403,28 +403,24 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .map_or(0, |index| (index + 1) % available.len());
             args.model = available[next].clone();
             args.apply_model_thinking_defaults();
+            super::thinking::adjust(args);
             Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
             Ok(Some(
                 json!({"model":model_value(args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
             ))
         }
-        "get_available_thinking_levels" => Ok(Some(json!({"levels":THINKING_LEVELS}))),
-        "set_thinking_level" | "cycle_thinking_level" if !busy(worker) => {
-            let level = if name == "set_thinking_level" {
-                request["level"]
-                    .as_str()
-                    .filter(|level| THINKING_LEVELS.contains(level))
-                    .ok_or_else(|| Error::Config("invalid thinking level".into()))?
-            } else {
-                let index = THINKING_LEVELS
-                    .iter()
-                    .position(|level| Some(*level) == args.thinking.as_deref())
-                    .unwrap_or(0);
-                THINKING_LEVELS[(index + 1) % THINKING_LEVELS.len()]
-            };
-            args.thinking = Some(level.into());
-            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
-            Ok((name == "cycle_thinking_level").then(|| json!({"level":level})))
+        "get_available_thinking_levels" => {
+            Ok(Some(json!({"levels":super::thinking::available(args)})))
+        }
+        "set_thinking_level" if !busy(worker) => {
+            let level = request["level"]
+                .as_str()
+                .ok_or_else(|| Error::Config("invalid thinking level".into()))?;
+            super::thinking::set(args, level)?;
+            Ok(None)
+        }
+        "cycle_thinking_level" if !busy(worker) => {
+            Ok(super::thinking::cycle(args)?.map(|level| json!({"level":level})))
         }
 
         "switch_session" if !busy(worker) => {
@@ -515,6 +511,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .ok_or_else(|| Error::Config("modelId is required".into()))?;
             args.model = model.to_owned();
             args.apply_model_thinking_defaults();
+            super::thinking::adjust(args);
             Session::open(&args.session)?.select_model(model, args.thinking.as_deref())?;
             Ok(Some(model_value(args.provider, model)))
         }
@@ -660,8 +657,6 @@ pub(super) fn snapshot_response(
         _ => Err(Error::Config("unsupported snapshot command".into())),
     }
 }
-
-const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 fn model_value(provider: super::Provider, model: &str) -> Value {
     json!({"id":model,"name":model,"provider":provider.id()})
@@ -1059,6 +1054,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut args = Cli::try_parse_from(["pi"]).unwrap();
         args.session = root.path().join("thinking.jsonl");
+        args.endpoint = "http://127.0.0.1:9/chat/completions".into();
         args.model_scope = vec![
             crate::model_selection::Choice {
                 model: "a".into(),

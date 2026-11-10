@@ -31,6 +31,7 @@ mod rpc;
 mod runtime;
 mod session_import;
 mod sessions;
+mod thinking;
 mod tool_selection;
 mod ui;
 
@@ -52,6 +53,8 @@ struct Cli {
     model_explicit: bool,
     #[arg(skip)]
     thinking_explicit: bool,
+    #[arg(skip)]
+    thinking_profile: Option<(String, Vec<String>)>,
     #[arg(skip)]
     initial_images: Vec<pi_rs::ImageContent>,
     #[arg(skip)]
@@ -830,6 +833,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     if let Some((model, thinking)) = session.model_selection() {
         args.restore_model_selection(model, thinking);
     }
+    thinking::adjust(&mut args);
     session.select_model(&args.model, args.thinking.as_deref())?;
     let runtime = runtime::configure(&args).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());

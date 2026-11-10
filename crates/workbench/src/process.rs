@@ -58,7 +58,9 @@ impl Worker {
         if let Some(timeout) = args.tool_timeout_secs {
             command.arg("--tool-timeout-secs").arg(timeout.to_string());
         }
-        if let Some(thinking) = &args.thinking {
+        if let Some(thinking) = &args.thinking
+            && super::thinking::LEVELS.contains(&thinking.as_str())
+        {
             command.arg("--thinking").arg(thinking);
         }
         if args.trusted {
@@ -210,7 +212,7 @@ impl Worker {
         self.persistent && self.configuration == configuration(args)
     }
     pub(super) fn request(&mut self, args: &Cli, request: Value) -> Result<()> {
-        self.send(json!({"type":"configure","model":args.model,"thinking":args.thinking,"session":args.session}))?;
+        self.send(json!({"type":"configure","model":args.model,"thinking":args.thinking,"reported_thinking":super::thinking::reported(args).is_some(),"session":args.session}))?;
         self.compacting = request["type"] == "compact";
         self.bashing = request["type"] == "bash";
         self.send(request)?;

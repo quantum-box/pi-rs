@@ -120,11 +120,19 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn set_thinking(&mut self, thinking: Option<&str>) {
-        self.provider = self.provider.clone().with_reasoning_effort(thinking);
+    pub fn set_thinking(&mut self, thinking: Option<&str>, reported: bool) {
+        self.provider = reasoning_effort(self.provider.clone(), thinking, reported);
     }
     pub async fn close(&self) -> Result<()> {
         self.registry.shutdown().await
+    }
+}
+
+fn reasoning_effort(provider: Ollama, thinking: Option<&str>, reported: bool) -> Ollama {
+    if reported {
+        provider.with_reported_reasoning_effort(thinking)
+    } else {
+        provider.with_reasoning_effort(thinking)
     }
 }
 
@@ -316,16 +324,17 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         });
         registry.set_refresher(catalog.clone());
         let show_reasoning = args.trace;
-        let provider = args
-            .provider
-            .connect(&args.endpoint, args.model_token())?
-            .with_reasoning_effort(args.thinking.as_deref())
-            .with_progress(|stage| output(json!({"type":"model_progress","stage":stage})))
-            .with_reasoning(move |delta| {
-                if show_reasoning {
-                    output(json!({"type":"reasoning_delta","delta":delta}));
-                }
-            });
+        let provider = reasoning_effort(
+            args.provider.connect(&args.endpoint, args.model_token())?,
+            args.thinking.as_deref(),
+            super::thinking::reported(args).is_some(),
+        )
+        .with_progress(|stage| output(json!({"type":"model_progress","stage":stage})))
+        .with_reasoning(move |delta| {
+            if show_reasoning {
+                output(json!({"type":"reasoning_delta","delta":delta}));
+            }
+        });
 
         Ok(Runtime {
             retry: pi_rs::RetryControl::new(args.settings.retry_settings()),

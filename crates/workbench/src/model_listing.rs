@@ -127,6 +127,7 @@ mod tests {
                 context_window: Some(131_072),
                 reasoning: Some(true),
                 images: Some(false),
+                thinking_levels: None,
             },
         )]);
         let result = table("ollama", &models, &details);

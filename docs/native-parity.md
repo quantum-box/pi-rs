@@ -1832,3 +1832,23 @@ Loopback checks cover table, JSON and RPC output, unknown values, native
 metadata fallback, search misses and authorization forwarding. Local Ollama
 listing verifies both installed Qwen models. Full workspace tests and all-target
 Clippy pass.
+
+### Model-aware thinking controls checkpoint
+
+Ollama discovery reads the advertised `thinking.values` alongside capability
+flags. Boolean controls appear as `off` and `high`, and advertised names are
+available in the terminal and RPC. Models reporting only `off` skip cycling.
+Explicit selections clamp to the next supported higher standard level, then
+the nearest lower one, as in Pi. Services without level metadata use the
+standard fallback menu. The provider chooses its default when no level is
+requested. [Ollama thinking controls](https://docs.ollama.com/capabilities/thinking)
+
+The selected model's metadata is reused by the frontend. A resolved named
+level reaches the worker and request without the legacy effort remapping.
+The CLI accepts the standard thinking flags; the terminal and RPC accept
+additional advertised names.
+
+Loopback checks cover toggle, off-only and named controls, model switches,
+clamping and worker transmission. A real PTY check with local Qwen verifies
+the available levels, selection persistence and terminal restoration.
+Workspace tests and all-target Clippy pass.
