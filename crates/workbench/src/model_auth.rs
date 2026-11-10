@@ -80,6 +80,7 @@ pub(super) struct Keys {
 struct SavedKey {
     endpoint: String,
     official_routes: bool,
+    oauth: bool,
     key: Credential,
 }
 
@@ -135,6 +136,7 @@ impl Keys {
                     SavedKey {
                         endpoint: endpoint.to_owned(),
                         official_routes: oauth || entry.get("endpoint").is_none(),
+                        oauth,
                         key,
                     },
                 ))
@@ -156,6 +158,14 @@ impl Keys {
             && endpoint == super::radius_auth::DEFAULT_MODEL_ENDPOINT
             && entry.endpoint == "https://radius.pi.dev/messages";
         (entry.endpoint == endpoint || legacy_radius).then_some(&entry.key)
+    }
+
+    pub fn oauth(&self, provider: &Provider, endpoint: &str) -> bool {
+        self.credential(provider, endpoint).is_some()
+            && self
+                .entries
+                .get(provider.id())
+                .is_some_and(|entry| entry.oauth)
     }
 
     pub fn operation_credential(

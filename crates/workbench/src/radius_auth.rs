@@ -143,6 +143,10 @@ impl Gateway {
         Ok(self.credential()?.is_some())
     }
 
+    pub(super) fn cached_access(&self) -> Result<Option<String>> {
+        Ok(self.credential()?.map(|credential| credential.access))
+    }
+
     pub(super) fn cached_login_id(&self) -> Result<Option<String>> {
         Ok(self.credential()?.map(|credential| credential.login_id()))
     }

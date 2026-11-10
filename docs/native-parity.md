@@ -2434,3 +2434,16 @@ file targets still work with exclusion globs. Native `find` honors
 `.fdignore` and omits Git metadata directories while retaining ordinary
 hidden files and dependency directories.
 [fd manual](https://github.com/sharkdp/fd/blob/master/doc/fd.1)
+
+### CLI credential checks
+
+`pi auth check` reports configured credential readiness for a provider
+or model. It supports JSON output and a read-only `--no-refresh` check.
+`print-api-key` and `print-bearer-token` explicitly resolve their own
+credential type. Model-specific endpoints are respected. Radius bearer
+tokens use the normal refresh path and accept `--min-expiry`. The default
+check output contains only status and metadata.
+
+Loopback checks covered expired and refreshed Radius credentials,
+model-specific key selection, OpenRouter's OAuth key type, and invalid
+configuration.

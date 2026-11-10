@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 mod attachments;
+mod auth_cli;
 mod backend;
 mod builtin_chat;
 mod cli_compat;
@@ -372,7 +373,17 @@ impl Cli {
     ) -> Option<model_auth::Credential> {
         self.model_override_token(provider, endpoint)
             .map(model_auth::Credential::Literal)
-            .or_else(|| self.model_keys.credential(provider, endpoint).cloned())
+            .or_else(|| self.configured_model_credential(provider, endpoint))
+    }
+
+    fn configured_model_credential(
+        &self,
+        provider: &Provider,
+        endpoint: &str,
+    ) -> Option<model_auth::Credential> {
+        self.model_keys
+            .credential(provider, endpoint)
+            .cloned()
             .or_else(|| self.model_profiles.credential(provider, endpoint))
             .or_else(|| {
                 if provider == &Provider::Radius {
@@ -614,6 +625,11 @@ enum Command {
         #[command(subcommand)]
         command: mcp_config::McpCommand,
     },
+    /// Check or print a configured provider credential.
+    Auth {
+        #[command(subcommand)]
+        command: auth_cli::AuthCommand,
+    },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
         #[arg(value_parser = ["radius", "openrouter"])]
@@ -745,6 +761,15 @@ async fn run_cli() {
             matches.value_source("model") == Some(clap::parser::ValueSource::CommandLine);
         args.thinking_explicit =
             matches.value_source("thinking") == Some(clap::parser::ValueSource::CommandLine);
+        if let Some(Command::Auth { command }) = args.command.as_ref() {
+            if matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine) {
+                return Err(Error::Config(
+                    "auth selects endpoints from provider and model configuration".into(),
+                ));
+            }
+            let command = command.clone();
+            return auth_cli::run(args, command).await;
+        }
         let decision = config::project_trust(
             &args.workspace,
             if args.no_trust {
