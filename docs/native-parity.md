@@ -2577,3 +2577,12 @@ estimate in the journal and session statistics. An explicit provider
 total takes precedence. Unmeasured responses remain unpriced. Model
 overrides can replace individual price fields. Loopback checks covered
 Chat Completions, native Anthropic Messages, Gemini, and RPC statistics.
+
+### OpenRouter reported usage checkpoint
+
+Both OpenRouter chat transports use complete reported usage totals. For
+bring-your-own-key requests, the total adds the gateway charge and the
+upstream inference charge. Separate prompt and completion charges can
+supply the upstream total. Server-tool charges already included by the
+gateway are counted once. Incomplete or malformed accounting falls back
+to the catalog estimate when measured usage exists.

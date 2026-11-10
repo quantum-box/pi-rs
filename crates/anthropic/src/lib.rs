@@ -7,12 +7,13 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
     Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ResolvedModelIdentity, Result, ToolCall, Usage,
+    ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 use reqwest::{
     Client, Response, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -708,6 +709,8 @@ impl Model for Anthropic {
         let requested_model = request.model.clone();
         let max_output_tokens = request.max_output_tokens;
         let provider = self.provider.clone();
+        let openrouter =
+            provider.as_ref() == "openrouter" || self.endpoint.host_str() == Some("openrouter.ai");
         let replay_scope = self.replay_scope.clone();
         let mut body = encode_request(request, &replay_scope)?;
         if let Some(level) = self.thinking_level.as_deref() {
@@ -882,6 +885,12 @@ impl Model for Anthropic {
                     }
                     Some("message_delta") if started => {
                         usage.update(&value["usage"], &mut metadata);
+                        if openrouter
+                            && let Some(cost) = ReportedUsageCost::deserialize(&value["usage"])
+                                .ok().and_then(|accounting| accounting.total())
+                        {
+                            metadata.cost_usd = Some(cost);
+                        }
                         if let Some(reason) = value["delta"]["stop_reason"].as_str() {
                             metadata.finish_reason = Some(match reason {
                                 "end_turn" | "stop_sequence" => "stop",

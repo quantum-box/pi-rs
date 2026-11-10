@@ -17,7 +17,7 @@ pub use compatibility::ChatCompatibility;
 
 use pi_rs_core::{
     Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ResolvedModelIdentity, Result, ToolCall, Usage,
+    ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 
 type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
@@ -669,8 +669,8 @@ impl Model for Ollama {
                         .or(stats.prompt_cache_hit_tokens)
                         .or(stats.cached_tokens);
                     metadata.cache_creation_input_tokens = details.cache_write_tokens;
-                    if let Some(cost) = stats.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
-                        metadata.cost_usd = serde_json::Number::from_f64(cost);
+                    if let Some(cost) = stats.accounting.total() {
+                        metadata.cost_usd = Some(cost);
                     }
                 }
                 for choice in chunk.choices {
@@ -804,7 +804,8 @@ struct WireUsage {
     prompt_cache_hit_tokens: Option<u64>,
     cached_tokens: Option<u64>,
     prompt_tokens_details: Option<PromptTokenDetails>,
-    cost: Option<f64>,
+    #[serde(flatten)]
+    accounting: ReportedUsageCost,
 }
 
 #[derive(Default, Deserialize)]

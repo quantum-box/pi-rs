@@ -259,6 +259,45 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+/// Usage accounting supplied by a compatible provider. BYOK charges can
+/// include separate gateway and upstream costs.
+#[derive(Default, Deserialize)]
+pub struct ReportedUsageCost {
+    #[serde(default)]
+    cost: Value,
+    #[serde(default)]
+    is_byok: Value,
+    #[serde(default)]
+    cost_details: Value,
+}
+
+impl ReportedUsageCost {
+    pub fn total(&self) -> Option<serde_json::Number> {
+        fn amount(value: &Value) -> Option<f64> {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+        }
+
+        let gateway = amount(&self.cost)?;
+        let total = match self.is_byok {
+            Value::Bool(true) => {
+                let upstream = match self.cost_details.get("upstream_inference_cost")? {
+                    Value::Null => {
+                        amount(&self.cost_details["upstream_inference_prompt_cost"])?
+                            + amount(&self.cost_details["upstream_inference_completions_cost"])?
+                    }
+                    total => amount(total)?,
+                };
+                gateway + upstream
+            }
+            Value::Bool(false) | Value::Null => gateway,
+            _ => return None,
+        };
+        serde_json::Number::from_f64(total)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelRequest {
     pub model: String,
@@ -269,7 +308,7 @@ pub struct ModelRequest {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelMetadata {
-    /// Provider- or importer-supplied total cost in USD; absent when unknown.
+    /// Provider, importer, or catalog estimate in USD, absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<serde_json::Number>,
     pub provider_request_id: Option<String>,
