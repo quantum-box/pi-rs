@@ -284,6 +284,16 @@ fn collect_matching(
             Ok(Vec::new())
         };
     }
+    if kind == Kind::Skill {
+        let mut files: Vec<_> = skill_files(path)
+            .into_iter()
+            .filter(|file| matches_pattern(file, path, matcher))
+            .map(|file| file.canonicalize())
+            .collect::<std::io::Result<_>>()?;
+        files.sort();
+        files.dedup();
+        return Ok(files);
+    }
     let mut files = Vec::new();
     for entry in ignore::WalkBuilder::new(path)
         .hidden(false)
@@ -307,15 +317,7 @@ fn collect_matching(
         };
         if entry.file_type().is_some_and(|kind| kind.is_file())
             && kind.accepts(entry.path())
-            && matcher.is_none_or(|matcher| {
-                entry
-                    .path()
-                    .ancestors()
-                    .take_while(|ancestor| ancestor.starts_with(path))
-                    .any(|candidate| {
-                        matcher.is_match(candidate.to_string_lossy().replace('\\', "/"))
-                    })
-            })
+            && matches_pattern(entry.path(), path, matcher)
         {
             files.push(entry.path().canonicalize()?);
         }
@@ -323,6 +325,54 @@ fn collect_matching(
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+fn matches_pattern(path: &Path, root: &Path, matcher: Option<&globset::GlobMatcher>) -> bool {
+    matcher.is_none_or(|matcher| {
+        path.ancestors()
+            .take_while(|ancestor| ancestor.starts_with(root))
+            .any(|candidate| matcher.is_match(candidate.to_string_lossy().replace('\\', "/")))
+    })
+}
+
+pub(super) fn skill_files(root: &Path) -> Vec<PathBuf> {
+    if root.is_file() {
+        return vec![root.to_owned()];
+    }
+    let mut files = Vec::new();
+    let mut declared_roots = std::collections::BTreeSet::new();
+    for entry in ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .parents(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .add_custom_ignore_filename(".fdignore")
+        .follow_links(true)
+        .filter_entry(|entry| entry.file_name() != "node_modules")
+        .build()
+        .flatten()
+    {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if entry.file_name() == "SKILL.md" {
+            let path = entry.into_path();
+            declared_roots.insert(path.parent().expect("skill parent directory").to_owned());
+            files.push(path);
+        } else if entry.depth() == 1 && entry.path().extension().is_some_and(|ext| ext == "md") {
+            files.push(entry.into_path());
+        }
+    }
+    files.retain(|path| {
+        let mut ancestors = path.ancestors().skip(1);
+        if path.file_name().is_some_and(|name| name == "SKILL.md") {
+            ancestors.next();
+        }
+        !ancestors.any(|directory| declared_roots.contains(directory))
+    });
+    files.sort();
+    files
 }
 
 #[cfg(test)]

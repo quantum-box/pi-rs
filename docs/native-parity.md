@@ -2418,3 +2418,19 @@ journal. Codemode rejects image-bearing classifier and image-generation
 inputs while the setting is on. The `/settings` toggle takes effect on the
 next request. A PTY and loopback check covered local display, user and tool
 image delivery, a live setting change, and blocked Codemode calls.
+
+### Skill and prompt discovery
+
+Skill directories recognize `SKILL.md` roots and direct Markdown skill
+files, skip hidden and dependency directories, and honor local ignore
+files. A declared root takes precedence over nested skills. Name and
+description diagnostics preserve otherwise loadable skills. Malformed
+prompt templates report their path while other templates remain usable.
+Prompt descriptions without frontmatter use a bounded first-line preview.
+
+Native `grep` now applies inclusion and exclusion globs with the same
+walker semantics as ripgrep, including workspace-relative patterns. Explicit
+file targets still work with exclusion globs. Native `find` honors
+`.fdignore` and omits Git metadata directories while retaining ordinary
+hidden files and dependency directories.
+[fd manual](https://github.com/sharkdp/fd/blob/master/doc/fd.1)

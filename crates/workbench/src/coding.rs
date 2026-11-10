@@ -597,12 +597,7 @@ impl CodingTool {
                     .compile_matcher(),
             )
         } else {
-            args["glob"]
-                .as_str()
-                .map(globset::Glob::new)
-                .transpose()
-                .map_err(|error| Error::Config(error.to_string()))?
-                .map(|glob| glob.compile_matcher())
+            None
         };
         let mut grep = if is_find {
             None
@@ -622,7 +617,20 @@ impl CodingTool {
             let inside_git = base.ancestors().any(|path| path.join(".git").exists());
             walker
                 .require_git(inside_git)
+                .add_custom_ignore_filename(".fdignore")
+                .filter_entry(|entry| {
+                    entry.depth() == 0
+                        || entry.file_name() != ".git"
+                        || !entry.file_type().is_some_and(|kind| kind.is_dir())
+                })
                 .sort_by_file_path(std::path::Path::cmp);
+        } else if let Some(glob) = args["glob"].as_str() {
+            let mut overrides = ignore::overrides::OverrideBuilder::new(&self.root);
+            let overrides = overrides
+                .add(glob)
+                .and_then(|builder| builder.build())
+                .map_err(|error| Error::Config(error.to_string()))?;
+            walker.overrides(overrides);
         }
         for entry in walker.build() {
             let entry = entry.map_err(|error| Error::Config(error.to_string()))?;
@@ -637,16 +645,12 @@ impl CodingTool {
                 .ok()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new(entry.file_name()));
-            let match_path = if is_find && pattern.contains('/') {
+            let match_path = if pattern.contains('/') {
                 entry.path()
-            } else if is_find {
-                Path::new(entry.file_name())
             } else {
-                relative
+                Path::new(entry.file_name())
             };
-            if glob.as_ref().is_some_and(|glob| {
-                !glob.is_match(match_path) && (is_find || !glob.is_match(entry.file_name()))
-            }) {
+            if glob.as_ref().is_some_and(|glob| !glob.is_match(match_path)) {
                 continue;
             }
             if let Some(grep) = &mut grep {
@@ -1470,12 +1474,13 @@ mod tests {
     }
 
     #[test]
-    fn find_uses_ignore_rules_instead_of_excluding_named_directories() {
+    fn find_keeps_dependency_paths_but_respects_vcs_and_fd_ignores() {
         let root = tempfile::tempdir().unwrap();
-        for directory in ["node_modules/nested", ".git/objects", "src"] {
+        for directory in ["node_modules/nested", ".git/objects", "src", "fd-ignored"] {
             std::fs::create_dir_all(root.path().join(directory)).unwrap();
             std::fs::write(root.path().join(directory).join("sample.rs"), "").unwrap();
         }
+        std::fs::write(root.path().join(".fdignore"), "fd-ignored/\n").unwrap();
         let tool = CodingTool {
             unrestricted: false,
             shell: ShellConfig::default(),
@@ -1486,7 +1491,7 @@ mod tests {
             tool.search(&json!({"pattern":"**/*.rs"}))
                 .unwrap()
                 .tool_content(),
-            ".git/objects/sample.rs\nnode_modules/nested/sample.rs\nsrc/sample.rs"
+            "node_modules/nested/sample.rs\nsrc/sample.rs"
         );
         assert_eq!(
             tool.search(&json!({"pattern":"**/*.rs", "path":"node_modules"}))
@@ -1618,6 +1623,39 @@ mod tests {
                 .unwrap()
                 .tool_content(),
             "main.rs:1: fn main() {}"
+        );
+    }
+
+    #[test]
+    fn grep_globs_accept_exclusions_and_workspace_relative_patterns() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        for file in ["src/a.rs", "src/b.txt"] {
+            std::fs::write(root.path().join(file), "needle\n").unwrap();
+        }
+        let tool = CodingTool {
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        assert_eq!(
+            tool.search(&json!({"pattern":"needle","path":"src","glob":"!*.rs"}))
+                .unwrap()
+                .tool_content(),
+            "b.txt:1: needle"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"needle","path":"src","glob":"/src/*.rs"}))
+                .unwrap()
+                .tool_content(),
+            "a.rs:1: needle"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"needle","path":"src/a.rs","glob":"!*.rs"}))
+                .unwrap()
+                .tool_content(),
+            "a.rs:1: needle"
         );
     }
 

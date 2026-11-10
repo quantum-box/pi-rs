@@ -148,45 +148,34 @@ impl Resources {
                 resources.append_system = read(&append)?;
             }
         }
-        for root in skill_roots {
-            let mut files = Vec::new();
-            if root.is_file() {
-                files.push(root);
-            } else if root.is_dir() {
-                for entry in ignore::WalkBuilder::new(root)
-                    .hidden(false)
-                    .git_ignore(false)
-                    .follow_links(true)
-                    .build()
-                    .flatten()
-                {
-                    if entry.file_type().is_some_and(|kind| kind.is_file())
-                        && entry.file_name() == "SKILL.md"
-                    {
-                        files.push(entry.into_path());
-                    }
-                }
-            }
-            files.sort();
-            for path in files {
-                match parse_skill(&path) {
-                    Ok((name, skill)) => {
-                        if let std::collections::btree_map::Entry::Vacant(entry) =
-                            resources.skills.entry(name.clone())
-                        {
+        for path in skill_roots {
+            match parse_skill(&path) {
+                Ok((name, skill)) => {
+                    validate_skill(&name, &skill, &mut resources.warnings);
+                    match resources.skills.entry(name.clone()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
                             entry.insert(skill);
-                        } else {
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if entry.get().path != skill.path =>
+                        {
                             resources
                                 .warnings
                                 .push(format!("Duplicate skill {name} at {}", path.display()));
                         }
+                        _ => {}
                     }
-                    Err(error) => resources.warnings.push(error.to_string()),
                 }
+                Err(error) if path.file_name().is_some_and(|name| name == "SKILL.md") => {
+                    resources
+                        .warnings
+                        .push(format!("{}: {error}", path.display()));
+                }
+                Err(_) => {}
             }
         }
         for root in prompt_roots {
-            let files = if root.is_file() {
+            let mut files = if root.is_file() {
                 vec![root]
             } else {
                 std::fs::read_dir(root)
@@ -194,25 +183,34 @@ impl Resources {
                     .flatten()
                     .filter_map(|entry| entry.ok())
                     .map(|entry| entry.path())
-                    .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+                    .filter(|path| {
+                        path.is_file() && path.extension().is_some_and(|ext| ext == "md")
+                    })
                     .collect()
             };
+            files.sort();
             for path in files {
                 let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
                     continue;
                 };
-                let text = read(&path)?;
-                let (metadata, body) = frontmatter(&text)?;
-                resources.prompts.entry(name.into()).or_insert(Prompt {
-                    path: path.clone(),
-                    description: metadata.description.unwrap_or_else(|| {
-                        body.lines()
-                            .find(|line| !line.trim().is_empty())
-                            .unwrap_or("")
-                            .into()
-                    }),
-                    body,
-                });
+                match parse_prompt(&path) {
+                    Ok(prompt) => match resources.prompts.entry(name.into()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(prompt);
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if entry.get().path != prompt.path =>
+                        {
+                            resources
+                                .warnings
+                                .push(format!("Duplicate prompt {name} at {}", path.display()));
+                        }
+                        _ => {}
+                    },
+                    Err(error) => resources
+                        .warnings
+                        .push(format!("{}: {error}", path.display())),
+                }
             }
         }
         if resources.instructions.len() > 256 * 1024 {
@@ -329,17 +327,44 @@ fn resource_path(workspace: &Path, path: &str) -> PathBuf {
         workspace.join(path)
     }
 }
+fn validate_skill(name: &str, skill: &Skill, warnings: &mut Vec<String>) {
+    let mut warning = |message: &str| warnings.push(format!("{}: {message}", skill.path.display()));
+    let name_length = name.encode_utf16().count();
+    if name_length > 64 {
+        warning(&format!("name exceeds 64 characters ({name_length})"));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        warning("name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)");
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        warning("name must not start or end with a hyphen");
+    }
+    if name.contains("--") {
+        warning("name must not contain consecutive hyphens");
+    }
+    let description_length = skill.description.encode_utf16().count();
+    if description_length > 1024 {
+        warning(&format!(
+            "description exceeds 1024 characters ({description_length})"
+        ));
+    }
+}
+
 fn parse_skill(path: &Path) -> Result<(String, Skill)> {
     let text = read(path)?;
     let (metadata, _) = frontmatter(&text)?;
     let name = metadata
         .name
+        .filter(|name| !name.is_empty())
         .or_else(|| path.parent()?.file_name()?.to_str().map(str::to_owned))
-        .ok_or_else(|| Error::Config(format!("{} has no skill name", path.display())))?;
+        .ok_or_else(|| Error::Config("skill name is required".into()))?;
     let description = metadata
         .description
         .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| Error::Config(format!("{} has no skill description", path.display())))?;
+        .ok_or_else(|| Error::Config("description is required".into()))?;
     Ok((
         name,
         Skill {
@@ -349,25 +374,47 @@ fn parse_skill(path: &Path) -> Result<(String, Skill)> {
         },
     ))
 }
+fn parse_prompt(path: &Path) -> Result<Prompt> {
+    let (metadata, body) = frontmatter(&read(path)?)?;
+    let description = metadata
+        .description
+        .filter(|description| !description.is_empty())
+        .unwrap_or_else(|| {
+            let first = body
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or_default();
+            let mut characters = first.chars();
+            let mut description: String = characters.by_ref().take(60).collect();
+            if characters.next().is_some() {
+                description.push_str("...");
+            }
+            description
+        });
+    Ok(Prompt {
+        path: path.canonicalize()?,
+        description,
+        body,
+    })
+}
+
 fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
-    let text = text.trim_start_matches('\u{feff}');
-    if !text.starts_with("---\n") && !text.starts_with("---\r\n") {
-        return Ok((Frontmatter::default(), text.into()));
-    }
-    let mut lines = text.lines();
-    lines.next();
-    let mut yaml = String::new();
-    for line in lines.by_ref() {
-        if line == "---" {
-            return Ok((
-                serde_yaml::from_str(&yaml).map_err(|error| Error::Config(error.to_string()))?,
-                lines.collect::<Vec<_>>().join("\n"),
-            ));
-        }
-        yaml.push_str(line);
-        yaml.push('\n');
-    }
-    Err(Error::Config("unterminated resource frontmatter".into()))
+    let normalized = text
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let Some(end) = normalized
+        .strip_prefix("---")
+        .and_then(|rest| rest.find("\n---"))
+        .map(|index| index + 3)
+    else {
+        return Ok((Frontmatter::default(), normalized));
+    };
+    let yaml = normalized.get(4..=end).unwrap_or_default();
+    let metadata = serde_yaml::from_str::<Option<Frontmatter>>(yaml)
+        .map_err(|error| Error::Config(error.to_string()))?
+        .unwrap_or_default();
+    Ok((metadata, normalized[end + 4..].trim().into()))
 }
 pub fn prompt_argument(workspace: &Path, argument: &str) -> Result<String> {
     let path = resource_path(workspace, argument);
@@ -436,6 +483,65 @@ fn expand_arguments(body: &str, arguments: &str) -> Result<String> {
 mod tests {
     use super::*;
     #[test]
+    fn skill_discovery_honors_declared_roots_hidden_paths_and_local_ignores() {
+        use super::super::resource_paths::skill_files;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for path in [
+            "declared/SKILL.md",
+            "declared/child/SKILL.md",
+            "group/second/SKILL.md",
+            "group/nested-legacy.md",
+            "git-hidden/SKILL.md",
+            "ignore-hidden/SKILL.md",
+            "fd-hidden/SKILL.md",
+            ".private/SKILL.md",
+            "node_modules/vendor/SKILL.md",
+            "legacy.md",
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "---\ndescription: fixture\n---\nSkill content").unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "git-hidden/\n").unwrap();
+        std::fs::write(root.join(".ignore"), "ignore-hidden/\n").unwrap();
+        std::fs::write(root.join(".fdignore"), "fd-hidden/\n").unwrap();
+        assert_eq!(
+            skill_files(root),
+            [
+                root.join("declared/SKILL.md"),
+                root.join("group/second/SKILL.md"),
+                root.join("legacy.md"),
+            ],
+        );
+        let declared = root.join("declared");
+        assert_eq!(skill_files(&declared), [declared.join("SKILL.md")]);
+    }
+
+    #[test]
+    fn skill_metadata_warnings_preserve_loadable_skills() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("SKILL.md");
+        let description = "x".repeat(1025);
+        std::fs::write(
+            &file,
+            format!("---\nname: -Bad--name\ndescription: {description}\n---\nBody"),
+        )
+        .unwrap();
+        let (name, skill) = parse_skill(&file).unwrap();
+        assert_eq!(name, "-Bad--name");
+        let mut warnings = Vec::new();
+        validate_skill(&name, &skill, &mut warnings);
+        assert_eq!(warnings.len(), 4);
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message.contains("exceeds 1024"))
+        );
+        assert!(warnings.iter().all(|message| message.contains("SKILL.md")));
+    }
+
+    #[test]
     fn prompt_arguments_accept_text_and_workspace_relative_files() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("system.md"), "File instruction").unwrap();
@@ -478,6 +584,41 @@ mod tests {
         assert!(!custom.contains("<rules>"));
         assert!(custom.contains("<skills>"));
     }
+    #[test]
+    fn malformed_prompt_warns_without_hiding_other_prompts() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        std::fs::write(workspace.join("broken.md"), "---\ndescription: [\n---\nBad").unwrap();
+        let description = "日".repeat(61);
+        std::fs::write(
+            workspace.join("valid.md"),
+            format!("---\n---\n{description}"),
+        )
+        .unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--prompt-template",
+            ".",
+        ])
+        .unwrap();
+        args.workspace = workspace.to_owned();
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.prompts.keys().collect::<Vec<_>>(), ["valid"]);
+        assert_eq!(
+            resources.prompts["valid"].description,
+            format!("{}...", "日".repeat(60))
+        );
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("broken.md"))
+        );
+    }
+
     #[test]
     fn disabled_discovery_keeps_explicit_resource_paths() {
         use clap::Parser;
