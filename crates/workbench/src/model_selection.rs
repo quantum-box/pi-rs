@@ -31,9 +31,12 @@ impl ScopedChoice {
     }
 }
 
-pub fn qualified_model(value: &str) -> Option<(Provider, &str)> {
+pub fn qualified_model<'a>(
+    value: &'a str,
+    profiles: &super::model_profiles::Profiles,
+) -> Option<(Provider, &'a str)> {
     let (provider, model) = value.split_once('/')?;
-    Some((Provider::named(provider)?, model))
+    Some((profiles.provider(provider)?, model))
 }
 
 pub struct Catalog {
@@ -56,8 +59,8 @@ impl Catalog {
             Default::default()
         };
         for model in models {
-            if let Some(metadata) = profiles.model(self.provider, model) {
-                metadata.apply(self.provider, details.entry(model.clone()).or_default());
+            if let Some(metadata) = profiles.model(&self.provider, model) {
+                metadata.apply(&self.provider, details.entry(model.clone()).or_default());
             }
         }
         details
@@ -73,9 +76,9 @@ impl Catalog {
 }
 
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
-    let endpoint = args.endpoint_for(provider);
-    let client = provider.connect(endpoint, args.model_token_for(provider, endpoint))?;
-    let mut models = args.model_profiles.model_ids(provider);
+    let endpoint = args.endpoint_for(&provider);
+    let client = provider.connect(endpoint, args.model_token_for(&provider, endpoint))?;
+    let mut models = args.model_profiles.model_ids(&provider);
     let mut probe_details = false;
     if probe {
         match client.models().await {
@@ -88,7 +91,7 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
             Err(_) => {}
         }
     }
-    let aliases = aliases(&args.model_profiles, provider, &models);
+    let aliases = aliases(&args.model_profiles, &provider, &models);
     Ok(Catalog {
         provider,
         client,
@@ -99,14 +102,14 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
 }
 
 pub async fn catalogs(args: &Cli, automatic: bool) -> Result<Vec<Catalog>> {
-    let providers = std::iter::once(args.provider).chain(
-        Provider::ALL
-            .into_iter()
+    let providers = std::iter::once(args.provider.clone()).chain(
+        args.model_profiles
+            .providers()
             .filter(|provider| *provider != args.provider),
     );
     let discovered = futures_util::future::join_all(providers.filter_map(|provider| {
-        let probe = !automatic || args.allow_endpoint_probes(args.endpoint_for(provider));
-        (probe || !args.model_profiles.model_ids(provider).is_empty())
+        let probe = !automatic || args.allow_endpoint_probes(args.endpoint_for(&provider));
+        (probe || !args.model_profiles.model_ids(&provider).is_empty())
             .then_some(catalog(args, provider, probe))
     }))
     .await;
@@ -141,8 +144,14 @@ pub fn scoped_choices<'a>(
         .filter(|pattern| !pattern.is_empty())
     {
         let glob = pattern.contains(['*', '?', '[']);
-        let qualified = qualified_model(pattern)
-            .map(|(provider, _)| provider)
+        let qualified = pattern
+            .split_once('/')
+            .and_then(|(prefix, _)| {
+                catalogs
+                    .iter()
+                    .find(|catalog| prefix.eq_ignore_ascii_case(catalog.provider.id()))
+                    .map(|catalog| &catalog.provider)
+            })
             .or_else(|| {
                 if glob {
                     return None;
@@ -154,12 +163,12 @@ pub fn scoped_choices<'a>(
                             || thinking_suffix(pattern)
                                 .is_some_and(|(model, _)| catalog.has_exact(model))
                     })
-                    .map(|catalog| catalog.provider)
+                    .map(|catalog| &catalog.provider)
             });
         let mut matched = false;
         for catalog in catalogs
             .iter()
-            .filter(|catalog| qualified.is_none_or(|provider| provider == catalog.provider))
+            .filter(|catalog| qualified.is_none_or(|provider| provider == &catalog.provider))
         {
             let candidates = search_ids(&catalog.models, &catalog.aliases);
             let resolved = scope([pattern], &candidates, catalog.provider.id());
@@ -174,7 +183,7 @@ pub fn scoped_choices<'a>(
                     existing.provider != catalog.provider || existing.model != choice.model
                 }) {
                     selected.push(ScopedChoice {
-                        provider: catalog.provider,
+                        provider: catalog.provider.clone(),
                         model: choice.model,
                         thinking: choice.thinking,
                     });
@@ -194,7 +203,7 @@ pub fn scoped_choices<'a>(
 pub fn split_with_profiles(
     value: &str,
     available: &[String],
-    provider: Provider,
+    provider: &Provider,
     profiles: &super::model_profiles::Profiles,
 ) -> Result<Choice> {
     let mut ids = available.to_vec();
@@ -211,7 +220,7 @@ pub fn split_with_profiles(
 
 fn aliases(
     profiles: &super::model_profiles::Profiles,
-    provider: Provider,
+    provider: &Provider,
     ids: &[String],
 ) -> Vec<(String, String)> {
     ids.iter()

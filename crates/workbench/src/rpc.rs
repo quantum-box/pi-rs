@@ -501,7 +501,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             };
             args.change_model(next.provider, next.model, next.thinking)?;
             Ok(Some(
-                json!({"model":model_value(args, args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
+                json!({"model":model_value(args, &args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
             ))
         }
         "get_available_thinking_levels" => {
@@ -594,10 +594,10 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         }
         "set_model" if !busy(worker) => {
             let provider = match request.get("provider") {
-                None => args.provider,
+                None => args.provider.clone(),
                 Some(value) => value
                     .as_str()
-                    .and_then(super::Provider::named)
+                    .and_then(|name| args.model_profiles.provider(name))
                     .ok_or_else(|| Error::Config("unsupported model provider".into()))?,
             };
             let model = request["modelId"]
@@ -605,7 +605,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| Error::Config("modelId is required".into()))?;
             args.change_model(provider, model.to_owned(), None)?;
-            Ok(Some(model_value(args, args.provider, model)))
+            Ok(Some(model_value(args, &args.provider, model)))
         }
         "edit_context" if !busy(worker) => {
             let session = &mut Session::open(&args.session)?;
@@ -670,7 +670,7 @@ pub(super) fn snapshot_command(name: &str) -> bool {
 }
 
 fn state_flags(args: &Cli, worker: &Option<Worker>) -> Result<Value> {
-    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.bashing),"model":model_value(args, args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.bashing),"model":model_value(args, &args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
     state["autoCompactionEnabled"] = json!(args.settings.auto_compaction_enabled());
     state["steeringMode"] = json!(
         worker
@@ -766,13 +766,13 @@ pub(super) fn snapshot_response(
     }
 }
 
-fn model_value(args: &Cli, provider: super::Provider, model: &str) -> Value {
+fn model_value(args: &Cli, provider: &super::Provider, model: &str) -> Value {
     let configured = args.model_profiles.model(provider, model);
     let name = configured
         .as_ref()
         .and_then(|metadata| metadata.name.as_deref())
         .unwrap_or(model);
-    let value = json!({"id":model,"name":name,"provider":provider.id()});
+    let value = json!({"id":model,"name":name,"provider":provider.id(),"api":provider.api()});
     if let Some(configured) = configured {
         let mut details = pi_rs::ollama::ModelDetails::default();
         configured.apply(provider, &mut details);
@@ -799,9 +799,10 @@ fn available_models(
             let mut catalogs = super::model_selection::catalogs(&args, false).await?;
             if !include_details {
                 catalogs.sort_by_key(|catalog| {
-                    super::Provider::ALL
-                        .iter()
-                        .position(|provider| *provider == catalog.provider)
+                    args.model_profiles
+                        .providers()
+                        .position(|provider| provider == catalog.provider)
+                        .unwrap_or(usize::MAX)
                 });
             }
             let mut choices = Vec::new();
@@ -815,12 +816,12 @@ fn available_models(
                 for model in catalog.models {
                     if include_details {
                         rows.push(super::model_listing::with_details(
-                            model_value(&args, catalog.provider, &model),
+                            model_value(&args, &catalog.provider, &model),
                             details.get(&model),
                         ));
                     }
                     choices.push(ScopedChoice {
-                        provider: catalog.provider,
+                        provider: catalog.provider.clone(),
                         model,
                         thinking: None,
                     });

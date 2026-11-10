@@ -18,7 +18,7 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius sharing |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, named profiles for those APIs, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage | Model-provider OAuth and credential refresh |
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Input hooks for queued SDK controls, remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
@@ -2145,3 +2145,17 @@ limits, are protected from sampling overrides.
 The loopback fixture exercised level clamping, the actual request payload,
 and clearing the previous model's sampling configuration when switching
 models on the same connection.
+
+### Named model providers
+
+A custom provider in `models.json` uses its own ID, base URL, models and
+credentials. Its `api` selects one of the installed adapters
+(`openai-completions`, `anthropic-messages`, or `google-generative-ai`).
+Select it with `--provider`, a qualified `--model provider/id`, RPC
+`set_model`, or the terminal's model picker. Named providers participate
+in scopes, saved model selection and the masked API key controls.
+
+The RPC and terminal fixtures used two providers with the same model ID
+and different local endpoints and authentication schemes. They covered
+switching, credentials bound to each connection, journal restoration,
+and provider identity in the transcript.

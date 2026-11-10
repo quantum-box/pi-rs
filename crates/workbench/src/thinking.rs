@@ -18,22 +18,24 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     }
     if let Some(levels) = args
         .model_profiles
-        .model(args.provider, &args.model)
-        .and_then(|model| model.levels(args.provider))
+        .model(&args.provider, &args.model)
+        .and_then(|model| model.levels(&args.provider))
     {
         args.thinking_profile = Some((args.model.clone(), levels.clone()));
         return levels;
     }
-    let fallback = || match args.provider {
-        super::Provider::Ollama => LEVELS.iter().map(|level| (*level).into()).collect(),
-        super::Provider::Anthropic => vec!["off".into()],
-        super::Provider::Google => pi_rs::google::model_thinking_levels(&args.model),
+    let fallback = || match args.provider.adapter() {
+        super::providers::Adapter::ChatCompletions => {
+            LEVELS.iter().map(|level| (*level).into()).collect()
+        }
+        super::providers::Adapter::Anthropic => vec!["off".into()],
+        super::providers::Adapter::Google => pi_rs::google::model_thinking_levels(&args.model),
     };
     if !args.allow_model_probes() {
         return fallback();
     }
     let model = args.model.clone();
-    let provider = args.provider;
+    let provider = args.provider.clone();
     let endpoint = args.endpoint.clone();
     let token = args.model_token();
     let discovered = std::thread::spawn(move || {
@@ -74,7 +76,9 @@ fn clamp<'a>(requested: &str, levels: &'a [String]) -> &'a str {
 pub(super) fn adjust(args: &mut Cli) {
     if let Some(requested) = args.thinking.clone() {
         let levels = available(args);
-        if reported(args).is_some() || args.provider != super::Provider::Ollama {
+        if reported(args).is_some()
+            || args.provider.adapter() != super::providers::Adapter::ChatCompletions
+        {
             args.thinking = Some(clamp(&requested, &levels).into());
         }
     }

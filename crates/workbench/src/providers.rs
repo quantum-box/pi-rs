@@ -1,36 +1,73 @@
 //! Provider selection and shared workbench catalog and progress controls.
 use std::collections::BTreeMap;
 
-use clap::ValueEnum;
 use pi_rs::anthropic::Anthropic;
 use pi_rs::google::Google;
 use pi_rs::ollama::{ModelDetails, Ollama};
 use pi_rs::{Error, Model, ModelRequest, ModelStream, Result};
 use serde_json::json;
+use std::sync::Arc;
 
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) enum Provider {
+    #[default]
     Ollama,
     Anthropic,
     Google,
+    Custom {
+        id: Arc<str>,
+        adapter: Adapter,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Adapter {
+    ChatCompletions,
+    Anthropic,
+    Google,
+}
+
+impl Adapter {
+    pub fn named(api: &str) -> Option<Self> {
+        match api {
+            "openai-completions" => Some(Self::ChatCompletions),
+            "anthropic-messages" => Some(Self::Anthropic),
+            "google-generative-ai" => Some(Self::Google),
+            _ => None,
+        }
+    }
+
+    fn api(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "openai-completions",
+            Self::Anthropic => "anthropic-messages",
+            Self::Google => "google-generative-ai",
+        }
+    }
 }
 
 impl Provider {
     pub const ALL: [Self; 3] = [Self::Ollama, Self::Anthropic, Self::Google];
 
-    pub fn api(self) -> &'static str {
+    pub fn adapter(&self) -> Adapter {
         match self {
-            Self::Ollama => "openai-completions",
-            Self::Anthropic => "anthropic-messages",
-            Self::Google => "google-generative-ai",
+            Self::Ollama => Adapter::ChatCompletions,
+            Self::Anthropic => Adapter::Anthropic,
+            Self::Google => Adapter::Google,
+            Self::Custom { adapter, .. } => *adapter,
         }
     }
 
-    pub fn id(self) -> &'static str {
+    pub fn api(&self) -> &'static str {
+        self.adapter().api()
+    }
+
+    pub fn id(&self) -> &str {
         match self {
             Self::Ollama => "ollama",
             Self::Anthropic => "anthropic",
             Self::Google => "google",
+            Self::Custom { id, .. } => id,
         }
     }
 
@@ -40,26 +77,31 @@ impl Provider {
             .find(|provider| name.eq_ignore_ascii_case(provider.id()))
     }
 
-    pub fn default_endpoint(self) -> &'static str {
+    pub fn default_endpoint(&self) -> &'static str {
         match self {
             Self::Ollama => "http://127.0.0.1:11434/v1/chat/completions",
             Self::Anthropic => pi_rs::anthropic::DEFAULT_ENDPOINT,
             Self::Google => pi_rs::google::DEFAULT_ENDPOINT,
+            Self::Custom { .. } => "",
         }
     }
 
-    pub fn connect(self, endpoint: &str, token: Option<String>) -> Result<Client> {
-        match self {
-            Self::Ollama => Ok(Client::Ollama(Ollama::new(endpoint, token)?)),
-            Self::Anthropic => {
-                let token = token.ok_or_else(|| {
-                    Error::Config("set ANTHROPIC_API_KEY or pass --api-key".into())
-                })?;
+    pub fn connect(&self, endpoint: &str, token: Option<String>) -> Result<Client> {
+        let missing_key = || {
+            Error::Config(match self {
+                Self::Anthropic => "set ANTHROPIC_API_KEY or pass --api-key".into(),
+                Self::Google => "set GEMINI_API_KEY or pass --api-key".into(),
+                _ => format!("configure an API key for {}", self.id()),
+            })
+        };
+        match self.adapter() {
+            Adapter::ChatCompletions => Ok(Client::Ollama(Ollama::new(endpoint, token)?)),
+            Adapter::Anthropic => {
+                let token = token.ok_or_else(missing_key)?;
                 Ok(Client::Anthropic(Anthropic::new(endpoint, &token)?))
             }
-            Self::Google => {
-                let token = token
-                    .ok_or_else(|| Error::Config("set GEMINI_API_KEY or pass --api-key".into()))?;
+            Adapter::Google => {
+                let token = token.ok_or_else(missing_key)?;
                 Ok(Client::Google(Google::new(endpoint, &token)?))
             }
         }
@@ -158,7 +200,7 @@ impl Client {
         let thinking = args.provider_thinking();
         Ok(match self {
             Self::Ollama(client) => {
-                let configured = args.model_profiles.model(args.provider, &args.model);
+                let configured = args.model_profiles.model(&args.provider, &args.model);
                 let mapped = configured
                     .as_ref()
                     .and_then(|model| model.mapped_effort(thinking?));

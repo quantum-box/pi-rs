@@ -14,7 +14,8 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         .filter(|term| !term.is_empty())
         .collect();
     let provider = args.provider.id();
-    let catalog = model_selection::catalog(args, args.provider, args.allow_model_probes()).await?;
+    let catalog =
+        model_selection::catalog(args, args.provider.clone(), args.allow_model_probes()).await?;
     let catalog_empty = catalog.models.is_empty();
     let models: Vec<_> = catalog
         .models
@@ -22,7 +23,7 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         .filter(|model| {
             let configured_name = args
                 .model_profiles
-                .model(args.provider, model)
+                .model(&args.provider, model)
                 .and_then(|metadata| metadata.name)
                 .unwrap_or_default();
             let candidate = format!("{provider} {model} {configured_name}");
@@ -37,7 +38,7 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         for model in models {
             let name = args
                 .model_profiles
-                .model(args.provider, &model)
+                .model(&args.provider, &model)
                 .and_then(|metadata| metadata.name)
                 .unwrap_or_else(|| model.clone());
             output(with_details(

@@ -319,6 +319,21 @@ impl Projection {
                     })
                     .or_else(|| model.map(|model| model.provider))
                     .unwrap_or("ollama");
+                let provider = model
+                    .filter(|selected| Provider::named(selected.provider).is_none())
+                    .map_or(provider, |selected| selected.provider);
+                let api = Provider::named(provider)
+                    .or_else(|| {
+                        replay
+                            .as_ref()
+                            .and_then(|replay| Provider::named(&replay.identity.provider))
+                    })
+                    .or_else(|| {
+                        finalized
+                            .and_then(|entry| entry.metadata.resolved_model.as_ref())
+                            .and_then(|identity| Provider::named(&identity.provider))
+                    })
+                    .map_or("openai-completions", |provider| provider.api());
                 let model_id = model
                     .filter(|model| !model.model.is_empty())
                     .map(|model| model.model)
@@ -352,7 +367,7 @@ impl Projection {
                     .unwrap_or_default();
                 let mut value = json!({
                     "role":"assistant","content":blocks,"provider":provider,
-                    "api":Provider::named(provider).map_or("unknown", Provider::api),
+                    "api":api,
                     "model":model_id,"timestamp":timestamp,"stopReason":stop,
                     "usage":super::rpc_events::usage_value(usage, metadata)
                 });

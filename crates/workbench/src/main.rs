@@ -132,13 +132,9 @@ struct Cli {
     #[arg(long, global = true)]
     trace: bool,
     /// Model provider used by this invocation.
-    #[arg(
-        long,
-        global = true,
-        value_enum,
-        default_value = "ollama",
-        ignore_case = true
-    )]
+    #[arg(long = "provider", global = true)]
+    provider_argument: Option<String>,
+    #[arg(skip)]
     provider: Provider,
     /// Model served by the selected provider.
     #[arg(long, default_value = "qwen2.5:7b", global = true)]
@@ -278,14 +274,14 @@ impl Cli {
     fn effective_context_window(&self) -> Option<u32> {
         self.context_window.or_else(|| {
             self.model_profiles
-                .model(self.provider, &self.model)?
+                .model(&self.provider, &self.model)?
                 .context_window
         })
     }
 
     fn effective_max_output_tokens(&self) -> u32 {
         self.model_profiles
-            .model(self.provider, &self.model)
+            .model(&self.provider, &self.model)
             .and_then(|model| model.max_tokens)
             .map_or(self.max_output_tokens, |max| {
                 self.max_output_tokens.min(max)
@@ -295,7 +291,7 @@ impl Cli {
     fn provider_thinking(&self) -> Option<&str> {
         if self
             .model_profiles
-            .model(self.provider, &self.model)
+            .model(&self.provider, &self.model)
             .is_some_and(|model| model.reasoning == Some(false))
         {
             None
@@ -319,14 +315,14 @@ impl Cli {
         Duration::from_secs(self.tool_timeout_secs.unwrap_or(2_147_483))
     }
     fn model_token(&self) -> Option<String> {
-        self.model_token_for(self.provider, &self.endpoint)
+        self.model_token_for(&self.provider, &self.endpoint)
     }
 
-    fn model_token_for(&self, provider: Provider, endpoint: &str) -> Option<String> {
+    fn model_token_for(&self, provider: &Provider, endpoint: &str) -> Option<String> {
         let initial = self
             .initial_connection
             .as_ref()
-            .is_none_or(|(original, address)| *original == provider && address == endpoint);
+            .is_none_or(|(original, address)| original == provider && address == endpoint);
         let override_key = initial
             .then(|| {
                 self.api_key
@@ -355,8 +351,8 @@ impl Cli {
         if provider == self.provider {
             return Ok(());
         }
-        let endpoint = self.endpoint_for(provider).to_owned();
-        provider.connect(&endpoint, self.model_token_for(provider, &endpoint))?;
+        let endpoint = self.endpoint_for(&provider).to_owned();
+        provider.connect(&endpoint, self.model_token_for(&provider, &endpoint))?;
         self.provider = provider;
         self.endpoint = endpoint;
         self.thinking_profile = None;
@@ -367,13 +363,13 @@ impl Cli {
         Ok(())
     }
 
-    fn endpoint_for(&self, provider: Provider) -> &str {
-        if provider == self.provider {
+    fn endpoint_for(&self, provider: &Provider) -> &str {
+        if provider == &self.provider {
             return &self.endpoint;
         }
         self.initial_connection
             .as_ref()
-            .filter(|(original, _)| self.endpoint_explicit && *original == provider)
+            .filter(|(original, _)| self.endpoint_explicit && original == provider)
             .map_or_else(
                 || self.model_profiles.endpoint(provider),
                 |(_, endpoint)| endpoint,
@@ -382,14 +378,21 @@ impl Cli {
 
     fn reload_model_profiles(&mut self) -> Result<()> {
         let profiles = model_profiles::Profiles::load()?;
+        let provider = profiles.provider(self.provider.id()).ok_or_else(|| {
+            Error::Config(format!(
+                "model provider {} is no longer configured",
+                self.provider.id()
+            ))
+        })?;
         let explicit_current_endpoint = self.endpoint_explicit
             && self
                 .initial_connection
                 .as_ref()
-                .is_some_and(|(provider, _)| *provider == self.provider);
+                .is_some_and(|(initial, _)| initial.id() == provider.id());
         if !explicit_current_endpoint {
-            self.endpoint = profiles.endpoint(self.provider).to_owned();
+            self.endpoint = profiles.endpoint(&provider).to_owned();
         }
+        self.provider = provider;
         self.model_profiles = profiles;
         self.thinking_profile = None;
         Ok(())
@@ -415,7 +418,7 @@ impl Cli {
         Ok(())
     }
     fn configured_model_name(&self, model: &str) -> String {
-        match self.provider {
+        match &self.provider {
             Provider::Ollama => model.into(),
             provider => format!("{}/{model}", provider.id()),
         }
@@ -434,7 +437,7 @@ impl Cli {
             })
             .or_else(|| self.thinking.clone());
     }
-    fn recorded_provider(&self) -> Option<&'static str> {
+    fn recorded_provider(&self) -> Option<&str> {
         (self.provider != Provider::Ollama).then(|| self.provider.id())
     }
 
@@ -452,7 +455,7 @@ impl Cli {
         thinking: Option<String>,
         provider: Option<&str>,
     ) {
-        let Some(provider) = Provider::named(provider.unwrap_or("ollama")) else {
+        let Some(provider) = self.model_profiles.provider(provider.unwrap_or("ollama")) else {
             return;
         };
         let in_scope = self.model_scope.is_empty()
@@ -651,32 +654,33 @@ async fn run_cli() {
         let provider_prefix = |model: &str| {
             model
                 .split_once('/')
-                .and_then(|(prefix, _)| Provider::named(prefix))
+                .and_then(|(prefix, _)| args.model_profiles.provider(prefix))
         };
         let configured_provider = configured_model
             .and_then(provider_prefix)
             .or_else(|| {
                 args.settings
                     .string("defaultProvider")
-                    .and_then(Provider::named)
+                    .and_then(|name| args.model_profiles.provider(name))
             })
-            .unwrap_or(Provider::Ollama);
-        if matches.value_source("provider") != Some(clap::parser::ValueSource::CommandLine) {
-            args.provider = if args.model_explicit {
-                provider_prefix(&args.model).unwrap_or(configured_provider)
-            } else {
-                configured_provider
-            };
-        }
+            .unwrap_or_default();
+        args.provider = if let Some(name) = args.provider_argument.as_deref() {
+            args.model_profiles
+                .provider(name)
+                .ok_or_else(|| Error::Config(format!("unknown model provider {name:?}")))?
+        } else if args.model_explicit {
+            provider_prefix(&args.model).unwrap_or_else(|| configured_provider.clone())
+        } else {
+            configured_provider.clone()
+        };
         let explicit_endpoint =
             matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
         args.endpoint_explicit = explicit_endpoint;
-        args.connection_explicit = explicit_endpoint
-            || matches.value_source("provider") == Some(clap::parser::ValueSource::CommandLine);
+        args.connection_explicit = explicit_endpoint || args.provider_argument.is_some();
         if !explicit_endpoint {
-            args.endpoint = args.model_profiles.endpoint(args.provider).into();
+            args.endpoint = args.model_profiles.endpoint(&args.provider).into();
         }
-        args.initial_connection = Some((args.provider, args.endpoint.clone()));
+        args.initial_connection = Some((args.provider.clone(), args.endpoint.clone()));
         if !args.model_explicit {
             if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
                 args.model = model.into();
@@ -778,7 +782,10 @@ async fn execute(mut args: Cli) -> Result<()> {
     let catalogs = if has_patterns {
         model_selection::catalogs(&args, true).await?
     } else if needs_default_model {
-        vec![model_selection::catalog(&args, args.provider, args.allow_model_probes()).await?]
+        vec![
+            model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes())
+                .await?,
+        ]
     } else {
         Vec::new()
     };
@@ -791,7 +798,7 @@ async fn execute(mut args: Cli) -> Result<()> {
         let selected = model_selection::split_with_profiles(
             &args.model,
             available,
-            args.provider,
+            &args.provider,
             &args.model_profiles,
         )?;
         args.model = selected.model;

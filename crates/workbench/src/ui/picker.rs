@@ -119,7 +119,7 @@ pub struct Picker {
 }
 
 struct ModelScope {
-    provider: &'static str,
+    provider: String,
     catalog: Vec<String>,
     enabled: Vec<String>,
 }
@@ -163,16 +163,12 @@ impl Picker {
             model_scope: None,
         }
     }
-    pub fn scoped_models(
-        provider: &'static str,
-        catalog: Vec<String>,
-        mut enabled: Vec<String>,
-    ) -> Self {
+    pub fn scoped_models(provider: &str, catalog: Vec<String>, mut enabled: Vec<String>) -> Self {
         let available: std::collections::HashSet<_> = catalog.iter().collect();
         enabled.retain(|model| available.contains(model));
         let mut picker = Self {
             model_scope: Some(ModelScope {
-                provider,
+                provider: provider.to_owned(),
                 catalog,
                 enabled,
             }),
@@ -201,10 +197,9 @@ impl Picker {
                     .filter(|model| !enabled.contains(model)),
             )
             .map(|model| {
-                let (id, provider) = crate::model_selection::qualified_model(model)
-                    .map_or((model.as_str(), scope.provider), |(provider, id)| {
-                        (id, provider.id())
-                    });
+                let (provider, id) = model
+                    .split_once('/')
+                    .unwrap_or((&scope.provider, model.as_str()));
                 Item {
                     label: format!(
                         "{} {id} [{provider}]",
@@ -272,16 +267,19 @@ impl Picker {
             let targets = if toggle {
                 selected.into_iter().cloned().collect()
             } else if provider {
-                let provider_id = |model: &str| {
-                    crate::model_selection::qualified_model(model)
-                        .map_or(scope.provider, |(provider, _)| provider.id())
-                };
                 selected.map_or_else(Vec::new, |model| {
-                    let selected_provider = provider_id(model);
+                    let selected_provider = model
+                        .split_once('/')
+                        .map_or(scope.provider.as_str(), |(provider, _)| provider);
                     scope
                         .catalog
                         .iter()
-                        .filter(|model| provider_id(model) == selected_provider)
+                        .filter(|model| {
+                            model
+                                .split_once('/')
+                                .map_or(scope.provider.as_str(), |(provider, _)| provider)
+                                == selected_provider
+                        })
                         .cloned()
                         .collect()
                 })

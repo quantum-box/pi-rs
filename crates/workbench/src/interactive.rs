@@ -907,7 +907,7 @@ impl View {
         queue!(out, MoveTo(0, (height - 1) as u16))?;
         let model = format!(
             "{} · {}",
-            args.model,
+            args.configured_model_name(&args.model),
             args.thinking.as_deref().unwrap_or("default")
         );
         let model_width = UnicodeWidthStr::width(model.as_str());
@@ -1131,7 +1131,7 @@ impl View {
             &format!(
                 "↑↓ {} tokens · {} · {}",
                 self.tokens,
-                args.model,
+                args.configured_model_name(&args.model),
                 args.thinking.as_deref().unwrap_or("default")
             ),
             theme.color("dim"),
@@ -1339,9 +1339,10 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
-                let items = super::Provider::ALL
-                    .into_iter()
-                    .filter(|provider| login || args.model_keys.has(*provider))
+                let items = args
+                    .model_profiles
+                    .providers()
+                    .filter(|provider| login || args.model_keys.has(provider))
                     .map(|provider| Item {
                         label: provider.id().into(),
                         selection: if login {
@@ -1364,7 +1365,9 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     ));
                 }
             } else {
-                let provider = super::Provider::named(rest)
+                let provider = args
+                    .model_profiles
+                    .provider(rest)
                     .ok_or_else(|| Error::Config("unsupported model provider".into()))?;
                 if login {
                     edit_provider_key(provider, view);
@@ -1800,14 +1803,17 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     models
                                         .into_iter()
                                         .map(|model| Item {
-                                            label: super::model_selection::qualified_model(&model)
-                                                .and_then(|(provider, id)| {
-                                                    args.model_profiles.model(provider, id)?.name
-                                                })
-                                                .map_or_else(
-                                                    || model.clone(),
-                                                    |name| format!("{name} · {model}"),
-                                                ),
+                                            label: super::model_selection::qualified_model(
+                                                &model,
+                                                &args.model_profiles,
+                                            )
+                                            .and_then(|(provider, id)| {
+                                                args.model_profiles.model(&provider, id)?.name
+                                            })
+                                            .map_or_else(
+                                                || model.clone(),
+                                                |name| format!("{name} · {model}"),
+                                            ),
                                             selection: Selection::Model(model),
                                         })
                                         .collect(),
@@ -2017,8 +2023,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     Some(text),
                                 ),
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
-                                    *provider,
-                                    args.endpoint_for(*provider),
+                                    provider,
+                                    args.endpoint_for(provider),
                                     &text,
                                 )
                                 .and_then(|()| super::model_auth::Keys::load())
@@ -2093,7 +2099,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 Selection::Model(model) => args.settings.set_user(
                                     "defaultModel",
                                     json!(if model.split_once('/').is_some_and(|(name, _)| {
-                                        super::Provider::named(name).is_some()
+                                        args.model_profiles.provider(name).is_some()
                                     }) {
                                         model
                                     } else {
@@ -2626,14 +2632,12 @@ fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Res
 }
 
 fn edit_provider_key(provider: super::Provider, view: &mut View) {
-    view.local_editor = Some((
-        LocalEditor::ProviderKey(provider),
-        crate::ui::dialog::Dialog::secret(format!("{} API key", provider.id())),
-    ));
+    let dialog = crate::ui::dialog::Dialog::secret(format!("{} API key", provider.id()));
+    view.local_editor = Some((LocalEditor::ProviderKey(provider), dialog));
 }
 
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
-    let removed = super::model_auth::remove(provider)?;
+    let removed = super::model_auth::remove(&provider)?;
     args.model_keys = super::model_auth::Keys::load()?;
     view.append(&format!(
         "{} for {}",
@@ -2648,19 +2652,19 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
 }
 
 fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
-    let provider = super::model_selection::qualified_model(input)
-        .map_or(args.provider, |(provider, _)| provider);
+    let provider = super::model_selection::qualified_model(input, &args.model_profiles)
+        .map_or_else(|| args.provider.clone(), |(provider, _)| provider);
     let available = view
         .available_models
         .iter()
-        .filter_map(|model| super::model_selection::qualified_model(model))
+        .filter_map(|model| super::model_selection::qualified_model(model, &args.model_profiles))
         .filter(|(candidate, _)| *candidate == provider)
         .map(|(_, model)| model.to_owned())
         .collect::<Vec<_>>();
     let selected = super::model_selection::split_with_profiles(
         input,
         &available,
-        provider,
+        &provider,
         &args.model_profiles,
     )?;
     args.change_model(provider, selected.model, selected.thinking)
@@ -2677,7 +2681,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
         discovered = view
             .available_models
             .iter()
-            .filter_map(|model| qualified_model(model))
+            .filter_map(|model| qualified_model(model, &args.model_profiles))
             .map(|(provider, model)| ScopedChoice {
                 provider,
                 model: model.to_owned(),
@@ -2747,7 +2751,7 @@ fn update_model_scope(
         enabled
             .iter()
             .filter_map(|key| {
-                let (provider, model) = qualified_model(key)?;
+                let (provider, model) = qualified_model(key, &args.model_profiles)?;
                 Some(previous.get(key).map_or_else(
                     || ScopedChoice {
                         provider,

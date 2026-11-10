@@ -24,20 +24,21 @@ impl Keys {
     }
 
     fn parse(value: &Value) -> Self {
-        let entries = Provider::ALL
+        let entries = value
+            .as_object()
             .into_iter()
-            .filter_map(|provider| {
-                let entry = value.get(provider.id())?;
+            .flatten()
+            .filter_map(|(name, entry)| {
                 if entry["type"] != "api_key" {
                     return None;
                 }
                 let key = entry["key"].as_str().filter(|key| valid_key(key))?;
                 let endpoint = match entry.get("endpoint") {
-                    None => provider.default_endpoint(),
+                    None => Provider::named(name)?.default_endpoint(),
                     Some(value) => value.as_str()?,
                 };
                 Some((
-                    provider.id().to_owned(),
+                    name.to_ascii_lowercase(),
                     SavedKey {
                         endpoint: endpoint.to_owned(),
                         key: key.to_owned(),
@@ -48,17 +49,17 @@ impl Keys {
         Self { entries }
     }
 
-    pub fn get(&self, provider: Provider, endpoint: &str) -> Option<&str> {
+    pub fn get(&self, provider: &Provider, endpoint: &str) -> Option<&str> {
         let entry = self.entries.get(provider.id())?;
         (entry.endpoint == endpoint).then_some(entry.key.as_str())
     }
 
-    pub fn has(&self, provider: Provider) -> bool {
+    pub fn has(&self, provider: &Provider) -> bool {
         self.entries.contains_key(provider.id())
     }
 }
 
-pub(super) fn save(provider: Provider, endpoint: &str, key: &str) -> Result<()> {
+pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()> {
     let key = key.trim();
     if !valid_key(key) {
         return Err(Error::Config(
@@ -74,7 +75,7 @@ pub(super) fn save(provider: Provider, endpoint: &str, key: &str) -> Result<()> 
     })
 }
 
-pub(super) fn remove(provider: Provider) -> Result<bool> {
+pub(super) fn remove(provider: &Provider) -> Result<bool> {
     let mut removed = false;
     config::update_object(&config::agent_dir().join("auth.json"), |data| {
         if data
@@ -106,17 +107,17 @@ mod tests {
             "ollama": {"type":"api_key","key":"proxy-key","endpoint":proxy},
             "anthropic": {"type":"api_key","key":"legacy-key"},
         }));
-        assert_eq!(keys.get(Provider::Ollama, proxy), Some("proxy-key"));
+        assert_eq!(keys.get(&Provider::Ollama, proxy), Some("proxy-key"));
         assert!(
-            keys.get(Provider::Ollama, Provider::Ollama.default_endpoint())
+            keys.get(&Provider::Ollama, Provider::Ollama.default_endpoint())
                 .is_none()
         );
         assert_eq!(
-            keys.get(Provider::Anthropic, Provider::Anthropic.default_endpoint()),
+            keys.get(&Provider::Anthropic, Provider::Anthropic.default_endpoint()),
             Some("legacy-key")
         );
         assert!(
-            keys.get(Provider::Anthropic, "http://127.0.0.1:8001/v1/messages")
+            keys.get(&Provider::Anthropic, "http://127.0.0.1:8001/v1/messages")
                 .is_none()
         );
     }

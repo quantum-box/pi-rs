@@ -1,13 +1,13 @@
 //! User-level connection profiles for the installed provider adapters.
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use pi_rs::{Error, Result};
 use regex::{Captures, Regex};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Provider, config};
+use super::{Provider, config, providers::Adapter};
 
 #[derive(Clone, Default)]
 pub(super) struct Profiles {
@@ -16,6 +16,7 @@ pub(super) struct Profiles {
 
 #[derive(Clone)]
 struct Profile {
+    provider: Provider,
     endpoint: String,
     api_key: Option<String>,
     models: Vec<ConfiguredModel>,
@@ -94,7 +95,7 @@ impl ModelMetadata {
         }
     }
 
-    fn validate(&self, provider: Provider, id: &str) -> Result<()> {
+    fn validate(&self, provider: &Provider, id: &str) -> Result<()> {
         if id.trim().is_empty()
             || self
                 .name
@@ -108,7 +109,7 @@ impl ModelMetadata {
                 provider.id()
             )));
         }
-        if provider == Provider::Ollama {
+        if provider.adapter() == Adapter::ChatCompletions {
             pi_rs::ollama::validate_sampling(&self.sampling_params)?;
             for (level, parameters) in &self.sampling_params_by_thinking_level {
                 if !super::thinking::LEVELS.contains(&level.as_str()) {
@@ -131,11 +132,11 @@ impl ModelMetadata {
         Ok(())
     }
 
-    pub fn levels(&self, provider: Provider) -> Option<Vec<String>> {
+    pub fn levels(&self, provider: &Provider) -> Option<Vec<String>> {
         if self.reasoning == Some(false) {
             return Some(vec!["off".into()]);
         }
-        if provider != Provider::Ollama || self.thinking_level_map.is_empty() {
+        if provider.adapter() != Adapter::ChatCompletions || self.thinking_level_map.is_empty() {
             return None;
         }
         Some(
@@ -166,7 +167,7 @@ impl ModelMetadata {
         sampling
     }
 
-    pub fn apply(&self, provider: Provider, details: &mut pi_rs::ollama::ModelDetails) {
+    pub fn apply(&self, provider: &Provider, details: &mut pi_rs::ollama::ModelDetails) {
         details.context_window = self.context_window.or(details.context_window);
         details.max_output_tokens = self.max_tokens.or(details.max_output_tokens);
         details.reasoning = self.reasoning.or(details.reasoning);
@@ -195,8 +196,28 @@ impl Profiles {
             .ok_or_else(|| Error::Config("models.json providers must be an object".into()))?;
         let mut entries = BTreeMap::new();
         for (name, entry) in providers {
-            let Some(provider) = Provider::named(name) else {
-                continue;
+            let provider = if let Some(provider) = Provider::named(name) {
+                provider
+            } else {
+                let Some(adapter) = entry["api"].as_str().and_then(Adapter::named) else {
+                    continue;
+                };
+                if name.is_empty()
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+                {
+                    return Err(Error::Config("invalid custom model provider name".into()));
+                }
+                if entry["baseUrl"].as_str().is_none() {
+                    return Err(Error::Config(format!(
+                        "custom model provider {name} requires baseUrl"
+                    )));
+                }
+                Provider::Custom {
+                    id: Arc::from(name.to_ascii_lowercase()),
+                    adapter,
+                }
             };
             let profile = ConfiguredProfile::deserialize(entry).map_err(|_| {
                 Error::Config(format!("invalid models.json profile for {}", provider.id()))
@@ -214,11 +235,11 @@ impl Profiles {
             }
             let endpoint = profile.base_url.as_deref().map_or_else(
                 || Ok(provider.default_endpoint().to_owned()),
-                |base| endpoint_from_base(provider, base),
+                |base| endpoint_from_base(&provider, base),
             )?;
             let mut ids = std::collections::BTreeSet::new();
             for model in &profile.models {
-                model.metadata.validate(provider, &model.id)?;
+                model.metadata.validate(&provider, &model.id)?;
                 if !ids.insert(model.id.as_str()) {
                     return Err(Error::Config(format!(
                         "duplicate model {}/{}",
@@ -228,28 +249,52 @@ impl Profiles {
                 }
             }
             for (id, metadata) in &profile.model_overrides {
-                metadata.validate(provider, id)?;
+                metadata.validate(&provider, id)?;
             }
-            entries.insert(
-                provider.id().into(),
-                Profile {
-                    endpoint,
-                    api_key: profile.api_key,
-                    models: profile.models,
-                    overrides: profile.model_overrides,
-                },
-            );
+            let id = provider.id().to_owned();
+            if entries
+                .insert(
+                    id.clone(),
+                    Profile {
+                        provider,
+                        endpoint,
+                        api_key: profile.api_key,
+                        models: profile.models,
+                        overrides: profile.model_overrides,
+                    },
+                )
+                .is_some()
+            {
+                return Err(Error::Config(format!("duplicate model provider {id}")));
+            }
         }
         Ok(Self { entries })
     }
 
-    pub fn endpoint(&self, provider: Provider) -> &str {
+    pub fn provider(&self, name: &str) -> Option<Provider> {
+        Provider::named(name).or_else(|| {
+            self.entries
+                .get(&name.to_ascii_lowercase())
+                .map(|profile| profile.provider.clone())
+        })
+    }
+
+    pub fn providers(&self) -> impl Iterator<Item = Provider> + '_ {
+        Provider::ALL.into_iter().chain(
+            self.entries
+                .values()
+                .filter(|profile| matches!(profile.provider, Provider::Custom { .. }))
+                .map(|profile| profile.provider.clone()),
+        )
+    }
+
+    pub fn endpoint(&self, provider: &Provider) -> &str {
         self.entries
             .get(provider.id())
             .map_or_else(|| provider.default_endpoint(), |profile| &profile.endpoint)
     }
 
-    pub fn api_key(&self, provider: Provider, endpoint: &str) -> Option<String> {
+    pub fn api_key(&self, provider: &Provider, endpoint: &str) -> Option<String> {
         let profile = self.entries.get(provider.id())?;
         if profile.endpoint != endpoint {
             return None;
@@ -257,7 +302,7 @@ impl Profiles {
         expand_key(profile.api_key.as_deref()?)
     }
 
-    pub fn model_ids(&self, provider: Provider) -> Vec<String> {
+    pub fn model_ids(&self, provider: &Provider) -> Vec<String> {
         self.entries
             .get(provider.id())
             .into_iter()
@@ -265,7 +310,7 @@ impl Profiles {
             .collect()
     }
 
-    pub fn model(&self, provider: Provider, id: &str) -> Option<ModelMetadata> {
+    pub fn model(&self, provider: &Provider, id: &str) -> Option<ModelMetadata> {
         let profile = self.entries.get(provider.id())?;
         let model = profile
             .models
@@ -279,7 +324,7 @@ impl Profiles {
     }
 }
 
-fn endpoint_from_base(provider: Provider, base: &str) -> Result<String> {
+fn endpoint_from_base(provider: &Provider, base: &str) -> Result<String> {
     let invalid = || Error::Config(format!("invalid models.json baseUrl for {}", provider.id()));
     let mut url = reqwest::Url::parse(base).map_err(|_| invalid())?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
@@ -293,10 +338,10 @@ fn endpoint_from_base(provider: Provider, base: &str) -> Result<String> {
         return Err(invalid());
     }
 
-    let suffix = match provider {
-        Provider::Ollama => "/chat/completions",
-        Provider::Anthropic => "/messages",
-        Provider::Google => {
+    let suffix = match provider.adapter() {
+        Adapter::ChatCompletions => "/chat/completions",
+        Adapter::Anthropic => "/messages",
+        Adapter::Google => {
             if url.path() == "/" {
                 url.set_path("/v1beta");
             }
@@ -352,7 +397,7 @@ mod tests {
             "anthropic":{"baseUrl":"http://127.0.0.1:7001/v1","apiKey":"anthropic-profile"}
         }}))
         .unwrap();
-        args.endpoint = args.model_profiles.endpoint(Provider::Ollama).into();
+        args.endpoint = args.model_profiles.endpoint(&Provider::Ollama).into();
         args.initial_connection = Some((Provider::Ollama, args.endpoint.clone()));
         args.model_scope
             .push(super::super::model_selection::ScopedChoice {
@@ -367,7 +412,7 @@ mod tests {
         assert_eq!(args.endpoint, "http://127.0.0.1:7001/v1/messages");
         assert_eq!(args.model_token().as_deref(), Some("anthropic-profile"));
         assert!(
-            args.model_token_for(Provider::Anthropic, "http://127.0.0.1:7002/v1/messages")
+            args.model_token_for(&Provider::Anthropic, "http://127.0.0.1:7002/v1/messages")
                 .is_none()
         );
         args.activate_provider(Provider::Ollama).unwrap();
@@ -388,16 +433,16 @@ mod tests {
                 "existing":{"contextWindow":32000}
             }
         }}})).unwrap();
-        assert_eq!(profiles.model_ids(Provider::Ollama), ["custom"]);
-        let custom = profiles.model(Provider::Ollama, "custom").unwrap();
+        assert_eq!(profiles.model_ids(&Provider::Ollama), ["custom"]);
+        let custom = profiles.model(&Provider::Ollama, "custom").unwrap();
         assert_eq!(custom.name.as_deref(), Some("Local Fixture"));
         assert_eq!(custom.max_tokens, Some(100));
         assert_eq!(custom.context_window, Some(128_000));
         let mut details = pi_rs::ollama::ModelDetails::default();
-        custom.apply(Provider::Ollama, &mut details);
+        custom.apply(&Provider::Ollama, &mut details);
         assert_eq!(details.images, Some(true));
         assert_eq!(details.thinking_levels, Some(vec!["off".into()]));
-        let existing = profiles.model(Provider::Ollama, "existing").unwrap();
+        let existing = profiles.model(&Provider::Ollama, "existing").unwrap();
         assert_eq!(existing.context_window, Some(32000));
         assert_eq!(existing.max_tokens, None);
     }
@@ -412,8 +457,8 @@ mod tests {
             }],
             "modelOverrides":{"custom":{"samplingParamsByThinkingLevel":{"xhigh":{"temperature":0.2}}}}
         }}})).unwrap();
-        let model = profiles.model(Provider::Ollama, "custom").unwrap();
-        let levels = model.levels(Provider::Ollama).unwrap();
+        let model = profiles.model(&Provider::Ollama, "custom").unwrap();
+        let levels = model.levels(&Provider::Ollama).unwrap();
         assert!(
             !levels
                 .iter()
@@ -433,6 +478,25 @@ mod tests {
                 "models":[{"id":"invalid","samplingParams":{"messages":[]}}]
             }}}))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn named_profiles_keep_their_adapter_endpoint_and_model_identity() {
+        let profiles = Profiles::parse(&json!({"providers":{
+            "Local-Relay":{"api":"openai-completions","baseUrl":"http://127.0.0.1:7000/v1","models":[{"id":"same"}]},
+            "message-proxy":{"api":"anthropic-messages","baseUrl":"http://127.0.0.1:7001/v1","models":[{"id":"same"}]}
+        }})).unwrap();
+        let relay = profiles.provider("LOCAL-RELAY").unwrap();
+        let proxy = profiles.provider("message-proxy").unwrap();
+        assert_eq!(relay.id(), "local-relay");
+        assert_eq!(relay.adapter(), Adapter::ChatCompletions);
+        assert_eq!(proxy.adapter(), Adapter::Anthropic);
+        assert_ne!(relay, proxy);
+        assert_eq!(profiles.model_ids(&relay), ["same"]);
+        assert_eq!(
+            profiles.endpoint(&proxy),
+            "http://127.0.0.1:7001/v1/messages"
         );
     }
 }
