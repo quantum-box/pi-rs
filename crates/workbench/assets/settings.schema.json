@@ -69,6 +69,10 @@
     },
     "autocompleteMaxVisible": { "type": "integer", "minimum": 3, "maximum": 20 },
     "enableSkillCommands": { "type": "boolean" },
+    "images": {
+      "type": "object",
+      "properties": { "blockImages": { "type": "boolean" } }
+    },
     "terminal": {
       "type": "object",
       "properties": {

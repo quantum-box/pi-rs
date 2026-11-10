@@ -2409,3 +2409,12 @@ selection replaces only the current word, preserving text to the right of
 the cursor. Tab and Enter confirm, and Escape keeps the original draft.
 `autocompleteMaxVisible` sets the row limit. `enableSkillCommands` controls
 skill suggestions while preserving manual skill invocation and discovery.
+
+### Model image delivery setting
+
+`images.blockImages` replaces images with a text placeholder in outbound
+chat context. Image data remains available in the local transcript and
+journal. Codemode rejects image-bearing classifier and image-generation
+inputs while the setting is on. The `/settings` toggle takes effect on the
+next request. A PTY and loopback check covered local display, user and tool
+image delivery, a live setting change, and blocked Codemode calls.

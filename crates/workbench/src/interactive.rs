@@ -3048,6 +3048,17 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     ),
                                 },
                             ];
+                            let block_images = args.settings.block_model_images();
+                            items.push(Item {
+                                label: format!(
+                                    "Block images · {} (toggle)",
+                                    if block_images { "on" } else { "off" }
+                                ),
+                                selection: Selection::Setting(
+                                    "images.blockImages".into(),
+                                    json!(!block_images),
+                                ),
+                            });
                             if view.graphics.enabled() {
                                 let show_images = args.settings.show_terminal_images();
                                 let image_width = args.settings.terminal_image_width();
@@ -3874,6 +3885,9 @@ fn select(
             } else if let Some(member) = key.strip_prefix("terminal.") {
                 args.settings
                     .set_user_member("terminal", member, value.clone())?;
+            } else if let Some(member) = key.strip_prefix("images.") {
+                args.settings
+                    .set_user_member("images", member, value.clone())?;
             } else if key == "theme" {
                 let next = Theme::load(
                     value

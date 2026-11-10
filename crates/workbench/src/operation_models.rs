@@ -496,7 +496,19 @@ impl Tool for Operations {
         } else {
             json!([])
         };
-        let result = if let Some(model) = catalogue.0.iter().find(|model| {
+        let inputs = &args["context"];
+        let has_images = if kind == Kind::Classifier {
+            inputs["images"]
+                .as_array()
+                .is_some_and(|images| !images.is_empty())
+        } else {
+            inputs["input"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+        };
+        let result = if has_images && self.args.settings.block_model_images() {
+            Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
+        } else if let Some(model) = catalogue.0.iter().find(|model| {
             model.api.kind() == kind
                 && Some(model.provider.as_str()) == provider
                 && Some(model.model.id.as_str()) == args["id"].as_str()

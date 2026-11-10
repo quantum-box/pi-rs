@@ -1,5 +1,4 @@
 //! Shared local runtime construction for print, RPC and terminal sessions.
-use super::providers::Client;
 use super::{Cli, DEFAULT_SYSTEM_PROMPT, mcp_config, output, resources};
 use pi_rs::{
     Agent, CancellationToken, Extension, ExtensionUi, Limits, ProjectResources, Registry, Result,
@@ -14,7 +13,7 @@ use std::time::Duration;
 pub struct Runtime {
     pub auto_compaction: pi_rs::AutoCompactionControl,
     pub retry: pi_rs::RetryControl,
-    provider: Client,
+    provider: super::image_policy::WorkbenchModel,
     pub registry: Registry,
     shell: ShellConfig,
     system_prompt: String,
@@ -460,12 +459,15 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
     result
 }
 
-fn model_client(args: &Cli, reported: bool) -> Result<super::providers::Client> {
-    Ok(args
-        .connect_provider(&args.provider, Some(&args.model))?
-        .with_context_probes(args.allow_model_probes())
-        .with_model_options(args, reported)?
-        .observe())
+fn model_client(args: &Cli, reported: bool) -> Result<super::image_policy::WorkbenchModel> {
+    Ok(super::image_policy::WorkbenchModel {
+        client: args
+            .connect_provider(&args.provider, Some(&args.model))?
+            .with_context_probes(args.allow_model_probes())
+            .with_model_options(args, reported)?
+            .observe(),
+        block_images: args.settings.block_model_images(),
+    })
 }
 
 fn tool_discovery(

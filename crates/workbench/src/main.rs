@@ -20,6 +20,7 @@ mod cli_compat;
 mod clipboard;
 mod config;
 mod extension_ui;
+mod image_policy;
 mod interactive;
 mod mcp_config;
 mod model_auth;

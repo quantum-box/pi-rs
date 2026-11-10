@@ -148,6 +148,11 @@ impl Settings {
             .as_bool()
             .unwrap_or(false)
     }
+    pub fn block_model_images(&self) -> bool {
+        self.value["images"]["blockImages"]
+            .as_bool()
+            .unwrap_or(false)
+    }
     pub fn show_terminal_images(&self) -> bool {
         self.value["terminal"]["showImages"]
             .as_bool()
