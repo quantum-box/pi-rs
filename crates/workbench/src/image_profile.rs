@@ -1,11 +1,12 @@
 //! Model-specific preparation of new image inputs.
 use std::io::{BufRead, Cursor, Read, Seek};
 
+use base64::Engine;
 use image::{
     DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader,
     codecs::jpeg::JpegEncoder,
 };
-use pi_rs::{Error, Result};
+use pi_rs::{Error, ImageContent, Result};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_IMAGE_SOURCE_BYTES: usize = 20 * 1024 * 1024;
@@ -66,6 +67,35 @@ pub fn normalize<R: BufRead + Seek>(
     if bytes.len() > MAX_IMAGE_SOURCE_BYTES {
         return Err(Error::Config("image exceeds 20 MiB".into()));
     }
+    normalize_encoded(bytes, format, profile)
+}
+
+pub fn normalize_content(
+    content: ImageContent,
+    profile: ImageResizeProfile,
+) -> Result<ImageContent> {
+    if content.data.len() > MAX_ENCODED_IMAGE_BYTES {
+        return Err(Error::Config(
+            "image exceeds the encoded input limit".into(),
+        ));
+    }
+    let encoding = base64::engine::general_purpose::STANDARD;
+    let bytes = encoding
+        .decode(content.data)
+        .map_err(|_| Error::Config("invalid image data".into()))?;
+    let format = image::guess_format(&bytes).map_err(image_error)?;
+    let prepared = normalize_encoded(bytes, format, profile)?;
+    Ok(ImageContent {
+        data: encoding.encode(prepared.bytes),
+        mime_type: prepared.mime_type.into(),
+    })
+}
+
+fn normalize_encoded(
+    bytes: Vec<u8>,
+    format: ImageFormat,
+    profile: ImageResizeProfile,
+) -> Result<ModelImage> {
     let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(128 * 1024 * 1024);

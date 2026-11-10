@@ -2622,5 +2622,13 @@ limits. CLI attachments, clipboard paste, and `read` apply the profile
 before recording new images. In-budget files keep their original bytes.
 Resized transparent images retain alpha. A same-endpoint model change
 updates the active reader profile. The existing `images.autoResize`
-setting governs model-specific resizing. Raw RPC image input and pending
-drafts after a model change still need the same preparation.
+setting governs model-specific resizing. Raw RPC images and pending
+drafts use the active profile before submission, including queued
+steering and follow-up inputs.
+
+### Queued image preparation checkpoint
+
+New RPC and TUI prompt images are prepared before the worker accepts
+them, using the active model. Loopback checks covered a raw RPC prompt,
+a follow-up queued during streaming, the journaled resized bytes, and
+rejection of invalid image data before any model request.

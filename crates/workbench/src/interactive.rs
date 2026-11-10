@@ -3389,13 +3389,15 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             }
                         } else if is_busy(&worker) && auth_command {
                             view.append("Wait for the current operation before changing provider authentication");
-                        } else if let Some(active) = worker.as_mut().filter(|active| active.busy) {
+                        } else if worker.as_ref().is_some_and(|active| active.busy) {
                             let kind = if action == "app.message.followUp" {
                                 "followup"
                             } else {
                                 "steer"
                             };
-                            match active.send(
+                            match Worker::control(
+                                &mut worker,
+                                &args,
                                 json!({"type":kind,"content":input,"images":view.draft_images}),
                             ) {
                                 Ok(()) => view.draft_images.clear(),

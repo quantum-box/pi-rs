@@ -218,7 +218,8 @@ impl Worker {
             Ok(())
         }
     }
-    pub(super) fn control(slot: &mut Option<Self>, args: &Cli, request: Value) -> Result<()> {
+    pub(super) fn control(slot: &mut Option<Self>, args: &Cli, mut request: Value) -> Result<()> {
+        prepare_images(args, &mut request)?;
         if slot
             .as_ref()
             .is_none_or(|worker| !worker.matches(args) || worker.session != args.session)
@@ -247,7 +248,8 @@ impl Worker {
     pub(super) fn matches(&self, args: &Cli) -> bool {
         self.persistent && self.configuration == configuration(args)
     }
-    pub(super) fn request(&mut self, args: &Cli, request: Value) -> Result<()> {
+    pub(super) fn request(&mut self, args: &Cli, mut request: Value) -> Result<()> {
+        prepare_images(args, &mut request)?;
         if self.bashing && self.session != args.session {
             return Err(Error::Config(
                 "cannot change sessions while a shell command is running".into(),
@@ -271,6 +273,27 @@ impl Worker {
         Ok(())
     }
 }
+fn prepare_images(args: &Cli, request: &mut Value) -> Result<()> {
+    let Some(profile) = args.model_image_resize() else {
+        return Ok(());
+    };
+    let images = match request["type"].as_str() {
+        Some("prompt" | "steer" | "followup") => request.get_mut("images"),
+        Some("queue_input") => request
+            .get_mut("message")
+            .and_then(|message| message.get_mut("images")),
+        _ => None,
+    };
+    if let Some(Value::Array(images)) = images {
+        for image in images {
+            let content = serde_json::from_value(std::mem::take(image))?;
+            let prepared = pi_rs_workbench::image_profile::normalize_content(content, profile)?;
+            *image = serde_json::to_value(prepared)?;
+        }
+    }
+    Ok(())
+}
+
 fn configuration(args: &Cli) -> Value {
     use sha2::{Digest, Sha256};
     let token_fingerprint = args
