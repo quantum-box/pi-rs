@@ -1,5 +1,9 @@
 //! Grapheme-safe editor with line movement, a kill ring, and undo snapshots.
 use std::ops::Range;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use super::editor_layout::Layout;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -15,6 +19,9 @@ pub struct Editor {
     undo: Vec<Snapshot>,
     kills: Vec<String>,
     yank: Option<(Range<usize>, usize)>,
+    preferred_column: Option<usize>,
+    scroll_offset: usize,
+    jump_forward: Option<bool>,
 }
 impl Editor {
     fn remember(&mut self) {
@@ -26,6 +33,8 @@ impl Editor {
             self.undo.remove(0);
         }
         self.yank = None;
+        self.preferred_column = None;
+        self.jump_forward = None;
     }
     pub fn replace(&mut self, text: String) {
         self.remember();
@@ -50,7 +59,7 @@ impl Editor {
             .next()
             .map_or(0, str::len);
     }
-    fn line_start(&self) -> usize {
+    pub fn line_start(&self) -> usize {
         self.text[..self.cursor]
             .rfind('\n')
             .map_or(0, |index| index + 1)
@@ -157,6 +166,86 @@ impl Editor {
         }
         true
     }
+    pub fn visible_rows(&mut self, width: usize, height: usize) -> (Vec<String>, usize, usize) {
+        let layout = Layout::new(&self.text, width);
+        let row = layout.row(self.cursor);
+        let column = layout.column(&self.text, row, self.cursor).min(width - 1);
+        self.scroll_offset = self
+            .scroll_offset
+            .clamp(row.saturating_sub(height - 1), row)
+            .min(layout.len().saturating_sub(height));
+        let lines = layout
+            .visible(&self.text, self.scroll_offset, height)
+            .map(str::to_owned)
+            .collect();
+        (lines, row - self.scroll_offset, column)
+    }
+
+    /// False at a viewport boundary, where the caller may switch to history navigation.
+    pub fn visual_move(&mut self, width: usize, delta: isize) -> bool {
+        let layout = Layout::new(&self.text, width);
+        let row = layout.row(self.cursor);
+        let target = row.saturating_add_signed(delta).min(layout.len() - 1);
+        if row == target {
+            return false;
+        }
+        let column = *self
+            .preferred_column
+            .get_or_insert_with(|| layout.column(&self.text, row, self.cursor));
+        self.cursor = layout.cursor_at(&self.text, target, column);
+        self.yank = None;
+        true
+    }
+
+    /// Arm a character jump, or consume the next printable key as its case-sensitive target.
+    pub fn jump_key(&mut self, action: &str, key: KeyEvent) -> bool {
+        let direction = match action {
+            "tui.editor.jumpForward" => Some(true),
+            "tui.editor.jumpBackward" => Some(false),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            self.jump_forward = if self.jump_forward.is_some() {
+                None
+            } else {
+                Some(direction)
+            };
+            return true;
+        }
+        let Some(forward) = self.jump_forward.take() else {
+            return false;
+        };
+        if let KeyCode::Char(character) = key.code
+            && !character.is_control()
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            let mut glyphs = self.text.grapheme_indices(true);
+            let matched = if forward {
+                glyphs.find(|(offset, glyph)| *offset > self.cursor && glyph.contains(character))
+            } else {
+                glyphs.rfind(|(offset, glyph)| *offset < self.cursor && glyph.contains(character))
+            };
+            if let Some((offset, _)) = matched {
+                self.cursor = offset;
+            }
+            self.preferred_column = None;
+            self.yank = None;
+            return true;
+        }
+        false
+    }
+
+    pub fn continued_line(&mut self) -> bool {
+        if !self.text[..self.cursor].ends_with('\\') {
+            return false;
+        }
+        self.remember();
+        self.text.replace_range(self.cursor - 1..self.cursor, "\n");
+        true
+    }
+
     pub fn action(&mut self, action: &str) -> bool {
         match action {
             "tui.editor.cursorLeft" => self.left(),
@@ -214,12 +303,39 @@ impl Editor {
             "tui.input.newLine" => self.insert("\n"),
             _ => return false,
         }
+        self.preferred_column = None;
+        if !matches!(action, "tui.editor.yank" | "tui.editor.yankPop") {
+            self.yank = None;
+        }
         true
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn jumps_across_lines_without_inserting_the_target() {
+        let mut editor = Editor::default();
+        editor.insert("最初\n東京 京");
+        let key = KeyEvent::new(KeyCode::Char('京'), KeyModifiers::NONE);
+        editor.jump_key("tui.editor.jumpBackward", key);
+        assert!(editor.jump_key("", key));
+        assert_eq!(editor.cursor, "最初\n東京 ".len());
+        editor.jump_key("tui.editor.jumpBackward", key);
+        assert!(editor.jump_key("", key));
+        assert_eq!(editor.cursor, "最初\n東".len());
+        editor.jump_key("tui.editor.jumpForward", key);
+        editor.jump_key("", key);
+        assert_eq!(editor.cursor, "最初\n東京 ".len());
+        assert_eq!(editor.text, "最初\n東京 京");
+
+        editor.insert("\\");
+        assert!(editor.continued_line());
+        assert_eq!(editor.text, "最初\n東京 \n京");
+        assert!(editor.action("tui.editor.undo"));
+        assert_eq!(editor.text, "最初\n東京 \\京");
+    }
+
     #[test]
     fn kill_yank_undo_and_multiline_movement_preserve_unicode() {
         let mut editor = Editor::default();

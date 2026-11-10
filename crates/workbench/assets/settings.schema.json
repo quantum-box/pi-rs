@@ -3,6 +3,7 @@
   "title": "Native Pi settings",
   "type": "object",
   "properties": {
+    "editorPaddingX": { "type": "integer", "minimum": 0, "maximum": 3 },
     "sessionShareDestination": { "enum": ["auto", "radius", "gist"] },
     "retry": {
       "type": "object",

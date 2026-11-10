@@ -304,9 +304,10 @@ struct View {
     hide_thinking: bool,
     streaming: String,
     editor: Editor,
+    editor_width: usize,
+    editor_page: usize,
     draft_images: Vec<pi_rs::ImageContent>,
     clipboard: Option<std::sync::mpsc::Receiver<Result<super::clipboard::Content>>>,
-    scroll: usize,
     viewport: Viewport,
     search: Option<Search>,
     tokens: u64,
@@ -375,7 +376,6 @@ impl View {
                 )));
             }
             request => {
-                self.scroll = 0;
                 self.search = None;
                 self.dialogs
                     .push_back(crate::ui::dialog::Dialog::new(id, request));
@@ -527,7 +527,6 @@ impl View {
         self.lines.clear();
         self.viewport.follow();
         self.search = None;
-        self.scroll = 0;
         self.streaming.clear();
         self.thinking.clear();
         self.draft_images.clear();
@@ -901,6 +900,30 @@ impl View {
         self.request_started = None;
         self.phase = None;
     }
+    fn prompt_rows(
+        &mut self,
+        args: &Cli,
+        width: usize,
+        height: usize,
+    ) -> (Vec<String>, usize, usize) {
+        let padding = (args.settings.value()["editorPaddingX"]
+            .as_u64()
+            .unwrap_or(0) as usize)
+            .min(width.saturating_sub(1) / 2);
+        self.editor_width = width - 2 * padding;
+        self.editor_page = (height * 3 / 10).max(5).min(height - 5);
+        let (mut rows, cursor, column) = self
+            .editor
+            .visible_rows(self.editor_width, self.editor_page);
+        if padding > 0 {
+            let left = " ".repeat(padding);
+            for row in &mut rows {
+                row.insert_str(0, &left);
+            }
+        }
+        (rows, cursor, column + padding)
+    }
+
     fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
         if args.tui_mode == Some(TuiMode::Regular) {
             return self.draw_regular(args, theme, busy, keys);
@@ -908,8 +931,8 @@ impl View {
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
-        let prompt = wrap(&self.editor.text, width);
-        let prompt_height = prompt.len().clamp(1, 6).min(height.saturating_sub(5));
+        let (prompt, cursor_row, column) = self.prompt_rows(args, width, height);
+        let prompt_height = prompt.len();
         let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
         below.truncate(height.saturating_sub(prompt_height + 6));
         if self.dialog().is_some() {
@@ -1012,10 +1035,7 @@ impl View {
             theme.color("border"),
         )
         .draw(&mut out, width)?;
-        let cursor_prefix = wrap(&self.editor.text[..self.editor.cursor], width);
-        let cursor_row = cursor_prefix.len().saturating_sub(1);
-        let offset = cursor_row.saturating_sub(prompt_height - 1);
-        for (row, line) in prompt.iter().skip(offset).take(prompt_height).enumerate() {
+        for (row, line) in prompt.iter().enumerate() {
             queue!(out, MoveTo(0, (border_row + 1 + row) as u16))?;
             Line::plain(line, theme.color("text")).draw(&mut out, width)?;
         }
@@ -1046,10 +1066,6 @@ impl View {
             theme.color("dim"),
         )
         .draw(&mut out, width)?;
-        let column = cursor_prefix
-            .last()
-            .map_or(0, |line| UnicodeWidthStr::width(line.as_str()))
-            .min(width - 1);
         if !modal && let Some(search) = &self.search {
             let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
             let left = width.saturating_sub(search_width + 1);
@@ -1075,7 +1091,7 @@ impl View {
         } else {
             queue!(
                 out,
-                MoveTo(column as u16, (border_row + 1 + cursor_row - offset) as u16),
+                MoveTo(column as u16, (border_row + 1 + cursor_row) as u16),
                 Show
             )?;
         }
@@ -1120,8 +1136,8 @@ impl View {
         if self.lines.len() < self.regular.committed {
             self.regular.committed = 0;
         }
-        let prompt = wrap(&self.editor.text, width);
-        let prompt_height = prompt.len().clamp(1, 6).min(height - 5);
+        let (prompt, cursor, column) = self.prompt_rows(args, width, height);
+        let prompt_height = prompt.len();
         let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
         below.truncate(height.saturating_sub(prompt_height + 6));
         if self.dialog().is_some() {
@@ -1169,7 +1185,7 @@ impl View {
             }
         }
         let mut active = Vec::new();
-        if !busy && self.picker.is_none() && self.dialog().is_none() && self.scroll == 0 {
+        if !busy && self.picker.is_none() && self.dialog().is_none() {
             for entry in &self.lines[self.regular.committed..] {
                 for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
                     line.draw(&mut out, width)?;
@@ -1180,14 +1196,13 @@ impl View {
             }
             self.regular.committed = self.lines.len();
         } else {
-            let start = if self.scroll > 0 {
-                0
-            } else {
-                self.regular.committed
-            };
-            active.extend(self.lines[start..].iter().flat_map(|entry| {
-                entry.render(theme, width, self.expand_tools, !self.hide_thinking)
-            }));
+            active.extend(
+                self.lines[self.regular.committed..]
+                    .iter()
+                    .flat_map(|entry| {
+                        entry.render(theme, width, self.expand_tools, !self.hide_thinking)
+                    }),
+            );
             active.extend(Entry::Thinking(self.thinking.clone()).render(
                 theme,
                 width,
@@ -1200,16 +1215,6 @@ impl View {
                 active =
                     picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
             }
-            let end = active
-                .len()
-                .saturating_sub(self.scroll.min(active.len().saturating_sub(1)));
-            active = active[..end]
-                .iter()
-                .rev()
-                .take(height - prompt_height - 4 - below.len())
-                .cloned()
-                .collect();
-            active.reverse();
         }
         if let Some(dialog) = self.dialog() {
             active = dialog.render(theme, width, height - prompt_height - 4 - below.len());
@@ -1253,10 +1258,7 @@ impl View {
         )
         .draw(&mut out, width)?;
         queue!(out, Print("\r\n"))?;
-        let prefix = wrap(&self.editor.text[..self.editor.cursor], width);
-        let cursor = prefix.len().saturating_sub(1);
-        let offset = cursor.saturating_sub(prompt_height - 1);
-        for line in prompt.iter().skip(offset).take(prompt_height) {
+        for line in &prompt {
             Line::plain(line, theme.color("text")).draw(&mut out, width)?;
             queue!(out, Print("\r\n"))?;
         }
@@ -1281,12 +1283,8 @@ impl View {
             theme.color("dim"),
         )
         .draw(&mut out, width)?;
-        self.regular.cursor_row = active.len() + 1 + cursor - offset;
+        self.regular.cursor_row = active.len() + 1 + cursor;
         self.regular.region_height = active.len() + prompt_height + 4 + below.len();
-        let column = prefix
-            .last()
-            .map_or(0, |line| UnicodeWidthStr::width(line.as_str()))
-            .min(width - 1);
         let (column, show_cursor) = if let Some(dialog) = self.dialog() {
             let position = dialog.cursor(width, height - prompt_height - 4 - below.len());
             self.regular.cursor_row = position.map_or(0, |(row, _)| row);
@@ -1335,7 +1333,7 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nFullscreen: Ctrl+Shift+F finds transcript text. Ctrl+Up/Down jumps between prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. Ctrl+Shift+F finds transcript text. Ctrl+Up/Down jumps between prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>> {
     let (name, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
@@ -2410,18 +2408,6 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         search.input(key, &keys);
                         continue;
                     }
-                } else if let Some(action) = keys.viewport_action(key) {
-                    let scroll = match action {
-                        "tui.altScreen.pageUp" => Some(view.scroll.saturating_add(10)),
-                        "tui.altScreen.pageDown" => Some(view.scroll.saturating_sub(10)),
-                        "tui.altScreen.top" => Some(usize::MAX),
-                        "tui.altScreen.bottom" => Some(0),
-                        _ => None,
-                    };
-                    if let Some(scroll) = scroll {
-                        view.scroll = scroll;
-                        continue;
-                    }
                 }
                 let action = keys
                     .action(
@@ -2432,7 +2418,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 if action != "app.interrupt" || is_busy(&worker) {
                     last_idle_interrupt = None;
                 }
-                if view.editor.action(action) {
+                if view.editor.jump_key(action, key) || view.editor.action(action) {
                     continue;
                 }
                 match action {
@@ -2574,6 +2560,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     "app.model.select" if !is_busy(&worker) => {
                         start_model_picker(&args, &mut view, ModelListIntent::Select)
                     }
+                    "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit" | "app.message.followUp" => {
                         if view.branch_summary.is_some() {
                             continue;
@@ -2594,7 +2581,6 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         if matches!(input.trim(), "/quit" | "/exit") {
                             break;
                         }
-                        view.scroll = 0;
                         view.viewport.follow();
                         let auth_command =
                             matches!(input.split_whitespace().next(), Some("/login" | "/logout"));
@@ -2730,7 +2716,17 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             let tree_filter = TreeFilter::parse(
                                 args.settings.string("treeFilterMode").unwrap_or("default"),
                             );
+                            let padding = args.settings.value()["editorPaddingX"]
+                                .as_u64()
+                                .unwrap_or(0);
                             items.extend([
+                                Item {
+                                    label: format!("Editor padding · {padding}"),
+                                    selection: Selection::Setting(
+                                        "editorPaddingX".into(),
+                                        json!((padding + 1) % 4),
+                                    ),
+                                },
                                 Item {
                                     label: format!("Double-escape action · {escape}"),
                                     selection: Selection::Setting(
@@ -2864,8 +2860,23 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             }
                         }
                     }
-                    "tui.editor.cursorUp" if view.editor.vertical(false) => {}
-                    "tui.editor.cursorDown" if view.editor.vertical(true) => {}
+                    "tui.editor.pageUp" | "tui.editor.pageDown" => {
+                        let step = view.editor_page as isize;
+                        let delta = if action == "tui.editor.pageUp" {
+                            -step
+                        } else {
+                            step
+                        };
+                        view.editor.visual_move(view.editor_width, delta);
+                    }
+                    "tui.editor.cursorUp" if view.editor.visual_move(view.editor_width, -1) => {}
+                    "tui.editor.cursorDown" if view.editor.visual_move(view.editor_width, 1) => {}
+                    "tui.editor.cursorUp"
+                        if view.history_index.is_none()
+                            && view.editor.cursor != view.editor.line_start() =>
+                    {
+                        view.editor.action("tui.editor.cursorLineStart");
+                    }
                     "tui.editor.cursorUp" | "tui.editor.historyPrevious"
                         if !view.history.is_empty() =>
                     {
@@ -2883,6 +2894,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         view.editor
                             .replace(view.history.get(index).cloned().unwrap_or_default());
                         view.history_index = (index < view.history.len()).then_some(index);
+                    }
+                    "tui.editor.cursorDown" => {
+                        view.editor.action("tui.editor.cursorLineEnd");
                     }
                     "" => {
                         if let KeyCode::Char(character) = key.code

@@ -31,6 +31,10 @@ impl Keys {
             ),
             ("tui.editor.cursorLineStart", &["home", "ctrl+a"]),
             ("tui.editor.cursorLineEnd", &["end", "ctrl+e"]),
+            ("tui.editor.jumpForward", &["ctrl+]"]),
+            ("tui.editor.jumpBackward", &["ctrl+alt+]"]),
+            ("tui.editor.pageUp", &["pageup", "ctrl+pageup"]),
+            ("tui.editor.pageDown", &["pagedown", "ctrl+pagedown"]),
             ("tui.editor.deleteCharBackward", &["backspace"]),
             ("tui.editor.deleteCharForward", &["delete", "ctrl+d"]),
             (
