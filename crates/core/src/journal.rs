@@ -922,18 +922,17 @@ impl Session {
 
     /// Confirm the outcome via the system that owns the effect, using the operation ID.
     pub fn reconcile(&mut self, operation_id: Uuid, outcome: Outcome) -> Result<()> {
-        if !matches!(outcome, Outcome::Succeeded(_) | Outcome::Failed(_))
-            || !self.operations().iter().any(|(inv, state)| {
-                inv.operation_id == operation_id
-                    && matches!(
-                        state,
-                        OperationState::Started
-                            | OperationState::Finished(
-                                Outcome::Unknown(_) | Outcome::Pending { .. }
-                            )
-                    )
-            })
-        {
+        if !matches!(
+            outcome,
+            Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. } | Outcome::Failed(_)
+        ) || !self.operations().iter().any(|(inv, state)| {
+            inv.operation_id == operation_id
+                && matches!(
+                    state,
+                    OperationState::Started
+                        | OperationState::Finished(Outcome::Unknown(_) | Outcome::Pending { .. })
+                )
+        }) {
             return Err(Error::Session(
                 "reconciliation needs an uncertain operation and a known outcome".into(),
             ));

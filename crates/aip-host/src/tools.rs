@@ -225,8 +225,11 @@ pub async fn reconcile(
     if cancel_remote {
         port.cancel(scope, operation_id, reference).await?;
     }
-    let Some(outcome @ (Outcome::Succeeded(_) | Outcome::Failed(_))) =
-        port.inspect(scope, operation_id, reference).await?
+    let Some(
+        outcome @ (Outcome::Succeeded(_)
+        | Outcome::SucceededWithDetails { .. }
+        | Outcome::Failed(_)),
+    ) = port.inspect(scope, operation_id, reference).await?
     else {
         return Ok(false);
     };

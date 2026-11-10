@@ -1709,3 +1709,23 @@ as the earlier newline and truncation boundaries. Focused tests exercise a
 small streaming buffer and verify the complete decoded byte count.
 
 Full workspace tests and all-target Clippy pass.
+
+### Write and edit result checkpoint
+
+The model-facing `write` and `edit` success messages now match Pi and preserve
+the requested path spelling. The edit result journals its bounded unified patch
+and first changed line separately from model-facing text. The terminal uses
+that patch for its diff presentation, and programmatic text callers receive the
+success text. Successful imported text results preserve their original details.
+
+The native `SucceededWithDetails` outcome serializes details durably while
+excluding them from the model conversation. The existing tool output limit
+also applies to the serialized detail payload. Native edits retain their
+existing file mutation locking, atomic replacement and line-ending behavior.
+
+A normal CLI write/edit round trip verifies exact success text, changed bytes,
+first changed line and patch against the pinned reference for a BOM/CRLF file.
+The patch remains outside the subsequent model request. Remaining display and
+patch edge cases are tracked under local tools and terminal parity.
+
+Workspace tests, the imported-details regression and all-target Clippy pass.

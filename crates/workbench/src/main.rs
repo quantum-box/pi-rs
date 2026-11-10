@@ -1100,7 +1100,7 @@ fn metadata(record: &pi_rs::Record) -> Value {
 
 fn outcome_status(outcome: &Outcome) -> &'static str {
     match outcome {
-        Outcome::Succeeded(_) => "succeeded",
+        Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. } => "succeeded",
         Outcome::Failed(_) => "failed",
         Outcome::Skipped(_) => "skipped",
         Outcome::Unknown(_) => "unknown",

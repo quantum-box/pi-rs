@@ -341,6 +341,11 @@ pub trait Model: Send + Sync {
 #[serde(tag = "status", content = "detail", rename_all = "snake_case")]
 pub enum Outcome {
     Succeeded(String),
+    /// Successful text output with journaled details excluded from model context.
+    SucceededWithDetails {
+        output: String,
+        details: Value,
+    },
     Failed(String),
     Skipped(String),
     /// An effect may have occurred. Only an authoritative reconciliation can clear this state.
@@ -368,7 +373,7 @@ pub struct AttachmentRef {
 impl Outcome {
     pub fn tool_content(&self) -> String {
         match self {
-            Self::Succeeded(output) => output.clone(),
+            Self::Succeeded(output) | Self::SucceededWithDetails { output, .. } => output.clone(),
             Self::Failed(reason) => format!("Tool failed: {reason}"),
             Self::Skipped(reason) => format!("Tool did not start: {reason}"),
             Self::Unknown(reason) => format!("Tool outcome unknown: {reason}"),

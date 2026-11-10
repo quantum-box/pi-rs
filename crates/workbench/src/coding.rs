@@ -290,7 +290,11 @@ impl Tool for CodingTool {
         let result = match self.kind {
             Kind::Read => self.read(&args),
             Kind::Write => self.write(&args),
-            Kind::Edit => self.edit(&args),
+            Kind::Edit => {
+                return self
+                    .edit(&args)
+                    .unwrap_or_else(|error| Outcome::Failed(error.to_string()));
+            }
             Kind::Grep | Kind::Find => self.search(&args),
             Kind::List => self.list(&args),
             Kind::Bash | Kind::PowerShell => self.bash(&args).await,
@@ -409,7 +413,8 @@ impl CodingTool {
         if content.len() as u64 > MAX_FILE_BYTES {
             return Err(Error::Config("content exceeds 4 MiB".into()));
         }
-        let input = crate::coding_paths::normalize(string(args, "path")?)?;
+        let display_path = string(args, "path")?;
+        let input = crate::coding_paths::normalize(display_path)?;
         let target = crate::coding_paths::resolve(&self.root, &input);
         if !self.unrestricted
             && (!target.starts_with(&self.root)
@@ -446,14 +451,10 @@ impl CodingTool {
         }
         let _lock = mutation_lock(&target)?;
         atomic_write(&target, content.as_bytes())?;
-        Ok(format!(
-            "Wrote {} bytes to {}",
-            content.len(),
-            target.strip_prefix(&self.root).unwrap_or(&target).display()
-        ))
+        Ok(format!("Successfully wrote to {display_path}"))
     }
 
-    fn edit(&self, args: &Value) -> Result<String> {
+    fn edit(&self, args: &Value) -> Result<Outcome> {
         let path = self.path(string(args, "path")?)?;
         let _lock = mutation_lock(&path)?;
         let original = self.text(&path)?;
@@ -468,15 +469,23 @@ impl CodingTool {
         }
         atomic_write(&path, output.as_bytes())?;
         let display_path = args["path"].as_str().unwrap_or_default();
-        let diff = similar::TextDiff::from_lines(&original, &output)
+        let original = crate::text_edit::normalized_content(&original);
+        let edited = crate::text_edit::normalized_content(&output);
+        let diff = similar::TextDiff::from_lines(&original, &edited);
+        let first_changed_line = diff
+            .ops()
+            .iter()
+            .find(|op| !matches!(op, similar::DiffOp::Equal { .. }))
+            .map(|op| op.new_range().start + 1);
+        let patch = diff
             .unified_diff()
-            .context_radius(3)
+            .context_radius(4)
             .header(display_path, display_path)
             .to_string();
-        Ok(bounded(format!(
-            "Applied {} edits to {display_path}\n{diff}",
-            count
-        )))
+        Ok(Outcome::SucceededWithDetails {
+            output: format!("Successfully replaced {count} block(s) in {display_path}."),
+            details: json!({"patch":bounded(patch),"firstChangedLine":first_changed_line}),
+        })
     }
 
     fn list(&self, args: &Value) -> Result<String> {
@@ -1127,7 +1136,11 @@ mod tests {
             .collect::<Vec<_>>();
         barrier.wait();
         for handle in handles {
-            assert!(handle.join().unwrap().contains("@@"));
+            let Outcome::SucceededWithDetails { output, details } = handle.join().unwrap() else {
+                panic!("expected edit details");
+            };
+            assert_eq!(output, "Successfully replaced 1 block(s) in file.txt.");
+            assert!(details["patch"].as_str().unwrap().contains("@@"));
         }
         assert_eq!(
             std::fs::read_to_string(root.join("file.txt")).unwrap(),
@@ -1208,8 +1221,11 @@ mod tests {
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Write,
         };
-        tool.write(&json!({"path":"src/a.txt","content":"first\n日本語\nlast\n"}))
-            .unwrap();
+        assert_eq!(
+            tool.write(&json!({"path":"src/a.txt","content":"first\n日本語\nlast\n"}))
+                .unwrap(),
+            "Successfully wrote to src/a.txt"
+        );
         assert_eq!(
             tool.read(&json!({"path":"src/a.txt","offset":2,"limit":1}))
                 .unwrap(),

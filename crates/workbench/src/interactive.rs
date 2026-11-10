@@ -553,7 +553,9 @@ impl View {
             *output = display_tool_result(outcome);
             *failed = !matches!(
                 outcome,
-                pi_rs::Outcome::Succeeded(_) | pi_rs::Outcome::Structured { .. }
+                pi_rs::Outcome::Succeeded(_)
+                    | pi_rs::Outcome::SucceededWithDetails { .. }
+                    | pi_rs::Outcome::Structured { .. }
             );
             *finished = true;
         }
@@ -1101,6 +1103,11 @@ impl View {
 }
 
 fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
+    if let pi_rs::Outcome::SucceededWithDetails { output, details } = outcome
+        && let Some(patch) = details["patch"].as_str().filter(|patch| !patch.is_empty())
+    {
+        return format!("{output}\n{patch}");
+    }
     if let pi_rs::Outcome::Structured { data, .. } = outcome
         && let Some(blocks) = data["content"].as_array()
     {

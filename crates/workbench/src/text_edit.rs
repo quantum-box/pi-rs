@@ -24,6 +24,9 @@ struct Group {
 fn lf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
+pub(super) fn normalized_content(text: &str) -> String {
+    lf(text.strip_prefix('\u{feff}').unwrap_or(text))
+}
 fn fuzzy(text: &str) -> String {
     text.nfkc()
         .collect::<String>()

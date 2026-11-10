@@ -1291,6 +1291,16 @@ impl Agent<'_> {
             Outcome::Succeeded(output) if output.len() > max_output_bytes => Outcome::Truncated {
                 original_bytes: output.len(),
             },
+            outcome @ Outcome::SucceededWithDetails { .. } => {
+                let size = serde_json::to_vec(&outcome)?.len();
+                if size > max_output_bytes {
+                    Outcome::Truncated {
+                        original_bytes: size,
+                    }
+                } else {
+                    outcome
+                }
+            }
             outcome @ Outcome::Structured { .. } => {
                 let size = outcome.tool_content().len();
                 if size > max_output_bytes {

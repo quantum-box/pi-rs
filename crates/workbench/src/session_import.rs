@@ -415,6 +415,13 @@ fn convert(
                         }
                     } else if message["isError"] == true {
                         Outcome::Failed(text)
+                    } else if let Some(details) =
+                        message.get("details").filter(|details| !details.is_null())
+                    {
+                        Outcome::SucceededWithDetails {
+                            output: text,
+                            details: details.clone(),
+                        }
                     } else {
                         Outcome::Succeeded(text)
                     };
@@ -616,6 +623,24 @@ mod tests {
     use super::*;
     use pi_rs::Message;
     use serde_json::json;
+    #[test]
+    fn imported_tool_details_remain_in_history_outside_model_context() {
+        let details = json!({"patch":"--- old\n+++ new", "firstChangedLine":1});
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"edit","arguments":{}}]}}),
+            json!({"type":"message","id":"t","parentId":"a","message":{"role":"toolResult","toolCallId":"call","content":[{"type":"text","text":"done"}],"details":details}}),
+        ]).unwrap();
+        assert!(session.records().iter().any(|record| matches!(&record.event,
+            Event::ToolFinished { outcome: Outcome::SucceededWithDetails { details: value, .. }, .. } if value == &details)));
+        assert!(
+            session
+                .current_messages()
+                .iter()
+                .any(|message| matches!(message, Message::Tool {content, ..} if content == "done"))
+        );
+    }
+
     #[test]
     fn imported_activity_prefers_message_time_to_outer_entry_time() {
         let session = import_pi(vec![

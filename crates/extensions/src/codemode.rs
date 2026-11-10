@@ -377,7 +377,9 @@ fn install_globals(
 }
 fn tool_value(outcome: Outcome) -> Value {
     match outcome {
-        Outcome::Succeeded(value) => json!({"ok":true,"value":value}),
+        Outcome::Succeeded(value) | Outcome::SucceededWithDetails { output: value, .. } => {
+            json!({"ok":true,"value":value})
+        }
         Outcome::Structured { data, .. } => json!({"ok":true,"value":data}),
         outcome => json!({"ok":false,"error":outcome.tool_content()}),
     }
