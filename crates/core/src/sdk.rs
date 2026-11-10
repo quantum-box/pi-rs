@@ -40,7 +40,33 @@ pub struct SessionControl {
     active: Arc<Mutex<Option<CancellationToken>>>,
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
+    input_hooks: Arc<Mutex<InputHooks>>,
+    input_order: Arc<tokio::sync::Mutex<()>>,
 }
+
+#[derive(Clone, Default)]
+struct InputHooks {
+    extensions: Vec<Arc<dyn Extension>>,
+    states: crate::ExtensionStates,
+}
+
+impl InputHooks {
+    fn new(registry: &Registry, session: &Session) -> Self {
+        let extensions: Vec<_> = registry
+            .extensions
+            .iter()
+            .filter(|extension| extension.handles_input())
+            .cloned()
+            .collect();
+        let states = if extensions.is_empty() {
+            Default::default()
+        } else {
+            session.extension_states()
+        };
+        Self { extensions, states }
+    }
+}
+
 impl SessionControl {
     pub fn set_retry_settings(&self, settings: crate::RetrySettings) -> Result<()> {
         if self.input.is_closed() {
@@ -100,11 +126,41 @@ impl SessionControl {
         images: Vec<crate::ImageContent>,
     ) -> Result<Uuid> {
         let id = Uuid::new_v4();
-        let message = QueuedMessage {
+        let mut message = QueuedMessage {
             input: QueuedInput { id, kind, content },
             images,
         };
         message.validate()?;
+        let _order = self.input_order.lock().await;
+        if self.input.is_closed() {
+            return Err(Error::Config("session is closed".into()));
+        }
+        let hooks = self.input_hooks.lock().expect("SDK input hooks").clone();
+        if !hooks.extensions.is_empty() {
+            let streaming = self
+                .active
+                .lock()
+                .expect("session control")
+                .as_ref()
+                .is_some_and(|token| !token.is_cancelled());
+            let event = crate::InputEvent {
+                text: message.input.content,
+                images: message.images,
+                source: crate::InputSource::Extension,
+                streaming_behavior: streaming.then_some(kind),
+            };
+            let prepared = tokio::select! {
+                biased;
+                _ = self.input.closed() => return Err(Error::Config("session is closed".into())),
+                result = crate::extension::prepare_input(&hooks.extensions, event, &hooks.states) => result?,
+            };
+            let Some(prepared) = prepared else {
+                return Ok(id);
+            };
+            message.input.content = prepared.text;
+            message.images = prepared.images;
+            message.validate()?;
+        }
         self.input
             .send(message.into())
             .await
@@ -126,6 +182,7 @@ impl SessionControl {
     ) -> Result<T> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         let token = {
+            let _order = self.input_order.lock().await;
             let state = self.active.lock().expect("session control");
             let active = state.as_ref().ok_or_else(|| {
                 Error::Config(
@@ -150,6 +207,24 @@ impl SessionControl {
     pub fn abort(&self) {
         if let Some(active) = self.active.lock().expect("session control").as_ref() {
             active.cancel();
+        }
+    }
+
+    fn observe(&self, event: &Notification<'_>) {
+        let Notification::Committed(record) = event else {
+            return;
+        };
+        let states = match &record.event {
+            crate::Event::ExtensionStates { states }
+            | crate::Event::Compacted { states, .. }
+            | crate::Event::ToolFinished { states, .. } => states,
+            _ => return,
+        };
+        if !states.is_empty() {
+            let mut hooks = self.input_hooks.lock().expect("SDK input hooks");
+            if !hooks.extensions.is_empty() {
+                hooks.states.extend(states.clone());
+            }
         }
     }
 }
@@ -226,6 +301,7 @@ impl SessionBuilder {
         let (events, _) = broadcast::channel(64);
         let auto_compaction = session.auto_compaction_control();
         let retry = session.retry_control();
+        let input_hooks = Arc::new(Mutex::new(InputHooks::new(&self.registry, &session)));
         Ok(AgentSession {
             model: self.model,
             model_name: self.model_name,
@@ -240,6 +316,8 @@ impl SessionBuilder {
                 active: Arc::new(Mutex::new(None)),
                 auto_compaction,
                 retry,
+                input_hooks,
+                input_order: Arc::new(tokio::sync::Mutex::new(())),
             },
             closed: false,
         })
@@ -361,11 +439,14 @@ impl AgentSession {
             .ok_or_else(|| {
                 Error::Config("register extensions before sharing this session with a fork".into())
             })?
-            .register(extension)
+            .register(extension)?;
+        self.refresh_input_hooks();
+        Ok(())
     }
     pub fn checkout(&mut self, record: u64) -> Result<()> {
         self.ensure_open()?;
         self.session.checkout(record)?;
+        self.refresh_input_hooks();
         self.emit_last();
         if let Some((model, _)) = self.session.model_selection() {
             self.model_name = model;
@@ -434,6 +515,7 @@ impl AgentSession {
             .limits(self.limits.clone())
             .build(session)?;
         fork.registry = self.registry.clone();
+        fork.refresh_input_hooks();
         Ok(fork)
     }
 
@@ -489,6 +571,7 @@ impl AgentSession {
         let events = self.events.as_ref().expect("open session").clone();
         let mut started = false;
         let mut observe = |event: Notification<'_>| {
+            self.control.observe(&event);
             emit(&events, &event);
             observer(event);
         };
@@ -580,7 +663,10 @@ impl AgentSession {
             extension,
             command,
             arguments,
-            &mut |event| emit(&events, &event),
+            &mut |event| {
+                self.control.observe(&event);
+                emit(&events, &event);
+            },
         )
     }
     pub fn compact(&mut self, compaction: Compaction) -> Result<()> {
@@ -594,6 +680,7 @@ impl AgentSession {
             limits: self.limits.clone(),
         };
         agent.compact(&mut self.session, compaction, &mut |event| {
+            self.control.observe(&event);
             emit(&events, &event)
         })
     }
@@ -629,7 +716,10 @@ impl AgentSession {
             system_prompt: &self.system_prompt,
             limits: self.limits.clone(),
         };
-        let mut observer = |event: Notification<'_>| emit(&events, &event);
+        let mut observer = |event: Notification<'_>| {
+            self.control.observe(&event);
+            emit(&events, &event);
+        };
         let result = match keep_turns {
             Some(keep_turns) => {
                 agent
@@ -665,6 +755,7 @@ impl AgentSession {
         self.closed = true;
         self.control.abort();
         self.input.close();
+        *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
         while self.input.try_recv().is_ok() {}
         let registry = std::mem::replace(&mut self.registry, Arc::new(Registry::default()));
         let result = if Arc::strong_count(&registry) == 1 {
@@ -681,6 +772,10 @@ impl AgentSession {
         if let (Some(events), Some(record)) = (&self.events, self.session.records().last()) {
             emit(events, &Notification::Committed(record));
         }
+    }
+    fn refresh_input_hooks(&self) {
+        *self.control.input_hooks.lock().expect("SDK input hooks") =
+            InputHooks::new(&self.registry, &self.session);
     }
     fn ensure_open(&self) -> Result<()> {
         if self.closed {
@@ -701,6 +796,7 @@ impl AgentSession {
 impl Drop for AgentSession {
     fn drop(&mut self) {
         self.control.abort();
+        *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
     }
 }
 struct ActiveRun {
@@ -1053,21 +1149,85 @@ mod tests {
             true
         }
 
+        fn commands(&self) -> &[&str] {
+            &["prefix"]
+        }
+
+        fn command(
+            &self,
+            _: &str,
+            arguments: &str,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::ExtensionState> {
+            Ok(crate::ExtensionState {
+                version: 1,
+                data: serde_json::json!(arguments),
+            })
+        }
+
         async fn input(
             &self,
             event: &crate::InputEvent,
-            _: Option<&crate::ExtensionState>,
+            state: Option<&crate::ExtensionState>,
         ) -> crate::ExtensionResult<crate::InputAction> {
             assert_eq!(event.source, crate::InputSource::Extension);
             Ok(if event.text == "handled" {
                 crate::InputAction::Handled
             } else {
-                crate::InputAction::Transform {
-                    text: event.text.to_uppercase(),
-                    images: None,
+                let mut text = match event.streaming_behavior {
+                    Some(InputKind::Steer) => "steer:".to_owned(),
+                    Some(InputKind::FollowUp) => "follow-up:".to_owned(),
+                    None => String::new(),
+                };
+                if let Some(prefix) = state.and_then(|state| state.data.as_str()) {
+                    text.push_str(prefix);
+                    text.push(':');
                 }
+                text.push_str(&event.text.to_uppercase());
+                crate::InputAction::Transform { text, images: None }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn queued_hooks_use_branch_state_and_preserve_images() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .extension(Arc::new(InputExtension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let root = session.journal().head();
+        session
+            .extension_command("input-test", "prefix", "branch")
+            .unwrap();
+        let controls = session.controls();
+        controls.follow_up("handled").await.unwrap();
+        assert_eq!(session.pending_inputs(), 0);
+        let image = crate::ImageContent {
+            data: "aGVsbG8=".into(),
+            mime_type: "image/png".into(),
+        };
+        let id = controls
+            .steer_with_images("fixture", vec![image.clone()])
+            .await
+            .unwrap();
+        let queued = session.clear_queued_inputs().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].input.id, id);
+        assert_eq!(queued[0].input.content, "branch:FIXTURE");
+        assert_eq!(queued[0].images, vec![image]);
+        let mut fork = session.fork_at(session.journal().head()).unwrap();
+        fork.controls().follow_up("forked").await.unwrap();
+        assert_eq!(
+            fork.clear_queued_inputs().unwrap()[0].input.content,
+            "branch:FORKED"
+        );
+        session.checkout(root).unwrap();
+        controls.follow_up("root").await.unwrap();
+        assert_eq!(
+            session.clear_queued_inputs().unwrap()[0].input.content,
+            "ROOT"
+        );
     }
 
     #[tokio::test]
@@ -1892,6 +2052,32 @@ mod tests {
         async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
             Ok(Box::pin(futures_util::stream::pending()))
         }
+    }
+    #[tokio::test]
+    async fn active_queued_hooks_receive_the_delivery_mode_before_clear() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")
+            .extension(Arc::new(InputExtension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let controls = session.controls();
+        let mut events = session.subscribe();
+        let queue = async {
+            while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
+            controls.steer("handled").await.unwrap();
+            let id = controls.follow_up("active").await.unwrap();
+            let queued = controls.clear_queued_inputs().await.unwrap();
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].input.id, id);
+            assert_eq!(queued[0].input.content, "follow-up:ACTIVE");
+            controls.abort();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(session.prompt("wait"), queue)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
     }
     #[tokio::test]
     async fn cloned_control_can_abort_a_running_session() {

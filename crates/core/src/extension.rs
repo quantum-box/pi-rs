@@ -340,32 +340,10 @@ impl Registry {
     /// Run opted-in extensions in registration order. A handled input is not submitted.
     pub async fn prepare_input(
         &self,
-        mut event: InputEvent,
+        event: InputEvent,
         states: &ExtensionStates,
     ) -> Result<Option<InputEvent>> {
-        for extension in self
-            .extensions
-            .iter()
-            .filter(|extension| extension.handles_input())
-        {
-            match hook(
-                extension.as_ref(),
-                extension.input(&event, states.get(extension.id())).await,
-            )? {
-                InputAction::Continue => {}
-                InputAction::Handled => return Ok(None),
-                InputAction::Transform { text, images } => {
-                    event.text = text;
-                    if let Some(images) = images {
-                        for image in &images {
-                            image.validate()?;
-                        }
-                        event.images = images;
-                    }
-                }
-            }
-        }
-        Ok(Some(event))
+        prepare_input(&self.extensions, event, states).await
     }
 
     pub fn set_refresher(&mut self, refresher: Arc<dyn RegistryRefresher>) {
@@ -612,6 +590,35 @@ impl Registry {
         self.extensions.push(extension);
         Ok(())
     }
+}
+
+pub(crate) async fn prepare_input(
+    extensions: &[Arc<dyn Extension>],
+    mut event: InputEvent,
+    states: &ExtensionStates,
+) -> Result<Option<InputEvent>> {
+    for extension in extensions
+        .iter()
+        .filter(|extension| extension.handles_input())
+    {
+        match hook(
+            extension.as_ref(),
+            extension.input(&event, states.get(extension.id())).await,
+        )? {
+            InputAction::Continue => {}
+            InputAction::Handled => return Ok(None),
+            InputAction::Transform { text, images } => {
+                event.text = text;
+                if let Some(images) = images {
+                    for image in &images {
+                        image.validate()?;
+                    }
+                    event.images = images;
+                }
+            }
+        }
+    }
+    Ok(Some(event))
 }
 
 pub(crate) fn hook<T>(extension: &dyn Extension, result: ExtensionResult<T>) -> Result<T> {

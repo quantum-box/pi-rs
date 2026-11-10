@@ -20,7 +20,7 @@ remaining acceptance work for that surface.
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages, Google Gemini Generate Content, and Radius Pi Messages, named profiles for those APIs and Pi Messages, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh | OAuth and refresh for other model providers |
-| Native extensions | Rust tool, prompt input, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Input hooks for queued SDK controls, remaining Pi events and custom terminal components |
+| Native extensions | Rust tool, prompt input, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Automatic default client metadata identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
@@ -2284,3 +2284,15 @@ The RPC fixture changed key and header values between requests on one
 worker, then checked a command failure and an endpoint override. The
 failure redacted command output, and the other endpoint received only
 its explicitly supplied credential.
+
+### Queued SDK input hooks
+
+Rust SDK controls run the same registered input hooks as direct prompts.
+A hook can handle or transform steering and follow-ups, preserving
+attachments unless it replaces them. Active submissions include their
+delivery mode. Queue controls keep their order with submissions while
+cancellation remains independent of input preparation.
+
+The SDK tests cover handled and transformed queued input, image
+attachments, fork and checkout state, delivery mode during a run and
+clearing the resulting queue.
