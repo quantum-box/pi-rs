@@ -564,17 +564,18 @@ impl Operations {
                 if available && self.args.connect_provider(&candidate, Some(&id)).is_err() {
                     continue;
                 }
+                let adapter = profiles.model_adapter(&candidate, &id);
                 let metadata = profiles.model(&candidate, &id);
                 let mut detail = pi_rs::ollama::ModelDetails::default();
                 if let Some(metadata) = &metadata {
-                    metadata.apply(&candidate, &mut detail);
+                    metadata.apply(adapter, &mut detail);
                 }
                 let mut model = json!({
                     "type":"chat",
                     "provider":candidate.id(),
                     "id":id,
                     "name":metadata.as_ref().and_then(|metadata| metadata.name.as_deref()).unwrap_or(&id),
-                    "api":candidate.api(),
+                    "api":adapter.api(),
                     "input":if detail.images == Some(true) { vec!["text", "image"] } else { vec!["text"] },
                 });
                 if let Some(window) = detail.context_window {

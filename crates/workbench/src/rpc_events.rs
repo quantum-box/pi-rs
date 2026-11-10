@@ -146,7 +146,7 @@ impl Stream {
                 self.metadata = ModelMetadata::default();
                 self.assistant = json!({
                     "role":"assistant", "content":[],
-                    "api": args.provider.api(),
+                    "api": args.model_profiles.model_adapter(&args.provider, &args.model).api(),
                     "provider":args.provider.id(), "model":model,
                     "thinkingLevel":args.thinking.as_deref().unwrap_or("off"),
                     "timestamp":timestamp(), "stopReason":"stop",

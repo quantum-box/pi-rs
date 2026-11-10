@@ -67,7 +67,10 @@ impl Catalog {
         };
         for model in models {
             if let Some(metadata) = profiles.model(&self.provider, model) {
-                metadata.apply(&self.provider, details.entry(model.clone()).or_default());
+                metadata.apply(
+                    profiles.model_adapter(&self.provider, model),
+                    details.entry(model.clone()).or_default(),
+                );
             }
         }
         details
@@ -481,7 +484,11 @@ mod tests {
             Catalog {
                 provider: Provider::Ollama,
                 client: Provider::Ollama
-                    .connect(Provider::Ollama.default_endpoint(), None)
+                    .connect(
+                        Provider::Ollama.adapter(),
+                        Provider::Ollama.default_endpoint(),
+                        None,
+                    )
                     .unwrap(),
                 models: vec!["same".into(), "exact-extra".into()],
                 aliases: Vec::new(),
@@ -491,6 +498,7 @@ mod tests {
                 provider: Provider::Anthropic,
                 client: Provider::Anthropic
                     .connect(
+                        Provider::Anthropic.adapter(),
                         Provider::Anthropic.default_endpoint(),
                         Some("fixture".into()),
                     )

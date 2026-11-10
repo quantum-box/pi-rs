@@ -305,9 +305,20 @@ impl Projection {
                 let model = request
                     .and_then(|request| self.requested(records, request))
                     .or_else(|| self.selected(records, record.id));
-                let provider = replay
-                    .as_ref()
-                    .map(|replay| replay.identity.provider.as_str())
+                let messages_provider = replay.as_ref().and_then(|replay| {
+                    replay
+                        .identity
+                        .provider
+                        .strip_prefix("anthropic-messages:")?
+                        .split_once(':')
+                        .map(|(provider, _)| provider)
+                });
+                let provider = messages_provider
+                    .or_else(|| {
+                        replay
+                            .as_ref()
+                            .map(|replay| replay.identity.provider.as_str())
+                    })
                     .or_else(|| {
                         finalized.and_then(|entry| {
                             entry
@@ -322,30 +333,34 @@ impl Projection {
                 let provider = model
                     .filter(|selected| Provider::named(selected.provider).is_none())
                     .map_or(provider, |selected| selected.provider);
-                let api = Provider::named(provider)
-                    .or_else(|| {
-                        replay
-                            .as_ref()
-                            .and_then(|replay| Provider::named(&replay.identity.provider))
-                    })
-                    .or_else(|| {
-                        finalized
-                            .and_then(|entry| entry.metadata.resolved_model.as_ref())
-                            .and_then(|identity| Provider::named(&identity.provider))
-                    })
-                    .map_or_else(
-                        || {
-                            if replay
-                                .as_deref()
-                                .is_some_and(super::pi_messages::is_pi_messages_replay)
-                            {
-                                "pi-messages"
-                            } else {
-                                "openai-completions"
-                            }
-                        },
-                        |provider| provider.api(),
-                    );
+                let api = messages_provider
+                    .map(|_| "anthropic-messages")
+                    .unwrap_or_else(|| {
+                        Provider::named(provider)
+                            .or_else(|| {
+                                replay
+                                    .as_ref()
+                                    .and_then(|replay| Provider::named(&replay.identity.provider))
+                            })
+                            .or_else(|| {
+                                finalized
+                                    .and_then(|entry| entry.metadata.resolved_model.as_ref())
+                                    .and_then(|identity| Provider::named(&identity.provider))
+                            })
+                            .map_or_else(
+                                || {
+                                    if replay
+                                        .as_deref()
+                                        .is_some_and(super::pi_messages::is_pi_messages_replay)
+                                    {
+                                        "pi-messages"
+                                    } else {
+                                        "openai-completions"
+                                    }
+                                },
+                                |provider| provider.api(),
+                            )
+                    });
                 let model_id = model
                     .filter(|model| !model.model.is_empty())
                     .map(|model| model.model)

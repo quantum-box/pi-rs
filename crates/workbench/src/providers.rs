@@ -42,7 +42,7 @@ impl Adapter {
         }
     }
 
-    fn api(self) -> &'static str {
+    pub fn api(self) -> &'static str {
         match self {
             Self::ChatCompletions => "openai-completions",
             Self::Anthropic => "anthropic-messages",
@@ -98,7 +98,12 @@ impl Provider {
         }
     }
 
-    pub fn connect(&self, endpoint: &str, token: Option<String>) -> Result<Client> {
+    pub fn connect(
+        &self,
+        adapter: Adapter,
+        endpoint: &str,
+        token: Option<String>,
+    ) -> Result<Client> {
         let missing_key = || {
             Error::Config(match self {
                 Self::Anthropic => "set ANTHROPIC_API_KEY or pass --api-key".into(),
@@ -109,7 +114,7 @@ impl Provider {
                 _ => format!("configure an API key for {}", self.id()),
             })
         };
-        match self.adapter() {
+        match adapter {
             Adapter::ChatCompletions => {
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
@@ -125,7 +130,17 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                Ok(Client::Anthropic(Anthropic::new(endpoint, &token)?))
+                let mut client = Anthropic::new(endpoint, &token)?;
+                if self != &Self::Anthropic {
+                    use sha2::{Digest, Sha256};
+                    let scope = format!(
+                        "anthropic-messages:{}:{:x}",
+                        self.id(),
+                        Sha256::digest(endpoint)
+                    );
+                    client = client.with_provider(self.id(), scope);
+                }
+                Ok(Client::Anthropic(client))
             }
             Adapter::Google => {
                 let token = token.ok_or_else(missing_key)?;
@@ -165,6 +180,7 @@ pub(super) enum Client {
 #[derive(Clone)]
 pub(super) struct Deferred {
     provider: Provider,
+    adapter: Adapter,
     endpoint: String,
     credential: Option<Credential>,
     headers: RequestHeaders,
@@ -185,7 +201,7 @@ impl Deferred {
             .await?;
         let mut client = self
             .provider
-            .connect(&self.endpoint, token)?
+            .connect(self.adapter, &self.endpoint, token)?
             .with_headers(headers)
             .with_context_probes(self.probe_context);
         if let Some((args, reported)) = &self.options {
@@ -202,12 +218,14 @@ impl Deferred {
 impl Client {
     pub fn deferred(
         provider: Provider,
+        adapter: Adapter,
         endpoint: &str,
         credential: Option<Credential>,
         headers: RequestHeaders,
     ) -> Self {
         Self::Deferred(Box::new(Deferred {
             provider,
+            adapter,
             endpoint: endpoint.into(),
             credential,
             headers,

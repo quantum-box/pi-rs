@@ -133,6 +133,7 @@ struct ConfiguredModel {
     kind: Option<String>,
     #[serde(rename = "baseUrl")]
     base_url: Option<String>,
+    api: Option<String>,
     #[serde(flatten)]
     metadata: ModelMetadata,
 }
@@ -196,7 +197,7 @@ impl ModelMetadata {
         }
     }
 
-    fn validate(&self, provider: &Provider, id: &str) -> Result<()> {
+    fn validate(&self, provider: &Provider, adapter: Adapter, id: &str) -> Result<()> {
         if id.trim().is_empty()
             || self
                 .name
@@ -210,7 +211,7 @@ impl ModelMetadata {
                 provider.id()
             )));
         }
-        if provider.adapter() == Adapter::ChatCompletions {
+        if adapter == Adapter::ChatCompletions {
             pi_rs::ollama::validate_sampling(&self.sampling_params)?;
             for (level, parameters) in &self.sampling_params_by_thinking_level {
                 if !super::thinking::LEVELS.contains(&level.as_str()) {
@@ -233,11 +234,11 @@ impl ModelMetadata {
         Ok(())
     }
 
-    pub fn levels(&self, provider: &Provider) -> Option<Vec<String>> {
+    pub fn levels(&self, adapter: Adapter) -> Option<Vec<String>> {
         if self.reasoning == Some(false) {
             return Some(vec!["off".into()]);
         }
-        if provider.adapter() != Adapter::ChatCompletions || self.thinking_level_map.is_empty() {
+        if adapter != Adapter::ChatCompletions || self.thinking_level_map.is_empty() {
             return None;
         }
         Some(
@@ -268,14 +269,14 @@ impl ModelMetadata {
         sampling
     }
 
-    pub fn apply(&self, provider: &Provider, details: &mut pi_rs::ollama::ModelDetails) {
+    pub fn apply(&self, adapter: Adapter, details: &mut pi_rs::ollama::ModelDetails) {
         details.context_window = self.context_window.or(details.context_window);
         details.max_output_tokens = self.max_tokens.or(details.max_output_tokens);
         details.reasoning = self.reasoning.or(details.reasoning);
         if let Some(input) = &self.input {
             details.images = Some(input.contains(&Modality::Image));
         }
-        if let Some(levels) = self.levels(provider) {
+        if let Some(levels) = self.levels(adapter) {
             details.thinking_levels = Some(levels);
         }
     }
@@ -360,7 +361,7 @@ impl Profiles {
             }
             let endpoint = profile.base_url.as_deref().map_or_else(
                 || Ok(provider.default_endpoint().to_owned()),
-                |base| endpoint_from_base(&provider, base),
+                |base| endpoint_from_base(&provider, provider.adapter(), base),
             )?;
             profile
                 .models
@@ -368,10 +369,35 @@ impl Profiles {
             let mut ids = std::collections::BTreeSet::new();
             let mut model_endpoints = BTreeMap::new();
             for model in &mut profile.models {
-                if let Some(base) = &model.base_url {
-                    model_endpoints.insert(model.id.clone(), endpoint_from_base(&provider, base)?);
+                let adapter = match model.api.as_deref() {
+                    None => provider.adapter(),
+                    Some(api) => Adapter::named(api).ok_or_else(|| {
+                        Error::Config(format!(
+                            "unsupported API {api:?} for model {}/{}",
+                            provider.id(),
+                            model.id
+                        ))
+                    })?,
+                };
+                if let Some(base) = model.base_url.as_deref().or_else(|| {
+                    profile
+                        .base_url
+                        .as_deref()
+                        .filter(|_| adapter != provider.adapter())
+                }) {
+                    model_endpoints.insert(
+                        model.id.clone(),
+                        endpoint_from_base(&provider, adapter, base)?,
+                    );
+                } else if adapter != provider.adapter() {
+                    return Err(Error::Config(format!(
+                        "model {}/{} requires baseUrl for the {} API",
+                        provider.id(),
+                        model.id,
+                        adapter.api()
+                    )));
                 }
-                model.metadata.validate(&provider, &model.id)?;
+                model.metadata.validate(&provider, adapter, &model.id)?;
                 model.metadata.headers =
                     validate_headers(std::mem::take(&mut model.metadata.headers))?;
                 if !ids.insert(model.id.as_str()) {
@@ -383,7 +409,14 @@ impl Profiles {
                 }
             }
             for (id, metadata) in &mut profile.model_overrides {
-                metadata.validate(&provider, id)?;
+                let adapter = profile
+                    .models
+                    .iter()
+                    .find(|model| model.id == *id)
+                    .and_then(|model| model.api.as_deref())
+                    .and_then(Adapter::named)
+                    .unwrap_or_else(|| provider.adapter());
+                metadata.validate(&provider, adapter, id)?;
                 metadata.headers = validate_headers(std::mem::take(&mut metadata.headers))?;
             }
             let id = provider.id().to_owned();
@@ -563,9 +596,9 @@ impl Profiles {
         ids
     }
 
-    pub fn model(&self, provider: &Provider, id: &str) -> Option<ModelMetadata> {
-        let profile = self.entries.get(provider.id());
-        let model = profile
+    fn definition(&self, provider: &Provider, id: &str) -> Option<&ConfiguredModel> {
+        self.entries
+            .get(provider.id())
             .and_then(|profile| profile.models.iter().find(|model| model.id == id))
             .or_else(|| {
                 BUILTIN_MODELS
@@ -573,6 +606,19 @@ impl Profiles {
                     .iter()
                     .find(|model| model.id == id)
             })
+    }
+
+    pub fn model_adapter(&self, provider: &Provider, model: &str) -> Adapter {
+        self.definition(provider, model)
+            .and_then(|model| model.api.as_deref())
+            .and_then(Adapter::named)
+            .unwrap_or_else(|| provider.adapter())
+    }
+
+    pub fn model(&self, provider: &Provider, id: &str) -> Option<ModelMetadata> {
+        let profile = self.entries.get(provider.id());
+        let model = self
+            .definition(provider, id)
             .map(|model| model.metadata.clone().with_model_defaults());
         match profile.and_then(|profile| profile.overrides.get(id)) {
             Some(overrides) => Some(model.unwrap_or_default().overlay(overrides)),
@@ -581,7 +627,7 @@ impl Profiles {
     }
 }
 
-fn endpoint_from_base(provider: &Provider, base: &str) -> Result<String> {
+fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Result<String> {
     let invalid = || Error::Config(format!("invalid models.json baseUrl for {}", provider.id()));
     let mut url = reqwest::Url::parse(base).map_err(|_| invalid())?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
@@ -595,7 +641,7 @@ fn endpoint_from_base(provider: &Provider, base: &str) -> Result<String> {
         return Err(invalid());
     }
 
-    let suffix = match provider.adapter() {
+    let suffix = match adapter {
         Adapter::ChatCompletions => "/chat/completions",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
         Adapter::Google => {
@@ -613,7 +659,7 @@ fn endpoint_from_base(provider: &Provider, base: &str) -> Result<String> {
         && url.host_str() == Some("api.deepseek.com")
     {
         suffix.to_owned()
-    } else if path.is_empty() && provider.adapter() != Adapter::PiMessages {
+    } else if path.is_empty() && adapter != Adapter::PiMessages {
         format!("/v1{suffix}")
     } else {
         format!("{path}{suffix}")
@@ -703,7 +749,7 @@ mod tests {
             });
         assert_eq!(args.endpoint, "http://127.0.0.1:7000/v1/chat/completions");
         assert_eq!(args.model_token().as_deref(), Some("local-override"));
-        args.activate_provider(Provider::Anthropic).unwrap();
+        args.activate_provider(Provider::Anthropic, None).unwrap();
         assert_eq!(args.model_scope[0].provider.id(), "ollama");
         assert_eq!(args.endpoint, "http://127.0.0.1:7001/v1/messages");
         assert_eq!(args.model_token().as_deref(), Some("anthropic-profile"));
@@ -711,7 +757,7 @@ mod tests {
             args.model_credential_for(&Provider::Anthropic, "http://127.0.0.1:7002/v1/messages")
                 .is_none()
         );
-        args.activate_provider(Provider::Ollama).unwrap();
+        args.activate_provider(Provider::Ollama, None).unwrap();
         assert_eq!(args.model_scope[0].model, "local-scoped");
         assert_eq!(args.model_token().as_deref(), Some("local-override"));
         args.model = "local-scoped".into();
@@ -735,7 +781,7 @@ mod tests {
         assert_eq!(custom.max_tokens, Some(100));
         assert_eq!(custom.context_window, Some(128_000));
         let mut details = pi_rs::ollama::ModelDetails::default();
-        custom.apply(&Provider::Ollama, &mut details);
+        custom.apply(Adapter::ChatCompletions, &mut details);
         assert_eq!(details.images, Some(true));
         assert_eq!(details.thinking_levels, Some(vec!["off".into()]));
         let existing = profiles.model(&Provider::Ollama, "existing").unwrap();
@@ -754,7 +800,7 @@ mod tests {
             "modelOverrides":{"custom":{"samplingParamsByThinkingLevel":{"xhigh":{"temperature":0.2}}}}
         }}})).unwrap();
         let model = profiles.model(&Provider::Ollama, "custom").unwrap();
-        let levels = model.levels(&Provider::Ollama).unwrap();
+        let levels = model.levels(Adapter::ChatCompletions).unwrap();
         assert!(
             !levels
                 .iter()

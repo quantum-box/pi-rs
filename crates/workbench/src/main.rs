@@ -426,6 +426,10 @@ impl Cli {
         model: Option<&str>,
     ) -> Result<providers::Client> {
         let endpoint = self.model_endpoint_for(provider, model);
+        let adapter = model.map_or_else(
+            || provider.adapter(),
+            |model| self.model_profiles.model_adapter(provider, model),
+        );
         let credential = self.model_credential_for(provider, endpoint);
         let settings = self
             .model_profiles
@@ -437,6 +441,7 @@ impl Cli {
         {
             return Ok(providers::Client::deferred(
                 provider.clone(),
+                adapter,
                 endpoint,
                 credential,
                 settings,
@@ -447,15 +452,17 @@ impl Cli {
             .and_then(model_auth::Credential::literal)
             .map(str::to_owned);
         let headers = settings.static_headers(provider, token.as_deref())?;
-        Ok(provider.connect(endpoint, token)?.with_headers(headers))
+        Ok(provider
+            .connect(adapter, endpoint, token)?
+            .with_headers(headers))
     }
 
-    fn activate_provider(&mut self, provider: Provider) -> Result<()> {
+    fn activate_provider(&mut self, provider: Provider, model: Option<&str>) -> Result<()> {
         if provider == self.provider {
             return Ok(());
         }
         let endpoint = self.endpoint_for(&provider).to_owned();
-        self.connect_provider(&provider, None)?;
+        self.connect_provider(&provider, model)?;
         self.provider = provider;
         self.endpoint = endpoint;
         self.thinking_profile = None;
@@ -516,7 +523,7 @@ impl Cli {
         thinking: Option<String>,
     ) -> Result<()> {
         let mut selected = self.clone();
-        selected.activate_provider(provider)?;
+        selected.activate_provider(provider, Some(&model))?;
         selected.model = model;
         selected.connect_provider(&selected.provider, Some(&selected.model))?;
         if thinking.is_some() {
@@ -579,7 +586,7 @@ impl Cli {
             && (self.model_explicit
                 || self.connection_explicit
                 || !in_scope
-                || self.activate_provider(provider).is_err())
+                || self.activate_provider(provider, Some(&model)).is_err())
         {
             return;
         }
@@ -991,7 +998,7 @@ async fn execute(mut args: Cli) -> Result<()> {
             .cloned();
         if let Some(choice) = selected {
             let previous_thinking = args.thinking.clone();
-            args.activate_provider(choice.provider)?;
+            args.activate_provider(choice.provider, Some(&choice.model))?;
             args.model = choice.model;
             if args.thinking_explicit {
                 args.thinking = previous_thinking;

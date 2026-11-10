@@ -54,6 +54,8 @@ pub struct Anthropic {
     client: Client,
     endpoint: Url,
     api_key: HeaderValue,
+    provider: Arc<str>,
+    replay_scope: Arc<str>,
     headers: HeaderMap,
     catalog: Arc<RwLock<BTreeMap<String, CatalogEntry>>>,
     probe_context: bool,
@@ -97,6 +99,8 @@ impl Anthropic {
             client,
             endpoint,
             api_key,
+            provider: Arc::from("anthropic"),
+            replay_scope: Arc::from("anthropic"),
             headers: HeaderMap::new(),
             catalog: Default::default(),
             probe_context: true,
@@ -104,6 +108,13 @@ impl Anthropic {
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Isolate opaque reasoning blocks when another service uses the Messages protocol.
+    pub fn with_provider(mut self, provider: &str, replay_scope: impl Into<Arc<str>>) -> Self {
+        self.provider = Arc::from(provider);
+        self.replay_scope = replay_scope.into();
+        self
     }
 
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
@@ -315,7 +326,7 @@ async fn read_json(mut response: Response) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|_| Error::Model("invalid Anthropic response".into()))
 }
 
-fn encode_request(request: ModelRequest) -> Result<Value> {
+fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
     let mut system = Vec::new();
     let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
     for message in request.messages {
@@ -341,7 +352,15 @@ fn encode_request(request: ModelRequest) -> Result<Value> {
                 replay,
             } => {
                 let blocks = match replay {
-                    Some(replay) if replay_matches(&replay, &request.model, &content, &calls) => {
+                    Some(replay)
+                        if replay_matches(
+                            &replay,
+                            replay_scope,
+                            &request.model,
+                            &content,
+                            &calls,
+                        ) =>
+                    {
                         replay.blocks
                     }
                     _ => {
@@ -454,8 +473,14 @@ fn tool_block(call: &ToolCall) -> Value {
     json!({"type":"tool_use","id":call.id,"name":call.name,"input":input})
 }
 
-fn replay_matches(replay: &ProviderReplay, model: &str, text: &str, calls: &[ToolCall]) -> bool {
-    if replay.identity.provider != "anthropic" || replay.identity.model != model {
+fn replay_matches(
+    replay: &ProviderReplay,
+    scope: &str,
+    model: &str,
+    text: &str,
+    calls: &[ToolCall],
+) -> bool {
+    if replay.identity.provider != scope || replay.identity.model != model {
         return false;
     }
     let rendered = replay
@@ -630,7 +655,9 @@ impl Model for Anthropic {
         }
         let requested_model = request.model.clone();
         let max_output_tokens = request.max_output_tokens;
-        let mut body = encode_request(request)?;
+        let provider = self.provider.clone();
+        let replay_scope = self.replay_scope.clone();
+        let mut body = encode_request(request, &replay_scope)?;
         if let Some(level) = self.thinking_level.as_deref() {
             configure_thinking(&mut body, details.as_ref(), level, max_output_tokens)?;
         }
@@ -688,7 +715,7 @@ impl Model for Anthropic {
                             id.len() <= 128 && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
                         ).map(str::to_owned);
                         metadata.resolved_model = Some(ResolvedModelIdentity {
-                            provider: "anthropic".into(),
+                            provider: provider.to_string(),
                             model: message["model"].as_str().unwrap_or(&requested_model).into(),
                         });
                         usage.update(&message["usage"], &mut metadata);
@@ -838,7 +865,7 @@ impl Model for Anthropic {
                         }
                         if signed {
                             metadata.replay = Some(Box::new(ProviderReplay {
-                                identity: ResolvedModelIdentity { provider: "anthropic".into(), model: requested_model },
+                                identity: ResolvedModelIdentity { provider: replay_scope.to_string(), model: requested_model },
                                 blocks: replay.into_values().collect(),
                             }));
                         }

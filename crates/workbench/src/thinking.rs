@@ -16,15 +16,18 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if let Some(levels) = reported(args) {
         return levels.to_vec();
     }
+    let adapter = args
+        .model_profiles
+        .model_adapter(&args.provider, &args.model);
     if let Some(levels) = args
         .model_profiles
         .model(&args.provider, &args.model)
-        .and_then(|model| model.levels(&args.provider))
+        .and_then(|model| model.levels(adapter))
     {
         args.thinking_profile = Some((args.model.clone(), levels.clone()));
         return levels;
     }
-    let fallback = || match args.provider.adapter() {
+    let fallback = || match adapter {
         super::providers::Adapter::ChatCompletions | super::providers::Adapter::PiMessages => {
             LEVELS.iter().map(|level| (*level).into()).collect()
         }
@@ -76,7 +79,10 @@ pub(super) fn adjust(args: &mut Cli) {
     if let Some(requested) = args.thinking.clone() {
         let levels = available(args);
         if reported(args).is_some()
-            || args.provider.adapter() != super::providers::Adapter::ChatCompletions
+            || args
+                .model_profiles
+                .model_adapter(&args.provider, &args.model)
+                != super::providers::Adapter::ChatCompletions
         {
             args.thinking = Some(clamp(&requested, &levels).into());
         }
