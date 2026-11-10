@@ -448,38 +448,52 @@ fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
 }
 pub fn is_package_source(source: &str, workspace: &Path) -> bool {
     !super::resource_paths::named_extension(source)
-        && (source.starts_with("cargo:")
-            || source.starts_with("git:")
-            || source.starts_with("https://")
-            || source.starts_with("ssh://")
-            || source.starts_with("git@")
-            || normalize(source, workspace).is_ok_and(|path| Path::new(&path).is_dir()))
+        && normalize(source, workspace)
+            .is_ok_and(|source| remote(&source) || Path::new(&source).is_dir())
 }
+
+fn git_transport(source: &str) -> bool {
+    ["https://", "http://", "ssh://", "git://", "git@"]
+        .iter()
+        .any(|prefix| source.starts_with(prefix))
+}
+
 fn normalize(source: &str, base: &Path) -> Result<String> {
-    if source.trim().is_empty() {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
         return Err(Error::Config("package source is empty".into()));
     }
-    if let Some(source) = source.strip_prefix("git:") {
-        let source = if source.contains("://") || source.starts_with("git@") {
+    if git_transport(trimmed) {
+        return Ok(format!("git:{trimmed}"));
+    }
+    if let Some(source) = trimmed.strip_prefix("git:") {
+        let source = source.trim();
+        if source.is_empty() {
+            return Err(Error::Config("git package source is empty".into()));
+        }
+        let source = if source.contains("://") || git_transport(source) {
             source.to_owned()
         } else {
             format!("https://{source}")
         };
         return Ok(format!("git:{source}"));
     }
-    if source.starts_with("https://") || source.starts_with("ssh://") || source.starts_with("git@")
-    {
-        return Ok(format!("git:{source}"));
+    if trimmed.starts_with("cargo:") {
+        return Ok(trimmed.into());
     }
-    if source.starts_with("cargo:") {
-        return Ok(source.into());
-    }
-    if source.starts_with("npm:") {
+    if trimmed.starts_with("npm:") {
         return Err(Error::Config(
             "native packages use Cargo, git, or local paths".into(),
         ));
     }
-    let path = if source == "~" || source.starts_with("~/") {
+    let path = if trimmed.starts_with("file:") {
+        let invalid = || Error::Config("invalid local package file URL".into());
+        let url = reqwest::Url::parse(trimmed).map_err(|_| invalid())?;
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(invalid());
+        }
+        url.to_file_path().map_err(|_| invalid())?
+    } else if source == "~" || source.starts_with("~/") {
         let path = source.strip_prefix("~/").unwrap_or("");
         PathBuf::from(
             std::env::var_os("HOME")
@@ -546,7 +560,10 @@ fn source_identity(source: &str) -> String {
             let path = repository.path().trim_matches('/');
             let path = path.strip_suffix(".git").unwrap_or(path);
             let port = repository.port().filter(|port| {
-                !matches!((repository.scheme(), port), ("ssh", 22) | ("https", 443))
+                !matches!(
+                    (repository.scheme(), port),
+                    ("ssh", 22) | ("http", 80) | ("https", 443) | ("git", 9418)
+                )
             });
             let authority = port.map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
             return format!("git:{authority}/{path}");
@@ -681,7 +698,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         fetch
             .arg("-C")
             .arg(&root)
-            .args(["fetch", "--depth", "1", "origin", reference]);
+            .args(["fetch", "--depth", "1", "--", "origin", reference]);
         run(fetch).await?;
         let mut checkout = tokio::process::Command::new("git");
         checkout
@@ -1061,6 +1078,33 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn package_sources_normalize_file_urls_and_git_transports() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("native package");
+        std::fs::create_dir(&package).unwrap();
+        let url = reqwest::Url::from_file_path(&package).unwrap();
+        assert!(url.as_str().contains("%20"));
+        assert_eq!(
+            normalize(url.as_str(), root.path()).unwrap(),
+            normalize("native package", root.path()).unwrap()
+        );
+        assert!(is_package_source(url.as_str(), root.path()));
+        let git = [
+            " https://github.com/example/demo.git#v1 ",
+            "http://github.com:80/example/demo.git",
+            "git://github.com:9418/example/demo.git",
+            "git: ssh://git@github.com:22/example/demo@main ",
+            "git@github.com:example/demo",
+        ];
+        for source in git {
+            assert_eq!(
+                source_identity(&normalize(source, root.path()).unwrap()),
+                "git:github.com/example/demo"
+            );
+        }
+    }
+
     #[test]
     fn git_revisions_preserve_transport_credentials_and_branch_slashes() {
         for (source, url, reference) in [

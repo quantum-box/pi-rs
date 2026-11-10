@@ -2447,3 +2447,9 @@ check output contains only status and metadata.
 Loopback checks covered expired and refreshed Radius credentials,
 model-specific key selection, OpenRouter's OAuth key type, and invalid
 configuration.
+
+Native packages accept local `file:` URLs, including encoded spaces and
+Unicode, and recognize HTTP, HTTPS, SSH, and Git repository transports.
+Default transport ports and revision selectors are excluded from repository
+identity. A local install and removal check verified that a file URL and its
+equivalent path resolve to the same package.
