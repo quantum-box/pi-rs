@@ -3,15 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pi_rs::{Error, Extension, Outcome, Result, Tool, ToolContext, ToolSpec};
 use rmcp::{
-    RoleClient, ServiceExt,
-    model::CallToolResponse,
-    service::RunningService,
+    RoleClient,
+    model::{CallToolResponse, ProtocolVersion, SubscriptionFilter},
+    service::{ClientLifecycleMode, ClientServiceExt, NotificationContext, RunningService},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -36,6 +36,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     pub timeout: Option<u64>,
+    pub protocol_version: Option<String>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
     pub exposure: Option<String>,
@@ -47,7 +48,29 @@ pub struct ServerConfig {
 #[derive(Clone, Default)]
 struct NativeClient {
     interaction: Arc<std::sync::Mutex<Option<Interaction>>>,
+    catalog: Arc<CatalogSignal>,
 }
+
+#[derive(Default)]
+struct CatalogSignal {
+    revision: AtomicU64,
+    listening: AtomicBool,
+}
+
+impl CatalogSignal {
+    fn changed(&self) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct CatalogSnapshot {
+    signal: Arc<CatalogSignal>,
+    revision: u64,
+    checked_at: Instant,
+}
+
+const CATALOG_FALLBACK: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 struct Interaction {
     host: Arc<dyn pi_rs::ToolHost>,
@@ -75,6 +98,10 @@ impl rmcp::ClientHandler for NativeClient {
             .into(),
         );
         info
+    }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.catalog.changed();
     }
 
     async fn create_elicitation(
@@ -292,6 +319,43 @@ impl Drop for Connection {
     }
 }
 
+async fn listen_for_tool_changes(service: &RunningService<RoleClient, NativeClient>, stdio: bool) {
+    let Some(info) = service.peer_info() else {
+        return;
+    };
+    if info
+        .capabilities
+        .tools
+        .as_ref()
+        .is_none_or(|tools| tools.list_changed != Some(true))
+    {
+        return;
+    }
+    let signal = service.service().catalog.clone();
+    if info.protocol_version < ProtocolVersion::V_2026_07_28 {
+        // A legacy HTTP server can advertise notifications but reject its GET stream.
+        signal.listening.store(stdio, Ordering::SeqCst);
+        return;
+    }
+    let filter = SubscriptionFilter::builder().tools_list_changed().build();
+    let Ok(Ok(mut subscription)) =
+        tokio::time::timeout(Duration::from_secs(2), service.listen(filter)).await
+    else {
+        return;
+    };
+    if subscription.acknowledged().tools_list_changed != Some(true) {
+        return;
+    }
+    signal.listening.store(true, Ordering::SeqCst);
+    tokio::spawn(async move {
+        while let Ok(Some(_)) = subscription.next().await {
+            signal.changed();
+        }
+        signal.listening.store(false, Ordering::SeqCst);
+        signal.changed();
+    });
+}
+
 pub struct McpExtension {
     id: String,
     tools: Vec<Arc<dyn Tool>>,
@@ -301,6 +365,7 @@ pub struct McpExtension {
     pub server_name: String,
     pub description: String,
     connection: Arc<Connection>,
+    catalog: CatalogSnapshot,
 }
 impl McpExtension {
     pub async fn connect(name: &str, config: &ServerConfig, workspace: &Path) -> Result<Self> {
@@ -332,6 +397,17 @@ impl McpExtension {
             return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
         }
         let timeout = Duration::from_secs(config.timeout.unwrap_or(60).clamp(1, 3600));
+        let lifecycle = match config.protocol_version.as_deref() {
+            None => ClientLifecycleMode::Initialize,
+            Some("2026-07-28") => ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+            Some(version) => {
+                return Err(Error::Config(format!(
+                    "MCP {name} has unsupported protocolVersion {version}"
+                )));
+            }
+        };
         let mut identity = connection_identity(name, config, workspace)?;
         let service = if let Some(command) = &config.command {
             if config.url.is_some()
@@ -371,7 +447,7 @@ impl McpExtension {
             let transport = TokioChildProcess::new(wrapped)?;
             tokio::time::timeout(
                 timeout.min(Duration::from_secs(10)),
-                NativeClient::default().serve(transport),
+                NativeClient::default().serve_with_lifecycle(transport, lifecycle),
             )
             .await
             .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
@@ -428,17 +504,17 @@ impl McpExtension {
                     let (client, generation) = crate::mcp_auth::client(name, url, client).await?;
                     identity.update(generation.as_bytes());
                     NativeClient::default()
-                        .serve(StreamableHttpClientTransport::with_client(
-                            client,
-                            transport_config,
-                        ))
+                        .serve_with_lifecycle(
+                            StreamableHttpClientTransport::with_client(client, transport_config),
+                            lifecycle,
+                        )
                         .await
                 } else {
                     NativeClient::default()
-                        .serve(StreamableHttpClientTransport::with_client(
-                            client,
-                            transport_config,
-                        ))
+                        .serve_with_lifecycle(
+                            StreamableHttpClientTransport::with_client(client, transport_config),
+                            lifecycle,
+                        )
                         .await
                 }
                 .map_err(|error| {
@@ -455,6 +531,7 @@ impl McpExtension {
         } else {
             return Err(Error::Config(format!("MCP {name} needs command or url")));
         };
+        listen_for_tool_changes(&service, config.command.is_some()).await;
         let connection = Arc::new(Connection {
             identity: format!("{:x}", identity.finalize()),
             service: tokio::sync::Mutex::new(service),
@@ -473,16 +550,39 @@ impl McpExtension {
         Self::discover(self.connection.clone()).await
     }
 
+    /// Keep a notified catalog between turns and poll when notifications are unavailable.
+    pub async fn refresh_if_changed(&self) -> Result<Option<Self>> {
+        let service = self.connection.active_service().await?;
+        let signal = &service.service().catalog;
+        if Arc::ptr_eq(signal, &self.catalog.signal) {
+            let no_tools = service
+                .peer_info()
+                .is_some_and(|info| info.capabilities.tools.is_none());
+            let unchanged = signal.listening.load(Ordering::SeqCst)
+                && signal.revision.load(Ordering::SeqCst) == self.catalog.revision
+                && self.catalog.checked_at.elapsed() < CATALOG_FALLBACK;
+            if no_tools || unchanged {
+                return Ok(None);
+            }
+        }
+        drop(service);
+        Self::discover(self.connection.clone()).await.map(Some)
+    }
+
     async fn discover(connection: Arc<Connection>) -> Result<Self> {
         let name = connection.name.clone();
         let config = connection.config.clone();
         let timeout = connection.timeout;
-        let info = connection.service.lock().await.peer_info();
+        let service = connection.service.lock().await;
+        let info = service.peer_info();
+        let signal = service.service().catalog.clone();
+        // A notification received during discovery leaves this snapshot dirty.
+        let revision = signal.revision.load(Ordering::SeqCst);
         let definitions = if info
             .as_ref()
             .is_some_and(|info| info.capabilities.tools.is_some())
         {
-            tokio::time::timeout(timeout, connection.service.lock().await.list_all_tools())
+            tokio::time::timeout(timeout, service.list_all_tools())
                 .await
                 .map_err(|_| Error::Config(format!("MCP {name} tool discovery timed out")))?
                 .map_err(|error| {
@@ -490,6 +590,12 @@ impl McpExtension {
                 })?
         } else {
             Vec::new()
+        };
+        drop(service);
+        let catalog = CatalogSnapshot {
+            signal,
+            revision,
+            checked_at: Instant::now(),
         };
         let prefix = format!("mcp__{}__", normalize(&name));
         let mut counts = BTreeMap::<String, usize>::new();
@@ -643,6 +749,7 @@ impl McpExtension {
             server_name: name,
             description,
             connection,
+            catalog,
         })
     }
     pub fn has_deferred(&self) -> bool {
@@ -813,6 +920,9 @@ fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> R
     let workspace = workspace.canonicalize()?;
     let mut identity = Sha256::new();
     identity.update(json!({"name":name,"command":config.command,"args":config.args,"url":config.url,"cwd":config.cwd,"workspace":workspace}).to_string());
+    if let Some(version) = &config.protocol_version {
+        identity.update(version.as_bytes());
+    }
     Ok(identity)
 }
 

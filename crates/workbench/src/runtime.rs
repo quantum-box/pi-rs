@@ -147,7 +147,9 @@ impl pi_rs::RegistryRefresher for LiveMcpCatalog {
         let mut servers = Vec::with_capacity(previous.len());
         let mut registry = current.clone();
         for server in previous {
-            let refreshed = Arc::new(server.refresh().await?);
+            let refreshed = server.refresh_if_changed().await?.map_or(server, Arc::new);
+            // A prior in-flight refresh may have updated the shared catalog
+            // while this caller still holds the previous registry snapshot.
             registry.replace(refreshed.clone())?;
             servers.push(refreshed);
         }
