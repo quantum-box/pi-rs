@@ -102,7 +102,7 @@ pub struct Picker {
     selected: usize,
     active_session: Option<PathBuf>,
     session_action: Option<SessionAction>,
-    session_error: Option<String>,
+    feedback: Option<Result<String, String>>,
     session_sort: SessionSort,
     all_workspaces: bool,
     named_only: bool,
@@ -128,6 +128,7 @@ pub enum Input {
     Cancel,
     Select(Selection),
     Save(Selection),
+    CopyTreeRecord(u64),
 }
 impl Picker {
     pub fn new(title: &str, items: Vec<Item>) -> Self {
@@ -138,7 +139,7 @@ impl Picker {
             selected: 0,
             active_session: None,
             session_action: None,
-            session_error: None,
+            feedback: None,
             session_sort: SessionSort::Threaded,
             all_workspaces: false,
             named_only: false,
@@ -148,6 +149,14 @@ impl Picker {
             tree: None,
         }
     }
+    pub fn show_feedback(&mut self, feedback: Result<String, String>) {
+        self.feedback = Some(feedback);
+    }
+
+    pub fn select_last(&mut self) {
+        self.selected = self.matches().len().saturating_sub(1);
+    }
+
     pub fn sessions(
         items: Vec<Item>,
         active: PathBuf,
@@ -302,6 +311,7 @@ impl Picker {
         Some(super::session_threads::layout(&paths, &parents))
     }
     pub fn input(&mut self, key: KeyEvent, keys: &super::keys::Keys) -> Input {
+        self.feedback = None;
         if let Some(action) = self.session_action.clone() {
             if key.code == KeyCode::Esc {
                 self.session_action = None;
@@ -327,7 +337,6 @@ impl Picker {
                 SessionAction::Rename(_) | SessionAction::Label(_) => {}
             }
         } else if self.active_session.is_some() {
-            self.session_error = None;
             if key.code == KeyCode::Tab {
                 self.all_workspaces = !self.all_workspaces;
                 self.selected = 0;
@@ -370,7 +379,7 @@ impl Picker {
                             .as_ref()
                             .and_then(|path| path.canonicalize().ok())
                     {
-                        self.session_error = Some("Cannot delete the active session".into());
+                        self.show_feedback(Err("Cannot delete the active session".into()));
                     } else {
                         self.session_action = Some(SessionAction::Delete(path));
                     }
@@ -396,6 +405,9 @@ impl Picker {
                 return Input::Continue;
             }
             if let Some(id) = selected {
+                if keys.matches("app.message.copy", key) {
+                    return Input::CopyTreeRecord(id);
+                }
                 if keys.matches("app.tree.editLabel", key) {
                     self.query = self
                         .tree
@@ -605,7 +617,7 @@ impl Picker {
         }
         let mut available = height
             .saturating_sub(
-                3 + usize::from(self.session_error.is_some())
+                3 + usize::from(self.feedback.is_some())
                     + usize::from(self.active_session.is_some()),
             )
             .max(1);
@@ -691,8 +703,12 @@ impl Picker {
                 };
             lines.push(Line::plain(message, theme.color("dim")));
         }
-        if let Some(error) = &self.session_error {
-            lines.push(Line::plain(error, theme.color("error")));
+        if let Some(feedback) = &self.feedback {
+            let (message, role) = match feedback {
+                Ok(message) => (message, "dim"),
+                Err(message) => (message, "error"),
+            };
+            lines.push(Line::plain(message, theme.color(role)));
         }
         if self.active_session.is_some() {
             lines.push(Line::plain(
@@ -725,7 +741,7 @@ impl Picker {
                 }
             }
         } else if self.tree.is_some() {
-            "Ctrl+O filter · Alt+←/→ fold/navigate · Shift+L label · Enter checkout · Esc cancel"
+            "Ctrl+O filter · Alt+←/→ navigate · Shift+L label · Ctrl+X copy · Enter checkout"
         } else {
             "Type to search · ↑↓ to select · Enter to open · Esc to cancel"
         };

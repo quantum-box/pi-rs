@@ -353,6 +353,58 @@ pub fn copy_last(session: &Session) -> Result<()> {
             _ => None,
         })
         .ok_or_else(|| Error::Config("no assistant response to copy".into()))?;
+    copy_text(text)
+}
+
+pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
+    use std::borrow::Cow;
+
+    let text = session
+        .records()
+        .get(id.saturating_sub(1) as usize)
+        .filter(|record| record.id == id)
+        .and_then(|record| match &record.event {
+            Event::User { content, .. }
+            | Event::UserWithImages { content, .. }
+            | Event::Assistant { content, .. } => Some(Cow::Borrowed(content.as_str())),
+            Event::BashExecution { execution } => Some(Cow::Borrowed(execution.command.as_str())),
+            Event::ToolFinished {
+                outcome: pi_rs::Outcome::Structured { data, .. },
+                ..
+            }
+            | Event::ToolReconciled {
+                outcome: pi_rs::Outcome::Structured { data, .. },
+                ..
+            } => data["content"]
+                .as_array()
+                .map(|blocks| {
+                    Cow::Owned(
+                        blocks
+                            .iter()
+                            .filter(|block| block["type"] == "text")
+                            .filter_map(|block| block["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                })
+                .or_else(|| data["output"].as_str().map(Cow::Borrowed)),
+            Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => {
+                Some(Cow::Owned(outcome.tool_content()))
+            }
+            Event::ModelFinished {
+                failure: Some(_),
+                partial,
+                ..
+            } => Some(Cow::Borrowed(partial.as_str())),
+            Event::Compacted { summary, .. } => Some(Cow::Borrowed(summary.as_str())),
+            _ => None,
+        })
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| Error::Config("selected entry has no text to copy".into()))?;
+    Ok(text.into_owned())
+}
+
+pub fn copy_text(text: &str) -> Result<()> {
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
     } else if cfg!(windows) {

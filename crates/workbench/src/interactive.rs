@@ -1186,7 +1186,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         }
         "/fork" if rest.is_empty() => {
             let session = Session::open(&args.session)?;
-            let items = session
+            let items: Vec<_> = session
                 .branch()
                 .iter()
                 .filter_map(|record| match &record.event {
@@ -1202,26 +1202,20 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     _ => None,
                 })
                 .collect();
-            view.picker = Some(Picker::new("Fork from user message", items));
+            if items.is_empty() {
+                view.append("No messages to fork from");
+            } else {
+                let mut picker = Picker::new("Fork from user message", items);
+                picker.select_last();
+                view.picker = Some(picker);
+            }
         }
         "/clone" | "/fork" => {
             let session = Session::open(&args.session)?;
             let (target, input) = if name == "/fork" {
                 let target = rest
                     .parse::<u64>()
-                    .ok()
-                    .or_else(|| {
-                        session.branch().iter().rev().find_map(|record| {
-                            matches!(
-                                record.event,
-                                pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. }
-                            )
-                            .then_some(record.id)
-                        })
-                    })
-                    .ok_or_else(|| {
-                        Error::Config("no user message to fork; use /fork <user-record-id>".into())
-                    })?;
+                    .map_err(|_| Error::Config("use /fork <user-record-id>".into()))?;
                 let record = session
                     .records()
                     .iter()
@@ -1885,6 +1879,16 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     match picker.input(key, &keys) {
                         Input::Continue => view.picker = Some(picker),
                         Input::Cancel => {}
+                        Input::CopyTreeRecord(id) => {
+                            picker.show_feedback(
+                                Session::open(&args.session)
+                                    .and_then(|session| sessions::tree_record_text(&session, id))
+                                    .and_then(|text| sessions::copy_text(&text))
+                                    .map(|()| "Copied entry".into())
+                                    .map_err(|error| error.to_string()),
+                            );
+                            view.picker = Some(picker);
+                        }
                         Input::Save(selection) => {
                             let result = match selection {
                                 Selection::Model(model) => {
@@ -2491,6 +2495,10 @@ fn select(
         }
         Selection::Checkout(id) => {
             let mut session = Session::open(&args.session)?;
+            if id == session.head() {
+                view.append("Already at this point");
+                return Ok(());
+            }
             let record = &session.records()[id as usize - 1];
             let (target, input) = match &record.event {
                 pi_rs::Event::User { content, .. }

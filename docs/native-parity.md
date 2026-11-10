@@ -1886,3 +1886,9 @@ catalog is unavailable.
 A fixture verified the update flag, cached Git resource loading and skipped
 uncached installations with a sentinel Git executable. It also verified RPC
 startup without a remote catalog and model listing against local Ollama.
+
+The tree's copy binding copies the full selected text and keeps the tree open.
+Shell entries copy their command, and structured tool results copy their text
+blocks. Selecting the current head is a no-op. The fork picker opens on the
+most recent user message and reports when the branch contains none. A PTY
+fixture exercised full Unicode clipboard text and the fork preselection.
