@@ -608,6 +608,31 @@ fn api_key_override_reaches_direct_and_rpc_requests_without_persistence() {
             break;
         }
     }
+    writeln!(
+        input,
+        "{{\"type\":\"get_messages\",\"id\":\"messages\",\"includeNative\":true}}"
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let messages = loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| {
+                let _ = rpc.kill();
+                let _ = rpc.wait();
+                panic!("RPC transcript did not arrive: {error}");
+            });
+        if event["type"] == "response" && event["id"] == "messages" {
+            break event["data"].clone();
+        }
+    };
+    assert_eq!(
+        messages["messages"][1]["content"][1]["text"],
+        "fixture answer"
+    );
+    assert_eq!(messages["messages"][1]["usage"]["cacheRead"], 7);
+    assert_eq!(messages["nativeMessages"][1]["content"], "fixture answer");
     writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
     input.flush().unwrap();
     drop(input);

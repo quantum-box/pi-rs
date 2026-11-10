@@ -42,9 +42,17 @@ success flag. Prompt acceptance is separate from completion; wait for
 `agent_settled`. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries. Tool-call blocks become
-available when their provider response is complete. Session entry and message
-snapshot schemas, incremental tool arguments, and additional session events
-remain in progress.
+available when their provider response is complete. `get_messages` returns
+Pi message roles and blocks, with a correlated partial assistant message
+during streaming. Set `includeNative: true` to include the native model
+projection in `nativeMessages`. Session entry schemas, incremental tool
+arguments, and additional session events remain in progress.
+
+The message snapshot preserves imported Pi roles, timestamps, and extension
+message details. Context edits replace the affected content in the snapshot.
+Imported Gemini conversations carry signed text, thought, and function parts
+into continued requests. Tests covered a live partial, a typed tool result,
+and a resumed signed Gemini tool conversation.
 
 ## Verification
 

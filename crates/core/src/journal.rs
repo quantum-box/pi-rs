@@ -239,6 +239,14 @@ pub struct Record {
     pub event: Event,
 }
 
+impl Record {
+    pub fn timestamp_millis(&self) -> Option<i64> {
+        chrono::DateTime::parse_from_rfc3339(self.timestamp.as_deref()?)
+            .ok()
+            .map(|timestamp| timestamp.timestamp_millis())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelFailure {
@@ -494,8 +502,16 @@ impl Session {
 
     /// Current projected messages, including calls whose tools are still running.
     pub fn current_messages(&self) -> Vec<Message> {
+        self.current_message_entries()
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    /// Current projected messages and the journal record that supplied each one.
+    pub fn current_message_entries(&self) -> Vec<(u64, Message)> {
         let branch = self.branch();
-        project_messages(&branch, operations(&branch))
+        project_message_entries(&branch, operations(&branch))
     }
 
     /// Measured context when usable, otherwise a visible-content estimate.
@@ -1478,16 +1494,29 @@ fn project_messages(
     branch: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<Message> {
+    project_message_entries(branch, operations)
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect()
+}
+
+fn project_message_entries(
+    branch: &[&Record],
+    operations: Vec<(Invocation, OperationState)>,
+) -> Vec<(u64, Message)> {
     let mut messages = Vec::new();
-    if let Some(summary) = branch.iter().rev().find_map(|record| match &record.event {
-        Event::Compacted { summary, .. } => Some(summary),
+    if let Some((id, summary)) = branch.iter().rev().find_map(|record| match &record.event {
+        Event::Compacted { summary, .. } => Some((record.id, summary)),
         _ => None,
     }) {
-        messages.push(Message::User {
-            content: format!("Prior conversation summary:\n{summary}"),
-        });
+        messages.push((
+            id,
+            Message::User {
+                content: format!("Prior conversation summary:\n{summary}"),
+            },
+        ));
     }
-    messages.extend(conversation(branch, operations));
+    messages.extend(conversation_entries(branch, operations));
     messages
 }
 

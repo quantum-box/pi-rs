@@ -600,14 +600,23 @@ pub(super) fn snapshot_response(
     context_window: Option<u32>,
     mut state: Value,
 ) -> Result<Value> {
+    let pending_request = || {
+        (state["isStreaming"] == true)
+            .then(|| super::rpc_messages::pending_request(session))
+            .flatten()
+    };
     match request["type"].as_str().unwrap_or_default() {
         "get_state" => {
+            let pending = pending_request();
             state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
             state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
             state["sessionId"] = json!(session.session_id());
             state["sessionName"] = json!(session.name());
-            state["messageCount"] = json!(session.current_messages().len());
+            state["messageCount"] = json!(super::rpc_messages::count(session));
             state["pendingMessageCount"] = json!(session.queued_inputs().len());
+            if let Some(pending) = pending {
+                state["_streamRequestId"] = json!(pending);
+            }
             Ok(state)
         }
         "get_entries" => {
@@ -649,7 +658,17 @@ pub(super) fn snapshot_response(
                     });
             Ok(json!({"text":text}))
         }
-        "get_messages" => Ok(json!({"messages":session.current_messages()})),
+        "get_messages" => {
+            let (messages, native) = super::rpc_messages::snapshot(session);
+            let mut data = json!({"messages":messages});
+            if request["includeNative"] == true {
+                data["nativeMessages"] = json!(native);
+            }
+            if let Some(pending) = pending_request() {
+                data["_streamRequestId"] = json!(pending);
+            }
+            Ok(data)
+        }
         "get_session_stats" => {
             let mut stats = serde_json::to_value(session.statistics())?;
             stats["sessionFile"] = json!(path);
@@ -781,6 +800,27 @@ fn forward_event(
     args: &Cli,
 ) -> Result<()> {
     match event["type"].as_str() {
+        Some("response")
+            if matches!(
+                event["command"].as_str(),
+                Some("get_messages" | "get_state")
+            ) =>
+        {
+            let mut event = event;
+            let pending = event["data"]
+                .as_object_mut()
+                .and_then(|data| data.remove("_streamRequestId"));
+            if let Some(partial) = pending.as_ref().and_then(|id| stream.partial(id)) {
+                if event["command"] == "get_messages" {
+                    if let Some(messages) = event["data"]["messages"].as_array_mut() {
+                        messages.push(partial.clone());
+                    }
+                } else if let Some(count) = event["data"]["messageCount"].as_u64() {
+                    event["data"]["messageCount"] = json!(count.saturating_add(1));
+                }
+            }
+            emit(event)
+        }
         Some("response") if event["command"] == "compact" => {
             pending_compact.take();
             *busy = false;

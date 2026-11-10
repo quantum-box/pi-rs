@@ -33,6 +33,7 @@ mod resource_paths;
 mod resources;
 mod rpc;
 mod rpc_events;
+mod rpc_messages;
 mod runtime;
 mod session_import;
 mod sessions;

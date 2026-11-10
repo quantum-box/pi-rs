@@ -2,7 +2,9 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pi_rs::{Event, Invocation, ModelFailure, ModelMetadata, Outcome, Record, Usage, UsageReport};
+use pi_rs::{
+    Event, Invocation, ModelFailure, ModelMetadata, Outcome, Record, ToolCall, Usage, UsageReport,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -13,6 +15,7 @@ use super::Cli;
 pub(super) struct Stream {
     pub messages: Vec<Value>,
     assistant: Value,
+    request_id: Option<Uuid>,
     started: bool,
     ended: bool,
     turn: bool,
@@ -31,6 +34,11 @@ impl Stream {
 
     pub fn aborted(&self) -> bool {
         self.aborted
+    }
+
+    pub fn partial(&self, request_id: &Value) -> Option<&Value> {
+        let id = request_id.as_str()?.parse::<Uuid>().ok()?;
+        (self.request_id == Some(id) && self.started && !self.ended).then_some(&self.assistant)
     }
 
     pub fn observe(&mut self, event: &Value, args: &Cli) -> Vec<Value> {
@@ -91,13 +99,16 @@ impl Stream {
                 self.user(json!(blocks), events);
             }
             Event::ModelRequested { .. } if self.summary => {}
-            Event::ModelRequested { model, .. } => {
+            Event::ModelRequested {
+                model, request_id, ..
+            } => {
                 // The journal closes a logical turn after its final answer.
                 // Pi emits a turn for every assistant response and tool batch.
                 self.finish_turn(events);
                 self.begin_turn(events);
                 self.started = false;
                 self.ended = false;
+                self.request_id = request_id;
                 self.metadata = ModelMetadata::default();
                 self.assistant = json!({
                     "role":"assistant", "content":[],
@@ -168,7 +179,7 @@ impl Stream {
                     blocks.push(json!({"type":"text","text":content}));
                 }
                 for invocation in invocations {
-                    let call = call_value(&invocation);
+                    let call = tool_call_value(&invocation.call);
                     let index = self.assistant["content"]
                         .as_array()
                         .expect("assistant blocks")
@@ -205,7 +216,7 @@ impl Stream {
                 if let Some((invocation, parent)) = self.calls.get(&operation_id) {
                     let mut event = json!({
                         "type":"tool_execution_start", "toolCallId":invocation.call.id,
-                        "toolName":invocation.call.name, "args":call_value(invocation)["arguments"],
+                        "toolName":invocation.call.name, "args":tool_call_value(&invocation.call)["arguments"],
                     });
                     if let Some(parent) = &parent {
                         event["parentToolCallId"] = json!(parent);
@@ -223,19 +234,8 @@ impl Stream {
                 outcome,
             } => {
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
-                    let is_error = matches!(
-                        outcome,
-                        Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-                    );
-                    let (text, images) = pi_rs::extract_tool_images(outcome.tool_content());
-                    let mut content = vec![json!({"type":"text","text":text})];
-                    content.extend(images.into_iter().map(|image| {
-                        json!({"type":"image","data":image.data,"mimeType":image.mime_type})
-                    }));
-                    let mut result = json!({"content":content});
-                    if let Outcome::SucceededWithDetails { details, .. } = outcome {
-                        result["details"] = details;
-                    }
+                    let is_error = tool_failed(&outcome);
+                    let result = tool_result_value(&outcome.tool_content(), Some(&outcome));
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
@@ -276,6 +276,7 @@ impl Stream {
             );
             self.tool_results.clear();
             self.assistant = Value::Null;
+            self.request_id = None;
         }
     }
 
@@ -367,8 +368,7 @@ impl Stream {
     }
 }
 
-fn call_value(invocation: &Invocation) -> Value {
-    let call = &invocation.call;
+pub(super) fn tool_call_value(call: &ToolCall) -> Value {
     let arguments = serde_json::from_str::<Value>(&call.arguments)
         .ok()
         .filter(Value::is_object);
@@ -379,7 +379,29 @@ fn call_value(invocation: &Invocation) -> Value {
     value
 }
 
-fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
+pub(super) fn tool_failed(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
+    ) || matches!(outcome, Outcome::Structured { data, .. } if data["isError"] == true)
+}
+
+pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value {
+    let (text, images) = pi_rs::extract_tool_images(text.to_owned());
+    let mut content = vec![json!({"type":"text","text":text})];
+    content.extend(
+        images
+            .into_iter()
+            .map(|image| json!({"type":"image","data":image.data,"mimeType":image.mime_type})),
+    );
+    let mut result = json!({"content":content});
+    if let Some(Outcome::SucceededWithDetails { details, .. }) = outcome {
+        result["details"] = details.clone();
+    }
+    result
+}
+
+pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
     let read = metadata.cached_input_tokens.unwrap_or_default();
     let write = metadata.cache_creation_input_tokens.unwrap_or_default();
     json!({

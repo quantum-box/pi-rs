@@ -353,6 +353,54 @@ fn anthropic_replay(message: &Value) -> Option<Box<pi_rs::ProviderReplay>> {
     })
 }
 
+fn google_replay(message: &Value) -> Option<Box<pi_rs::ProviderReplay>> {
+    if message["provider"] != "google" || message["api"] != "google-generative-ai" {
+        return None;
+    }
+    let model = message["model"].as_str()?;
+    let mut signed = false;
+    let mut parts = Vec::new();
+    for block in message["content"].as_array()? {
+        let (mut part, signature) = match block["type"].as_str()? {
+            "text" => (
+                serde_json::json!({"text":block["text"].as_str()?}),
+                &block["textSignature"],
+            ),
+            "thinking" => (
+                serde_json::json!({"thought":true,"text":block["thinking"].as_str()?}),
+                &block["thinkingSignature"],
+            ),
+            "toolCall" => {
+                let mut call = serde_json::json!({
+                    "name":block["name"].as_str()?,"args":block["arguments"].as_object()?,
+                });
+                if pi_rs::google::uses_tool_call_ids(model) {
+                    call["id"] = serde_json::json!(block["id"].as_str()?);
+                }
+                (
+                    serde_json::json!({"functionCall":call}),
+                    &block["thoughtSignature"],
+                )
+            }
+            _ => return None,
+        };
+        if let Some(signature) = signature.as_str().filter(|signature| !signature.is_empty()) {
+            signed = true;
+            part["thoughtSignature"] = serde_json::json!(signature);
+        }
+        parts.push(part);
+    }
+    signed.then(|| {
+        Box::new(pi_rs::ProviderReplay {
+            identity: pi_rs::ResolvedModelIdentity {
+                provider: "google".into(),
+                model: model.strip_prefix("models/").unwrap_or(model).into(),
+            },
+            blocks: parts,
+        })
+    })
+}
+
 fn convert(
     entry: &Value,
     branch: &mut Branch,
@@ -419,7 +467,7 @@ fn convert(
                             cache_creation_input_tokens: message["usage"]["cacheWrite"].as_u64(),
                             finish_reason: message["stopReason"].as_str().map(str::to_owned),
                             reasoning,
-                            replay: anthropic_replay(message),
+                            replay: anthropic_replay(message).or_else(|| google_replay(message)),
                             resolved_model: message["model"].as_str().map(|model| {
                                 pi_rs::ResolvedModelIdentity {
                                     provider: message["provider"]

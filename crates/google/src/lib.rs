@@ -289,6 +289,14 @@ fn gemini_major(id: &str) -> Option<u32> {
     version.split(['.', '-']).next()?.parse().ok()
 }
 
+/// Whether the model expects call IDs in both function calls and their responses.
+pub fn uses_tool_call_ids(model: &str) -> bool {
+    let id = model_id(model);
+    gemini_major(id).is_some_and(|version| version >= 3)
+        || id.starts_with("claude-")
+        || id.starts_with("gpt-oss-")
+}
+
 pub fn model_thinking_levels(id: &str) -> Vec<String> {
     let id = model_id(id);
     available_thinking(id, family(id).is_some())
@@ -376,7 +384,15 @@ fn push_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>, merge:
     if parts.is_empty() {
         return;
     }
-    if merge && let Some(last) = contents.last_mut().filter(|last| last["role"] == role) {
+    let tool_result = parts
+        .first()
+        .is_some_and(|part| part.get("functionResponse").is_some());
+    if merge
+        && let Some(last) = contents.last_mut().filter(|last| {
+            last["role"] == role
+                && last["parts"][0].get("functionResponse").is_some() == tool_result
+        })
+    {
         last["parts"]
             .as_array_mut()
             .expect("content parts")
@@ -389,9 +405,7 @@ fn push_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>, merge:
 fn wire_request(request: &ModelRequest, thinking: Option<&str>) -> Result<Value> {
     let identity = identity(model_id(&request.model));
     let gemini_v3 = gemini_major(&identity.model).is_some_and(|version| version >= 3);
-    let explicit_tool_ids = gemini_v3
-        || identity.model.starts_with("claude-")
-        || identity.model.starts_with("gpt-oss-");
+    let explicit_tool_ids = uses_tool_call_ids(&identity.model);
     let mut contents = Vec::new();
     let mut system = Vec::new();
     let mut calls = BTreeMap::new();
@@ -716,6 +730,9 @@ mod tests {
                     call_id: "logical-call".into(),
                     content: "tool output".into(),
                 },
+                Message::User {
+                    content: "Follow-up after the tool result".into(),
+                },
             ],
             tools: Vec::new(),
             max_output_tokens: 1024,
@@ -725,6 +742,11 @@ mod tests {
         assert_eq!(
             wire["contents"][1]["parts"][0]["functionResponse"]["id"],
             "original-call"
+        );
+        assert_eq!(wire["contents"][1]["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            wire["contents"][2]["parts"][0]["text"],
+            "Follow-up after the tool result"
         );
         request.model = "gemini-3.1-pro".into();
         let other = wire_request(&request, Some("low")).unwrap();
