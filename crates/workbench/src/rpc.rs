@@ -61,6 +61,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 match event["type"].as_str() {
                     Some("auto_retry_start") => active.retrying = true,
                     Some("auto_retry_end" | "agent_settled" | "request") => active.retrying = false,
+                    Some("bash_execution_end") => active.bashing = false,
                     _ => {}
                 }
                 forward_event(
@@ -277,11 +278,6 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         }
         if request["type"] == "bash" {
             let result = (|| {
-                if busy(&worker) {
-                    return Err(Error::Config(
-                        "wait for the current operation before executing a shell command".into(),
-                    ));
-                }
                 let command = request["command"]
                     .as_str()
                     .ok_or_else(|| Error::Config("command must be a string".into()))?;
@@ -290,7 +286,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         "shell command must contain 1–1048576 bytes".into(),
                     ));
                 }
-                Worker::submit(
+                Worker::start_bash(
                     &mut worker,
                     &args,
                     json!({"type":"bash","command":command,"exclude_from_context":request["excludeFromContext"] == true,"request_id":request.get("id")}),
@@ -302,10 +298,15 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
             continue;
         }
-        if (request["type"] == "abort"
-            || (request["type"] == "abort_bash" && pending_bash.is_some()))
-            && busy(&worker)
-        {
+        if request["type"] == "abort_bash" {
+            let result = worker
+                .as_mut()
+                .filter(|worker| worker.bashing)
+                .map_or(Ok(()), |active| active.send(json!({"type":"abort_bash"})));
+            response(&request, result.map(|()| None))?;
+            continue;
+        }
+        if request["type"] == "abort" && worker.as_ref().is_some_and(|worker| worker.busy) {
             if pending_abort.is_some() {
                 response(&request, Err(Error::Config("abort already pending".into())))?;
             } else if let Some(active) = &mut worker {
@@ -596,7 +597,7 @@ pub(super) fn snapshot_command(name: &str) -> bool {
 }
 
 fn state_flags(args: &Cli, worker: &Option<Worker>) -> Result<Value> {
-    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.bashing),"model":model_value(args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
     state["autoCompactionEnabled"] = json!(args.settings.auto_compaction_enabled());
     state["steeringMode"] = json!(
         worker
@@ -772,7 +773,9 @@ fn session_tree(session: &Session) -> Vec<Value> {
 }
 
 fn busy(worker: &Option<Worker>) -> bool {
-    worker.as_ref().is_some_and(|worker| worker.busy)
+    worker
+        .as_ref()
+        .is_some_and(|worker| worker.busy || worker.bashing)
 }
 
 fn forward_event(

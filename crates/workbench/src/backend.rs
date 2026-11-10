@@ -79,6 +79,7 @@ enum Request {
         exclude_from_context: bool,
         request_id: Option<serde_json::Value>,
     },
+    AbortBash,
     ExtensionUiResponse {
         id: Uuid,
         value: pi_rs::UiResponse,
@@ -119,6 +120,7 @@ struct ReaderControls {
     auto_compaction: pi_rs::AutoCompactionControl,
     retry: pi_rs::RetryControl,
     command_catalog: serde_json::Value,
+    shell: ShellRunner,
 }
 
 #[derive(Default)]
@@ -126,6 +128,19 @@ struct ControlState {
     token: Option<CancellationToken>,
     queued: usize,
     pending_cancel: bool,
+    shell: Option<CancellationToken>,
+}
+
+struct ShellRunner {
+    workspace: PathBuf,
+    timeout: Option<std::time::Duration>,
+    completed: mpsc::Sender<ShellCompletion>,
+}
+
+struct ShellCompletion {
+    id: Uuid,
+    request_id: Option<serde_json::Value>,
+    result: Result<pi_rs::BashExecution>,
 }
 
 pub fn run(args: Cli) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
@@ -140,6 +155,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     let active = Arc::new(Mutex::new(ControlState::default()));
     let stopping = Arc::new(AtomicBool::new(false));
     let (commands, mut requests) = mpsc::channel(32);
+    let (shell_completed, mut shell_results) = mpsc::channel(1);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
     let initial_records = Session::open(&args.session)?.records().to_vec();
@@ -155,6 +171,11 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             auto_compaction: runtime.auto_compaction.clone(),
             retry: runtime.retry.clone(),
             command_catalog: runtime.command_catalog(&args),
+            shell: ShellRunner {
+                workspace: args.workspace.clone(),
+                timeout: args.tool_timeout_secs.map(std::time::Duration::from_secs),
+                completed: shell_completed,
+            },
         },
     );
     let signal_active = active.clone();
@@ -164,9 +185,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         if tokio::signal::ctrl_c().await.is_ok() {
             signal_stopping.store(true, Ordering::SeqCst);
             signal_notify.notify_one();
-            if let Some(cancel) = signal_active.lock().expect("worker control").token.as_ref() {
-                cancel.cancel();
-            }
+            cancel_active(&signal_active);
         }
     });
     output(json!({"type":"backend_ready"}));
@@ -174,6 +193,10 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     while !stopping.load(Ordering::SeqCst) {
         let (request, scheduled) = tokio::select! {
             _ = stop_notify.notified() => break,
+            Some(shell) = shell_results.recv() => {
+                save_shell(shell, &args, &snapshot, &active);
+                continue;
+            }
             request = requests.recv() => match request { Some(request) => (request, true), None => break },
             input = queued.recv() => match input {
                 Some(input) => {
@@ -240,7 +263,9 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             }
         }
         output(json!({"type":"agent_started"}));
-        let result = async {
+        let mut completed_shells = Vec::new();
+        let mut run_session = None;
+        let mut operation = Box::pin(async {
             if matches!(&request, Request::Prompt { .. }) {
                 tokio::select! {
                     biased;
@@ -248,7 +273,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     result = runtime.refresh_mcp(&args) => result?,
                 }
             }
-            let mut session = Session::open(&args.session)?;
+            let session = run_session.insert(Session::open(&args.session)?);
             session.set_auto_compaction_control(runtime.auto_compaction.clone());
             session.set_retry_control(runtime.retry.clone());
             if session.host_binding().is_some() {
@@ -259,18 +284,28 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             if session.working_directory().is_none() {
                 session.set_working_directory(&args.workspace)?;
             }
-            args.record_model_selection(&mut session)?;
-            initialize_queue_modes(&mut session, &args)?;
+            args.record_model_selection(session)?;
+            initialize_queue_modes(session, &args)?;
             *snapshot.lock().expect("session snapshot") = session.records().to_vec();
             let agent = runtime.agent(&args);
-            let mut observer = |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
+            let mut observer =
+                |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
             match request {
-                Request::Prompt { content, images, queued_only, require_command } => {
-                    if queued_only && !agent.apply_queued_inputs(&mut session, &mut observer)? { return Ok(()); }
+                Request::Prompt {
+                    content,
+                    images,
+                    queued_only,
+                    require_command,
+                } => {
+                    if queued_only && !agent.apply_queued_inputs(session, &mut observer)? {
+                        return Ok(());
+                    }
                     if images.is_empty()
                         && let Some(input) = content.as_deref()
-                        && agent.try_extension_command(&mut session, input, &mut observer)?
-                    { return Ok(()); }
+                        && agent.try_extension_command(session, input, &mut observer)?
+                    {
+                        return Ok(());
+                    }
                     let mut content = content
                         .map(|input| {
                             let expanded = runtime.resources.expand(&input)?;
@@ -282,11 +317,17 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                         .transpose()?;
                     let run_id = Uuid::new_v4();
                     if !images.is_empty() {
-                        session.append_user_with_images(content.take().unwrap_or_default(), images, Some(run_id))?;
-                        observer(pi_rs::Notification::Committed(session.records().last().expect("appended user input")));
+                        session.append_user_with_images(
+                            content.take().unwrap_or_default(),
+                            images,
+                            Some(run_id),
+                        )?;
+                        observer(pi_rs::Notification::Committed(
+                            session.records().last().expect("appended user input"),
+                        ));
                     }
                     let answer = Box::pin(agent.run_correlated(
-                        &mut session,
+                        session,
                         run_id,
                         content,
                         &mut queued,
@@ -301,7 +342,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     command,
                     arguments,
                 } => agent.extension_command(
-                    &mut session,
+                    session,
                     &extension_id,
                     &command,
                     &arguments,
@@ -312,7 +353,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     keep_turns,
                     ..
                 } => agent.compact(
-                    &mut session,
+                    session,
                     Compaction {
                         summary,
                         keep_turns,
@@ -328,16 +369,33 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                 } => {
                     let tokens_before = session.estimated_context_tokens();
                     if use_token_settings {
-                        agent.summarize_configured(
-                            &mut session, &cancel, &mut observer, Some(&mut queued), instructions.as_deref(),
-                        ).await?;
+                        agent
+                            .summarize_configured(
+                                session,
+                                &cancel,
+                                &mut observer,
+                                Some(&mut queued),
+                                instructions.as_deref(),
+                            )
+                            .await?;
                     } else {
-                        agent.summarize_with_instructions(
-                            &mut session, keep_turns, &cancel, &mut observer, Some(&mut queued), instructions.as_deref(),
-                        ).await?;
+                        agent
+                            .summarize_with_instructions(
+                                session,
+                                keep_turns,
+                                &cancel,
+                                &mut observer,
+                                Some(&mut queued),
+                                instructions.as_deref(),
+                            )
+                            .await?;
                     }
                     if let Some(record) = session.records().last()
-                        && let pi_rs::Event::Compacted { summary, retain_from, .. } = &record.event
+                        && let pi_rs::Event::Compacted {
+                            summary,
+                            retain_from,
+                            ..
+                        } = &record.event
                     {
                         compact_result = json!({
                             "summary": summary,
@@ -346,64 +404,105 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                         });
                     }
                 }
-                Request::BranchSummary { selected, instructions, reserve_tokens } => {
+                Request::BranchSummary {
+                    selected,
+                    instructions,
+                    reserve_tokens,
+                } => {
                     Box::pin(agent.summarize_branch(
-                        &mut session, selected, instructions.as_deref(), reserve_tokens,
-                        &cancel, &mut observer,
-                    )).await?;
+                        session,
+                        selected,
+                        instructions.as_deref(),
+                        reserve_tokens,
+                        &cancel,
+                        &mut observer,
+                    ))
+                    .await?;
                 }
                 Request::McpStatus => runtime.mcp_status(&args)?,
-                Request::Bash { command, exclude_from_context, request_id } => {
-                    let execution_id = Uuid::new_v4();
-                    output(json!({"type":"bash_execution_start","executionId":execution_id,"command":command,"excludeFromContext":exclude_from_context,"id":request_id}));
-                    let result = async {
-                        session.ensure_settled()?;
-                        let tools = pi_rs_workbench::coding::CodingTools::local(&args.workspace)?;
-                        let mut execution = tools.execute_shell(&command, args.tool_timeout_secs.map(std::time::Duration::from_secs), &cancel, &mut |chunk| {
-                            output(json!({"type":"bash_execution_update","executionId":execution_id,"output":chunk,"id":request_id}));
-                        }).await?;
-                        execution.exclude_from_context = exclude_from_context;
-                        session.append_bash_execution(execution.clone())?;
-                        observer(pi_rs::Notification::Committed(session.records().last().expect("saved shell execution")));
-                        Ok::<_, Error>(execution)
-                    }.await;
-                    match result {
-                        Ok(execution) => output(json!({"type":"bash_execution_end","executionId":execution_id,"data":execution,"id":request_id})),
-                        Err(error) => {
-                            output(json!({"type":"bash_execution_end","executionId":execution_id,"error":error.to_string(),"id":request_id}));
-                            return Err(error);
-                        }
-                    }
-                }
-
-                Request::Review { child, from_record, resume, task } => {
+                Request::Review {
+                    child,
+                    from_record,
+                    resume,
+                    task,
+                } => {
                     let mut child = Session::open(child)?;
                     child.set_auto_compaction_control(runtime.auto_compaction.clone());
-            child.set_retry_control(runtime.retry.clone());
+                    child.set_retry_control(runtime.retry.clone());
                     let review = pi_rs_review::Review {
-                        task: &task, from_record, resume, timeout: std::time::Duration::from_secs(args.model_timeout_secs),
+                        task: &task,
+                        from_record,
+                        resume,
+                        timeout: std::time::Duration::from_secs(args.model_timeout_secs),
                         output_budget: args.output_budget,
-                        allowed_tools: ["read_text", "lookup_order", "read", "grep", "find", "ls"].into_iter().filter(|name| runtime.registry.has_tool(name)).map(str::to_owned).collect(),
+                        allowed_tools: ["read_text", "lookup_order", "read", "grep", "find", "ls"]
+                            .into_iter()
+                            .filter(|name| runtime.registry.has_tool(name))
+                            .map(str::to_owned)
+                            .collect(),
                     };
                     let parent_id = session.session_id();
                     let child_id = child.session_id();
                     let mut child_observer = |event: pi_rs::Notification<'_>| {
                         if let pi_rs::Notification::Committed(record) = event {
-                            let mut event = if args.trace { json!({"type":"record","record":record}) } else { super::metadata(record) };
+                            let mut event = if args.trace {
+                                json!({"type":"record","record":record})
+                            } else {
+                                super::metadata(record)
+                            };
                             event["review_parent_session"] = json!(parent_id);
                             event["review_child_session"] = json!(child_id);
                             output(event);
                         }
                     };
-                    let answer = review.run_with_controls(&agent, &mut session, &mut child, &cancel, &mut child_observer, Some(pi_rs_review::ReviewControls { inputs: &mut queued, observer: &mut observer })).await?;
-                    output(json!({"type":"review_answer","content":answer,"child_session":child.session_id(),"parent_session":session.session_id()}));
+                    let answer = review
+                        .run_with_controls(
+                            &agent,
+                            session,
+                            &mut child,
+                            &cancel,
+                            &mut child_observer,
+                            Some(pi_rs_review::ReviewControls {
+                                inputs: &mut queued,
+                                observer: &mut observer,
+                            }),
+                        )
+                        .await?;
+                    output(
+                        json!({"type":"review_answer","content":answer,"child_session":child.session_id(),"parent_session":session.session_id()}),
+                    );
                 }
                 _ => return Err(Error::Config("invalid worker operation".into())),
             }
             Ok::<(), Error>(())
-        }
-        .await;
+        });
+        let result = loop {
+            tokio::select! {
+                result = &mut operation => break result,
+                Some(shell) = shell_results.recv(), if completed_shells.len() < 32 => {
+                    finish_shell(&shell, &active);
+                    if let Ok(execution) = shell.result {
+                        completed_shells.push(execution);
+                    }
+                }
+            }
+        };
+        drop(operation);
         active.lock().expect("worker control").token = None;
+        for execution in completed_shells {
+            let recorded = match run_session.as_mut() {
+                Some(session) => record_shell(session, &execution, &args, &snapshot),
+                None => Session::open(&args.session).and_then(|mut session| {
+                    record_shell(&mut session, &execution, &args, &snapshot)
+                }),
+            };
+            if let Err(error) = recorded {
+                output(
+                    json!({"type":"error","message":format!("Could not record shell output: {error}")}),
+                );
+            }
+        }
+        drop(run_session);
         if resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled))) {
             continue_queue = Session::open(&args.session)
                 .is_ok_and(|session| !session.queued_inputs().is_empty());
@@ -425,7 +524,73 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             );
         }
     }
+    cancel_active(&active);
+    let shell_pending = active.lock().expect("worker control").shell.is_some();
+    if shell_pending && let Some(shell) = shell_results.recv().await {
+        save_shell(shell, &args, &snapshot, &active);
+    }
     runtime.close().await
+}
+
+fn cancel_active(active: &Mutex<ControlState>) {
+    let state = active.lock().expect("worker control");
+    for token in state.token.iter().chain(&state.shell) {
+        token.cancel();
+    }
+}
+
+fn save_shell(
+    mut shell: ShellCompletion,
+    args: &Cli,
+    snapshot: &Mutex<Vec<pi_rs::Record>>,
+    active: &Mutex<ControlState>,
+) {
+    if let Ok(execution) = &shell.result
+        && let Err(error) = Session::open(&args.session)
+            .and_then(|mut session| record_shell(&mut session, execution, args, snapshot))
+    {
+        shell.result = Err(error);
+    }
+    finish_shell(&shell, active);
+}
+
+fn record_shell(
+    session: &mut Session,
+    execution: &pi_rs::BashExecution,
+    args: &Cli,
+    snapshot: &Mutex<Vec<pi_rs::Record>>,
+) -> Result<()> {
+    if session.working_directory().is_none() {
+        session.set_working_directory(&args.workspace)?;
+    }
+    session.append_local_bash_result(execution.clone())?;
+    *snapshot.lock().expect("session snapshot") = session.records().to_vec();
+    observe(
+        pi_rs::Notification::Committed(session.records().last().expect("saved shell execution")),
+        args.trace,
+    );
+    Ok(())
+}
+
+fn finish_shell(shell: &ShellCompletion, active: &Mutex<ControlState>) {
+    let mut state = active.lock().expect("worker control");
+    state.shell = None;
+    report_shell_end(shell.id, shell.request_id.as_ref(), &shell.result);
+}
+
+fn report_shell_end(
+    id: Uuid,
+    request_id: Option<&serde_json::Value>,
+    result: &Result<pi_rs::BashExecution>,
+) {
+    match result {
+        Ok(execution) => output(
+            json!({"type":"bash_execution_end","executionId":id,"data":execution,"id":request_id}),
+        ),
+        Err(error) => output(
+            json!({"type":"bash_execution_end","executionId":id,"error":error.to_string(),"id":request_id}),
+        ),
+    }
 }
 fn observe_snapshot(
     event: pi_rs::Notification<'_>,
@@ -456,10 +621,14 @@ fn read_requests(
         retry,
         command_catalog,
         snapshot,
+        shell,
     } = controls;
     let runtime = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
+            if stopping.load(Ordering::SeqCst) {
+                break;
+            }
             let Ok(line) = line else {
                 break;
             };
@@ -496,6 +665,58 @@ fn read_requests(
                 }
                 Request::GetCommands { id } => {
                     control_response("get_commands", id, Ok(command_catalog.clone()));
+                }
+                Request::Bash {
+                    command,
+                    exclude_from_context,
+                    request_id,
+                } => {
+                    let id = Uuid::new_v4();
+                    let cancel = CancellationToken::new();
+                    {
+                        let mut state = active.lock().expect("worker control");
+                        if stopping.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if state.shell.is_some() {
+                            report_shell_end(
+                                id,
+                                request_id.as_ref(),
+                                &Err(Error::Config("a shell command is already running".into())),
+                            );
+                            continue;
+                        }
+                        state.shell = Some(cancel.clone());
+                    }
+                    let allowed = {
+                        let records = snapshot.lock().expect("session snapshot");
+                        !records
+                            .iter()
+                            .any(|record| matches!(record.event, pi_rs::Event::HostBound { .. }))
+                    };
+                    let workspace = shell.workspace.clone();
+                    let timeout = shell.timeout;
+                    let completed = shell.completed.clone();
+                    runtime.spawn(async move {
+                        output(json!({"type":"bash_execution_start","executionId":id,"command":command,"excludeFromContext":exclude_from_context,"id":request_id}));
+                        let result = async {
+                            if !allowed {
+                                return Err(Error::Session("a managed session must execute shell commands through its host".into()));
+                            }
+                            let tools = pi_rs_workbench::coding::CodingTools::local(&workspace)?;
+                            let mut execution = tools.execute_shell(&command, timeout, &cancel, &mut |chunk| {
+                                output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));
+                            }).await?;
+                            execution.exclude_from_context = exclude_from_context;
+                            Ok(execution)
+                        }.await;
+                        let _ = completed.send(ShellCompletion { id, request_id, result }).await;
+                    });
+                }
+                Request::AbortBash => {
+                    if let Some(cancel) = active.lock().expect("worker control").shell.as_ref() {
+                        cancel.cancel();
+                    }
                 }
                 Request::SetAutoRetry { enabled, id } => {
                     retry.set_enabled(enabled);
@@ -607,9 +828,7 @@ fn read_requests(
             }
         }
         stopping.store(true, Ordering::SeqCst);
-        if let Some(cancel) = active.lock().expect("worker control").token.as_ref() {
-            cancel.cancel();
-        }
+        cancel_active(&active);
     });
 }
 

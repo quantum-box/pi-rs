@@ -165,6 +165,15 @@ fn model_fixture_with_config(
     finish: &'static str,
     expected_token: Option<&'static str>,
 ) -> (String, std::thread::JoinHandle<()>) {
+    model_fixture_with_gate(effort, finish, expected_token, None)
+}
+
+fn model_fixture_with_gate(
+    effort: Option<&'static str>,
+    finish: &'static str,
+    expected_token: Option<&'static str>,
+    mut release_first: Option<std::sync::mpsc::Receiver<()>>,
+) -> (String, std::thread::JoinHandle<()>) {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!(
         "http://{}/v1/chat/completions",
@@ -241,6 +250,11 @@ fn model_fixture_with_config(
                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n\n",
                 "data: [DONE]\n\n",
             ).replace("\"finish_reason\":\"stop\"", &format!("\"finish_reason\":\"{finish}\""));
+            if let Some(release) = release_first.take() {
+                release
+                    .recv_timeout(Duration::from_secs(15))
+                    .expect("release first response");
+            }
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
         }
     });
@@ -602,6 +616,92 @@ fn api_key_override_reaches_direct_and_rpc_requests_without_persistence() {
     assert!(output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
     server.join().unwrap();
+}
+
+#[test]
+fn rpc_shell_finishes_while_the_model_is_streaming() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = root.path().join("session.jsonl");
+    let (release, gate) = std::sync::mpsc::channel();
+    let (endpoint, fixture) = model_fixture_with_gate(None, "stop", None, Some(gate));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args(["--workspace"])
+        .arg(root.path())
+        .args(["--session"])
+        .arg(&journal)
+        .args([
+            "--no-trust",
+            "--no-mcp",
+            "--endpoint",
+            &endpoint,
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (events, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if events
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut send = |request: Value| {
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+    };
+    let mut until = |matches: &dyn Fn(&Value) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let event = receive
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("RPC event timed out: {error}");
+                });
+            if matches(&event) {
+                break event;
+            }
+        }
+    };
+    send(serde_json::json!({"type":"prompt","message":"same input"}));
+    until(&|event| event["record"]["event"]["type"] == "model_requested");
+    send(serde_json::json!({"type":"bash","id":"shell","command":"echo parallel-shell"}));
+    let shell = until(&|event| event["type"] == "response" && event["id"] == "shell");
+    let before_settlement = std::fs::read_to_string(&journal).unwrap();
+    release.send(()).unwrap();
+    until(&|event| event["type"] == "agent_settled");
+    let after_settlement = std::fs::read_to_string(&journal).unwrap();
+    send(serde_json::json!({"type":"prompt","message":"same input"}));
+    until(&|event| event["type"] == "agent_settled");
+    send(serde_json::json!({"type":"shutdown"}));
+    drop(input);
+    let exit = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    fixture.join().unwrap();
+    assert!(
+        exit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exit.stderr)
+    );
+    assert_eq!(shell["success"], true, "{shell:?}");
+    assert_eq!(
+        shell["data"]["output"].as_str().unwrap().trim(),
+        "parallel-shell"
+    );
+    assert!(!before_settlement.contains("parallel-shell"));
+    assert!(after_settlement.contains("parallel-shell"));
 }
 
 #[test]

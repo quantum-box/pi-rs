@@ -831,6 +831,22 @@ impl Session {
 
     pub fn append_bash_execution(&mut self, execution: crate::BashExecution) -> Result<()> {
         self.ensure_settled()?;
+        self.record_bash_result(execution)
+    }
+
+    /// Record a separately running user shell after the local agent yields.
+    /// An interrupted tool can still await reconciliation. Its eventual result
+    /// is projected beside its tool call, before this shell output.
+    pub fn append_local_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {
+        if self.host_binding().is_some() {
+            return Err(Error::Session(
+                "a managed session must record shell output through its host".into(),
+            ));
+        }
+        self.record_bash_result(execution)
+    }
+
+    fn record_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {
         if execution.command.trim().is_empty() {
             return Err(Error::Config("empty shell command".into()));
         }

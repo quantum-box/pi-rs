@@ -189,6 +189,11 @@ impl Worker {
             }
             active.request(args, request)
         } else {
+            if slot.as_ref().is_some_and(|worker| worker.bashing) {
+                return Err(Error::Config(
+                    "cannot change the worker while a shell command is running".into(),
+                ));
+            }
             slot.take();
             *slot = Some(Self::start_request(args, request)?);
             Ok(())
@@ -199,7 +204,10 @@ impl Worker {
             .as_ref()
             .is_none_or(|worker| !worker.matches(args) || worker.session != args.session)
         {
-            if slot.as_ref().is_some_and(|worker| worker.busy) {
+            if slot
+                .as_ref()
+                .is_some_and(|worker| worker.busy || worker.bashing)
+            {
                 return Err(Error::Config(
                     "cannot redirect controls for an active session".into(),
                 ));
@@ -209,13 +217,25 @@ impl Worker {
         }
         slot.as_mut().expect("queue worker").send(request)
     }
+    pub(super) fn start_bash(slot: &mut Option<Self>, args: &Cli, request: Value) -> Result<()> {
+        if slot.as_ref().is_some_and(|worker| worker.bashing) {
+            return Err(Error::Config("a shell command is already running".into()));
+        }
+        Self::control(slot, args, request)?;
+        slot.as_mut().expect("shell worker").bashing = true;
+        Ok(())
+    }
     pub(super) fn matches(&self, args: &Cli) -> bool {
         self.persistent && self.configuration == configuration(args)
     }
     pub(super) fn request(&mut self, args: &Cli, request: Value) -> Result<()> {
+        if self.bashing && self.session != args.session {
+            return Err(Error::Config(
+                "cannot change sessions while a shell command is running".into(),
+            ));
+        }
         self.send(json!({"type":"configure","model":args.model,"thinking":args.thinking,"reported_thinking":super::thinking::reported(args).is_some(),"session":args.session}))?;
         self.compacting = request["type"] == "compact";
-        self.bashing = request["type"] == "bash";
         self.send(request)?;
         self.session = args.session.clone();
         self.busy = true;

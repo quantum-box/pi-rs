@@ -219,6 +219,7 @@ struct View {
     history_index: Option<usize>,
     request_started: Option<Instant>,
     phase: Option<&'static str>,
+    shell_running: bool,
     restoring_queue: bool,
 }
 impl View {
@@ -317,6 +318,7 @@ impl View {
             (true, Some("再試行待ち")) => "要約の再試行待ち",
             (true, _) => "Summarizing branch",
             (false, Some(phase)) => phase,
+            (false, None) if self.shell_running => "コマンド実行中",
             _ => "処理中",
         }
     }
@@ -637,7 +639,7 @@ impl View {
                 } else { self.append(value["error"].as_str().unwrap_or("Queue restore failed")); }
             }
             Some("bash_execution_start") => {
-                self.phase = Some("コマンド実行中");
+                self.shell_running = true;
                 self.lines.push(Entry::Tool {
                     id: value["executionId"].as_str().unwrap_or_default().into(),
                     name: if value["excludeFromContext"] == true { "bash (excluded)" } else { "bash" }.into(),
@@ -660,6 +662,7 @@ impl View {
                 }
             }
             Some("bash_execution_end") => {
+                self.shell_running = false;
                 let outcome = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
                     Ok(execution) if !execution.cancelled && execution.exit_code == Some(0) => pi_rs::Outcome::Succeeded(execution.context_text()),
                     Ok(execution) => pi_rs::Outcome::Failed(execution.context_text()),
@@ -1786,7 +1789,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             }
         }
         if let Some(active) = &mut worker {
-            if active.busy && view.request_started.is_none() {
+            if (active.busy || active.bashing) && view.request_started.is_none() {
                 view.request_started = Some(Instant::now());
             }
             let events: Vec<_> = active.events.try_iter().collect();
@@ -1823,6 +1826,12 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 }
                 if value["type"] == "agent_started" {
                     active.busy = true;
+                }
+                if value["type"] == "bash_execution_end" {
+                    active.bashing = false;
+                    if !active.busy {
+                        view.request_started = None;
+                    }
                 }
                 view.receive(value);
                 if settled {
@@ -1873,6 +1882,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 }
                 view.request_started = None;
                 view.phase = None;
+                view.shell_running = false;
                 dirty = true;
             }
         }
@@ -2097,7 +2107,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
-                    "app.interrupt" if is_busy(&worker) => {
+                    "app.interrupt" if worker.as_ref().is_some_and(|active| active.busy) => {
                         if let Err(error) =
                             Worker::control(&mut worker, &args, json!({"type":"clear_queue"}))
                         {
@@ -2107,6 +2117,11 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         }
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
+                        }
+                    }
+                    "app.interrupt" if worker.as_ref().is_some_and(|active| active.bashing) => {
+                        if let Some(active) = &mut worker {
+                            let _ = active.send(json!({"type":"abort_bash"}));
                         }
                     }
                     "app.interrupt" => {
@@ -2396,19 +2411,17 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             }
                             view.picker = Some(Picker::new("Settings", items));
                         } else if input.starts_with('!') {
-                            if is_busy(&worker) {
-                                view.append("Wait for the current operation before executing a shell command");
+                            let excluded = input.starts_with("!!");
+                            let command = input[if excluded { 2 } else { 1 }..].trim();
+                            if !command.is_empty()
+                                && let Err(error) = Worker::start_bash(
+                                    &mut worker,
+                                    &args,
+                                    json!({"type":"bash","command":command,"exclude_from_context":excluded}),
+                                )
+                            {
+                                view.append(&error.to_string());
                                 view.editor.replace(input);
-                            } else {
-                                let excluded = input.starts_with("!!");
-                                let command = input[if excluded { 2 } else { 1 }..].trim();
-                                if !command.is_empty() {
-                                    start_request(
-                                        &args,
-                                        json!({"type":"bash","command":command,"exclude_from_context":excluded}),
-                                        &mut worker,
-                                    )?;
-                                }
                             }
                         } else if let Some(active) = worker.as_mut().filter(|active| active.busy) {
                             let kind = if action == "app.message.followUp" {
@@ -2422,6 +2435,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 Ok(()) => view.draft_images.clear(),
                                 Err(error) => view.append(&error.to_string()),
                             }
+                        } else if input.starts_with('/') && is_busy(&worker) {
+                            view.append("Wait for the shell command to finish");
+                            view.editor.replace(input);
                         } else if input.trim() == "/reload" {
                             worker.take();
                             view.dialogs.clear();
@@ -2524,7 +2540,9 @@ fn show_startup_header(args: &Cli) -> bool {
 }
 
 fn is_busy(worker: &Option<Worker>) -> bool {
-    worker.as_ref().is_some_and(|worker| worker.busy)
+    worker
+        .as_ref()
+        .is_some_and(|worker| worker.busy || worker.bashing)
 }
 
 fn start_prompt(

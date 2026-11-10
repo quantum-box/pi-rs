@@ -16,7 +16,7 @@ remaining acceptance work for that surface.
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
 | Terminal | Default `pi` startup, Unicode multiline editor and kill ring, text/image clipboard paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
-| Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity |
+| Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius sharing |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint and native Anthropic Messages, API keys and bearer tokens, asynchronous searchable model selector, branch-local model/thinking selection, Ollama capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, provider-specific thinking for other services and live provider switching |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
@@ -740,20 +740,20 @@ exits retain output and the exit code. Escape cancels the command and reaps its
 process group or Windows job. Timeouts retain a cancelled result.
 
 RPC supports `bash`, streamed `bash_execution_update` events correlated with
-the caller's ID, `abort_bash`, and `isBashRunning` in `get_state`. The caller
-waits for the final command response. Native and imported Pi shell records keep
-context-exclusion flags. The existing journal's pending tool operations must
-be resolved before a direct shell command starts.
-
-The current frontend serializes shell and agent operations. Running a user shell
-concurrently with a model response remains part of the outstanding acceptance
-work. The public workbench shell API and session append API are available to
-Rust embedding applications.
+the caller's ID, `abort_bash`, and `isBashRunning` in `get_state`. One user
+shell can run concurrently with the agent. RPC returns the shell result when
+the command finishes. During an active run, completed shell results enter the
+journal at settlement, after the assistant and tool records. `abort` and
+`abort_bash` target the model run and user shell independently. In the
+terminal, Escape interrupts the model first when both are active. Native and
+imported Pi shell records keep context-exclusion flags.
 
 RPC and both terminal modes passed fixtures covering streamed UTF-8 output,
 nonzero exits, included/excluded model context, cancellation, process cleanup
-and durable restoration. Core tests cover exclusion after reopening the journal,
-and shell tests cover partial UTF-8 chunks and timeouts.
+and durable restoration. A held model response verified concurrent execution,
+independent cancellation and the deferred journal append. Core tests cover
+exclusion after reopening the journal, and shell tests cover partial UTF-8
+chunks and timeouts.
 
 ### Clipped Kitty image checkpoint
 
