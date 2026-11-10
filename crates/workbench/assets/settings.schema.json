@@ -7,6 +7,8 @@
     "fullscreenScrollbar": { "enum": ["auto", "always", "hidden"] },
     "fullscreenCopyOnSelect": { "type": "boolean" },
     "fullscreenWheelScrollLines": { "type": ["number", "string"], "anyOf": [{"type": "number"}, {"const": "auto"}] },
+    "shellPath": { "type": "string" },
+    "shellCommandPrefix": { "type": "string" },
     "editorPaddingX": { "type": "integer", "minimum": 0, "maximum": 3 },
     "sessionShareDestination": { "enum": ["auto", "radius", "gist"] },
     "retry": {

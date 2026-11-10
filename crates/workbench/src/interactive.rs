@@ -3002,6 +3002,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 "fullscreenWheelScrollLines",
                                 "sessionDir",
                                 "sessionShareDestination",
+                                "shellPath",
+                                "shellCommandPrefix",
                                 "defaultProjectTrust",
                                 "defaultTools",
                                 "extensions",
@@ -3583,6 +3585,7 @@ fn select(
                         .unwrap_or_else(|| std::path::Path::new(""))
                 ),
                 "fullscreenWheelScrollLines" => json!("auto"),
+                "shellPath" | "shellCommandPrefix" => json!(""),
                 "defaultProjectTrust" => json!("ask"),
                 "defaultTools" => json!(["read", "bash", "edit", "write"]),
                 "modelThinkingLevels" => json!({}),

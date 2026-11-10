@@ -56,6 +56,9 @@ impl Worker {
             .arg(args.output_budget.to_string())
             .arg("--model-timeout-secs")
             .arg(args.model_timeout_secs.to_string());
+        if args.no_session || args.ephemeral_worker_session {
+            command.arg("--ephemeral-worker-session");
+        }
         if let Some(timeout) = args.tool_timeout_secs {
             command.arg("--tool-timeout-secs").arg(timeout.to_string());
         }

@@ -10,6 +10,7 @@ use pi_rs::{
     AgentInput, CancellationToken, Compaction, Error, InputKind, QueueMode, QueuedMessage, Result,
     Session,
 };
+use pi_rs_workbench::coding::CodingTools;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -177,7 +178,7 @@ impl SessionSnapshot {
 }
 
 struct ShellRunner {
-    workspace: PathBuf,
+    tools: Arc<CodingTools>,
     timeout: Option<std::time::Duration>,
     completed: mpsc::Sender<ShellCompletion>,
 }
@@ -222,7 +223,10 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             resources: runtime.resources.clone(),
             registry: runtime.registry.clone(),
             shell: ShellRunner {
-                workspace: args.workspace.clone(),
+                tools: Arc::new(
+                    CodingTools::local(&args.workspace)?
+                        .with_shell_config(runtime::shell_config(&args)),
+                ),
                 timeout: args.tool_timeout_secs.map(std::time::Duration::from_secs),
                 completed: shell_completed,
             },
@@ -386,7 +390,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             args.record_model_selection(session)?;
             initialize_queue_modes(session, &args)?;
             snapshot.lock().expect("session snapshot").refresh(session);
-            let agent = runtime.agent(&args);
+            let agent = runtime.agent(&args, session.session_id());
             let mut observer =
                 |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
             match request {
@@ -875,7 +879,7 @@ fn read_requests(
                             .iter()
                             .any(|record| matches!(record.event, pi_rs::Event::HostBound { .. }))
                     };
-                    let workspace = shell.workspace.clone();
+                    let tools = shell.tools.clone();
                     let timeout = shell.timeout;
                     let completed = shell.completed.clone();
                     runtime.spawn(async move {
@@ -884,7 +888,6 @@ fn read_requests(
                             if !allowed {
                                 return Err(Error::Session("a managed session must execute shell commands through its host".into()));
                             }
-                            let tools = pi_rs_workbench::coding::CodingTools::local(&workspace)?;
                             let mut execution = tools.execute_shell(&command, timeout, &cancel, &mut |chunk| {
                                 output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));
                             }).await?;

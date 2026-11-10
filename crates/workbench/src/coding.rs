@@ -12,7 +12,9 @@ use pi_rs::{
     ToolSpec,
 };
 use serde_json::{Map, Value, json};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+pub use crate::shell_config::{ShellConfig, ShellContext};
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
@@ -20,6 +22,7 @@ const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub struct CodingTools {
     root: PathBuf,
     unrestricted: bool,
+    shell: ShellConfig,
 }
 
 impl CodingTools {
@@ -31,6 +34,7 @@ impl CodingTools {
         Ok(Self {
             root,
             unrestricted: false,
+            shell: ShellConfig::default(),
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -39,6 +43,11 @@ impl CodingTools {
         tools.unrestricted = true;
         Ok(tools)
     }
+    pub fn with_shell_config(mut self, shell: ShellConfig) -> Self {
+        self.shell = shell;
+        self
+    }
+
     /// Execute an explicit user shell command without making a model request.
     pub async fn execute_shell(
         &self,
@@ -58,7 +67,8 @@ impl CodingTools {
         let tool = CodingTool {
             root: self.root.clone(),
             unrestricted: self.unrestricted,
-            kind: if cfg!(windows) {
+            shell: self.shell.clone(),
+            kind: if cfg!(windows) && !self.shell.uses_custom_bash() {
                 Kind::PowerShell
             } else {
                 Kind::Bash
@@ -100,6 +110,7 @@ impl CodingTools {
         CodingTool {
             root: self.root.clone(),
             unrestricted: self.unrestricted,
+            shell: self.shell.clone(),
             kind: Kind::Read,
         }
         .path(
@@ -113,6 +124,7 @@ impl CodingTools {
         let tool = CodingTool {
             root: self.root.clone(),
             unrestricted: self.unrestricted,
+            shell: self.shell.clone(),
             kind: Kind::Read,
         };
         let name = path
@@ -144,28 +156,31 @@ impl Extension for CodingTools {
     }
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        [
+        let mut kinds = vec![
             Kind::Read,
             Kind::Write,
             Kind::Edit,
-            if cfg!(windows) {
-                Kind::PowerShell
-            } else {
-                Kind::Bash
-            },
             Kind::Grep,
             Kind::Find,
             Kind::List,
-        ]
-        .into_iter()
-        .map(|kind| {
-            Arc::new(CodingTool {
-                root: self.root.clone(),
-                unrestricted: self.unrestricted,
-                kind,
-            }) as Arc<dyn Tool>
-        })
-        .collect()
+        ];
+        if cfg!(windows) {
+            kinds.push(Kind::PowerShell);
+        }
+        if !cfg!(windows) || self.unrestricted {
+            kinds.push(Kind::Bash);
+        }
+        kinds
+            .into_iter()
+            .map(|kind| {
+                Arc::new(CodingTool {
+                    root: self.root.clone(),
+                    unrestricted: self.unrestricted,
+                    shell: self.shell.clone(),
+                    kind,
+                }) as Arc<dyn Tool>
+            })
+            .collect()
     }
 }
 
@@ -184,6 +199,7 @@ enum Kind {
 struct CodingTool {
     root: PathBuf,
     unrestricted: bool,
+    shell: ShellConfig,
     kind: Kind,
 }
 
@@ -690,18 +706,14 @@ impl CodingTool {
         } else {
             result.output.display
         };
-        match result.status.code() {
-            Some(0) => match result.output.details {
+        match exit_code(result.status) {
+            0 => match result.output.details {
                 Some(details) => Outcome::SucceededWithDetails { output, details },
                 None => Outcome::Succeeded(output),
             },
-            Some(code) => Outcome::Failed(shell_status(
+            code => Outcome::Failed(shell_status(
                 &output,
                 &format!("Command exited with code {code}"),
-            )),
-            None => Outcome::Failed(shell_status(
-                &output,
-                "Command terminated without an exit code",
             )),
         }
     }
@@ -738,30 +750,31 @@ impl CodingTool {
     ) -> Result<ShellResult> {
         let started = std::time::Instant::now();
         let timeout = shell_timeout(args)?;
-        let mut command = if matches!(self.kind, Kind::PowerShell) {
-            let executable = std::env::var_os("PATH")
-                .into_iter()
-                .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-                .map(|path| path.join(if cfg!(windows) { "pwsh.exe" } else { "pwsh" }))
-                .find(|path| path.is_file())
-                .unwrap_or_else(|| "powershell.exe".into());
-            let mut command = tokio::process::Command::new(executable);
-            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]).arg(format!("$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); {}", string(args, "command")?));
-            command
-        } else {
-            let mut command = tokio::process::Command::new("bash");
-            command.args(["-c", string(args, "command")?]);
-            command
-        };
+        let crate::shell_config::Launch { mut command, input } = self.shell.launch(
+            &self.root,
+            matches!(self.kind, Kind::PowerShell),
+            self.unrestricted,
+            string(args, "command")?,
+        )?;
         command
             .current_dir(&self.root)
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
         let mut process = ProcessGroup::spawn(command)?;
+        let input_task = input.map(|input| {
+            let mut stdin = process.stdin();
+            tokio::spawn(async move {
+                let _ = stdin.write_all(input.as_bytes()).await;
+            })
+        });
         let mut stdout = process.stdout();
         let mut stderr = process.stderr();
         let deadline = async {
@@ -818,6 +831,9 @@ impl CodingTool {
                     }
                 } => break,
             }
+        }
+        if let Some(input_task) = input_task {
+            input_task.abort();
         }
         stdout_text.finish(progress);
         stderr_text.finish(progress);
@@ -1069,6 +1085,16 @@ impl ProcessGroup {
         }
         let _ = self.child.start_kill();
     }
+    fn stdin(&mut self) -> tokio::process::ChildStdin {
+        #[cfg(windows)]
+        {
+            self.child.stdin().take().expect("piped stdin")
+        }
+        #[cfg(not(windows))]
+        {
+            self.child.stdin.take().expect("piped stdin")
+        }
+    }
     fn stdout(&mut self) -> tokio::process::ChildStdout {
         #[cfg(windows)]
         {
@@ -1175,6 +1201,7 @@ mod tests {
                     let tool = CodingTool {
                         root,
                         unrestricted: false,
+                        shell: ShellConfig::default(),
                         kind: Kind::Edit,
                     };
                     barrier.wait();
@@ -1207,6 +1234,7 @@ mod tests {
         let tool = CodingTool {
             root: directory.path().canonicalize().unwrap(),
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: Kind::Read,
         };
         let value = tool
@@ -1232,12 +1260,14 @@ mod tests {
         let scoped = CodingTool {
             root: workspace.clone(),
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: Kind::Read,
         };
         assert!(scoped.path(skill.to_str().unwrap()).is_err());
         let local = CodingTool {
             root: workspace,
             unrestricted: true,
+            shell: ShellConfig::default(),
             kind: Kind::Read,
         };
         assert_eq!(
@@ -1253,6 +1283,7 @@ mod tests {
         std::fs::write(&path, "alpha beta gamma").unwrap();
         let tool = CodingTool {
             unrestricted: false,
+            shell: ShellConfig::default(),
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Edit,
         };
@@ -1267,6 +1298,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
             unrestricted: false,
+            shell: ShellConfig::default(),
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Write,
         };
@@ -1293,6 +1325,7 @@ mod tests {
         let tool = CodingTool {
             root: root.path().canonicalize().unwrap(),
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: Kind::Write,
         };
         tool.write(&json!({"path":"@nested/some\u{202f}file.txt", "content":"hello"}))
@@ -1335,6 +1368,7 @@ mod tests {
         let tool = CodingTool {
             root: root.path().canonicalize().unwrap(),
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: Kind::List,
         };
         assert_eq!(
@@ -1359,6 +1393,7 @@ mod tests {
         let tool = CodingTool {
             root: root.path().canonicalize().unwrap(),
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: Kind::List,
         };
         let names: Vec<_> = (0..301)
@@ -1413,6 +1448,7 @@ mod tests {
         let tool = CodingTool {
             root: root.path().canonicalize().unwrap(),
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: Kind::List,
         };
         let names: Vec<_> = (0..257)
@@ -1442,6 +1478,7 @@ mod tests {
         }
         let tool = CodingTool {
             unrestricted: false,
+            shell: ShellConfig::default(),
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Find,
         };
@@ -1468,6 +1505,7 @@ mod tests {
         std::fs::write(root.path().join(".hidden"), "").unwrap();
         let tool = CodingTool {
             unrestricted: false,
+            shell: ShellConfig::default(),
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Find,
         };
@@ -1515,6 +1553,7 @@ mod tests {
         std::fs::write(root.path().join("b.rs"), "").unwrap();
         let tool = CodingTool {
             unrestricted: false,
+            shell: ShellConfig::default(),
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Find,
         };
@@ -1542,6 +1581,7 @@ mod tests {
         std::os::unix::fs::symlink("missing", root.path().join("broken")).unwrap();
         let tool = CodingTool {
             unrestricted: false,
+            shell: ShellConfig::default(),
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Find,
         };
@@ -1557,6 +1597,7 @@ mod tests {
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
         let tool = CodingTool {
             unrestricted: false,
+            shell: ShellConfig::default(),
             root: root.path().canonicalize().unwrap(),
             kind: Kind::Find,
         };
@@ -1568,6 +1609,7 @@ mod tests {
         );
         let tool = CodingTool {
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: Kind::Grep,
             ..tool
         };
@@ -1585,6 +1627,7 @@ mod tests {
         let tool = CodingTool {
             root: root.path().to_path_buf(),
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: if cfg!(windows) {
                 Kind::PowerShell
             } else {
@@ -1620,6 +1663,7 @@ mod tests {
         let tool = CodingTool {
             root: root.path().to_path_buf(),
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: Kind::Bash,
         };
         let result = tokio::time::timeout(
@@ -1641,6 +1685,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
             unrestricted: false,
+            shell: ShellConfig::default(),
             root: root.path().to_path_buf(),
             kind: if cfg!(windows) {
                 Kind::PowerShell
@@ -1672,6 +1717,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
             unrestricted: true,
+            shell: ShellConfig::default(),
             root: root.path().to_path_buf(),
             kind: Kind::Bash,
         };
@@ -1704,7 +1750,7 @@ mod tests {
                 .any(|tool| tool.spec().name == "powershell")
         );
         assert!(
-            !extension
+            extension
                 .tools()
                 .iter()
                 .any(|tool| tool.spec().name == "bash")
@@ -1712,6 +1758,7 @@ mod tests {
         let tool = CodingTool {
             root: root.path().to_owned(),
             unrestricted: false,
+            shell: ShellConfig::default(),
             kind: Kind::PowerShell,
         };
         let output = tool

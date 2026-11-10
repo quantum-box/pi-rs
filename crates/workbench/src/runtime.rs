@@ -5,6 +5,7 @@ use pi_rs::{
     Agent, CancellationToken, Extension, ExtensionUi, Limits, ProjectResources, Registry, Result,
     UiRequest, UiResponse,
 };
+use pi_rs_workbench::coding::{CodingTools, ShellConfig, ShellContext};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde_json::json;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ pub struct Runtime {
     pub retry: pi_rs::RetryControl,
     provider: Client,
     pub registry: Registry,
+    shell: ShellConfig,
     system_prompt: String,
     pub resources: resources::Resources,
     catalog: Arc<LiveMcpCatalog>,
@@ -80,7 +82,15 @@ impl Runtime {
         json!({"commands":commands})
     }
 
-    pub fn agent<'a>(&'a self, args: &'a Cli) -> Agent<'a> {
+    pub fn agent<'a>(&'a self, args: &'a Cli, session_id: uuid::Uuid) -> Agent<'a> {
+        self.shell.set_context(ShellContext {
+            id: session_id,
+            path: (!args.no_session && !args.ephemeral_worker_session)
+                .then(|| args.session.clone()),
+            provider: args.provider.id().into(),
+            model: args.model.clone(),
+            reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
+        });
         self.auto_compaction.set_token_settings(
             args.settings
                 .compaction_tokens(args.provider.id(), &args.model),
@@ -268,6 +278,13 @@ impl pi_rs::RegistryRefresher for LiveMcpCatalog {
     }
 }
 
+pub(super) fn shell_config(args: &Cli) -> ShellConfig {
+    ShellConfig::new(
+        args.settings.string("shellPath"),
+        args.settings.string("shellCommandPrefix"),
+    )
+}
+
 pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
     super::packages::prepare(args).await?;
     let mut local_resources = resources::Resources::load(args)?;
@@ -398,9 +415,10 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             .as_deref()
             .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
         registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
-        registry.register(Arc::new(pi_rs_workbench::coding::CodingTools::local(
-            &args.workspace,
-        )?))?;
+        let shell = shell_config(args);
+        registry.register(Arc::new(
+            CodingTools::local(&args.workspace)?.with_shell_config(shell.clone()),
+        ))?;
         let system_prompt = select_tools(
             &mut registry,
             &selection,
@@ -425,6 +443,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             ),
             provider,
             registry,
+            shell,
             system_prompt,
             resources: local_resources,
             catalog,

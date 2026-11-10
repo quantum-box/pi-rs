@@ -123,6 +123,8 @@ struct Cli {
     /// Keep the session only for this process.
     #[arg(long, conflicts_with_all = ["session", "continue_session"])]
     no_session: bool,
+    #[arg(long, hide = true)]
+    ephemeral_worker_session: bool,
     /// Print the final answer and exit.
     #[arg(short = 'p', long)]
     print: bool,
@@ -1212,7 +1214,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     session.set_retry_control(runtime.retry.clone());
     let result = async {
         let registry = &runtime.registry;
-        let agent = runtime.agent(&args);
+        let agent = runtime.agent(&args, session.session_id());
         let mut stream = (args.mode == Some(OutputMode::Json)
             && matches!(command, Command::Run { .. } | Command::Resume))
             .then(rpc_events::Stream::default);

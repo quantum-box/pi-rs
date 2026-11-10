@@ -23,6 +23,7 @@ pub mod mcp_auth;
 mod mcp_provider_auth;
 #[doc(hidden)]
 pub mod oauth_callback;
+mod shell_config;
 mod shell_output;
 mod text_edit;
 mod text_page;
