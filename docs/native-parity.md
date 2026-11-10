@@ -53,7 +53,8 @@ Queued input is acknowledged after it is saved. The `get_entries` and
 `get_tree` responses use Pi entry types, string IDs, parent links, and a leaf
 ID. Session records used internally for run recovery are omitted from this
 view. Set `includeNative: true` for the native entries or tree and the native
-leaf ID. Incremental tool arguments and additional session events remain in
+leaf ID. Newly committed entries are emitted as `entry_appended` with those
+same IDs. Incremental tool arguments and additional session events remain in
 progress.
 
 The message snapshot preserves imported Pi roles, timestamps, and extension

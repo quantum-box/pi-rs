@@ -604,6 +604,23 @@ fn api_key_override_reaches_direct_and_rpc_requests_without_persistence() {
                 update["message"],
                 update["assistantMessageEvent"]["partial"]
             );
+            let entries: Vec<_> = events
+                .iter()
+                .filter(|event| event["type"] == "entry_appended")
+                .map(|event| &event["entry"])
+                .collect();
+            let user = entries
+                .iter()
+                .position(|entry| entry["message"]["role"] == "user")
+                .expect("user entry appended");
+            let assistant = entries
+                .iter()
+                .position(|entry| entry["message"]["role"] == "assistant")
+                .expect("assistant entry appended");
+            assert!(assistant > user);
+            for pair in entries[user..=assistant].windows(2) {
+                assert_eq!(pair[1]["parentId"], pair[0]["id"]);
+            }
             assert_eq!(events.last().unwrap()["aborted"], false);
             break;
         }

@@ -9,12 +9,13 @@ use uuid::Uuid;
 
 use super::Provider;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct ModelIdentity<'a> {
     provider: &'a str,
     model: &'a str,
 }
 
+#[derive(Clone, Copy)]
 struct Finished<'a> {
     metadata: &'a ModelMetadata,
     usage: Option<Usage>,
@@ -98,7 +99,11 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             }
         }
         let timestamp = record.timestamp_millis().unwrap_or_default();
-        let value = projection.message(session, record, &message, edited.contains(&id));
+        let value = if let Event::Compacted { summary, .. } = &record.event {
+            json!({"role":"compactionSummary","summary":summary,"tokensBefore":compaction_tokens(session, record),"timestamp":timestamp})
+        } else {
+            projection.message(session.records(), record, &message, edited.contains(&id))
+        };
         let value = imported_entries
             .get(&id)
             .and_then(|source| imported_message(source, &value, timestamp, edited.contains(&id)))
@@ -111,15 +116,15 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
 }
 
 #[derive(Default)]
-pub(super) struct Projection<'a> {
-    requests: HashMap<Uuid, ModelIdentity<'a>>,
-    finished: HashMap<Uuid, Finished<'a>>,
-    models: HashMap<u64, ModelIdentity<'a>>,
-    tools: HashMap<Uuid, &'a Invocation>,
+pub(super) struct Projection {
+    requests: HashMap<Uuid, u64>,
+    finished: HashMap<Uuid, u64>,
+    models: HashMap<u64, u64>,
+    tools: HashMap<Uuid, (u64, usize)>,
 }
 
-impl<'a> Projection<'a> {
-    pub(super) fn new(records: impl IntoIterator<Item = &'a Record>) -> Self {
+impl Projection {
+    pub(super) fn new<'a>(records: impl IntoIterator<Item = &'a Record>) -> Self {
         let mut projection = Self::default();
         for record in records {
             projection.record(record);
@@ -127,15 +132,9 @@ impl<'a> Projection<'a> {
         projection
     }
 
-    pub(super) fn record(&mut self, record: &'a Record) {
-        let selected = if let Event::ModelSelected {
-            provider, model, ..
-        } = &record.event
-        {
-            Some(ModelIdentity {
-                provider: provider.as_deref().unwrap_or("ollama"),
-                model,
-            })
+    pub(super) fn record(&mut self, record: &Record) {
+        let selected = if matches!(record.event, Event::ModelSelected { .. }) {
+            Some(record.id)
         } else {
             record
                 .parent
@@ -146,43 +145,77 @@ impl<'a> Projection<'a> {
         }
         match &record.event {
             Event::ModelRequested {
-                model,
                 request_id: Some(id),
                 ..
             } => {
-                self.requests.insert(
-                    *id,
-                    ModelIdentity {
-                        provider: selected.map_or("ollama", |selected| selected.provider),
-                        model,
-                    },
-                );
+                self.requests.insert(*id, record.id);
             }
-            Event::ModelFinished {
-                request_id,
-                metadata,
-                usage,
-                ..
-            } => {
-                let usage = match usage {
-                    UsageReport::Measured { usage } => Some(*usage),
-                    _ => None,
-                };
-                self.finished
-                    .insert(*request_id, Finished { metadata, usage });
+            Event::ModelFinished { request_id, .. } => {
+                self.finished.insert(*request_id, record.id);
             }
             Event::Assistant { invocations, .. } => {
                 self.tools.extend(
                     invocations
                         .iter()
-                        .map(|invocation| (invocation.operation_id, invocation)),
+                        .enumerate()
+                        .map(|(index, invocation)| (invocation.operation_id, (record.id, index))),
                 );
             }
             _ => {}
         }
     }
 
-    pub(super) fn raw_message(&self, session: &Session, record: &Record) -> Option<Value> {
+    fn selected<'a>(&self, records: &'a [Record], id: u64) -> Option<ModelIdentity<'a>> {
+        let model = self.models.get(&id)?;
+        let Event::ModelSelected {
+            model, provider, ..
+        } = &records[*model as usize - 1].event
+        else {
+            return None;
+        };
+        Some(ModelIdentity {
+            model,
+            provider: provider.as_deref().unwrap_or("ollama"),
+        })
+    }
+
+    fn requested<'a>(&self, records: &'a [Record], id: Uuid) -> Option<ModelIdentity<'a>> {
+        let request = *self.requests.get(&id)?;
+        let Event::ModelRequested { model, .. } = &records[request as usize - 1].event else {
+            return None;
+        };
+        Some(ModelIdentity {
+            model,
+            provider: self
+                .selected(records, request)
+                .map_or("ollama", |model| model.provider),
+        })
+    }
+
+    fn finished<'a>(&self, records: &'a [Record], id: Uuid) -> Option<Finished<'a>> {
+        let request = self.finished.get(&id)?;
+        let Event::ModelFinished {
+            metadata, usage, ..
+        } = &records[*request as usize - 1].event
+        else {
+            return None;
+        };
+        let usage = match usage {
+            UsageReport::Measured { usage } => Some(*usage),
+            _ => None,
+        };
+        Some(Finished { metadata, usage })
+    }
+
+    fn invocation<'a>(&self, records: &'a [Record], id: &Uuid) -> Option<&'a Invocation> {
+        let (record, index) = self.tools.get(id)?;
+        let Event::Assistant { invocations, .. } = &records[*record as usize - 1].event else {
+            return None;
+        };
+        invocations.get(*index)
+    }
+
+    pub(super) fn raw_message(&self, records: &[Record], record: &Record) -> Option<Value> {
         let message = match &record.event {
             Event::User { content, .. } => Message::User {
                 content: content.clone(),
@@ -214,7 +247,7 @@ impl<'a> Projection<'a> {
                 operation_id,
                 outcome,
             } => Message::Tool {
-                call_id: self.tools.get(operation_id)?.call.id.clone(),
+                call_id: self.invocation(records, operation_id)?.call.id.clone(),
                 content: outcome.tool_content(),
             },
             Event::BashExecution { .. } => return shell_message(record),
@@ -223,12 +256,12 @@ impl<'a> Projection<'a> {
             },
             _ => return None,
         };
-        Some(self.message(session, record, &message, false))
+        Some(self.message(records, record, &message, false))
     }
 
     fn message(
         &self,
-        session: &Session,
+        records: &[Record],
         record: &Record,
         message: &Message,
         edited: bool,
@@ -240,9 +273,6 @@ impl<'a> Projection<'a> {
             }
             Message::User { content } => match &record.event {
                 Event::BashExecution { .. } => shell_message(record).expect("shell record"),
-                Event::Compacted { summary, .. } => {
-                    json!({"role":"compactionSummary","summary":summary,"tokensBefore":compaction_tokens(session, record),"timestamp":timestamp})
-                }
                 Event::BranchSummary { summary, from, .. } => {
                     json!({"role":"branchSummary","summary":summary,"fromId":from.map(|id| id.to_string()),"timestamp":timestamp})
                 }
@@ -271,10 +301,10 @@ impl<'a> Projection<'a> {
                     } => (*request_id, *usage),
                     _ => (None, None),
                 };
-                let finalized = request.and_then(|request| self.finished.get(&request));
+                let finalized = request.and_then(|request| self.finished(records, request));
                 let model = request
-                    .and_then(|request| self.requests.get(&request))
-                    .or_else(|| self.models.get(&record.id));
+                    .and_then(|request| self.requested(records, request))
+                    .or_else(|| self.selected(records, record.id));
                 let provider = replay
                     .as_ref()
                     .map(|replay| replay.identity.provider.as_str())
@@ -348,7 +378,7 @@ impl<'a> Projection<'a> {
                     _ => None,
                 };
                 let name = operation
-                    .and_then(|(id, _)| self.tools.get(id))
+                    .and_then(|(id, _)| self.invocation(records, id))
                     .map_or("", |invocation| invocation.call.name.as_str());
                 let outcome = operation.map(|(_, outcome)| outcome);
                 let mut value = super::rpc_events::tool_result_value(content, outcome);

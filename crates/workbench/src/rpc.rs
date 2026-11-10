@@ -177,6 +177,8 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         | "clone"
                         | "set_model"
                         | "cycle_model"
+                        | "set_thinking_level"
+                        | "cycle_thinking_level"
                         | "set_session_name"
                         | "edit_context"
                 )
@@ -367,7 +369,33 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             continue;
         }
         let previous_thinking = args.thinking.clone();
+        let previous_records = if !busy(&worker)
+            && matches!(
+                request["type"].as_str(),
+                Some(
+                    "set_model"
+                        | "cycle_model"
+                        | "set_thinking_level"
+                        | "cycle_thinking_level"
+                        | "set_session_name"
+                        | "edit_context"
+                )
+            ) {
+            Session::snapshot(&args.session)
+                .ok()
+                .map(|session| session.records().len())
+        } else {
+            None
+        };
         let result = command(&request, &mut args, &mut worker);
+        if result.is_ok()
+            && let Some(previous) = previous_records
+            && let Ok(session) = Session::snapshot(&args.session)
+        {
+            for entry in super::rpc_entries::changes(&session, previous) {
+                emit(json!({"type":"entry_appended","entry":entry}))?;
+            }
+        }
         if result.is_ok()
             && previous_thinking.as_deref().unwrap_or("off")
                 != args.thinking.as_deref().unwrap_or("off")

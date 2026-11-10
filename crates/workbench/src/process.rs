@@ -134,6 +134,9 @@ impl Worker {
         if let Some(url) = &args.fixtures {
             command.arg("--fixtures").arg(url);
         }
+        if args.mode == Some(super::OutputMode::Rpc) {
+            command.args(["--mode", "rpc"]);
+        }
         command
             .args(operation)
             .stdin(Stdio::piped())

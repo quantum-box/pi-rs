@@ -9,10 +9,10 @@ use super::rpc_messages::Projection;
 const UNKNOWN_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
 #[derive(Clone, Copy, Default)]
-struct Position<'a> {
+struct Position {
     visible: Option<u64>,
     imported: Option<u64>,
-    model: Option<(&'a str, &'a str, &'a str)>,
+    model: Option<u64>,
 }
 
 pub(super) struct Entries {
@@ -22,174 +22,15 @@ pub(super) struct Entries {
 
 impl Entries {
     pub(super) fn new(session: &Session) -> Self {
-        let mut entries = Vec::new();
-        let mut positions = Vec::with_capacity(session.records().len() + 1);
-        positions.push(Position::default());
-        let mut source_ids = HashMap::new();
-        let mut messages = Projection::default();
-
-        for record in session.records() {
-            messages.record(record);
-            let parent = record
-                .parent
-                .map_or_else(Position::default, |id| positions[id as usize]);
-            let mut position = parent;
-            let entry = match &record.event {
-                Event::SourceEntry { format, entry } if format == "pi" => {
-                    position.imported = (entry["type"] != "session").then_some(record.id);
-                    if position.imported.is_some() {
-                        if let Some(source_id) = entry["id"].as_str() {
-                            source_ids.insert(source_id, record.id);
-                        }
-                        let mut entry = entry.clone();
-                        for reference in ["targetId", "fromId", "firstKeptEntryId"] {
-                            if let Some(id) =
-                                entry[reference].as_str().and_then(|id| source_ids.get(id))
-                            {
-                                entry[reference] = json!(id.to_string());
-                            }
-                        }
-                        Some(entry)
-                    } else {
-                        None
-                    }
-                }
-                // An imported source entry already includes the visible representation.
-                _ if parent
-                    .imported
-                    .is_some_and(|id| imported_conversion(session, id, record)) =>
-                {
-                    position.imported = None;
-                    if let Event::ModelSelected {
-                        model,
-                        provider,
-                        thinking,
-                    } = &record.event
-                    {
-                        position.model =
-                            Some(selection(model, provider.as_deref(), thinking.as_deref()));
-                    }
-                    None
-                }
-                Event::ModelSelected {
-                    model,
-                    provider,
-                    thinking,
-                } => {
-                    let current = selection(model, provider.as_deref(), thinking.as_deref());
-                    position.model = Some(current);
-                    let model_changed = parent
-                        .model
-                        .is_none_or(|old| (old.0, old.1) != (current.0, current.1));
-                    let thinking_changed = parent.model.is_none_or(|old| old.2 != current.2);
-                    let model_entry =
-                        || json!({"type":"model_change","provider":current.0,"modelId":current.1});
-                    if model_changed && thinking_changed {
-                        let id = format!("{}-model", record.id);
-                        entries.push(with_identity(
-                            model_entry(),
-                            &id,
-                            wire_id(parent.visible),
-                            record,
-                        ));
-                        let thinking =
-                            json!({"type":"thinking_level_change","thinkingLevel":current.2});
-                        entries.push(with_identity(
-                            thinking,
-                            &record.id.to_string(),
-                            Some(id),
-                            record,
-                        ));
-                        position.visible = Some(record.id);
-                        positions.push(position);
-                        continue;
-                    }
-                    if model_changed {
-                        Some(model_entry())
-                    } else if thinking_changed {
-                        Some(json!({"type":"thinking_level_change","thinkingLevel":current.2}))
-                    } else {
-                        None
-                    }
-                }
-                Event::Label { target, label } => {
-                    let target = positions
-                        .get(*target as usize)
-                        .and_then(|target| target.visible);
-                    target.map(|target| {
-                        let mut entry = json!({"type":"label","targetId":target.to_string()});
-                        if let Some(label) = label {
-                            entry["label"] = json!(label);
-                        }
-                        entry
-                    })
-                }
-                Event::SessionInfo {
-                    name: Some(name), ..
-                } => Some(json!({"type":"session_info","name":name})),
-                Event::ContextEdited {
-                    target,
-                    replacement,
-                } => Some(json!({
-                    "type":"context_edit","targetId":wire_id(positions.get(*target as usize).and_then(|target| target.visible)),
-                    "replacement":replacement.as_ref().map(|content| json!({"content":content}))
-                })),
-                Event::Compacted {
-                    summary,
-                    retain_from,
-                    usage,
-                    ..
-                } => {
-                    let first = retain_from
-                        .and_then(|id| positions.get(id as usize)?.visible)
-                        .unwrap_or(record.id);
-                    let mut entry = json!({
-                        "type":"compaction","summary":summary,"firstKeptEntryId":first.to_string(),
-                        "tokensBefore":super::rpc_messages::compaction_tokens(session, record)
-                    });
-                    add_usage(&mut entry, *usage);
-                    Some(entry)
-                }
-                Event::BranchSummary {
-                    summary,
-                    from,
-                    usage,
-                    read_files,
-                    modified_files,
-                    ..
-                } => {
-                    let from = from.and_then(|id| positions.get(id as usize)?.visible);
-                    let mut entry = json!({
-                        "type":"branch_summary","summary":summary,"fromId":wire_id(from),
-                        "details":{"readFiles":read_files,"modifiedFiles":modified_files}
-                    });
-                    add_usage(&mut entry, *usage);
-                    Some(entry)
-                }
-                Event::ExtensionStates { states } => Some(json!({
-                    "type":"custom","customType":"pi-rs:extension-states","data":states
-                })),
-                _ => messages
-                    .raw_message(session, record)
-                    .map(|message| json!({"type":"message","message":message})),
-            };
-            if let Some(entry) = entry {
-                entries.push(with_identity(
-                    entry,
-                    &record.id.to_string(),
-                    wire_id(parent.visible),
-                    record,
-                ));
-                position.visible = Some(record.id);
-                if !matches!(record.event, Event::SourceEntry { .. }) {
-                    position.imported = None;
-                }
-            }
-            positions.push(position);
-        }
+        let mut cursor = Cursor::default();
+        let values = session
+            .records()
+            .iter()
+            .flat_map(|record| cursor.append(session.records(), record, Some(session)))
+            .collect();
         Self {
-            values: entries,
-            leaf: wire_id(positions[session.head() as usize].visible),
+            values,
+            leaf: wire_id(cursor.positions[session.head() as usize].visible),
         }
     }
 
@@ -284,8 +125,226 @@ impl Entries {
     }
 }
 
-fn imported_conversion(session: &Session, source: u64, record: &Record) -> bool {
-    let source = &session.records()[source as usize - 1];
+pub(super) struct Cursor {
+    positions: Vec<Position>,
+    source_ids: HashMap<String, u64>,
+    messages: Projection,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            positions: vec![Position::default()],
+            source_ids: HashMap::new(),
+            messages: Projection::default(),
+        }
+    }
+}
+
+impl Cursor {
+    pub(super) fn advance(&mut self, records: &[Record]) {
+        for record in records.iter().skip(self.positions.len() - 1) {
+            self.append(records, record, None);
+        }
+    }
+
+    pub(super) fn appended(&mut self, records: &[Record]) -> Vec<Value> {
+        let Some((record, prefix)) = records.split_last() else {
+            return Vec::new();
+        };
+        self.advance(prefix);
+        if record.id as usize != self.positions.len() {
+            return Vec::new();
+        }
+        self.append(records, record, None)
+    }
+
+    fn append(
+        &mut self,
+        records: &[Record],
+        record: &Record,
+        session: Option<&Session>,
+    ) -> Vec<Value> {
+        let mut entries = Vec::new();
+        self.messages.record(record);
+        let parent = record
+            .parent
+            .map_or_else(Position::default, |id| self.positions[id as usize]);
+        let mut position = parent;
+        let entry = match &record.event {
+            Event::SourceEntry { format, entry } if format == "pi" => {
+                position.imported = (entry["type"] != "session").then_some(record.id);
+                if position.imported.is_some() {
+                    if let Some(source_id) = entry["id"].as_str() {
+                        self.source_ids.insert(source_id.to_owned(), record.id);
+                    }
+                    let mut entry = entry.clone();
+                    for reference in ["targetId", "fromId", "firstKeptEntryId"] {
+                        if let Some(id) = entry[reference]
+                            .as_str()
+                            .and_then(|id| self.source_ids.get(id))
+                        {
+                            entry[reference] = json!(id.to_string());
+                        }
+                    }
+                    Some(entry)
+                } else {
+                    None
+                }
+            }
+            // An imported source entry already includes the visible representation.
+            _ if parent
+                .imported
+                .is_some_and(|id| imported_conversion(records, id, record)) =>
+            {
+                position.imported = None;
+                if matches!(record.event, Event::ModelSelected { .. }) {
+                    position.model = Some(record.id);
+                }
+                None
+            }
+            Event::ModelSelected {
+                model,
+                provider,
+                thinking,
+            } => {
+                let current = selection(model, provider.as_deref(), thinking.as_deref());
+                position.model = Some(record.id);
+                let previous = parent.model.and_then(|id| {
+                    let Event::ModelSelected {
+                        model,
+                        provider,
+                        thinking,
+                    } = &records[id as usize - 1].event
+                    else {
+                        return None;
+                    };
+                    Some(selection(model, provider.as_deref(), thinking.as_deref()))
+                });
+                let model_changed =
+                    previous.is_none_or(|old| (old.0, old.1) != (current.0, current.1));
+                let thinking_changed = previous.is_none_or(|old| old.2 != current.2);
+                let model_entry =
+                    || json!({"type":"model_change","provider":current.0,"modelId":current.1});
+                if model_changed && thinking_changed {
+                    let id = format!("{}-model", record.id);
+                    entries.push(with_identity(
+                        model_entry(),
+                        &id,
+                        wire_id(parent.visible),
+                        record,
+                    ));
+                    let thinking =
+                        json!({"type":"thinking_level_change","thinkingLevel":current.2});
+                    entries.push(with_identity(
+                        thinking,
+                        &record.id.to_string(),
+                        Some(id),
+                        record,
+                    ));
+                    position.visible = Some(record.id);
+                    self.positions.push(position);
+                    return entries;
+                }
+                if model_changed {
+                    Some(model_entry())
+                } else if thinking_changed {
+                    Some(json!({"type":"thinking_level_change","thinkingLevel":current.2}))
+                } else {
+                    None
+                }
+            }
+            Event::Label { target, label } => {
+                let target = self
+                    .positions
+                    .get(*target as usize)
+                    .and_then(|target| target.visible);
+                target.map(|target| {
+                    let mut entry = json!({"type":"label","targetId":target.to_string()});
+                    if let Some(label) = label {
+                        entry["label"] = json!(label);
+                    }
+                    entry
+                })
+            }
+            Event::SessionInfo {
+                name: Some(name), ..
+            } => Some(json!({"type":"session_info","name":name})),
+            Event::ContextEdited {
+                target,
+                replacement,
+            } => Some(json!({
+                "type":"context_edit","targetId":wire_id(self.positions.get(*target as usize).and_then(|target| target.visible)),
+                "replacement":replacement.as_ref().map(|content| json!({"content":content}))
+            })),
+            Event::Compacted {
+                summary,
+                retain_from,
+                usage,
+                ..
+            } => {
+                let first = retain_from
+                    .and_then(|id| self.positions.get(id as usize)?.visible)
+                    .unwrap_or(record.id);
+                let mut entry = json!({
+                    "type":"compaction","summary":summary,"firstKeptEntryId":first.to_string(),
+                    "tokensBefore":compaction_tokens(records, record, session)
+                });
+                add_usage(&mut entry, *usage);
+                Some(entry)
+            }
+            Event::BranchSummary {
+                summary,
+                from,
+                usage,
+                read_files,
+                modified_files,
+                ..
+            } => {
+                let from = from.and_then(|id| self.positions.get(id as usize)?.visible);
+                let mut entry = json!({
+                    "type":"branch_summary","summary":summary,"fromId":wire_id(from),
+                    "details":{"readFiles":read_files,"modifiedFiles":modified_files}
+                });
+                add_usage(&mut entry, *usage);
+                Some(entry)
+            }
+            Event::ExtensionStates { states } => Some(json!({
+                "type":"custom","customType":"pi-rs:extension-states","data":states
+            })),
+            _ => self
+                .messages
+                .raw_message(records, record)
+                .map(|message| json!({"type":"message","message":message})),
+        };
+        if let Some(entry) = entry {
+            entries.push(with_identity(
+                entry,
+                &record.id.to_string(),
+                wire_id(parent.visible),
+                record,
+            ));
+            position.visible = Some(record.id);
+            if !matches!(record.event, Event::SourceEntry { .. }) {
+                position.imported = None;
+            }
+        }
+        self.positions.push(position);
+        entries
+    }
+}
+
+fn compaction_tokens(records: &[Record], record: &Record, session: Option<&Session>) -> u64 {
+    if let Some(session) = session {
+        return super::rpc_messages::compaction_tokens(session, record);
+    }
+    Session::from_records(records[..record.id as usize].to_vec()).map_or(0, |session| {
+        super::rpc_messages::compaction_tokens(&session, record)
+    })
+}
+
+fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool {
+    let source = &records[source as usize - 1];
     let Event::SourceEntry { entry, .. } = &source.event else {
         return false;
     };
@@ -338,8 +397,24 @@ pub(super) fn editable_record(session: &Session, id: u64) -> u64 {
             ) && record.timestamp == source.timestamp
                 && record.run_id.is_none()
         })
-        .find(|record| imported_conversion(session, id, record))
+        .find(|record| imported_conversion(session.records(), id, record))
         .map_or(id, |record| record.id)
+}
+
+pub(super) fn changes(session: &Session, previous: usize) -> Vec<Value> {
+    let records = session.records();
+    let Some((prefix, appended)) = records.split_at_checked(previous) else {
+        return Vec::new();
+    };
+    if appended.is_empty() {
+        return Vec::new();
+    }
+    let mut cursor = Cursor::default();
+    cursor.advance(prefix);
+    appended
+        .iter()
+        .flat_map(|record| cursor.append(records, record, Some(session)))
+        .collect()
 }
 
 fn with_identity(mut entry: Value, id: &str, parent: Option<String>, record: &Record) -> Value {

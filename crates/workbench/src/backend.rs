@@ -121,7 +121,7 @@ enum Request {
     Shutdown,
 }
 struct ReaderControls {
-    snapshot: Arc<Mutex<Vec<pi_rs::Record>>>,
+    snapshot: Arc<Mutex<SessionSnapshot>>,
     auto_compaction: pi_rs::AutoCompactionControl,
     retry: pi_rs::RetryControl,
     command_catalog: serde_json::Value,
@@ -135,6 +135,39 @@ struct ControlState {
     queued: usize,
     pending_cancel: bool,
     shell: Option<CancellationToken>,
+}
+
+struct SessionSnapshot {
+    records: Vec<pi_rs::Record>,
+    entries: Option<super::rpc_entries::Cursor>,
+}
+
+impl SessionSnapshot {
+    fn new(records: Vec<pi_rs::Record>, emit_entries: bool) -> Self {
+        let mut entries = emit_entries.then(super::rpc_entries::Cursor::default);
+        if let Some(cursor) = &mut entries {
+            cursor.advance(&records);
+        }
+        Self { records, entries }
+    }
+
+    fn refresh(&mut self, session: &Session) {
+        self.records = session.records().to_vec();
+        if let Some(cursor) = &mut self.entries {
+            cursor.advance(&self.records);
+        }
+    }
+
+    fn record(&mut self, record: &pi_rs::Record) -> Vec<serde_json::Value> {
+        if let Some(existing) = self.records.get_mut(record.id.saturating_sub(1) as usize) {
+            *existing = record.clone();
+            return Vec::new();
+        }
+        self.records.push(record.clone());
+        self.entries
+            .as_mut()
+            .map_or_else(Vec::new, |cursor| cursor.appended(&self.records))
+    }
 }
 
 struct ShellRunner {
@@ -165,7 +198,10 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
     let initial_records = Session::open(&args.session)?.records().to_vec();
-    let snapshot = Arc::new(Mutex::new(initial_records));
+    let snapshot = Arc::new(Mutex::new(SessionSnapshot::new(
+        initial_records,
+        args.mode == Some(super::OutputMode::Rpc),
+    )));
     read_requests(
         commands,
         inputs,
@@ -210,7 +246,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     let mut starts_run = matches!(input, AgentInput::Message(_));
                     let result = Session::open(&args.session).and_then(|mut session| {
                         if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
-                        *snapshot.lock().expect("session snapshot") = session.records().to_vec();
+                        snapshot.lock().expect("session snapshot").refresh(&session);
                         let mut observer = |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
                         input.apply(&mut session, &mut observer)?;
                         for _ in 0..queued.max_capacity() {
@@ -244,8 +280,10 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             args.thinking = thinking;
             args.session = session;
             runtime.set_thinking(args.thinking.as_deref(), reported_thinking);
-            *snapshot.lock().expect("session snapshot") =
-                Session::open(&args.session)?.records().to_vec();
+            snapshot
+                .lock()
+                .expect("session snapshot")
+                .refresh(&Session::open(&args.session)?);
             continue;
         }
         if let Request::QueueInput {
@@ -261,7 +299,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                         "managed session queue controls require its host".into(),
                     ));
                 }
-                *snapshot.lock().expect("session snapshot") = session.records().to_vec();
+                snapshot.lock().expect("session snapshot").refresh(&session);
                 AgentInput::from(message).apply(&mut session, &mut |event| {
                     observe_snapshot(event, args.trace, &snapshot)
                 })
@@ -318,7 +356,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             }
             args.record_model_selection(session)?;
             initialize_queue_modes(session, &args)?;
-            *snapshot.lock().expect("session snapshot") = session.records().to_vec();
+            snapshot.lock().expect("session snapshot").refresh(session);
             let agent = runtime.agent(&args);
             let mut observer =
                 |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
@@ -574,7 +612,7 @@ fn cancel_active(active: &Mutex<ControlState>) {
 fn save_shell(
     mut shell: ShellCompletion,
     args: &Cli,
-    snapshot: &Mutex<Vec<pi_rs::Record>>,
+    snapshot: &Mutex<SessionSnapshot>,
     active: &Mutex<ControlState>,
 ) {
     if let Ok(execution) = &shell.result
@@ -590,16 +628,17 @@ fn record_shell(
     session: &mut Session,
     execution: &pi_rs::BashExecution,
     args: &Cli,
-    snapshot: &Mutex<Vec<pi_rs::Record>>,
+    snapshot: &Mutex<SessionSnapshot>,
 ) -> Result<()> {
     if session.working_directory().is_none() {
         session.set_working_directory(&args.workspace)?;
+        snapshot.lock().expect("session snapshot").refresh(session);
     }
     session.append_local_bash_result(execution.clone())?;
-    *snapshot.lock().expect("session snapshot") = session.records().to_vec();
-    observe(
+    observe_snapshot(
         pi_rs::Notification::Committed(session.records().last().expect("saved shell execution")),
         args.trace,
+        snapshot,
     );
     Ok(())
 }
@@ -627,17 +666,17 @@ fn report_shell_end(
 fn observe_snapshot(
     event: pi_rs::Notification<'_>,
     trace: bool,
-    snapshot: &Mutex<Vec<pi_rs::Record>>,
+    snapshot: &Mutex<SessionSnapshot>,
 ) {
-    if let pi_rs::Notification::Committed(record) = &event {
-        let mut records = snapshot.lock().expect("session snapshot");
-        if let Some(existing) = records.get_mut(record.id.saturating_sub(1) as usize) {
-            *existing = (*record).clone();
-        } else {
-            records.push((*record).clone());
-        }
-    }
+    let entries = if let pi_rs::Notification::Committed(record) = &event {
+        snapshot.lock().expect("session snapshot").record(record)
+    } else {
+        Vec::new()
+    };
     observe(event, trace);
+    for entry in entries {
+        output(json!({"type":"entry_appended","entry":entry}));
+    }
 }
 
 fn read_requests(
@@ -680,7 +719,7 @@ fn read_requests(
                     context_window,
                     state,
                 } => {
-                    let records = snapshot.lock().expect("session snapshot").clone();
+                    let records = snapshot.lock().expect("session snapshot").records.clone();
                     let result = Session::from_records(records).and_then(|session| {
                         super::rpc::snapshot_response(
                             &request,
@@ -724,6 +763,7 @@ fn read_requests(
                     let allowed = {
                         let records = snapshot.lock().expect("session snapshot");
                         !records
+                            .records
                             .iter()
                             .any(|record| matches!(record.event, pi_rs::Event::HostBound { .. }))
                     };
