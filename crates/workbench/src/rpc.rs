@@ -379,11 +379,21 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             )?))
         }
 
-        "get_available_models" => Ok(Some(
-            json!({"models":available_models(args)?.iter().map(|model| model_value(args.provider, model)).collect::<Vec<_>>()}),
-        )),
+        "get_available_models" => {
+            let (models, details) = available_models(args, true)?;
+            let models: Vec<_> = models
+                .iter()
+                .map(|model| {
+                    super::model_listing::with_details(
+                        model_value(args.provider, model),
+                        details.get(model),
+                    )
+                })
+                .collect();
+            Ok(Some(json!({"models":models})))
+        }
         "cycle_model" if !busy(worker) => {
-            let available = available_models(args)?;
+            let (available, _) = available_models(args, false)?;
             if available.is_empty() {
                 return Ok(None);
             }
@@ -657,13 +667,16 @@ fn model_value(provider: super::Provider, model: &str) -> Value {
     json!({"id":model,"name":model,"provider":provider.id()})
 }
 
-fn available_models(args: &Cli) -> Result<Vec<String>> {
-    if !args.model_scope.is_empty() {
-        return Ok(args
-            .model_scope
-            .iter()
-            .map(|choice| choice.model.clone())
-            .collect());
+type CatalogDetails = std::collections::BTreeMap<String, pi_rs::ollama::ModelDetails>;
+
+fn available_models(args: &Cli, include_details: bool) -> Result<(Vec<String>, CatalogDetails)> {
+    let scope: Vec<_> = args
+        .model_scope
+        .iter()
+        .map(|choice| choice.model.clone())
+        .collect();
+    if !include_details && !scope.is_empty() {
+        return Ok((scope, CatalogDetails::new()));
     }
     let provider = args.provider;
     let endpoint = args.endpoint.clone();
@@ -672,7 +685,20 @@ fn available_models(args: &Cli) -> Result<Vec<String>> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(provider.connect(&endpoint, token)?.models())
+        runtime.block_on(async {
+            let provider = provider.connect(&endpoint, token)?;
+            let models = if scope.is_empty() {
+                provider.models().await?
+            } else {
+                scope
+            };
+            let details = if include_details {
+                provider.model_details(&models).await
+            } else {
+                CatalogDetails::new()
+            };
+            Ok((models, details))
+        })
     })
     .join()
     .map_err(|_| Error::Config("model discovery worker stopped".into()))?

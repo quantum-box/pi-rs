@@ -26,6 +26,18 @@ pub struct Ollama {
     reasoning: Option<ReasoningObserver>,
 }
 
+/// Capabilities reported by the native Ollama service.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<bool>,
+}
+
 /// Transient presentation signals, separate from the durable model result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,26 +175,70 @@ impl Ollama {
         Ok(models)
     }
 
-    async fn running_models(&self) -> Option<Value> {
+    /// Inspect selected catalog entries on a native service within a shared time bound.
+    pub async fn model_details(&self, models: &[String]) -> BTreeMap<String, ModelDetails> {
+        let mut details = BTreeMap::new();
+        if models.is_empty() {
+            return details;
+        }
+        let Some(running) = self.running_models().await else {
+            return details;
+        };
+        if !running["models"].is_array() {
+            return details;
+        }
+        let Some(endpoint) = self.native_endpoint("show") else {
+            return details;
+        };
+        let mut requests = futures_util::stream::iter(models.iter().map(|model| {
+            let endpoint = endpoint.clone();
+            async move { (model, self.show_model(endpoint, model).await) }
+        }))
+        .buffer_unordered(4);
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some((model, info)) = requests.next().await {
+                let mut info = info.unwrap_or_default();
+                info.context_window = info
+                    .context_window
+                    .or_else(|| running_context_window(&running, model));
+                if info != ModelDetails::default() {
+                    details.insert(model.clone(), info);
+                }
+            }
+        })
+        .await;
+        details
+    }
+
+    fn native_endpoint(&self, operation: &str) -> Option<Url> {
         let prefix = self.endpoint.path().strip_suffix("/v1/chat/completions")?;
         let mut endpoint = self.endpoint.clone();
-        endpoint.set_path(&format!("{prefix}/api/ps"));
+        endpoint.set_path(&format!("{prefix}/api/{operation}"));
+        Some(endpoint)
+    }
+
+    async fn show_model(&self, endpoint: Url, model: &str) -> Option<ModelDetails> {
         let mut request = self
             .client
-            .get(endpoint)
+            .post(endpoint)
+            .timeout(Duration::from_millis(750))
+            .json(&json!({"model": model}));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let value = read_native_response(request).await?;
+        Some(decode_model_details(&value))
+    }
+
+    async fn running_models(&self) -> Option<Value> {
+        let mut request = self
+            .client
+            .get(self.native_endpoint("ps")?)
             .timeout(Duration::from_millis(250));
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
-        let mut response = request.send().await.ok()?.error_for_status().ok()?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.ok()? {
-            if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
-                return None;
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&bytes).ok()
+        read_native_response(request).await
     }
 
     async fn model_loaded(&self, model: &str) -> Option<bool> {
@@ -194,6 +250,38 @@ impl Ollama {
                 .iter()
                 .any(|item| running_model_matches(item, model)),
         )
+    }
+}
+
+async fn read_native_response(request: reqwest::RequestBuilder) -> Option<Value> {
+    let mut response = request.send().await.ok()?.error_for_status().ok()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn decode_model_details(value: &Value) -> ModelDetails {
+    let info = &value["model_info"];
+    let context_window = info["general.architecture"]
+        .as_str()
+        .and_then(|arch| info.get(format!("{arch}.context_length")))
+        .and_then(Value::as_u64)
+        .and_then(|length| u32::try_from(length).ok())
+        .filter(|length| *length > 0);
+    let capability = |name: &str| {
+        value["capabilities"]
+            .as_array()
+            .map(|items| items.iter().any(|item| item.as_str() == Some(name)))
+    };
+    ModelDetails {
+        context_window,
+        reasoning: capability("thinking"),
+        images: capability("vision"),
     }
 }
 

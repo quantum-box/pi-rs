@@ -21,6 +21,7 @@ mod config;
 mod extension_ui;
 mod interactive;
 mod mcp_config;
+mod model_listing;
 mod model_selection;
 mod packages;
 mod process;
@@ -527,9 +528,10 @@ async fn execute(mut args: Cli) -> Result<()> {
     } else {
         Vec::new()
     };
-    let available = if args.list_models.is_some()
-        || patterns.iter().any(|pattern| !pattern.trim().is_empty())
-    {
+    if let Some(search) = &args.list_models {
+        return model_listing::list(&args, search).await;
+    }
+    let available = if patterns.iter().any(|pattern| !pattern.trim().is_empty()) {
         args.provider
             .connect(&args.endpoint, args.model_token())?
             .models()
@@ -537,25 +539,6 @@ async fn execute(mut args: Cli) -> Result<()> {
     } else {
         Vec::new()
     };
-    if let Some(search) = &args.list_models {
-        let terms: Vec<_> = search
-            .split(|character: char| character.is_whitespace() || character == '/')
-            .filter(|term| !term.is_empty())
-            .collect();
-        for model in available.iter().filter(|model| {
-            let candidate = format!("{} {model}", args.provider.id());
-            terms
-                .iter()
-                .all(|term| model_selection::fuzzy(term, &candidate))
-        }) {
-            if args.mode == Some(OutputMode::Json) {
-                output(json!({"type":"model","model":model}));
-            } else {
-                println!("{model}");
-            }
-        }
-        return Ok(());
-    }
     // The hidden worker command receives an already-resolved, literal model ID.
     if !matches!(args.command, Some(Command::Serve)) {
         let selected = model_selection::split(&args.model, &available)?;

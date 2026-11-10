@@ -1813,3 +1813,22 @@ catalog currently comes from the configured Ollama-compatible endpoint.
 
 The pinned reference comparison, CLI/RPC checks, workspace tests and all-target
 Clippy pass.
+
+### Ollama model catalog presentation checkpoint
+
+`--list-models` uses Pi's provider, model, context, max-out, thinking and images
+columns. Native Ollama metadata supplies the architecture context limit and
+capability flags. A running context window provides a fallback for loaded models.
+Unavailable values, including max output when it is unreported, display as `?`.
+JSON listing and RPC model discovery expose known fields and retain model IDs.
+
+The adapter confirms native service metadata through `/api/ps` before looking
+up selected rows through `/api/show`. Metadata calls share a two-second bound
+after that probe and use bounded response buffers. A compatible relay can
+return its existing ID-only catalog. Scoped discovery only looks up selected
+models. [Ollama show-model details](https://docs.ollama.com/api-reference/show-model-details)
+
+Loopback checks cover table, JSON and RPC output, unknown values, native
+metadata fallback, search misses and authorization forwarding. Local Ollama
+listing verifies both installed Qwen models. Full workspace tests and all-target
+Clippy pass.
