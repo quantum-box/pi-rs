@@ -244,16 +244,27 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     });
     output(json!({"type":"backend_ready"}));
     let mut continue_queue = false;
+    let mut cache_task = None;
     while !stopping.load(Ordering::SeqCst) {
         let (request, scheduled) = tokio::select! {
             _ = stop_notify.notified() => break,
             Some(shell) = shell_results.recv() => {
+                cache_task = None;
                 save_shell(shell, &args, &snapshot, &active);
+                continue;
+            }
+            receipt = super::cache_warming::wait(&mut cache_task) => {
+                cache_task = receipt.and_then(|receipt| {
+                    receipt.persist(&args.session, |record| {
+                        observe_snapshot(pi_rs::Notification::Committed(record), args.trace, &snapshot);
+                    })
+                });
                 continue;
             }
             request = requests.recv() => match request { Some(request) => (request, true), None => break },
             input = queued.recv() => match input {
                 Some(input) => {
+                    cache_task = None;
                     let mut replies = Vec::new();
                     let result = Session::open(&args.session).and_then(|mut session| {
                         if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
@@ -289,6 +300,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             },
             _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
         };
+        cache_task = None;
         if stopping.load(Ordering::SeqCst) {
             break;
         }
@@ -365,6 +377,8 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         }
         let mut completed_shells = Vec::new();
         let mut run_session = None;
+        let mut cache_capture =
+            super::cache_warming::Capture::new(&args, matches!(&request, Request::Prompt { .. }));
         let mut operation = Box::pin(async {
             if matches!(&request, Request::Prompt { .. } | Request::McpStatus) {
                 tokio::select! {
@@ -391,8 +405,10 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             initialize_queue_modes(session, &args)?;
             snapshot.lock().expect("session snapshot").refresh(session);
             let agent = runtime.agent(&args, session.session_id());
-            let mut observer =
-                |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
+            let mut observer = |event: pi_rs::Notification<'_>| {
+                cache_capture.observe(&event);
+                observe_snapshot(event, args.trace, &snapshot);
+            };
             match request {
                 Request::Prompt {
                     mut content,
@@ -633,6 +649,11 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         };
         drop(operation);
         active.lock().expect("worker control").token = None;
+        if result.is_ok() && completed_shells.is_empty() {
+            cache_task = run_session
+                .as_ref()
+                .and_then(|session| cache_capture.schedule(session, &args));
+        }
         for execution in completed_shells {
             let recorded = match run_session.as_mut() {
                 Some(session) => record_shell(session, &execution, &args, &snapshot),

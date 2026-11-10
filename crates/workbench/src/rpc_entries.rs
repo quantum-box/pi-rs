@@ -235,6 +235,16 @@ impl Cursor {
                     None
                 }
             }
+            Event::CacheWarm { metadata, usage } => {
+                let identity = metadata.resolved_model.as_ref();
+                Some(json!({
+                    "type":"usage",
+                    "kind":"cache_warm",
+                    "provider":identity.map(|id| id.provider.as_str()).unwrap_or_default(),
+                    "model":identity.map(|id| id.model.as_str()).unwrap_or_default(),
+                    "usage":super::rpc_events::usage_value(*usage, metadata)
+                }))
+            }
             // An imported source entry already includes the visible representation.
             _ if parent
                 .imported

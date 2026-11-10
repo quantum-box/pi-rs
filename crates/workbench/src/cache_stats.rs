@@ -115,6 +115,21 @@ impl Tracker {
             {
                 return self.imported_warm(entry, record.timestamp_millis());
             }
+            Event::CacheWarm { metadata, usage } => {
+                return self.warmed(
+                    Previous {
+                        identity: metadata.resolved_model.clone(),
+                        finished_at: record.timestamp_millis(),
+                        prompt_tokens: usage.input_tokens,
+                        reported_cache: true,
+                    },
+                    metadata
+                        .cost_usd
+                        .as_ref()
+                        .and_then(serde_json::Number::as_f64),
+                    None,
+                );
+            }
             Event::ModelSelected { provider, .. } => self.selected_provider = provider.clone(),
             Event::ModelRequested { model, .. } => {
                 self.requested_model = Some(model.clone());
@@ -237,8 +252,8 @@ impl Tracker {
         let prompt_tokens = tokens("input")
             .saturating_add(tokens("cacheRead"))
             .saturating_add(tokens("cacheWrite"));
-        if prompt_tokens > 0 {
-            self.previous = Some(Previous {
+        self.warmed(
+            Previous {
                 identity: entry["provider"].as_str().zip(entry["model"].as_str()).map(
                     |(provider, model)| ResolvedModelIdentity {
                         provider: provider.into(),
@@ -248,14 +263,25 @@ impl Tracker {
                 finished_at,
                 prompt_tokens,
                 reported_cache: true,
-            });
+            },
+            usage["cost"]["total"].as_f64(),
+            entry["note"].as_str(),
+        )
+    }
+
+    fn warmed(
+        &mut self,
+        previous: Previous,
+        cost: Option<f64>,
+        note: Option<&str>,
+    ) -> Option<String> {
+        if previous.prompt_tokens > 0 {
+            self.previous = Some(previous);
         }
-        let note = entry["note"]
-            .as_str()
+        let note = note
             .filter(|text| !text.is_empty())
             .map_or_else(String::new, |note| format!(" ({note})"));
-        let cost = usage["cost"]["total"].as_f64().filter(|cost| *cost >= 0.0);
-        Some(match cost {
+        Some(match cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
             Some(cost) => {
                 let mut cost = format!("{cost:.6}");
                 let minimum = cost.find('.').expect("decimal cost") + 4;

@@ -18,6 +18,7 @@ mod auth_cli;
 mod backend;
 mod builtin_chat;
 mod cache_stats;
+mod cache_warming;
 mod cli_compat;
 mod clipboard;
 mod config;
@@ -1711,6 +1712,9 @@ fn metadata(record: &pi_rs::Record) -> Value {
             let mut metadata = metadata.clone();
             metadata.reasoning = None;
             json!({"event": "model_finished", "request_id": request_id, "metadata": metadata, "usage": usage, "failure": failure})
+        }
+        Event::CacheWarm { metadata, usage } => {
+            json!({"event":"cache_warm","metadata":metadata,"usage":usage})
         }
         Event::TurnFinished { assistant_record } => {
             json!({"event": "turn_finished", "assistant_record": assistant_record})

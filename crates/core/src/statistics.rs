@@ -139,6 +139,9 @@ fn statistics(session: &Session) -> SessionStats {
                     stats.cost = None;
                 }
             }
+            Event::CacheWarm { usage, metadata } => {
+                stats.add_usage(*usage, Some(metadata));
+            }
             Event::Compacted { usage, .. } | Event::BranchSummary { usage, .. } => {
                 if let Some(usage) = usage
                     && Some(*usage) != pending_summary

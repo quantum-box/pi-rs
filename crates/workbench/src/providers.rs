@@ -54,7 +54,7 @@ impl Adapter {
     }
 }
 
-fn cache_retention(supports_long: bool) -> CacheRetention {
+pub(super) fn cache_retention(supports_long: bool) -> CacheRetention {
     if supports_long && std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long") {
         CacheRetention::Long
     } else {

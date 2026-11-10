@@ -197,7 +197,8 @@ pub fn summary(path: &Path, session: &Session) -> SessionSummary {
             Event::ModelFinished {
                 usage: pi_rs::UsageReport::Measured { usage },
                 ..
-            } => {
+            }
+            | Event::CacheWarm { usage, .. } => {
                 summary.input_tokens = summary.input_tokens.saturating_add(usage.input_tokens);
                 summary.output_tokens = summary.output_tokens.saturating_add(usage.output_tokens);
             }

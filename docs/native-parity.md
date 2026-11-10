@@ -2690,3 +2690,17 @@ the cache comparison baseline to the measured prompt at the refresh
 timestamp. The original usage remains part of session billing. An
 offline session import verified display and totals without duplicate
 billing or an additional conversation message.
+
+### Idle prompt cache refresh checkpoint
+
+With the user setting `cacheWarming: "idle"`, a persistent terminal or
+RPC worker can refresh an eligible Anthropic Messages prompt after the
+run settles. The last confirmed request is replayed with a one-token
+output cap when its published TTL and rates indicate at least $0.05 in
+expected savings. The worker checks the same session head and setting
+before dispatch, uses the original affinity and tool definitions, and
+stops on a changed context, a missed cache, or the 30-minute limit.
+Refresh usage is journaled and projected as a Pi usage entry. Response
+content stays out of the conversation. This checkpoint covers idle
+requests with thinking off. Streaming warming and extension decisions
+remain.

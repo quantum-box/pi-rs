@@ -151,6 +151,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<RecordedReply>,
     },
+    /// Billed cache refresh usage. The response never enters the conversation.
+    CacheWarm {
+        metadata: ModelMetadata,
+        usage: Usage,
+    },
     TurnFinished {
         assistant_record: u64,
     },
@@ -883,6 +888,22 @@ impl Session {
             ));
         }
         self.record_bash_result(execution)
+    }
+
+    /// Record background cache usage only on the session and branch that sent it.
+    pub fn record_cache_warm(
+        &mut self,
+        session_id: Uuid,
+        head: u64,
+        mut metadata: ModelMetadata,
+        usage: Usage,
+    ) -> Result<Option<&Record>> {
+        if self.host_binding().is_some() || self.session_id() != session_id || self.head != head {
+            return Ok(None);
+        }
+        metadata.replay = None;
+        metadata.reasoning = None;
+        self.append(Event::CacheWarm { metadata, usage }).map(Some)
     }
 
     fn record_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {

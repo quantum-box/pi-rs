@@ -227,7 +227,7 @@ impl Runtime {
     }
 
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
-        self.provider = model_client(args, reported)?;
+        self.provider = model_client(args, reported, true)?;
         Ok(())
     }
     pub async fn close(&self) -> Result<()> {
@@ -456,7 +456,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             servers: std::sync::Mutex::new(mcp_connections.clone()),
         });
         registry.set_refresher(catalog.clone());
-        let provider = model_client(args, super::thinking::reported(args).is_some())?;
+        let provider = model_client(args, super::thinking::reported(args).is_some(), true)?;
 
         Ok(Runtime {
             retry: pi_rs::RetryControl::new(args.settings.retry_settings()),
@@ -481,13 +481,17 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
     result
 }
 
-fn model_client(args: &Cli, reported: bool) -> Result<super::image_policy::WorkbenchModel> {
+pub(super) fn model_client(
+    args: &Cli,
+    reported: bool,
+    observe: bool,
+) -> Result<super::image_policy::WorkbenchModel> {
+    let client = args
+        .connect_provider(&args.provider, Some(&args.model))?
+        .with_context_probes(args.allow_model_probes())
+        .with_model_options(args, reported)?;
     Ok(super::image_policy::WorkbenchModel {
-        client: args
-            .connect_provider(&args.provider, Some(&args.model))?
-            .with_context_probes(args.allow_model_probes())
-            .with_model_options(args, reported)?
-            .observe(),
+        client: if observe { client.observe() } else { client },
         block_images: args.settings.block_model_images(),
         price: args
             .model_profiles

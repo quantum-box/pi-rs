@@ -22,10 +22,9 @@ impl Settings {
         if trusted {
             let project_path = workspace.join(".pi/settings.json");
             let mut project = read_object(&project_path)?;
-            project
-                .as_object_mut()
-                .expect("object")
-                .remove("defaultProjectTrust");
+            let user_only = project.as_object_mut().expect("object");
+            user_only.remove("defaultProjectTrust");
+            user_only.remove("cacheWarming");
             validate_settings(&project, &project_path)?;
             resource_layers.push((workspace.join(".pi"), project.clone()));
             merge(&mut value, project);

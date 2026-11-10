@@ -572,7 +572,10 @@ impl View {
         if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
             && args.settings.boolean("showCacheMissNotices") == Some(true)
         {
-            if matches!(record.event, pi_rs::Event::SourceEntry { .. }) {
+            if matches!(
+                record.event,
+                pi_rs::Event::SourceEntry { .. } | pi_rs::Event::CacheWarm { .. }
+            ) {
                 self.append(&notice);
             } else {
                 self.lines.push(Entry::Warning(notice));
@@ -589,6 +592,7 @@ impl View {
                     "model_selected"
                         | "model_requested"
                         | "model_finished"
+                        | "cache_warm"
                         | "assistant"
                         | "compacted"
                         | "branch_summary"
@@ -684,6 +688,12 @@ impl View {
                             .saturating_add(usage.input_tokens)
                             .saturating_add(usage.output_tokens);
                     }
+                }
+                pi_rs::Event::CacheWarm { usage, .. } => {
+                    self.tokens = self
+                        .tokens
+                        .saturating_add(usage.input_tokens)
+                        .saturating_add(usage.output_tokens);
                 }
                 pi_rs::Event::Assistant {
                     content,
@@ -984,6 +994,13 @@ impl View {
                         }
                         self.phase = Some("結果を保存中");
                         let usage = &event["usage"]["usage"];
+                        self.tokens = self
+                            .tokens
+                            .saturating_add(usage["input_tokens"].as_u64().unwrap_or(0))
+                            .saturating_add(usage["output_tokens"].as_u64().unwrap_or(0));
+                    }
+                    Some("cache_warm") => {
+                        let usage = &event["usage"];
                         self.tokens = self
                             .tokens
                             .saturating_add(usage["input_tokens"].as_u64().unwrap_or(0))

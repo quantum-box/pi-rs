@@ -72,6 +72,9 @@
     "showCacheMissNotices": {
       "type": "boolean"
     },
+    "cacheWarming": {
+      "enum": ["off", "streaming", "idle"]
+    },
     "autocompleteMaxVisible": { "type": "integer", "minimum": 3, "maximum": 20 },
     "enableSkillCommands": { "type": "boolean" },
     "images": {

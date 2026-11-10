@@ -563,6 +563,15 @@ impl ModelMetadata {
         self.input_limits.as_ref()?.images.as_ref()?.resize
     }
 
+    pub fn prompt_cache_seconds(&self, retention: pi_rs::CacheRetention) -> Option<f64> {
+        let cache = self.prompt_cache?;
+        match retention {
+            pi_rs::CacheRetention::None => None,
+            pi_rs::CacheRetention::Short => cache.short,
+            pi_rs::CacheRetention::Long => cache.long,
+        }
+    }
+
     pub fn allows_empty_signature(&self) -> bool {
         self.compat.allow_empty_signature == Some(true)
     }
