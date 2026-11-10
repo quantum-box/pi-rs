@@ -42,4 +42,8 @@ jobs:
       - name: Check all targets
         run: cargo +1.89.0 clippy --locked --workspace --all-features --all-targets -- -D warnings
       - name: Run native acceptance tests
+        env:
+          # The CLI fixtures start independent workers that sync journals to disk.
+          # Serial execution keeps their per-request deadlines stable on shared runners.
+          RUST_TEST_THREADS: 1
         run: cargo +1.89.0 test --locked --workspace --all-features
