@@ -174,6 +174,7 @@ struct RegularState {
 enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
+    ProviderKey(super::Provider),
 }
 
 #[derive(Clone, Copy)]
@@ -1194,7 +1195,7 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>> {
     let (name, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
@@ -1333,6 +1334,43 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         "/share" => view.append(&sessions::share_gist(&Session::open(&args.session)?)?),
         "/model" if rest.is_empty() => start_model_picker(args, view, ModelListIntent::Select),
         "/scoped-models" => start_model_picker(args, view, ModelListIntent::Scope),
+        "/login" | "/logout" => {
+            let login = name == "/login";
+            if rest.is_empty() {
+                let items = super::Provider::ALL
+                    .into_iter()
+                    .filter(|provider| login || args.model_keys.has(*provider))
+                    .map(|provider| Item {
+                        label: provider.id().into(),
+                        selection: if login {
+                            Selection::LoginProvider(provider)
+                        } else {
+                            Selection::LogoutProvider(provider)
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                if items.is_empty() {
+                    view.append("No saved provider API keys");
+                } else {
+                    view.picker = Some(Picker::new(
+                        if login {
+                            "Save provider API key"
+                        } else {
+                            "Remove saved provider API key"
+                        },
+                        items,
+                    ));
+                }
+            } else {
+                let provider = super::Provider::named(rest)
+                    .ok_or_else(|| Error::Config("unsupported model provider".into()))?;
+                if login {
+                    edit_provider_key(provider, view);
+                } else {
+                    remove_provider_key(provider, args, view)?;
+                }
+            }
+        }
         "/model" => {
             select_model_input(args, view, rest)?;
             view.append(&format!("Model › {rest}"));
@@ -1977,6 +2015,16 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     *id,
                                     Some(text),
                                 ),
+                                LocalEditor::ProviderKey(provider) => super::model_auth::save(
+                                    *provider,
+                                    args.endpoint_for(*provider),
+                                    &text,
+                                )
+                                .and_then(|()| super::model_auth::Keys::load())
+                                .map(|keys| {
+                                    args.model_keys = keys;
+                                    view.append(&format!("API key saved for {}", provider.id()));
+                                }),
                             };
                             if let Err(error) = result {
                                 dialog.set_error(error.to_string());
@@ -2237,7 +2285,11 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             break;
                         }
                         view.scroll = 0;
-                        view.history.push(input.clone());
+                        let auth_command =
+                            matches!(input.split_whitespace().next(), Some("/login" | "/logout"));
+                        if !auth_command {
+                            view.history.push(input.clone());
+                        }
                         view.history_index = None;
                         if input.trim() == "/theme" {
                             let names = Theme::discover(
@@ -2430,6 +2482,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
+                        } else if is_busy(&worker) && auth_command {
+                            view.append("Wait for the current operation before changing provider authentication");
                         } else if let Some(active) = worker.as_mut().filter(|active| active.busy) {
                             let kind = if action == "app.message.followUp" {
                                 "followup"
@@ -2452,6 +2506,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             view.widgets.clear();
                             args.settings =
                                 crate::config::Settings::load(&args.workspace, args.trusted)?;
+                            args.model_keys = super::model_auth::Keys::load()?;
                             super::packages::prepare(&args).await?;
                             view.resources = super::resources::Resources::load(&args)?;
                             args.theme_paths = view.resources.themes.clone();
@@ -2570,6 +2625,28 @@ fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Res
 
 fn apply_scoped_thinking(args: &mut Cli) {
     args.apply_model_thinking_defaults();
+}
+
+fn edit_provider_key(provider: super::Provider, view: &mut View) {
+    view.local_editor = Some((
+        LocalEditor::ProviderKey(provider),
+        crate::ui::dialog::Dialog::secret(format!("{} API key", provider.id())),
+    ));
+}
+
+fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
+    let removed = super::model_auth::remove(provider)?;
+    args.model_keys = super::model_auth::Keys::load()?;
+    view.append(&format!(
+        "{} for {}",
+        if removed {
+            "Removed saved API key"
+        } else {
+            "No saved API key"
+        },
+        provider.id()
+    ));
+    Ok(())
 }
 
 fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
@@ -2888,6 +2965,8 @@ fn select(
         Selection::Model(model) => {
             select_model_input(args, view, &model)?;
         }
+        Selection::LoginProvider(provider) => edit_provider_key(provider, view),
+        Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
         Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
@@ -3135,6 +3214,8 @@ fn complete_input(args: &Cli, view: &mut View) {
             "/session",
             "/model",
             "/scoped-models",
+            "/login",
+            "/logout",
             "/compact",
             "/tree",
             "/checkout",

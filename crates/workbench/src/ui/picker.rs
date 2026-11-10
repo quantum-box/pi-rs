@@ -17,6 +17,8 @@ pub enum Selection {
     Label(u64, String),
     Fork(u64),
     Model(String),
+    LoginProvider(super::super::Provider),
+    LogoutProvider(super::super::Provider),
     Theme(String),
     Trust(bool),
     Thinking(String),

@@ -7,6 +7,7 @@ use super::{
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pi_rs::{UiRequest, UiResponse};
+use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -16,6 +17,7 @@ pub struct Dialog {
     editor: Editor,
     selected: usize,
     error: Option<String>,
+    masked: bool,
 }
 impl Dialog {
     pub fn new(id: Uuid, request: UiRequest) -> Self {
@@ -31,6 +33,28 @@ impl Dialog {
             editor,
             selected: 0,
             error: None,
+            masked: false,
+        }
+    }
+    pub fn secret(title: String) -> Self {
+        let mut dialog = Self::new(
+            Uuid::new_v4(),
+            UiRequest::Input {
+                title,
+                placeholder: Some("Paste or enter your API key".into()),
+                initial_value: None,
+                timeout: None,
+            },
+        );
+        dialog.masked = true;
+        dialog
+    }
+
+    fn visible<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if self.masked {
+            Cow::Owned("•".repeat(text.chars().count()))
+        } else {
+            Cow::Borrowed(text)
         }
     }
     pub fn set_error(&mut self, error: String) {
@@ -132,7 +156,8 @@ impl Dialog {
         }
         let prefix = wrap(
             &[Span::new(
-                &self.editor.text[..self.editor.cursor],
+                self.visible(&self.editor.text[..self.editor.cursor])
+                    .as_ref(),
                 crossterm::style::Color::Reset,
             )],
             width,
@@ -199,10 +224,17 @@ impl Dialog {
                 ));
             }
             UiRequest::Input { .. } | UiRequest::Editor { .. } => {
-                let content = wrap(&[Span::new(&self.editor.text, theme.color("text"))], width);
+                let content = wrap(
+                    &[Span::new(
+                        self.visible(&self.editor.text).as_ref(),
+                        theme.color("text"),
+                    )],
+                    width,
+                );
                 let prefix = wrap(
                     &[Span::new(
-                        &self.editor.text[..self.editor.cursor],
+                        self.visible(&self.editor.text[..self.editor.cursor])
+                            .as_ref(),
                         theme.color("text"),
                     )],
                     width,

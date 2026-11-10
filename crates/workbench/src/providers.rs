@@ -14,6 +14,8 @@ pub(super) enum Provider {
 }
 
 impl Provider {
+    pub const ALL: [Self; 2] = [Self::Ollama, Self::Anthropic];
+
     pub fn api(self) -> &'static str {
         match self {
             Self::Ollama => "openai-completions",

@@ -21,6 +21,7 @@ mod config;
 mod extension_ui;
 mod interactive;
 mod mcp_config;
+mod model_auth;
 mod model_listing;
 mod model_profiles;
 mod model_selection;
@@ -55,6 +56,8 @@ struct Cli {
     settings: config::Settings,
     #[arg(skip)]
     model_profiles: model_profiles::Profiles,
+    #[arg(skip)]
+    model_keys: model_auth::Keys,
     #[arg(skip)]
     initial_connection: Option<(Provider, String)>,
     #[arg(skip)]
@@ -297,6 +300,7 @@ impl Cli {
             })
             .flatten();
         override_key
+            .or_else(|| self.model_keys.get(provider, endpoint).map(str::to_owned))
             .or_else(|| self.model_profiles.api_key(provider, endpoint))
             .or_else(|| {
                 (provider == Provider::Anthropic
@@ -591,6 +595,7 @@ async fn run_cli() {
         args.trust_pending = decision.is_none();
         args.settings = config::Settings::load(&args.workspace, args.trusted)?;
         args.model_profiles = model_profiles::Profiles::load()?;
+        args.model_keys = model_auth::Keys::load()?;
         let configured_model = args.settings.string("defaultModel");
         let provider_prefix = |model: &str| {
             model
