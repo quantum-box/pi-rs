@@ -76,8 +76,7 @@ impl Catalog {
 }
 
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
-    let endpoint = args.endpoint_for(&provider);
-    let client = provider.connect(endpoint, args.model_token_for(&provider, endpoint))?;
+    let client = args.connect_provider(&provider, None)?;
     let mut models = args.model_profiles.model_ids(&provider);
     let mut probe_details = false;
     if probe {

@@ -4,14 +4,17 @@ use std::sync::{Arc, LazyLock};
 
 use pi_rs::{Error, Result};
 use regex::{Captures, Regex};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::{Provider, config, providers::Adapter};
 
 #[derive(Clone, Default)]
 pub(super) struct Profiles {
     entries: BTreeMap<String, Profile>,
+    revision: String,
 }
 
 #[derive(Clone)]
@@ -19,6 +22,8 @@ struct Profile {
     provider: Provider,
     endpoint: String,
     api_key: Option<String>,
+    headers: BTreeMap<String, String>,
+    auth_header: bool,
     models: Vec<ConfiguredModel>,
     overrides: BTreeMap<String, ModelMetadata>,
 }
@@ -29,6 +34,10 @@ struct ConfiguredProfile {
     base_url: Option<String>,
     api: Option<String>,
     api_key: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    auth_header: bool,
     #[serde(default)]
     models: Vec<ConfiguredModel>,
     #[serde(default)]
@@ -56,6 +65,8 @@ pub(super) struct ModelMetadata {
     sampling_params: BTreeMap<String, Value>,
     #[serde(default)]
     sampling_params_by_thinking_level: BTreeMap<String, BTreeMap<String, Value>>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -79,6 +90,7 @@ impl ModelMetadata {
             .extend(overrides.thinking_level_map.clone());
         self.sampling_params
             .extend(overrides.sampling_params.clone());
+        self.headers.extend(overrides.headers.clone());
         for (level, parameters) in &overrides.sampling_params_by_thinking_level {
             self.sampling_params_by_thinking_level
                 .entry(level.clone())
@@ -219,7 +231,7 @@ impl Profiles {
                     adapter,
                 }
             };
-            let profile = ConfiguredProfile::deserialize(entry).map_err(|_| {
+            let mut profile = ConfiguredProfile::deserialize(entry).map_err(|_| {
                 Error::Config(format!("invalid models.json profile for {}", provider.id()))
             })?;
             if profile
@@ -238,8 +250,10 @@ impl Profiles {
                 |base| endpoint_from_base(&provider, base),
             )?;
             let mut ids = std::collections::BTreeSet::new();
-            for model in &profile.models {
+            for model in &mut profile.models {
                 model.metadata.validate(&provider, &model.id)?;
+                model.metadata.headers =
+                    validate_headers(std::mem::take(&mut model.metadata.headers))?;
                 if !ids.insert(model.id.as_str()) {
                     return Err(Error::Config(format!(
                         "duplicate model {}/{}",
@@ -248,8 +262,9 @@ impl Profiles {
                     )));
                 }
             }
-            for (id, metadata) in &profile.model_overrides {
+            for (id, metadata) in &mut profile.model_overrides {
                 metadata.validate(&provider, id)?;
+                metadata.headers = validate_headers(std::mem::take(&mut metadata.headers))?;
             }
             let id = provider.id().to_owned();
             if entries
@@ -259,6 +274,8 @@ impl Profiles {
                         provider,
                         endpoint,
                         api_key: profile.api_key,
+                        headers: validate_headers(profile.headers)?,
+                        auth_header: profile.auth_header,
                         models: profile.models,
                         overrides: profile.model_overrides,
                     },
@@ -268,7 +285,12 @@ impl Profiles {
                 return Err(Error::Config(format!("duplicate model provider {id}")));
             }
         }
-        Ok(Self { entries })
+        let revision = format!("{:x}", Sha256::digest(serde_json::to_vec(data)?));
+        Ok(Self { entries, revision })
+    }
+
+    pub fn revision(&self) -> &str {
+        &self.revision
     }
 
     pub fn provider(&self, name: &str) -> Option<Provider> {
@@ -300,6 +322,45 @@ impl Profiles {
             return None;
         }
         expand_key(profile.api_key.as_deref()?)
+    }
+
+    pub fn request_headers(
+        &self,
+        provider: &Provider,
+        endpoint: &str,
+        model: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<HeaderMap> {
+        let Some(profile) = self
+            .entries
+            .get(provider.id())
+            .filter(|profile| profile.endpoint == endpoint)
+        else {
+            return Ok(HeaderMap::new());
+        };
+        let mut configured = profile.headers.clone();
+        if let Some(metadata) = model.and_then(|id| self.model(provider, id)) {
+            configured.extend(metadata.headers);
+        }
+        let mut headers =
+            HeaderMap::with_capacity(configured.len() + usize::from(profile.auth_header));
+        for (name, value) in configured {
+            let value = expand_value(&value)
+                .ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))?;
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
+                sensitive_header(&name, &value)?,
+            );
+        }
+        if profile.auth_header {
+            let token = token
+                .ok_or_else(|| Error::Config("authHeader requires a resolved API key".into()))?;
+            headers.insert(
+                AUTHORIZATION,
+                sensitive_header("authorization", &format!("Bearer {token}"))?,
+            );
+        }
+        Ok(headers)
     }
 
     pub fn model_ids(&self, provider: &Provider) -> Vec<String> {
@@ -361,6 +422,10 @@ fn endpoint_from_base(provider: &Provider, base: &str) -> Result<String> {
 }
 
 fn expand_key(value: &str) -> Option<String> {
+    expand_value(value).filter(|value| !value.trim().is_empty())
+}
+
+fn expand_value(value: &str) -> Option<String> {
     if value.starts_with('!') {
         // Model profiles use literals or environment interpolation.
         return None;
@@ -380,7 +445,42 @@ fn expand_key(value: &str) -> Option<String> {
             String::new()
         })
     });
-    (!missing && !expanded.trim().is_empty()).then(|| expanded.into_owned())
+    (!missing).then(|| expanded.into_owned())
+}
+
+fn validate_headers(headers: BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    let mut result = BTreeMap::new();
+    for (key, value) in headers {
+        let key = HeaderName::from_bytes(key.as_bytes())
+            .map_err(|_| Error::Config("invalid model header name".into()))?;
+        if matches!(
+            key.as_str(),
+            "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "te"
+                | "upgrade"
+                | "trailer"
+        ) {
+            return Err(Error::Config(format!(
+                "model header {key} is managed by the HTTP transport"
+            )));
+        }
+        if result.insert(key.as_str().to_owned(), value).is_some() {
+            return Err(Error::Config(format!("duplicate model header {key}")));
+        }
+    }
+    Ok(result)
+}
+
+fn sensitive_header(name: &str, value: &str) -> Result<HeaderValue> {
+    let mut value = HeaderValue::from_str(value)
+        .map_err(|_| Error::Config(format!("invalid value for model header {name}")))?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -497,6 +597,46 @@ mod tests {
         assert_eq!(
             profiles.endpoint(&proxy),
             "http://127.0.0.1:7001/v1/messages"
+        );
+    }
+
+    #[test]
+    fn request_headers_merge_case_insensitively_and_stay_endpoint_bound() {
+        let profiles = Profiles::parse(&json!({"providers":{"ollama":{
+            "baseUrl":"http://127.0.0.1:7000/v1",
+            "headers":{"X-Route":"base","X-Extra":"$$literal"},
+            "authHeader":true,
+            "models":[{"id":"custom","headers":{"x-route":"model"}}],
+            "modelOverrides":{"custom":{"headers":{"X-ROUTE":"override"}}}
+        }}}))
+        .unwrap();
+        let provider = Provider::Ollama;
+        let endpoint = profiles.endpoint(&provider);
+        let headers = profiles
+            .request_headers(&provider, endpoint, Some("custom"), Some("secret"))
+            .unwrap();
+        assert_eq!(headers["x-route"], "override");
+        assert_eq!(headers["x-extra"], "$literal");
+        assert_eq!(headers[AUTHORIZATION], "Bearer secret");
+        assert!(headers[AUTHORIZATION].is_sensitive());
+        assert!(
+            profiles
+                .request_headers(&provider, endpoint, None, None)
+                .is_err()
+        );
+        assert!(
+            profiles
+                .request_headers(
+                    &provider,
+                    "http://127.0.0.1:7001/v1/chat/completions",
+                    Some("custom"),
+                    Some("secret")
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            Profiles::parse(&json!({"providers":{"ollama":{"headers":{"Host":"other"}}}})).is_err()
         );
     }
 }

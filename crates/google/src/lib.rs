@@ -9,7 +9,10 @@ use pi_rs_core::{
     Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
     ResolvedModelIdentity, Result, ToolCall, Usage, extract_tool_images,
 };
-use reqwest::{Client, Response, Url, header::HeaderValue};
+use reqwest::{
+    Client, Response, Url,
+    header::{HeaderMap, HeaderValue},
+};
 use serde_json::{Value, json};
 
 pub const DEFAULT_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -40,6 +43,7 @@ pub struct Google {
     client: Client,
     endpoint: Url,
     api_key: HeaderValue,
+    headers: HeaderMap,
     catalog: Arc<RwLock<BTreeMap<String, CatalogEntry>>>,
     probe_context: bool,
     thinking: Option<String>,
@@ -79,12 +83,18 @@ impl Google {
             client,
             endpoint,
             api_key,
+            headers: HeaderMap::new(),
             catalog: Arc::default(),
             probe_context: true,
             thinking: None,
             progress: None,
             reasoning: None,
         })
+    }
+
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
     }
 
     pub fn with_context_probe(mut self, enabled: bool) -> Self {
@@ -120,6 +130,7 @@ impl Google {
             .client
             .get(url)
             .header("x-goog-api-key", self.api_key.clone())
+            .headers(self.headers.clone())
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -566,6 +577,7 @@ impl Model for Google {
             .client
             .post(url)
             .header("x-goog-api-key", self.api_key.clone())
+            .headers(self.headers.clone())
             .json(&body)
             .send()
             .await

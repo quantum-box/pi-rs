@@ -34,18 +34,17 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if !args.allow_model_probes() {
         return fallback();
     }
-    let model = args.model.clone();
-    let provider = args.provider.clone();
-    let endpoint = args.endpoint.clone();
-    let token = args.model_token();
+    let connection = args.clone();
     let discovered = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .ok()?;
         runtime.block_on(async {
-            let client = provider.connect(&endpoint, token).ok()?;
-            client.thinking_levels(&model).await
+            let client = connection
+                .connect_provider(&connection.provider, Some(&connection.model))
+                .ok()?;
+            client.thinking_levels(&connection.model).await
         })
     })
     .join()

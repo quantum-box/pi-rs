@@ -347,12 +347,25 @@ impl Cli {
             })
     }
 
+    fn connect_provider(
+        &self,
+        provider: &Provider,
+        model: Option<&str>,
+    ) -> Result<providers::Client> {
+        let endpoint = self.endpoint_for(provider);
+        let token = self.model_token_for(provider, endpoint);
+        let headers =
+            self.model_profiles
+                .request_headers(provider, endpoint, model, token.as_deref())?;
+        Ok(provider.connect(endpoint, token)?.with_headers(headers))
+    }
+
     fn activate_provider(&mut self, provider: Provider) -> Result<()> {
         if provider == self.provider {
             return Ok(());
         }
         let endpoint = self.endpoint_for(&provider).to_owned();
-        provider.connect(&endpoint, self.model_token_for(&provider, &endpoint))?;
+        self.connect_provider(&provider, None)?;
         self.provider = provider;
         self.endpoint = endpoint;
         self.thinking_profile = None;
@@ -407,6 +420,7 @@ impl Cli {
         let mut selected = self.clone();
         selected.activate_provider(provider)?;
         selected.model = model;
+        selected.connect_provider(&selected.provider, Some(&selected.model))?;
         if thinking.is_some() {
             selected.thinking = thinking;
         } else {

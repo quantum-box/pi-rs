@@ -116,6 +116,14 @@ pub(super) enum Client {
 }
 
 impl Client {
+    pub fn with_headers(self, headers: reqwest::header::HeaderMap) -> Self {
+        match self {
+            Self::Ollama(client) => Self::Ollama(client.with_headers(headers)),
+            Self::Anthropic(client) => Self::Anthropic(client.with_headers(headers)),
+            Self::Google(client) => Self::Google(client.with_headers(headers)),
+        }
+    }
+
     pub async fn models(&self) -> Result<Vec<String>> {
         match self {
             Self::Ollama(client) => client.models().await,

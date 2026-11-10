@@ -218,7 +218,17 @@ impl Runtime {
     }
 
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
-        self.provider = self.provider.clone().with_model_options(args, reported)?;
+        let headers = args.model_profiles.request_headers(
+            &args.provider,
+            &args.endpoint,
+            Some(&args.model),
+            args.model_token().as_deref(),
+        )?;
+        self.provider = self
+            .provider
+            .clone()
+            .with_headers(headers)
+            .with_model_options(args, reported)?;
         Ok(())
     }
     pub async fn close(&self) -> Result<()> {
@@ -417,8 +427,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
         });
         registry.set_refresher(catalog.clone());
         let provider = args
-            .provider
-            .connect(&args.endpoint, args.model_token())?
+            .connect_provider(&args.provider, Some(&args.model))?
             .with_context_probes(args.allow_model_probes())
             .with_model_options(args, super::thinking::reported(args).is_some())?
             .observe(args.trace);

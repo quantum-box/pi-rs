@@ -2159,3 +2159,16 @@ The RPC and terminal fixtures used two providers with the same model ID
 and different local endpoints and authentication schemes. They covered
 switching, credentials bound to each connection, journal restoration,
 and provider identity in the transcript.
+
+### Provider and model request headers
+
+The compatible adapters apply provider headers, then declared model headers
+and model overrides. Header names match case-insensitively. A provider can
+enable `authHeader` to also send its key as a bearer token. Header values
+can refer to environment variables, and credentials stay bound to the
+configured connection. The terminal reloads these settings when opening
+the model picker and replaces its worker when the profile changes.
+
+Loopback checks exercised native and custom authentication headers, model
+override order, endpoint isolation, redacted errors and a live terminal
+worker reload.

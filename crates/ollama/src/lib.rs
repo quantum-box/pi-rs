@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
+use reqwest::header::HeaderMap;
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,6 +22,7 @@ pub struct Ollama {
     client: Client,
     endpoint: Url,
     token: Option<String>,
+    headers: HeaderMap,
     reasoning_effort: Option<String>,
     sampling: BTreeMap<String, Value>,
     native_probes: bool,
@@ -96,12 +98,27 @@ impl Ollama {
             client,
             endpoint,
             token,
+            headers: HeaderMap::new(),
             reasoning_effort: None,
             sampling: BTreeMap::new(),
             native_probes: true,
             progress: None,
             reasoning: None,
         })
+    }
+
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = if let Some(token) = &self.token {
+            request.bearer_auth(token)
+        } else {
+            request
+        };
+        request.headers(self.headers.clone())
     }
 
     /// Enable or suppress auxiliary native endpoint probes.
@@ -169,10 +186,9 @@ impl Ollama {
             })?;
         let path = format!("{path}models");
         endpoint.set_path(&path);
-        let mut request = self.client.get(endpoint).timeout(Duration::from_secs(10));
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
+        let request = self
+            .authenticate(self.client.get(endpoint))
+            .timeout(Duration::from_secs(10));
         let mut response = request
             .send()
             .await
@@ -254,26 +270,18 @@ impl Ollama {
     }
 
     async fn show_model(&self, endpoint: Url, model: &str) -> Option<ModelDetails> {
-        let mut request = self
-            .client
-            .post(endpoint)
+        let request = self
+            .authenticate(self.client.post(endpoint))
             .timeout(Duration::from_millis(750))
             .json(&json!({"model": model}));
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
         let value = read_native_response(request).await?;
         Some(decode_model_details(&value))
     }
 
     async fn running_models(&self) -> Option<Value> {
-        let mut request = self
-            .client
-            .get(self.native_endpoint("ps")?)
+        let request = self
+            .authenticate(self.client.get(self.native_endpoint("ps")?))
             .timeout(Duration::from_millis(250));
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
         read_native_response(request).await
     }
 
@@ -433,10 +441,9 @@ impl Model for Ollama {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
-        let mut builder = self.client.post(self.endpoint.clone()).json(&body);
-        if let Some(token) = &self.token {
-            builder = builder.bearer_auth(token);
-        }
+        let builder = self
+            .authenticate(self.client.post(self.endpoint.clone()))
+            .json(&body);
         let monitor_loading = self.progress.is_some()
             && !requested_model.ends_with(":cloud")
             && self.endpoint.port_or_known_default() == Some(11434)

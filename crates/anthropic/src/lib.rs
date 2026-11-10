@@ -9,7 +9,10 @@ use pi_rs_core::{
     Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
     ResolvedModelIdentity, Result, ToolCall, Usage,
 };
-use reqwest::{Client, Response, Url, header::HeaderValue};
+use reqwest::{
+    Client, Response, Url,
+    header::{HeaderMap, HeaderValue},
+};
 use serde_json::{Value, json};
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -51,6 +54,7 @@ pub struct Anthropic {
     client: Client,
     endpoint: Url,
     api_key: HeaderValue,
+    headers: HeaderMap,
     catalog: Arc<RwLock<BTreeMap<String, CatalogEntry>>>,
     probe_context: bool,
     thinking_level: Option<String>,
@@ -93,12 +97,18 @@ impl Anthropic {
             client,
             endpoint,
             api_key,
+            headers: HeaderMap::new(),
             catalog: Default::default(),
             probe_context: true,
             thinking_level: None,
             progress: None,
             reasoning: None,
         })
+    }
+
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
     }
 
     pub fn with_context_probe(mut self, enabled: bool) -> Self {
@@ -162,6 +172,7 @@ impl Anthropic {
         request
             .header("anthropic-version", API_VERSION)
             .header("x-api-key", self.api_key.clone())
+            .headers(self.headers.clone())
     }
 
     /// Return paginated models in server order and retain their metadata for this client.
