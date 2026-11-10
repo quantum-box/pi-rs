@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pi_rs::{
     Agent, CancellationToken, Limits, MemoryStore, Notification, Registry, Session, ollama::Ollama,
@@ -170,10 +170,24 @@ fn model_fixture_with_config(
         "http://{}/v1/chat/completions",
         server.local_addr().unwrap()
     );
+    server.set_nonblocking(true).unwrap();
     let handle = std::thread::spawn(move || {
         let mut completed = 0;
+        let deadline = Instant::now() + Duration::from_secs(30);
         while completed < 2 {
-            let (mut socket, _) = server.accept().unwrap();
+            let (mut socket, _) = match server.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "received {completed} of 2 model requests"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("model fixture accept failed: {error}"),
+            };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -449,16 +463,25 @@ fn persistent_worker_accepts_multiple_prompts_and_releases_the_journal() {
         )
         .unwrap();
         input.flush().unwrap();
-        let mut answered = false;
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let event = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
-            answered |= event["type"] == "answer";
-            if event["type"] == "agent_settled" {
-                assert_eq!(event["success"], true);
+            let event = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!("worker did not settle: {error}; events: {events:?}")
+                });
+            let settled = event["type"] == "agent_settled";
+            events.push(event);
+            if settled {
+                assert_eq!(events.last().unwrap()["success"], true, "{events:?}");
                 break;
             }
         }
-        assert!(answered);
+        assert!(
+            events.iter().any(|event| event["type"] == "answer"),
+            "{events:?}"
+        );
         assert!(child.try_wait().unwrap().is_none());
         drop(Session::open(&path).unwrap());
     }
@@ -522,19 +545,47 @@ fn api_key_override_reaches_direct_and_rpc_requests_without_persistence() {
     let mut input = rpc.stdin.take().unwrap();
     writeln!(input, "{{\"type\":\"prompt\",\"message\":\"same input\"}}").unwrap();
     input.flush().unwrap();
-    let mut reader = BufReader::new(rpc.stdout.take().unwrap());
+    let stdout = rpc.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            assert!(!line.contains(token));
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut events = Vec::new();
     loop {
-        let mut line = String::new();
-        assert!(reader.read_line(&mut line).unwrap() > 0);
-        assert!(!line.contains(token));
-        let event: Value = serde_json::from_str(&line).unwrap();
-        if event["type"] == "agent_settled" {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| {
+                let _ = rpc.kill();
+                let _ = rpc.wait();
+                panic!("RPC did not settle: {error}; events: {events:?}");
+            });
+        let settled = event["type"] == "agent_settled";
+        events.push(event);
+        if settled {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["type"] == "agent_end" && event["success"] == true),
+                "{events:?}"
+            );
             break;
         }
     }
     writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
     input.flush().unwrap();
+    drop(input);
     let output = rpc.wait_with_output().unwrap();
+    reader.join().unwrap();
     assert!(output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
     server.join().unwrap();
