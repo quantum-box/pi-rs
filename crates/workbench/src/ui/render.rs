@@ -177,27 +177,28 @@ impl Entry {
         expand_tools: bool,
         show_thinking: bool,
         image_width: Option<usize>,
+        output_pad: usize,
     ) -> Vec<Line> {
-        let inner = width.saturating_sub(2).max(1);
-        match self {
-            Self::Notice(text) => wrap(&[Span::new(text, theme.color("muted"))], width),
+        let padding = output_pad.min(width.saturating_sub(1) / 2);
+        let inner = width.saturating_sub(2 * padding).max(1);
+        let mut lines = match self {
+            Self::Notice(text) => return wrap(&[Span::new(text, theme.color("muted"))], width),
             Self::User(text) => {
                 let mut lines = wrap(&[Span::new(text, theme.color("userMessageText"))], inner);
                 for line in &mut lines {
                     line.background = Some(theme.color("userMessageBg"));
-                    line.spans
-                        .insert(0, Span::new(" ", theme.color("userMessageText")));
                 }
                 lines.push(Line::default());
                 lines
             }
             Self::Assistant(text) => {
-                let mut lines = markdown(text, theme, width);
+                let mut lines = markdown(text, theme, inner);
                 lines.push(Line::default());
                 lines
             }
             Self::Image(image) => {
-                image_width.map_or_else(Vec::new, |limit| image.lines(width, limit))
+                return image_width
+                    .map_or_else(Vec::new, |limit| image.lines(width, limit, padding));
             }
             Self::Thinking(text) => {
                 if !show_thinking {
@@ -205,7 +206,7 @@ impl Entry {
                 }
                 let mut span = Span::new(text, theme.color("thinkingText"));
                 span.italic = true;
-                let mut lines = wrap(&[span], width);
+                let mut lines = wrap(&[span], inner);
                 lines.push(Line::default());
                 lines
             }
@@ -261,7 +262,9 @@ impl Entry {
                     for part in parts {
                         match part {
                             ToolPart::Text(text) => render_text(text, &mut lines),
-                            ToolPart::Image(image) => lines.extend(image.lines(inner, limit)),
+                            ToolPart::Image(image) => {
+                                lines.extend(image.lines(width, limit, padding))
+                            }
                         }
                     }
                 } else {
@@ -286,13 +289,19 @@ impl Entry {
                 }
                 for line in &mut lines {
                     line.background = Some(theme.color(role));
-                    line.spans
-                        .insert(0, Span::new(" ", theme.color("toolOutput")));
                 }
                 lines.push(Line::default());
                 lines
             }
+        };
+        if padding != 0 {
+            for line in &mut lines {
+                if !line.spans.is_empty() {
+                    line.spans.insert(0, Span::new(" ", Color::Reset));
+                }
+            }
         }
+        lines
     }
 }
 
@@ -848,7 +857,7 @@ mod tests {
                 ToolPart::Text("after".into()),
             ],
         };
-        let lines = entry.render(&Theme::system(), 80, true, true, Some(60));
+        let lines = entry.render(&Theme::system(), 80, true, true, Some(60), 1);
         let before = lines
             .iter()
             .position(|line| line.spans.iter().any(|span| span.text.contains("before")))
@@ -861,7 +870,7 @@ mod tests {
         assert!(before < image && image < after);
         assert!(
             entry
-                .render(&Theme::system(), 80, false, true, Some(60))
+                .render(&Theme::system(), 80, false, true, Some(60), 1)
                 .iter()
                 .all(|line| line.image.is_none())
         );

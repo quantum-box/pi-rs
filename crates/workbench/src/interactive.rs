@@ -228,6 +228,7 @@ struct RegularLayout {
     expand_tools: bool,
     hide_thinking: bool,
     image_width: Option<usize>,
+    output_pad: usize,
 }
 #[derive(Default)]
 struct RegularState {
@@ -434,7 +435,7 @@ impl View {
             .values()
             .filter(|(_, location)| *location == placement)
             .flat_map(|(lines, _)| lines.iter())
-            .flat_map(|text| Entry::Notice(text.clone()).render(theme, width, false, true, None))
+            .flat_map(|text| Entry::Notice(text.clone()).render(theme, width, false, true, None, 0))
             .collect()
     }
     fn extension_status(&self) -> String {
@@ -1087,6 +1088,7 @@ impl View {
             below.clear();
         }
         let image_width = self.image_width(args);
+        let output_pad = args.settings.output_padding();
         let header_rows = usize::from(show_startup_header(args));
         let body_height = height.saturating_sub(prompt_height + 4 + header_rows + below.len());
         let mut lines = Vec::new();
@@ -1101,6 +1103,7 @@ impl View {
                 self.expand_tools,
                 !self.hide_thinking,
                 image_width,
+                output_pad,
             ));
         }
         if !self.thinking.is_empty() {
@@ -1110,12 +1113,13 @@ impl View {
                 false,
                 !self.hide_thinking,
                 None,
+                output_pad,
             ));
         }
         if !self.streaming.is_empty() {
             lines.extend(
                 Entry::Assistant(self.streaming.clone())
-                    .render(theme, body_width, false, true, None),
+                    .render(theme, body_width, false, true, None, output_pad),
             );
         }
         if let Some(picker) = &self.picker {
@@ -1320,6 +1324,7 @@ impl View {
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
         self.graphics.reset();
         let image_width = self.image_width(args);
+        let output_pad = args.settings.output_padding();
         let width = usize::from(terminal::size()?.0.max(1));
         let mut out = std::io::stdout().lock();
         queue!(out, MoveToColumn(0), Print("\r\n"))?;
@@ -1330,6 +1335,7 @@ impl View {
                 self.expand_tools,
                 !self.hide_thinking,
                 image_width,
+                output_pad,
             ) {
                 line.draw(&mut out, width)?;
                 self.graphics
@@ -1346,6 +1352,7 @@ impl View {
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
         let image_width = self.image_width(args);
+        let output_pad = args.settings.output_padding();
         let layout = RegularLayout {
             width,
             height,
@@ -1354,6 +1361,7 @@ impl View {
             expand_tools: self.expand_tools,
             hide_thinking: self.hide_thinking,
             image_width,
+            output_pad,
         };
         let redraw = self.regular.layout.is_some()
             && (self.regular.redraw
@@ -1410,6 +1418,7 @@ impl View {
                     self.expand_tools,
                     !self.hide_thinking,
                     image_width,
+                    output_pad,
                 ) {
                     line.draw(&mut out, width)?;
                     self.graphics
@@ -1427,6 +1436,7 @@ impl View {
                     self.expand_tools,
                     !self.hide_thinking,
                     image_width,
+                    output_pad,
                 ) {
                     line.draw(&mut out, width)?;
                     self.graphics
@@ -1446,6 +1456,7 @@ impl View {
                             self.expand_tools,
                             !self.hide_thinking,
                             image_width,
+                            output_pad,
                         )
                     }),
             );
@@ -1455,9 +1466,11 @@ impl View {
                 false,
                 !self.hide_thinking,
                 None,
+                output_pad,
             ));
             active.extend(
-                Entry::Assistant(self.streaming.clone()).render(theme, width, false, true, None),
+                Entry::Assistant(self.streaming.clone())
+                    .render(theme, width, false, true, None, output_pad),
             );
             if let Some(picker) = &self.picker {
                 active =
@@ -3203,6 +3216,16 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     selection: Selection::Setting(
                                         "editorPaddingX".into(),
                                         json!((padding + 1) % 4),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
+                                        "Output padding · {}",
+                                        args.settings.output_padding()
+                                    ),
+                                    selection: Selection::Setting(
+                                        "outputPad".into(),
+                                        json!(1 - args.settings.output_padding()),
                                     ),
                                 },
                                 Item {

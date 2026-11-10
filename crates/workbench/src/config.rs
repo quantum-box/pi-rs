@@ -166,6 +166,10 @@ impl Settings {
             .as_f64()
             .map_or(60, |width| width.min(f64::from(u16::MAX)) as usize)
     }
+    pub fn output_padding(&self) -> usize {
+        usize::from(self.value["outputPad"].as_u64() != Some(0))
+    }
+
     pub fn set_user_member(&mut self, key: &str, member: &str, value: Value) -> Result<()> {
         let path = agent_dir().join("settings.json");
         let update = |settings: &mut Map<String, Value>| -> Result<()> {

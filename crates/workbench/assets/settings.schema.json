@@ -9,6 +9,7 @@
     "fullscreenWheelScrollLines": { "type": ["number", "string"], "anyOf": [{"type": "number"}, {"const": "auto"}] },
     "shellPath": { "type": "string" },
     "shellCommandPrefix": { "type": "string" },
+    "outputPad": { "enum": [0, 1] },
     "editorPaddingX": { "type": "integer", "minimum": 0, "maximum": 3 },
     "sessionShareDestination": { "enum": ["auto", "radius", "gist"] },
     "retry": {

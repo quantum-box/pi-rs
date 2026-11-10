@@ -85,8 +85,8 @@ impl InlineImage {
             height: prepared.height,
         }))
     }
-    pub fn lines(self: &Arc<Self>, width: usize, image_width: usize) -> Vec<Line> {
-        let maximum_columns = width.saturating_sub(2).min(image_width).max(1);
+    pub fn lines(self: &Arc<Self>, width: usize, image_width: usize, padding: usize) -> Vec<Line> {
+        let maximum_columns = width.saturating_sub(2 * padding).min(image_width).max(1);
         let cell = cell_dimensions();
         let maximum_rows = ((maximum_columns as f64 * cell.0) / cell.1).ceil().max(1.0) as usize;
         let optimize = detect(|key| std::env::var(key).ok()) == Some(Protocol::Kitty);
@@ -103,6 +103,7 @@ impl InlineImage {
                 image: Some(Placement {
                     image: self.clone(),
                     columns,
+                    column: padding,
                     rows,
                     offset,
                 }),
@@ -207,6 +208,7 @@ fn less_distorted(upper: usize, ideal: f64) -> usize {
 pub struct Placement {
     image: Arc<InlineImage>,
     columns: usize,
+    column: usize,
     rows: usize,
     offset: usize,
 }
@@ -350,7 +352,7 @@ impl Renderer {
         if protocol == Protocol::Iterm2 && iterm_rows > 1 {
             queue!(out, MoveUp((iterm_rows - 1) as u16))?;
         }
-        queue!(out, MoveToColumn(0))?;
+        queue!(out, MoveToColumn(placement.column as u16))?;
         match protocol {
             Protocol::Kitty => {
                 if !self.uploaded.contains(&image.id) {
@@ -591,6 +593,7 @@ mod tests {
             image: Some(Placement {
                 image: fixture(),
                 columns: 2,
+                column: 0,
                 rows: 2,
                 offset: 1,
             }),
@@ -621,6 +624,7 @@ mod tests {
             image: Some(Placement {
                 image: image.clone(),
                 columns: 2,
+                column: 0,
                 rows: 2,
                 offset: 0,
             }),
@@ -659,6 +663,7 @@ mod tests {
             image: Some(Placement {
                 image: image.clone(),
                 columns: 2,
+                column: 0,
                 rows: 3,
                 offset,
             }),
@@ -676,6 +681,7 @@ mod tests {
             image: Some(Placement {
                 image: fixture(),
                 columns: 2,
+                column: 0,
                 rows: 1,
                 offset: 0,
             }),
@@ -697,6 +703,7 @@ mod tests {
                 image: Some(Placement {
                     image: image.clone(),
                     columns: 2,
+                    column: 0,
                     rows: 2,
                     offset,
                 }),
