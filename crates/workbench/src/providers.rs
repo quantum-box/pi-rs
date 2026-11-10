@@ -122,6 +122,7 @@ impl Provider {
         adapter: Adapter,
         endpoint: &str,
         token: Option<String>,
+        bearer: bool,
     ) -> Result<Client> {
         let missing_key = || {
             Error::Config(match self {
@@ -149,7 +150,7 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = if matches!(self.id(), "fireworks" | "openrouter") {
+                let mut client = if bearer || matches!(self.id(), "fireworks" | "openrouter") {
                     Anthropic::with_bearer_token(endpoint, &token)?
                 } else {
                     Anthropic::new(endpoint, &token)?
@@ -220,9 +221,10 @@ impl Deferred {
             .headers
             .resolve(&self.provider, token.as_deref())
             .await?;
+        let bearer = self.credential.as_ref().is_some_and(Credential::is_bearer);
         let mut client = self
             .provider
-            .connect(self.adapter, &self.endpoint, token)?
+            .connect(self.adapter, &self.endpoint, token, bearer)?
             .with_headers(headers)
             .with_context_probes(self.probe_context);
         if let Some((args, reported)) = &self.options {

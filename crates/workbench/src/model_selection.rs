@@ -488,6 +488,7 @@ mod tests {
                         Provider::Ollama.adapter(),
                         Provider::Ollama.default_endpoint(),
                         None,
+                        false,
                     )
                     .unwrap(),
                 models: vec!["same".into(), "exact-extra".into()],
@@ -501,6 +502,7 @@ mod tests {
                         Provider::Anthropic.adapter(),
                         Provider::Anthropic.default_endpoint(),
                         Some("fixture".into()),
+                        false,
                     )
                     .unwrap(),
                 models: vec!["same".into(), "exact".into()],

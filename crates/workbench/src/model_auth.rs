@@ -11,6 +11,7 @@ use super::{Provider, config};
 #[derive(Clone)]
 pub(super) enum Credential {
     Literal(String),
+    Bearer(String),
     Command(String),
     StoredCommand(String),
 }
@@ -33,9 +34,13 @@ impl Credential {
 
     pub fn literal(&self) -> Option<&str> {
         match self {
-            Self::Literal(value) => Some(value),
+            Self::Literal(value) | Self::Bearer(value) => Some(value),
             Self::Command(_) | Self::StoredCommand(_) => None,
         }
+    }
+
+    pub fn is_bearer(&self) -> bool {
+        matches!(self, Self::Bearer(_))
     }
 
     pub fn is_command(&self) -> bool {
@@ -44,7 +49,7 @@ impl Credential {
 
     pub async fn resolve(&self) -> Result<String> {
         let value = match self {
-            Self::Literal(value) => return Ok(value.clone()),
+            Self::Literal(value) | Self::Bearer(value) => return Ok(value.clone()),
             Self::Command(command) => resolve_command(command).await,
             Self::StoredCommand(command) => {
                 let cell = STORED_COMMANDS

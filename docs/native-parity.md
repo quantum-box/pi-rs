@@ -2652,3 +2652,13 @@ respect the model and provider compatibility settings. Other chat models
 keep their standard request shape. Compaction omits automatic cache
 markers and session-affinity headers. Loopback checks covered default
 OpenRouter routing, configured short retention, and compacted history.
+
+### Native Anthropic authorization header checkpoint
+
+The standard Anthropic Messages endpoint accepts an explicitly supplied
+`ANTHROPIC_AUTH_TOKEN` as an Authorization bearer credential. Stored and
+configured keys retain precedence. The header token takes priority over
+`ANTHROPIC_API_KEY` on the standard endpoint. Custom URLs and ports do
+not inherit it. Auth status remains masked and uses Pi's API credential
+classification. Offline and loopback checks covered priority, endpoint
+isolation, and explicit proxy keys.
