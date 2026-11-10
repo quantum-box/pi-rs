@@ -6,6 +6,48 @@ use serde_json::{Value, json};
 
 use super::{Provider, config};
 
+#[derive(Clone)]
+pub(super) enum Credential {
+    Literal(String),
+    Command(String),
+}
+
+impl Credential {
+    pub fn configured(value: &str) -> Option<Self> {
+        if let Some(command) = value.strip_prefix('!') {
+            return (!command.trim().is_empty() && value.len() <= 16 * 1024)
+                .then(|| Self::Command(value.into()));
+        }
+        super::model_profiles::expand_value(value)
+            .filter(|value| valid_key(value))
+            .map(Self::Literal)
+    }
+
+    pub fn literal(&self) -> Option<&str> {
+        match self {
+            Self::Literal(value) => Some(value),
+            Self::Command(_) => None,
+        }
+    }
+
+    pub async fn resolve(&self) -> Result<String> {
+        match self {
+            Self::Literal(value) => Ok(value.clone()),
+            Self::Command(command) => {
+                let value = pi_rs_workbench::mcp::resolve_value(command)
+                    .await
+                    .map_err(|_| Error::Config("Model credential command failed".into()))?;
+                if !valid_key(&value) {
+                    return Err(Error::Config(
+                        "Model credential command returned an invalid key".into(),
+                    ));
+                }
+                Ok(value)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Keys {
     entries: BTreeMap<String, SavedKey>,
@@ -14,7 +56,7 @@ pub(super) struct Keys {
 #[derive(Clone)]
 struct SavedKey {
     endpoint: String,
-    key: String,
+    key: Credential,
 }
 
 impl Keys {
@@ -32,7 +74,12 @@ impl Keys {
                 if entry["type"] != "api_key" {
                     return None;
                 }
-                let key = entry["key"].as_str().filter(|key| valid_key(key))?;
+                let value = entry["key"].as_str()?;
+                let key = if entry["literal"] == true {
+                    valid_key(value).then(|| Credential::Literal(value.into()))?
+                } else {
+                    Credential::configured(value)?
+                };
                 let endpoint = match entry.get("endpoint") {
                     None => Provider::named(name)?.default_endpoint(),
                     Some(value) => value.as_str()?,
@@ -41,7 +88,7 @@ impl Keys {
                     name.to_ascii_lowercase(),
                     SavedKey {
                         endpoint: endpoint.to_owned(),
-                        key: key.to_owned(),
+                        key,
                     },
                 ))
             })
@@ -49,9 +96,14 @@ impl Keys {
         Self { entries }
     }
 
-    pub fn get(&self, provider: &Provider, endpoint: &str) -> Option<&str> {
+    pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<&Credential> {
         let entry = self.entries.get(provider.id())?;
-        (entry.endpoint == endpoint).then_some(entry.key.as_str())
+        (entry.endpoint == endpoint).then_some(&entry.key)
+    }
+
+    #[cfg(test)]
+    fn get(&self, provider: &Provider, endpoint: &str) -> Option<&str> {
+        self.credential(provider, endpoint)?.literal()
     }
 
     pub fn has(&self, provider: &Provider) -> bool {
@@ -69,7 +121,7 @@ pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()>
     config::update_object(&config::agent_dir().join("auth.json"), |data| {
         data.insert(
             provider.id().into(),
-            json!({"type":"api_key","key":key,"endpoint":endpoint}),
+            json!({"type":"api_key","key":key,"endpoint":endpoint,"literal":true}),
         );
         Ok(())
     })

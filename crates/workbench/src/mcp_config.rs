@@ -221,7 +221,10 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
                 } else {
                     args.model_profiles.endpoint(&provider)
                 };
-                let token = args.model_token_for(&provider, endpoint);
+                let token = match args.model_credential_for(&provider, endpoint) {
+                    Some(source) => Some(source.resolve().await?),
+                    None => None,
+                };
                 if token.is_some() || provider != super::Provider::Radius {
                     return Ok(token);
                 }

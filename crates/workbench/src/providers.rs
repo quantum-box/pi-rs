@@ -8,7 +8,7 @@ use pi_rs::{Error, Model, ModelRequest, ModelStream, Result};
 use serde_json::json;
 use std::sync::Arc;
 
-use super::pi_messages::PiMessages;
+use super::{Cli, model_auth::Credential, model_profiles::RequestHeaders, pi_messages::PiMessages};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) enum Provider {
@@ -144,9 +144,64 @@ pub(super) enum Client {
     Anthropic(Anthropic),
     Google(Google),
     PiMessages(PiMessages),
+    Deferred(Box<Deferred>),
+}
+
+#[derive(Clone)]
+pub(super) struct Deferred {
+    provider: Provider,
+    endpoint: String,
+    credential: Option<Credential>,
+    headers: RequestHeaders,
+    options: Option<(Box<Cli>, bool)>,
+    probe_context: bool,
+    observed: bool,
+}
+
+impl Deferred {
+    async fn resolve(&self) -> Result<Client> {
+        let token = match &self.credential {
+            Some(credential) => Some(credential.resolve().await?),
+            None => None,
+        };
+        let headers = self
+            .headers
+            .resolve(&self.provider, token.as_deref())
+            .await?;
+        let mut client = self
+            .provider
+            .connect(&self.endpoint, token)?
+            .with_headers(headers)
+            .with_context_probes(self.probe_context);
+        if let Some((args, reported)) = &self.options {
+            client = client.with_model_options(args, *reported)?;
+        }
+        Ok(if self.observed {
+            client.observe()
+        } else {
+            client
+        })
+    }
 }
 
 impl Client {
+    pub fn deferred(
+        provider: Provider,
+        endpoint: &str,
+        credential: Option<Credential>,
+        headers: RequestHeaders,
+    ) -> Self {
+        Self::Deferred(Box::new(Deferred {
+            provider,
+            endpoint: endpoint.into(),
+            credential,
+            headers,
+            options: None,
+            probe_context: true,
+            observed: false,
+        }))
+    }
+
     pub fn aliases(&self) -> Vec<(String, String)> {
         match self {
             Self::PiMessages(client) => client.aliases(),
@@ -160,6 +215,7 @@ impl Client {
             Self::Anthropic(client) => Self::Anthropic(client.with_headers(headers)),
             Self::Google(client) => Self::Google(client.with_headers(headers)),
             Self::PiMessages(client) => Self::PiMessages(client.with_headers(headers)),
+            Self::Deferred(_) => unreachable!("deferred provider headers resolve per request"),
         }
     }
 
@@ -179,6 +235,7 @@ impl Client {
                 .map(|model| model.id)
                 .collect()),
             Self::PiMessages(client) => client.models().await,
+            Self::Deferred(client) => Box::pin(client.resolve().await?.models()).await,
         }
     }
 
@@ -234,6 +291,10 @@ impl Client {
                     .collect()
             }
             Self::PiMessages(client) => client.model_details(models).await,
+            Self::Deferred(client) => match client.resolve().await {
+                Ok(client) => Box::pin(client.model_details(models)).await,
+                Err(_) => BTreeMap::new(),
+            },
         }
     }
 
@@ -243,6 +304,10 @@ impl Client {
             Self::Anthropic(client) => Self::Anthropic(client.with_context_probe(enabled)),
             Self::Google(client) => Self::Google(client.with_context_probe(enabled)),
             Self::PiMessages(client) => Self::PiMessages(client.with_context_probe(enabled)),
+            Self::Deferred(mut client) => {
+                client.probe_context = enabled;
+                Self::Deferred(client)
+            }
         }
     }
 
@@ -269,6 +334,10 @@ impl Client {
             Self::Anthropic(client) => Self::Anthropic(client.with_thinking(thinking)),
             Self::Google(client) => Self::Google(client.with_thinking(thinking)),
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
+            Self::Deferred(mut client) => {
+                client.options = Some((Box::new(args.clone()), reported));
+                Self::Deferred(client)
+            }
         })
     }
 
@@ -290,6 +359,9 @@ impl Client {
                     .remove(model)?
                     .thinking_levels
             }
+            Self::Deferred(client) => {
+                Box::pin(client.resolve().await.ok()?.thinking_levels(model)).await
+            }
         }
     }
 
@@ -302,6 +374,10 @@ impl Client {
             Self::Anthropic(client) => Self::Anthropic(client.with_progress(progress)),
             Self::Google(client) => Self::Google(client.with_progress(progress)),
             Self::PiMessages(client) => Self::PiMessages(client.observe(progress)),
+            Self::Deferred(mut client) => {
+                client.observed = true;
+                Self::Deferred(client)
+            }
         }
     }
 }
@@ -314,6 +390,7 @@ impl Model for Client {
             Self::Anthropic(client) => client.context_window(model).await,
             Self::Google(client) => client.context_window(model).await,
             Self::PiMessages(client) => client.context_window(model).await,
+            Self::Deferred(client) => client.resolve().await.ok()?.context_window(model).await,
         }
     }
 
@@ -323,6 +400,12 @@ impl Model for Client {
             Self::Anthropic(client) => client.stream(request).await,
             Self::Google(client) => client.stream(request).await,
             Self::PiMessages(client) => client.stream(request).await,
+            Self::Deferred(client) => {
+                if client.observed {
+                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
+                }
+                client.resolve().await?.stream(request).await
+            }
         }
     }
 }

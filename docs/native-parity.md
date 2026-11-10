@@ -2270,3 +2270,17 @@ Forwarding is limited to the configured HTTPS or loopback endpoint.
 Project MCP files cannot request forwarding. The local fixture covered
 key rotation on an existing connection, a Radius refresh, refusal of
 project forwarding and a redirect that received no token.
+
+### Command-backed model credentials
+
+User model profiles can use `!command` for an API key or a request
+header, including a model override. Endpoint-bound keys in `auth.json`
+also support commands and environment references. The workbench
+resolves command-backed values immediately before the request, with
+bounded execution and output, and sends only the resolved value.
+A key entered through the masked terminal login stays literal.
+
+The RPC fixture changed key and header values between requests on one
+worker, then checked a command failure and an endpoint override. The
+failure redacted command output, and the other endpoint received only
+its explicitly supplied credential.

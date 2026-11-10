@@ -318,10 +318,16 @@ impl Cli {
         Duration::from_secs(self.tool_timeout_secs.unwrap_or(2_147_483))
     }
     fn model_token(&self) -> Option<String> {
-        self.model_token_for(&self.provider, &self.endpoint)
+        self.model_credential_for(&self.provider, &self.endpoint)?
+            .literal()
+            .map(str::to_owned)
     }
 
-    fn model_token_for(&self, provider: &Provider, endpoint: &str) -> Option<String> {
+    fn model_credential_for(
+        &self,
+        provider: &Provider,
+        endpoint: &str,
+    ) -> Option<model_auth::Credential> {
         let initial = self
             .initial_connection
             .as_ref()
@@ -334,20 +340,22 @@ impl Cli {
             })
             .flatten();
         override_key
-            .or_else(|| self.model_keys.get(provider, endpoint).map(str::to_owned))
-            .or_else(|| self.model_profiles.api_key(provider, endpoint))
+            .map(model_auth::Credential::Literal)
+            .or_else(|| self.model_keys.credential(provider, endpoint).cloned())
+            .or_else(|| self.model_profiles.credential(provider, endpoint))
             .or_else(|| {
                 if provider == &Provider::Radius {
                     let gateway = radius_auth::Gateway::configured_origin().ok()?;
                     if gateway.join("/messages").ok()?.as_str() == endpoint {
                         return std::env::var("RADIUS_API_KEY")
                             .ok()
-                            .filter(|key| !key.trim().is_empty());
+                            .filter(|key| !key.trim().is_empty())
+                            .map(model_auth::Credential::Literal);
                     }
                     return None;
                 }
                 let url = reqwest::Url::parse(endpoint).ok()?;
-                match (provider, url.scheme(), url.host_str()) {
+                let token = match (provider, url.scheme(), url.host_str()) {
                     (Provider::Anthropic, "https", Some("api.anthropic.com")) => {
                         std::env::var("ANTHROPIC_API_KEY").ok()
                     }
@@ -355,7 +363,8 @@ impl Cli {
                         std::env::var("GEMINI_API_KEY").ok()
                     }
                     _ => None,
-                }
+                };
+                token.map(model_auth::Credential::Literal)
             })
     }
 
@@ -365,10 +374,24 @@ impl Cli {
         model: Option<&str>,
     ) -> Result<providers::Client> {
         let endpoint = self.endpoint_for(provider);
-        let token = self.model_token_for(provider, endpoint);
-        let headers =
-            self.model_profiles
-                .request_headers(provider, endpoint, model, token.as_deref())?;
+        let credential = self.model_credential_for(provider, endpoint);
+        let settings = self
+            .model_profiles
+            .header_settings(provider, endpoint, model);
+        if settings.has_command() || matches!(credential, Some(model_auth::Credential::Command(_)))
+        {
+            return Ok(providers::Client::deferred(
+                provider.clone(),
+                endpoint,
+                credential,
+                settings,
+            ));
+        }
+        let token = credential
+            .as_ref()
+            .and_then(model_auth::Credential::literal)
+            .map(str::to_owned);
+        let headers = settings.static_headers(provider, token.as_deref())?;
         Ok(provider.connect(endpoint, token)?.with_headers(headers))
     }
 

@@ -736,6 +736,7 @@ impl View {
             Some("auto_retry_end") => { self.phase = None; }
             Some("model_progress") => {
                 self.phase = Some(match value["stage"].as_str() {
+                    Some("resolving_credentials") => "認証情報を取得中",
                     Some("loading_model") => "モデル読込待ち",
                     Some("thinking") => "思考中",
                     Some("generating") => "回答生成中",

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{Provider, config, providers::Adapter};
+use super::{Provider, config, model_auth::Credential, providers::Adapter};
 
 #[derive(Clone, Default)]
 pub(super) struct Profiles {
@@ -27,6 +27,81 @@ struct Profile {
     auth_header: bool,
     models: Vec<ConfiguredModel>,
     overrides: BTreeMap<String, ModelMetadata>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct RequestHeaders {
+    values: BTreeMap<String, String>,
+    auth_header: bool,
+}
+
+impl RequestHeaders {
+    pub fn has_command(&self) -> bool {
+        self.values.values().any(|value| value.starts_with('!'))
+    }
+
+    pub fn static_headers(&self, provider: &Provider, token: Option<&str>) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::with_capacity(self.values.len());
+        for (name, value) in &self.values {
+            let value = expand_value(value)
+                .ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))?;
+            Self::insert(&mut headers, name, &value)?;
+        }
+        self.authenticate(headers, provider, token)
+    }
+
+    pub async fn resolve(&self, provider: &Provider, token: Option<&str>) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::with_capacity(self.values.len());
+        for (name, value) in &self.values {
+            let resolved = if value.starts_with('!') {
+                pi_rs_workbench::mcp::resolve_value(value)
+                    .await
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            } else {
+                expand_value(value)
+            };
+            let value = resolved
+                .ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))?;
+            Self::insert(&mut headers, name, &value)?;
+        }
+        self.authenticate(headers, provider, token)
+    }
+
+    fn insert(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
+            sensitive_header(name, value)?,
+        );
+        Ok(())
+    }
+
+    fn authenticate(
+        &self,
+        mut headers: HeaderMap,
+        provider: &Provider,
+        token: Option<&str>,
+    ) -> Result<HeaderMap> {
+        if self.auth_header {
+            match token {
+                Some(token) => Self::insert(
+                    &mut headers,
+                    AUTHORIZATION.as_str(),
+                    &format!("Bearer {token}"),
+                )?,
+                None if provider == &Provider::Radius => {
+                    // The gateway adapter adds its current OAuth access token.
+                    headers.remove(AUTHORIZATION);
+                }
+                None => {
+                    return Err(Error::Config(
+                        "authHeader requires a resolved API key".into(),
+                    ));
+                }
+            }
+        }
+        Ok(headers)
+    }
 }
 
 #[derive(Deserialize)]
@@ -347,62 +422,47 @@ impl Profiles {
         )
     }
 
-    pub fn api_key(&self, provider: &Provider, endpoint: &str) -> Option<String> {
+    pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<Credential> {
         let profile = self.entries.get(provider.id())?;
         if profile.endpoint != endpoint {
             return None;
         }
-        expand_key(profile.api_key.as_deref()?)
+        Credential::configured(profile.api_key.as_deref()?)
     }
 
-    pub fn request_headers(
+    pub fn header_settings(
+        &self,
+        provider: &Provider,
+        endpoint: &str,
+        model: Option<&str>,
+    ) -> RequestHeaders {
+        let Some(profile) = self
+            .entries
+            .get(provider.id())
+            .filter(|profile| profile.endpoint == endpoint)
+        else {
+            return RequestHeaders::default();
+        };
+        let mut configured = profile.headers.clone();
+        if let Some(metadata) = model.and_then(|id| self.model(provider, id)) {
+            configured.extend(metadata.headers);
+        }
+        RequestHeaders {
+            values: configured,
+            auth_header: profile.auth_header,
+        }
+    }
+
+    #[cfg(test)]
+    fn request_headers(
         &self,
         provider: &Provider,
         endpoint: &str,
         model: Option<&str>,
         token: Option<&str>,
     ) -> Result<HeaderMap> {
-        let Some(profile) = self
-            .entries
-            .get(provider.id())
-            .filter(|profile| profile.endpoint == endpoint)
-        else {
-            return Ok(HeaderMap::new());
-        };
-        let mut configured = profile.headers.clone();
-        if let Some(metadata) = model.and_then(|id| self.model(provider, id)) {
-            configured.extend(metadata.headers);
-        }
-        let mut headers =
-            HeaderMap::with_capacity(configured.len() + usize::from(profile.auth_header));
-        for (name, value) in configured {
-            let value = expand_value(&value)
-                .ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))?;
-            headers.insert(
-                HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
-                sensitive_header(&name, &value)?,
-            );
-        }
-        if profile.auth_header {
-            match token {
-                Some(token) => {
-                    headers.insert(
-                        AUTHORIZATION,
-                        sensitive_header("authorization", &format!("Bearer {token}"))?,
-                    );
-                }
-                None if provider == &Provider::Radius => {
-                    // The gateway adapter adds its current OAuth access token.
-                    headers.remove(AUTHORIZATION);
-                }
-                None => {
-                    return Err(Error::Config(
-                        "authHeader requires a resolved API key".into(),
-                    ));
-                }
-            }
-        }
-        Ok(headers)
+        self.header_settings(provider, endpoint, model)
+            .static_headers(provider, token)
     }
 
     pub fn model_ids(&self, provider: &Provider) -> Vec<String> {
@@ -463,13 +523,8 @@ fn endpoint_from_base(provider: &Provider, base: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-fn expand_key(value: &str) -> Option<String> {
-    expand_value(value).filter(|value| !value.trim().is_empty())
-}
-
-fn expand_value(value: &str) -> Option<String> {
+pub(super) fn expand_value(value: &str) -> Option<String> {
     if value.starts_with('!') {
-        // Model profiles use literals or environment interpolation.
         return None;
     }
     static ENVIRONMENT: LazyLock<Regex> = LazyLock::new(|| {
@@ -554,7 +609,7 @@ mod tests {
         assert_eq!(args.endpoint, "http://127.0.0.1:7001/v1/messages");
         assert_eq!(args.model_token().as_deref(), Some("anthropic-profile"));
         assert!(
-            args.model_token_for(&Provider::Anthropic, "http://127.0.0.1:7002/v1/messages")
+            args.model_credential_for(&Provider::Anthropic, "http://127.0.0.1:7002/v1/messages")
                 .is_none()
         );
         args.activate_provider(Provider::Ollama).unwrap();
