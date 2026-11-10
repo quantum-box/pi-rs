@@ -18,6 +18,8 @@ pub(super) struct Profiles {
 struct Profile {
     endpoint: String,
     api_key: Option<String>,
+    models: Vec<ConfiguredModel>,
+    overrides: BTreeMap<String, ModelMetadata>,
 }
 
 #[derive(Deserialize)]
@@ -26,6 +28,83 @@ struct ConfiguredProfile {
     base_url: Option<String>,
     api: Option<String>,
     api_key: Option<String>,
+    #[serde(default)]
+    models: Vec<ConfiguredModel>,
+    #[serde(default)]
+    model_overrides: BTreeMap<String, ModelMetadata>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ConfiguredModel {
+    id: String,
+    #[serde(flatten)]
+    metadata: ModelMetadata,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ModelMetadata {
+    pub name: Option<String>,
+    pub context_window: Option<u32>,
+    pub max_tokens: Option<u32>,
+    pub reasoning: Option<bool>,
+    input: Option<Vec<Modality>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Modality {
+    Text,
+    Image,
+}
+
+impl ModelMetadata {
+    fn with_model_defaults(mut self) -> Self {
+        self.context_window.get_or_insert(128_000);
+        self.max_tokens.get_or_insert(16_384);
+        self.reasoning.get_or_insert(false);
+        self.input.get_or_insert_with(|| vec![Modality::Text]);
+        self
+    }
+
+    fn overlay(self, overrides: &Self) -> Self {
+        Self {
+            name: overrides.name.clone().or(self.name),
+            context_window: overrides.context_window.or(self.context_window),
+            max_tokens: overrides.max_tokens.or(self.max_tokens),
+            reasoning: overrides.reasoning.or(self.reasoning),
+            input: overrides.input.clone().or(self.input),
+        }
+    }
+
+    fn validate(&self, provider: Provider, id: &str) -> Result<()> {
+        if id.trim().is_empty()
+            || self
+                .name
+                .as_ref()
+                .is_some_and(|name| name.trim().is_empty())
+            || self.context_window == Some(0)
+            || self.max_tokens == Some(0)
+        {
+            return Err(Error::Config(format!(
+                "invalid model metadata for {}/{id}",
+                provider.id()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn apply(&self, details: &mut pi_rs::ollama::ModelDetails) {
+        details.context_window = self.context_window.or(details.context_window);
+        details.max_output_tokens = self.max_tokens.or(details.max_output_tokens);
+        details.reasoning = self.reasoning.or(details.reasoning);
+        if let Some(input) = &self.input {
+            details.images = Some(input.contains(&Modality::Image));
+        }
+        if self.reasoning == Some(false) {
+            details.thinking_levels = Some(vec!["off".into()]);
+        }
+    }
 }
 
 impl Profiles {
@@ -65,11 +144,27 @@ impl Profiles {
                 || Ok(provider.default_endpoint().to_owned()),
                 |base| endpoint_from_base(provider, base),
             )?;
+            let mut ids = std::collections::BTreeSet::new();
+            for model in &profile.models {
+                model.metadata.validate(provider, &model.id)?;
+                if !ids.insert(model.id.as_str()) {
+                    return Err(Error::Config(format!(
+                        "duplicate model {}/{}",
+                        provider.id(),
+                        model.id
+                    )));
+                }
+            }
+            for (id, metadata) in &profile.model_overrides {
+                metadata.validate(provider, id)?;
+            }
             entries.insert(
                 provider.id().into(),
                 Profile {
                     endpoint,
                     api_key: profile.api_key,
+                    models: profile.models,
+                    overrides: profile.model_overrides,
                 },
             );
         }
@@ -88,6 +183,27 @@ impl Profiles {
             return None;
         }
         expand_key(profile.api_key.as_deref()?)
+    }
+
+    pub fn model_ids(&self, provider: Provider) -> Vec<String> {
+        self.entries
+            .get(provider.id())
+            .into_iter()
+            .flat_map(|profile| profile.models.iter().map(|model| model.id.clone()))
+            .collect()
+    }
+
+    pub fn model(&self, provider: Provider, id: &str) -> Option<ModelMetadata> {
+        let profile = self.entries.get(provider.id())?;
+        let model = profile
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .map(|model| model.metadata.clone().with_model_defaults());
+        match profile.overrides.get(id) {
+            Some(overrides) => Some(model.unwrap_or_default().overlay(overrides)),
+            None => model,
+        }
     }
 }
 
@@ -189,5 +305,28 @@ mod tests {
         args.restore_model_selection("outside-scope".into(), None, Some("anthropic"));
         assert_eq!(args.provider.id(), "ollama");
         assert_eq!(args.model, "local-scoped");
+    }
+
+    #[test]
+    fn declared_models_and_overrides_preserve_identity_and_unset_fields() {
+        let profiles = Profiles::parse(&json!({"providers":{"ollama":{
+            "models":[{"id":"custom","name":"Local Fixture","input":["text","image"],"maxTokens":200}],
+            "modelOverrides":{
+                "custom":{"maxTokens":100},
+                "existing":{"contextWindow":32000}
+            }
+        }}})).unwrap();
+        assert_eq!(profiles.model_ids(Provider::Ollama), ["custom"]);
+        let custom = profiles.model(Provider::Ollama, "custom").unwrap();
+        assert_eq!(custom.name.as_deref(), Some("Local Fixture"));
+        assert_eq!(custom.max_tokens, Some(100));
+        assert_eq!(custom.context_window, Some(128_000));
+        let mut details = pi_rs::ollama::ModelDetails::default();
+        custom.apply(&mut details);
+        assert_eq!(details.images, Some(true));
+        assert_eq!(details.thinking_levels, Some(vec!["off".into()]));
+        let existing = profiles.model(Provider::Ollama, "existing").unwrap();
+        assert_eq!(existing.context_window, Some(32000));
+        assert_eq!(existing.max_tokens, None);
     }
 }

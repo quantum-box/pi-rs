@@ -360,7 +360,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         }
         if busy(&worker) && snapshot_command(request["type"].as_str().unwrap_or_default()) {
             let state = state_flags(&args, &worker)?;
-            let control = json!({"type":"read_session","request":request,"path":args.session,"context_window":args.context_window,"state":state});
+            let control = json!({"type":"read_session","request":request,"path":args.session,"context_window":args.effective_context_window(),"state":state});
             match Worker::control(&mut worker, &args, control) {
                 Ok(()) => pending_queries.push(request),
                 Err(error) => response(&request, Err(error))?,
@@ -485,7 +485,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 request,
                 &session,
                 &args.session,
-                args.context_window,
+                args.effective_context_window(),
                 state_flags(args, worker)?,
             )?))
         }
@@ -501,7 +501,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             };
             args.change_model(next.provider, next.model, next.thinking)?;
             Ok(Some(
-                json!({"model":model_value(args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
+                json!({"model":model_value(args, args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
             ))
         }
         "get_available_thinking_levels" => {
@@ -605,7 +605,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| Error::Config("modelId is required".into()))?;
             args.change_model(provider, model.to_owned(), None)?;
-            Ok(Some(model_value(args.provider, model)))
+            Ok(Some(model_value(args, args.provider, model)))
         }
         "edit_context" if !busy(worker) => {
             let session = &mut Session::open(&args.session)?;
@@ -670,7 +670,7 @@ pub(super) fn snapshot_command(name: &str) -> bool {
 }
 
 fn state_flags(args: &Cli, worker: &Option<Worker>) -> Result<Value> {
-    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.bashing),"model":model_value(args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.bashing),"model":model_value(args, args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
     state["autoCompactionEnabled"] = json!(args.settings.auto_compaction_enabled());
     state["steeringMode"] = json!(
         worker
@@ -766,8 +766,20 @@ pub(super) fn snapshot_response(
     }
 }
 
-fn model_value(provider: super::Provider, model: &str) -> Value {
-    json!({"id":model,"name":model,"provider":provider.id()})
+fn model_value(args: &Cli, provider: super::Provider, model: &str) -> Value {
+    let configured = args.model_profiles.model(provider, model);
+    let name = configured
+        .as_ref()
+        .and_then(|metadata| metadata.name.as_deref())
+        .unwrap_or(model);
+    let value = json!({"id":model,"name":name,"provider":provider.id()});
+    if let Some(configured) = configured {
+        let mut details = pi_rs::ollama::ModelDetails::default();
+        configured.apply(&mut details);
+        super::model_listing::with_details(value, Some(&details))
+    } else {
+        value
+    }
 }
 
 fn available_models(
@@ -796,14 +808,14 @@ fn available_models(
             let mut rows = Vec::new();
             for catalog in catalogs {
                 let details = if include_details {
-                    catalog.client.model_details(&catalog.models).await
+                    catalog.details(&catalog.models, &args.model_profiles).await
                 } else {
                     Default::default()
                 };
                 for model in catalog.models {
                     if include_details {
                         rows.push(super::model_listing::with_details(
-                            model_value(catalog.provider, &model),
+                            model_value(&args, catalog.provider, &model),
                             details.get(&model),
                         ));
                     }

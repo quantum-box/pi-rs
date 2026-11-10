@@ -92,11 +92,11 @@ impl Runtime {
             system_prompt: &self.system_prompt,
             limits: Limits {
                 model_requests: args.max_requests,
-                output_tokens_per_request: args.max_output_tokens,
+                output_tokens_per_request: args.effective_max_output_tokens(),
                 output_tokens_per_run: args.output_budget,
                 model_timeout: Duration::from_secs(args.model_timeout_secs),
                 tool_timeout: args.tool_timeout(),
-                context_window: args.context_window,
+                context_window: args.effective_context_window(),
             },
         }
     }
@@ -420,7 +420,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             .connect(&args.endpoint, args.model_token())?
             .with_context_probes(args.allow_model_probes())
             .with_thinking(
-                args.thinking.as_deref(),
+                args.provider_thinking(),
                 super::thinking::reported(args).is_some(),
             )
             .observe(args.trace);

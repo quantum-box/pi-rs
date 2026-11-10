@@ -65,6 +65,8 @@ struct Cli {
     #[arg(skip)]
     connection_explicit: bool,
     #[arg(skip)]
+    endpoint_explicit: bool,
+    #[arg(skip)]
     model_explicit: bool,
     #[arg(skip)]
     thinking_explicit: bool,
@@ -273,6 +275,35 @@ struct Cli {
 }
 
 impl Cli {
+    fn effective_context_window(&self) -> Option<u32> {
+        self.context_window.or_else(|| {
+            self.model_profiles
+                .model(self.provider, &self.model)?
+                .context_window
+        })
+    }
+
+    fn effective_max_output_tokens(&self) -> u32 {
+        self.model_profiles
+            .model(self.provider, &self.model)
+            .and_then(|model| model.max_tokens)
+            .map_or(self.max_output_tokens, |max| {
+                self.max_output_tokens.min(max)
+            })
+    }
+
+    fn provider_thinking(&self) -> Option<&str> {
+        if self
+            .model_profiles
+            .model(self.provider, &self.model)
+            .is_some_and(|model| model.reasoning == Some(false))
+        {
+            None
+        } else {
+            self.thinking.as_deref()
+        }
+    }
+
     fn allow_model_probes(&self) -> bool {
         self.allow_endpoint_probes(&self.endpoint)
     }
@@ -342,11 +373,26 @@ impl Cli {
         }
         self.initial_connection
             .as_ref()
-            .filter(|(original, _)| *original == provider)
+            .filter(|(original, _)| self.endpoint_explicit && *original == provider)
             .map_or_else(
                 || self.model_profiles.endpoint(provider),
                 |(_, endpoint)| endpoint,
             )
+    }
+
+    fn reload_model_profiles(&mut self) -> Result<()> {
+        let profiles = model_profiles::Profiles::load()?;
+        let explicit_current_endpoint = self.endpoint_explicit
+            && self
+                .initial_connection
+                .as_ref()
+                .is_some_and(|(provider, _)| *provider == self.provider);
+        if !explicit_current_endpoint {
+            self.endpoint = profiles.endpoint(self.provider).to_owned();
+        }
+        self.model_profiles = profiles;
+        self.thinking_profile = None;
+        Ok(())
     }
 
     fn change_model(
@@ -624,6 +670,7 @@ async fn run_cli() {
         }
         let explicit_endpoint =
             matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
+        args.endpoint_explicit = explicit_endpoint;
         args.connection_explicit = explicit_endpoint
             || matches.value_source("provider") == Some(clap::parser::ValueSource::CommandLine);
         if !explicit_endpoint {
@@ -730,14 +777,8 @@ async fn execute(mut args: Cli) -> Result<()> {
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
     let catalogs = if has_patterns {
         model_selection::catalogs(&args, true).await?
-    } else if needs_default_model && args.allow_model_probes() {
-        let client = args.provider.connect(&args.endpoint, args.model_token())?;
-        let models = client.models().await?;
-        vec![model_selection::Catalog {
-            provider: args.provider,
-            client,
-            models,
-        }]
+    } else if needs_default_model {
+        vec![model_selection::catalog(&args, args.provider, args.allow_model_probes()).await?]
     } else {
         Vec::new()
     };
@@ -747,7 +788,12 @@ async fn execute(mut args: Cli) -> Result<()> {
         .map_or(&[][..], |catalog| catalog.models.as_slice());
     // The hidden worker command receives an already-resolved, literal model ID.
     if !args.model.is_empty() && !matches!(args.command, Some(Command::Serve)) {
-        let selected = model_selection::split(&args.model, available, args.provider.id())?;
+        let selected = model_selection::split_with_profiles(
+            &args.model,
+            available,
+            args.provider,
+            &args.model_profiles,
+        )?;
         args.model = selected.model;
         if !args.thinking_explicit && selected.thinking.is_some() {
             args.thinking = selected.thinking;

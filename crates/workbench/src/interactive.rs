@@ -1328,8 +1328,14 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             view.append("Copied last response");
         }
         "/share" => view.append(&sessions::share_gist(&Session::open(&args.session)?)?),
-        "/model" if rest.is_empty() => start_model_picker(args, view, ModelListIntent::Select),
-        "/scoped-models" => start_model_picker(args, view, ModelListIntent::Scope),
+        "/model" if rest.is_empty() => {
+            args.reload_model_profiles()?;
+            start_model_picker(args, view, ModelListIntent::Select);
+        }
+        "/scoped-models" => {
+            args.reload_model_profiles()?;
+            start_model_picker(args, view, ModelListIntent::Scope);
+        }
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -1368,6 +1374,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             }
         }
         "/model" => {
+            args.reload_model_profiles()?;
             select_model_input(args, view, rest)?;
             view.append(&format!("Model › {rest}"));
         }
@@ -1793,7 +1800,14 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     models
                                         .into_iter()
                                         .map(|model| Item {
-                                            label: model.clone(),
+                                            label: super::model_selection::qualified_model(&model)
+                                                .and_then(|(provider, id)| {
+                                                    args.model_profiles.model(provider, id)?.name
+                                                })
+                                                .map_or_else(
+                                                    || model.clone(),
+                                                    |name| format!("{name} · {model}"),
+                                                ),
                                             selection: Selection::Model(model),
                                         })
                                         .collect(),
@@ -2494,6 +2508,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             args.settings =
                                 crate::config::Settings::load(&args.workspace, args.trusted)?;
                             args.model_keys = super::model_auth::Keys::load()?;
+                            args.reload_model_profiles()?;
                             super::packages::prepare(&args).await?;
                             view.resources = super::resources::Resources::load(&args)?;
                             args.theme_paths = view.resources.themes.clone();
@@ -2642,7 +2657,12 @@ fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()
         .filter(|(candidate, _)| *candidate == provider)
         .map(|(_, model)| model.to_owned())
         .collect::<Vec<_>>();
-    let selected = super::model_selection::split(input, &available, provider.id())?;
+    let selected = super::model_selection::split_with_profiles(
+        input,
+        &available,
+        provider,
+        &args.model_profiles,
+    )?;
     args.change_model(provider, selected.model, selected.thinking)
 }
 

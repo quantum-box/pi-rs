@@ -40,6 +40,62 @@ pub struct Catalog {
     pub provider: Provider,
     pub client: super::providers::Client,
     pub models: Vec<String>,
+    aliases: Vec<(String, String)>,
+    probe_details: bool,
+}
+
+impl Catalog {
+    pub async fn details(
+        &self,
+        models: &[String],
+        profiles: &super::model_profiles::Profiles,
+    ) -> std::collections::BTreeMap<String, pi_rs::ollama::ModelDetails> {
+        let mut details = if self.probe_details {
+            self.client.model_details(models).await
+        } else {
+            Default::default()
+        };
+        for model in models {
+            if let Some(metadata) = profiles.model(self.provider, model) {
+                metadata.apply(details.entry(model.clone()).or_default());
+            }
+        }
+        details
+    }
+
+    fn has_exact(&self, model: &str) -> bool {
+        exact(model, &self.models, self.provider.id()).is_some()
+            || self
+                .aliases
+                .iter()
+                .any(|(_, name)| name.eq_ignore_ascii_case(unqualified(model, self.provider.id())))
+    }
+}
+
+pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
+    let endpoint = args.endpoint_for(provider);
+    let client = provider.connect(endpoint, args.model_token_for(provider, endpoint))?;
+    let mut models = args.model_profiles.model_ids(provider);
+    let mut probe_details = false;
+    if probe {
+        match client.models().await {
+            Ok(discovered) => {
+                let mut seen: std::collections::BTreeSet<_> = models.iter().cloned().collect();
+                models.extend(discovered.into_iter().filter(|id| seen.insert(id.clone())));
+                probe_details = true;
+            }
+            Err(error) if models.is_empty() => return Err(error),
+            Err(_) => {}
+        }
+    }
+    let aliases = aliases(&args.model_profiles, provider, &models);
+    Ok(Catalog {
+        provider,
+        client,
+        models,
+        aliases,
+        probe_details,
+    })
 }
 
 pub async fn catalogs(args: &Cli, automatic: bool) -> Result<Vec<Catalog>> {
@@ -49,16 +105,9 @@ pub async fn catalogs(args: &Cli, automatic: bool) -> Result<Vec<Catalog>> {
             .filter(|provider| *provider != args.provider),
     );
     let discovered = futures_util::future::join_all(providers.filter_map(|provider| {
-        let endpoint = args.endpoint_for(provider);
-        (!automatic || args.allow_endpoint_probes(endpoint)).then_some(async move {
-            let client = provider.connect(endpoint, args.model_token_for(provider, endpoint))?;
-            let models = client.models().await?;
-            Ok::<_, Error>(Catalog {
-                provider,
-                client,
-                models,
-            })
-        })
+        let probe = !automatic || args.allow_endpoint_probes(args.endpoint_for(provider));
+        (probe || !args.model_profiles.model_ids(provider).is_empty())
+            .then_some(catalog(args, provider, probe))
     }))
     .await;
     let mut catalogs = Vec::new();
@@ -101,10 +150,9 @@ pub fn scoped_choices<'a>(
                 catalogs
                     .iter()
                     .find(|catalog| {
-                        exact(pattern, &catalog.models, catalog.provider.id()).is_some()
-                            || thinking_suffix(pattern).is_some_and(|(model, _)| {
-                                exact(model, &catalog.models, catalog.provider.id()).is_some()
-                            })
+                        catalog.has_exact(pattern)
+                            || thinking_suffix(pattern)
+                                .is_some_and(|(model, _)| catalog.has_exact(model))
                     })
                     .map(|catalog| catalog.provider)
             });
@@ -113,13 +161,15 @@ pub fn scoped_choices<'a>(
             .iter()
             .filter(|catalog| qualified.is_none_or(|provider| provider == catalog.provider))
         {
-            let resolved = scope([pattern], &catalog.models, catalog.provider.id());
+            let candidates = search_ids(&catalog.models, &catalog.aliases);
+            let resolved = scope([pattern], &candidates, catalog.provider.id());
             if resolved.choices.is_empty() {
                 continue;
             }
             matched = true;
             warnings.extend(resolved.warnings);
-            for choice in resolved.choices {
+            for mut choice in resolved.choices {
+                choice.model = canonical(choice.model, &catalog.models, &catalog.aliases);
                 if selected.iter().all(|existing| {
                     existing.provider != catalog.provider || existing.model != choice.model
                 }) {
@@ -139,6 +189,54 @@ pub fn scoped_choices<'a>(
         }
     }
     (selected, warnings)
+}
+
+pub fn split_with_profiles(
+    value: &str,
+    available: &[String],
+    provider: Provider,
+    profiles: &super::model_profiles::Profiles,
+) -> Result<Choice> {
+    let mut ids = available.to_vec();
+    for id in profiles.model_ids(provider) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let aliases = aliases(profiles, provider, &ids);
+    let mut selected = split(value, &search_ids(&ids, &aliases), provider.id())?;
+    selected.model = canonical(selected.model, &ids, &aliases);
+    Ok(selected)
+}
+
+fn aliases(
+    profiles: &super::model_profiles::Profiles,
+    provider: Provider,
+    ids: &[String],
+) -> Vec<(String, String)> {
+    ids.iter()
+        .filter_map(|id| {
+            let name = profiles.model(provider, id)?.name?;
+            (name != *id).then(|| (id.clone(), name))
+        })
+        .collect()
+}
+
+fn search_ids(ids: &[String], aliases: &[(String, String)]) -> Vec<String> {
+    ids.iter()
+        .chain(aliases.iter().map(|(_, alias)| alias))
+        .cloned()
+        .collect()
+}
+
+fn canonical(model: String, ids: &[String], aliases: &[(String, String)]) -> String {
+    if ids.contains(&model) {
+        return model;
+    }
+    aliases
+        .iter()
+        .find_map(|(id, alias)| (*alias == model).then(|| id.clone()))
+        .unwrap_or(model)
 }
 
 pub fn next_model(args: &Cli, available: &[ScopedChoice], reverse: bool) -> Option<ScopedChoice> {
@@ -354,6 +452,8 @@ mod tests {
                     .connect(Provider::Ollama.default_endpoint(), None)
                     .unwrap(),
                 models: vec!["same".into(), "exact-extra".into()],
+                aliases: Vec::new(),
+                probe_details: false,
             },
             Catalog {
                 provider: Provider::Anthropic,
@@ -364,6 +464,8 @@ mod tests {
                     )
                     .unwrap(),
                 models: vec!["same".into(), "exact".into()],
+                aliases: Vec::new(),
+                probe_details: false,
             },
         ];
         let (choices, warnings) = scoped_choices(

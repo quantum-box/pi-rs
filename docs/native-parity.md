@@ -18,7 +18,7 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius sharing |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, API keys and bearer tokens, searchable catalog, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage | Model-provider OAuth and credential refresh |
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Input hooks for queued SDK controls, remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
@@ -2115,3 +2115,20 @@ The hook receives the delivery behavior during an active turn. Queued hooks
 run independently of cancellation and dialog replies. The executable
 protocol advertises the hook during discovery and continues to load
 extensions built without that capability.
+
+### Model declarations and overrides
+
+A supported provider's `models.json` profile can declare models by ID and
+display name. The catalog merges declared and discovered IDs, and still
+offers declared models if discovery fails. Display names can be selected
+directly or matched by scoped model patterns. Overrides apply by ID without
+adding entries to the catalog.
+
+Declared reasoning and image capabilities appear in model discovery.
+`contextWindow` supplies the context limit unless the CLI overrides it.
+`maxTokens` caps the output allowance of each request. The terminal's model
+picker reloads the file, and a key supplied for the original connection
+stays bound to its endpoint when the file changes.
+
+Loopback checks covered aliases, model overrides, unavailable discovery,
+actual request limits, and updated configuration in a real terminal picker.

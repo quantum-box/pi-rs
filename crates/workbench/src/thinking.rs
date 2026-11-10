@@ -16,6 +16,15 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if let Some(levels) = reported(args) {
         return levels.to_vec();
     }
+    if args
+        .model_profiles
+        .model(args.provider, &args.model)
+        .is_some_and(|model| model.reasoning == Some(false))
+    {
+        let levels = vec!["off".into()];
+        args.thinking_profile = Some((args.model.clone(), levels.clone()));
+        return levels;
+    }
     let fallback = || match args.provider {
         super::Provider::Ollama => LEVELS.iter().map(|level| (*level).into()).collect(),
         super::Provider::Anthropic => vec!["off".into()],

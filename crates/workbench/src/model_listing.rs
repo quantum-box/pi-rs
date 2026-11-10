@@ -9,28 +9,39 @@ use unicode_width::UnicodeWidthStr;
 use super::{Cli, OutputMode, model_selection, output};
 
 pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
-    let client = args.provider.connect(&args.endpoint, args.model_token())?;
     let terms: Vec<_> = search
         .split(|character: char| character.is_whitespace() || character == '/')
         .filter(|term| !term.is_empty())
         .collect();
     let provider = args.provider.id();
-    let available = client.models().await?;
-    let catalog_empty = available.is_empty();
-    let models: Vec<_> = available
-        .into_iter()
+    let catalog = model_selection::catalog(args, args.provider, args.allow_model_probes()).await?;
+    let catalog_empty = catalog.models.is_empty();
+    let models: Vec<_> = catalog
+        .models
+        .iter()
         .filter(|model| {
-            let candidate = format!("{provider} {model}");
+            let configured_name = args
+                .model_profiles
+                .model(args.provider, model)
+                .and_then(|metadata| metadata.name)
+                .unwrap_or_default();
+            let candidate = format!("{provider} {model} {configured_name}");
             terms
                 .iter()
                 .all(|term| model_selection::fuzzy(term, &candidate))
         })
+        .cloned()
         .collect();
-    let details = client.model_details(&models).await;
+    let details = catalog.details(&models, &args.model_profiles).await;
     if args.mode == Some(OutputMode::Json) {
         for model in models {
+            let name = args
+                .model_profiles
+                .model(args.provider, &model)
+                .and_then(|metadata| metadata.name)
+                .unwrap_or_else(|| model.clone());
             output(with_details(
-                json!({"type":"model","model":model,"provider":provider}),
+                json!({"type":"model","model":model,"name":name,"provider":provider}),
                 details.get(&model),
             ));
         }
