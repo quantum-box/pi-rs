@@ -661,6 +661,7 @@ struct StreamUsage {
     output: Option<u64>,
     cached: Option<u64>,
     cache_written: Option<u64>,
+    cache_written_1h: Option<u64>,
 }
 impl StreamUsage {
     fn update(&mut self, value: &Value, metadata: &mut ModelMetadata) {
@@ -670,6 +671,10 @@ impl StreamUsage {
         self.cache_written = value["cache_creation_input_tokens"]
             .as_u64()
             .or(self.cache_written);
+        self.cache_written_1h = value["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_u64()
+            .or(self.cache_written_1h);
+        metadata.cache_write_1h_tokens = self.cache_written_1h;
         metadata.cached_input_tokens = self.cached;
         metadata.cache_creation_input_tokens = self.cache_written;
         metadata.provider_prompt_tokens = self.total_input();
@@ -890,6 +895,7 @@ impl Model for Anthropic {
                                 .ok().and_then(|accounting| accounting.total())
                         {
                             metadata.cost_usd = Some(cost);
+                        metadata.cost_from_provider = Some(true);
                         }
                         if let Some(reason) = value["delta"]["stop_reason"].as_str() {
                             metadata.finish_reason = Some(match reason {

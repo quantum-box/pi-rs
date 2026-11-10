@@ -671,6 +671,7 @@ impl Model for Ollama {
                     metadata.cache_creation_input_tokens = details.cache_write_tokens;
                     if let Some(cost) = stats.accounting.total() {
                         metadata.cost_usd = Some(cost);
+                        metadata.cost_from_provider = Some(true);
                     }
                 }
                 for choice in chunk.choices {

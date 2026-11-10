@@ -2586,3 +2586,13 @@ upstream inference charge. Separate prompt and completion charges can
 supply the upstream total. Server-tool charges already included by the
 gateway are counted once. Incomplete or malformed accounting falls back
 to the catalog estimate when measured usage exists.
+
+### Tiered rates and usage detail checkpoint
+
+JSON catalog surfaces include the pinned input-length pricing tiers.
+Estimates select the highest threshold strictly below total input tokens
+and apply the separate one-hour Anthropic cache-write rate. The journal
+and RPC retain the component costs, the one-hour token count, and whether
+the total came from the provider. Existing journal records can omit these
+fields. Loopback checks covered tier boundaries, nested cache usage,
+provider totals, and the detailed RPC projection.

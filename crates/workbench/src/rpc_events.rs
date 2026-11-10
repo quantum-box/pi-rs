@@ -518,12 +518,24 @@ pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value 
 pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
     let read = metadata.cached_input_tokens.unwrap_or_default();
     let write = metadata.cache_creation_input_tokens.unwrap_or_default();
-    json!({
+    let breakdown = metadata.cost_breakdown.clone().unwrap_or_default();
+    let mut value = json!({
         "input":usage.input_tokens.saturating_sub(read).saturating_sub(write),
         "output":usage.output_tokens,"cacheRead":read,"cacheWrite":write,
         "totalTokens":usage.input_tokens.saturating_add(usage.output_tokens),
-        "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":metadata.cost_usd.as_ref().and_then(serde_json::Number::as_f64).unwrap_or_default()},
-    })
+        "cost":{
+            "input":breakdown.input,"output":breakdown.output,
+            "cacheRead":breakdown.cache_read,"cacheWrite":breakdown.cache_write,
+            "total":metadata.cost_usd.as_ref().and_then(serde_json::Number::as_f64).unwrap_or_default()
+        },
+    });
+    if let Some(long) = metadata.cache_write_1h_tokens {
+        value["cacheWrite1h"] = json!(long);
+    }
+    if let Some(from_provider) = metadata.cost_from_provider {
+        value["cost"]["totalFromProvider"] = json!(from_provider);
+    }
+    value
 }
 
 fn timestamp() -> u64 {

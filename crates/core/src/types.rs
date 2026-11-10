@@ -306,15 +306,78 @@ pub struct ModelRequest {
     pub max_output_tokens: u32,
 }
 
+/// The priced portions of a measured usage record, in USD.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UsageCostBreakdown {
+    pub input: serde_json::Number,
+    pub output: serde_json::Number,
+    pub cache_read: serde_json::Number,
+    pub cache_write: serde_json::Number,
+}
+
+impl Default for UsageCostBreakdown {
+    fn default() -> Self {
+        Self {
+            input: 0.into(),
+            output: 0.into(),
+            cache_read: 0.into(),
+            cache_write: 0.into(),
+        }
+    }
+}
+
+impl UsageCostBreakdown {
+    pub fn new(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Option<Self> {
+        let number = serde_json::Number::from_f64;
+        Some(Self {
+            input: number(input)?,
+            output: number(output)?,
+            cache_read: number(cache_read)?,
+            cache_write: number(cache_write)?,
+        })
+    }
+
+    fn parts(&self) -> [f64; 4] {
+        [
+            &self.input,
+            &self.output,
+            &self.cache_read,
+            &self.cache_write,
+        ]
+        .map(|part| part.as_f64().unwrap_or_default())
+    }
+
+    pub fn total(&self) -> Option<serde_json::Number> {
+        serde_json::Number::from_f64(self.parts().into_iter().sum())
+    }
+
+    pub fn from_value(value: &Value) -> Option<Self> {
+        value.as_object()?;
+        let cost = Self::deserialize(value).ok()?;
+        cost.parts()
+            .into_iter()
+            .all(|value| value.is_finite() && value >= 0.0)
+            .then_some(cost)
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelMetadata {
     /// Provider, importer, or catalog estimate in USD, absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_breakdown: Option<UsageCostBreakdown>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_from_provider: Option<bool>,
     pub provider_request_id: Option<String>,
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// One-hour cache writes included in cache_creation_input_tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_tokens: Option<u64>,
     /// Provider-native prompt count when the host reports a normalized total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_prompt_tokens: Option<u64>,

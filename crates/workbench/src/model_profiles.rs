@@ -176,16 +176,17 @@ impl ModelCompatibility {
 }
 
 /// Model prices in dollars per million tokens.
-#[derive(Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct ChatPrice {
+#[derive(Clone, Default, Deserialize)]
+struct ChatRates {
     input: Option<f64>,
     output: Option<f64>,
+    #[serde(rename = "cacheRead")]
     cache_read: Option<f64>,
+    #[serde(rename = "cacheWrite")]
     cache_write: Option<f64>,
 }
 
-impl ChatPrice {
+impl ChatRates {
     fn overlay(self, newer: Self) -> Self {
         Self {
             input: newer.input.or(self.input),
@@ -195,14 +196,14 @@ impl ChatPrice {
         }
     }
 
-    fn valid(self) -> bool {
+    fn valid(&self) -> bool {
         [self.input, self.output, self.cache_read, self.cache_write]
             .into_iter()
             .flatten()
             .all(|amount| amount.is_finite() && amount >= 0.0)
     }
 
-    pub fn value(self) -> Value {
+    fn value(&self) -> Value {
         serde_json::json!({
             "input": self.input.unwrap_or_default(),
             "output": self.output.unwrap_or_default(),
@@ -210,12 +211,72 @@ impl ChatPrice {
             "cacheWrite": self.cache_write.unwrap_or_default(),
         })
     }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PriceTier {
+    input_tokens_above: u64,
+    #[serde(flatten)]
+    rates: ChatRates,
+}
+
+#[derive(Clone, Default, Deserialize)]
+pub(super) struct ChatPrice {
+    #[serde(flatten)]
+    rates: ChatRates,
+    tiers: Option<Vec<PriceTier>>,
+}
+
+impl ChatPrice {
+    fn overlay(self, newer: Self) -> Self {
+        Self {
+            rates: self.rates.overlay(newer.rates),
+            tiers: newer.tiers.or(self.tiers),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.rates.valid()
+            && self
+                .tiers
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .all(|tier| tier.rates.valid())
+    }
+
+    pub fn value(&self) -> Value {
+        let mut value = self.rates.value();
+        if let Some(tiers) = &self.tiers {
+            value["tiers"] = Value::Array(
+                tiers
+                    .iter()
+                    .map(|tier| {
+                        let mut value = tier.rates.value();
+                        value["inputTokensAbove"] = serde_json::json!(tier.input_tokens_above);
+                        value
+                    })
+                    .collect(),
+            );
+        }
+        value
+    }
 
     pub fn estimate(
-        self,
+        &self,
         usage: pi_rs::Usage,
         metadata: &pi_rs::ModelMetadata,
-    ) -> Option<serde_json::Number> {
+    ) -> Option<pi_rs::UsageCostBreakdown> {
+        let tier = self
+            .tiers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .filter(|tier| usage.input_tokens > tier.input_tokens_above)
+            .max_by_key(|tier| tier.input_tokens_above);
+        let rates = tier.map_or(&self.rates, |tier| &tier.rates);
         let reads = metadata
             .cached_input_tokens
             .unwrap_or_default()
@@ -225,13 +286,17 @@ impl ChatPrice {
             .cache_creation_input_tokens
             .unwrap_or_default()
             .min(other_input);
-        let input = other_input - writes;
-        serde_json::Number::from_f64(
-            (input as f64 * self.input.unwrap_or_default()
-                + usage.output_tokens as f64 * self.output.unwrap_or_default()
-                + reads as f64 * self.cache_read.unwrap_or_default()
-                + writes as f64 * self.cache_write.unwrap_or_default())
-                / 1_000_000.0,
+        let long = metadata
+            .cache_write_1h_tokens
+            .unwrap_or_default()
+            .min(writes);
+        let input_rate = rates.input.unwrap_or_default();
+        pi_rs::UsageCostBreakdown::new(
+            (input_rate / 1_000_000.0) * (other_input - writes) as f64,
+            (rates.output.unwrap_or_default() / 1_000_000.0) * usage.output_tokens as f64,
+            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64,
+            (rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
+                + (input_rate / 500_000.0) * long as f64,
         )
     }
 }
@@ -291,7 +356,7 @@ impl ModelMetadata {
             context_window: overrides.context_window.or(self.context_window),
             max_tokens: overrides.max_tokens.or(self.max_tokens),
             reasoning: overrides.reasoning.or(self.reasoning),
-            cost: match (self.cost, overrides.cost) {
+            cost: match (self.cost, overrides.cost.clone()) {
                 (Some(base), Some(newer)) => Some(base.overlay(newer)),
                 (base, newer) => newer.or(base),
             },
@@ -308,7 +373,7 @@ impl ModelMetadata {
                 .is_some_and(|name| name.trim().is_empty())
             || self.context_window == Some(0)
             || self.max_tokens == Some(0)
-            || self.cost.is_some_and(|cost| !cost.valid())
+            || self.cost.as_ref().is_some_and(|cost| !cost.valid())
         {
             return Err(Error::Config(format!(
                 "invalid model metadata for {}/{id}",

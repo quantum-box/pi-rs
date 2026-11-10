@@ -50,7 +50,7 @@ impl Model for WorkbenchModel {
 
 impl WorkbenchModel {
     fn estimate_usage(&self, mut stream: ModelStream) -> ModelStream {
-        let Some(price) = self.price else {
+        let Some(price) = self.price.clone() else {
             return stream;
         };
         Box::pin(async_stream::try_stream! {
@@ -61,10 +61,15 @@ impl WorkbenchModel {
                     metadata.clone_from(current);
                 }
                 if let ModelEvent::Complete { usage: Some(usage), .. } = &event
-                    && metadata.cost_usd.is_none()
-                    && let Some(cost) = price.estimate(*usage, &metadata)
+                    && metadata.cost_breakdown.is_none()
+                    && let Some(breakdown) = price.estimate(*usage, &metadata)
+                    && let Some(total) = breakdown.total()
                 {
-                    metadata.cost_usd = Some(cost);
+                    metadata.cost_breakdown = Some(breakdown);
+                    if metadata.cost_usd.is_none() {
+                        metadata.cost_usd = Some(total);
+                        metadata.cost_from_provider = Some(false);
+                    }
                     yield ModelEvent::Metadata(metadata.clone());
                 }
                 yield event;

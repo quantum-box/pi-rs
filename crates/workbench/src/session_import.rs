@@ -37,6 +37,9 @@ fn append_imported_usage(events: &mut Vec<Event>, value: &Value) -> Option<Usage
         request_id: Uuid::new_v4(),
         metadata: pi_rs::ModelMetadata {
             cost_usd: imported_cost(value),
+            cost_breakdown: pi_rs::UsageCostBreakdown::from_value(&value["cost"]),
+            cost_from_provider: value["cost"]["totalFromProvider"].as_bool(),
+            cache_write_1h_tokens: value["cacheWrite1h"].as_u64(),
             cached_input_tokens: Some(cache_read),
             cache_creation_input_tokens: Some(cache_write),
             ..Default::default()
@@ -463,6 +466,12 @@ fn convert(
                         request_id,
                         metadata: pi_rs::ModelMetadata {
                             cost_usd: imported_cost(&message["usage"]),
+                            cost_breakdown: pi_rs::UsageCostBreakdown::from_value(
+                                &message["usage"]["cost"],
+                            ),
+                            cost_from_provider: message["usage"]["cost"]["totalFromProvider"]
+                                .as_bool(),
+                            cache_write_1h_tokens: message["usage"]["cacheWrite1h"].as_u64(),
                             cached_input_tokens: message["usage"]["cacheRead"].as_u64(),
                             cache_creation_input_tokens: message["usage"]["cacheWrite"].as_u64(),
                             finish_reason: message["stopReason"].as_str().map(str::to_owned),
