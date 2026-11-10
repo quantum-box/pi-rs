@@ -673,7 +673,9 @@ impl Model for Google {
                             if calls.len() == 64 {
                                 Err(Error::Model("too many Google Gemini function calls".into()))?;
                             }
-                            calls.push(ToolCall { id, name: name.into(), arguments });
+                            let index = calls.len() as u64;
+                            calls.push(ToolCall { id: id.clone(), name: name.into(), arguments: arguments.clone() });
+                            yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta { index, id, name: name.into(), arguments });
                         }
                         blocks.push(part.clone());
                     }

@@ -129,6 +129,8 @@ pub enum Notification<'a> {
     Request(&'a ModelRequest),
     /// Transient text. Only a fully completed response is committed.
     Text(&'a str),
+    /// Transient tool call fragments. Tool dispatch uses only the completed response.
+    ToolCallDelta(&'a crate::ToolCallDelta),
 }
 
 pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
@@ -781,6 +783,7 @@ impl Agent<'_> {
         const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
         let mut content = String::new();
         let mut metadata = ModelMetadata::default();
+        let mut tool_delta_bytes = 0_usize;
         let collect = async {
             let opening = self.model.stream_with_id(request_id, request);
             tokio::pin!(opening);
@@ -808,6 +811,17 @@ impl Agent<'_> {
                         }
                         observer(Notification::Text(&delta));
                         content.push_str(&delta);
+                    }
+                    ModelEvent::ToolCallDelta(delta) => {
+                        tool_delta_bytes = tool_delta_bytes.saturating_add(
+                            std::mem::size_of_val(&delta.index)
+                                + delta.id.len()
+                                + delta.name.len()
+                                + delta.arguments.len(),
+                        );
+                        if retain_reply && tool_delta_bytes <= MAX_RESPONSE_BYTES {
+                            observer(Notification::ToolCallDelta(&delta));
+                        }
                     }
                     ModelEvent::Metadata(update) => metadata = update,
                     ModelEvent::Complete { calls, usage } => {

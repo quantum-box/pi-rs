@@ -1,9 +1,10 @@
 //! Pi-compatible message and tool events layered over the native journal stream.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pi_rs::{
-    Event, Invocation, ModelFailure, ModelMetadata, Outcome, Record, ToolCall, Usage, UsageReport,
+    Event, Invocation, ModelFailure, ModelMetadata, Outcome, Record, ToolCall, ToolCallDelta,
+    Usage, UsageReport,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,8 +24,14 @@ pub(super) struct Stream {
     metadata: ModelMetadata,
     tool_results: Vec<Value>,
     calls: HashMap<Uuid, (Invocation, Option<String>)>,
+    pending_tools: HashMap<u64, PendingTool>,
     aborted: bool,
     summary: bool,
+}
+
+struct PendingTool {
+    content_index: usize,
+    arguments: String,
 }
 
 impl Stream {
@@ -63,6 +70,11 @@ impl Stream {
                         "thinking"
                     };
                     self.delta(kind, delta, &mut events);
+                }
+            }
+            Some("tool_call_delta") if !self.assistant.is_null() && !self.ended => {
+                if let Ok(delta) = ToolCallDelta::deserialize(&event["toolCallDelta"]) {
+                    self.tool_delta(delta, &mut events);
                 }
             }
             _ => {}
@@ -173,31 +185,62 @@ impl Stream {
                 if let Some(reasoning) = &self.metadata.reasoning
                     && !blocks.iter().any(|block| block["type"] == "thinking")
                 {
-                    blocks.insert(0, json!({"type":"thinking","thinking":reasoning}));
+                    let index = if self.pending_tools.is_empty() {
+                        0
+                    } else {
+                        blocks.len()
+                    };
+                    blocks.insert(index, json!({"type":"thinking","thinking":reasoning}));
                 }
                 if !content.is_empty() && !blocks.iter().any(|block| block["type"] == "text") {
                     blocks.push(json!({"type":"text","text":content}));
                 }
+                let mut finalized = HashSet::new();
                 for invocation in invocations {
                     let call = tool_call_value(&invocation.call);
-                    let index = self.assistant["content"]
-                        .as_array()
-                        .expect("assistant blocks")
-                        .len();
-                    self.assistant["content"]
+                    let blocks = self.assistant["content"]
                         .as_array_mut()
-                        .expect("assistant blocks")
-                        .push(call.clone());
-                    self.update(
-                        json!({"type":"toolcall_start","contentIndex":index}),
-                        events,
-                    );
+                        .expect("assistant blocks");
+                    let pending = self
+                        .pending_tools
+                        .values()
+                        .find(|pending| blocks[pending.content_index]["id"] == invocation.call.id);
+                    let index = if let Some(pending) = pending {
+                        blocks[pending.content_index] = call.clone();
+                        finalized.insert(pending.content_index);
+                        pending.content_index
+                    } else {
+                        let index = blocks.len();
+                        blocks.push(call.clone());
+                        self.update(
+                            json!({"type":"toolcall_start","contentIndex":index}),
+                            events,
+                        );
+                        index
+                    };
                     self.update(
                         json!({"type":"toolcall_end","contentIndex":index,"toolCall":call}),
                         events,
                     );
                     self.calls
                         .insert(invocation.operation_id, (invocation, None));
+                }
+                let incomplete: HashSet<_> = self
+                    .pending_tools
+                    .drain()
+                    .map(|(_, pending)| pending.content_index)
+                    .filter(|index| !finalized.contains(index))
+                    .collect();
+                if !incomplete.is_empty() {
+                    let mut index = 0;
+                    self.assistant["content"]
+                        .as_array_mut()
+                        .expect("assistant blocks")
+                        .retain(|_| {
+                            let keep = !incomplete.contains(&index);
+                            index += 1;
+                            keep
+                        });
                 }
                 self.finish_message(Some(content), events);
             }
@@ -275,6 +318,7 @@ impl Stream {
                 json!({"type":"turn_end","message":self.assistant,"toolResults":self.tool_results}),
             );
             self.tool_results.clear();
+            self.pending_tools.clear();
             self.assistant = Value::Null;
             self.request_id = None;
         }
@@ -354,6 +398,51 @@ impl Stream {
             json!({"type":format!("{kind}_delta"),"contentIndex":index,"delta":delta}),
             events,
         );
+    }
+
+    fn tool_delta(&mut self, delta: ToolCallDelta, events: &mut Vec<Value>) {
+        self.start_message(events);
+        self.close_block(events);
+        let blocks = self.assistant["content"]
+            .as_array_mut()
+            .expect("assistant blocks");
+        let next = blocks.len();
+        let pending = self.pending_tools.entry(delta.index).or_insert_with(|| {
+            blocks.push(json!({"type":"toolCall","id":"","name":"","arguments":{}}));
+            PendingTool {
+                content_index: next,
+                arguments: String::new(),
+            }
+        });
+        let index = pending.content_index;
+        let block = &mut blocks[index];
+        for (field, fragment) in [("id", &delta.id), ("name", &delta.name)] {
+            if !fragment.is_empty()
+                && let Value::String(value) = &mut block[field]
+            {
+                value.push_str(fragment);
+            }
+        }
+        if index == next {
+            self.update(
+                json!({"type":"toolcall_start","contentIndex":index}),
+                events,
+            );
+        }
+        if !delta.arguments.is_empty() {
+            let pending = self
+                .pending_tools
+                .get_mut(&delta.index)
+                .expect("open tool call");
+            pending.arguments.push_str(&delta.arguments);
+            if let Ok(arguments @ Value::Object(_)) = serde_json::from_str(&pending.arguments) {
+                self.assistant["content"][index]["arguments"] = arguments;
+            }
+            self.update(
+                json!({"type":"toolcall_delta","contentIndex":index,"delta":delta.arguments}),
+                events,
+            );
+        }
     }
 
     fn close_block(&mut self, events: &mut Vec<Value>) {

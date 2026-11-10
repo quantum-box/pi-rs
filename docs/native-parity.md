@@ -2187,3 +2187,17 @@ This checkpoint authenticates Radius using `RADIUS_API_KEY`. The
 `PI_RS_RADIUS_SHARE_URL` environment override can point to a configured
 artifact endpoint. Native journals do not yet record the complete
 system prompt and tool schemas for the viewer's `pi.share` metadata.
+
+### Streamed tool call arguments
+
+Chat-completions, Anthropic Messages and Gemini model streams expose tool
+call fragments before the response completes. Pi JSON and RPC modes emit
+`toolcall_start` and `toolcall_delta` with stable assistant content
+indexes, then `toolcall_end` with the completed call. The Rust SDK exposes
+the same transient fragments through its event subscription. Partial
+arguments populate the snapshot once the accumulated JSON is a valid
+object. Dispatch still uses the completed, journaled assistant response.
+
+A loopback server held the final argument fragment until the RPC client
+observed the first one. The fixture covered stable indexes after
+reasoning, final arguments and tool output, and abort before completion.

@@ -1307,6 +1307,9 @@ fn observe(event: Notification<'_>, trace: bool) {
             output(json!({"type": "request", "request": request}))
         }
         Notification::Text(delta) if trace => output(json!({"type": "text_delta", "delta": delta})),
+        Notification::ToolCallDelta(delta) if trace => {
+            output(json!({"type":"tool_call_delta","toolCallDelta":delta}))
+        }
         _ => {}
     }
 }

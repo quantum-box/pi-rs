@@ -314,11 +314,25 @@ pub enum UsageReport {
 #[derive(Clone, Debug)]
 pub enum ModelEvent {
     Text(String),
+    ToolCallDelta(ToolCallDelta),
     Metadata(ModelMetadata),
     Complete {
         calls: Vec<ToolCall>,
         usage: Option<Usage>,
     },
+}
+
+/// Provider fragments for display while a tool call is being generated.
+/// Only a completed model response can authorize execution.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    pub index: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arguments: String,
 }
 
 pub type ModelStream = futures_util::stream::BoxStream<'static, Result<ModelEvent>>;

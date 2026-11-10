@@ -570,12 +570,17 @@ impl Model for Ollama {
                         if delta.index >= 64 {
                             Err(Error::Model("invalid tool call index".into()))?;
                         }
+                        let (name, arguments) = delta.function
+                            .map(|function| (function.name.unwrap_or_default(), function.arguments.unwrap_or_default()))
+                            .unwrap_or_default();
+                        let id = delta.id.unwrap_or_default();
                         let call = calls.entry(delta.index).or_default();
-                        call.id.push_str(delta.id.as_deref().unwrap_or(""));
-                        if let Some(function) = delta.function {
-                            call.name.push_str(function.name.as_deref().unwrap_or(""));
-                            call.arguments.push_str(function.arguments.as_deref().unwrap_or(""));
-                        }
+                        call.id.push_str(&id);
+                        call.name.push_str(&name);
+                        call.arguments.push_str(&arguments);
+                        yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                            index: delta.index as u64, id, name, arguments,
+                        });
                     }
                     metadata.finish_reason = choice.finish_reason.map(|reason| {
                         match reason.as_str() {

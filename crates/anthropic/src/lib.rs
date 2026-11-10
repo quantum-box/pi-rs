@@ -712,6 +712,13 @@ impl Model for Anthropic {
                                 fragments: String::new(), complete: false,
                             });
                             report(Progress::PreparingTool);
+                            yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                                index,
+                                id: id.into(),
+                                name: name.into(),
+                                arguments: block["input"].as_object().filter(|input| !input.is_empty())
+                                    .map_or_else(String::new, |input| Value::Object(input.clone()).to_string()),
+                            });
                         } else {
                             let captured = ResponseBlock::new(block);
                             match block["type"].as_str() {
@@ -772,7 +779,12 @@ impl Model for Anthropic {
                             Some("input_json_delta") => {
                                 let call = calls.get_mut(&index).filter(|call| !call.complete)
                                     .ok_or_else(|| Error::Model("Anthropic tool input has no open block".into()))?;
-                                call.fragments.push_str(delta["partial_json"].as_str().unwrap_or_default());
+                                if let Some(arguments) = delta["partial_json"].as_str().filter(|text| !text.is_empty()) {
+                                    call.fragments.push_str(arguments);
+                                    yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                                        index, id: String::new(), name: String::new(), arguments: arguments.into(),
+                                    });
+                                }
                             }
                             _ => {}
                         }
