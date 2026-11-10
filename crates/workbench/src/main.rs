@@ -1203,6 +1203,12 @@ fn observe(event: Notification<'_>, trace: bool) {
     match event {
         Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
         Notification::SummaryRequest if trace => output(json!({"type":"summary_request_start"})),
+        Notification::QueueUpdated {
+            steering,
+            follow_up,
+        } if trace => {
+            output(json!({"type":"queue_update","steering":steering,"followUp":follow_up}))
+        }
         Notification::Committed(record) if trace => {
             output(json!({"type": "record", "record": record}))
         }

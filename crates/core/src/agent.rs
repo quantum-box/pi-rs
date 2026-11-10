@@ -120,6 +120,11 @@ pub enum Notification<'a> {
     Committed(&'a Record),
     /// The following model request generates a compaction summary.
     SummaryRequest,
+    /// Current queued text after a message was added, accepted, or cleared.
+    QueueUpdated {
+        steering: Vec<&'a str>,
+        follow_up: Vec<&'a str>,
+    },
     /// Final logical context after extensions, before provider encoding. May contain sensitive data.
     Request(&'a ModelRequest),
     /// Transient text. Only a fully completed response is committed.
@@ -2444,11 +2449,17 @@ fn queue_input(
 ) -> Result<()> {
     let input = match input {
         AgentInput::Message(message) => message,
+        AgentInput::Enqueue { message, reply } => {
+            return reply_to_control(queue_message(session, message, observer), reply);
+        }
         AgentInput::ClearQueue { reply } => {
             let count = session.records().len();
             let result = session.clear_queued_inputs();
             for record in &session.records()[count..] {
                 observer(Notification::Committed(record));
+            }
+            if result.is_ok() {
+                notify_queue(session, observer);
             }
             return reply_to_control(result, reply);
         }
@@ -2461,6 +2472,22 @@ fn queue_input(
             return reply_to_control(result, reply);
         }
     };
+    queue_message(session, input, observer)
+}
+
+fn notify_queue(session: &Session, observer: &mut Observer<'_>) {
+    let (steering, follow_up) = session.queued_text();
+    observer(Notification::QueueUpdated {
+        steering,
+        follow_up,
+    });
+}
+
+fn queue_message(
+    session: &mut Session,
+    input: QueuedMessage,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
     if input.input.content.trim().is_empty() && input.images.is_empty() {
         return Ok(());
     }
@@ -2500,7 +2527,9 @@ fn queue_input(
     } else {
         Event::InputQueuedWithImages { input }
     };
-    commit(session, event, observer)
+    commit(session, event, observer)?;
+    notify_queue(session, observer);
+    Ok(())
 }
 
 fn apply_inputs(
@@ -2543,6 +2572,9 @@ fn apply_inputs(
             }
         };
         commit(session, event, observer)?;
+    }
+    if accepted {
+        notify_queue(session, observer);
     }
     Ok(accepted)
 }

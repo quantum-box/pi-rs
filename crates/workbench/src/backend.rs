@@ -66,6 +66,11 @@ enum Request {
         #[serde(default)]
         images: Vec<pi_rs::ImageContent>,
     },
+    QueueInput {
+        message: QueuedMessage,
+        command: String,
+        id: Option<serde_json::Value>,
+    },
     Review {
         child: PathBuf,
         from_record: Option<u64>,
@@ -120,6 +125,7 @@ struct ReaderControls {
     auto_compaction: pi_rs::AutoCompactionControl,
     retry: pi_rs::RetryControl,
     command_catalog: serde_json::Value,
+    resources: super::resources::Resources,
     shell: ShellRunner,
 }
 
@@ -171,6 +177,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             auto_compaction: runtime.auto_compaction.clone(),
             retry: runtime.retry.clone(),
             command_catalog: runtime.command_catalog(&args),
+            resources: runtime.resources.clone(),
             shell: ShellRunner {
                 workspace: args.workspace.clone(),
                 timeout: args.tool_timeout_secs.map(std::time::Duration::from_secs),
@@ -223,7 +230,6 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             },
             _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false }, false),
         };
-        continue_queue = false;
         if stopping.load(Ordering::SeqCst) {
             break;
         }
@@ -242,6 +248,32 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                 Session::open(&args.session)?.records().to_vec();
             continue;
         }
+        if let Request::QueueInput {
+            message,
+            command,
+            id,
+        } = request
+        {
+            let result = (|| {
+                let mut session = Session::open(&args.session)?;
+                if session.host_binding().is_some() {
+                    return Err(Error::Session(
+                        "managed session queue controls require its host".into(),
+                    ));
+                }
+                *snapshot.lock().expect("session snapshot") = session.records().to_vec();
+                AgentInput::from(message).apply(&mut session, &mut |event| {
+                    observe_snapshot(event, args.trace, &snapshot)
+                })
+            })();
+            control_response(
+                &command,
+                id,
+                result.map(|()| json!({"disposition":"queued"})),
+            );
+            continue;
+        }
+        continue_queue = false;
         let resume_queued = matches!(
             &request,
             Request::Prompt { .. } | Request::Compact { .. } | Request::Review { .. }
@@ -620,6 +652,7 @@ fn read_requests(
         auto_compaction,
         retry,
         command_catalog,
+        resources,
         snapshot,
         shell,
     } = controls;
@@ -748,6 +781,80 @@ fn read_requests(
                         output(json!({"type":"input_rejected","reason":error.to_string()}));
                     } else if inputs.try_send(message.into()).is_err() {
                         output(json!({"type":"input_rejected","reason":"follow-up queue is full"}));
+                    }
+                }
+                Request::QueueInput {
+                    mut message,
+                    command,
+                    id,
+                } => {
+                    let prepared = (|| {
+                        if let Some(name) = message
+                            .input
+                            .content
+                            .strip_prefix('/')
+                            .and_then(|content| content.split_whitespace().next())
+                            && command_catalog["commands"]
+                                .as_array()
+                                .is_some_and(|commands| {
+                                    commands.iter().any(|command| {
+                                        command["source"] == "extension" && command["name"] == name
+                                    })
+                                })
+                        {
+                            return Err(Error::Config(
+                                "an extension command cannot be queued".into(),
+                            ));
+                        }
+                        if let Some(expanded) = resources.expand(&message.input.content)? {
+                            message.input.content = expanded;
+                        }
+                        message.validate()
+                    })();
+                    if let Err(error) = prepared {
+                        control_response(&command, id, Err(error));
+                        continue;
+                    }
+                    let running = {
+                        let state = active.lock().expect("worker control");
+                        state.token.is_some() || state.queued > 0
+                    };
+                    if running {
+                        let (reply, receiver) = tokio::sync::oneshot::channel();
+                        if inputs
+                            .try_send(AgentInput::Enqueue { message, reply })
+                            .is_err()
+                        {
+                            control_response(
+                                &command,
+                                id,
+                                Err(Error::Config("follow-up queue is full or closed".into())),
+                            );
+                            continue;
+                        }
+                        runtime.spawn(async move {
+                            let result = receiver
+                                .await
+                                .map_err(|_| Error::Config("queue control channel closed".into()))
+                                .and_then(|result| result)
+                                .map(|()| json!({"disposition":"queued"}));
+                            control_response(&command, id, result);
+                        });
+                    } else if commands
+                        .try_send(Request::QueueInput {
+                            message,
+                            command: command.clone(),
+                            id: id.clone(),
+                        })
+                        .is_err()
+                    {
+                        control_response(
+                            &command,
+                            id,
+                            Err(Error::Config(
+                                "queue control channel is full or closed".into(),
+                            )),
+                        );
                     }
                 }
                 Request::ExtensionUiResponse { id, value } => ui.resolve(id, value),

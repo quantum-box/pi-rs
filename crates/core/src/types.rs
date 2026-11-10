@@ -67,6 +67,10 @@ impl From<String> for QueuedInput {
 /// Messages and acknowledged queue controls accepted during an agent run.
 pub enum AgentInput {
     Message(QueuedMessage),
+    Enqueue {
+        message: QueuedMessage,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     ClearQueue {
         reply: tokio::sync::oneshot::Sender<Result<Vec<QueuedMessage>>>,
     },

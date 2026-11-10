@@ -15,12 +15,21 @@ use crate::{
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
     Closed,
-    RunStarted { run_id: Uuid },
+    RunStarted {
+        run_id: Uuid,
+    },
     Record(Arc<Record>),
     Request(Arc<ModelRequest>),
     Text(String),
     Retry(crate::RetryEvent),
-    RunEnded { run_id: Uuid, succeeded: bool },
+    QueueUpdated {
+        steering: Vec<String>,
+        follow_up: Vec<String>,
+    },
+    RunEnded {
+        run_id: Uuid,
+        succeeded: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -700,6 +709,13 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         Notification::Text(text) => SessionEvent::Text((*text).into()),
         Notification::Retry(event) => SessionEvent::Retry(event.clone()),
         Notification::SummaryRequest => return,
+        Notification::QueueUpdated {
+            steering,
+            follow_up,
+        } => SessionEvent::QueueUpdated {
+            steering: steering.iter().map(|text| (*text).to_owned()).collect(),
+            follow_up: follow_up.iter().map(|text| (*text).to_owned()).collect(),
+        },
     };
     let _ = events.send(event);
 }

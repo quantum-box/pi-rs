@@ -780,6 +780,34 @@ impl Session {
     }
 
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
+        self.queued_input_records()
+            .filter_map(|record| match &record.event {
+                Event::InputQueued { input } => Some(input.clone().into()),
+                Event::InputQueuedWithImages { input } => Some(input.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pending text in steering and follow-up order, without copying attachments.
+    pub fn queued_text(&self) -> (Vec<&str>, Vec<&str>) {
+        let mut steering = Vec::new();
+        let mut follow_up = Vec::new();
+        for record in self.queued_input_records() {
+            let input = match &record.event {
+                Event::InputQueued { input } => input,
+                Event::InputQueuedWithImages { input } => &input.input,
+                _ => continue,
+            };
+            match input.kind {
+                crate::InputKind::Steer => steering.push(input.content.as_str()),
+                crate::InputKind::FollowUp => follow_up.push(input.content.as_str()),
+            }
+        }
+        (steering, follow_up)
+    }
+
+    fn queued_input_records(&self) -> impl Iterator<Item = &Record> {
         let branch = self.branch();
         let mut consumed = std::collections::HashSet::new();
         for record in &branch {
@@ -797,17 +825,12 @@ impl Session {
             }
         }
         branch
-            .iter()
-            .filter_map(|record| match &record.event {
-                Event::InputQueued { input } if !consumed.contains(&input.id) => {
-                    Some(input.clone().into())
-                }
-                Event::InputQueuedWithImages { input } if !consumed.contains(&input.input.id) => {
-                    Some(input.clone())
-                }
-                _ => None,
+            .into_iter()
+            .filter(move |record| match &record.event {
+                Event::InputQueued { input } => !consumed.contains(&input.id),
+                Event::InputQueuedWithImages { input } => !consumed.contains(&input.input.id),
+                _ => false,
             })
-            .collect()
     }
     pub fn clear_queued_inputs(&mut self) -> Result<Vec<crate::QueuedMessage>> {
         let pending = self.queued_inputs();

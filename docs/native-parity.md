@@ -45,7 +45,11 @@ blocks, tool calls, tool results and turn boundaries. Tool-call blocks become
 available when their provider response is complete. `get_messages` returns
 Pi message roles and blocks, with a correlated partial assistant message
 during streaming. Set `includeNative: true` to include the native model
-projection in `nativeMessages`. Session entry schemas, incremental tool
+projection in `nativeMessages`. The `steer` and `follow_up` commands
+can queue input before the next prompt without starting the model. The same
+queue accepts prompts with `streamingBehavior` during a turn, expands prompt
+templates and skills, and emits `queue_update` as inputs are saved or consumed.
+Queued input is acknowledged after it is saved. Session entry schemas, incremental tool
 arguments, and additional session events remain in progress.
 
 The message snapshot preserves imported Pi roles, timestamps, and extension

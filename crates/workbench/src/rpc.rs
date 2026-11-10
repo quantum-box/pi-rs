@@ -48,16 +48,13 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut pending_bash: Option<Value> = None;
     let mut pending_compact: Option<Value> = None;
     let mut pending_queries: Vec<Value> = Vec::new();
+    let mut pending_inputs: Vec<Value> = Vec::new();
     let mut stream = super::rpc_events::Stream::default();
     loop {
         if let Some(active) = &mut worker {
             for event in active.events.try_iter() {
-                if event["type"] == "response"
-                    && (event["command"] == "get_commands"
-                        || snapshot_command(event["command"].as_str().unwrap_or_default()))
-                {
-                    pending_queries.retain(|request| request["id"] != event["id"]);
-                }
+                acknowledge(&mut pending_queries, &event);
+                acknowledge(&mut pending_inputs, &event);
                 match event["type"].as_str() {
                     Some("auto_retry_start") => active.retrying = true,
                     Some("auto_retry_end" | "agent_settled" | "request") => active.retrying = false,
@@ -80,12 +77,8 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     let _ = reader.join();
                 }
                 for event in finished.events.try_iter() {
-                    if event["type"] == "response"
-                        && (event["command"] == "get_commands"
-                            || snapshot_command(event["command"].as_str().unwrap_or_default()))
-                    {
-                        pending_queries.retain(|request| request["id"] != event["id"]);
-                    }
+                    acknowledge(&mut pending_queries, &event);
+                    acknowledge(&mut pending_inputs, &event);
                     forward_event(
                         event,
                         &mut finished.busy,
@@ -101,6 +94,14 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         &request,
                         Err(Error::Config(
                             "session query worker exited before returning a result".into(),
+                        )),
+                    )?;
+                }
+                for request in pending_inputs.drain(..) {
+                    response(
+                        &request,
+                        Err(Error::Config(
+                            "input worker exited before acknowledging the queue".into(),
                         )),
                     )?;
                 }
@@ -155,6 +156,40 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 continue;
             }
         };
+        if matches!(
+            request["type"].as_str(),
+            Some("prompt" | "steer" | "follow_up")
+        ) {
+            match submit_prompt(&request, &args, &mut worker) {
+                Ok(Some(data)) => response(&request, Ok(Some(data)))?,
+                Ok(None) => pending_inputs.push(request),
+                Err(error) => response(&request, Err(error))?,
+            }
+            continue;
+        }
+        if !pending_inputs.is_empty()
+            && matches!(
+                request["type"].as_str(),
+                Some(
+                    "new_session"
+                        | "switch_session"
+                        | "fork"
+                        | "clone"
+                        | "set_model"
+                        | "cycle_model"
+                        | "set_session_name"
+                        | "edit_context"
+                )
+            )
+        {
+            response(
+                &request,
+                Err(Error::Config(
+                    "wait for queued input to be acknowledged".into(),
+                )),
+            )?;
+            continue;
+        }
         if request["type"] == "extension_ui_response" {
             if let Some(active) = &mut worker {
                 let value = if request["cancelled"] == true {
@@ -347,47 +382,81 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     Ok(())
 }
 
+fn acknowledge(pending: &mut Vec<Value>, event: &Value) {
+    if event["type"] == "response"
+        && let Some(index) = pending
+            .iter()
+            .position(|request| request["id"] == event["id"] && request["type"] == event["command"])
+    {
+        pending.remove(index);
+    }
+}
+
+fn submit_prompt(
+    request: &Value,
+    args: &Cli,
+    worker: &mut Option<Worker>,
+) -> Result<Option<Value>> {
+    use pi_rs::{InputKind, QueuedInput, QueuedMessage};
+    let name = request["type"].as_str().expect("prompt command");
+    let images: Vec<pi_rs::ImageContent> = request
+        .get("images")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    for image in &images {
+        image.validate()?;
+    }
+    let message = request["message"].as_str().unwrap_or_default();
+    if message.is_empty() && images.is_empty() {
+        return Err(Error::Config("message or images are required".into()));
+    }
+    let queue_kind = match name {
+        "steer" => Some(InputKind::Steer),
+        "follow_up" => Some(InputKind::FollowUp),
+        _ if worker.as_ref().is_some_and(|worker| worker.busy) => {
+            match request["streamingBehavior"].as_str() {
+                Some("steer") => Some(InputKind::Steer),
+                Some("followUp") => Some(InputKind::FollowUp),
+                _ => {
+                    return Err(Error::Config(
+                        "streamingBehavior is required while running".into(),
+                    ));
+                }
+            }
+        }
+        _ => None,
+    };
+    if let Some(kind) = queue_kind {
+        let queued = QueuedMessage {
+            input: QueuedInput {
+                id: uuid::Uuid::new_v4(),
+                kind,
+                content: message.into(),
+            },
+            images,
+        };
+        Worker::control(
+            worker,
+            args,
+            json!({
+                "type":"queue_input","message":queued,"command":name,"id":request.get("id")
+            }),
+        )?;
+        Ok(None)
+    } else {
+        Worker::submit(
+            worker,
+            args,
+            json!({"type":"prompt","content":message,"images":images}),
+        )?;
+        Ok(Some(json!({"disposition":"started"})))
+    }
+}
+
 fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Result<Option<Value>> {
     let name = request["type"].as_str().unwrap_or_default();
     match name {
-        "prompt" | "steer" | "follow_up" => {
-            let images: Vec<pi_rs::ImageContent> = request
-                .get("images")
-                .map(|value| serde_json::from_value(value.clone()))
-                .transpose()?
-                .unwrap_or_default();
-            for image in &images {
-                image.validate()?;
-            }
-            let message = request["message"].as_str().unwrap_or_default();
-            if message.is_empty() && images.is_empty() {
-                return Err(Error::Config("message or images are required".into()));
-            }
-            if let Some(active) = worker.as_mut().filter(|worker| worker.busy) {
-                let kind = match name {
-                    "steer" => "steer",
-                    "follow_up" => "followup",
-                    _ => match request["streamingBehavior"].as_str() {
-                        Some("steer") => "steer",
-                        Some("followUp") => "followup",
-                        _ => {
-                            return Err(Error::Config(
-                                "streamingBehavior is required while running".into(),
-                            ));
-                        }
-                    },
-                };
-                active.send(json!({"type":kind,"content":message,"images":images}))?;
-                Ok(Some(json!({"disposition":"queued"})))
-            } else {
-                Worker::submit(
-                    worker,
-                    args,
-                    json!({"type":"prompt","content":message,"images":images}),
-                )?;
-                Ok(Some(json!({"disposition":"started"})))
-            }
-        }
         "abort" | "abort_bash" => Ok(None),
         name if snapshot_command(name) => {
             let session = Session::snapshot(&args.session)?;

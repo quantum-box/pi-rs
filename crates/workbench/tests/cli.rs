@@ -644,7 +644,7 @@ fn api_key_override_reaches_direct_and_rpc_requests_without_persistence() {
 }
 
 #[test]
-fn rpc_shell_finishes_while_the_model_is_streaming() {
+fn rpc_controls_apply_while_idle_and_streaming() {
     let root = tempfile::tempdir().unwrap();
     let journal = root.path().join("session.jsonl");
     let (release, gate) = std::sync::mpsc::channel();
@@ -700,6 +700,24 @@ fn rpc_shell_finishes_while_the_model_is_streaming() {
             }
         }
     };
+    send(serde_json::json!({"type":"steer","id":"idle-steer","message":"queued while idle"}));
+    let updated = until(&|event| event["type"] == "queue_update" || event["id"] == "idle-steer");
+    assert_eq!(
+        updated["steering"],
+        serde_json::json!(["queued while idle"])
+    );
+    let queued = until(&|event| event["type"] == "response" && event["id"] == "idle-steer");
+    assert_eq!(queued["data"]["disposition"], "queued");
+    send(serde_json::json!({"type":"get_state","id":"idle-state"}));
+    let state = until(&|event| event["id"] == "idle-state");
+    assert_eq!(state["data"]["pendingMessageCount"], 1);
+    assert_eq!(state["data"]["isStreaming"], false);
+    send(serde_json::json!({"type":"clear_queue","id":"idle-clear"}));
+    let cleared = until(&|event| event["id"] == "idle-clear");
+    assert_eq!(
+        cleared["data"]["steering"],
+        serde_json::json!(["queued while idle"])
+    );
     send(serde_json::json!({"type":"prompt","message":"same input"}));
     until(&|event| event["record"]["event"]["type"] == "model_requested");
     send(serde_json::json!({"type":"bash","id":"shell","command":"echo parallel-shell"}));
