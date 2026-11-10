@@ -1,7 +1,7 @@
 //! Pi session entries omit the native journal's execution bookkeeping.
 use std::collections::HashMap;
 
-use pi_rs::{Error, Event, ModelMetadata, Record, Result, Session};
+use pi_rs::{Error, Event, Record, Result, Session};
 use serde_json::{Value, json};
 
 use super::rpc_messages::Projection;
@@ -341,7 +341,6 @@ impl Cursor {
             Event::Compacted {
                 summary,
                 retain_from,
-                usage,
                 ..
             } => {
                 let first = retain_from
@@ -351,13 +350,12 @@ impl Cursor {
                     "type":"compaction","summary":summary,"firstKeptEntryId":first.to_string(),
                     "tokensBefore":compaction_tokens(records, record, session)
                 });
-                add_usage(&mut entry, *usage);
+                add_summary_usage(&mut entry, records, record);
                 Some(entry)
             }
             Event::BranchSummary {
                 summary,
                 from,
-                usage,
                 read_files,
                 modified_files,
                 ..
@@ -367,7 +365,7 @@ impl Cursor {
                     "type":"branch_summary","summary":summary,"fromId":wire_id(from),
                     "details":{"readFiles":read_files,"modifiedFiles":modified_files}
                 });
-                add_usage(&mut entry, *usage);
+                add_summary_usage(&mut entry, records, record);
                 Some(entry)
             }
             Event::ExtensionStates { states } => Some(json!({
@@ -501,9 +499,10 @@ fn selection<'a>(
     )
 }
 
-fn add_usage(entry: &mut Value, usage: Option<pi_rs::Usage>) {
-    if let Some(usage) = usage {
-        entry["usage"] = super::rpc_events::usage_value(usage, &ModelMetadata::default());
+fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
+    if let Some((usage, metadata)) = record.summary_usage(records) {
+        let metadata = metadata.map(|details| details.metadata).unwrap_or_default();
+        entry["usage"] = super::rpc_events::usage_value(usage, &metadata);
     }
 }
 

@@ -299,7 +299,7 @@ impl Tracker {
     }
 }
 
-fn format_tokens(tokens: u64) -> String {
+pub(super) fn format_tokens(tokens: u64) -> String {
     match tokens {
         0..=999 => tokens.to_string(),
         1_000..=9_999 => format!("{:.1}k", tokens as f64 / 1_000.0),

@@ -52,6 +52,11 @@ fn append_imported_usage(events: &mut Vec<Event>, value: &Value) -> Option<Usage
     Some(usage)
 }
 
+fn summary_usage_metadata(events: &[Event]) -> Option<Box<pi_rs::SummaryUsageMetadata>> {
+    let (_, metadata) = pi_rs::SummaryUsageMetadata::from_completion(events.last()?)?;
+    Some(Box::new(metadata))
+}
+
 pub fn read(path: &Path) -> Result<Session> {
     let mut text = String::new();
     std::fs::File::open(path)?
@@ -649,15 +654,18 @@ fn convert(
                 )
             };
             let usage = append_imported_usage(&mut events, &entry["usage"]);
+            let usage_metadata = summary_usage_metadata(&events);
             events.push(Event::Compacted {
                 summary: required(entry, "summary")?.into(),
                 retain_from,
                 states: Default::default(),
                 usage,
+                usage_metadata,
             });
         }
         "branch_summary" => {
             let usage = append_imported_usage(&mut events, &entry["usage"]);
+            let usage_metadata = summary_usage_metadata(&events);
             let files = |key: &str| {
                 entry["details"][key]
                     .as_array()
@@ -676,6 +684,7 @@ fn convert(
                     .map(|branch| branch.head),
                 target: None,
                 usage,
+                usage_metadata,
                 read_files: files("readFiles"),
                 modified_files: files("modifiedFiles"),
             });

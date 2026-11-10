@@ -2740,3 +2740,13 @@ refresh cost, cache miss penalty, and any extension override. The command
 can read the journal during model and tool execution and does not become
 a queued prompt. Changing the active journal head invalidates an idle
 status for the previous head.
+
+### Compaction and branch summary billing checkpoint
+
+Measured summary usage and cost stay attached to compaction and branch
+summary entries, including when a fork omits the original model request.
+The terminal shows the billed tokens and cost when cache notices are
+enabled. RPC session entries expose the cache breakdown and provider
+total. Older native journals recover usage details from the adjacent
+model completion when available. Imported Pi usage remains intact and
+session statistics count each completed summary once.

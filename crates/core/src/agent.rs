@@ -1856,6 +1856,7 @@ impl Agent<'_> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let usage_metadata = summary_usage_metadata(session, &reply);
         let mut summary = if reply.content.trim().is_empty() {
             "No summary generated".into()
         } else {
@@ -1878,6 +1879,7 @@ impl Agent<'_> {
                 from: Some(from),
                 target: Some(target),
                 usage: reply.usage,
+                usage_metadata,
                 read_files,
                 modified_files,
             },
@@ -2063,6 +2065,9 @@ impl Agent<'_> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let billing = reply
+            .usage
+            .map(|usage| (usage, summary_usage_metadata(session, &reply)));
         self.commit_compaction(
             session,
             Compaction {
@@ -2070,7 +2075,7 @@ impl Agent<'_> {
                 keep_turns: retention.keep_turns,
             },
             states,
-            reply.usage,
+            billing,
             Some(retention),
             observer,
         )?;
@@ -2111,7 +2116,7 @@ impl Agent<'_> {
         session: &mut Session,
         mut compaction: Compaction,
         states: &ExtensionStates,
-        usage: Option<Usage>,
+        billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
         minimum_retention: Option<RetentionPlan>,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
@@ -2149,6 +2154,8 @@ impl Agent<'_> {
                 changes.insert(extension.id().into(), state);
             }
         }
+        let (usage, usage_metadata) =
+            billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
         commit(
             session,
             Event::Compacted {
@@ -2156,6 +2163,7 @@ impl Agent<'_> {
                 retain_from,
                 states: changes,
                 usage,
+                usage_metadata,
             },
             observer,
         )
@@ -2473,6 +2481,16 @@ struct Reply {
     content: String,
     invocations: Vec<Invocation>,
     usage: Option<Usage>,
+}
+
+fn summary_usage_metadata(
+    session: &Session,
+    reply: &Reply,
+) -> Option<Box<crate::SummaryUsageMetadata>> {
+    let (usage, metadata) =
+        crate::SummaryUsageMetadata::from_completion(&session.records().last()?.event)?;
+    (Some(usage) == reply.usage && metadata.request_id == reply.request_id)
+        .then(|| Box::new(metadata))
 }
 
 fn pending_reply(

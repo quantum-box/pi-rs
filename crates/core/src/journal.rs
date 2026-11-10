@@ -34,6 +34,39 @@ pub struct RecordedReply {
     pub max_output_tokens: u32,
 }
 
+/// Billing retained with a summary, including when its request is on a discarded branch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SummaryUsageMetadata {
+    pub request_id: Uuid,
+    pub metadata: ModelMetadata,
+}
+
+impl SummaryUsageMetadata {
+    pub fn from_completion(event: &Event) -> Option<(Usage, Self)> {
+        let Event::ModelFinished {
+            request_id,
+            metadata,
+            usage: UsageReport::Measured { usage },
+            failure: None,
+            reply: None,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let mut metadata = metadata.clone();
+        metadata.replay = None;
+        metadata.reasoning = None;
+        Some((
+            *usage,
+            Self {
+                request_id: *request_id,
+                metadata,
+            },
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 // Keep the public journal event shape stable as optional provider metadata grows.
@@ -192,6 +225,8 @@ pub enum Event {
         states: ExtensionStates,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_metadata: Option<Box<SummaryUsageMetadata>>,
     },
     /// Summary of a branch left behind, optionally committed at a new position.
     BranchSummary {
@@ -202,6 +237,8 @@ pub enum Event {
         target: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_metadata: Option<Box<SummaryUsageMetadata>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         read_files: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -247,6 +284,29 @@ pub struct Record {
 }
 
 impl Record {
+    /// Read current summary billing, or recover it from an older journal's adjacent completion.
+    pub fn summary_usage(&self, records: &[Self]) -> Option<(Usage, Option<SummaryUsageMetadata>)> {
+        let (usage, metadata) = match &self.event {
+            Event::Compacted {
+                usage,
+                usage_metadata,
+                ..
+            }
+            | Event::BranchSummary {
+                usage,
+                usage_metadata,
+                ..
+            } => ((*usage)?, usage_metadata),
+            _ => return None,
+        };
+        let metadata = metadata.as_deref().cloned().or_else(|| {
+            let previous = records.get(self.id.checked_sub(2)? as usize)?;
+            let (measured, metadata) = SummaryUsageMetadata::from_completion(&previous.event)?;
+            (usage == measured).then_some(metadata)
+        });
+        Some((usage, metadata))
+    }
+
     pub fn timestamp_millis(&self) -> Option<i64> {
         chrono::DateTime::parse_from_rfc3339(self.timestamp.as_deref()?)
             .ok()
@@ -1087,6 +1147,9 @@ impl Session {
             .collect();
         let mut records = Vec::new();
         for record in branch {
+            let summary_metadata = record
+                .summary_usage(&self.records)
+                .and_then(|(_, metadata)| metadata.map(Box::new));
             let mut record = record.clone();
             record.id = ids[&record.id];
             record.parent = record.parent.and_then(|parent| ids.get(&parent).copied());
@@ -1103,12 +1166,23 @@ impl Session {
                         .get(assistant_record)
                         .ok_or_else(|| Error::Session("missing fork response".into()))?;
                 }
-                Event::Compacted { retain_from, .. } => {
+                Event::Compacted {
+                    retain_from,
+                    usage_metadata,
+                    ..
+                } => {
                     *retain_from = retain_from.and_then(|id| ids.get(&id).copied());
+                    *usage_metadata = summary_metadata;
                 }
-                Event::BranchSummary { from, target, .. } => {
+                Event::BranchSummary {
+                    from,
+                    target,
+                    usage_metadata,
+                    ..
+                } => {
                     *from = from.and_then(|id| ids.get(&id).copied());
                     *target = None;
+                    *usage_metadata = summary_metadata;
                 }
                 Event::Label { target, .. } | Event::ContextEdited { target, .. } => {
                     if let Some(id) = ids.get(target) {
@@ -2000,12 +2074,32 @@ mod session_metadata_tests {
                 content: "abandoned context".into()
             }]
         );
+        let usage = Usage {
+            input_tokens: 40,
+            output_tokens: 5,
+        };
+        session
+            .append(Event::ModelFinished {
+                request_id: Uuid::new_v4(),
+                metadata: ModelMetadata {
+                    cached_input_tokens: Some(10),
+                    cost_usd: serde_json::Number::from_f64(0.4),
+                    reasoning: Some("model reasoning stays on the old branch".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Measured { usage },
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
         session
             .append(Event::BranchSummary {
                 summary: "decision from the old branch".into(),
                 from: Some(3),
                 target: Some(2),
-                usage: None,
+                usage: Some(usage),
+                usage_metadata: None,
                 read_files: vec!["source.txt".into()],
                 modified_files: vec!["result.txt".into()],
             })
@@ -2018,9 +2112,19 @@ mod session_metadata_tests {
                 .iter()
                 .map(|record| record.id)
                 .collect::<Vec<_>>(),
-            [1, 2, 4]
+            [1, 2, 5]
         );
         assert_eq!(restored.current_messages(), fork.current_messages());
+        assert_eq!(restored.statistics().cost, Some(0.4));
+        assert_eq!(fork.statistics().cost, Some(0.4));
+        assert_eq!(fork.statistics().tokens.cache_read, 10);
+        let (_, billing) = fork
+            .records()
+            .last()
+            .unwrap()
+            .summary_usage(fork.records())
+            .unwrap();
+        assert!(billing.unwrap().metadata.reasoning.is_none());
         assert!(
             matches!(&restored.current_messages()[1], Message::User { content } if content.contains("decision from the old branch"))
         );

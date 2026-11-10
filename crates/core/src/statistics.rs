@@ -144,11 +144,16 @@ fn statistics(session: &Session) -> SessionStats {
             } => {
                 stats.add_usage(*usage, Some(metadata));
             }
-            Event::Compacted { usage, .. } | Event::BranchSummary { usage, .. } => {
-                if let Some(usage) = usage
-                    && Some(*usage) != pending_summary
-                {
-                    stats.add_usage(*usage, None);
+            Event::Compacted { .. } | Event::BranchSummary { .. } => {
+                if let Some((usage, details)) = record.summary_usage(records) {
+                    let counted = details
+                        .as_ref()
+                        .map_or(Some(usage) == pending_summary, |details| {
+                            measured.contains_key(&details.request_id)
+                        });
+                    if !counted {
+                        stats.add_usage(usage, details.as_ref().map(|details| &details.metadata));
+                    }
                 }
                 pending_summary = None;
             }

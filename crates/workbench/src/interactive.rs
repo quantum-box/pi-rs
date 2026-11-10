@@ -584,6 +584,36 @@ impl View {
         }
     }
 
+    fn show_summary_billing(
+        &mut self,
+        record: &pi_rs::Record,
+        records: &[pi_rs::Record],
+        args: &Cli,
+    ) {
+        if args.settings.boolean("showCacheMissNotices") != Some(true) {
+            return;
+        }
+        let Some((usage, metadata)) = record.summary_usage(records) else {
+            return;
+        };
+        let label = if matches!(record.event, pi_rs::Event::BranchSummary { .. }) {
+            "Branch summary"
+        } else {
+            "Compaction"
+        };
+        let tokens = super::cache_stats::format_tokens(
+            usage.input_tokens.saturating_add(usage.output_tokens),
+        );
+        let cost = metadata
+            .and_then(|details| details.metadata.cost_usd)
+            .and_then(|number| number.as_f64())
+            .filter(|cost| *cost >= 0.01)
+            .map_or_else(String::new, |cost| format!(" (~${cost:.2})"));
+        self.lines.push(Entry::Warning(format!(
+            "{label}: {tokens} tokens billed{cost}"
+        )));
+    }
+
     fn receive_worker(&mut self, mut value: Value, args: &Cli) {
         if value["type"] == "cache_warming_status" {
             if value["session"] == json!(args.session) {
@@ -610,6 +640,7 @@ impl View {
             if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
                 self.cache_stats.select_provider(args.provider.id());
             }
+            self.show_summary_billing(&record, &[], args);
             self.observe_cache(&record, args);
         }
     }
@@ -732,6 +763,7 @@ impl View {
                 }
                 _ => {}
             }
+            self.show_summary_billing(record, session.records(), args);
             self.observe_cache(record, args);
         }
         if show_startup_header(args) {
