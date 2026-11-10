@@ -1,5 +1,5 @@
 //! Searchable keyboard selectors for session and model navigation.
-use super::{render::Line, theme::Theme};
+use super::{keys::Keys, render::Line, theme::Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
@@ -89,7 +89,7 @@ impl TreeFilter {
         Self::MODES[(self.index() + offset) % Self::MODES.len()].0
     }
 
-    fn filter_for_key(self, key: KeyEvent, keys: &super::keys::Keys) -> Option<Self> {
+    fn filter_for_key(self, key: KeyEvent, keys: &Keys) -> Option<Self> {
         if keys.matches("app.tree.filter.cycleForward", key) {
             return Some(self.next());
         }
@@ -108,6 +108,7 @@ pub struct Picker {
     items: Vec<Item>,
     query: String,
     selected: usize,
+    page_size: std::cell::Cell<usize>,
     active_session: Option<PathBuf>,
     session_action: Option<SessionAction>,
     feedback: Option<Result<String, String>>,
@@ -153,6 +154,7 @@ impl Picker {
             items,
             query: String::new(),
             selected: 0,
+            page_size: std::cell::Cell::new(10),
             active_session: None,
             session_action: None,
             feedback: None,
@@ -222,8 +224,9 @@ impl Picker {
             .unwrap_or_else(|| self.selected.min(matches.len().saturating_sub(1)));
     }
 
-    fn model_scope_input(&mut self, key: KeyEvent, keys: &super::keys::Keys) -> Option<Input> {
-        if key.code == KeyCode::Char('c')
+    fn model_scope_input(&mut self, key: KeyEvent, keys: &Keys) -> Option<Input> {
+        if keys.matches("tui.select.cancel", key)
+            && key.code == KeyCode::Char('c')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !self.query.is_empty()
         {
@@ -234,7 +237,7 @@ impl Picker {
         if keys.matches("app.models.save", key) {
             return Some(Input::UpdateModelScope { save: true });
         }
-        let toggle = key.code == KeyCode::Enter;
+        let toggle = keys.matches("tui.select.confirm", key);
         let enable = keys.matches("app.models.enableAll", key);
         let clear = keys.matches("app.models.clearAll", key);
         let provider = keys.matches("app.models.toggleProvider", key);
@@ -362,6 +365,18 @@ impl Picker {
         picker.focus_record(head);
         picker
     }
+    pub fn set_label_timestamps(&mut self, timestamps: std::collections::BTreeMap<u64, String>) {
+        if let Some(tree) = &mut self.tree {
+            tree.label_timestamps = timestamps;
+        }
+    }
+    pub fn focus_thinking(&mut self, current: &str) {
+        if let Some(index) = self.items.iter().position(
+            |item| matches!(&item.selection, Selection::Thinking(level) if level == current),
+        ) {
+            self.selected = index;
+        }
+    }
     pub fn focus_record(&mut self, id: u64) {
         let visible: std::collections::HashMap<_, _> = self
             .matches()
@@ -469,15 +484,17 @@ impl Picker {
         let (paths, parents): (Vec<_>, Vec<_>) = entries?.into_iter().unzip();
         Some(super::session_threads::layout(&paths, &parents))
     }
-    pub fn input(&mut self, key: KeyEvent, keys: &super::keys::Keys) -> Input {
+    pub fn input(&mut self, key: KeyEvent, keys: &Keys) -> Input {
         self.feedback = None;
         if self.model_scope.is_some()
             && let Some(input) = self.model_scope_input(key, keys)
         {
             return input;
         }
+        let cancel = keys.matches("tui.select.cancel", key);
+        let confirm = keys.matches("tui.select.confirm", key);
         if let Some(action) = self.session_action.clone() {
-            if key.code == KeyCode::Esc {
+            if cancel {
                 self.session_action = None;
                 if matches!(action, SessionAction::Rename(_) | SessionAction::Label(_)) {
                     self.query.clear();
@@ -486,22 +503,22 @@ impl Picker {
             }
             match action {
                 SessionAction::Delete(path) => {
-                    return if key.code == KeyCode::Enter {
+                    return if confirm {
                         Input::Select(Selection::DeleteSession(path))
                     } else {
                         Input::Continue
                     };
                 }
-                SessionAction::Rename(path) if key.code == KeyCode::Enter => {
+                SessionAction::Rename(path) if confirm => {
                     return Input::Select(Selection::RenameSession(path, self.query.clone()));
                 }
-                SessionAction::Label(id) if key.code == KeyCode::Enter => {
+                SessionAction::Label(id) if confirm => {
                     return Input::Select(Selection::Label(id, self.query.clone()));
                 }
                 SessionAction::Rename(_) | SessionAction::Label(_) => {}
             }
         } else if self.active_session.is_some() {
-            if key.code == KeyCode::Tab {
+            if keys.matches("tui.input.tab", key) {
                 self.all_workspaces = !self.all_workspaces;
                 self.selected = 0;
                 return Input::Continue;
@@ -560,6 +577,10 @@ impl Picker {
                         _ => None,
                     });
             let tree = self.tree.as_mut().expect("tree picker");
+            if keys.matches("app.tree.toggleLabelTimestamp", key) {
+                tree.show_label_timestamps = !tree.show_label_timestamps;
+                return Input::Continue;
+            }
             if let Some(filter) = tree.filter.filter_for_key(key, keys) {
                 tree.filter = filter;
                 tree.collapsed.clear();
@@ -615,32 +636,66 @@ impl Picker {
                 }
             }
         }
-        let count = self.matches().len();
+        let matches = self.matches();
+        let count = matches.len();
+        if let Some(item) = matches.get(self.selected) {
+            let save = match &item.selection {
+                Selection::Thinking(_) => keys.matches("app.thinking.save", key),
+                Selection::Model(_) => keys.matches("app.models.save", key),
+                _ => false,
+            };
+            if save {
+                return Input::Save(item.selection.clone());
+            }
+            if confirm {
+                return Input::Select(item.selection.clone());
+            }
+        }
+        if cancel {
+            if let Some(tree) = &mut self.tree
+                && !self.query.is_empty()
+            {
+                self.query.clear();
+                tree.collapsed.clear();
+                tree.rebuild_visible();
+                let head = tree.head;
+                self.focus_record(head);
+                return Input::Continue;
+            }
+            return Input::Cancel;
+        }
+        let tree = self.tree.is_some();
+        if keys.matches("tui.select.up", key) {
+            self.selected = self
+                .selected
+                .checked_sub(1)
+                .unwrap_or(count.saturating_sub(1));
+            return Input::Continue;
+        }
+        if keys.matches("tui.select.down", key) {
+            self.selected = (self.selected + 1) % count.max(1);
+            return Input::Continue;
+        }
+        if keys.matches("tui.select.pageUp", key)
+            || (tree && keys.matches("tui.editor.cursorLeft", key))
+        {
+            self.selected = self.selected.saturating_sub(self.page_size.get());
+            return Input::Continue;
+        }
+        if keys.matches("tui.select.pageDown", key)
+            || (tree && keys.matches("tui.editor.cursorRight", key))
+        {
+            self.selected = (self.selected + self.page_size.get()).min(count.saturating_sub(1));
+            return Input::Continue;
+        }
+        if keys.matches("tui.editor.deleteCharBackward", key) {
+            self.query.pop();
+            self.selected = 0;
+            return Input::Continue;
+        }
         match key.code {
-            KeyCode::Esc => return Input::Cancel,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Input::Cancel;
-            }
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(item) = self.matches().get(self.selected) {
-                    return Input::Save(item.selection.clone());
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(item) = self.matches().get(self.selected) {
-                    return Input::Select(item.selection.clone());
-                }
-            }
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(count.saturating_sub(1)),
-            KeyCode::PageUp => self.selected = self.selected.saturating_sub(10),
-            KeyCode::PageDown => self.selected = (self.selected + 10).min(count.saturating_sub(1)),
             KeyCode::Home => self.selected = 0,
             KeyCode::End => self.selected = count.saturating_sub(1),
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.selected = 0;
-            }
             KeyCode::Char(character)
                 if !key.modifiers.intersects(
                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
@@ -736,28 +791,33 @@ impl Picker {
         }
     }
 
-    pub fn render(&self, theme: &Theme, width: usize, height: usize) -> Vec<Line> {
+    pub fn render(&self, theme: &Theme, width: usize, height: usize, keys: &Keys) -> Vec<Line> {
+        let hint = |action| keys.hint(action);
         if let Some(action) = &self.session_action {
+            let confirm = hint("tui.select.confirm");
+            let cancel = hint("tui.select.cancel");
             let (title, hint) = match action {
                 SessionAction::Rename(_) => (
                     format!("Rename session · {}", self.query),
-                    "Type the new name · Enter to save · Esc to cancel",
+                    format!("Type the new name · {confirm} to save · {cancel} to cancel"),
                 ),
                 SessionAction::Label(id) => (
                     format!("Label record {id} · {}", self.query),
-                    "Type the label · Enter to save · Empty to remove · Esc to cancel",
+                    format!(
+                        "Type the label · {confirm} to save · Empty to remove · {cancel} to cancel"
+                    ),
                 ),
                 SessionAction::Delete(path) => (
                     format!(
                         "Delete {}?",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ),
-                    "Enter to delete · Esc to cancel",
+                    format!("{confirm} to delete · {cancel} to cancel"),
                 ),
             };
             return vec![
                 Line::plain(&title, theme.color("accent")),
-                Line::plain(hint, theme.color("dim")),
+                Line::plain(&hint, theme.color("dim")),
             ];
         }
         let filter = self
@@ -789,6 +849,7 @@ impl Picker {
         if scrolling {
             available = available.saturating_sub(1).max(1);
         }
+        self.page_size.set(available);
         let start = if self.active_session.is_some() {
             self.selected
                 .saturating_sub(available / 2)
@@ -825,7 +886,7 @@ impl Picker {
                         (&self.tree, &item.selection)
                     {
                         format!(
-                            "{}{}{} {}",
+                            "{}{}{} {}{}",
                             "  ".repeat(tree.depths.get(id).copied().unwrap_or(0).min(12)),
                             if tree.collapsed.contains(id) {
                                 "▸"
@@ -839,6 +900,15 @@ impl Picker {
                                 "·"
                             },
                             if *id == tree.head { "●" } else { " " },
+                            if tree.show_label_timestamps {
+                                tree.label_timestamps
+                                    .get(id)
+                                    .map_or_else(String::new, |timestamp| {
+                                        format!("{} ", format_label_timestamp(timestamp))
+                                    })
+                            } else {
+                                String::new()
+                            },
                             item.label
                         )
                     } else {
@@ -893,27 +963,77 @@ impl Picker {
             ));
         }
         let hint = if self.active_session.is_some() {
-            match self.session_sort {
-                SessionSort::Threaded => {
-                    "Threaded · Ctrl+S recent · Ctrl+R rename · Ctrl+D delete · Esc cancel"
-                }
-                SessionSort::Recent => {
-                    "Recent · Ctrl+S relevance · Ctrl+R rename · Ctrl+D delete · Esc cancel"
-                }
-                SessionSort::Relevance => {
-                    "Relevance · Ctrl+S threaded · Ctrl+R rename · Ctrl+D delete · Esc cancel"
-                }
-            }
+            let (sort, next) = match self.session_sort {
+                SessionSort::Threaded => ("Threaded", "recent"),
+                SessionSort::Recent => ("Recent", "relevance"),
+                SessionSort::Relevance => ("Relevance", "threaded"),
+            };
+            format!(
+                "{sort} · {} {next} · {} rename · {} delete · {} cancel",
+                hint("app.session.toggleSort"),
+                hint("app.session.rename"),
+                hint("app.session.delete"),
+                hint("tui.select.cancel"),
+            )
         } else if self.model_scope.is_some() {
-            "Enter toggle · Alt+↑/↓ reorder · Ctrl+A enable · Ctrl+X clear · Ctrl+S save"
+            format!(
+                "{} toggle · {}/{} reorder · {} enable · {} clear · {} save",
+                hint("tui.select.confirm"),
+                hint("app.models.reorderUp"),
+                hint("app.models.reorderDown"),
+                hint("app.models.enableAll"),
+                hint("app.models.clearAll"),
+                hint("app.models.save"),
+            )
         } else if self.tree.is_some() {
-            "Ctrl+O filter · Alt+←/→ navigate · Shift+L label · Ctrl+X copy · Enter checkout"
+            format!(
+                "{} filter · {}/{} navigate · {} label · {} timestamps · {} copy · {} checkout",
+                hint("app.tree.filter.cycleForward"),
+                hint("app.tree.foldOrUp"),
+                hint("app.tree.unfoldOrDown"),
+                hint("app.tree.editLabel"),
+                hint("app.tree.toggleLabelTimestamp"),
+                hint("app.message.copy"),
+                hint("tui.select.confirm"),
+            )
         } else {
-            "Type to search · ↑↓ to select · Enter to open · Esc to cancel"
+            let save = self.items.first().and_then(|item| match item.selection {
+                Selection::Thinking(_) => Some("app.thinking.save"),
+                Selection::Model(_) => Some("app.models.save"),
+                _ => None,
+            });
+            format!(
+                "Type to search · {}/{} to select · {} to open · {}{} to cancel",
+                hint("tui.select.up"),
+                hint("tui.select.down"),
+                hint("tui.select.confirm"),
+                save.map_or_else(String::new, |action| format!(
+                    "{} to set as default · ",
+                    hint(action)
+                )),
+                hint("tui.select.cancel"),
+            )
         };
-        lines.push(Line::plain(hint, theme.color("dim")));
+        lines.push(Line::plain(&hint, theme.color("dim")));
         lines
     }
+}
+
+fn format_label_timestamp(timestamp: &str) -> String {
+    use chrono::{Datelike, Local};
+    let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+        return timestamp.to_owned();
+    };
+    let date = timestamp.with_timezone(&Local);
+    let today = Local::now().date_naive();
+    let format = if date.date_naive() == today {
+        "%H:%M"
+    } else if date.year() == today.year() {
+        "%-m/%-d %H:%M"
+    } else {
+        "%y/%-m/%-d %H:%M"
+    };
+    date.format(format).to_string()
 }
 
 struct TreeState {
@@ -922,6 +1042,8 @@ struct TreeState {
     parents: std::collections::BTreeMap<u64, Option<u64>>,
     children: std::collections::BTreeMap<u64, Vec<u64>>,
     labels: std::collections::BTreeMap<u64, String>,
+    label_timestamps: std::collections::BTreeMap<u64, String>,
+    show_label_timestamps: bool,
     roots: Vec<u64>,
     order: Vec<u64>,
     depths: std::collections::BTreeMap<u64, usize>,
@@ -955,6 +1077,8 @@ impl TreeState {
             parents,
             children,
             labels,
+            label_timestamps: Default::default(),
+            show_label_timestamps: false,
             roots,
             order: vec![],
             depths: Default::default(),
@@ -1081,7 +1205,7 @@ mod tests {
             5,
             TreeFilter::Default,
         );
-        let keys = super::super::keys::Keys::load().unwrap();
+        let keys = Keys::default();
         assert_eq!(picker.selected, 4);
         picker.focus_record(1);
         picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
@@ -1135,7 +1259,7 @@ mod tests {
             5,
             TreeFilter::NoTools,
         );
-        let keys = super::super::keys::Keys::load().unwrap();
+        let keys = Keys::default();
         let rows = |picker: &Picker| {
             picker
                 .matches()
@@ -1165,7 +1289,7 @@ mod tests {
     fn scoped_models_reorder_and_filter_the_enabled_set() {
         let catalog = ["alpha", "beta", "gamma"].map(str::to_owned).to_vec();
         let mut picker = Picker::scoped_models("ollama", catalog.clone(), catalog);
-        let keys = super::super::keys::Keys::load().unwrap();
+        let keys = Keys::default();
         picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
         assert_eq!(picker.model_scope().unwrap().1, ["beta", "gamma"]);
         picker.query = "gam".into();
@@ -1204,7 +1328,7 @@ mod tests {
             local.clone(),
             std::collections::HashSet::from([remote]),
         );
-        let keys = super::super::keys::Keys::load().unwrap();
+        let keys = Keys::default();
         assert_eq!(picker.matches().len(), 1);
         picker.input(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &keys);
         assert_eq!(picker.matches().len(), 2);
@@ -1326,7 +1450,7 @@ mod tests {
         picker.query = "needle".into();
         assert_eq!(selected(&picker), paths);
         picker.query.clear();
-        let keys = super::super::keys::Keys::load().unwrap();
+        let keys = Keys::default();
         picker.input(
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             &keys,
@@ -1413,7 +1537,7 @@ mod tests {
         assert!(matches!(
             picker.input(
                 KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                &super::super::keys::Keys::default()
+                &Keys::default()
             ),
             Input::Continue
         ));

@@ -858,9 +858,9 @@ impl View {
         self.request_started = None;
         self.phase = None;
     }
-    fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool) -> Result<()> {
+    fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
         if args.tui_mode == Some(TuiMode::Regular) {
-            return self.draw_regular(args, theme, busy);
+            return self.draw_regular(args, theme, busy, keys);
         }
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
@@ -892,7 +892,7 @@ impl View {
                 .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
         }
         if let Some(picker) = &self.picker {
-            lines = picker.render(theme, width, body_height);
+            lines = picker.render(theme, width, body_height, keys);
         }
         if let Some(dialog) = self.dialog() {
             lines = dialog.render(theme, width, body_height);
@@ -1025,7 +1025,7 @@ impl View {
         Ok(())
     }
 
-    fn draw_regular(&mut self, args: &Cli, theme: &Theme, busy: bool) -> Result<()> {
+    fn draw_regular(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
@@ -1123,7 +1123,8 @@ impl View {
             active
                 .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
             if let Some(picker) = &self.picker {
-                active = picker.render(theme, width, height - prompt_height - 4 - below.len());
+                active =
+                    picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
             }
             let end = active
                 .len()
@@ -1491,16 +1492,28 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             view.append(&format!("Model › {rest}"));
         }
         "/thinking" if rest.is_empty() => {
-            view.picker = Some(Picker::new(
+            let default = args
+                .settings
+                .string("defaultThinkingLevel")
+                .unwrap_or("off")
+                .to_owned();
+            let current = args.thinking.clone().unwrap_or_else(|| "off".into());
+            let mut picker = Picker::new(
                 "Thinking level",
                 super::thinking::available(args)
                     .into_iter()
                     .map(|level| Item {
-                        label: level.clone(),
+                        label: format!(
+                            "{}{level}{}",
+                            if level == current { "✓ " } else { "" },
+                            if level == default { " · default" } else { "" },
+                        ),
                         selection: Selection::Thinking(level),
                     })
                     .collect(),
-            ));
+            );
+            picker.focus_thinking(&current);
+            view.picker = Some(picker);
         }
         "/thinking" => super::thinking::set(args, rest)?,
         "/new" => {
@@ -1754,7 +1767,9 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 .collect();
             let filter =
                 TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
-            view.picker = Some(Picker::tree(items, entries, labels, head, filter));
+            let mut picker = Picker::tree(items, entries, labels, head, filter);
+            picker.set_label_timestamps(session.label_timestamps());
+            view.picker = Some(picker);
         }
         "/checkout" => {
             let id = rest
@@ -2072,7 +2087,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             || ((is_busy(&worker) || view.remote_task.is_some())
                 && last_frame.elapsed() >= Duration::from_millis(100))
         {
-            view.draw(&args, &theme, is_busy(&worker))?;
+            view.draw(&args, &theme, is_busy(&worker), &keys)?;
             dirty = false;
             last_frame = Instant::now();
         }
@@ -2243,25 +2258,30 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         }
                         Input::Save(selection) => {
                             let result = match selection {
-                                Selection::Model(model) => args.settings.set_user(
-                                    "defaultModel",
-                                    json!(if model.split_once('/').is_some_and(|(name, _)| {
-                                        args.model_profiles.provider(name).is_some()
-                                    }) {
-                                        model
-                                    } else {
-                                        args.configured_model_name(&model)
-                                    }),
-                                ),
-                                Selection::Thinking(thinking) => args
-                                    .settings
-                                    .set_user("defaultThinkingLevel", json!(thinking)),
+                                Selection::Model(model) => select_model_input(
+                                    &mut args, &mut view, &model,
+                                )
+                                .and_then(|()| {
+                                    let configured =
+                                        format!("{}/{}", args.provider.id(), args.model);
+                                    args.settings.set_user("defaultModel", json!(configured))?;
+                                    view.append(&format!("Default model: {configured}"));
+                                    Ok(())
+                                }),
+                                Selection::Thinking(thinking) => {
+                                    super::thinking::set(&mut args, &thinking).and_then(|()| {
+                                        args.settings
+                                            .set_user("defaultThinkingLevel", json!(thinking))?;
+                                        view.append(&format!("Default thinking level: {thinking}"));
+                                        Ok(())
+                                    })
+                                }
                                 _ => Ok(()),
                             };
                             if let Err(error) = result {
-                                view.append(&error.to_string());
+                                picker.show_feedback(Err(error.to_string()));
+                                view.picker = Some(picker);
                             }
-                            view.picker = Some(picker);
                         }
                         Input::Select(selection) => {
                             view.tree_confirmation = None;

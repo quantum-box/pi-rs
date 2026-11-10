@@ -93,29 +93,52 @@ impl Dialog {
         }
     }
     pub fn input(&mut self, key: KeyEvent, keys: &Keys) -> Option<UiResponse> {
-        if key.code == KeyCode::Esc
-            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
+        let cancel = if matches!(self.request, UiRequest::Custom { .. }) {
+            key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        } else {
+            keys.matches("tui.select.cancel", key)
+        };
+        if cancel {
             return Some(UiResponse::Cancelled);
         }
+        let up = keys.matches("tui.select.up", key);
+        let down = keys.matches("tui.select.down", key);
+        let confirm = keys.matches("tui.select.confirm", key);
         match &self.request {
-            UiRequest::Select { options, .. } => match key.code {
-                KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-                KeyCode::Down => {
-                    self.selected = (self.selected + 1).min(options.len().saturating_sub(1))
+            UiRequest::Select { options, .. } => {
+                if confirm {
+                    return options.get(self.selected).cloned().map(UiResponse::Text);
                 }
-                KeyCode::Enter => return options.get(self.selected).cloned().map(UiResponse::Text),
-                _ => {}
-            },
-            UiRequest::Confirm { .. } => match key.code {
-                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
-                    self.selected = 1 - self.selected
+                let count = options.len().max(1);
+                if up {
+                    self.selected = self.selected.checked_sub(1).unwrap_or(count - 1);
+                } else if down {
+                    self.selected = (self.selected + 1) % count;
+                } else if keys.matches("tui.select.pageUp", key) {
+                    self.selected = self.selected.saturating_sub(8);
+                } else if keys.matches("tui.select.pageDown", key) {
+                    self.selected = (self.selected + 8).min(count - 1);
                 }
-                KeyCode::Enter => return Some(UiResponse::Confirmed(self.selected == 0)),
-                KeyCode::Char('y') => return Some(UiResponse::Confirmed(true)),
-                KeyCode::Char('n') => return Some(UiResponse::Confirmed(false)),
-                _ => {}
-            },
+            }
+            UiRequest::Confirm { .. } => {
+                if confirm {
+                    return Some(UiResponse::Confirmed(self.selected == 0));
+                }
+                if up
+                    || down
+                    || matches!(key.code, KeyCode::Left | KeyCode::Right)
+                    || keys.matches("tui.input.tab", key)
+                {
+                    self.selected = 1 - self.selected;
+                } else if key.modifiers.is_empty() {
+                    match key.code {
+                        KeyCode::Char('y') => return Some(UiResponse::Confirmed(true)),
+                        KeyCode::Char('n') => return Some(UiResponse::Confirmed(false)),
+                        _ => {}
+                    }
+                }
+            }
             UiRequest::Custom { actions, .. } => {
                 let normalized = keys::normalize(key);
                 if let Some(action) = actions.iter().find(|action| {
@@ -139,8 +162,10 @@ impl Dialog {
             }
             UiRequest::Input { .. } | UiRequest::Editor { .. } => {
                 let multiline = matches!(self.request, UiRequest::Editor { .. });
-                if (key.code == KeyCode::Enter
-                    && (!multiline || key.modifiers.contains(KeyModifiers::CONTROL)))
+                if (!multiline && confirm)
+                    || (multiline
+                        && key.code == KeyCode::Enter
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
                     || (key.code == KeyCode::Char('s')
                         && key.modifiers.contains(KeyModifiers::CONTROL))
                 {

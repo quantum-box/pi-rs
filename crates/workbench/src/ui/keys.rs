@@ -11,12 +11,11 @@ pub fn windows_keybindings() -> bool {
                 || std::env::var_os("WSL_INTEROP").is_some()))
 }
 
-#[derive(Default)]
 pub struct Keys {
     bindings: BTreeMap<String, Vec<KeyEvent>>,
 }
 impl Keys {
-    pub fn load() -> Result<Self> {
+    fn defaults() -> Result<BTreeMap<String, Vec<KeyEvent>>> {
         let defaults: &[(&str, &[&str])] = &[
             ("tui.editor.cursorUp", &["up"]),
             ("tui.editor.cursorDown", &["down"]),
@@ -47,6 +46,12 @@ impl Keys {
             ("tui.input.newLine", &["shift+enter", "ctrl+j"]),
             ("tui.input.submit", &["enter"]),
             ("tui.input.tab", &["tab"]),
+            ("tui.select.up", &["up"]),
+            ("tui.select.down", &["down"]),
+            ("tui.select.pageUp", &["pageup"]),
+            ("tui.select.pageDown", &["pagedown"]),
+            ("tui.select.confirm", &["enter"]),
+            ("tui.select.cancel", &["escape", "ctrl+c"]),
             ("tui.altScreen.pageUp", &["pageup"]),
             ("tui.altScreen.pageDown", &["pagedown"]),
             ("tui.altScreen.top", &["ctrl+home"]),
@@ -59,6 +64,7 @@ impl Keys {
             ("app.tools.expand", &["ctrl+o"]),
             ("app.thinking.toggle", &["ctrl+t"]),
             ("app.thinking.cycle", &["shift+tab"]),
+            ("app.thinking.save", &["ctrl+s"]),
             (
                 "app.message.followUp",
                 if windows_keybindings() {
@@ -97,6 +103,7 @@ impl Keys {
             ("app.tree.foldOrUp", &["alt+left", "ctrl+left"]),
             ("app.tree.unfoldOrDown", &["alt+right", "ctrl+right"]),
             ("app.tree.editLabel", &["shift+l"]),
+            ("app.tree.toggleLabelTimestamp", &["shift+t"]),
             ("app.tree.filter.default", &["ctrl+d"]),
             ("app.tree.filter.noTools", &["ctrl+t"]),
             ("app.tree.filter.userOnly", &["ctrl+u"]),
@@ -126,6 +133,10 @@ impl Keys {
                     .collect::<Result<Vec<_>>>()?,
             );
         }
+        Ok(bindings)
+    }
+    pub fn load() -> Result<Self> {
+        let mut bindings = Self::defaults()?;
         let custom =
             crate::config::read_object(&crate::config::agent_dir().join("keybindings.json"))?;
         for (action, value) in custom.as_object().expect("object") {
@@ -170,9 +181,11 @@ impl Keys {
             .find(|(action, keys)| {
                 if action.starts_with("app.tree.")
                     || action.starts_with("app.models.")
+                    || action.starts_with("tui.select.")
                     || matches!(
                         action.as_str(),
-                        "app.session.rename"
+                        "app.thinking.save"
+                            | "app.session.rename"
                             | "app.session.delete"
                             | "app.session.deleteNoninvasive"
                             | "app.session.toggleSort"
@@ -191,6 +204,31 @@ impl Keys {
                     .any(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
             })
             .map(|(action, _)| action.as_str())
+    }
+    pub fn hint(&self, action: &str) -> String {
+        let Some(key) = self.bindings.get(action).and_then(|keys| keys.first()) else {
+            return "—".into();
+        };
+        let mut label = String::new();
+        for (modifier, prefix) in [
+            (KeyModifiers::CONTROL, "Ctrl+"),
+            (KeyModifiers::ALT, "Alt+"),
+            (KeyModifiers::SHIFT, "Shift+"),
+            (KeyModifiers::SUPER, "Super+"),
+        ] {
+            if key.modifiers.contains(modifier) {
+                label.push_str(prefix);
+            }
+        }
+        match key.code {
+            KeyCode::Char(character) => label.push(character.to_ascii_uppercase()),
+            KeyCode::Up => label.push('↑'),
+            KeyCode::Down => label.push('↓'),
+            KeyCode::Left => label.push('←'),
+            KeyCode::Right => label.push('→'),
+            code => label.push_str(&format!("{code:?}")),
+        }
+        label
     }
     pub fn describe(&self) -> String {
         self.bindings
@@ -304,5 +342,14 @@ mod session_tests {
             keys.action(key, false),
             Some("tui.editor.deleteCharForward")
         );
+    }
+}
+
+#[cfg(test)]
+impl Default for Keys {
+    fn default() -> Self {
+        Self {
+            bindings: Self::defaults().expect("valid built-in keybindings"),
+        }
     }
 }
