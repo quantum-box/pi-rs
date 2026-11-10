@@ -2275,15 +2275,16 @@ project forwarding and a redirect that received no token.
 
 User model profiles can use `!command` for an API key or a request
 header, including a model override. Endpoint-bound keys in `auth.json`
-also support commands and environment references. The workbench
-resolves command-backed values immediately before the request, with
-bounded execution and output, and sends only the resolved value.
-A key entered through the masked terminal login stays literal.
+also support commands and environment references. Commands from
+`auth.json` cache their first result for the process lifetime, including
+failures. Model profile keys and headers resolve at request time. The
+workbench bounds command execution and output. A key entered through
+the masked terminal login stays literal.
 
-The RPC fixture changed key and header values between requests on one
-worker, then checked a command failure and an endpoint override. The
-failure redacted command output, and the other endpoint received only
-its explicitly supplied credential.
+The RPC fixture kept the stored key stable while refreshing the header
+from its command on each request. A separate check verified that failed
+stored commands stay unresolved, and endpoint overrides receive only
+their explicitly supplied credentials.
 
 ### Queued SDK input hooks
 

@@ -378,7 +378,10 @@ impl Cli {
         let settings = self
             .model_profiles
             .header_settings(provider, endpoint, model);
-        if settings.has_command() || matches!(credential, Some(model_auth::Credential::Command(_)))
+        if settings.has_command()
+            || credential
+                .as_ref()
+                .is_some_and(model_auth::Credential::is_command)
         {
             return Ok(providers::Client::deferred(
                 provider.clone(),

@@ -1,5 +1,6 @@
 //! Private API keys for native model providers.
 use std::collections::BTreeMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use pi_rs::{Error, Result};
 use serde_json::{Value, json};
@@ -10,7 +11,13 @@ use super::{Provider, config};
 pub(super) enum Credential {
     Literal(String),
     Command(String),
+    StoredCommand(String),
 }
+
+type CommandResult = std::result::Result<String, &'static str>;
+type CachedCommand = Arc<tokio::sync::OnceCell<CommandResult>>;
+static STORED_COMMANDS: LazyLock<Mutex<BTreeMap<String, CachedCommand>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 impl Credential {
     pub fn configured(value: &str) -> Option<Self> {
@@ -19,33 +26,47 @@ impl Credential {
                 .then(|| Self::Command(value.into()));
         }
         super::model_profiles::expand_value(value)
-            .filter(|value| valid_key(value))
+            .filter(|value| !value.trim().is_empty())
             .map(Self::Literal)
     }
 
     pub fn literal(&self) -> Option<&str> {
         match self {
             Self::Literal(value) => Some(value),
-            Self::Command(_) => None,
+            Self::Command(_) | Self::StoredCommand(_) => None,
         }
     }
 
-    pub async fn resolve(&self) -> Result<String> {
-        match self {
-            Self::Literal(value) => Ok(value.clone()),
-            Self::Command(command) => {
-                let value = pi_rs_workbench::mcp::resolve_value(command)
-                    .await
-                    .map_err(|_| Error::Config("Model credential command failed".into()))?;
-                if !valid_key(&value) {
-                    return Err(Error::Config(
-                        "Model credential command returned an invalid key".into(),
-                    ));
-                }
-                Ok(value)
-            }
-        }
+    pub fn is_command(&self) -> bool {
+        self.literal().is_none()
     }
+
+    pub async fn resolve(&self) -> Result<String> {
+        let value = match self {
+            Self::Literal(value) => return Ok(value.clone()),
+            Self::Command(command) => resolve_command(command).await,
+            Self::StoredCommand(command) => {
+                let cell = STORED_COMMANDS
+                    .lock()
+                    .expect("stored credential commands")
+                    .entry(command.clone())
+                    .or_default()
+                    .clone();
+                cell.get_or_init(|| resolve_command(command)).await.clone()
+            }
+        };
+        value.map_err(|message| Error::Config(message.into()))
+    }
+}
+
+async fn resolve_command(command: &str) -> CommandResult {
+    let value = pi_rs_workbench::mcp::resolve_value(command)
+        .await
+        .map_err(|_| "Model credential command failed")?;
+    if !valid_key(&value) {
+        return Err("Model credential command returned an invalid key");
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Default)]
@@ -78,7 +99,13 @@ impl Keys {
                 let key = if entry["literal"] == true {
                     valid_key(value).then(|| Credential::Literal(value.into()))?
                 } else {
-                    Credential::configured(value)?
+                    match Credential::configured(value)? {
+                        Credential::Command(command) => Credential::StoredCommand(command),
+                        Credential::Literal(value) if valid_key(&value) => {
+                            Credential::Literal(value)
+                        }
+                        _ => return None,
+                    }
                 };
                 let endpoint = match entry.get("endpoint") {
                     None => Provider::named(name)?.default_endpoint(),
@@ -151,6 +178,32 @@ fn valid_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stored_commands_cache_results_and_profile_commands_read_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key");
+        let command = format!("!cat {}", shell_words::quote(path.to_str().unwrap()));
+        std::fs::write(&path, "first").unwrap();
+        let stored = Credential::StoredCommand(command.clone());
+        assert_eq!(stored.resolve().await.unwrap(), "first");
+        std::fs::write(&path, "second").unwrap();
+        assert_eq!(stored.resolve().await.unwrap(), "first");
+        assert_eq!(
+            Credential::Command(command).resolve().await.unwrap(),
+            "second"
+        );
+
+        let missing = directory.path().join("missing");
+        let command = Credential::StoredCommand(format!(
+            "!cat {}",
+            shell_words::quote(missing.to_str().unwrap())
+        ));
+        assert!(command.resolve().await.is_err());
+        std::fs::write(missing, "available").unwrap();
+        assert!(command.resolve().await.is_err());
+    }
 
     #[test]
     fn saved_keys_only_match_their_bound_endpoint() {
