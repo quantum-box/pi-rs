@@ -2662,3 +2662,12 @@ configured keys retain precedence. The header token takes priority over
 not inherit it. Auth status remains masked and uses Pi's API credential
 classification. Offline and loopback checks covered priority, endpoint
 isolation, and explicit proxy keys.
+
+### Published input limits and cache lifetimes checkpoint
+
+The bundled Anthropic and Gemini catalogs retain Pi's declared request
+byte and image count limits. Anthropic also exposes the short and long
+prompt cache lifetimes. JSON model listings, RPC, and Codemode include
+the metadata. Custom declarations merge individual limit, resize, and
+lifetime fields. Release checks covered the offline catalogs, nested
+overrides, invalid values, and the existing image resize and cost paths.

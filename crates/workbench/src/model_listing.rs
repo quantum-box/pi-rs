@@ -47,12 +47,7 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
                     "provider":provider,
                 });
                 if let Some(metadata) = args.model_profiles.model(&catalog.provider, &model) {
-                    if let Some(resize) = metadata.image_resize() {
-                        row["inputLimits"] = json!({"images":{"resize":resize}});
-                    }
-                    if let Some(cost) = metadata.cost {
-                        row["cost"] = cost.value();
-                    }
+                    metadata.apply_catalog_metadata(&mut row);
                 }
                 output(with_details(row, detail.as_ref()));
             } else {

@@ -7,7 +7,7 @@ use pi_rs::{Error, Result};
 use pi_rs_workbench::image_profile::ImageResizeProfile;
 use regex::{Captures, Regex};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -329,14 +329,83 @@ impl ChatPrice {
     }
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct InputLimits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_request_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     images: Option<ImageLimits>,
 }
 
-#[derive(Clone, Default, Deserialize)]
+impl InputLimits {
+    fn overlay(self, newer: Self) -> Self {
+        Self {
+            max_request_bytes: newer.max_request_bytes.or(self.max_request_bytes),
+            images: match (self.images, newer.images) {
+                (Some(base), Some(newer)) => Some(base.overlay(newer)),
+                (base, newer) => newer.or(base),
+            },
+        }
+    }
+
+    fn valid(self) -> bool {
+        self.max_request_bytes != Some(0) && self.images.is_none_or(ImageLimits::valid)
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ImageLimits {
+    #[serde(skip_serializing_if = "Option::is_none")]
     resize: Option<ImageResizeProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_per_message: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_per_request: Option<u64>,
+}
+
+impl ImageLimits {
+    fn overlay(self, newer: Self) -> Self {
+        Self {
+            resize: match (self.resize, newer.resize) {
+                (Some(base), Some(newer)) => Some(base.overlay(newer)),
+                (base, newer) => newer.or(base),
+            },
+            max_per_message: newer.max_per_message.or(self.max_per_message),
+            max_per_request: newer.max_per_request.or(self.max_per_request),
+        }
+    }
+
+    fn valid(self) -> bool {
+        self.max_per_message != Some(0)
+            && self.max_per_request != Some(0)
+            && self.resize.is_none_or(ImageResizeProfile::valid)
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+struct PromptCache {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    short: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    long: Option<f64>,
+}
+
+impl PromptCache {
+    fn overlay(self, newer: Self) -> Self {
+        Self {
+            short: newer.short.or(self.short),
+            long: newer.long.or(self.long),
+        }
+    }
+
+    fn valid(self) -> bool {
+        [self.short, self.long]
+            .into_iter()
+            .flatten()
+            .all(|seconds| seconds.is_finite() && seconds > 0.0)
+    }
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -348,6 +417,7 @@ pub(super) struct ModelMetadata {
     pub reasoning: Option<bool>,
     pub cost: Option<ChatPrice>,
     input_limits: Option<InputLimits>,
+    prompt_cache: Option<PromptCache>,
     #[serde(default)]
     compat: ModelCompatibility,
     input: Option<Vec<Modality>>,
@@ -390,15 +460,6 @@ impl ModelMetadata {
                 .or_default()
                 .extend(parameters.clone());
         }
-        let input_limits = match (self.image_resize(), overrides.image_resize()) {
-            (base, None) => base,
-            (base, Some(newer)) => Some(base.map_or(newer, |base| base.overlay(newer))),
-        }
-        .map(|resize| InputLimits {
-            images: Some(ImageLimits {
-                resize: Some(resize),
-            }),
-        });
         Self {
             name: overrides.name.clone().or(self.name),
             context_window: overrides.context_window.or(self.context_window),
@@ -408,7 +469,14 @@ impl ModelMetadata {
                 (Some(base), Some(newer)) => Some(base.overlay(newer)),
                 (base, newer) => newer.or(base),
             },
-            input_limits,
+            input_limits: match (self.input_limits, overrides.input_limits) {
+                (Some(base), Some(newer)) => Some(base.overlay(newer)),
+                (base, newer) => newer.or(base),
+            },
+            prompt_cache: match (self.prompt_cache, overrides.prompt_cache) {
+                (Some(base), Some(newer)) => Some(base.overlay(newer)),
+                (base, newer) => newer.or(base),
+            },
             input: overrides.input.clone().or(self.input),
             ..self
         }
@@ -423,7 +491,8 @@ impl ModelMetadata {
             || self.context_window == Some(0)
             || self.max_tokens == Some(0)
             || self.cost.as_ref().is_some_and(|cost| !cost.valid())
-            || self.image_resize().is_some_and(|resize| !resize.valid())
+            || self.input_limits.is_some_and(|limits| !limits.valid())
+            || self.prompt_cache.is_some_and(|cache| !cache.valid())
         {
             return Err(Error::Config(format!(
                 "invalid model metadata for {}/{id}",
@@ -476,6 +545,18 @@ impl ModelMetadata {
                 .map(str::to_owned)
                 .collect(),
         )
+    }
+
+    pub fn apply_catalog_metadata(&self, model: &mut Value) {
+        if let Some(limits) = self.input_limits {
+            model["inputLimits"] = serde_json::json!(limits);
+        }
+        if let Some(cache) = self.prompt_cache {
+            model["promptCache"] = serde_json::json!(cache);
+        }
+        if let Some(cost) = &self.cost {
+            model["cost"] = cost.value();
+        }
     }
 
     pub fn image_resize(&self) -> Option<ImageResizeProfile> {

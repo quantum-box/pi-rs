@@ -792,12 +792,7 @@ fn model_value(args: &Cli, provider: &super::Provider, model: &str) -> Value {
     let adapter = args.model_profiles.model_adapter(provider, model);
     let mut value = json!({"id":model,"name":name,"provider":provider.id(),"api":adapter.api()});
     if let Some(configured) = configured {
-        if let Some(resize) = configured.image_resize() {
-            value["inputLimits"] = json!({"images":{"resize":resize}});
-        }
-        if let Some(cost) = &configured.cost {
-            value["cost"] = cost.value();
-        }
+        configured.apply_catalog_metadata(&mut value);
         let mut details = pi_rs::ollama::ModelDetails::default();
         configured.apply(adapter, &mut details);
         super::model_listing::with_details(value, Some(&details))
