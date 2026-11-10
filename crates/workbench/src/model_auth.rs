@@ -108,7 +108,11 @@ impl Keys {
                     }
                 };
                 let endpoint = match entry.get("endpoint") {
-                    None => Provider::named(name)?.default_endpoint(),
+                    None => Provider::named(name)
+                        .map(|provider| provider.default_endpoint())
+                        .or_else(|| {
+                            super::operation_models::official_base(&name.to_ascii_lowercase())
+                        })?,
                     Some(value) => value.as_str()?,
                 };
                 Some((
@@ -129,6 +133,20 @@ impl Keys {
             && endpoint == super::radius_auth::DEFAULT_MODEL_ENDPOINT
             && entry.endpoint == "https://radius.pi.dev/messages";
         (entry.endpoint == endpoint || legacy_radius).then_some(&entry.key)
+    }
+
+    pub fn operation_credential(
+        &self,
+        provider: &str,
+        endpoint: &str,
+        official: bool,
+    ) -> Option<&Credential> {
+        let entry = self.entries.get(provider)?;
+        (entry.endpoint == endpoint
+            || (official
+                && super::operation_models::official_base(provider)
+                    == Some(entry.endpoint.as_str())))
+        .then_some(&entry.key)
     }
 
     #[cfg(test)]
@@ -174,7 +192,7 @@ pub(super) fn remove(provider: &Provider) -> Result<bool> {
     Ok(removed)
 }
 
-fn valid_key(key: &str) -> bool {
+pub(super) fn valid_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= 4096 && key.bytes().all(|byte| byte.is_ascii_graphic())
 }
 

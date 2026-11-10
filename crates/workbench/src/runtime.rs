@@ -327,6 +327,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             )));
         }
         if enabled("builtin:codemode")? {
+            extensions.push(Arc::new(super::operation_models::Operations::new(args)?));
             extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
                 inline_budget: args.settings.value()["codemode"]["inlineBudget"]
@@ -532,7 +533,7 @@ fn select_tools(
     let active: Vec<_> = registry
         .tool_specs()
         .into_iter()
-        .filter(|tool| selection.includes(&tool.name))
+        .filter(|tool| tool.name != super::operation_models::TOOL && selection.includes(&tool.name))
         .map(|tool| tool.name)
         .collect();
     registry.set_active_tools(active)?;

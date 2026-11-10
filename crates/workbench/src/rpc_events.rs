@@ -270,6 +270,9 @@ impl Stream {
                 invocation,
                 parent_operation,
             } => {
+                if invocation.call.name == super::operation_models::TOOL {
+                    return;
+                }
                 let parent = self
                     .calls
                     .get(&parent_operation)

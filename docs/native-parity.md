@@ -23,7 +23,7 @@ remaining acceptance work for that surface.
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration, compaction and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Automatic default client metadata identity |
-| Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
+| Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
@@ -2328,3 +2328,18 @@ the same component payload and submit a declared action value.
 An independently compiled native extension verified scrolling, key
 actions, component updates, cancellation and terminal restoration in
 both display modes, as well as the correlated RPC responses.
+
+
+### Native Codemode model operations
+
+Codemode lists classifier and image entries using `models.getModelsOfType`,
+`models.getAvailableOfType`, and `models.getModelOfType`. Scripts invoke System
+One classifiers with `models.classify` and OpenRouter image models with
+`models.generateImages`. Model credentials remain in the native host and
+provider responses enter the same journal as other nested tool calls. Native
+`models.json` also accepts configured entries with `type: "classifier"` or
+`type: "image"` for supported endpoints.
+Classifier and image usage is included in the script result, terminal token
+total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
+catalogues are projected from the published
+[Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).

@@ -56,6 +56,28 @@
     globalThis.searchTools = async (query, options = {}) => JSON.parse(__search_tools(String(query), JSON.stringify(options)));
     globalThis.describeTool = async name => JSON.parse(__describe_tool(String(name))) ?? undefined;
     globalThis.describeNamespace = async name => JSON.parse(__describe_namespace(String(name))) ?? undefined;
+    const callModel = __call_model_operation;
+    const modelType = type => {
+        if (!["chat", "classifier", "image"].includes(type)) throw new Error("Unknown model type");
+        return type;
+    };
+    const listModels = async (type, provider, available, id) => {
+        const reply = JSON.parse(await callModel(JSON.stringify({ action: "list", type: modelType(type), provider, available, id })));
+        if (!reply.ok) throw new Error(reply.error);
+        return reply.value;
+    };
+    const modelOperation = async (action, model, context) => {
+        const { provider = "", id = "" } = model ?? {};
+        const reply = JSON.parse(await callModel(JSON.stringify({ action, provider, id, context })));
+        return reply.ok ? reply.value : { provider, model: id, stopReason: "error", errorMessage: reply.error, ...(action === "classify" ? { answers: {} } : { output: [] }) };
+    };
+    globalThis.models = Object.freeze({
+        getModelsOfType: (type, provider) => listModels(type, provider, false),
+        getAvailableOfType: (type, provider) => listModels(type, provider, true),
+        getModelOfType: async (type, provider, id) => (await listModels(type, provider, false, id))[0],
+        classify: (model, context) => modelOperation("classify", model, context),
+        generateImages: (model, context) => modelOperation("generateImages", model, context),
+    });
     const exitToken = Symbol("exit");
     globalThis.exit = () => { throw exitToken; };
     globalThis.__run = async action => {

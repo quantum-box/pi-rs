@@ -146,6 +146,38 @@ pub struct SessionSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
+pub(super) fn model_operation_usage(
+    records: impl IntoIterator<Item = impl std::borrow::Borrow<pi_rs::Record>>,
+) -> pi_rs_extensions::codemode::ModelUsage {
+    use pi_rs_extensions::codemode::ModelUsage;
+    let mut pending = std::collections::HashSet::new();
+    let mut usage = ModelUsage::default();
+    for record in records {
+        match &record.borrow().event {
+            Event::ToolPlanned { invocation, .. }
+                if invocation.call.name == super::operation_models::TOOL =>
+            {
+                pending.insert(invocation.operation_id);
+            }
+            Event::ToolFinished {
+                operation_id,
+                outcome,
+                ..
+            }
+            | Event::ToolReconciled {
+                operation_id,
+                outcome,
+            } if pending.remove(operation_id) => {
+                if let Some(measured) = ModelUsage::from_outcome(outcome) {
+                    usage.add(&measured);
+                }
+            }
+            _ => {}
+        }
+    }
+    usage
+}
+
 pub fn summary(path: &Path, session: &Session) -> SessionSummary {
     let mut summary = SessionSummary {
         path: path.into(),
@@ -172,6 +204,13 @@ pub fn summary(path: &Path, session: &Session) -> SessionSummary {
             _ => {}
         }
     }
+    let operations = model_operation_usage(session.branch());
+    summary.input_tokens = summary
+        .input_tokens
+        .saturating_add(operations.input)
+        .saturating_add(operations.cache_read)
+        .saturating_add(operations.cache_write);
+    summary.output_tokens = summary.output_tokens.saturating_add(operations.output);
     summary
 }
 

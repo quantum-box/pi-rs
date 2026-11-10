@@ -12,12 +12,13 @@ use rquickjs::{
     AsyncContext, AsyncRuntime, Promise,
     function::{Async, Func},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::tool_search::{SearchDocument, rank};
 
 const ID: &str = "codemode";
+const MODEL_OPERATION: &str = "pi_model_operation";
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 100_000;
 
@@ -64,11 +65,12 @@ impl Extension for Codemode {
         _: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
         let mut declarations = String::new();
-        for tool in request
-            .tools
-            .iter()
-            .filter(|tool| !matches!(tool.name.as_str(), "codemode" | "tool_search"))
-        {
+        for tool in request.tools.iter().filter(|tool| {
+            !matches!(
+                tool.name.as_str(),
+                "codemode" | "tool_search" | MODEL_OPERATION
+            )
+        }) {
             let entry = describe(tool);
             if declarations.len() + entry.len() > self.inline_budget.saturating_mul(4) {
                 break;
@@ -104,7 +106,7 @@ impl Tool for ScriptTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ID.into(),
-            description: "Run JavaScript in a QuickJS sandbox. Use await tools.<name>(args), text(value), image(value), console.log, return, exit(), store(key,value), load(key), ALL_TOOLS, searchTools(query), describeTool(name), and describeNamespace(name). The sandbox has no filesystem, network, Node APIs or timers. Only emitted output reaches the model. A first-line // @options: JSON object may set max_output_tokens and timeout_ms. Store writes commit only after success.".into(),
+            description: "Run JavaScript in a QuickJS sandbox. Use await tools.<name>(args), models.getAvailableOfType(type), models.classify(model, context), models.generateImages(model, context), text(value), image(value), console.log, return, exit(), store(key,value), load(key), ALL_TOOLS, searchTools(query), describeTool(name), and describeNamespace(name). The sandbox has no filesystem, network, Node APIs or timers. Only emitted output reaches the model. A first-line // @options: JSON object may set max_output_tokens and timeout_ms. Store writes commit only after success.".into(),
             parameters: json!({"type":"object","properties":{"code":{"type":"string","minLength":1}},"required":["code"],"additionalProperties":false}),
         }
     }
@@ -273,7 +275,12 @@ async fn evaluate(
     let documents: Arc<Vec<_>> = Arc::new(
         host.tools()
             .into_iter()
-            .filter(|tool| !matches!(tool.name.as_str(), "codemode" | "tool_search"))
+            .filter(|tool| {
+                !matches!(
+                    tool.name.as_str(),
+                    "codemode" | "tool_search" | MODEL_OPERATION
+                )
+            })
             .map(|tool| SearchDocument {
                 namespace: tool_namespace(&tool.name),
                 tool,
@@ -328,6 +335,7 @@ fn install_globals(
         ctx.json_parse(serde_json::to_string(&catalogue).unwrap())?,
     )?;
     globals.set("__initial_store", ctx.json_parse(store.to_string())?)?;
+    let model_usage = sink.clone();
     globals.set(
         "__emit",
         Func::from(move |kind: String, value: String| {
@@ -338,13 +346,52 @@ fn install_globals(
                 .unwrap_or_default()
         }),
     )?;
+    let model_host = host.clone();
+    let has_operations = model_host
+        .tools()
+        .iter()
+        .any(|tool| tool.name == MODEL_OPERATION);
+    let model_slots = Arc::new(tokio::sync::Semaphore::new(4));
+    globals.set(
+        "__call_model_operation",
+        Func::from(Async(move |arguments: String| {
+            let model_host = model_host.clone();
+            let slots = model_slots.clone();
+            let model_usage = model_usage.clone();
+            async move {
+                let result = match serde_json::from_str::<Value>(&arguments) {
+                    Ok(args) if has_operations => {
+                        let _permit = slots.acquire().await.expect("model operation slots");
+                        let outcome = model_host.call(MODEL_OPERATION, args).await;
+                        if let Some(usage) = ModelUsage::from_outcome(&outcome) {
+                            model_usage
+                                .lock()
+                                .expect("codemode output")
+                                .model_usage
+                                .add(&usage);
+                        }
+                        tool_value(outcome)
+                    }
+                    Ok(args) if args["action"] == "list" => json!({"ok":true,"value":[]}),
+                    Ok(_) => json!({"ok":false,"error":"native model operations are unavailable"}),
+                    Err(error) => json!({"ok":false,"error":error.to_string()}),
+                };
+                Ok::<_, rquickjs::Error>(result.to_string())
+            }
+        })),
+    )?;
     globals.set(
         "__call_tool",
         Func::from(Async(move |name: String, arguments: String| {
             let host = host.clone();
             async move {
                 let result = match serde_json::from_str(&arguments) {
-                    Ok(_) if matches!(name.as_str(), "codemode" | "tool_search") => {
+                    Ok(_)
+                        if matches!(
+                            name.as_str(),
+                            "codemode" | "tool_search" | MODEL_OPERATION
+                        ) =>
+                    {
                         json!({"ok":false,"error":"This tool is not callable from a script"})
                     }
                     Ok(arguments) => tool_value(host.call(&name, arguments).await),
@@ -440,12 +487,61 @@ fn typescript(schema: &Value) -> String {
     }
 }
 
+/// Usage reported by provider operations invoked from a native script.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub total_tokens: u64,
+    pub cost: ModelCost,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub total: f64,
+}
+
+impl ModelUsage {
+    pub fn from_outcome(outcome: &Outcome) -> Option<Self> {
+        let Outcome::Structured { data, .. } = outcome else {
+            return None;
+        };
+        serde_json::from_value(data.get("usage")?.clone()).ok()
+    }
+
+    pub fn add(&mut self, usage: &Self) {
+        self.input = self.input.saturating_add(usage.input);
+        self.output = self.output.saturating_add(usage.output);
+        self.cache_read = self.cache_read.saturating_add(usage.cache_read);
+        self.cache_write = self.cache_write.saturating_add(usage.cache_write);
+        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+        self.cost.input += usage.cost.input;
+        self.cost.output += usage.cost.output;
+        self.cost.cache_read += usage.cost.cache_read;
+        self.cost.cache_write += usage.cost.cache_write;
+        self.cost.total += usage.cost.total;
+    }
+
+    pub fn measured(&self) -> bool {
+        self.total_tokens != 0 || self.cost.total != 0.0
+    }
+}
+
 #[derive(Default)]
 struct Output {
     items: Vec<Item>,
     console: Vec<String>,
     bytes: usize,
     calls: usize,
+    model_usage: ModelUsage,
     saved_images: std::collections::BTreeMap<String, std::result::Result<String, String>>,
 }
 enum Item {
@@ -619,7 +715,11 @@ impl Output {
         if omitted != 0 {
             content.push(json!({"type":"text","text":format!("{omitted} image(s) omitted from inline output because of the result size limit. Image locations and save errors are included in the text output.")}));
         }
-        json!({"content":content,"isError":!success,"full_output_path":full_output_path,"wall_time_seconds":elapsed.as_secs_f64()})
+        let mut result = json!({"content":content,"isError":!success,"full_output_path":full_output_path,"wall_time_seconds":elapsed.as_secs_f64()});
+        if self.model_usage.measured() {
+            result["usage"] = json!(self.model_usage);
+        }
+        result
     }
 }
 

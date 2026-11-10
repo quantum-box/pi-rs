@@ -330,6 +330,7 @@ struct View {
     scrollbar_dragging: bool,
     flash: Option<(String, Instant)>,
     tokens: u64,
+    model_operations: std::collections::HashSet<String>,
     history: Vec<String>,
     history_index: Option<usize>,
     request_started: Option<Instant>,
@@ -563,6 +564,7 @@ impl View {
         self.history.clear();
         self.history_index = None;
         self.tokens = 0;
+        self.model_operations.clear();
         for record in session.branch() {
             match &record.event {
                 pi_rs::Event::User { content, .. }
@@ -675,6 +677,11 @@ impl View {
         }
     }
     fn add_tool(&mut self, invocation: &pi_rs::Invocation) {
+        if invocation.call.name == super::operation_models::TOOL {
+            self.model_operations
+                .insert(invocation.operation_id.to_string());
+            return;
+        }
         self.lines.push(Entry::Tool {
             id: invocation.operation_id.to_string(),
             name: invocation.call.name.clone(),
@@ -687,6 +694,12 @@ impl View {
         });
     }
     fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
+        if self.model_operations.remove(operation) {
+            if let Some(usage) = pi_rs_extensions::codemode::ModelUsage::from_outcome(outcome) {
+                self.tokens = self.tokens.saturating_add(usage.total_tokens);
+            }
+            return;
+        }
         let rendered_parts = if self.graphics.enabled() {
             match outcome {
                 pi_rs::Outcome::Structured { data, .. } => data["content"]

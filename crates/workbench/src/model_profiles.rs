@@ -16,6 +16,7 @@ pub(super) struct Profiles {
     entries: BTreeMap<String, Profile>,
     revision: String,
     radius_endpoint: Option<String>,
+    operations: super::operation_models::Catalogue,
 }
 
 #[derive(Clone)]
@@ -123,6 +124,8 @@ struct ConfiguredProfile {
 #[derive(Clone, Deserialize)]
 struct ConfiguredModel {
     id: String,
+    #[serde(rename = "type")]
+    kind: Option<String>,
     #[serde(flatten)]
     metadata: ModelMetadata,
 }
@@ -293,12 +296,14 @@ impl Profiles {
     }
 
     fn parse(data: &Value) -> Result<Self> {
-        let Some(providers) = data.get("providers") else {
-            return Ok(Self::default());
+        let empty = serde_json::Map::new();
+        let providers = match data.get("providers") {
+            Some(providers) => providers
+                .as_object()
+                .ok_or_else(|| Error::Config("models.json providers must be an object".into()))?,
+            None => &empty,
         };
-        let providers = providers
-            .as_object()
-            .ok_or_else(|| Error::Config("models.json providers must be an object".into()))?;
+        let operations = super::operation_models::Catalogue::parse(providers)?;
         let mut entries = BTreeMap::new();
         for (name, entry) in providers {
             let provider = if let Some(provider) = Provider::named(name) {
@@ -342,6 +347,9 @@ impl Profiles {
                 || Ok(provider.default_endpoint().to_owned()),
                 |base| endpoint_from_base(&provider, base),
             )?;
+            profile
+                .models
+                .retain(|model| model.kind.as_deref().is_none_or(|kind| kind == "chat"));
             let mut ids = std::collections::BTreeSet::new();
             for model in &mut profile.models {
                 model.metadata.validate(&provider, &model.id)?;
@@ -383,7 +391,12 @@ impl Profiles {
             entries,
             revision,
             radius_endpoint: None,
+            operations,
         })
+    }
+
+    pub fn operations(&self) -> &super::operation_models::Catalogue {
+        &self.operations
     }
 
     pub fn revision(&self) -> &str {

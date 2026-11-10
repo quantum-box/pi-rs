@@ -755,7 +755,24 @@ pub(super) fn snapshot_response(
             Ok(data)
         }
         "get_session_stats" => {
-            let mut stats = serde_json::to_value(session.statistics())?;
+            let mut native = session.statistics();
+            let operations = super::sessions::model_operation_usage(session.records());
+            native.tokens.input = native.tokens.input.saturating_add(operations.input);
+            native.tokens.output = native.tokens.output.saturating_add(operations.output);
+            native.tokens.cache_read = native
+                .tokens
+                .cache_read
+                .saturating_add(operations.cache_read);
+            native.tokens.cache_write = native
+                .tokens
+                .cache_write
+                .saturating_add(operations.cache_write);
+            native.tokens.total = native.tokens.total.saturating_add(operations.total_tokens);
+            native.cost = native.cost.map(|cost| cost + operations.cost.total);
+            let mut stats = serde_json::to_value(native)?;
+            if operations.measured() {
+                stats["operationUsage"] = serde_json::to_value(operations)?;
+            }
             stats["sessionFile"] = json!(path);
             if let Some(usage) = context_window.and_then(|window| session.context_usage(window)) {
                 stats["contextUsage"] = serde_json::to_value(usage)?;
