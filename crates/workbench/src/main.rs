@@ -437,8 +437,24 @@ enum Control {
     Cancel,
 }
 
+fn main() {
+    #[cfg(windows)]
+    {
+        // Windows executables start with a smaller stack than Unix binaries.
+        std::thread::Builder::new()
+            .name("pi".into())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(run_cli)
+            .expect("start Pi runtime thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+    #[cfg(not(windows))]
+    run_cli();
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn run_cli() {
     let matches = cli_compat::parse(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let result = async {
         let mut args =
@@ -495,7 +511,7 @@ async fn main() {
         if matches.value_source("session") != Some(clap::parser::ValueSource::CommandLine) {
             args.session = interactive::session_path(&args.workspace, args.session_dir.as_deref());
         }
-        execute(args).await
+        Box::pin(execute(args)).await
     }
     .await;
     if let Err(err) = result {
