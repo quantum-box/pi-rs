@@ -133,6 +133,12 @@ pub enum Notification<'a> {
     Reasoning(&'a str),
     /// Transient tool call fragments. Tool dispatch uses only the completed response.
     ToolCallDelta(&'a crate::ToolCallDelta),
+    /// A non-fatal failure in an observing extension hook.
+    ExtensionLifecycleError {
+        extension: &'a str,
+        event: &'static str,
+        message: &'a str,
+    },
 }
 
 pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
@@ -238,6 +244,20 @@ impl Agent<'_> {
             },
             observer,
         )?;
+        let lifecycle = crate::lifecycle::enabled(self.registry);
+        if lifecycle {
+            self.observe_lifecycle(
+                crate::LifecycleEvent::AgentStart {
+                    session_id: session.session_id(),
+                    run_id,
+                    model: self.model_name.into(),
+                },
+                &session.extension_states(),
+                Some(cancel),
+                observer,
+            )
+            .await;
+        }
         let mut retry_attempt = 0;
         let mut retry_observer = |event: Notification<'_>| {
             match &event {
@@ -292,7 +312,52 @@ impl Agent<'_> {
             },
             observer,
         )?;
+        if lifecycle {
+            let messages = crate::lifecycle::messages(session, |id| {
+                session.records().get((id - 1) as usize).is_some_and(|record| {
+                    record.run_id == Some(run_id)
+                        || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)
+                })
+            });
+            self.observe_lifecycle(
+                crate::LifecycleEvent::AgentEnd {
+                    session_id: session.session_id(),
+                    run_id,
+                    state,
+                    messages,
+                },
+                &session.extension_states(),
+                None,
+                observer,
+            )
+            .await;
+        }
         result
+    }
+
+    async fn observe_lifecycle(
+        &self,
+        event: crate::LifecycleEvent,
+        states: &ExtensionStates,
+        cancel: Option<&CancellationToken>,
+        observer: &mut Observer<'_>,
+    ) {
+        let notify = crate::lifecycle::notify(
+            self.registry,
+            event,
+            states,
+            self.limits.model_timeout,
+            observer,
+        );
+        if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {}
+                _ = notify => {}
+            }
+        } else {
+            notify.await;
+        }
     }
 
     async fn drive<T: Into<AgentInput> + Send>(
@@ -379,6 +444,8 @@ impl Agent<'_> {
         let mut budget = self.limits.output_tokens_per_run;
         let mut compacted = false;
         let mut retry_attempt = 0;
+        let lifecycle = crate::lifecycle::enabled(self.registry);
+        let mut turn_index = 0;
         for request_index in 0..self.limits.model_requests {
             let update = tokio::select! {
                 biased;
@@ -403,9 +470,20 @@ impl Agent<'_> {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
+            let turn_start = |recovered| crate::LifecycleEvent::TurnStart {
+                run_id,
+                turn_index,
+                timestamp: crate::lifecycle::now(),
+                recovered,
+            };
             let (reply, advertised, allowance) = if let Some((request, metadata, usage, recorded)) =
                 pending.take()
             {
+                if lifecycle {
+                    active
+                        .observe_lifecycle(turn_start(true), &states, Some(cancel), observer)
+                        .await;
+                }
                 active.settle_usage(request, &usage, &metadata).await?;
                 let allowance = recorded
                     .max_output_tokens
@@ -516,6 +594,11 @@ impl Agent<'_> {
                 let advertised: HashSet<_> =
                     request.tools.iter().map(|spec| spec.name.clone()).collect();
                 let allowance = request.max_output_tokens;
+                if lifecycle && retry_attempt == 0 {
+                    active
+                        .observe_lifecycle(turn_start(false), &states, Some(cancel), observer)
+                        .await;
+                }
                 let result = active
                     .reply(session, request, true, cancel, observer, Some(followups))
                     .await?
@@ -584,6 +667,7 @@ impl Agent<'_> {
                 },
                 observer,
             )?;
+            let assistant_record = session.head();
 
             let dispatch_update = if invocations.is_empty() {
                 Ok(None)
@@ -630,6 +714,23 @@ impl Agent<'_> {
                 return Err(err);
             }
 
+            if lifecycle {
+                let messages = crate::lifecycle::messages(session, |id| id >= assistant_record);
+                dispatcher
+                    .observe_lifecycle(
+                        crate::LifecycleEvent::TurnEnd {
+                            run_id,
+                            turn_index,
+                            messages,
+                        },
+                        &states,
+                        Some(cancel),
+                        observer,
+                    )
+                    .await;
+            }
+            turn_index += 1;
+
             if let Some(update) = dispatch_update {
                 runtime_registry = update.registry;
                 if let Some(prompt) = update.system_prompt {
@@ -638,7 +739,6 @@ impl Agent<'_> {
             }
 
             if let Some(answer) = answer {
-                let assistant_record = session.head();
                 commit(session, Event::TurnFinished { assistant_record }, observer)?;
                 queue_inputs(session, followups, observer)?;
                 if cancel.is_cancelled() {

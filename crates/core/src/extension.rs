@@ -228,6 +228,19 @@ pub trait Extension: Send + Sync {
         Ok(InputAction::Continue)
     }
 
+    fn handles_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Observe a run or turn boundary after the preceding journal records are committed.
+    async fn lifecycle(
+        &self,
+        _event: &crate::LifecycleEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
+    }
+
     /// Release long-lived clients and subprocesses owned by this extension.
     async fn shutdown(&self) -> ExtensionResult<()> {
         Ok(())

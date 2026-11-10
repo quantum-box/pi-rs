@@ -1421,6 +1421,19 @@ fn observe(event: Notification<'_>, trace: bool) {
         Notification::ToolCallDelta(delta) if trace => {
             output(json!({"type":"tool_call_delta","toolCallDelta":delta}))
         }
+        Notification::ExtensionLifecycleError {
+            extension,
+            event,
+            message,
+        } => {
+            if TEXT_OUTPUT.load(Ordering::Relaxed) {
+                eprintln!("Extension {extension} ({event}): {message}");
+            } else {
+                output(
+                    json!({"type":"extension_error","extension":extension,"event":event,"message":message}),
+                );
+            }
+        }
         _ => {}
     }
 }

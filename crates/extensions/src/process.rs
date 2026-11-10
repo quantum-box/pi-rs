@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use pi_rs_core::{
     CancellationToken, Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState,
-    InputAction, InputEvent, Message, ModelRequest, Outcome, RequestPurpose, Result, Tool,
-    ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec,
+    InputAction, InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RequestPurpose,
+    Result, Tool, ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,6 +87,10 @@ enum ProtocolRequest {
         event: InputEvent,
         state: Option<ExtensionState>,
     },
+    Lifecycle {
+        event: LifecycleEvent,
+        state: Option<ExtensionState>,
+    },
     BeforeRequest {
         request: ModelRequest,
         summary: bool,
@@ -150,6 +154,8 @@ struct Description {
     host_calls: bool,
     #[serde(default)]
     input_hook: bool,
+    #[serde(default)]
+    lifecycle_hook: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
@@ -220,6 +226,18 @@ impl ExecutableExtension {
     ) -> ExtensionResult<T> {
         call(&self.executable, request, None)
     }
+
+    async fn request_async<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        request: ProtocolRequest,
+    ) -> ExtensionResult<T> {
+        let path = self.executable.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+            .await
+            .map_err(|error| error.to_string())?
+    }
 }
 
 #[async_trait::async_trait]
@@ -270,16 +288,25 @@ impl Extension for ExecutableExtension {
         event: &InputEvent,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<InputAction> {
-        let request = ProtocolRequest::Input {
+        self.request_async(ProtocolRequest::Input {
             event: event.clone(),
             state: state.cloned(),
-        };
-        let path = self.executable.clone();
-        let guard = CancelOnDrop(CancellationToken::new());
-        let cancelled = guard.0.clone();
-        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
-            .await
-            .map_err(|error| error.to_string())?
+        })
+        .await
+    }
+    fn handles_lifecycle(&self) -> bool {
+        self.description.lifecycle_hook
+    }
+    async fn lifecycle(
+        &self,
+        event: &LifecycleEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        self.request_async(ProtocolRequest::Lifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
     }
     fn migrate(
         &self,
@@ -313,13 +340,7 @@ impl Extension for ExecutableExtension {
             summary: purpose == RequestPurpose::Summary,
             state: state.cloned(),
         };
-        let path = self.executable.clone();
-        let guard = CancelOnDrop(CancellationToken::new());
-        let cancelled = guard.0.clone();
-        let mut updated =
-            tokio::task::spawn_blocking(move || call(&path, message, Some(&cancelled)))
-                .await
-                .map_err(|error| error.to_string())??;
+        let mut updated = self.request_async(message).await?;
         restore_provider_replay(request, &mut updated);
         *request = updated;
         Ok(())
@@ -1000,6 +1021,7 @@ async fn dispatch_with_host(
                 .collect(),
             host_calls: true,
             input_hook: extension.handles_input(),
+            lifecycle_hook: extension.handles_lifecycle(),
             tools: extension
                 .tools()
                 .into_iter()
@@ -1027,6 +1049,9 @@ async fn dispatch_with_host(
         }
         ProtocolRequest::Input { event, state } => {
             encode(extension.input(&event, state.as_ref()).await)
+        }
+        ProtocolRequest::Lifecycle { event, state } => {
+            encode(extension.lifecycle(&event, state.as_ref()).await)
         }
         ProtocolRequest::BeforeRequest {
             mut request,

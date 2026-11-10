@@ -760,6 +760,12 @@ impl View {
                 "Error › {}",
                 value["message"].as_str().unwrap_or_default()
             )),
+            Some("extension_error") => self.append(&format!(
+                "Extension {} ({}) · {}",
+                value["extension"].as_str().unwrap_or_default(),
+                value["event"].as_str().unwrap_or_default(),
+                value["message"].as_str().unwrap_or_default()
+            )),
             Some("record") => {
                 let event = &value["record"]["event"];
                 match event["type"].as_str() {

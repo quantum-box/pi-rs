@@ -23,6 +23,11 @@ pub enum SessionEvent {
     Text(String),
     Reasoning(String),
     ToolCallDelta(crate::ToolCallDelta),
+    ExtensionLifecycleError {
+        extension: String,
+        event: &'static str,
+        message: String,
+    },
     Retry(crate::RetryEvent),
     QueueUpdated {
         steering: Vec<String>,
@@ -838,6 +843,15 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         Notification::Text(text) => SessionEvent::Text((*text).into()),
         Notification::Reasoning(text) => SessionEvent::Reasoning((*text).into()),
         Notification::ToolCallDelta(delta) => SessionEvent::ToolCallDelta((*delta).clone()),
+        Notification::ExtensionLifecycleError {
+            extension,
+            event,
+            message,
+        } => SessionEvent::ExtensionLifecycleError {
+            extension: (*extension).into(),
+            event,
+            message: (*message).into(),
+        },
         Notification::Retry(event) => SessionEvent::Retry(event.clone()),
         Notification::SummaryRequest => return,
         Notification::QueueUpdated {
