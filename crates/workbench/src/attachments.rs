@@ -2,14 +2,17 @@
 use std::path::Path;
 
 use pi_rs::{Error, ImageContent, Result};
+use pi_rs_workbench::image_profile::ImageResizeProfile;
 
 pub fn expand(
     arguments: &[String],
     workspace: &Path,
     auto_resize: bool,
+    profile: Option<ImageResizeProfile>,
 ) -> Result<(String, Vec<ImageContent>)> {
-    let tools =
-        pi_rs_workbench::coding::CodingTools::local(workspace)?.with_image_resize(auto_resize);
+    let tools = pi_rs_workbench::coding::CodingTools::local(workspace)?
+        .with_image_resize(auto_resize)
+        .with_image_profile(profile);
     let mut files = String::new();
     let mut messages = Vec::new();
     let mut images = Vec::new();
@@ -50,12 +53,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("Capture d’ecran.md");
         std::fs::write(&file, "fallback attachment").unwrap();
-        let (text, images) =
-            expand(&["@Capture d'ecran.md".into()], directory.path(), true).unwrap();
+        let (text, images) = expand(
+            &["@Capture d'ecran.md".into()],
+            directory.path(),
+            true,
+            None,
+        )
+        .unwrap();
         assert!(text.contains("fallback attachment"));
         assert!(images.is_empty());
         let url = reqwest::Url::from_file_path(&file).unwrap();
-        let (text, _) = expand(&[format!("@{url}")], directory.path(), true).unwrap();
+        let (text, _) = expand(&[format!("@{url}")], directory.path(), true, None).unwrap();
         assert!(text.contains("fallback attachment"));
     }
 
@@ -70,13 +78,14 @@ mod tests {
             &["@note.md".into(), "@image.png".into(), "describe".into()],
             directory.path(),
             true,
+            None,
         )
         .unwrap();
         assert!(text.contains("attachment marker\n"));
         assert!(text.ends_with("describe"));
         assert_eq!(images.len(), 1);
         images[0].validate().unwrap();
-        assert!(expand(&["@missing".into()], directory.path(), true).is_err());
+        assert!(expand(&["@missing".into()], directory.path(), true, None).is_err());
     }
 
     #[test]
@@ -89,14 +98,14 @@ mod tests {
             .save(&path)
             .unwrap();
         let input = ["@photo.jpg".into()];
-        let (_, original) = expand(&input, directory.path(), false).unwrap();
+        let (_, original) = expand(&input, directory.path(), false, None).unwrap();
         assert_eq!(original[0].mime_type, "image/jpeg");
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&original[0].data)
             .unwrap();
         assert_eq!(bytes, std::fs::read(&path).unwrap());
 
-        let (_, resized) = expand(&input, directory.path(), true).unwrap();
+        let (_, resized) = expand(&input, directory.path(), true, None).unwrap();
         assert_eq!(resized[0].mime_type, "image/png");
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&resized[0].data)

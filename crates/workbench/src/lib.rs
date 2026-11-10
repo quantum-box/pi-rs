@@ -18,6 +18,7 @@ const MAX_COMMAND_INPUT: u64 = 1024 * 1024;
 pub mod coding;
 mod coding_paths;
 mod file_search;
+pub mod image_profile;
 pub mod mcp;
 pub mod mcp_auth;
 mod mcp_provider_auth;

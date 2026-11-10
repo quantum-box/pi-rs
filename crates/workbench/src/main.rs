@@ -314,6 +314,15 @@ impl Cli {
         }
     }
 
+    fn model_image_resize(&self) -> Option<pi_rs_workbench::image_profile::ImageResizeProfile> {
+        if !self.settings.resize_model_images() {
+            return None;
+        }
+        self.model_profiles
+            .model(&self.provider, &self.model)?
+            .image_resize()
+    }
+
     fn allow_model_probes(&self) -> bool {
         self.allow_endpoint_probes(self.model_endpoint_for(&self.provider, Some(&self.model)))
     }
@@ -1128,6 +1137,7 @@ async fn execute(mut args: Cli) -> Result<()> {
             &args.prompt,
             &args.workspace,
             args.settings.resize_model_images(),
+            args.model_image_resize(),
         )?;
         args.initial_images = images;
         if !std::io::stdin().is_terminal() && !args.stdin_control {

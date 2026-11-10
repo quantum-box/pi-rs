@@ -578,8 +578,13 @@ impl Operations {
                     "api":adapter.api(),
                     "input":if detail.images == Some(true) { vec!["text", "image"] } else { vec!["text"] },
                 });
-                if let Some(cost) = metadata.and_then(|metadata| metadata.cost) {
-                    model["cost"] = cost.value();
+                if let Some(metadata) = metadata {
+                    if let Some(resize) = metadata.image_resize() {
+                        model["inputLimits"] = json!({"images":{"resize":resize}});
+                    }
+                    if let Some(cost) = metadata.cost {
+                        model["cost"] = cost.value();
+                    }
                 }
                 if let Some(window) = detail.context_window {
                     model["contextWindow"] = json!(window);

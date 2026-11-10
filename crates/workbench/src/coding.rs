@@ -25,6 +25,7 @@ pub struct CodingTools {
     unrestricted: bool,
     shell: ShellConfig,
     auto_resize_images: bool,
+    image_profile: Option<crate::image_profile::ImageResizeProfile>,
 }
 
 impl CodingTools {
@@ -38,6 +39,7 @@ impl CodingTools {
             unrestricted: false,
             shell: ShellConfig::default(),
             auto_resize_images: true,
+            image_profile: None,
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -53,6 +55,14 @@ impl CodingTools {
 
     pub fn with_image_resize(mut self, enabled: bool) -> Self {
         self.auto_resize_images = enabled;
+        self
+    }
+
+    pub fn with_image_profile(
+        mut self,
+        profile: Option<crate::image_profile::ImageResizeProfile>,
+    ) -> Self {
+        self.image_profile = profile;
         self
     }
 
@@ -121,6 +131,7 @@ impl CodingTools {
             shell: self.shell.clone(),
             kind: Kind::Read {
                 auto_resize: self.auto_resize_images,
+                profile: self.image_profile,
             },
         }
         .path(
@@ -137,6 +148,7 @@ impl CodingTools {
             shell: self.shell.clone(),
             kind: Kind::Read {
                 auto_resize: self.auto_resize_images,
+                profile: self.image_profile,
             },
         };
         let name = path
@@ -171,6 +183,7 @@ impl Extension for CodingTools {
         let mut kinds = vec![
             Kind::Read {
                 auto_resize: self.auto_resize_images,
+                profile: self.image_profile,
             },
             Kind::Write,
             Kind::Edit,
@@ -200,7 +213,10 @@ impl Extension for CodingTools {
 
 #[derive(Clone, Copy)]
 enum Kind {
-    Read { auto_resize: bool },
+    Read {
+        auto_resize: bool,
+        profile: Option<crate::image_profile::ImageResizeProfile>,
+    },
     Write,
     Edit,
     Bash,
@@ -434,38 +450,55 @@ impl CodingTool {
         if path.metadata()?.len() > 20 * 1024 * 1024 {
             return Err(Error::Config("image exceeds 20 MiB".into()));
         }
-        let (bytes, mime_type, source, output) =
-            if matches!(self.kind, Kind::Read { auto_resize: false }) {
-                let mime_type = format.to_mime_type();
-                if !matches!(
-                    mime_type,
-                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                ) {
-                    return Err(Error::Config("unsupported image format".into()));
-                }
-                let mut bytes = Vec::new();
-                reader
-                    .into_inner()
-                    .take((MAX_ORIGINAL_IMAGE_BYTES + 1) as u64)
-                    .read_to_end(&mut bytes)?;
-                if bytes.len() > MAX_ORIGINAL_IMAGE_BYTES {
-                    return Err(Error::Config(
-                        "image exceeds the 6 MiB original image limit".into(),
-                    ));
-                }
-                let dimensions = image::ImageReader::with_format(Cursor::new(&bytes), format)
-                    .into_dimensions()
-                    .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
-                (bytes, mime_type, dimensions, dimensions)
-            } else {
-                let prepared = normalize_image(reader)?;
-                (
-                    prepared.png,
-                    "image/png",
-                    (prepared.source_width, prepared.source_height),
-                    (prepared.width, prepared.height),
-                )
-            };
+        let (bytes, mime_type, source, output) = if matches!(
+            self.kind,
+            Kind::Read {
+                auto_resize: false,
+                ..
+            }
+        ) {
+            let mime_type = format.to_mime_type();
+            if !matches!(
+                mime_type,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            ) {
+                return Err(Error::Config("unsupported image format".into()));
+            }
+            let mut bytes = Vec::new();
+            reader
+                .into_inner()
+                .take((MAX_ORIGINAL_IMAGE_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_ORIGINAL_IMAGE_BYTES {
+                return Err(Error::Config(
+                    "image exceeds the 6 MiB original image limit".into(),
+                ));
+            }
+            let dimensions = image::ImageReader::with_format(Cursor::new(&bytes), format)
+                .into_dimensions()
+                .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
+            (bytes, mime_type, dimensions, dimensions)
+        } else if let Kind::Read {
+            profile: Some(profile),
+            ..
+        } = self.kind
+        {
+            let prepared = crate::image_profile::normalize(reader, profile)?;
+            (
+                prepared.bytes,
+                prepared.mime_type,
+                prepared.source,
+                prepared.output,
+            )
+        } else {
+            let prepared = normalize_image(reader)?;
+            (
+                prepared.png,
+                "image/png",
+                (prepared.source_width, prepared.source_height),
+                (prepared.width, prepared.height),
+            )
+        };
         Ok(Some(json!({"content":[
             {"type":"text","text":format!("Read image {} ({}×{}, provided at {}×{})",path.display(),source.0,source.1,output.0,output.1)},
             {"type":"image","mimeType":mime_type,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}
@@ -1302,7 +1335,10 @@ mod tests {
             root: directory.path().canonicalize().unwrap(),
             unrestricted: false,
             shell: ShellConfig::default(),
-            kind: Kind::Read { auto_resize: true },
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+            },
         };
         let value = tool
             .read_image(&json!({"path":"sample.png"}))
@@ -1328,14 +1364,20 @@ mod tests {
             root: workspace.clone(),
             unrestricted: false,
             shell: ShellConfig::default(),
-            kind: Kind::Read { auto_resize: true },
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+            },
         };
         assert!(scoped.path(skill.to_str().unwrap()).is_err());
         let local = CodingTool {
             root: workspace,
             unrestricted: true,
             shell: ShellConfig::default(),
-            kind: Kind::Read { auto_resize: true },
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+            },
         };
         assert_eq!(
             local.read(&json!({"path":skill})).unwrap().tool_content(),
@@ -1399,7 +1441,10 @@ mod tests {
             .unwrap();
         let url = reqwest::Url::from_file_path(root.path().join("nested/some file.txt")).unwrap();
         let reader = CodingTool {
-            kind: Kind::Read { auto_resize: true },
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+            },
             ..tool
         };
         assert_eq!(

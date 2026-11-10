@@ -1,6 +1,7 @@
 //! Clipboard reads happen only after an explicit paste action.
 use base64::Engine;
 use pi_rs::{Error, ImageContent, Result};
+use pi_rs_workbench::image_profile::{self, ImageResizeProfile};
 
 #[derive(Debug)]
 pub enum Content {
@@ -8,7 +9,7 @@ pub enum Content {
     Files(Vec<std::path::PathBuf>),
     Image(ImageContent),
 }
-pub fn read(auto_resize: bool) -> Result<Content> {
+pub fn read(auto_resize: bool, profile: Option<ImageResizeProfile>) -> Result<Content> {
     let mut clipboard = arboard::Clipboard::new()
         .map_err(|error| Error::Config(format!("clipboard unavailable: {error}")))?;
     if let Ok(paths) = clipboard.get().file_list()
@@ -18,7 +19,7 @@ pub fn read(auto_resize: bool) -> Result<Content> {
         return Ok(Content::Files(paths));
     }
     match clipboard.get_image() {
-        Ok(image) => Ok(Content::Image(prepare(image, auto_resize)?)),
+        Ok(image) => Ok(Content::Image(prepare(image, auto_resize, profile)?)),
         Err(_) => clipboard.get_text().map(Content::Text).map_err(|error| {
             Error::Config(format!(
                 "clipboard contains no readable files, image or text: {error}"
@@ -56,7 +57,11 @@ pub fn file_text(paths: &[std::path::PathBuf], shell: bool) -> Result<String> {
     Ok(formatted.join(if shell { " " } else { "\n" }))
 }
 
-fn prepare(image: arboard::ImageData<'_>, auto_resize: bool) -> Result<ImageContent> {
+fn prepare(
+    image: arboard::ImageData<'_>,
+    auto_resize: bool,
+    profile: Option<ImageResizeProfile>,
+) -> Result<ImageContent> {
     let size = image
         .width
         .checked_mul(image.height)
@@ -72,10 +77,15 @@ fn prepare(image: arboard::ImageData<'_>, auto_resize: bool) -> Result<ImageCont
         .map_err(|_| Error::Config("clipboard image is too tall".into()))?;
     let pixels = image::RgbaImage::from_raw(width, height, image.bytes.into_owned())
         .ok_or_else(|| Error::Config("invalid clipboard pixels".into()))?;
-    let prepared = pi_rs_workbench::coding::prepare_image_with_resize(
-        image::DynamicImage::ImageRgba8(pixels),
-        auto_resize,
-    )?;
+    let pixels = image::DynamicImage::ImageRgba8(pixels);
+    if auto_resize && let Some(profile) = profile {
+        let prepared = image_profile::prepare_pixels(pixels, profile)?;
+        return Ok(ImageContent {
+            data: base64::engine::general_purpose::STANDARD.encode(prepared.bytes),
+            mime_type: prepared.mime_type.into(),
+        });
+    }
+    let prepared = pi_rs_workbench::coding::prepare_image_with_resize(pixels, auto_resize)?;
     Ok(ImageContent {
         data: base64::engine::general_purpose::STANDARD.encode(prepared.png),
         mime_type: "image/png".into(),
@@ -115,6 +125,7 @@ mod tests {
                 bytes: Cow::Borrowed(&[255, 0, 0, 80]),
             },
             true,
+            None,
         )
         .unwrap();
         let bytes = base64::engine::general_purpose::STANDARD
@@ -129,7 +140,8 @@ mod tests {
                     height: 2,
                     bytes: Cow::Borrowed(&[])
                 },
-                true
+                true,
+                None,
             )
             .is_err()
         );
@@ -140,7 +152,8 @@ mod tests {
                     height: 1,
                     bytes: Cow::Borrowed(&[0; 4])
                 },
-                true
+                true,
+                None,
             )
             .is_err()
         );

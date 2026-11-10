@@ -438,7 +438,8 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
         registry.register(Arc::new(
             CodingTools::local(&args.workspace)?
                 .with_shell_config(shell.clone())
-                .with_image_resize(args.settings.resize_model_images()),
+                .with_image_resize(args.settings.resize_model_images())
+                .with_image_profile(args.model_image_resize()),
         ))?;
         let system_prompt = select_tools(
             &mut registry,

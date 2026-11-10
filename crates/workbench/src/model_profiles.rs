@@ -4,6 +4,7 @@ use std::sync::{Arc, LazyLock};
 
 use pi_rs::ollama::ChatCompatibility;
 use pi_rs::{Error, Result};
+use pi_rs_workbench::image_profile::ImageResizeProfile;
 use regex::{Captures, Regex};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
@@ -313,6 +314,16 @@ impl ChatPrice {
 }
 
 #[derive(Clone, Default, Deserialize)]
+struct InputLimits {
+    images: Option<ImageLimits>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct ImageLimits {
+    resize: Option<ImageResizeProfile>,
+}
+
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ModelMetadata {
     pub name: Option<String>,
@@ -320,6 +331,7 @@ pub(super) struct ModelMetadata {
     pub max_tokens: Option<u32>,
     pub reasoning: Option<bool>,
     pub cost: Option<ChatPrice>,
+    input_limits: Option<InputLimits>,
     #[serde(default)]
     compat: ModelCompatibility,
     input: Option<Vec<Modality>>,
@@ -362,6 +374,15 @@ impl ModelMetadata {
                 .or_default()
                 .extend(parameters.clone());
         }
+        let input_limits = match (self.image_resize(), overrides.image_resize()) {
+            (base, None) => base,
+            (base, Some(newer)) => Some(base.map_or(newer, |base| base.overlay(newer))),
+        }
+        .map(|resize| InputLimits {
+            images: Some(ImageLimits {
+                resize: Some(resize),
+            }),
+        });
         Self {
             name: overrides.name.clone().or(self.name),
             context_window: overrides.context_window.or(self.context_window),
@@ -371,6 +392,7 @@ impl ModelMetadata {
                 (Some(base), Some(newer)) => Some(base.overlay(newer)),
                 (base, newer) => newer.or(base),
             },
+            input_limits,
             input: overrides.input.clone().or(self.input),
             ..self
         }
@@ -385,6 +407,7 @@ impl ModelMetadata {
             || self.context_window == Some(0)
             || self.max_tokens == Some(0)
             || self.cost.as_ref().is_some_and(|cost| !cost.valid())
+            || self.image_resize().is_some_and(|resize| !resize.valid())
         {
             return Err(Error::Config(format!(
                 "invalid model metadata for {}/{id}",
@@ -437,6 +460,10 @@ impl ModelMetadata {
                 .map(str::to_owned)
                 .collect(),
         )
+    }
+
+    pub fn image_resize(&self) -> Option<ImageResizeProfile> {
+        self.input_limits.as_ref()?.images.as_ref()?.resize
     }
 
     pub fn allows_empty_signature(&self) -> bool {

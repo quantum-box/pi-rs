@@ -2613,3 +2613,14 @@ Custom providers with a shared base URL can declare the API on each
 model. The catalog chooses the first declared chat API for provider
 discovery, while each model uses its own adapter and route. When the
 provider omits the API, a chat model without its own API is rejected.
+
+### Per-model image resize checkpoint
+
+The 394 bundled models with resize limits retain their width, height,
+base64 budget, and JPEG quality. Custom model overrides merge individual
+limits. CLI attachments, clipboard paste, and `read` apply the profile
+before recording new images. In-budget files keep their original bytes.
+Resized transparent images retain alpha. A same-endpoint model change
+updates the active reader profile. The existing `images.autoResize`
+setting governs model-specific resizing. Raw RPC image input and pending
+drafts after a model change still need the same preparation.

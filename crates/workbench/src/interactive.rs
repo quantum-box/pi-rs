@@ -497,14 +497,16 @@ impl View {
             images: self.draft_images.clone(),
         }
     }
-    fn paste_clipboard(&mut self, auto_resize: bool) {
+    fn paste_clipboard(&mut self, args: &Cli) {
         if self.clipboard.is_some() {
             return;
         }
         let (sender, receiver) = std::sync::mpsc::channel();
         self.clipboard = Some(receiver);
+        let auto_resize = args.settings.resize_model_images();
+        let profile = args.model_image_resize();
         std::thread::spawn(move || {
-            let _ = sender.send(super::clipboard::read(auto_resize));
+            let _ = sender.send(super::clipboard::read(auto_resize, profile));
         });
     }
     fn poll_clipboard(&mut self) -> bool {
@@ -1033,7 +1035,7 @@ impl View {
                 self.scrollbar_activity = Some(now);
             }
             MouseEventKind::Down(MouseButton::Right) if self.search.is_none() => {
-                self.paste_clipboard(args.settings.resize_model_images());
+                self.paste_clipboard(args);
             }
             MouseEventKind::Down(MouseButton::Left) if self.search.is_none() => {
                 self.mouse.press(event.column, event.row, now);
@@ -2930,9 +2932,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     }
                     "app.tools.expand" => view.expand_tools = !view.expand_tools,
                     "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
-                    "app.clipboard.pasteImage" => {
-                        view.paste_clipboard(args.settings.resize_model_images())
-                    }
+                    "app.clipboard.pasteImage" => view.paste_clipboard(&args),
                     "app.clear" => {
                         if let Some(active) = worker.as_mut().filter(|active| active.busy) {
                             let _ = active.send(json!({"type":"cancel"}));

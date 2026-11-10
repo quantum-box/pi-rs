@@ -46,12 +46,13 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
                     "type":"model", "model":model, "name":catalog.display_name(&model),
                     "provider":provider,
                 });
-                if let Some(cost) = args
-                    .model_profiles
-                    .model(&catalog.provider, &model)
-                    .and_then(|model| model.cost)
-                {
-                    row["cost"] = cost.value();
+                if let Some(metadata) = args.model_profiles.model(&catalog.provider, &model) {
+                    if let Some(resize) = metadata.image_resize() {
+                        row["inputLimits"] = json!({"images":{"resize":resize}});
+                    }
+                    if let Some(cost) = metadata.cost {
+                        row["cost"] = cost.value();
+                    }
                 }
                 output(with_details(row, detail.as_ref()));
             } else {
