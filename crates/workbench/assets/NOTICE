@@ -22,3 +22,5 @@ Session search token parsing and fuzzy scoring in src/ui/session_search.rs
 adapt Pi v1.5.0 session-selector-search.ts and packages/tui/src/fuzzy.ts.
 Session grouping in src/ui/session_threads.rs follows the parent-session tree
 and subtree activity ordering in Pi v1.5.0 session-selector.ts.
+Resume row layout and relative activity-age units in src/ui/picker.rs follow
+Pi v1.5.0 session-selector.ts.

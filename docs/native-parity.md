@@ -1662,3 +1662,19 @@ Tests cover grouping, descendant ordering, filters, search flattening and sort
 cycling. PTY checks verify branch rendering and all three modes, and repeat the
 transcript-search/open-session check. Full workspace tests and all-target Clippy
 pass.
+
+### Resume row presentation checkpoint
+
+Resume rows now show message count and relative activity age, right-aligned
+beside the session title. Long titles truncate by grapheme and display width,
+including Japanese and combining characters. Control characters in titles
+become spaces. The current session uses the accent color, named sessions use
+the warning color, and selected titles are bold.
+
+All-workspace view includes the working directory; the path toggle adds the
+session file path. Home prefixes shorten to `~`. The list keeps the selected
+row near its center and shows position when scrolling. Empty local results
+suggest switching scope with Tab. Tests cover alignment, Unicode truncation and
+the reference age units; real PTY search and threaded-selector checks pass.
+
+Full workspace tests and all-target Clippy pass.

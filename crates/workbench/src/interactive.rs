@@ -756,7 +756,7 @@ impl View {
                 .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
         }
         if let Some(picker) = &self.picker {
-            lines = picker.render(theme, body_height);
+            lines = picker.render(theme, width, body_height);
         }
         if let Some(dialog) = self.dialog() {
             lines = dialog.render(theme, width, body_height);
@@ -985,7 +985,7 @@ impl View {
             active
                 .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
             if let Some(picker) = &self.picker {
-                active = picker.render(theme, height - prompt_height - 4 - below.len());
+                active = picker.render(theme, width, height - prompt_height - 4 - below.len());
             }
             let end = active
                 .len()
@@ -1325,7 +1325,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                                     .find_map(|record| match &record.event {
                                         pi_rs::Event::User { content, .. }
                                         | pi_rs::Event::UserWithImages { content, .. } => {
-                                            Some(content.chars().take(70).collect())
+                                            Some(content.clone())
                                         }
                                         _ => None,
                                     })
@@ -1353,6 +1353,12 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                             messages,
                             local,
                         );
+                        document.message_count = session.statistics().total_messages;
+                        document.activity = session.activity_time().or_else(|| {
+                            path.metadata()
+                                .and_then(|metadata| metadata.modified())
+                                .ok()
+                        });
                         document.parent = session.parent_session().map(|parent| {
                             let parent = PathBuf::from(parent);
                             if parent.is_absolute() {
@@ -1363,10 +1369,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                         });
                         documents.insert(path.clone(), document);
                         items.push(Item {
-                            label: format!(
-                                "{title} · {}",
-                                path.file_stem().unwrap_or_default().to_string_lossy()
-                            ),
+                            label: title,
                             selection: Selection::Resume(path),
                         });
                     }

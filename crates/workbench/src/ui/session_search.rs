@@ -3,17 +3,25 @@ use std::sync::OnceLock;
 
 pub struct Document {
     pub local: bool,
+    pub message_count: u64,
+    pub activity: Option<std::time::SystemTime>,
     pub parent: Option<std::path::PathBuf>,
     fields: [String; 4],
     lower: [String; 4],
     normalized: OnceLock<[String; 4]>,
 }
 impl Document {
+    pub fn cwd(&self) -> &str {
+        &self.fields[2]
+    }
+
     pub fn new(name: String, id: String, cwd: String, messages: String, local: bool) -> Self {
         let fields = [name, id, cwd, messages];
         let lower = fields.each_ref().map(|field| field.to_lowercase());
         Self {
             local,
+            message_count: 0,
+            activity: None,
             parent: None,
             fields,
             lower,

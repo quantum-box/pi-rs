@@ -2,6 +2,8 @@
 use super::{render::Line, theme::Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone)]
 pub enum Selection {
@@ -377,7 +379,90 @@ impl Picker {
         }
         Input::Continue
     }
-    pub fn render(&self, theme: &Theme, height: usize) -> Vec<Line> {
+    fn session_line(
+        &self,
+        item: &Item,
+        prefix: &str,
+        selected: bool,
+        theme: &Theme,
+        width: usize,
+    ) -> Line {
+        let Selection::Resume(path) = &item.selection else {
+            unreachable!("session row");
+        };
+        let document = self.session_documents.get(path).expect("session document");
+        let age = document
+            .activity
+            .map(|time| {
+                session_age(
+                    std::time::SystemTime::now()
+                        .duration_since(time)
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_else(|| "?".into());
+        let mut right = format!("{} {age}", document.message_count);
+        if self.all_workspaces && !document.cwd().is_empty() {
+            right = format!(
+                "{} {right}",
+                short_path(std::path::Path::new(document.cwd()))
+            );
+        }
+        if self.show_path {
+            right = format!("{} {right}", short_path(path));
+        }
+        let title: String = item
+            .label
+            .chars()
+            .map(|character| {
+                if character <= '\u{1f}' || character == '\u{7f}' {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        let title = truncate(
+            title.trim(),
+            width
+                .saturating_sub(2 + prefix.width() + right.width() + 2)
+                .max(10),
+        );
+        let active = self.active_session.as_ref().is_some_and(|active| {
+            active
+                .canonicalize()
+                .ok()
+                .zip(path.canonicalize().ok())
+                .is_some_and(|(active, path)| active == path)
+        });
+        let color = if active {
+            "accent"
+        } else if self.named_sessions.contains(path) {
+            "warning"
+        } else {
+            "text"
+        };
+        let mut title_span = super::render::Span::new(title.clone(), theme.color(color));
+        title_span.bold = selected;
+        let spacing = width
+            .saturating_sub(2 + prefix.width() + title.width() + right.width())
+            .max(1);
+        Line {
+            spans: vec![
+                super::render::Span::new(if selected { "› " } else { "  " }, theme.color("accent")),
+                super::render::Span::new(prefix, theme.color("dim")),
+                title_span,
+                super::render::Span::new(
+                    format!("{}{right}", " ".repeat(spacing)),
+                    theme.color("dim"),
+                ),
+            ],
+            background: selected.then(|| theme.color("selectedBg")),
+            image: None,
+        }
+    }
+
+    pub fn render(&self, theme: &Theme, width: usize, height: usize) -> Vec<Line> {
         if let Some(action) = &self.session_action {
             let (title, hint) = match action {
                 SessionAction::Rename(_) => (
@@ -416,14 +501,36 @@ impl Picker {
                 prefixes[row.index] = row.prefix;
             }
         }
-        let available = height
+        let mut available = height
             .saturating_sub(
                 3 + usize::from(self.session_error.is_some())
                     + usize::from(self.active_session.is_some()),
             )
             .max(1);
-        let start = self.selected.saturating_sub(available - 1);
+        let scrolling = self.active_session.is_some() && items.len() > available;
+        if scrolling {
+            available = available.saturating_sub(1).max(1);
+        }
+        let start = if self.active_session.is_some() {
+            self.selected
+                .saturating_sub(available / 2)
+                .min(items.len().saturating_sub(available))
+        } else {
+            self.selected.saturating_sub(available - 1)
+        };
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
+            if let Selection::Resume(path) = &item.selection
+                && self.session_documents.contains_key(path)
+            {
+                lines.push(self.session_line(
+                    item,
+                    &prefixes[index],
+                    index == self.selected,
+                    theme,
+                    width,
+                ));
+                continue;
+            }
             let mut line = Line::plain(
                 &format!(
                     "{} {}{}",
@@ -467,8 +574,20 @@ impl Picker {
             }
             lines.push(line);
         }
+        if scrolling {
+            lines.push(Line::plain(
+                &format!("  ({}/{})", self.selected + 1, items.len()),
+                theme.color("dim"),
+            ));
+        }
         if items.is_empty() {
-            lines.push(Line::plain("No matches", theme.color("dim")));
+            let message =
+                if self.active_session.is_some() && self.query.is_empty() && !self.all_workspaces {
+                    "No sessions in current folder. Press Tab to view all."
+                } else {
+                    "No matches"
+                };
+            lines.push(Line::plain(message, theme.color("dim")));
         }
         if let Some(error) = &self.session_error {
             lines.push(Line::plain(error, theme.color("error")));
@@ -576,6 +695,55 @@ impl TreeState {
     }
 }
 
+fn session_age(age: std::time::Duration) -> String {
+    let minutes = age.as_secs() / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    if minutes < 1 {
+        "now".into()
+    } else if minutes < 60 {
+        format!("{minutes}m")
+    } else if hours < 24 {
+        format!("{hours}h")
+    } else if days < 7 {
+        format!("{days}d")
+    } else if days < 30 {
+        format!("{}w", days / 7)
+    } else if days < 365 {
+        format!("{}mo", days / 30)
+    } else {
+        format!("{}y", days / 365)
+    }
+}
+fn short_path(path: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if let Some(home) = home
+        && let Ok(relative) = path.strip_prefix(&home)
+    {
+        return std::path::Path::new("~")
+            .join(relative)
+            .display()
+            .to_string();
+    }
+    path.display().to_string()
+}
+fn truncate(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.into();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        if used + grapheme.width() > width.saturating_sub(1) {
+            break;
+        }
+        used += grapheme.width();
+        result.push_str(grapheme);
+    }
+    result.push('…');
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +833,66 @@ mod tests {
         picker.input(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &keys);
         assert!(picker.matches().is_empty());
     }
+    #[test]
+    fn session_rows_align_metadata_and_style_active_unicode_titles() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("active.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut document = super::super::session_search::Document::new(
+            "named".into(),
+            "id".into(),
+            String::new(),
+            String::new(),
+            true,
+        );
+        document.message_count = 12;
+        document.activity =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(7200));
+        let mut picker = Picker::sessions(
+            vec![Item {
+                label: format!("  日本語\n{}", "長い会話".repeat(30)),
+                selection: Selection::Resume(path.clone()),
+            }],
+            path.clone(),
+            Default::default(),
+        );
+        picker.set_session_documents(std::collections::BTreeMap::from([(path, document)]));
+        let theme = Theme::system();
+        let row = picker.session_line(&picker.items[0], "   └─ ", true, &theme, 60);
+        let text = row
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert_eq!(text.width(), 60);
+        assert!(text.ends_with("12 2h"));
+        assert!(text.contains('…'));
+        assert!(!text.contains('\n'));
+        assert_eq!(row.spans[2].color, theme.color("accent"));
+        assert!(row.spans[2].bold);
+    }
+
+    #[test]
+    fn session_age_uses_reference_units() {
+        for (seconds, expected) in [
+            (0, "now"),
+            (59, "now"),
+            (60, "1m"),
+            (3600, "1h"),
+            (86400, "1d"),
+            (604800, "1w"),
+            (2592000, "1mo"),
+            (31536000, "1y"),
+        ] {
+            assert_eq!(
+                session_age(std::time::Duration::from_secs(seconds)),
+                expected
+            );
+        }
+        assert_eq!(truncate("日本語", 4), "日…");
+        assert_eq!(truncate("e\u{301}xyz", 3), "e\u{301}x…");
+    }
+
     #[test]
     fn session_threads_group_parents_and_cycle_through_reference_sort_modes() {
         let parent = PathBuf::from("parent.jsonl");
