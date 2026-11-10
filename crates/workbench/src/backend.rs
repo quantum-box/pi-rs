@@ -35,6 +35,9 @@ enum Request {
         require_command: bool,
         #[serde(default)]
         images: Vec<pi_rs::ImageContent>,
+        #[serde(default)]
+        rpc: bool,
+        id: Option<serde_json::Value>,
     },
     Extension {
         extension_id: String,
@@ -257,14 +260,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                         Ok(starts_run && !session.queued_inputs().is_empty())
                     });
                     match result {
-                        Ok(true) => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false }, false),
+                        Ok(true) => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
                         Ok(false) => continue,
                         Err(error) => { output(json!({"type":"error","message":error.to_string()})); continue; }
                     }
                 }
                 None => break,
             },
-            _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false }, false),
+            _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
         };
         if stopping.load(Ordering::SeqCst) {
             break;
@@ -320,6 +323,11 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             Request::Compact { rpc: true, id, .. } => Some(id.clone()),
             _ => None,
         };
+        let mut prompt_response = match &request {
+            Request::Prompt { rpc: true, id, .. } => Some(id.clone()),
+            _ => None,
+        };
+        let mut started = prompt_response.is_none();
         let mut compact_result = serde_json::Value::Null;
         let cancel = CancellationToken::new();
         {
@@ -332,7 +340,9 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                 cancel.cancel();
             }
         }
-        output(json!({"type":"agent_started"}));
+        if started {
+            output(json!({"type":"agent_started"}));
+        }
         let mut completed_shells = Vec::new();
         let mut run_session = None;
         let mut operation = Box::pin(async {
@@ -369,6 +379,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     images,
                     queued_only,
                     require_command,
+                    ..
                 } => {
                     if queued_only && !agent.apply_queued_inputs(session, &mut observer)? {
                         return Ok(());
@@ -388,6 +399,21 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                             Ok(expanded.unwrap_or(input))
                         })
                         .transpose()?;
+                    if images.is_empty()
+                        && content
+                            .as_ref()
+                            .is_some_and(|content| content.trim().is_empty())
+                    {
+                        return Err(Error::Config("empty user input".into()));
+                    }
+                    if cancel.is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    if let Some(id) = prompt_response.take() {
+                        started = true;
+                        control_response("prompt", id, Ok(json!({"disposition":"started"})));
+                        output(json!({"type":"agent_started"}));
+                    }
                     let run_id = Uuid::new_v4();
                     if !images.is_empty() {
                         session.append_user_with_images(
@@ -576,15 +602,25 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             }
         }
         drop(run_session);
-        if resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled))) {
+        if started && resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled)))
+        {
             continue_queue = Session::open(&args.session)
                 .is_ok_and(|session| !session.queued_inputs().is_empty());
         }
-        if let Err(error) = &result {
+        if let Some(id) = prompt_response {
+            control_response(
+                "prompt",
+                id,
+                result
+                    .as_ref()
+                    .map(|_| json!({"disposition":"handled"}))
+                    .map_err(|error| Error::Config(error.to_string())),
+            );
+        } else if let Err(error) = &result {
             output(json!({"type":"error","message":error.to_string()}));
         }
         output(
-            json!({"type":"agent_settled","success":result.is_ok(),"aborted":matches!(result, Err(Error::Cancelled))}),
+            json!({"type":"agent_settled","success":result.is_ok(),"aborted":matches!(result, Err(Error::Cancelled)),"started":started}),
         );
         if let Some(id) = compact_response {
             control_response(
@@ -965,14 +1001,17 @@ fn read_requests(
                     if counted {
                         active.lock().expect("worker control").queued += 1;
                     }
-                    if commands.try_send(request).is_err() {
+                    if let Err(error) = commands.try_send(request) {
                         if counted {
                             let mut state = active.lock().expect("worker control");
                             state.queued = state.queued.saturating_sub(1);
                         }
-                        output(
-                            json!({"type":"input_rejected","reason":"operation queue is full or closed"}),
-                        );
+                        let message = "operation queue is full or closed";
+                        if let Request::Prompt { rpc: true, id, .. } = error.into_inner() {
+                            control_response("prompt", id, Err(Error::Config(message.into())));
+                        } else {
+                            output(json!({"type":"input_rejected","reason":message}));
+                        }
                     }
                 }
             }

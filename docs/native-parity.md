@@ -38,8 +38,10 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `get_fork_messages`, `get_entries`, `get_tree`, `get_last_assistant_text`, `get_commands`,
 `edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
 `set_follow_up_mode`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, and `shutdown`. Responses carry the request ID and a
-success flag. Prompt acceptance is separate from completion; wait for
-`agent_settled`. The interface emits native journal events alongside Pi-style
+success flag. Prompt acceptance follows input and command validation. A prompt
+that runs an extension command returns `handled`. A model turn returns
+`started` before completion. Wait for `agent_end` or `agent_settled` for that
+turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries. Tool-call blocks become
 available when their provider response is complete. `get_messages` returns

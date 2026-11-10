@@ -101,7 +101,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     response(
                         &request,
                         Err(Error::Config(
-                            "input worker exited before acknowledging the queue".into(),
+                            "input worker exited before acknowledging the request".into(),
                         )),
                     )?;
                 }
@@ -161,8 +161,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             Some("prompt" | "steer" | "follow_up")
         ) {
             match submit_prompt(&request, &args, &mut worker) {
-                Ok(Some(data)) => response(&request, Ok(Some(data)))?,
-                Ok(None) => pending_inputs.push(request),
+                Ok(()) => pending_inputs.push(request),
                 Err(error) => response(&request, Err(error))?,
             }
             continue;
@@ -420,11 +419,7 @@ fn acknowledge(pending: &mut Vec<Value>, event: &Value) {
     }
 }
 
-fn submit_prompt(
-    request: &Value,
-    args: &Cli,
-    worker: &mut Option<Worker>,
-) -> Result<Option<Value>> {
+fn submit_prompt(request: &Value, args: &Cli, worker: &mut Option<Worker>) -> Result<()> {
     use pi_rs::{InputKind, QueuedInput, QueuedMessage};
     let name = request["type"].as_str().expect("prompt command");
     let images: Vec<pi_rs::ImageContent> = request
@@ -436,7 +431,7 @@ fn submit_prompt(
         image.validate()?;
     }
     let message = request["message"].as_str().unwrap_or_default();
-    if message.is_empty() && images.is_empty() {
+    if message.trim().is_empty() && images.is_empty() {
         return Err(Error::Config("message or images are required".into()));
     }
     let queue_kind = match name {
@@ -470,15 +465,13 @@ fn submit_prompt(
             json!({
                 "type":"queue_input","message":queued,"command":name,"id":request.get("id")
             }),
-        )?;
-        Ok(None)
+        )
     } else {
         Worker::submit(
             worker,
             args,
-            json!({"type":"prompt","content":message,"images":images}),
-        )?;
-        Ok(Some(json!({"disposition":"started"})))
+            json!({"type":"prompt","content":message,"images":images,"rpc":true,"id":request.get("id")}),
+        )
     }
 }
 
@@ -959,13 +952,17 @@ fn forward_event(
         }
         Some("agent_settled") => {
             *busy = pending_compact.is_some();
-            for mapped in stream.settle(event["aborted"] == true) {
-                emit(mapped)?;
+            if event["started"] != false {
+                for mapped in stream.settle(event["aborted"] == true) {
+                    emit(mapped)?;
+                }
+                emit(
+                    json!({"type":"agent_end","success":event["success"],"messages":stream.messages,"willRetry":false}),
+                )?;
             }
             emit(
-                json!({"type":"agent_end","success":event["success"],"messages":stream.messages,"willRetry":false}),
+                json!({"type":"agent_settled","aborted":event["aborted"] == true || (event["started"] != false && stream.aborted())}),
             )?;
-            emit(json!({"type":"agent_settled","aborted":stream.aborted()}))?;
             if let Some(request) = pending_abort.take() {
                 response(&request, Ok(None))?;
             }
