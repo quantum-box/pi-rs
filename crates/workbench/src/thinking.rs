@@ -31,6 +31,15 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         super::providers::Adapter::ChatCompletions | super::providers::Adapter::PiMessages => {
             LEVELS.iter().map(|level| (*level).into()).collect()
         }
+        super::providers::Adapter::Anthropic
+            if matches!(args.provider.id(), "fireworks" | "openrouter")
+                && args
+                    .model_profiles
+                    .model(&args.provider, &args.model)
+                    .is_some_and(|model| model.reasoning == Some(true)) =>
+        {
+            ["off", "low", "medium", "high"].map(str::to_owned).to_vec()
+        }
         super::providers::Adapter::Anthropic => vec!["off".into()],
         super::providers::Adapter::Google => pi_rs::google::model_thinking_levels(&args.model),
     };

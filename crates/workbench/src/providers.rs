@@ -130,7 +130,11 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = Anthropic::new(endpoint, &token)?;
+                let mut client = if matches!(self.id(), "fireworks" | "openrouter") {
+                    Anthropic::with_bearer_token(endpoint, &token)?
+                } else {
+                    Anthropic::new(endpoint, &token)?
+                };
                 if self != &Self::Anthropic {
                     use sha2::{Digest, Sha256};
                     let scope = format!(
@@ -376,7 +380,34 @@ impl Client {
                     .unwrap_or_default();
                 Self::Ollama(client.with_sampling(sampling)?)
             }
-            Self::Anthropic(client) => Self::Anthropic(client.with_thinking(thinking)),
+            Self::Anthropic(client) => {
+                let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let gateway = matches!(args.provider.id(), "fireworks" | "openrouter");
+                let mut client = client.with_thinking(thinking);
+                if let Some(metadata) = metadata {
+                    client =
+                        client.with_empty_thinking_signature(metadata.allows_empty_signature());
+                    let adaptive = metadata.adaptive_thinking();
+                    if metadata.reasoning == Some(true) && (gateway || adaptive.is_some()) {
+                        let selected = thinking.unwrap_or("off");
+                        let mapped = metadata.mapped_effort(selected);
+                        if selected == "off" && mapped == Some(None) {
+                            client = client.with_thinking(None);
+                        } else {
+                            let effort = mapped
+                                .flatten()
+                                .filter(|_| selected != "off")
+                                .unwrap_or(selected);
+                            client = client.with_configured_thinking(
+                                effort,
+                                adaptive.unwrap_or(false),
+                                true,
+                            );
+                        }
+                    }
+                }
+                Self::Anthropic(client)
+            }
             Self::Google(client) => Self::Google(client.with_thinking(thinking)),
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
             Self::Deferred(mut client) => {

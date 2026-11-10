@@ -399,7 +399,8 @@ impl Cli {
                     return None;
                 }
                 if let Some(builtin) = builtin_chat::find(provider.id()) {
-                    return (builtin.endpoint() == endpoint)
+                    return builtin
+                        .is_official_endpoint(endpoint)
                         .then(|| std::env::var(builtin.env()).ok())
                         .flatten()
                         .filter(|key| !key.trim().is_empty())

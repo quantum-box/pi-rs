@@ -157,7 +157,10 @@ impl Keys {
         let legacy_radius = provider == &Provider::Radius
             && endpoint == super::radius_auth::DEFAULT_MODEL_ENDPOINT
             && entry.endpoint == "https://radius.pi.dev/messages";
-        (entry.endpoint == endpoint || legacy_radius).then_some(&entry.key)
+        let builtin_route = entry.official_routes
+            && super::builtin_chat::find(provider.id())
+                .is_some_and(|builtin| builtin.is_official_endpoint(endpoint));
+        (entry.endpoint == endpoint || legacy_radius || builtin_route).then_some(&entry.key)
     }
 
     pub fn oauth(&self, provider: &Provider, endpoint: &str) -> bool {

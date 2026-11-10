@@ -11,7 +11,7 @@ use pi_rs_core::{
 };
 use reqwest::{
     Client, Response, Url,
-    header::{HeaderMap, HeaderValue},
+    header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
 };
 use serde_json::{Value, json};
 
@@ -53,19 +53,35 @@ type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct Anthropic {
     client: Client,
     endpoint: Url,
-    api_key: HeaderValue,
+    auth: (HeaderName, HeaderValue),
     provider: Arc<str>,
     replay_scope: Arc<str>,
     headers: HeaderMap,
     catalog: Arc<RwLock<BTreeMap<String, CatalogEntry>>>,
     probe_context: bool,
     thinking_level: Option<String>,
+    configured_thinking: Option<CatalogEntry>,
+    allow_empty_signature: bool,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
 
 impl Anthropic {
     pub fn new(endpoint: &str, api_key: &str) -> Result<Self> {
+        Self::connect(endpoint, HeaderName::from_static("x-api-key"), api_key)
+    }
+
+    /// Connect to a Messages-compatible service using bearer authentication.
+    pub fn with_bearer_token(endpoint: &str, token: &str) -> Result<Self> {
+        if token.trim().is_empty() {
+            return Err(Error::Config(
+                "missing Anthropic-compatible bearer token".into(),
+            ));
+        }
+        Self::connect(endpoint, AUTHORIZATION, &format!("Bearer {token}"))
+    }
+
+    fn connect(endpoint: &str, name: HeaderName, credential: &str) -> Result<Self> {
         let endpoint =
             Url::parse(endpoint).map_err(|_| Error::Config("invalid Anthropic endpoint".into()))?;
         let loopback = matches!(
@@ -84,11 +100,11 @@ impl Anthropic {
                 "Anthropic endpoint must be HTTPS or loopback HTTP with a /messages path and no embedded credentials, query, or fragment".into(),
             ));
         }
-        let mut api_key = HeaderValue::from_str(api_key)
+        let mut value = HeaderValue::from_str(credential)
             .ok()
             .filter(|key| !key.is_empty())
             .ok_or_else(|| Error::Config("missing or invalid Anthropic API key".into()))?;
-        api_key.set_sensitive(true);
+        value.set_sensitive(true);
         let client = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -98,13 +114,15 @@ impl Anthropic {
         Ok(Self {
             client,
             endpoint,
-            api_key,
+            auth: (name, value),
             provider: Arc::from("anthropic"),
             replay_scope: Arc::from("anthropic"),
             headers: HeaderMap::new(),
             catalog: Default::default(),
             probe_context: true,
             thinking_level: None,
+            configured_thinking: None,
+            allow_empty_signature: false,
             progress: None,
             reasoning: None,
         })
@@ -129,6 +147,28 @@ impl Anthropic {
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking_level = level.map(str::to_owned);
+        self
+    }
+
+    /// Use known thinking capabilities for a gateway that lacks a Models API.
+    pub fn with_configured_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
+        self.thinking_level = Some(level.into());
+        self.configured_thinking = Some(CatalogEntry {
+            thinking_levels: vec![level.into()],
+            thinking: Some(if adaptive {
+                ThinkingMode::Adaptive
+            } else {
+                ThinkingMode::Budgeted
+            }),
+            can_disable_thinking: disable,
+            effort_levels: adaptive,
+            ..CatalogEntry::default()
+        });
+        self
+    }
+
+    pub fn with_empty_thinking_signature(mut self, enabled: bool) -> Self {
+        self.allow_empty_signature = enabled;
         self
     }
 
@@ -182,7 +222,7 @@ impl Anthropic {
     fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request
             .header("anthropic-version", API_VERSION)
-            .header("x-api-key", self.api_key.clone())
+            .header(self.auth.0.clone(), self.auth.1.clone())
             .headers(self.headers.clone())
     }
 
@@ -540,7 +580,7 @@ impl ResponseBlock {
         )
     }
 
-    fn finish(mut self) -> Result<Value> {
+    fn finish(mut self, allow_empty_signature: bool) -> Result<Value> {
         if !self.complete {
             return Err(Error::Model(
                 "Anthropic content block ended prematurely".into(),
@@ -548,7 +588,7 @@ impl ResponseBlock {
         }
         match self.raw["type"].as_str() {
             Some("text") => self.raw["text"] = json!(self.text),
-            Some("thinking") if !self.signature.is_empty() => {
+            Some("thinking") if allow_empty_signature || !self.signature.is_empty() => {
                 self.raw["thinking"] = json!(self.text);
                 self.raw["signature"] = json!(self.signature);
             }
@@ -645,7 +685,9 @@ impl Model for Anthropic {
     }
 
     async fn stream(&self, mut request: ModelRequest) -> Result<ModelStream> {
-        let details = if self.thinking_level.is_some() {
+        let details = if self.configured_thinking.is_some() {
+            self.configured_thinking.clone()
+        } else if self.thinking_level.is_some() {
             self.model(&request.model).await
         } else {
             self.cached_model(&request.model)
@@ -675,6 +717,7 @@ impl Model for Anthropic {
             return Err(Error::Model("expected an Anthropic SSE response".into()));
         }
         let progress = self.progress.clone();
+        let allow_empty_signature = self.allow_empty_signature;
         let reasoning = self.reasoning.clone();
         Ok(Box::pin(async_stream::try_stream! {
             let mut size = 0_usize;
@@ -849,7 +892,7 @@ impl Model for Anthropic {
                         let mut replay = BTreeMap::new();
                         if signed {
                             for (index, block) in blocks {
-                                replay.insert(index, block.finish()?);
+                                replay.insert(index, block.finish(allow_empty_signature)?);
                             }
                         }
                         let mut completed_calls = Vec::new();

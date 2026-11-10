@@ -119,6 +119,21 @@ impl Builtin {
         self.endpoint
     }
 
+    pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
+        match (adapter, self.id) {
+            (Adapter::ChatCompletions, _) => Some(self.endpoint),
+            (Adapter::Anthropic, "fireworks") => {
+                Some("https://api.fireworks.ai/inference/v1/messages")
+            }
+            (Adapter::Anthropic, "openrouter") => Some("https://openrouter.ai/api/v1/messages"),
+            _ => None,
+        }
+    }
+
+    pub fn is_official_endpoint(&self, endpoint: &str) -> bool {
+        self.endpoint == endpoint || self.endpoint_for(Adapter::Anthropic) == Some(endpoint)
+    }
+
     pub fn env(&self) -> &'static str {
         self.env
     }

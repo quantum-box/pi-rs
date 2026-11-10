@@ -18,7 +18,7 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, configurable Bash and Windows PowerShell with session metadata and Pi-style exit and truncation text, structured read, search, listing and shell truncation details, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages, Google Gemini Generate Content, and Radius Pi Messages, named profiles for those APIs, API keys and bearer tokens, searchable catalog with 546 built-in chat models, including native Anthropic and Gemini catalogs, model declarations and overrides including model-specific APIs and endpoints, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages, Google Gemini Generate Content, and Radius Pi Messages, named profiles for those APIs, API keys and bearer tokens, searchable catalog with 584 built-in chat models, including native Anthropic and Gemini catalogs and the Fireworks and OpenRouter Messages models, model declarations and overrides including model-specific APIs and endpoints, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh, OpenRouter browser OAuth with manual redirect fallback | OAuth and refresh for other model providers |
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration, compaction and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
@@ -2505,3 +2505,14 @@ inherit the profile base URL or supply its own base URL. The CLI, terminal,
 RPC model selection and Codemode catalog use the model's effective API.
 A loopback session verified switching between Chat Completions and Messages,
 endpoint-bound keys and headers, and route-bound signed Messages replay.
+
+### Fireworks and OpenRouter Messages catalogs checkpoint
+
+The offline catalog includes 19 Fireworks and 19 OpenRouter models using
+Messages alongside the existing Chat Completions models. The official
+Messages routes use bearer authentication. Environment credentials and
+imported provider-wide keys or OpenRouter OAuth work on the official routes.
+Explicitly stored keys remain bound to their saved endpoints. Loopback tests
+covered adaptive thinking, effort mapping and replay with Fireworks empty
+signatures and OpenRouter signed blocks. Session affinity and additional
+cache and mid-conversation options remain to be matched.

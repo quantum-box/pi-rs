@@ -140,13 +140,34 @@ struct ConfiguredModel {
 
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ModelCompatibility {
+    #[serde(flatten)]
+    chat: ChatCompatibility,
+    allow_empty_signature: Option<bool>,
+    force_adaptive_thinking: Option<bool>,
+}
+
+impl ModelCompatibility {
+    fn overlay(self, newer: Self) -> Self {
+        Self {
+            chat: self.chat.overlay(newer.chat),
+            allow_empty_signature: newer.allow_empty_signature.or(self.allow_empty_signature),
+            force_adaptive_thinking: newer
+                .force_adaptive_thinking
+                .or(self.force_adaptive_thinking),
+        }
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct ModelMetadata {
     pub name: Option<String>,
     pub context_window: Option<u32>,
     pub max_tokens: Option<u32>,
     pub reasoning: Option<bool>,
     #[serde(default)]
-    compat: ChatCompatibility,
+    compat: ModelCompatibility,
     input: Option<Vec<Modality>>,
     #[serde(default)]
     thinking_level_map: BTreeMap<String, Option<String>>,
@@ -238,7 +259,9 @@ impl ModelMetadata {
         if self.reasoning == Some(false) {
             return Some(vec!["off".into()]);
         }
-        if adapter != Adapter::ChatCompletions || self.thinking_level_map.is_empty() {
+        if !matches!(adapter, Adapter::ChatCompletions | Adapter::Anthropic)
+            || self.thinking_level_map.is_empty()
+        {
             return None;
         }
         Some(
@@ -255,6 +278,14 @@ impl ModelMetadata {
                 .map(str::to_owned)
                 .collect(),
         )
+    }
+
+    pub fn allows_empty_signature(&self) -> bool {
+        self.compat.allow_empty_signature == Some(true)
+    }
+
+    pub fn adaptive_thinking(&self) -> Option<bool> {
+        self.compat.force_adaptive_thinking
     }
 
     pub fn mapped_effort(&self, level: &str) -> Option<Option<&str>> {
@@ -390,12 +421,17 @@ impl Profiles {
                         endpoint_from_base(&provider, adapter, base)?,
                     );
                 } else if adapter != provider.adapter() {
-                    return Err(Error::Config(format!(
-                        "model {}/{} requires baseUrl for the {} API",
-                        provider.id(),
-                        model.id,
-                        adapter.api()
-                    )));
+                    let endpoint = builtin_chat::find(provider.id())
+                        .and_then(|builtin| builtin.endpoint_for(adapter))
+                        .ok_or_else(|| {
+                            Error::Config(format!(
+                                "model {}/{} requires baseUrl for the {} API",
+                                provider.id(),
+                                model.id,
+                                adapter.api()
+                            ))
+                        })?;
+                    model_endpoints.insert(model.id.clone(), endpoint.into());
                 }
                 model.metadata.validate(&provider, adapter, &model.id)?;
                 model.metadata.headers =
@@ -406,6 +442,26 @@ impl Profiles {
                         provider.id(),
                         model.id
                     )));
+                }
+            }
+            if let Some(builtin) = builtin_chat::find(provider.id())
+                && let Some(models) = BUILTIN_MODELS.get(provider.id())
+            {
+                for model in models
+                    .iter()
+                    .filter(|model| !ids.contains(model.id.as_str()))
+                {
+                    let Some(adapter) = model.api.as_deref().and_then(Adapter::named) else {
+                        continue;
+                    };
+                    let Some(official) = builtin.endpoint_for(adapter) else {
+                        continue;
+                    };
+                    let endpoint = profile.base_url.as_deref().map_or_else(
+                        || Ok(official.to_owned()),
+                        |base| endpoint_from_base(&provider, adapter, base),
+                    )?;
+                    model_endpoints.insert(model.id.clone(), endpoint);
                 }
             }
             for (id, metadata) in &mut profile.model_overrides {
@@ -500,11 +556,13 @@ impl Profiles {
     }
 
     pub fn model_endpoint(&self, provider: &Provider, model: &str) -> Option<&str> {
-        self.entries
-            .get(provider.id())?
-            .model_endpoints
-            .get(model)
-            .map(String::as_str)
+        if let Some(profile) = self.entries.get(provider.id()) {
+            return profile.model_endpoints.get(model).map(String::as_str);
+        }
+        let adapter = self.model_adapter(provider, model);
+        (adapter != provider.adapter())
+            .then(|| builtin_chat::find(provider.id())?.endpoint_for(adapter))
+            .flatten()
     }
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<Credential> {
@@ -572,9 +630,11 @@ impl Profiles {
             .get(provider.id())
             .map(|profile| profile.compat.clone())
             .unwrap_or_default();
-        builtin
-            .overlay(profile)
-            .overlay(model.map(|model| model.compat.clone()).unwrap_or_default())
+        builtin.overlay(profile).overlay(
+            model
+                .map(|model| model.compat.chat.clone())
+                .unwrap_or_default(),
+        )
     }
 
     pub fn model_ids(&self, provider: &Provider) -> Vec<String> {
