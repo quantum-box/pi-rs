@@ -486,14 +486,14 @@ impl View {
             images: self.draft_images.clone(),
         }
     }
-    fn paste_clipboard(&mut self) {
+    fn paste_clipboard(&mut self, auto_resize: bool) {
         if self.clipboard.is_some() {
             return;
         }
         let (sender, receiver) = std::sync::mpsc::channel();
         self.clipboard = Some(receiver);
         std::thread::spawn(move || {
-            let _ = sender.send(super::clipboard::read());
+            let _ = sender.send(super::clipboard::read(auto_resize));
         });
     }
     fn poll_clipboard(&mut self) -> bool {
@@ -1022,7 +1022,7 @@ impl View {
                 self.scrollbar_activity = Some(now);
             }
             MouseEventKind::Down(MouseButton::Right) if self.search.is_none() => {
-                self.paste_clipboard();
+                self.paste_clipboard(args.settings.resize_model_images());
             }
             MouseEventKind::Down(MouseButton::Left) if self.search.is_none() => {
                 self.mouse.press(event.column, event.row, now);
@@ -2866,7 +2866,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     }
                     "app.tools.expand" => view.expand_tools = !view.expand_tools,
                     "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
-                    "app.clipboard.pasteImage" => view.paste_clipboard(),
+                    "app.clipboard.pasteImage" => {
+                        view.paste_clipboard(args.settings.resize_model_images())
+                    }
                     "app.clear" => {
                         if let Some(active) = worker.as_mut().filter(|active| active.busy) {
                             let _ = active.send(json!({"type":"cancel"}));
@@ -3048,6 +3050,17 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     ),
                                 },
                             ];
+                            let resize_images = args.settings.resize_model_images();
+                            items.push(Item {
+                                label: format!(
+                                    "Auto-resize images · {} (toggle)",
+                                    if resize_images { "on" } else { "off" }
+                                ),
+                                selection: Selection::Setting(
+                                    "images.autoResize".into(),
+                                    json!(!resize_images),
+                                ),
+                            });
                             let block_images = args.settings.block_model_images();
                             items.push(Item {
                                 label: format!(

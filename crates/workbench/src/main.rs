@@ -1115,7 +1115,11 @@ async fn execute(mut args: Cli) -> Result<()> {
         return rpc::run(args);
     }
     if args.command.is_none() {
-        let (mut prompt, images) = attachments::expand(&args.prompt, &args.workspace)?;
+        let (mut prompt, images) = attachments::expand(
+            &args.prompt,
+            &args.workspace,
+            args.settings.resize_model_images(),
+        )?;
         args.initial_images = images;
         if !std::io::stdin().is_terminal() && !args.stdin_control {
             let mut input = String::new();

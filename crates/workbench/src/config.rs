@@ -148,6 +148,9 @@ impl Settings {
             .as_bool()
             .unwrap_or(false)
     }
+    pub fn resize_model_images(&self) -> bool {
+        self.value["images"]["autoResize"].as_bool().unwrap_or(true)
+    }
     pub fn block_model_images(&self) -> bool {
         self.value["images"]["blockImages"]
             .as_bool()

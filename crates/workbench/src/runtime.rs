@@ -436,7 +436,9 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
         registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
         let shell = shell_config(args);
         registry.register(Arc::new(
-            CodingTools::local(&args.workspace)?.with_shell_config(shell.clone()),
+            CodingTools::local(&args.workspace)?
+                .with_shell_config(shell.clone())
+                .with_image_resize(args.settings.resize_model_images()),
         ))?;
         let system_prompt = select_tools(
             &mut registry,

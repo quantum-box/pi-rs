@@ -71,7 +71,10 @@
     "enableSkillCommands": { "type": "boolean" },
     "images": {
       "type": "object",
-      "properties": { "blockImages": { "type": "boolean" } }
+      "properties": {
+        "blockImages": { "type": "boolean" },
+        "autoResize": { "type": "boolean" }
+      }
     },
     "mcpClientMetadataBaseUrl": { "type": "string", "minLength": 1 },
     "terminal": {

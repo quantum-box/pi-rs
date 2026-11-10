@@ -2483,3 +2483,10 @@ public metadata support use dynamic registration in auto mode.
 A loopback OAuth fixture covered both document paths, dynamic registration,
 and precedence. The hosted documents are supplied by the configured
 application identity. [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
+
+`images.autoResize` controls CLI file attachments, clipboard image
+encoding and the native `read` tool. With resizing disabled, supported
+files keep their original format and bytes within the input limit, and
+clipboard images keep their dimensions. The `/settings` toggle applies
+to subsequent reads. CLI and PTY checks compared bytes and dimensions at
+the receiving model fixture.
