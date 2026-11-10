@@ -123,7 +123,12 @@ struct ControlState {
     pending_cancel: bool,
 }
 
-pub async fn run(mut args: Cli) -> Result<()> {
+pub fn run(args: Cli) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
+    // Keep the long-lived worker's future out of the frontend stack frame.
+    Box::pin(run_worker(args))
+}
+
+async fn run_worker(mut args: Cli) -> Result<()> {
     let mut runtime = runtime::configure(&args).await?;
     let ui = Arc::new(super::extension_ui::Broker::default());
     runtime.registry.set_ui(ui.clone());
@@ -275,16 +280,15 @@ pub async fn run(mut args: Cli) -> Result<()> {
                         session.append_user_with_images(content.take().unwrap_or_default(), images, Some(run_id))?;
                         observer(pi_rs::Notification::Committed(session.records().last().expect("appended user input")));
                     }
-                    let answer = agent
-                        .run_correlated(
-                            &mut session,
-                            run_id,
-                            content,
-                            &mut queued,
-                            &cancel,
-                            &mut observer,
-                        )
-                        .await?;
+                    let answer = Box::pin(agent.run_correlated(
+                        &mut session,
+                        run_id,
+                        content,
+                        &mut queued,
+                        &cancel,
+                        &mut observer,
+                    ))
+                    .await?;
                     output(json!({"type":"answer","content":answer}));
                 }
                 Request::Extension {
