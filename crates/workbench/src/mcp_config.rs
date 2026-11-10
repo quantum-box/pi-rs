@@ -321,11 +321,22 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 .transpose()?;
             let announce =
                 |url: &str| output(json!({"type":"mcp_authorization","name":name,"url":url}));
+            let server_oauth = server.oauth.clone();
             if let Some(metadata_url) = client_metadata_url {
                 pi_rs_workbench::mcp_auth::login_with_metadata(
                     &name,
                     url,
                     &metadata_url,
+                    &scopes,
+                    announce,
+                )
+                .await?;
+            } else if client_id.is_none() && server.oauth_client().is_some() {
+                pi_rs_workbench::mcp_auth::login_configured(
+                    &name,
+                    url,
+                    server.oauth_client(),
+                    None,
                     &scopes,
                     announce,
                 )
@@ -350,6 +361,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     })?;
                 let current: ServerConfig = serde_json::from_value(server.clone())?;
                 if current.url.as_deref() != Some(url)
+                    || current.oauth != server_oauth
                     || current.command.is_some()
                     || current
                         .headers
@@ -360,7 +372,9 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                         "MCP authentication configuration changed during login".into(),
                     ));
                 }
-                server["oauth"] = json!(true);
+                if current.oauth_client().is_none() {
+                    server["oauth"] = json!(true);
+                }
                 Ok(())
             })?;
             output(json!({"type":"mcp_logged_in","name":name}));

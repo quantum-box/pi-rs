@@ -12,6 +12,36 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum OAuthSetting {
+    Enabled(bool),
+    Client(OAuthClientSettings),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct OAuthClientSettings {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub client_name: Option<String>,
+    pub callback_port: Option<u16>,
+    pub callback_url: Option<String>,
+    pub scope: Option<String>,
+    pub client_metadata_url: Option<String>,
+    pub auth_server_metadata_url: Option<String>,
+    pub client_registration: ClientRegistrationMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientRegistrationMode {
+    #[default]
+    Auto,
+    Dcr,
+    Cimd,
+}
+
 #[derive(Clone)]
 struct FileCredentials {
     path: PathBuf,
@@ -28,6 +58,8 @@ struct ClientRegistration {
     redirect_uri: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requested_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_server_metadata_url: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Envelope {
@@ -47,13 +79,21 @@ struct Upgrade {
     scopes: Vec<String>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ClientOptions<'a> {
+    client_id: Option<&'a str>,
+    client_secret: Option<&'a str>,
+    client_name: Option<&'a str>,
+    metadata_url: Option<&'a str>,
+    challenge: Option<&'a str>,
+    callback_port: Option<u16>,
+    callback_url: Option<&'a str>,
+    auth_server_metadata_url: Option<&'a str>,
+    registration: ClientRegistrationMode,
+}
+
 enum Registration<'a> {
-    New {
-        client_id: Option<&'a str>,
-        client_secret: Option<&'a str>,
-        metadata_url: Option<&'a str>,
-        challenge: Option<&'a str>,
-    },
+    New(ClientOptions<'a>),
     Upgrade(Box<Upgrade>),
 }
 impl FileCredentials {
@@ -282,6 +322,13 @@ pub async fn client(
     let identity = envelope.generation.to_string();
     let mut manager = AuthorizationManager::new(url).await.map_err(auth_error)?;
     manager.set_credential_store(store);
+    if let Some(metadata_url) = envelope
+        .registration
+        .as_ref()
+        .and_then(|registration| registration.auth_server_metadata_url.as_deref())
+    {
+        manager.set_metadata(configured_metadata(metadata_url).await?);
+    }
     if !manager.initialize_from_store().await.map_err(auth_error)? {
         return Err(auth_error(AuthError::AuthorizationRequired));
     }
@@ -336,12 +383,11 @@ pub async fn login_with_secret(
     authorize(
         name,
         url,
-        Registration::New {
+        Registration::New(ClientOptions {
             client_id,
             client_secret,
-            metadata_url: None,
-            challenge: None,
-        },
+            ..ClientOptions::default()
+        }),
         scopes,
         announce,
     )
@@ -360,12 +406,10 @@ pub async fn login_with_metadata(
     authorize(
         name,
         url,
-        Registration::New {
-            client_id: None,
-            client_secret: None,
+        Registration::New(ClientOptions {
             metadata_url: Some(client_metadata_url),
-            challenge: None,
-        },
+            ..ClientOptions::default()
+        }),
         scopes,
         announce,
     )
@@ -373,18 +417,49 @@ pub async fn login_with_metadata(
     .map(|_| ())
 }
 
-pub async fn login_discovered(name: &str, url: &str, challenge: Option<&str>) -> Result<()> {
+pub async fn login_configured(
+    name: &str,
+    url: &str,
+    settings: Option<&OAuthClientSettings>,
+    challenge: Option<&str>,
+    scopes: &[String],
+    announce: impl Fn(&str),
+) -> Result<()> {
+    let default = OAuthClientSettings::default();
+    let settings = settings.unwrap_or(&default);
+    let client_secret = if let Some(secret) = &settings.client_secret {
+        Some(crate::mcp::resolve_value(secret).await?)
+    } else {
+        None
+    };
+    let configured_scopes: Vec<_> = settings
+        .scope
+        .as_deref()
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let scopes = if scopes.is_empty() {
+        &configured_scopes
+    } else {
+        scopes
+    };
     authorize(
         name,
         url,
-        Registration::New {
-            client_id: None,
-            client_secret: None,
-            metadata_url: None,
+        Registration::New(ClientOptions {
+            client_id: settings.client_id.as_deref(),
+            client_secret: client_secret.as_deref(),
+            client_name: settings.client_name.as_deref(),
+            metadata_url: settings.client_metadata_url.as_deref(),
             challenge,
-        },
-        &[],
-        |_| {},
+            callback_port: settings.callback_port,
+            callback_url: settings.callback_url.as_deref(),
+            auth_server_metadata_url: settings.auth_server_metadata_url.as_deref(),
+            registration: settings.client_registration,
+        }),
+        scopes,
+        announce,
     )
     .await
     .map(|_| ())
@@ -430,6 +505,107 @@ pub(crate) async fn upgrade(
     .await
 }
 
+fn safe_http_url(value: &str) -> Result<reqwest_mcp::Url> {
+    let url = reqwest_mcp::Url::parse(value)
+        .map_err(|_| Error::Config("invalid MCP OAuth URL".into()))?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Error::Config(
+            "MCP OAuth requires HTTPS or loopback HTTP without embedded credentials or fragments"
+                .into(),
+        ));
+    }
+    Ok(url)
+}
+
+async fn callback_listener(
+    url: Option<&str>,
+    port: Option<u16>,
+) -> Result<(tokio::net::TcpListener, reqwest_mcp::Url)> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut callback = safe_http_url(url.unwrap_or("http://127.0.0.1/callback"))?;
+    let address = match callback.host_str() {
+        Some("127.0.0.1" | "localhost") => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Some("[::1]") => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        _ => {
+            return Err(Error::Config(
+                "MCP callbackUrl requires a loopback host".into(),
+            ));
+        }
+    };
+    if callback.scheme() != "http"
+        || callback.query().is_some()
+        || callback.path().starts_with("//")
+        || port == Some(0)
+    {
+        return Err(Error::Config(
+            "invalid MCP callbackUrl or callbackPort".into(),
+        ));
+    }
+    if let (Some(url_port), Some(port)) = (callback.port(), port)
+        && url_port != port
+    {
+        return Err(Error::Config(
+            "MCP callbackUrl and callbackPort disagree".into(),
+        ));
+    }
+    let listener =
+        tokio::net::TcpListener::bind((address, callback.port().or(port).unwrap_or_default()))
+            .await?;
+    callback
+        .set_port(Some(listener.local_addr()?.port()))
+        .map_err(|()| Error::Config("invalid MCP callback port".into()))?;
+    Ok((listener, callback))
+}
+
+async fn configured_metadata(value: &str) -> Result<rmcp::transport::auth::AuthorizationMetadata> {
+    const LIMIT: usize = 128 * 1024;
+    let url = safe_http_url(value)?;
+    let failure = |_| Error::Config("could not read configured MCP authorization metadata".into());
+    let client = reqwest_mcp::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest_mcp::redirect::Policy::none())
+        .build()
+        .map_err(failure)?;
+    let mut response = client.get(url).send().await.map_err(failure)?;
+    if !response.status().is_success() {
+        return Err(Error::Config(
+            "configured MCP authorization metadata was rejected".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(failure)? {
+        if bytes.len() + chunk.len() > LIMIT {
+            return Err(Error::Config(
+                "MCP authorization metadata exceeds 128 KiB".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let metadata: rmcp::transport::auth::AuthorizationMetadata = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::Config("invalid configured MCP authorization metadata".into()))?;
+    let issuer = metadata.issuer.as_deref().ok_or_else(|| {
+        Error::Config("configured MCP authorization metadata requires an issuer".into())
+    })?;
+    for endpoint in [
+        Some(issuer),
+        Some(metadata.authorization_endpoint.as_str()),
+        Some(metadata.token_endpoint.as_str()),
+        metadata.registration_endpoint.as_deref(),
+        metadata.jwks_uri.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        safe_http_url(endpoint)?;
+    }
+    Ok(metadata)
+}
+
 async fn authorize(
     name: &str,
     url: &str,
@@ -441,40 +617,62 @@ async fn authorize(
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let parsed = reqwest_mcp::Url::parse(url)
-        .map_err(|_| Error::Config("invalid MCP OAuth resource URL".into()))?;
-    let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback))
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return Err(Error::Config(
-            "MCP OAuth requires HTTPS or loopback HTTP without embedded credentials".into(),
-        ));
-    }
-    let (client_id, client_secret, client_metadata_url, challenge, upgrade) = match &registration {
-        Registration::New {
-            client_id,
-            client_secret,
-            metadata_url,
-            challenge,
-        } => (*client_id, *client_secret, *metadata_url, *challenge, None),
+    safe_http_url(url)?;
+    let (options, upgrade) = match &registration {
+        Registration::New(options) => (*options, None),
         Registration::Upgrade(upgrade) => {
             let client = upgrade.previous.registration.as_ref().ok_or_else(|| {
                 Error::Config("MCP registration is missing; sign in again before upgrading".into())
             })?;
+            let redirect = reqwest_mcp::Url::parse(&client.redirect_uri)
+                .map_err(|_| Error::Config("invalid saved MCP callback URL".into()))?;
             (
-                Some(upgrade.previous.credentials.client_id.as_str()),
-                client.client_secret.as_deref(),
-                None,
-                None,
+                ClientOptions {
+                    client_id: Some(upgrade.previous.credentials.client_id.as_str()),
+                    client_secret: client.client_secret.as_deref(),
+                    callback_port: redirect.port_or_known_default(),
+                    callback_url: Some(&client.redirect_uri),
+                    auth_server_metadata_url: client.auth_server_metadata_url.as_deref(),
+                    ..ClientOptions::default()
+                },
                 Some(upgrade),
             )
         }
     };
-    if client_secret.is_some() && client_id.is_none() {
+    if options.client_secret.is_some() && options.client_id.is_none() {
         return Err(Error::Config(
-            "--client-secret-env requires --client-id".into(),
+            "OAuth client secret requires a client ID".into(),
+        ));
+    }
+    if options.client_id.is_some_and(|id| id.trim().is_empty())
+        || options
+            .client_name
+            .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(Error::Config(
+            "OAuth client ID and name must be non-empty".into(),
+        ));
+    }
+    if options.registration == ClientRegistrationMode::Cimd
+        && (options.client_id.is_some()
+            || options.client_name.is_some()
+            || options.metadata_url.is_none())
+    {
+        return Err(Error::Config(
+            "OAuth cimd registration requires clientMetadataUrl and no clientId or clientName"
+                .into(),
+        ));
+    }
+    let (listener, callback) =
+        callback_listener(options.callback_url, options.callback_port).await?;
+    let client_metadata_url = options
+        .metadata_url
+        .filter(|_| options.registration != ClientRegistrationMode::Dcr);
+    if let Some(url) = client_metadata_url
+        && safe_http_url(url)?.scheme() != "https"
+    {
+        return Err(Error::Config(
+            "OAuth clientMetadataUrl requires HTTPS".into(),
         ));
     }
     let mut store = FileCredentials::new(name, url)?;
@@ -489,69 +687,53 @@ async fn authorize(
     }
     let mut manager = AuthorizationManager::new(url).await.map_err(auth_error)?;
     manager.set_credential_store(store.clone());
-    let metadata = manager
-        .resolve_metadata_from_challenge(challenge)
-        .await
-        .map_err(auth_error)?;
-    if challenge.is_some()
-        && metadata.source
-            == rmcp::transport::auth::AuthorizationMetadataSource::LegacyEndpointFallback
-    {
-        return Err(auth_error(AuthError::NoAuthorizationSupport));
-    }
+    let metadata = if let Some(url) = options.auth_server_metadata_url {
+        configured_metadata(url).await?
+    } else {
+        let metadata = manager
+            .resolve_metadata_from_challenge(options.challenge)
+            .await
+            .map_err(auth_error)?;
+        if options.challenge.is_some() && !metadata.source.is_discovered() {
+            return Err(auth_error(AuthError::NoAuthorizationSupport));
+        }
+        metadata.metadata
+    };
     if let Some(upgrade) = upgrade
-        && (metadata.metadata.issuer.is_none()
-            || metadata.metadata.issuer != upgrade.previous.credentials.issuer)
+        && (metadata.issuer.is_none() || metadata.issuer != upgrade.previous.credentials.issuer)
     {
         return Err(Error::Config(
             "MCP authorization issuer changed; sign in again before upgrading".into(),
         ));
     }
     let supports_client_metadata = metadata
-        .metadata
         .additional_fields
         .get("client_id_metadata_document_supported")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    manager.set_metadata(metadata.metadata);
-    let port = if let Some(upgrade) = upgrade {
-        let redirect = &upgrade
-            .previous
-            .registration
-            .as_ref()
-            .expect("registered client")
-            .redirect_uri;
-        let redirect = reqwest_mcp::Url::parse(redirect)
-            .map_err(|_| Error::Config("invalid saved MCP callback URL".into()))?;
-        redirect
-            .port()
-            .filter(|_| {
-                redirect.scheme() == "http"
-                    && redirect.host_str() == Some("127.0.0.1")
-                    && redirect.path() == "/callback"
-            })
-            .ok_or_else(|| Error::Config("invalid saved MCP callback URL".into()))?
-    } else {
-        0
-    };
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-    let callback = format!(
-        "http://127.0.0.1:{}/callback",
-        listener.local_addr()?.port()
-    );
+    if options.registration == ClientRegistrationMode::Cimd && !supports_client_metadata {
+        return Err(Error::Config(
+            "MCP authorization server does not support client metadata documents".into(),
+        ));
+    }
+    manager.set_metadata(metadata);
+    let client_name = options.client_name.unwrap_or("pi-rs");
     let scopes = if scopes.is_empty() {
         manager.select_initial_scopes(&[]).await
     } else {
         scopes.to_vec()
     };
-    let (client_id, secret) = if let Some(client_id) = client_id {
-        (Some(client_id.to_owned()), client_secret.map(str::to_owned))
+    let (client_id, secret) = if let Some(client_id) = options.client_id {
+        (
+            Some(client_id.to_owned()),
+            options.client_secret.map(str::to_owned),
+        )
     } else if client_metadata_url.is_some() && supports_client_metadata {
         (None, None)
     } else {
         let refs: Vec<_> = scopes.iter().map(String::as_str).collect();
         let registration = manager
-            .register_client("pi-rs", &callback, &refs)
+            .register_client(client_name, callback.as_str(), &refs)
             .await
             .map_err(auth_error)?;
         (Some(registration.client_id), registration.client_secret)
@@ -561,11 +743,12 @@ async fn authorize(
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(ClientRegistration {
         client_secret: secret.clone(),
-        redirect_uri: callback.clone(),
+        redirect_uri: callback.to_string(),
         requested_scopes: scopes.clone(),
+        auth_server_metadata_url: options.auth_server_metadata_url.map(str::to_owned),
     });
-    let mut request = AuthorizationRequest::new(&callback)
-        .with_client_name("pi-rs")
+    let mut request = AuthorizationRequest::new(callback.as_str())
+        .with_client_name(client_name)
         .with_initial_scope_selection()
         .with_scopes(scopes);
     if let Some(client_id) = client_id {
@@ -626,12 +809,18 @@ async fn authorize(
                 .and_then(|line| line.strip_prefix("GET "))
                 .and_then(|line| line.strip_suffix(" HTTP/1.1"));
             let target = target.filter(|target| {
-                target.starts_with("/callback?")
+                target.starts_with('/')
+                    && !target.starts_with("//")
                     && bytes.len() <= 8192
                     && bytes.windows(4).any(|part| part == b"\r\n\r\n")
             });
             let redirect = target
-                .and_then(|target| reqwest_mcp::Url::parse(&callback).ok()?.join(target).ok());
+                .and_then(|target| callback.join(target).ok())
+                .filter(|target| {
+                    target.origin() == callback.origin()
+                        && target.path() == callback.path()
+                        && target.fragment().is_none()
+                });
             let valid = redirect.filter(|redirect| {
                 let states: Vec<_> = redirect
                     .query_pairs()
@@ -733,6 +922,7 @@ mod tests {
             client_secret: Some("fixture-client-secret".into()),
             redirect_uri: "http://127.0.0.1:12345/callback".into(),
             requested_scopes: Vec::new(),
+            auth_server_metadata_url: None,
         });
         login
             .save(StoredCredentials::new("first".into(), None, vec![], None))

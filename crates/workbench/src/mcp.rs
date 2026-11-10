@@ -43,9 +43,33 @@ pub struct ServerConfig {
     pub description: Option<String>,
     pub enabled: Option<bool>,
     pub exposure: Option<String>,
-    pub oauth: Option<bool>,
+    pub oauth: Option<crate::mcp_auth::OAuthSetting>,
     #[serde(default)]
     pub tool_exposure: BTreeMap<String, String>,
+}
+
+impl ServerConfig {
+    pub fn oauth_client(&self) -> Option<&crate::mcp_auth::OAuthClientSettings> {
+        match &self.oauth {
+            Some(crate::mcp_auth::OAuthSetting::Client(client)) => Some(client),
+            _ => None,
+        }
+    }
+
+    fn oauth_required(&self) -> bool {
+        use crate::mcp_auth::OAuthSetting;
+        matches!(
+            self.oauth,
+            Some(OAuthSetting::Enabled(true) | OAuthSetting::Client(_))
+        )
+    }
+
+    fn oauth_allowed(&self) -> bool {
+        !matches!(
+            self.oauth,
+            Some(crate::mcp_auth::OAuthSetting::Enabled(false))
+        )
+    }
 }
 
 #[derive(Clone, Default)]
@@ -434,7 +458,7 @@ impl McpExtension {
                 "MCP exposure must be direct, deferred, codemode, or hidden".into(),
             ));
         }
-        if config.oauth == Some(true) && config.command.is_some() {
+        if config.oauth_required() && config.command.is_some() {
             return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
         }
         let timeout = Duration::from_secs(config.timeout.unwrap_or(60).clamp(1, 3600));
@@ -526,8 +550,8 @@ impl McpExtension {
                 headers.insert(name, value);
             }
             let manual_auth = headers.contains_key(&reqwest_mcp::header::AUTHORIZATION);
-            let may_authorize = config.oauth != Some(false) && !manual_auth;
-            let use_oauth = config.oauth == Some(true)
+            let may_authorize = config.oauth_allowed() && !manual_auth;
+            let use_oauth = config.oauth_required()
                 || (may_authorize && crate::mcp_auth::has_credentials(name, url)?);
             let client = reqwest_mcp::Client::builder()
                 .redirect(reqwest_mcp::redirect::Policy::none())

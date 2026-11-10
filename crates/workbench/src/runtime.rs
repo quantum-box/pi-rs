@@ -178,8 +178,15 @@ impl Runtime {
                         "MCP configuration changed before sign-in".into(),
                     ));
                 }
-                pi_rs_workbench::mcp_auth::login_discovered(&name, url, challenge.as_deref())
-                    .await?;
+                pi_rs_workbench::mcp_auth::login_configured(
+                    &name,
+                    url,
+                    config.oauth_client(),
+                    challenge.as_deref(),
+                    &[],
+                    |_| {},
+                )
+                .await?;
                 if current()?.as_ref() != Some(&config) {
                     return Err(pi_rs::Error::Config(
                         "MCP configuration changed during sign-in".into(),
