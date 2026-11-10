@@ -401,7 +401,7 @@ impl CodingTool {
         let limit = args["limit"]
             .as_u64()
             .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
-        crate::text_page::read(&path, offset, limit)
+        crate::text_page::read(&path, string(args, "path")?, offset, limit)
     }
 
     fn write(&self, args: &Value) -> Result<String> {

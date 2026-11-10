@@ -1678,3 +1678,19 @@ suggest switching scope with Tab. Tests cover alignment, Unicode truncation and
 the reference age units; real PTY search and threaded-selector checks pass.
 
 Full workspace tests and all-target Clippy pass.
+
+### Read boundary checkpoint
+
+A final newline no longer consumes the 2,000-line truncation allowance. An
+explicit 2,000-line request still reports the remaining final empty line, while
+an unrestricted read or 2,001-line request preserves the complete content.
+The line/byte boundary uses the reference's continuation classification.
+
+Oversized-line guidance now uses the original requested path, the reference
+KB/MB size formatting and the same bounded shell-read suggestion. Streaming
+line counting and bounded retained buffers remain in use. Four normal CLI tool
+calls compare their model-visible output exactly against the pinned reference,
+covering terminal newlines, explicit limits, oversized lines and combined
+line/byte limits. Regression tests cover the same boundaries.
+
+Full workspace tests and all-target Clippy pass.
