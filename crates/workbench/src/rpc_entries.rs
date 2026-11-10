@@ -394,6 +394,13 @@ impl Cursor {
 }
 
 fn compaction_tokens(records: &[Record], record: &Record, session: Option<&Session>) -> u64 {
+    if let Event::Compacted {
+        tokens_before: Some(tokens),
+        ..
+    } = &record.event
+    {
+        return *tokens;
+    }
     if let Some(session) = session {
         return super::rpc_messages::compaction_tokens(session, record);
     }

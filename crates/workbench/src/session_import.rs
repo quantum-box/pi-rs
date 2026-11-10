@@ -658,6 +658,7 @@ fn convert(
             events.push(Event::Compacted {
                 summary: required(entry, "summary")?.into(),
                 retain_from,
+                tokens_before: entry["tokensBefore"].as_u64(),
                 states: Default::default(),
                 usage,
                 usage_metadata,

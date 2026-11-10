@@ -489,13 +489,31 @@ fn shell_message(record: &Record) -> Option<Value> {
 }
 
 pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
+    if let Event::Compacted {
+        tokens_before: Some(tokens),
+        ..
+    } = &record.event
+    {
+        return *tokens;
+    }
     let Some(parent) = record.parent else {
         return 0;
+    };
+    let source = |id: u64| session.records().get(id.checked_sub(1)? as usize);
+    let previous = source(parent);
+    let imported = match previous {
+        Some(Record {
+            event: Event::ModelFinished { .. },
+            parent: Some(source_id),
+            ..
+        }) => source(*source_id),
+        record => record,
     };
     if let Some(Record {
         event: Event::SourceEntry { entry, .. },
         ..
-    }) = session.records().get(parent.saturating_sub(1) as usize)
+    }) = imported
+        && entry["type"] == "compaction"
         && let Some(tokens) = entry["tokensBefore"].as_u64()
     {
         return tokens;

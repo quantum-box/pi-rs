@@ -181,12 +181,24 @@ pub enum ToolPart {
 }
 
 #[derive(Clone)]
+pub enum SummaryKind {
+    Compaction { tokens_before: u64 },
+    Branch,
+}
+
+#[derive(Clone)]
 pub enum Entry {
     Notice(String),
     Warning(String),
     User(String),
     Assistant(String),
     Thinking(String),
+    Summary {
+        id: u64,
+        kind: SummaryKind,
+        text: String,
+        expanded: Option<bool>,
+    },
     Image(std::sync::Arc<super::images::InlineImage>),
     Tool {
         id: String,
@@ -204,6 +216,7 @@ pub struct TranscriptOptions {
     pub image_width: Option<usize>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
+    pub expand_key: Option<crossterm::event::KeyEvent>,
 }
 
 impl Entry {
@@ -232,6 +245,60 @@ impl Entry {
             }
             Self::Assistant(text) => {
                 let mut lines = markdown_at_depth(text, theme, inner, 0, options.mermaid);
+                lines.push(Line::default());
+                lines
+            }
+            Self::Summary {
+                kind,
+                text,
+                expanded,
+                ..
+            } => {
+                let (label, title) = match kind {
+                    SummaryKind::Compaction { tokens_before } => {
+                        let mut count = tokens_before.to_string();
+                        let mut offset = count.len();
+                        while offset > 3 {
+                            offset -= 3;
+                            count.insert(offset, ',');
+                        }
+                        ("[compaction]", format!("Compacted from {count} tokens"))
+                    }
+                    SummaryKind::Branch => ("[branch]", "Branch summary".into()),
+                };
+                let color = theme.color("customMessageText");
+                let mut heading = Span::new(label, theme.color("customMessageLabel"));
+                heading.bold = true;
+                let mut lines = vec![Line::default()];
+                lines.extend(wrap(&[heading], inner));
+                lines.push(Line::default());
+                if expanded.unwrap_or(expand_tools) {
+                    let markdown = format!("**{title}**\n\n{text}");
+                    let mut body = markdown_at_depth(&markdown, theme, inner, 0, options.mermaid);
+                    for span in body.iter_mut().flat_map(|line| &mut line.spans) {
+                        if span.color == theme.color("text") {
+                            span.color = color;
+                        }
+                    }
+                    lines.extend(body);
+                } else {
+                    let mut hint = vec![Span::new(title, color)];
+                    if options.expand_key.is_some() {
+                        hint.extend([
+                            Span::new(" (", color),
+                            Span::new(
+                                super::keys::binding_hint(options.expand_key),
+                                theme.color("dim"),
+                            ),
+                            Span::new(" to expand)", color),
+                        ]);
+                    }
+                    lines.extend(wrap(&hint, inner));
+                }
+                lines.push(Line::default());
+                for line in &mut lines {
+                    line.background = Some(theme.color("customMessageBg"));
+                }
                 lines.push(Line::default());
                 lines
             }
@@ -817,6 +884,48 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn summaries_fold_the_markdown_and_use_the_configured_expand_key() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let options = TranscriptOptions {
+            padding: 1,
+            expand_key: Some(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            ..TranscriptOptions::default()
+        };
+        let mut entry = Entry::Summary {
+            id: 7,
+            kind: SummaryKind::Compaction {
+                tokens_before: 12_345,
+            },
+            text: "**recovered context**".into(),
+            expanded: None,
+        };
+        let theme = Theme::system();
+        let render = |entry: &Entry, expand| entry.render(&theme, 72, expand, true, options);
+        let folded = render(&entry, false);
+        let text: String = folded
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(text.contains("Compacted from 12,345 tokens (Ctrl+G to expand)"));
+        assert!(!text.contains("recovered context"));
+        assert!(
+            folded
+                .iter()
+                .any(|line| line.background == Some(theme.color("customMessageBg")))
+        );
+        if let Entry::Summary { expanded, .. } = &mut entry {
+            *expanded = Some(true);
+        }
+        assert!(
+            render(&entry, false)
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.bold && span.text == "recovered context")
+        );
+    }
+
     #[test]
     fn list_continuations_keep_indent_and_deep_quotes_are_bounded() {
         let theme = Theme::system();

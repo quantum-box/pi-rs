@@ -222,6 +222,8 @@ pub enum Event {
     Compacted {
         summary: String,
         retain_from: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
         states: ExtensionStates,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,

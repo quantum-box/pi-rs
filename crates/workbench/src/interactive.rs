@@ -10,7 +10,7 @@ use crate::ui::{
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
     picker::{Input, Item, Picker, Selection, TreeEntryKind, TreeFilter},
-    render::{Entry, Line, ToolPart, TranscriptOptions},
+    render::{Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
     viewport::{Viewport, Wheel},
@@ -338,6 +338,10 @@ struct View {
     pending_request: Option<Value>,
     thinking: String,
     expand_tools: bool,
+    expand_key: Option<crossterm::event::KeyEvent>,
+    summary_rows: Vec<(std::ops::Range<usize>, u64)>,
+    summary_press: Option<(u64, u16, u16)>,
+    summarizing: bool,
     hide_thinking: bool,
     streaming: String,
     editor: Editor,
@@ -584,6 +588,48 @@ impl View {
         }
     }
 
+    fn add_summary(&mut self, record: &pi_rs::Record, session: Option<&Session>) {
+        let (kind, text) = match &record.event {
+            pi_rs::Event::Compacted {
+                summary,
+                tokens_before,
+                ..
+            } => (
+                SummaryKind::Compaction {
+                    tokens_before: tokens_before.unwrap_or_else(|| {
+                        session.map_or(0, |session| {
+                            super::rpc_messages::compaction_tokens(session, record)
+                        })
+                    }),
+                },
+                summary,
+            ),
+            pi_rs::Event::BranchSummary { summary, .. } => (SummaryKind::Branch, summary),
+            _ => return,
+        };
+        self.lines.push(Entry::Summary {
+            id: record.id,
+            kind,
+            text: text.clone(),
+            expanded: None,
+        });
+    }
+
+    fn set_expand_tools(&mut self, expanded: bool) {
+        self.expand_tools = expanded;
+        for entry in &mut self.lines {
+            if let Entry::Summary { expanded, .. } = entry {
+                *expanded = None;
+            }
+        }
+    }
+
+    fn summary_at(&self, row: u16) -> Option<u64> {
+        self.summary_rows
+            .iter()
+            .find_map(|(rows, id)| rows.contains(&usize::from(row)).then_some(*id))
+    }
+
     fn show_summary_billing(
         &mut self,
         record: &pi_rs::Record,
@@ -640,6 +686,7 @@ impl View {
             if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
                 self.cache_stats.select_provider(args.provider.id());
             }
+            self.add_summary(&record, None);
             self.show_summary_billing(&record, &[], args);
             self.observe_cache(&record, args);
         }
@@ -660,6 +707,9 @@ impl View {
         self.viewport.follow();
         self.search = None;
         self.mouse.clear();
+        self.summary_rows.clear();
+        self.summary_press = None;
+        self.summarizing = false;
         self.scrollbar_dragging = false;
         self.scrollbar_activity = None;
         self.flash = None;
@@ -679,6 +729,26 @@ impl View {
         self.cache_stats = super::cache_stats::Tracker::default();
         self.cache_warming_status = None;
         self.model_operations.clear();
+        let records = session.records();
+        let summary_requests: std::collections::HashSet<_> = records
+            .windows(2)
+            .filter_map(|pair| {
+                if matches!(
+                    pair[1].event,
+                    pi_rs::Event::Compacted { .. } | pi_rs::Event::BranchSummary { .. }
+                ) && let pi_rs::Event::ModelFinished {
+                    request_id,
+                    reply: None,
+                    failure: None,
+                    ..
+                } = pair[0].event
+                {
+                    Some(request_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
         for record in session.branch() {
             match &record.event {
                 pi_rs::Event::User { content, .. }
@@ -713,12 +783,17 @@ impl View {
                     self.add_images(images);
                 }
                 pi_rs::Event::ModelFinished {
-                    metadata, usage, ..
+                    metadata,
+                    usage,
+                    request_id,
+                    ..
                 } => {
                     if metadata.finish_reason.as_deref() == Some("length") {
                         self.append("Response reached the output token limit.");
                     }
-                    if let Some(reasoning) = &metadata.reasoning {
+                    if !summary_requests.contains(request_id)
+                        && let Some(reasoning) = &metadata.reasoning
+                    {
                         self.lines.push(Entry::Thinking(reasoning.clone()));
                     }
                     if let pi_rs::UsageReport::Measured { usage } = usage {
@@ -746,9 +821,6 @@ impl View {
                         self.add_tool(invocation);
                     }
                 }
-                pi_rs::Event::BranchSummary { summary, .. } => {
-                    self.append(&format!("Branch summary\n{summary}"));
-                }
                 pi_rs::Event::ToolPlanned { invocation, .. } => self.add_tool(invocation),
                 pi_rs::Event::ToolFinished {
                     operation_id,
@@ -763,7 +835,8 @@ impl View {
                 }
                 _ => {}
             }
-            self.show_summary_billing(record, session.records(), args);
+            self.add_summary(record, Some(&session));
+            self.show_summary_billing(record, records, args);
             self.observe_cache(record, args);
         }
         if show_startup_header(args) {
@@ -945,10 +1018,15 @@ impl View {
                     _ => "モデル応答待ち",
                 });
             }
-            Some("reasoning_delta") => self
+            Some("summary_request_start") => {
+                self.summarizing = true;
+                self.thinking.clear();
+                self.streaming.clear();
+            }
+            Some("reasoning_delta") if !self.summarizing => self
                 .thinking
                 .push_str(value["delta"].as_str().unwrap_or_default()),
-            Some("text_delta") => self
+            Some("text_delta") if !self.summarizing => self
                 .streaming
                 .push_str(value["delta"].as_str().unwrap_or_default()),
             Some("mcp_server") => self.append(&format!(
@@ -1028,7 +1106,11 @@ impl View {
                             );
                         }
                     }
+                    Some("compacted" | "branch_summary") => self.summarizing = false,
                     Some("model_finished") => {
+                        if !event["failure"].is_null() {
+                            self.summarizing = false;
+                        }
                         if event["metadata"]["finish_reason"] == "length" {
                             self.append("Response reached the output token limit.");
                         }
@@ -1054,6 +1136,7 @@ impl View {
         }
     }
     fn settle(&mut self) {
+        self.summarizing = false;
         if !self.thinking.is_empty() {
             self.lines
                 .push(Entry::Thinking(std::mem::take(&mut self.thinking)));
@@ -1133,13 +1216,25 @@ impl View {
                 self.paste_clipboard(args);
             }
             MouseEventKind::Down(MouseButton::Left) if self.search.is_none() => {
+                self.summary_press = event.modifiers.is_empty().then(|| self.summary_at(event.row))
+                    .flatten().map(|id| (id, event.column, event.row));
                 self.mouse.press(event.column, event.row, now);
             }
             MouseEventKind::Drag(MouseButton::Left) if self.search.is_none() => {
+                self.summary_press = None;
                 self.mouse.drag(event.column, event.row);
             }
             MouseEventKind::Up(MouseButton::Left) if self.search.is_none() => {
-                if self.mouse.release(event.column, event.row)
+                if let Some((id, column, row)) = self.summary_press.take()
+                    && (column, row) == (event.column, event.row)
+                    && self.summary_at(row) == Some(id)
+                    && let Some(Entry::Summary { expanded, .. }) = self.lines.iter_mut().find(
+                        |entry| matches!(entry, Entry::Summary { id: candidate, .. } if *candidate == id)
+                    )
+                {
+                    *expanded = Some(!expanded.unwrap_or(self.expand_tools));
+                    self.mouse.clear();
+                } else if self.mouse.release(event.column, event.row)
                     && args.settings.boolean("fullscreenCopyOnSelect") != Some(false)
                 {
                     self.copy_selection();
@@ -1175,6 +1270,7 @@ impl View {
     }
 
     fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
+        self.expand_key = keys.first_binding("app.tools.expand");
         if args.tui_mode == Some(TuiMode::Regular) {
             return self.draw_regular(args, theme, busy, keys);
         }
@@ -1200,10 +1296,12 @@ impl View {
         let body_height = height.saturating_sub(prompt_height + 4 + header_rows + below.len());
         let mut lines = Vec::new();
         let mut prompts = Vec::new();
+        let mut summaries = Vec::new();
         for entry in &self.lines {
             if matches!(entry, Entry::User(_)) {
                 prompts.push(lines.len());
             }
+            let start = lines.len();
             lines.extend(entry.render(
                 theme,
                 body_width,
@@ -1211,6 +1309,9 @@ impl View {
                 !self.hide_thinking,
                 output,
             ));
+            if let Entry::Summary { id, .. } = entry {
+                summaries.push((start..lines.len().saturating_sub(1), *id));
+            }
         }
         if !self.thinking.is_empty() {
             lines.extend(Entry::Thinking(self.thinking.clone()).render(
@@ -1260,9 +1361,18 @@ impl View {
             self.viewport.top()
         };
         let end = (start + body_height).min(lines.len());
+        self.summary_rows.clear();
         if modal {
+            self.summary_press = None;
             self.mouse.clear();
         } else {
+            self.summary_rows
+                .extend(summaries.into_iter().filter_map(|(rows, id)| {
+                    let first = rows.start.max(start);
+                    let last = rows.end.min(end);
+                    (first < last)
+                        .then(|| (header_rows + first - start..header_rows + last - start, id))
+                }));
             self.mouse
                 .update(&lines, start, header_rows..header_rows + body_height);
             if let Some(search) = &self.search {
@@ -1449,6 +1559,7 @@ impl View {
             image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
                 .then(|| args.settings.terminal_image_width()),
             padding: args.settings.output_padding(),
+            expand_key: self.expand_key,
             mermaid: match (args.settings.mermaid_mode(), streaming) {
                 ("off", _) | ("final", true) => Mermaid::Off,
                 (_, true) => Mermaid::Streaming,
@@ -2718,6 +2829,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 }
             }
             Event::FocusLost if args.tui_mode != Some(TuiMode::Regular) => {
+                view.summary_press = None;
                 view.mouse.focus_lost();
                 view.scrollbar_dragging = false;
                 dirty = true;
@@ -3048,7 +3160,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             view.append(&error.to_string());
                         }
                     }
-                    "app.tools.expand" => view.expand_tools = !view.expand_tools,
+                    "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
                     "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
                     "app.clear" => {
@@ -4200,7 +4312,7 @@ fn select(
                 worker.send(json!({"type":"cache_warming_changed"}))?;
             }
             match key.as_str() {
-                "expandTools" => view.expand_tools = value.as_bool().unwrap_or(false),
+                "expandTools" => view.set_expand_tools(value.as_bool().unwrap_or(false)),
                 "hideThinkingBlock" => view.hide_thinking = value.as_bool().unwrap_or(false),
                 _ => {}
             }

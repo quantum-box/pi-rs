@@ -2750,3 +2750,14 @@ enabled. RPC session entries expose the cache breakdown and provider
 total. Older native journals recover usage details from the adjacent
 model completion when available. Imported Pi usage remains intact and
 session statistics count each completed summary once.
+
+### Foldable compaction and branch summaries checkpoint
+
+Both terminal modes render compaction and branch summaries as themed,
+foldable Markdown cards. The configured tool-expansion key opens or
+closes all cards. Fullscreen clicks toggle one card and drags retain
+text selection. Generated summary deltas stay out of the normal
+assistant transcript. New compactions record their pre-compaction
+context size, and imported sessions retain Pi's `tokensBefore`.
+Loopback and PTY checks covered live compaction and branch summaries,
+imported journals, custom bindings, individual clicks, and billing.

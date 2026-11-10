@@ -2156,11 +2156,13 @@ impl Agent<'_> {
         }
         let (usage, usage_metadata) =
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
+        let tokens_before = session.estimated_context_tokens();
         commit(
             session,
             Event::Compacted {
                 summary: compaction.summary,
                 retain_from,
+                tokens_before: Some(tokens_before),
                 states: changes,
                 usage,
                 usage_metadata,

@@ -248,30 +248,15 @@ impl Keys {
         .find(|action| self.matches(action, key))
     }
 
+    pub fn first_binding(&self, action: &str) -> Option<KeyEvent> {
+        self.bindings
+            .get(action)
+            .and_then(|keys| keys.first())
+            .copied()
+    }
+
     pub fn hint(&self, action: &str) -> String {
-        let Some(key) = self.bindings.get(action).and_then(|keys| keys.first()) else {
-            return "—".into();
-        };
-        let mut label = String::new();
-        for (modifier, prefix) in [
-            (KeyModifiers::CONTROL, "Ctrl+"),
-            (KeyModifiers::ALT, "Alt+"),
-            (KeyModifiers::SHIFT, "Shift+"),
-            (KeyModifiers::SUPER, "Super+"),
-        ] {
-            if key.modifiers.contains(modifier) {
-                label.push_str(prefix);
-            }
-        }
-        match key.code {
-            KeyCode::Char(character) => label.push(character.to_ascii_uppercase()),
-            KeyCode::Up => label.push('↑'),
-            KeyCode::Down => label.push('↓'),
-            KeyCode::Left => label.push('←'),
-            KeyCode::Right => label.push('→'),
-            code => label.push_str(&format!("{code:?}")),
-        }
-        label
+        binding_hint(self.first_binding(action))
     }
     pub fn describe(&self) -> String {
         self.bindings
@@ -290,6 +275,32 @@ impl Keys {
             .join("\n")
     }
 }
+pub(super) fn binding_hint(key: Option<KeyEvent>) -> String {
+    let Some(key) = key else {
+        return "—".into();
+    };
+    let mut label = String::new();
+    for (modifier, prefix) in [
+        (KeyModifiers::CONTROL, "Ctrl+"),
+        (KeyModifiers::ALT, "Alt+"),
+        (KeyModifiers::SHIFT, "Shift+"),
+        (KeyModifiers::SUPER, "Super+"),
+    ] {
+        if key.modifiers.contains(modifier) {
+            label.push_str(prefix);
+        }
+    }
+    match key.code {
+        KeyCode::Char(character) => label.push(character.to_ascii_uppercase()),
+        KeyCode::Up => label.push('↑'),
+        KeyCode::Down => label.push('↓'),
+        KeyCode::Left => label.push('←'),
+        KeyCode::Right => label.push('→'),
+        code => label.push_str(&format!("{code:?}")),
+    }
+    label
+}
+
 pub(super) fn normalize(mut key: KeyEvent) -> KeyEvent {
     if key.code == KeyCode::BackTab {
         key.code = KeyCode::Tab;
