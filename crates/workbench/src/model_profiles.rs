@@ -401,7 +401,7 @@ fn endpoint_from_base(provider: &Provider, base: &str) -> Result<String> {
 
     let suffix = match provider.adapter() {
         Adapter::ChatCompletions => "/chat/completions",
-        Adapter::Anthropic => "/messages",
+        Adapter::Anthropic | Adapter::PiMessages => "/messages",
         Adapter::Google => {
             if url.path() == "/" {
                 url.set_path("/v1beta");
@@ -412,7 +412,7 @@ fn endpoint_from_base(provider: &Provider, base: &str) -> Result<String> {
     let path = url.path().trim_end_matches('/');
     let path = if path.ends_with(suffix) {
         path.to_owned()
-    } else if path.is_empty() {
+    } else if path.is_empty() && provider.adapter() != Adapter::PiMessages {
         format!("/v1{suffix}")
     } else {
         format!("{path}{suffix}")

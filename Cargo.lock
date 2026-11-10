@@ -2229,12 +2229,14 @@ name = "pi-rs-workbench"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "async-stream",
  "async-trait",
  "base64 0.22.1",
  "clap",
  "crossterm",
  "crossterm_winapi",
  "encoding_rs",
+ "eventsource-stream",
  "fancy-regex",
  "futures-util",
  "globset",

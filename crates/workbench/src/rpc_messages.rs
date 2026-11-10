@@ -333,7 +333,19 @@ impl Projection {
                             .and_then(|entry| entry.metadata.resolved_model.as_ref())
                             .and_then(|identity| Provider::named(&identity.provider))
                     })
-                    .map_or("openai-completions", |provider| provider.api());
+                    .map_or_else(
+                        || {
+                            if replay
+                                .as_deref()
+                                .is_some_and(super::pi_messages::is_pi_messages_replay)
+                            {
+                                "pi-messages"
+                            } else {
+                                "openai-completions"
+                            }
+                        },
+                        |provider| provider.api(),
+                    );
                 let model_id = model
                     .filter(|model| !model.model.is_empty())
                     .map(|model| model.model)

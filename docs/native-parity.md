@@ -18,7 +18,7 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, named profiles for those APIs, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, named profiles for those APIs and Pi Messages, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh | OAuth and refresh for other model providers |
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Input hooks for queued SDK controls, remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
@@ -2150,7 +2150,8 @@ models on the same connection.
 
 A custom provider in `models.json` uses its own ID, base URL, models and
 credentials. Its `api` selects one of the installed adapters
-(`openai-completions`, `anthropic-messages`, or `google-generative-ai`).
+(`openai-completions`, `anthropic-messages`, `google-generative-ai`, or
+`pi-messages`).
 Select it with `--provider`, a qualified `--model provider/id`, RPC
 `set_model`, or the terminal's model picker. Named providers participate
 in scopes, saved model selection and the masked API key controls.
@@ -2191,9 +2192,10 @@ system prompt and tool schemas for the viewer's `pi.share` metadata.
 ### Streamed tool call arguments
 
 Chat-completions, Anthropic Messages and Gemini model streams expose tool
-call fragments before the response completes. Pi JSON and RPC modes emit
-`toolcall_start` and `toolcall_delta` with stable assistant content
-indexes, then `toolcall_end` with the completed call. The Rust SDK exposes
+call fragments before the response completes. RPC emits `toolcall_start`
+and `toolcall_delta` with stable assistant content indexes, then
+`toolcall_end` with the completed call. JSON trace mode emits the native
+`tool_call_delta` records. The Rust SDK exposes
 the same transient fragments through its event subscription. Partial
 arguments populate the snapshot once the accumulated JSON is a valid
 object. Dispatch still uses the completed, journaled assistant response.
@@ -2215,3 +2217,15 @@ origin. Radius sharing refreshes expiring credentials, serializes
 concurrent refreshes and saves rotated refresh tokens. A local OAuth
 fixture exercised both login methods, a rejected callback, cancellation,
 concurrent refresh, endpoint isolation, authenticated share and logout.
+
+### Pi Messages connections
+
+A named provider with `api: "pi-messages"` posts Pi transcript context
+and request options to the gateway's `/messages` endpoint. It streams
+text, thinking and tool input, reports provider usage and response
+identity, and carries signed response blocks forward on the same
+connection. Changing endpoints excludes the opaque replay data.
+
+A loopback fixture covered tool calls and results, streamed reasoning,
+cache and cost accounting, signed history across process restarts and
+credential and signature isolation on endpoint changes.

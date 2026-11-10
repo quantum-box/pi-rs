@@ -25,7 +25,7 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         return levels;
     }
     let fallback = || match args.provider.adapter() {
-        super::providers::Adapter::ChatCompletions => {
+        super::providers::Adapter::ChatCompletions | super::providers::Adapter::PiMessages => {
             LEVELS.iter().map(|level| (*level).into()).collect()
         }
         super::providers::Adapter::Anthropic => vec!["off".into()],

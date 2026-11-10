@@ -26,6 +26,7 @@ mod model_listing;
 mod model_profiles;
 mod model_selection;
 mod packages;
+mod pi_messages;
 mod process;
 mod providers;
 use providers::Provider;

@@ -8,6 +8,8 @@ use pi_rs::{Error, Model, ModelRequest, ModelStream, Result};
 use serde_json::json;
 use std::sync::Arc;
 
+use super::pi_messages::PiMessages;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) enum Provider {
     #[default]
@@ -25,6 +27,7 @@ pub(super) enum Adapter {
     ChatCompletions,
     Anthropic,
     Google,
+    PiMessages,
 }
 
 impl Adapter {
@@ -33,6 +36,7 @@ impl Adapter {
             "openai-completions" => Some(Self::ChatCompletions),
             "anthropic-messages" => Some(Self::Anthropic),
             "google-generative-ai" => Some(Self::Google),
+            "pi-messages" => Some(Self::PiMessages),
             _ => None,
         }
     }
@@ -42,6 +46,7 @@ impl Adapter {
             Self::ChatCompletions => "openai-completions",
             Self::Anthropic => "anthropic-messages",
             Self::Google => "google-generative-ai",
+            Self::PiMessages => "pi-messages",
         }
     }
 }
@@ -104,6 +109,11 @@ impl Provider {
                 let token = token.ok_or_else(missing_key)?;
                 Ok(Client::Google(Google::new(endpoint, &token)?))
             }
+            Adapter::PiMessages => Ok(Client::PiMessages(PiMessages::new(
+                self.id(),
+                endpoint,
+                token.ok_or_else(missing_key)?,
+            )?)),
         }
     }
 }
@@ -113,6 +123,7 @@ pub(super) enum Client {
     Ollama(Ollama),
     Anthropic(Anthropic),
     Google(Google),
+    PiMessages(PiMessages),
 }
 
 impl Client {
@@ -121,6 +132,7 @@ impl Client {
             Self::Ollama(client) => Self::Ollama(client.with_headers(headers)),
             Self::Anthropic(client) => Self::Anthropic(client.with_headers(headers)),
             Self::Google(client) => Self::Google(client.with_headers(headers)),
+            Self::PiMessages(client) => Self::PiMessages(client.with_headers(headers)),
         }
     }
 
@@ -139,6 +151,7 @@ impl Client {
                 .into_iter()
                 .map(|model| model.id)
                 .collect()),
+            Self::PiMessages(_) => Ok(Vec::new()),
         }
     }
 
@@ -193,6 +206,7 @@ impl Client {
                     })
                     .collect()
             }
+            Self::PiMessages(_) => BTreeMap::new(),
         }
     }
 
@@ -201,6 +215,7 @@ impl Client {
             Self::Ollama(client) => Self::Ollama(client.with_native_probes(enabled)),
             Self::Anthropic(client) => Self::Anthropic(client.with_context_probe(enabled)),
             Self::Google(client) => Self::Google(client.with_context_probe(enabled)),
+            Self::PiMessages(client) => Self::PiMessages(client),
         }
     }
 
@@ -226,6 +241,7 @@ impl Client {
             }
             Self::Anthropic(client) => Self::Anthropic(client.with_thinking(thinking)),
             Self::Google(client) => Self::Google(client.with_thinking(thinking)),
+            Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
         })
     }
 
@@ -240,6 +256,7 @@ impl Client {
             }
             Self::Anthropic(client) => client.model(model).await.map(|entry| entry.thinking_levels),
             Self::Google(client) => client.model(model).await.map(|entry| entry.thinking_levels),
+            Self::PiMessages(_) => None,
         }
     }
 
@@ -262,6 +279,7 @@ impl Client {
             Self::Google(client) => {
                 Self::Google(client.with_progress(progress).with_reasoning(reasoning))
             }
+            Self::PiMessages(client) => Self::PiMessages(client.observe(progress, reasoning)),
         }
     }
 }
@@ -273,6 +291,7 @@ impl Model for Client {
             Self::Ollama(client) => client.context_window(model).await,
             Self::Anthropic(client) => client.context_window(model).await,
             Self::Google(client) => client.context_window(model).await,
+            Self::PiMessages(client) => client.context_window(model).await,
         }
     }
 
@@ -281,6 +300,7 @@ impl Model for Client {
             Self::Ollama(client) => client.stream(request).await,
             Self::Anthropic(client) => client.stream(request).await,
             Self::Google(client) => client.stream(request).await,
+            Self::PiMessages(client) => client.stream(request).await,
         }
     }
 }
