@@ -85,8 +85,8 @@ impl InlineImage {
             height: prepared.height,
         }))
     }
-    pub fn lines(self: &Arc<Self>, width: usize) -> Vec<Line> {
-        let maximum_columns = width.saturating_sub(2).clamp(1, 60);
+    pub fn lines(self: &Arc<Self>, width: usize, image_width: usize) -> Vec<Line> {
+        let maximum_columns = width.saturating_sub(2).min(image_width).max(1);
         let cell = cell_dimensions();
         let maximum_rows = ((maximum_columns as f64 * cell.0) / cell.1).ceil().max(1.0) as usize;
         let optimize = detect(|key| std::env::var(key).ok()) == Some(Protocol::Kitty);

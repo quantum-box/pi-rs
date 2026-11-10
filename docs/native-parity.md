@@ -2395,3 +2395,9 @@ request or compaction runs. A one-second keepalive maintains it in
 terminals that clear stale indicators. Completion and terminal teardown
 clear the indicator. The settings toggle edits only the user-level member
 of the terminal settings object.
+
+`terminal.showImages` and `terminal.imageWidthCells` control inline terminal
+graphics. Both terminal modes apply changes from `/settings` to images
+already in the transcript. Hiding graphics preserves textual tool results
+and leaves model image delivery intact. A PTY check exercised visibility,
+width changes, and existing user and tool images.

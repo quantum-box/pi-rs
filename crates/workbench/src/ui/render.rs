@@ -176,6 +176,7 @@ impl Entry {
         width: usize,
         expand_tools: bool,
         show_thinking: bool,
+        image_width: Option<usize>,
     ) -> Vec<Line> {
         let inner = width.saturating_sub(2).max(1);
         match self {
@@ -195,7 +196,9 @@ impl Entry {
                 lines.push(Line::default());
                 lines
             }
-            Self::Image(image) => image.lines(width),
+            Self::Image(image) => {
+                image_width.map_or_else(Vec::new, |limit| image.lines(width, limit))
+            }
             Self::Thinking(text) => {
                 if !show_thinking {
                     return vec![];
@@ -251,11 +254,14 @@ impl Entry {
                         }
                     }
                 };
-                if expand_tools && !parts.is_empty() {
+                if expand_tools
+                    && !parts.is_empty()
+                    && let Some(limit) = image_width
+                {
                     for part in parts {
                         match part {
                             ToolPart::Text(text) => render_text(text, &mut lines),
-                            ToolPart::Image(image) => lines.extend(image.lines(inner)),
+                            ToolPart::Image(image) => lines.extend(image.lines(inner, limit)),
                         }
                     }
                 } else {
@@ -842,7 +848,7 @@ mod tests {
                 ToolPart::Text("after".into()),
             ],
         };
-        let lines = entry.render(&Theme::system(), 80, true, true);
+        let lines = entry.render(&Theme::system(), 80, true, true, Some(60));
         let before = lines
             .iter()
             .position(|line| line.spans.iter().any(|span| span.text.contains("before")))
@@ -855,7 +861,7 @@ mod tests {
         assert!(before < image && image < after);
         assert!(
             entry
-                .render(&Theme::system(), 80, false, true)
+                .render(&Theme::system(), 80, false, true, Some(60))
                 .iter()
                 .all(|line| line.image.is_none())
         );

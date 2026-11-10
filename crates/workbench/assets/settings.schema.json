@@ -70,7 +70,9 @@
     "terminal": {
       "type": "object",
       "properties": {
-        "showTerminalProgress": { "type": "boolean" }
+        "showTerminalProgress": { "type": "boolean" },
+        "showImages": { "type": "boolean" },
+        "imageWidthCells": { "type": "integer", "minimum": 1 }
       }
     },
     "quietStartup": {

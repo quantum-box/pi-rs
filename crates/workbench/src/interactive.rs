@@ -227,6 +227,7 @@ struct RegularLayout {
     theme: Theme,
     expand_tools: bool,
     hide_thinking: bool,
+    image_width: Option<usize>,
 }
 #[derive(Default)]
 struct RegularState {
@@ -433,7 +434,7 @@ impl View {
             .values()
             .filter(|(_, location)| *location == placement)
             .flat_map(|(lines, _)| lines.iter())
-            .flat_map(|text| Entry::Notice(text.clone()).render(theme, width, false, true))
+            .flat_map(|text| Entry::Notice(text.clone()).render(theme, width, false, true, None))
             .collect()
     }
     fn extension_status(&self) -> String {
@@ -1085,6 +1086,7 @@ impl View {
         if self.dialog().is_some() {
             below.clear();
         }
+        let image_width = self.image_width(args);
         let header_rows = usize::from(show_startup_header(args));
         let body_height = height.saturating_sub(prompt_height + 4 + header_rows + below.len());
         let mut lines = Vec::new();
@@ -1093,7 +1095,13 @@ impl View {
             if matches!(entry, Entry::User(_)) {
                 prompts.push(lines.len());
             }
-            lines.extend(entry.render(theme, body_width, self.expand_tools, !self.hide_thinking));
+            lines.extend(entry.render(
+                theme,
+                body_width,
+                self.expand_tools,
+                !self.hide_thinking,
+                image_width,
+            ));
         }
         if !self.thinking.is_empty() {
             lines.extend(Entry::Thinking(self.thinking.clone()).render(
@@ -1101,11 +1109,13 @@ impl View {
                 body_width,
                 false,
                 !self.hide_thinking,
+                None,
             ));
         }
         if !self.streaming.is_empty() {
             lines.extend(
-                Entry::Assistant(self.streaming.clone()).render(theme, body_width, false, true),
+                Entry::Assistant(self.streaming.clone())
+                    .render(theme, body_width, false, true, None),
             );
         }
         if let Some(picker) = &self.picker {
@@ -1302,13 +1312,25 @@ impl View {
         Ok(())
     }
 
-    fn replay_transcript(&mut self, theme: &Theme) -> Result<()> {
+    fn image_width(&self, args: &Cli) -> Option<usize> {
+        (self.graphics.enabled() && args.settings.show_terminal_images())
+            .then(|| args.settings.terminal_image_width())
+    }
+
+    fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
         self.graphics.reset();
+        let image_width = self.image_width(args);
         let width = usize::from(terminal::size()?.0.max(1));
         let mut out = std::io::stdout().lock();
         queue!(out, MoveToColumn(0), Print("\r\n"))?;
         for entry in &self.lines {
-            for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
+            for line in entry.render(
+                theme,
+                width,
+                self.expand_tools,
+                !self.hide_thinking,
+                image_width,
+            ) {
                 line.draw(&mut out, width)?;
                 self.graphics
                     .paint(&line, &mut out, usize::MAX, usize::MAX)?;
@@ -1323,6 +1345,7 @@ impl View {
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
+        let image_width = self.image_width(args);
         let layout = RegularLayout {
             width,
             height,
@@ -1330,6 +1353,7 @@ impl View {
             theme: theme.clone(),
             expand_tools: self.expand_tools,
             hide_thinking: self.hide_thinking,
+            image_width,
         };
         let redraw = self.regular.layout.is_some()
             && (self.regular.redraw
@@ -1380,7 +1404,13 @@ impl View {
         }
         if redraw {
             for entry in &self.lines[..self.regular.committed] {
-                for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
+                for line in entry.render(
+                    theme,
+                    width,
+                    self.expand_tools,
+                    !self.hide_thinking,
+                    image_width,
+                ) {
                     line.draw(&mut out, width)?;
                     self.graphics
                         .paint(&line, &mut out, usize::MAX, usize::MAX)?;
@@ -1391,7 +1421,13 @@ impl View {
         let mut active = Vec::new();
         if !busy && self.picker.is_none() && self.dialog().is_none() {
             for entry in &self.lines[self.regular.committed..] {
-                for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
+                for line in entry.render(
+                    theme,
+                    width,
+                    self.expand_tools,
+                    !self.hide_thinking,
+                    image_width,
+                ) {
                     line.draw(&mut out, width)?;
                     self.graphics
                         .paint(&line, &mut out, usize::MAX, usize::MAX)?;
@@ -1404,7 +1440,13 @@ impl View {
                 self.lines[self.regular.committed..]
                     .iter()
                     .flat_map(|entry| {
-                        entry.render(theme, width, self.expand_tools, !self.hide_thinking)
+                        entry.render(
+                            theme,
+                            width,
+                            self.expand_tools,
+                            !self.hide_thinking,
+                            image_width,
+                        )
                     }),
             );
             active.extend(Entry::Thinking(self.thinking.clone()).render(
@@ -1412,9 +1454,11 @@ impl View {
                 width,
                 false,
                 !self.hide_thinking,
+                None,
             ));
-            active
-                .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
+            active.extend(
+                Entry::Assistant(self.streaming.clone()).render(theme, width, false, true, None),
+            );
             if let Some(picker) = &self.picker {
                 active =
                     picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
@@ -3002,6 +3046,34 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     ),
                                 },
                             ];
+                            if view.graphics.enabled() {
+                                let show_images = args.settings.show_terminal_images();
+                                let image_width = args.settings.terminal_image_width();
+                                let next_width = match image_width {
+                                    60 => 80,
+                                    80 => 120,
+                                    _ => 60,
+                                };
+                                items.extend([
+                                    Item {
+                                        label: format!(
+                                            "Show images · {} (toggle)",
+                                            if show_images { "on" } else { "off" }
+                                        ),
+                                        selection: Selection::Setting(
+                                            "terminal.showImages".into(),
+                                            json!(!show_images),
+                                        ),
+                                    },
+                                    Item {
+                                        label: format!("Image width · {image_width} cells"),
+                                        selection: Selection::Setting(
+                                            "terminal.imageWidthCells".into(),
+                                            json!(next_width),
+                                        ),
+                                    },
+                                ]);
+                            }
                             let escape =
                                 args.settings.string("doubleEscapeAction").unwrap_or("tree");
                             let next_escape = match escape {
@@ -3278,7 +3350,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     if args.tui_mode != Some(TuiMode::Regular)
         && args.settings.string("fullscreenExitOutput") != Some("resume-hint")
     {
-        view.replay_transcript(&theme)?;
+        view.replay_transcript(&args, &theme)?;
     }
     if !args.no_session && args.session.is_file() {
         let path = args.session.to_string_lossy();
@@ -3770,9 +3842,9 @@ fn select(
                     args,
                     json!({"type":"set_auto_compaction","enabled":enabled}),
                 )?;
-            } else if key == "terminal.showTerminalProgress" {
+            } else if let Some(member) = key.strip_prefix("terminal.") {
                 args.settings
-                    .set_user_member("terminal", "showTerminalProgress", value.clone())?;
+                    .set_user_member("terminal", member, value.clone())?;
             } else if key == "theme" {
                 let next = Theme::load(
                     value

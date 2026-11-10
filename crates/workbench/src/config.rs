@@ -140,6 +140,16 @@ impl Settings {
             .as_bool()
             .unwrap_or(false)
     }
+    pub fn show_terminal_images(&self) -> bool {
+        self.value["terminal"]["showImages"]
+            .as_bool()
+            .unwrap_or(true)
+    }
+    pub fn terminal_image_width(&self) -> usize {
+        self.value["terminal"]["imageWidthCells"]
+            .as_f64()
+            .map_or(60, |width| width.min(f64::from(u16::MAX)) as usize)
+    }
     pub fn set_user_member(&mut self, key: &str, member: &str, value: Value) -> Result<()> {
         let path = agent_dir().join("settings.json");
         let update = |settings: &mut Map<String, Value>| -> Result<()> {
