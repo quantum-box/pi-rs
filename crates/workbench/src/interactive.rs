@@ -48,7 +48,11 @@ pub(super) fn session_path(
         .join(format!("{}.jsonl", uuid::Uuid::new_v4()))
 }
 
-pub(super) fn latest_session(example: &std::path::Path) -> Result<PathBuf> {
+pub(super) fn latest_session(
+    example: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<PathBuf> {
+    let workspace = workspace.canonicalize()?;
     let directory = example
         .parent()
         .ok_or_else(|| Error::Config("session directory unavailable".into()))?;
@@ -59,6 +63,15 @@ pub(super) fn latest_session(example: &std::path::Path) -> Result<PathBuf> {
                 .path()
                 .extension()
                 .is_some_and(|value| value == "jsonl")
+        })
+        .filter(|entry| {
+            super::session_import::read(&entry.path()).is_ok_and(|session| {
+                session.working_directory().is_some_and(|cwd| {
+                    std::path::Path::new(cwd)
+                        .canonicalize()
+                        .is_ok_and(|cwd| cwd == workspace)
+                })
+            })
         })
         .filter_map(|entry| {
             entry
@@ -2742,6 +2755,35 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn continue_skips_newer_sessions_from_other_workspaces_and_invalid_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let other = directory.path().join("other");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let valid = directory.path().join("valid.jsonl");
+        let mut session = pi_rs::Session::open(&valid).unwrap();
+        session.set_working_directory(&workspace).unwrap();
+        drop(session);
+        let foreign = directory.path().join("foreign.jsonl");
+        let mut session = pi_rs::Session::open(&foreign).unwrap();
+        session.set_working_directory(&other).unwrap();
+        drop(session);
+        let invalid = directory.path().join("invalid.jsonl");
+        std::fs::write(&invalid, "invalid").unwrap();
+        let late = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+        for path in [&foreign, &invalid] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(late))
+                .unwrap();
+        }
+        assert_eq!(super::latest_session(&valid, &workspace).unwrap(), valid);
+    }
+
     use super::*;
     #[test]
     fn clipboard_results_update_the_draft_and_keep_image_only_input_valid() {

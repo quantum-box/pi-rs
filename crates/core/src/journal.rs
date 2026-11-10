@@ -771,6 +771,47 @@ impl Session {
         labels
     }
 
+    /// Latest user or assistant activity, falling back to the session header time.
+    pub fn activity_time(&self) -> Option<std::time::SystemTime> {
+        let parse = |value: &str| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|time| time.to_utc())
+        };
+        let mut latest = None;
+        let mut imported = None;
+        for record in &self.records {
+            match &record.event {
+                Event::SourceEntry { format, entry }
+                    if format == "pi"
+                        && entry["type"] == "message"
+                        && matches!(
+                            entry["message"]["role"].as_str(),
+                            Some("user" | "assistant")
+                        ) =>
+                {
+                    imported = Some(
+                        entry["message"]["timestamp"]
+                            .as_i64()
+                            .and_then(chrono::DateTime::from_timestamp_millis)
+                            .or_else(|| entry["timestamp"].as_str().and_then(parse)),
+                    );
+                }
+                Event::User { .. } | Event::UserWithImages { .. } | Event::Assistant { .. } => {
+                    let time = imported
+                        .take()
+                        .unwrap_or_else(|| record.timestamp.as_deref().and_then(parse));
+                    latest = latest.max(time);
+                }
+                _ => {}
+            }
+        }
+        latest
+            .filter(|time| time.timestamp_millis() > 0)
+            .or_else(|| self.records.first()?.timestamp.as_deref().and_then(parse))
+            .map(std::time::SystemTime::from)
+    }
+
     /// Last known label modification time, absent for legacy records without timestamps.
     pub fn label_timestamps(&self) -> BTreeMap<u64, String> {
         let mut timestamps = BTreeMap::new();
@@ -1890,6 +1931,26 @@ pub fn sanitize_session_name(name: &str) -> String {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+
+    #[test]
+    fn activity_time_tracks_conversation_and_ignores_metadata_changes() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("hello".into(), vec![], None)
+            .unwrap();
+        session.set_name("later rename").unwrap();
+        let mut records = session.records().to_vec();
+        records[0].timestamp = Some("2019-01-01T00:00:00.000Z".into());
+        records[1].timestamp = Some("2020-01-01T00:00:00.000Z".into());
+        records[2].timestamp = Some("2030-01-01T00:00:00.000Z".into());
+        let restored = Session::from_records(records.clone()).unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z").unwrap();
+        assert_eq!(restored.activity_time(), Some(expected.into()));
+        records[1].timestamp = None;
+        let restored = Session::from_records(records).unwrap();
+        let header = chrono::DateTime::parse_from_rfc3339("2019-01-01T00:00:00Z").unwrap();
+        assert_eq!(restored.activity_time(), Some(header.into()));
+    }
 
     #[test]
     fn timestamps_survive_reopening_and_legacy_records_remain_undated() {

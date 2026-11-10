@@ -617,6 +617,19 @@ mod tests {
     use pi_rs::Message;
     use serde_json::json;
     #[test]
+    fn imported_activity_prefers_message_time_to_outer_entry_time() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3,"timestamp":"2000-01-01T00:00:00Z"}),
+            json!({"type":"message","id":"u","parentId":null,"timestamp":"2030-01-01T00:00:00Z","message":{"role":"user","content":"question","timestamp":1_600_000_000_000_i64}}),
+            json!({"type":"session_info","id":"n","parentId":"u","timestamp":"2040-01-01T00:00:00Z","name":"rename"}),
+        ]).unwrap();
+        assert_eq!(
+            session.activity_time(),
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_600_000_000_000))
+        );
+    }
+
+    #[test]
     fn imported_timestamps_and_label_changes_preserve_source_times() {
         let created = "2026-01-02T03:04:05.000Z";
         let labeled = "2026-01-02T03:06:07.123Z";

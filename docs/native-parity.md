@@ -1610,3 +1610,18 @@ reuse a previous change's timestamp. Core and importer tests cover these cases.
 
 A CLI/RPC check verifies persisted UTC timestamps and label timestamp removal.
 The full workspace tests and all-target Clippy pass.
+
+### Session discovery ordering checkpoint
+
+Resume candidates are sorted by the latest user/assistant activity rather than
+file modification time. Pi imports honor the message's numeric timestamp before
+the enclosing entry timestamp. Metadata-only changes do not reorder a session.
+When conversation times are absent, discovery falls back to the session header
+and then the file modification time.
+
+`--continue` follows the reference's separate rule: use the most recently
+modified valid session belonging to the current working directory. Newer files
+from other workspaces and malformed journals are skipped. Tests cover both
+ordering rules, imported message timestamps and metadata updates. A CLI smoke
+check verifies continuation in a shared session directory. Full workspace tests
+and all-target Clippy pass.

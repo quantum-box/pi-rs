@@ -553,7 +553,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     if let Some(directory) = &temporary {
         args.session = directory.path().join("session.jsonl");
     } else if args.continue_session {
-        args.session = interactive::latest_session(&args.session)?;
+        args.session = interactive::latest_session(&args.session, &args.workspace)?;
     }
     if args.mode == Some(OutputMode::Rpc) {
         if args.prompt.iter().any(|argument| argument.starts_with('@')) {

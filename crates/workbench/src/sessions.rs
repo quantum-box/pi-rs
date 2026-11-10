@@ -104,14 +104,23 @@ pub fn stored_paths(current: &Path) -> Result<Vec<PathBuf>> {
             }
         }
     }
-    paths.sort_by_key(|path| {
+    sort_by_activity(&mut paths);
+    Ok(paths)
+}
+
+fn sort_by_activity(paths: &mut [PathBuf]) {
+    paths.sort_by_cached_key(|path| {
         std::cmp::Reverse(
-            path.metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok(),
+            super::session_import::read(path)
+                .ok()
+                .and_then(|session| session.activity_time())
+                .or_else(|| {
+                    path.metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                }),
         )
     });
-    Ok(paths)
 }
 
 fn stored_id(path: &Path) -> Option<String> {
@@ -438,6 +447,39 @@ mod tests {
         for valid in ["one", "Run_2.3", "a-b"] {
             assert!(validate_id(valid).is_ok());
         }
+    }
+
+    #[test]
+    fn session_order_uses_conversation_activity_instead_of_file_copy_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let older = directory.path().join("older.jsonl");
+        let newer = directory.path().join("newer.jsonl");
+        for (path, timestamp) in [
+            (&older, "2020-01-01T00:00:00.000Z"),
+            (&newer, "2021-01-01T00:00:00.000Z"),
+        ] {
+            let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            session
+                .append_user_with_images("hello".into(), vec![], None)
+                .unwrap();
+            let mut records = session.records().to_vec();
+            records[0].timestamp = Some("2019-01-01T00:00:00.000Z".into());
+            records[1].timestamp = Some(timestamp.into());
+            Session::from_records(records)
+                .unwrap()
+                .export_jsonl(path)
+                .unwrap();
+        }
+        let late = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(late))
+            .unwrap();
+        let mut paths = vec![older.clone(), newer.clone()];
+        sort_by_activity(&mut paths);
+        assert_eq!(paths, vec![newer, older]);
     }
 
     #[test]
