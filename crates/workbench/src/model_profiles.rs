@@ -2,6 +2,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
+use pi_rs::ollama::ChatCompatibility;
 use pi_rs::{Error, Result};
 use regex::{Captures, Regex};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
@@ -26,6 +27,7 @@ struct Profile {
     api_key: Option<String>,
     headers: BTreeMap<String, String>,
     auth_header: bool,
+    compat: ChatCompatibility,
     models: Vec<ConfiguredModel>,
     model_endpoints: BTreeMap<String, String>,
     overrides: BTreeMap<String, ModelMetadata>,
@@ -117,6 +119,8 @@ struct ConfiguredProfile {
     #[serde(default)]
     auth_header: bool,
     #[serde(default)]
+    compat: ChatCompatibility,
+    #[serde(default)]
     models: Vec<ConfiguredModel>,
     #[serde(default)]
     model_overrides: BTreeMap<String, ModelMetadata>,
@@ -140,6 +144,8 @@ pub(super) struct ModelMetadata {
     pub context_window: Option<u32>,
     pub max_tokens: Option<u32>,
     pub reasoning: Option<bool>,
+    #[serde(default)]
+    compat: ChatCompatibility,
     input: Option<Vec<Modality>>,
     #[serde(default)]
     thinking_level_map: BTreeMap<String, Option<String>>,
@@ -173,6 +179,7 @@ impl ModelMetadata {
         self.sampling_params
             .extend(overrides.sampling_params.clone());
         self.headers.extend(overrides.headers.clone());
+        self.compat = self.compat.overlay(overrides.compat.clone());
         for (level, parameters) in &overrides.sampling_params_by_thinking_level {
             self.sampling_params_by_thinking_level
                 .entry(level.clone())
@@ -384,6 +391,7 @@ impl Profiles {
                         api_key: profile.api_key,
                         headers: validate_headers(profile.headers)?,
                         auth_header: profile.auth_header,
+                        compat: profile.compat,
                         models: profile.models,
                         model_endpoints,
                         overrides: profile.model_overrides,
@@ -498,6 +506,19 @@ impl Profiles {
     ) -> Result<HeaderMap> {
         self.header_settings(provider, endpoint, model)
             .static_headers(provider, token)
+    }
+
+    pub fn chat_compatibility(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> ChatCompatibility {
+        let defaults = self
+            .entries
+            .get(provider.id())
+            .map(|profile| profile.compat.clone())
+            .unwrap_or_default();
+        defaults.overlay(model.map(|model| model.compat.clone()).unwrap_or_default())
     }
 
     pub fn model_ids(&self, provider: &Provider) -> Vec<String> {

@@ -316,9 +316,10 @@ impl Client {
         Ok(match self {
             Self::Ollama(client) => {
                 let configured = args.model_profiles.model(&args.provider, &args.model);
-                let mapped = configured
-                    .as_ref()
-                    .and_then(|model| model.mapped_effort(thinking?));
+                let mapped = configured.as_ref().and_then(|model| {
+                    let level = thinking.or((model.reasoning == Some(true)).then_some("off"))?;
+                    model.mapped_effort(level)
+                });
                 let client = if let Some(mapped) = mapped {
                     client.with_mapped_reasoning_effort(mapped)
                 } else if reported {
@@ -326,6 +327,17 @@ impl Client {
                 } else {
                     client.with_reasoning_effort(thinking)
                 };
+                let compatibility = args
+                    .model_profiles
+                    .chat_compatibility(&args.provider, configured.as_ref());
+                let client = client.with_chat_compatibility(
+                    compatibility,
+                    configured.as_ref().and_then(|model| model.reasoning),
+                    thinking.is_some_and(|level| level != "off"),
+                    configured
+                        .as_ref()
+                        .is_none_or(|model| model.mapped_effort("off") != Some(None)),
+                );
                 let sampling = configured
                     .map(|model| model.sampling(thinking.unwrap_or("off")))
                     .unwrap_or_default();

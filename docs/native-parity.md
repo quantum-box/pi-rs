@@ -2343,3 +2343,16 @@ Classifier and image usage is included in the script result, terminal token
 total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
 [Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
+
+### Chat model connection and compatibility
+
+Configured chat models can select their own endpoint and request headers.
+Startup credentials remain bound to the original provider and endpoint after
+a model switch. Provider, model, and override compatibility settings can
+select the token-limit field, message roles, streaming usage and finish
+handling, and provider-specific thinking fields. Textual assistant reasoning
+is replayed only to the model and endpoint that produced it when the receiving
+adapter requires that field.
+
+Loopback RPC checks exercised model and endpoint switching, header and key
+isolation, reasoning replay, stream completion and reported usage and cost.

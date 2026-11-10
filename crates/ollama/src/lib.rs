@@ -9,10 +9,14 @@ use reqwest::header::HeaderMap;
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+mod compatibility;
+pub use compatibility::ChatCompatibility;
 
 use pi_rs_core::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result, ToolCall,
-    Usage,
+    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
+    ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 
 type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
@@ -24,6 +28,10 @@ pub struct Ollama {
     token: Option<String>,
     headers: HeaderMap,
     reasoning_effort: Option<String>,
+    compatibility: ChatCompatibility,
+    supports_reasoning: Option<bool>,
+    reasoning_enabled: bool,
+    allow_reasoning_off: bool,
     sampling: BTreeMap<String, Value>,
     native_probes: bool,
     progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
@@ -100,6 +108,10 @@ impl Ollama {
             token,
             headers: HeaderMap::new(),
             reasoning_effort: None,
+            compatibility: ChatCompatibility::default(),
+            supports_reasoning: None,
+            reasoning_enabled: false,
+            allow_reasoning_off: true,
             sampling: BTreeMap::new(),
             native_probes: true,
             progress: None,
@@ -153,6 +165,65 @@ impl Ollama {
     pub fn with_mapped_reasoning_effort(mut self, effort: Option<&str>) -> Self {
         self.reasoning_effort = effort.map(str::to_owned);
         self
+    }
+
+    pub fn with_chat_compatibility(
+        mut self,
+        compatibility: ChatCompatibility,
+        reasoning: Option<bool>,
+        enabled: bool,
+        allow_off: bool,
+    ) -> Self {
+        self.compatibility = compatibility;
+        self.supports_reasoning = reasoning;
+        self.reasoning_enabled = enabled;
+        self.allow_reasoning_off = allow_off;
+        self
+    }
+
+    fn replay_identity(&self, model: &str) -> ResolvedModelIdentity {
+        ResolvedModelIdentity {
+            provider: format!(
+                "chat-completions+sha256:{:x}",
+                Sha256::digest(self.endpoint.as_str().as_bytes())
+            ),
+            model: model.to_owned(),
+        }
+    }
+
+    fn compatible_message(&self, message: Message, identity: &ResolvedModelIdentity) -> Vec<Value> {
+        let reason = match &message {
+            Message::Assistant {
+                replay: Some(replay),
+                ..
+            } if replay.identity == *identity => replay
+                .blocks
+                .iter()
+                .find(|block| block["type"] == "reasoning_content")
+                .and_then(|block| block["text"].as_str())
+                .map(str::to_owned),
+            _ => None,
+        };
+        let mut messages = encode_message(message);
+        let Some(first) = messages.first_mut() else {
+            return messages;
+        };
+        if first["role"] == "system"
+            && self.supports_reasoning == Some(true)
+            && self.compatibility.supports_developer_role == Some(true)
+        {
+            first["role"] = json!("developer");
+        }
+        if first["role"] == "assistant"
+            && self.supports_reasoning != Some(false)
+            && self
+                .compatibility
+                .requires_reasoning_content_on_assistant_messages
+                == Some(true)
+        {
+            first["reasoning_content"] = json!(reason.unwrap_or_default());
+        }
+        messages
     }
 
     pub fn with_sampling(mut self, sampling: BTreeMap<String, Value>) -> Result<Self> {
@@ -409,6 +480,13 @@ impl Model for Ollama {
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         let requested_model = request.model.clone();
+        let identity = self.replay_identity(&requested_model);
+        let infer_finish = self.compatibility.supports_finish_reason == Some(false);
+        let preserve_reasoning = self.supports_reasoning != Some(false)
+            && self
+                .compatibility
+                .requires_reasoning_content_on_assistant_messages
+                == Some(true);
         let mut last_progress = None;
         report_progress(
             &self.progress,
@@ -418,24 +496,26 @@ impl Model for Ollama {
         let messages: Vec<_> = request
             .messages
             .into_iter()
-            .flat_map(encode_message)
+            .flat_map(|message| self.compatible_message(message, &identity))
             .collect();
         let tools: Vec<_> = request
             .tools
             .into_iter()
             .map(|function| json!({"type": "function", "function": function}))
             .collect();
-        let mut body = json!({
-            "model": request.model, "messages": messages, "stream": true,
-            "stream_options": {"include_usage": true},
-            "max_tokens": request.max_output_tokens,
-        });
+        let mut body = json!({"model":request.model,"messages":messages,"stream":true});
+        self.compatibility
+            .request_options(&mut body, request.max_output_tokens, !tools.is_empty());
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
-        if let Some(effort) = &self.reasoning_effort {
-            body["reasoning_effort"] = json!(effort);
-        }
+        self.compatibility.reasoning_options(
+            &mut body,
+            self.supports_reasoning,
+            self.reasoning_enabled,
+            self.reasoning_effort.as_deref(),
+            self.allow_reasoning_off,
+        );
         body.as_object_mut().expect("chat request object").extend(
             self.sampling
                 .iter()
@@ -522,6 +602,10 @@ impl Model for Ollama {
                 let Some(event) = event else { break; };
                 let event = event.map_err(|_| Error::RetryableModel("broken SSE stream".into()))?;
                 if event.data == "[DONE]" {
+                    if infer_finish && !matches!(metadata.finish_reason.as_deref(), Some("length" | "content_filter")) {
+                        metadata.finish_reason = Some(if calls.is_empty() { "stop" } else { "tool_calls" }.into());
+                        yield ModelEvent::Metadata(metadata.clone());
+                    }
                     match metadata.finish_reason.as_deref() {
                         Some("stop" | "length") if calls.is_empty() => {},
                         Some("tool_calls") if !calls.is_empty() => {},
@@ -531,6 +615,12 @@ impl Model for Ollama {
                         id: call.id, name: call.name, arguments: call.arguments,
                     }).collect();
                     if !reasoning_text.is_empty() {
+                        if preserve_reasoning {
+                            metadata.replay = Some(Box::new(ProviderReplay {
+                                identity,
+                                blocks: vec![json!({"type":"reasoning_content","text":reasoning_text})],
+                            }));
+                        }
                         metadata.reasoning = Some(reasoning_text);
                         yield ModelEvent::Metadata(metadata);
                     }
@@ -550,7 +640,14 @@ impl Model for Ollama {
                 }
                 if let Some(stats) = chunk.usage {
                     usage = Some(Usage { input_tokens: stats.prompt_tokens, output_tokens: stats.completion_tokens });
-                    metadata.cached_input_tokens = stats.prompt_tokens_details.and_then(|details| details.cached_tokens);
+                    let details = stats.prompt_tokens_details.unwrap_or_default();
+                    metadata.cached_input_tokens = details.cached_tokens
+                        .or(stats.prompt_cache_hit_tokens)
+                        .or(stats.cached_tokens);
+                    metadata.cache_creation_input_tokens = details.cache_write_tokens;
+                    if let Some(cost) = stats.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+                        metadata.cost_usd = serde_json::Number::from_f64(cost);
+                    }
                 }
                 for choice in chunk.choices {
                     if choice.index != 0 || metadata.finish_reason.is_some() {
@@ -583,9 +680,13 @@ impl Model for Ollama {
                             index: delta.index as u64, id, name, arguments,
                         });
                     }
-                    metadata.finish_reason = choice.finish_reason.map(|reason| {
+                    metadata.finish_reason = choice.finish_reason.filter(|reason| {
+                        !infer_finish || matches!(reason.as_str(), "length" | "content_filter")
+                    }).map(|reason| {
                         match reason.as_str() {
                             "stop" | "tool_calls" | "length" | "content_filter" => reason,
+                            "end" => "stop".into(),
+                            "function_call" => "tool_calls".into(),
                             _ => "other".into(),
                         }
                     });
@@ -661,14 +762,20 @@ struct Chunk {
 
 #[derive(Deserialize)]
 struct WireUsage {
+    #[serde(default)]
     prompt_tokens: u64,
+    #[serde(default)]
     completion_tokens: u64,
+    prompt_cache_hit_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
     prompt_tokens_details: Option<PromptTokenDetails>,
+    cost: Option<f64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct PromptTokenDetails {
     cached_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
