@@ -178,7 +178,9 @@ fn auth_error(error: AuthError) -> Error {
         AuthError::AuthorizationRequired
         | AuthError::TokenExpired
         | AuthError::TokenRefreshRejected(_) => {
-            "MCP OAuth login required; run pi mcp login for this server"
+            return Error::AuthorizationRequired(
+                "MCP OAuth login required; run pi mcp login for this server".into(),
+            );
         }
         AuthError::RegistrationFailed(_) => {
             "MCP OAuth client registration failed; use --client-id for a pre-registered client"

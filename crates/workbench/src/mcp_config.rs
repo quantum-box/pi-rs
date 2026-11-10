@@ -110,6 +110,16 @@ pub fn auto_enable_codemode(args: &Cli) -> Result<bool> {
 }
 
 pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtension>>> {
+    Ok(discover(args, report, false).await?.connected)
+}
+
+#[derive(Default)]
+pub(super) struct Discovery {
+    pub connected: Vec<Arc<McpExtension>>,
+    pub sign_in: Vec<(String, ServerConfig)>,
+}
+
+pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Result<Discovery> {
     let mut normalized = BTreeSet::new();
     let mut pending = Vec::new();
     for (name, value) in configurations(args)? {
@@ -145,11 +155,11 @@ pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtensio
         let workspace = args.workspace.clone();
         pending.push(async move {
             let result = McpExtension::connect(&name, &config, &workspace).await;
-            (name, result)
+            (name, config, result)
         });
     }
-    let mut connected = Vec::new();
-    for (name, result) in futures_util::future::join_all(pending).await {
+    let mut discovery = Discovery::default();
+    for (name, config, result) in futures_util::future::join_all(pending).await {
         match result {
             Ok(extension) => {
                 if report {
@@ -157,7 +167,10 @@ pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtensio
                         json!({"type":"mcp_server","name":name,"status":"connected","tools":extension.tool_count(),"description":extension.description}),
                     );
                 }
-                connected.push(Arc::new(extension));
+                discovery.connected.push(Arc::new(extension));
+            }
+            Err(Error::AuthorizationRequired(_)) if interactive => {
+                discovery.sign_in.push((name, config));
             }
             Err(error) => {
                 if report {
@@ -170,7 +183,7 @@ pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtensio
             }
         }
     }
-    Ok(connected)
+    Ok(discovery)
 }
 
 pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {

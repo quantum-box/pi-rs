@@ -1053,7 +1053,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     }
     thinking::adjust(&mut args);
     args.record_model_selection(&mut session)?;
-    let runtime = runtime::configure(&args).await?;
+    let runtime = runtime::configure(&args, false).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
     session.set_retry_control(runtime.retry.clone());
     let result = async {

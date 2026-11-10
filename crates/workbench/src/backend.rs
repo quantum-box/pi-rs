@@ -188,7 +188,7 @@ pub fn run(args: Cli) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
 }
 
 async fn run_worker(mut args: Cli) -> Result<()> {
-    let mut runtime = runtime::configure(&args).await?;
+    let mut runtime = runtime::configure(&args, true).await?;
     let ui = Arc::new(super::extension_ui::Broker::default());
     runtime.registry.set_ui(ui.clone());
     let active = Arc::new(Mutex::new(ControlState::default()));
@@ -207,7 +207,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         inputs,
         active.clone(),
         stopping.clone(),
-        ui,
+        ui.clone(),
         ReaderControls {
             snapshot: snapshot.clone(),
             auto_compaction: runtime.auto_compaction.clone(),
@@ -336,11 +336,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         let mut completed_shells = Vec::new();
         let mut run_session = None;
         let mut operation = Box::pin(async {
-            if matches!(&request, Request::Prompt { .. }) {
+            if matches!(&request, Request::Prompt { .. } | Request::McpStatus) {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = runtime.refresh_mcp(&args) => result?,
+                    result = async {
+                        runtime.authorize_pending_mcp(&args, ui.as_ref(), &cancel).await?;
+                        runtime.refresh_mcp(&args).await
+                    } => result?,
                 }
             }
             let session = run_session.insert(Session::open(&args.session)?);

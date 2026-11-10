@@ -1,7 +1,10 @@
 //! Shared local runtime construction for print, RPC and terminal sessions.
 use super::providers::Client;
 use super::{Cli, DEFAULT_SYSTEM_PROMPT, mcp_config, output, resources};
-use pi_rs::{Agent, Extension, Limits, ProjectResources, Registry, Result};
+use pi_rs::{
+    Agent, CancellationToken, Extension, ExtensionUi, Limits, ProjectResources, Registry, Result,
+    UiRequest, UiResponse,
+};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde_json::json;
 use std::sync::Arc;
@@ -15,6 +18,7 @@ pub struct Runtime {
     system_prompt: String,
     pub resources: resources::Resources,
     catalog: Arc<LiveMcpCatalog>,
+    mcp_sign_in: std::collections::VecDeque<(String, pi_rs_workbench::mcp::ServerConfig)>,
 }
 impl Runtime {
     pub fn command_catalog(&self, args: &Cli) -> serde_json::Value {
@@ -123,6 +127,83 @@ impl Runtime {
         Ok(())
     }
 
+    pub async fn authorize_pending_mcp(
+        &mut self,
+        args: &Cli,
+        ui: &dyn ExtensionUi,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        while let Some((name, config)) = self.mcp_sign_in.front().cloned() {
+            let current = || {
+                mcp_config::configurations(args)?
+                    .remove(&name)
+                    .map(serde_json::from_value::<pi_rs_workbench::mcp::ServerConfig>)
+                    .transpose()
+                    .map_err(pi_rs::Error::from)
+            };
+            if args
+                .disable_extension
+                .contains(&format!("mcp-{}", name.replace('-', "_")))
+                || current()?.as_ref() != Some(&config)
+            {
+                self.mcp_sign_in.pop_front();
+                continue;
+            }
+            let confirmation = ui
+                .request(
+                    UiRequest::Confirm {
+                        title: format!("Sign in to MCP {name}"),
+                        message: "Open the browser to connect this MCP server?".into(),
+                        timeout: Some(120_000),
+                    },
+                    cancel.clone(),
+                )
+                .await;
+            if cancel.is_cancelled() {
+                return Err(pi_rs::Error::Cancelled);
+            }
+            if confirmation != Ok(UiResponse::Confirmed(true)) {
+                self.mcp_sign_in.pop_front();
+                continue;
+            }
+            let url = config.url.as_deref().expect("OAuth requires HTTP");
+            let result = async {
+                if current()?.as_ref() != Some(&config) {
+                    return Err(pi_rs::Error::Config(
+                        "MCP configuration changed before sign-in".into(),
+                    ));
+                }
+                pi_rs_workbench::mcp_auth::login(&name, url, None, &[], |_| {}).await?;
+                if current()?.as_ref() != Some(&config) {
+                    return Err(pi_rs::Error::Config(
+                        "MCP configuration changed during sign-in".into(),
+                    ));
+                }
+                pi_rs_workbench::mcp::McpExtension::connect(&name, &config, &args.workspace).await
+            }
+            .await;
+            self.mcp_sign_in.pop_front();
+            let extension = match result {
+                Ok(extension) => Arc::new(extension),
+                Err(error) => {
+                    eprintln!("MCP {name}: {error}");
+                    continue;
+                }
+            };
+            if let Err(error) = self.registry.register(extension.clone()) {
+                extension.close().await;
+                eprintln!("MCP {name}: {error}");
+                continue;
+            }
+            self.catalog
+                .servers
+                .lock()
+                .expect("MCP catalogs")
+                .push(extension);
+        }
+        Ok(())
+    }
+
     pub fn set_thinking(&mut self, thinking: Option<&str>, reported: bool) {
         self.provider = self.provider.clone().with_thinking(thinking, reported);
     }
@@ -173,7 +254,7 @@ impl pi_rs::RegistryRefresher for LiveMcpCatalog {
     }
 }
 
-pub async fn configure(args: &Cli) -> Result<Runtime> {
+pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
     super::packages::prepare(args).await?;
     let mut local_resources = resources::Resources::load(args)?;
     for argument in &args.append_system_prompt {
@@ -191,7 +272,8 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
         .map(|value| resources::prompt_argument(&args.workspace, &value.to_string_lossy()))
         .transpose()?
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into());
-    let mcp_connections = mcp_config::connect_all(args, false).await?;
+    let discovered = mcp_config::discover(args, false, interactive_mcp).await?;
+    let mcp_connections = discovered.connected;
     let result = async {
         let (selection, documents, hidden) = tool_discovery(args, &mcp_connections)?;
         let only_code = match args.settings.value()["codemode"]["mode"]
@@ -340,6 +422,7 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             system_prompt,
             resources: local_resources,
             catalog,
+            mcp_sign_in: discovered.sign_in.into(),
         })
     }
     .await;
