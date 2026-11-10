@@ -572,7 +572,11 @@ impl View {
         if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
             && args.settings.boolean("showCacheMissNotices") == Some(true)
         {
-            self.lines.push(Entry::Warning(notice));
+            if matches!(record.event, pi_rs::Event::SourceEntry { .. }) {
+                self.append(&notice);
+            } else {
+                self.lines.push(Entry::Warning(notice));
+            }
         }
     }
 

@@ -2681,3 +2681,12 @@ idle gaps appear in the notice. `/session` totals re-billed tokens and
 estimated cost even when notices are disabled. Compaction and branch
 summaries reset the comparison baseline. Failed requests and summary
 usage stay out of the conversation cache comparison.
+
+### Imported cache refresh checkpoint
+
+Imported Pi session entries with `kind: "cache_warm"` preserve their
+cache refresh notice, optional note, and billed cost. They also reset
+the cache comparison baseline to the measured prompt at the refresh
+timestamp. The original usage remains part of session billing. An
+offline session import verified display and totals without duplicate
+billing or an additional conversation message.

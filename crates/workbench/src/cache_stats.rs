@@ -10,10 +10,17 @@ pub(super) struct Tracker {
     requested_model: Option<String>,
     requested_at: Option<i64>,
     pending: Option<(Uuid, Measurement)>,
-    previous: Option<Measurement>,
+    previous: Option<Previous>,
     pub missed_tokens: u64,
     pub missed_cost: f64,
     pub miss_count: u64,
+}
+
+struct Previous {
+    identity: Option<ResolvedModelIdentity>,
+    finished_at: Option<i64>,
+    prompt_tokens: u64,
+    reported_cache: bool,
 }
 
 struct Measurement {
@@ -103,6 +110,11 @@ impl Tracker {
 
     pub fn observe(&mut self, record: &Record, profiles: &Profiles) -> Option<String> {
         match &record.event {
+            Event::SourceEntry { format, entry }
+                if format == "pi" && entry["type"] == "usage" && entry["kind"] == "cache_warm" =>
+            {
+                return self.imported_warm(entry, record.timestamp_millis());
+            }
             Event::ModelSelected { provider, .. } => self.selected_provider = provider.clone(),
             Event::ModelRequested { model, .. } => {
                 self.requested_model = Some(model.clone());
@@ -206,8 +218,54 @@ impl Tracker {
                 format_tokens(tokens)
             ))
         });
-        self.previous = Some(current);
+        self.previous = Some(Previous {
+            identity: current.identity,
+            finished_at: current.finished_at,
+            prompt_tokens: current.prompt_tokens,
+            reported_cache: current.reported_cache,
+        });
         notice
+    }
+
+    fn imported_warm(
+        &mut self,
+        entry: &serde_json::Value,
+        finished_at: Option<i64>,
+    ) -> Option<String> {
+        let usage = &entry["usage"];
+        let tokens = |key: &str| usage[key].as_u64().unwrap_or_default();
+        let prompt_tokens = tokens("input")
+            .saturating_add(tokens("cacheRead"))
+            .saturating_add(tokens("cacheWrite"));
+        if prompt_tokens > 0 {
+            self.previous = Some(Previous {
+                identity: entry["provider"].as_str().zip(entry["model"].as_str()).map(
+                    |(provider, model)| ResolvedModelIdentity {
+                        provider: provider.into(),
+                        model: model.into(),
+                    },
+                ),
+                finished_at,
+                prompt_tokens,
+                reported_cache: true,
+            });
+        }
+        let note = entry["note"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map_or_else(String::new, |note| format!(" ({note})"));
+        let cost = usage["cost"]["total"].as_f64().filter(|cost| *cost >= 0.0);
+        Some(match cost {
+            Some(cost) => {
+                let mut cost = format!("{cost:.6}");
+                let minimum = cost.find('.').expect("decimal cost") + 4;
+                while cost.len() > minimum && cost.ends_with('0') {
+                    cost.pop();
+                }
+                format!("Cache warmed{note}: ${cost}")
+            }
+            None => format!("Cache warmed{note}"),
+        })
     }
 }
 
