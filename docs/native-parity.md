@@ -2401,3 +2401,11 @@ graphics. Both terminal modes apply changes from `/settings` to images
 already in the transcript. Hiding graphics preserves textual tool results
 and leaves model image delivery intact. A PTY check exercised visibility,
 width changes, and existing user and tool images.
+
+### Terminal autocomplete
+
+Tab opens a selectable list when more than one file or command matches. The
+selection replaces only the current word, preserving text to the right of
+the cursor. Tab and Enter confirm, and Escape keeps the original draft.
+`autocompleteMaxVisible` sets the row limit. `enableSkillCommands` controls
+skill suggestions while preserving manual skill invocation and discovery.

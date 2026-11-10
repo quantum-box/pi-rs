@@ -135,6 +135,14 @@ impl Settings {
     pub fn set_auto_compaction_enabled(&mut self, enabled: bool) -> Result<()> {
         self.set_user_member("compaction", "enabled", Value::Bool(enabled))
     }
+    pub fn autocomplete_max_visible(&self) -> usize {
+        self.value["autocompleteMaxVisible"]
+            .as_f64()
+            .map_or(5, |count| count as usize)
+    }
+    pub fn enable_skill_commands(&self) -> bool {
+        self.boolean("enableSkillCommands").unwrap_or(true)
+    }
     pub fn terminal_progress(&self) -> bool {
         self.value["terminal"]["showTerminalProgress"]
             .as_bool()

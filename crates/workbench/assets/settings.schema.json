@@ -67,6 +67,8 @@
     "hideThinkingBlock": {
       "type": "boolean"
     },
+    "autocompleteMaxVisible": { "type": "integer", "minimum": 3, "maximum": 20 },
+    "enableSkillCommands": { "type": "boolean" },
     "terminal": {
       "type": "object",
       "properties": {

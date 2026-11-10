@@ -17,6 +17,10 @@ pub enum Selection {
     Label(u64, String),
     Fork(u64),
     Model(String),
+    Completion {
+        range: std::ops::Range<usize>,
+        text: String,
+    },
     LoginProvider(super::super::Provider),
     LoginOpenRouter,
     LogoutProvider(super::super::Provider),
@@ -110,6 +114,7 @@ pub struct Picker {
     query: String,
     selected: usize,
     page_size: std::cell::Cell<usize>,
+    completion_limit: Option<usize>,
     active_session: Option<PathBuf>,
     session_action: Option<SessionAction>,
     feedback: Option<Result<String, String>>,
@@ -156,6 +161,7 @@ impl Picker {
             query: String::new(),
             selected: 0,
             page_size: std::cell::Cell::new(10),
+            completion_limit: None,
             active_session: None,
             session_action: None,
             feedback: None,
@@ -169,6 +175,33 @@ impl Picker {
             model_scope: None,
         }
     }
+    pub fn completion(
+        candidates: Vec<String>,
+        range: std::ops::Range<usize>,
+        limit: usize,
+    ) -> Self {
+        let items = candidates
+            .into_iter()
+            .map(|text| Item {
+                label: text.clone(),
+                selection: Selection::Completion {
+                    range: range.clone(),
+                    text,
+                },
+            })
+            .collect();
+        Self {
+            completion_limit: Some(limit),
+            ..Self::new("Autocomplete", items)
+        }
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        self.query
+            .extend(text.chars().filter(|character| !character.is_control()));
+        self.selected = 0;
+    }
+
     pub fn scoped_models(provider: &str, catalog: Vec<String>, mut enabled: Vec<String>) -> Self {
         let available: std::collections::HashSet<_> = catalog.iter().collect();
         enabled.retain(|model| available.contains(model));
@@ -493,7 +526,8 @@ impl Picker {
             return input;
         }
         let cancel = keys.matches("tui.select.cancel", key);
-        let confirm = keys.matches("tui.select.confirm", key);
+        let confirm = keys.matches("tui.select.confirm", key)
+            || (self.completion_limit.is_some() && keys.matches("tui.input.tab", key));
         if let Some(action) = self.session_action.clone() {
             if cancel {
                 self.session_action = None;
@@ -846,6 +880,9 @@ impl Picker {
                     + usize::from(self.active_session.is_some()),
             )
             .max(1);
+        if let Some(limit) = self.completion_limit {
+            available = available.min(limit);
+        }
         let scrolling = self.active_session.is_some() && items.len() > available;
         if scrolling {
             available = available.saturating_sub(1).max(1);
@@ -996,6 +1033,15 @@ impl Picker {
                 hint("app.tree.toggleLabelTimestamp"),
                 hint("app.message.copy"),
                 hint("tui.select.confirm"),
+            )
+        } else if self.completion_limit.is_some() {
+            format!(
+                "{}/{} to select · {}/{} to insert · {} to cancel",
+                hint("tui.select.up"),
+                hint("tui.select.down"),
+                hint("tui.input.tab"),
+                hint("tui.select.confirm"),
+                hint("tui.select.cancel"),
             )
         } else {
             let save = self.items.first().and_then(|item| match item.selection {

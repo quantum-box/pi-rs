@@ -2549,6 +2549,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     dialog.paste(&text);
                 } else if let Some(search) = &mut view.search {
                     search.paste(&text);
+                } else if let Some(picker) = &mut view.picker {
+                    picker.paste(&text);
                 } else {
                     view.editor.insert(&text);
                 }
@@ -3074,6 +3076,32 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     },
                                 ]);
                             }
+                            let autocomplete_items = args.settings.autocomplete_max_visible();
+                            let skill_commands = args.settings.enable_skill_commands();
+                            items.extend([
+                                Item {
+                                    label: format!("Autocomplete max items · {autocomplete_items}"),
+                                    selection: Selection::Setting(
+                                        "autocompleteMaxVisible".into(),
+                                        json!(
+                                            [3, 5, 7, 10, 15, 20]
+                                                .into_iter()
+                                                .find(|count| *count > autocomplete_items)
+                                                .unwrap_or(3)
+                                        ),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
+                                        "Skill commands · {} (toggle)",
+                                        if skill_commands { "on" } else { "off" }
+                                    ),
+                                    selection: Selection::Setting(
+                                        "enableSkillCommands".into(),
+                                        json!(!skill_commands),
+                                    ),
+                                },
+                            ]);
                             let escape =
                                 args.settings.string("doubleEscapeAction").unwrap_or("tree");
                             let next_escape = match escape {
@@ -3764,6 +3792,7 @@ fn select(
         Selection::Model(model) => {
             select_model_input(args, view, &model)?;
         }
+        Selection::Completion { range, text } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
         Selection::LoginOpenRouter => start_openrouter_login(view),
         Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
@@ -4001,8 +4030,10 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
 fn complete_input(args: &Cli, view: &mut View) {
     let prefix = &view.editor.text[..view.editor.cursor];
     let start = prefix
-        .rfind(char::is_whitespace)
-        .map_or(0, |index| index + 1);
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
     let word = &prefix[start..];
     let mut candidates = if start == 0 && word.starts_with('/') {
         [
@@ -4041,7 +4072,8 @@ fn complete_input(args: &Cli, view: &mut View) {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        let directory = if file_word.ends_with('/') {
+        let ends_in_separator = file_word.ends_with(std::path::is_separator);
+        let directory = if ends_in_separator {
             args.workspace.join(path)
         } else {
             args.workspace.join(parent)
@@ -4052,14 +4084,10 @@ fn complete_input(args: &Cli, view: &mut View) {
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
                 let file_name = entry.file_name().into_string().ok()?;
-                if !file_word.ends_with('/') && !file_name.starts_with(name) {
+                if !ends_in_separator && !file_name.starts_with(name) {
                     return None;
                 }
-                let parent = if file_word.ends_with('/') {
-                    path
-                } else {
-                    parent
-                };
+                let parent = if ends_in_separator { path } else { parent };
                 let suffix = if entry.file_type().ok()?.is_dir() {
                     "/"
                 } else {
@@ -4080,29 +4108,40 @@ fn complete_input(args: &Cli, view: &mut View) {
                 .prompts
                 .keys()
                 .map(|name| format!("/{name}"))
-                .chain(
-                    view.resources
-                        .skills
-                        .keys()
-                        .map(|name| format!("/skill:{name}")),
-                )
                 .filter(|name| name.starts_with(word)),
         );
-        candidates.sort();
-        candidates.dedup();
+        if args.settings.enable_skill_commands() {
+            candidates.extend(
+                view.resources
+                    .skills
+                    .keys()
+                    .map(|name| format!("/skill:{name}"))
+                    .filter(|name| name.starts_with(word)),
+            );
+        }
     }
-    if candidates.len() == 1 {
-        let end = view.editor.cursor;
-        let mut text = view.editor.text.clone();
-        text.replace_range(start..end, &candidates[0]);
-        let cursor = start + candidates[0].len();
-        view.editor.replace(text);
-        view.editor.cursor = cursor;
-    } else if !candidates.is_empty() {
-        let mut candidates = candidates;
-        candidates.sort();
-        view.append(&candidates.join("  "));
+    candidates.sort();
+    candidates.dedup();
+    let range = start..view.editor.cursor;
+    match candidates.as_slice() {
+        [candidate] => insert_completion(view, range, candidate),
+        [] => {}
+        _ => {
+            view.picker = Some(Picker::completion(
+                candidates,
+                range,
+                args.settings.autocomplete_max_visible(),
+            ))
+        }
     }
+}
+
+fn insert_completion(view: &mut View, range: std::ops::Range<usize>, completion: &str) {
+    let mut text = view.editor.text.clone();
+    let cursor = range.start + completion.len();
+    text.replace_range(range, completion);
+    view.editor.replace(text);
+    view.editor.cursor = cursor;
 }
 
 fn clean(text: &str) -> String {
