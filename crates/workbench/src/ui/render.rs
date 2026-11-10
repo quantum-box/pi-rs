@@ -198,6 +198,13 @@ pub enum Entry {
         numbered_diff: bool,
     },
 }
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptOptions {
+    pub image_width: Option<usize>,
+    pub padding: usize,
+    pub mermaid: super::mermaid::Mermaid,
+}
+
 impl Entry {
     pub fn render(
         &self,
@@ -205,10 +212,9 @@ impl Entry {
         width: usize,
         expand_tools: bool,
         show_thinking: bool,
-        image_width: Option<usize>,
-        output_pad: usize,
+        options: TranscriptOptions,
     ) -> Vec<Line> {
-        let padding = output_pad.min(width.saturating_sub(1) / 2);
+        let padding = options.padding.min(width.saturating_sub(1) / 2);
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::new(text, theme.color("muted"))], width),
@@ -221,12 +227,13 @@ impl Entry {
                 lines
             }
             Self::Assistant(text) => {
-                let mut lines = markdown(text, theme, inner);
+                let mut lines = markdown_at_depth(text, theme, inner, 0, options.mermaid);
                 lines.push(Line::default());
                 lines
             }
             Self::Image(image) => {
-                return image_width
+                return options
+                    .image_width
                     .map_or_else(Vec::new, |limit| image.lines(width, limit, padding));
             }
             Self::Thinking(text) => {
@@ -286,7 +293,7 @@ impl Entry {
                 };
                 if expand_tools
                     && !parts.is_empty()
-                    && let Some(limit) = image_width
+                    && let Some(limit) = options.image_width
                 {
                     for part in parts {
                         match part {
@@ -498,10 +505,18 @@ impl Table {
     }
 }
 
-pub fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
-    markdown_at_depth(text, theme, width, 0)
+#[cfg(test)]
+fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
+    markdown_at_depth(text, theme, width, 0, super::mermaid::Mermaid::Off)
 }
-fn markdown_at_depth(text: &str, theme: &Theme, width: usize, depth: usize) -> Vec<Line> {
+
+fn markdown_at_depth(
+    text: &str,
+    theme: &Theme,
+    width: usize,
+    depth: usize,
+    mermaid: super::mermaid::Mermaid,
+) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut bold = 0usize;
@@ -588,16 +603,29 @@ fn markdown_at_depth(text: &str, theme: &Theme, width: usize, depth: usize) -> V
                     }
                     CodeBlockKind::Indented => String::new(),
                 });
-                lines.extend(wrap(
-                    &[Span::new(
-                        format!("```{}", code.as_deref().unwrap_or_default()),
-                        theme.color("mdCodeBlockBorder"),
-                    )],
-                    width,
-                ));
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some(language) = code.take() {
+                    let (art, warning) = if depth == 0
+                        && lists.is_empty()
+                        && language.eq_ignore_ascii_case("mermaid")
+                    {
+                        super::mermaid::render(&code_text, theme, width, mermaid)
+                    } else {
+                        (None, None)
+                    };
+                    if let Some(art) = art {
+                        lines.extend(art);
+                        code_text.clear();
+                        continue;
+                    }
+                    lines.extend(wrap(
+                        &[Span::new(
+                            format!("```{language}"),
+                            theme.color("mdCodeBlockBorder"),
+                        )],
+                        width,
+                    ));
                     let syntax = SYNTAXES
                         .find_syntax_by_token(&language)
                         .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
@@ -636,6 +664,9 @@ fn markdown_at_depth(text: &str, theme: &Theme, width: usize, depth: usize) -> V
                         &[Span::new("```", theme.color("mdCodeBlockBorder"))],
                         width,
                     ));
+                    if let Some(warning) = warning {
+                        lines.extend(wrap(&[Span::new(warning, theme.color("warning"))], width));
+                    }
                     code_text.clear();
                 }
             }
@@ -680,7 +711,7 @@ fn markdown_at_depth(text: &str, theme: &Theme, width: usize, depth: usize) -> V
                 let bordered = width >= 3;
                 let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
                 let quoted = if depth < 32 {
-                    markdown_at_depth(&body, theme, content_width, depth + 1)
+                    markdown_at_depth(&body, theme, content_width, depth + 1, mermaid)
                 } else {
                     wrap(&[Span::new(body, theme.color("mdQuote"))], content_width)
                 };
@@ -886,7 +917,17 @@ mod tests {
                 ToolPart::Text("after".into()),
             ],
         };
-        let lines = entry.render(&Theme::system(), 80, true, true, Some(60), 1);
+        let lines = entry.render(
+            &Theme::system(),
+            80,
+            true,
+            true,
+            TranscriptOptions {
+                image_width: Some(60),
+                padding: 1,
+                ..Default::default()
+            },
+        );
         let before = lines
             .iter()
             .position(|line| line.spans.iter().any(|span| span.text.contains("before")))
@@ -899,7 +940,17 @@ mod tests {
         assert!(before < image && image < after);
         assert!(
             entry
-                .render(&Theme::system(), 80, false, true, Some(60), 1)
+                .render(
+                    &Theme::system(),
+                    80,
+                    false,
+                    true,
+                    TranscriptOptions {
+                        image_width: Some(60),
+                        padding: 1,
+                        ..Default::default()
+                    }
+                )
                 .iter()
                 .all(|line| line.image.is_none())
         );

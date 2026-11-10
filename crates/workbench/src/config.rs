@@ -166,6 +166,12 @@ impl Settings {
             .as_f64()
             .map_or(60, |width| width.min(f64::from(u16::MAX)) as usize)
     }
+    pub fn mermaid_mode(&self) -> &str {
+        self.value["markdown"]["mermaid"]
+            .as_str()
+            .unwrap_or("streaming")
+    }
+
     pub fn clear_terminal_on_shrink(&self) -> bool {
         self.value["terminal"]["clearOnShrink"] == true
     }

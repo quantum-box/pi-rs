@@ -7,9 +7,10 @@ use crate::ui::{
     editor::Editor,
     images::{self, Cleanup, InlineImage, Renderer},
     keys::Keys,
+    mermaid::Mermaid,
     mouse_selection::MouseSelection,
     picker::{Input, Item, Picker, Selection, TreeEntryKind, TreeFilter},
-    render::{Entry, Line, ToolPart},
+    render::{Entry, Line, ToolPart, TranscriptOptions},
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
     viewport::{Viewport, Wheel},
@@ -227,8 +228,7 @@ struct RegularLayout {
     theme: Theme,
     expand_tools: bool,
     hide_thinking: bool,
-    image_width: Option<usize>,
-    output_pad: usize,
+    output: TranscriptOptions,
 }
 #[derive(Default)]
 struct RegularState {
@@ -437,7 +437,15 @@ impl View {
             .values()
             .filter(|(_, location)| *location == placement)
             .flat_map(|(lines, _)| lines.iter())
-            .flat_map(|text| Entry::Notice(text.clone()).render(theme, width, false, true, None, 0))
+            .flat_map(|text| {
+                Entry::Notice(text.clone()).render(
+                    theme,
+                    width,
+                    false,
+                    true,
+                    TranscriptOptions::default(),
+                )
+            })
             .collect()
     }
     fn extension_status(&self) -> String {
@@ -1090,8 +1098,7 @@ impl View {
         if self.dialog().is_some() {
             below.clear();
         }
-        let image_width = self.image_width(args);
-        let output_pad = args.settings.output_padding();
+        let output = self.transcript_options(args, false);
         let header_rows = usize::from(show_startup_header(args));
         let body_height = height.saturating_sub(prompt_height + 4 + header_rows + below.len());
         let mut lines = Vec::new();
@@ -1105,8 +1112,7 @@ impl View {
                 body_width,
                 self.expand_tools,
                 !self.hide_thinking,
-                image_width,
-                output_pad,
+                output,
             ));
         }
         if !self.thinking.is_empty() {
@@ -1115,15 +1121,17 @@ impl View {
                 body_width,
                 false,
                 !self.hide_thinking,
-                None,
-                output_pad,
+                self.transcript_options(args, true),
             ));
         }
         if !self.streaming.is_empty() {
-            lines.extend(
-                Entry::Assistant(self.streaming.clone())
-                    .render(theme, body_width, false, true, None, output_pad),
-            );
+            lines.extend(Entry::Assistant(self.streaming.clone()).render(
+                theme,
+                body_width,
+                false,
+                true,
+                self.transcript_options(args, true),
+            ));
         }
         if let Some(picker) = &self.picker {
             lines = picker.render(theme, width, body_height, keys);
@@ -1339,27 +1347,27 @@ impl View {
         Ok(())
     }
 
-    fn image_width(&self, args: &Cli) -> Option<usize> {
-        (self.graphics.enabled() && args.settings.show_terminal_images())
-            .then(|| args.settings.terminal_image_width())
+    fn transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions {
+        TranscriptOptions {
+            image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
+                .then(|| args.settings.terminal_image_width()),
+            padding: args.settings.output_padding(),
+            mermaid: match (args.settings.mermaid_mode(), streaming) {
+                ("off", _) | ("final", true) => Mermaid::Off,
+                (_, true) => Mermaid::Streaming,
+                (_, false) => Mermaid::Final,
+            },
+        }
     }
 
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
         self.graphics.reset();
-        let image_width = self.image_width(args);
-        let output_pad = args.settings.output_padding();
+        let output = self.transcript_options(args, false);
         let width = usize::from(terminal::size()?.0.max(1));
         let mut out = std::io::stdout().lock();
         queue!(out, MoveToColumn(0), Print("\r\n"))?;
         for entry in &self.lines {
-            for line in entry.render(
-                theme,
-                width,
-                self.expand_tools,
-                !self.hide_thinking,
-                image_width,
-                output_pad,
-            ) {
+            for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking, output) {
                 line.draw(&mut out, width)?;
                 self.graphics
                     .paint(&line, &mut out, usize::MAX, usize::MAX)?;
@@ -1375,8 +1383,7 @@ impl View {
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
         let hardware_cursor = args.settings.show_hardware_cursor();
-        let image_width = self.image_width(args);
-        let output_pad = args.settings.output_padding();
+        let output = self.transcript_options(args, false);
         let layout = RegularLayout {
             width,
             height,
@@ -1384,8 +1391,7 @@ impl View {
             theme: theme.clone(),
             expand_tools: self.expand_tools,
             hide_thinking: self.hide_thinking,
-            image_width,
-            output_pad,
+            output,
         };
         let redraw = self.regular.layout.is_some()
             && (self.regular.redraw
@@ -1404,14 +1410,7 @@ impl View {
             below.clear();
         }
         let render_entry = |entry: &Entry| {
-            entry.render(
-                theme,
-                width,
-                self.expand_tools,
-                !self.hide_thinking,
-                image_width,
-                output_pad,
-            )
+            entry.render(theme, width, self.expand_tools, !self.hide_thinking, output)
         };
         let pending = || {
             self.lines[self.regular.committed..]
@@ -1428,13 +1427,15 @@ impl View {
                 width,
                 false,
                 !self.hide_thinking,
-                None,
-                output_pad,
+                self.transcript_options(args, true),
             ));
-            active.extend(
-                Entry::Assistant(self.streaming.clone())
-                    .render(theme, width, false, true, None, output_pad),
-            );
+            active.extend(Entry::Assistant(self.streaming.clone()).render(
+                theme,
+                width,
+                false,
+                true,
+                self.transcript_options(args, true),
+            ));
             if let Some(picker) = &self.picker {
                 active =
                     picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
@@ -3270,6 +3271,20 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 },
                                 Item {
                                     label: format!(
+                                        "Mermaid rendering · {}",
+                                        args.settings.mermaid_mode()
+                                    ),
+                                    selection: Selection::Setting(
+                                        "markdown.mermaid".into(),
+                                        json!(match args.settings.mermaid_mode() {
+                                            "streaming" => "final",
+                                            "final" => "off",
+                                            _ => "streaming",
+                                        }),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
                                         "Clear on shrink · {}",
                                         if args.settings.clear_terminal_on_shrink() {
                                             "on"
@@ -4002,6 +4017,9 @@ fn select(
             } else if let Some(member) = key.strip_prefix("images.") {
                 args.settings
                     .set_user_member("images", member, value.clone())?;
+            } else if let Some(member) = key.strip_prefix("markdown.") {
+                args.settings
+                    .set_user_member("markdown", member, value.clone())?;
             } else if key == "theme" {
                 let next = Theme::load(
                     value

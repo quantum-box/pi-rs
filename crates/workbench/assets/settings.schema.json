@@ -79,6 +79,12 @@
       }
     },
     "mcpClientMetadataBaseUrl": { "type": "string", "minLength": 1 },
+    "markdown": {
+      "type": "object",
+      "properties": {
+        "mermaid": { "enum": ["off", "final", "streaming"] }
+      }
+    },
     "terminal": {
       "type": "object",
       "properties": {

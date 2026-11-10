@@ -5,6 +5,8 @@ mod editor_layout;
 pub mod images;
 pub mod input;
 pub mod keys;
+pub mod mermaid;
+mod mermaid_engine;
 pub mod mouse_selection;
 pub mod picker;
 pub mod render;
