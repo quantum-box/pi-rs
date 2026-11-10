@@ -48,6 +48,13 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    pub fn display_name<'a>(&'a self, model: &'a str) -> &'a str {
+        self.aliases
+            .iter()
+            .find(|(id, _)| id == model)
+            .map_or(model, |(_, name)| name)
+    }
+
     pub async fn details(
         &self,
         models: &[String],
@@ -90,7 +97,15 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
             Err(_) => {}
         }
     }
-    let aliases = aliases(&args.model_profiles, &provider, &models);
+    let mut aliases = aliases(&args.model_profiles, &provider, &models);
+    let configured: std::collections::HashSet<_> =
+        aliases.iter().map(|(id, _)| id.clone()).collect();
+    aliases.extend(
+        client
+            .aliases()
+            .into_iter()
+            .filter(|(id, _)| !configured.contains(id)),
+    );
     Ok(Catalog {
         provider,
         client,

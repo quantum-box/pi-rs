@@ -16,6 +16,7 @@ pub(super) enum Provider {
     Ollama,
     Anthropic,
     Google,
+    Radius,
     Custom {
         id: Arc<str>,
         adapter: Adapter,
@@ -52,13 +53,14 @@ impl Adapter {
 }
 
 impl Provider {
-    pub const ALL: [Self; 3] = [Self::Ollama, Self::Anthropic, Self::Google];
+    pub const ALL: [Self; 4] = [Self::Ollama, Self::Anthropic, Self::Google, Self::Radius];
 
     pub fn adapter(&self) -> Adapter {
         match self {
             Self::Ollama => Adapter::ChatCompletions,
             Self::Anthropic => Adapter::Anthropic,
             Self::Google => Adapter::Google,
+            Self::Radius => Adapter::PiMessages,
             Self::Custom { adapter, .. } => *adapter,
         }
     }
@@ -72,6 +74,7 @@ impl Provider {
             Self::Ollama => "ollama",
             Self::Anthropic => "anthropic",
             Self::Google => "google",
+            Self::Radius => "radius",
             Self::Custom { id, .. } => id,
         }
     }
@@ -87,6 +90,7 @@ impl Provider {
             Self::Ollama => "http://127.0.0.1:11434/v1/chat/completions",
             Self::Anthropic => pi_rs::anthropic::DEFAULT_ENDPOINT,
             Self::Google => pi_rs::google::DEFAULT_ENDPOINT,
+            Self::Radius => "https://radius.pi.dev/messages",
             Self::Custom { .. } => "",
         }
     }
@@ -96,6 +100,9 @@ impl Provider {
             Error::Config(match self {
                 Self::Anthropic => "set ANTHROPIC_API_KEY or pass --api-key".into(),
                 Self::Google => "set GEMINI_API_KEY or pass --api-key".into(),
+                Self::Radius => {
+                    "sign in with /login radius, set RADIUS_API_KEY, or pass --api-key".into()
+                }
                 _ => format!("configure an API key for {}", self.id()),
             })
         };
@@ -109,11 +116,24 @@ impl Provider {
                 let token = token.ok_or_else(missing_key)?;
                 Ok(Client::Google(Google::new(endpoint, &token)?))
             }
-            Adapter::PiMessages => Ok(Client::PiMessages(PiMessages::new(
-                self.id(),
-                endpoint,
-                token.ok_or_else(missing_key)?,
-            )?)),
+            Adapter::PiMessages => {
+                if self == &Self::Radius {
+                    let gateway = super::radius_auth::Gateway::configured()?;
+                    if gateway.url("/messages").as_str() == endpoint {
+                        if token.is_none() && !gateway.has_credential()? {
+                            return Err(missing_key());
+                        }
+                        return Ok(Client::PiMessages(PiMessages::radius(
+                            endpoint, token, gateway,
+                        )?));
+                    }
+                }
+                Ok(Client::PiMessages(PiMessages::new(
+                    self.id(),
+                    endpoint,
+                    token.ok_or_else(missing_key)?,
+                )?))
+            }
         }
     }
 }
@@ -127,6 +147,13 @@ pub(super) enum Client {
 }
 
 impl Client {
+    pub fn aliases(&self) -> Vec<(String, String)> {
+        match self {
+            Self::PiMessages(client) => client.aliases(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn with_headers(self, headers: reqwest::header::HeaderMap) -> Self {
         match self {
             Self::Ollama(client) => Self::Ollama(client.with_headers(headers)),
@@ -151,7 +178,7 @@ impl Client {
                 .into_iter()
                 .map(|model| model.id)
                 .collect()),
-            Self::PiMessages(_) => Ok(Vec::new()),
+            Self::PiMessages(client) => client.models().await,
         }
     }
 
@@ -206,7 +233,7 @@ impl Client {
                     })
                     .collect()
             }
-            Self::PiMessages(_) => BTreeMap::new(),
+            Self::PiMessages(client) => client.model_details(models).await,
         }
     }
 
@@ -215,7 +242,7 @@ impl Client {
             Self::Ollama(client) => Self::Ollama(client.with_native_probes(enabled)),
             Self::Anthropic(client) => Self::Anthropic(client.with_context_probe(enabled)),
             Self::Google(client) => Self::Google(client.with_context_probe(enabled)),
-            Self::PiMessages(client) => Self::PiMessages(client),
+            Self::PiMessages(client) => Self::PiMessages(client.with_context_probe(enabled)),
         }
     }
 
@@ -256,7 +283,13 @@ impl Client {
             }
             Self::Anthropic(client) => client.model(model).await.map(|entry| entry.thinking_levels),
             Self::Google(client) => client.model(model).await.map(|entry| entry.thinking_levels),
-            Self::PiMessages(_) => None,
+            Self::PiMessages(client) => {
+                client
+                    .model_details(&[model.into()])
+                    .await
+                    .remove(model)?
+                    .thinking_levels
+            }
         }
     }
 

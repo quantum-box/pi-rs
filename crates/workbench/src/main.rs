@@ -31,6 +31,7 @@ mod process;
 mod providers;
 use providers::Provider;
 mod radius_auth;
+mod radius_catalog;
 mod resource_paths;
 mod resources;
 mod rpc;
@@ -336,6 +337,15 @@ impl Cli {
             .or_else(|| self.model_keys.get(provider, endpoint).map(str::to_owned))
             .or_else(|| self.model_profiles.api_key(provider, endpoint))
             .or_else(|| {
+                if provider == &Provider::Radius {
+                    let gateway = radius_auth::Gateway::configured_origin().ok()?;
+                    if gateway.join("/messages").ok()?.as_str() == endpoint {
+                        return std::env::var("RADIUS_API_KEY")
+                            .ok()
+                            .filter(|key| !key.trim().is_empty());
+                    }
+                    return None;
+                }
                 let url = reqwest::Url::parse(endpoint).ok()?;
                 match (provider, url.scheme(), url.host_str()) {
                     (Provider::Anthropic, "https", Some("api.anthropic.com")) => {

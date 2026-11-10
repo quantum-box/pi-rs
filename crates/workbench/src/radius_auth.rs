@@ -73,7 +73,7 @@ enum TokenResult {
 }
 
 impl Gateway {
-    pub(super) fn configured() -> Result<Self> {
+    pub(super) fn configured_origin() -> Result<Url> {
         let value = std::env::var("PI_RADIUS_GATEWAY").unwrap_or_else(|_| DEFAULT_GATEWAY.into());
         let origin = if value.contains("://") {
             trusted_url(&value)?
@@ -85,6 +85,11 @@ impl Gateway {
                 "PI_RADIUS_GATEWAY must be a gateway origin".into(),
             ));
         }
+        Ok(origin)
+    }
+
+    pub(super) fn configured() -> Result<Self> {
+        let origin = Self::configured_origin()?;
         let client = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())

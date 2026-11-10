@@ -15,6 +15,7 @@ use super::{Provider, config, providers::Adapter};
 pub(super) struct Profiles {
     entries: BTreeMap<String, Profile>,
     revision: String,
+    radius_endpoint: Option<String>,
 }
 
 #[derive(Clone)]
@@ -196,7 +197,24 @@ impl Profiles {
     pub fn load() -> Result<Self> {
         let path = config::agent_dir().join("models.json");
         let data = config::read_object(&path)?;
-        Self::parse(&data)
+        let mut profiles = Self::parse(&data)?;
+        if std::env::var_os("PI_RADIUS_GATEWAY").is_some() {
+            let endpoint = super::radius_auth::Gateway::configured_origin()?
+                .join("/messages")
+                .expect("valid Radius endpoint")
+                .to_string();
+            if let Some(profile) = profiles.entries.get_mut("radius")
+                && data["providers"].as_object().is_some_and(|providers| {
+                    providers.iter().any(|(name, entry)| {
+                        name.eq_ignore_ascii_case("radius") && entry["baseUrl"].is_null()
+                    })
+                })
+            {
+                profile.endpoint.clone_from(&endpoint);
+            }
+            profiles.radius_endpoint = Some(endpoint);
+        }
+        Ok(profiles)
     }
 
     fn parse(data: &Value) -> Result<Self> {
@@ -286,7 +304,11 @@ impl Profiles {
             }
         }
         let revision = format!("{:x}", Sha256::digest(serde_json::to_vec(data)?));
-        Ok(Self { entries, revision })
+        Ok(Self {
+            entries,
+            revision,
+            radius_endpoint: None,
+        })
     }
 
     pub fn revision(&self) -> &str {
@@ -311,9 +333,18 @@ impl Profiles {
     }
 
     pub fn endpoint(&self, provider: &Provider) -> &str {
-        self.entries
-            .get(provider.id())
-            .map_or_else(|| provider.default_endpoint(), |profile| &profile.endpoint)
+        self.entries.get(provider.id()).map_or_else(
+            || {
+                if provider == &Provider::Radius {
+                    self.radius_endpoint
+                        .as_deref()
+                        .unwrap_or_else(|| provider.default_endpoint())
+                } else {
+                    provider.default_endpoint()
+                }
+            },
+            |profile| &profile.endpoint,
+        )
     }
 
     pub fn api_key(&self, provider: &Provider, endpoint: &str) -> Option<String> {
@@ -353,12 +384,23 @@ impl Profiles {
             );
         }
         if profile.auth_header {
-            let token = token
-                .ok_or_else(|| Error::Config("authHeader requires a resolved API key".into()))?;
-            headers.insert(
-                AUTHORIZATION,
-                sensitive_header("authorization", &format!("Bearer {token}"))?,
-            );
+            match token {
+                Some(token) => {
+                    headers.insert(
+                        AUTHORIZATION,
+                        sensitive_header("authorization", &format!("Bearer {token}"))?,
+                    );
+                }
+                None if provider == &Provider::Radius => {
+                    // The gateway adapter adds its current OAuth access token.
+                    headers.remove(AUTHORIZATION);
+                }
+                None => {
+                    return Err(Error::Config(
+                        "authHeader requires a resolved API key".into(),
+                    ));
+                }
+            }
         }
         Ok(headers)
     }

@@ -18,7 +18,7 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, named profiles for those APIs and Pi Messages, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages, Google Gemini Generate Content, and Radius Pi Messages, named profiles for those APIs and Pi Messages, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh | OAuth and refresh for other model providers |
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Input hooks for queued SDK controls, remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
@@ -2229,3 +2229,18 @@ connection. Changing endpoints excludes the opaque replay data.
 A loopback fixture covered tool calls and results, streamed reasoning,
 cache and cost accounting, signed history across process restarts and
 credential and signature isolation on endpoint changes.
+
+### Radius model discovery
+
+The `radius` provider loads the gateway's authenticated model catalog
+and uses its model endpoint on the same origin. The catalog supplies
+display names, context and output limits, image support and thinking
+levels. It can use a saved Radius OAuth credential, `RADIUS_API_KEY`,
+or an explicitly configured model key. The in-process catalog is scoped
+to the credential used to fetch it. A cross-origin model endpoint is
+rejected before any credentials are sent there.
+
+Local acceptance covered both authentication methods, model filtering,
+inference against the catalog route, the advertised output cap and
+rejection of an unrelated endpoint. The built-in offline catalog and
+disk-backed catalog cache are pending.

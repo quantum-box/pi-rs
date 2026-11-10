@@ -21,12 +21,7 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         .models
         .iter()
         .filter(|model| {
-            let configured_name = args
-                .model_profiles
-                .model(&args.provider, model)
-                .and_then(|metadata| metadata.name)
-                .unwrap_or_default();
-            let candidate = format!("{provider} {model} {configured_name}");
+            let candidate = format!("{provider} {model} {}", catalog.display_name(model));
             terms
                 .iter()
                 .all(|term| model_selection::fuzzy(term, &candidate))
@@ -36,11 +31,7 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
     let details = catalog.details(&models, &args.model_profiles).await;
     if args.mode == Some(OutputMode::Json) {
         for model in models {
-            let name = args
-                .model_profiles
-                .model(&args.provider, &model)
-                .and_then(|metadata| metadata.name)
-                .unwrap_or_else(|| model.clone());
+            let name = catalog.display_name(&model);
             output(with_details(
                 json!({"type":"model","model":model,"name":name,"provider":provider}),
                 details.get(&model),

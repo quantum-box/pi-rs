@@ -13,6 +13,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::{radius_auth::Gateway, radius_catalog};
+
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const MAX_BLOCKS: usize = 256;
 const REPLAY_ORIGIN: &str = "pi-rs:pi-messages-origin";
@@ -35,15 +37,41 @@ pub(super) struct PiMessages {
     endpoint: Url,
     identity: String,
     origin_hash: String,
-    token: String,
+    token: Option<String>,
     headers: HeaderMap,
     thinking: Option<String>,
     progress: Option<ProgressObserver>,
     reasoning: Option<ReasoningObserver>,
+    radius: Option<Radius>,
+    probe_catalog: bool,
+}
+
+#[derive(Clone)]
+struct Radius {
+    gateway: Gateway,
+    catalog: Arc<tokio::sync::Mutex<Option<CachedCatalog>>>,
+}
+
+struct CachedCatalog {
+    token_hash: [u8; 32],
+    value: Arc<radius_catalog::Catalog>,
 }
 
 impl PiMessages {
     pub(super) fn new(provider: &str, endpoint: &str, token: String) -> Result<Self> {
+        Self::build(provider, endpoint, Some(token))
+    }
+
+    pub(super) fn radius(endpoint: &str, token: Option<String>, gateway: Gateway) -> Result<Self> {
+        let mut client = Self::build("radius", endpoint, token)?;
+        client.radius = Some(Radius {
+            gateway,
+            catalog: Arc::new(tokio::sync::Mutex::new(None)),
+        });
+        Ok(client)
+    }
+
+    fn build(provider: &str, endpoint: &str, token: Option<String>) -> Result<Self> {
         let endpoint = Url::parse(endpoint)
             .map_err(|_| Error::Config("Invalid Pi Messages endpoint".into()))?;
         let loopback = matches!(
@@ -75,7 +103,104 @@ impl PiMessages {
             thinking: None,
             progress: None,
             reasoning: None,
+            radius: None,
+            probe_catalog: true,
         })
+    }
+
+    pub(super) fn with_context_probe(mut self, enabled: bool) -> Self {
+        self.probe_catalog = enabled;
+        self
+    }
+
+    async fn access(&self) -> Result<String> {
+        if let Some(token) = &self.token {
+            return Ok(token.clone());
+        }
+        let radius = self.radius.as_ref().expect("OAuth is only used by Radius");
+        radius
+            .gateway
+            .access(std::time::Duration::from_secs(60))
+            .await?
+            .ok_or_else(|| Error::Config("Radius credentials were removed. Sign in again.".into()))
+    }
+
+    async fn catalog(&self) -> Result<Option<Arc<radius_catalog::Catalog>>> {
+        if self.radius.is_none() {
+            return Ok(None);
+        }
+        let token = self.access().await?;
+        self.catalog_for(&token).await
+    }
+
+    async fn catalog_for(&self, token: &str) -> Result<Option<Arc<radius_catalog::Catalog>>> {
+        let Some(radius) = &self.radius else {
+            return Ok(None);
+        };
+        let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let mut cached = radius.catalog.lock().await;
+        if let Some(cached) = cached
+            .as_ref()
+            .filter(|cached| cached.token_hash == token_hash)
+        {
+            return Ok(Some(cached.value.clone()));
+        }
+        if !self.probe_catalog {
+            return Ok(None);
+        }
+        let value =
+            Arc::new(radius_catalog::load(&self.client, radius.gateway.url("/"), token).await?);
+        *cached = Some(CachedCatalog {
+            token_hash,
+            value: value.clone(),
+        });
+        Ok(Some(value))
+    }
+
+    pub(super) async fn models(&self) -> Result<Vec<String>> {
+        Ok(self.catalog().await?.map_or_else(Vec::new, |catalog| {
+            catalog
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect()
+        }))
+    }
+
+    pub(super) fn aliases(&self) -> Vec<(String, String)> {
+        self.radius
+            .as_ref()
+            .and_then(|radius| {
+                let cache = radius.catalog.try_lock().ok()?;
+                Some(
+                    cache
+                        .as_ref()?
+                        .value
+                        .models
+                        .iter()
+                        .map(|model| (model.id.clone(), model.name.clone()))
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) async fn model_details(
+        &self,
+        ids: &[String],
+    ) -> BTreeMap<String, pi_rs::ollama::ModelDetails> {
+        self.catalog()
+            .await
+            .ok()
+            .flatten()
+            .map_or_else(BTreeMap::new, |catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .filter(|model| ids.contains(&model.id))
+                    .map(|model| (model.id.clone(), model.details()))
+                    .collect()
+            })
     }
 
     pub(super) fn with_headers(mut self, headers: HeaderMap) -> Self {
@@ -251,16 +376,37 @@ pub(super) fn is_pi_messages_replay(replay: &ProviderReplay) -> bool {
 
 #[async_trait::async_trait]
 impl Model for PiMessages {
-    async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
-        let requested_model = request.model.clone();
-        let payload = self.encode(request);
+    async fn context_window(&self, model: &str) -> Option<u32> {
+        self.model_details(&[model.into()])
+            .await
+            .remove(model)?
+            .context_window
+    }
+
+    async fn stream(&self, mut request: ModelRequest) -> Result<ModelStream> {
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
+        let mut client = self.clone();
+        let token = self.access().await?;
+        if let Some(catalog) = self.catalog_for(&token).await.ok().flatten() {
+            client.endpoint = catalog.endpoint.clone();
+            client.origin_hash = format!("{:x}", Sha256::digest(client.endpoint.as_str()));
+            if let Some(model) = catalog
+                .models
+                .iter()
+                .find(|model| model.id == request.model)
+                && let Some(limit) = model.details().max_output_tokens
+            {
+                request.max_output_tokens = request.max_output_tokens.min(limit);
+            }
+        }
+        let requested_model = request.model.clone();
+        let payload = client.encode(request);
         let response = self
             .client
-            .post(self.endpoint.clone())
-            .bearer_auth(&self.token)
+            .post(client.endpoint.clone())
+            .bearer_auth(token)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&payload)
             .headers(self.headers.clone())
@@ -290,7 +436,6 @@ impl Model for PiMessages {
         {
             return Err(Error::Model("Expected a Pi Messages event stream".into()));
         }
-        let client = self.clone();
         let mut events = response.bytes_stream().eventsource();
         Ok(Box::pin(async_stream::try_stream! {
             let mut size = 0_usize;
