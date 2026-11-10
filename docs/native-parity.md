@@ -2244,3 +2244,15 @@ Local acceptance covered both authentication methods, model filtering,
 inference against the catalog route, the advertised output cap and
 rejection of an unrelated endpoint. The built-in offline catalog and
 disk-backed catalog cache are pending.
+
+### Single-shot JSON event stream
+
+`--mode json` emits the Pi session header followed by agent, turn,
+message and tool lifecycle events. It shares the RPC projection for
+text, reasoning and fragmented tool arguments. Existing native record
+metadata and the final `answer` remain available. The full request
+trace stays behind `--trace`.
+
+Visible reasoning is a transient model and SDK event. Print mode still
+writes the answer as text. Loopback tests covered the JSON header,
+reasoning before text, tool events, settlement, and the legacy answer.

@@ -293,26 +293,15 @@ impl Client {
         }
     }
 
-    pub fn observe(self, trace: bool) -> Self {
+    pub fn observe(self) -> Self {
         fn progress(stage: impl serde::Serialize) {
             super::output(json!({"type":"model_progress","stage":stage}));
         }
-        let reasoning = move |delta: &str| {
-            if trace {
-                super::output(json!({"type":"reasoning_delta","delta":delta}));
-            }
-        };
         match self {
-            Self::Ollama(client) => {
-                Self::Ollama(client.with_progress(progress).with_reasoning(reasoning))
-            }
-            Self::Anthropic(client) => {
-                Self::Anthropic(client.with_progress(progress).with_reasoning(reasoning))
-            }
-            Self::Google(client) => {
-                Self::Google(client.with_progress(progress).with_reasoning(reasoning))
-            }
-            Self::PiMessages(client) => Self::PiMessages(client.observe(progress, reasoning)),
+            Self::Ollama(client) => Self::Ollama(client.with_progress(progress)),
+            Self::Anthropic(client) => Self::Anthropic(client.with_progress(progress)),
+            Self::Google(client) => Self::Google(client.with_progress(progress)),
+            Self::PiMessages(client) => Self::PiMessages(client.observe(progress)),
         }
     }
 }

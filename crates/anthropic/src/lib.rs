@@ -731,6 +731,7 @@ impl Model for Anthropic {
                                     if !captured.text.is_empty() && block["type"] == "thinking" {
                                         reasoning_text.push_str(&captured.text);
                                         if let Some(observer) = &reasoning { observer(&captured.text); }
+                                        yield ModelEvent::Reasoning(captured.text.clone());
                                     }
                                 }
                                 _ => {}
@@ -760,6 +761,7 @@ impl Model for Anthropic {
                                     report(Progress::Thinking);
                                     reasoning_text.push_str(text);
                                     if let Some(observer) = &reasoning { observer(text); }
+                                    yield ModelEvent::Reasoning(text.into());
                                 }
                             }
                             Some("signature_delta") => {

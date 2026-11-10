@@ -560,6 +560,7 @@ impl Model for Ollama {
                         report_progress(&progress, &mut last_progress, ModelProgress::Thinking);
                         reasoning_text.push_str(text);
                         if let Some(observer) = &reasoning { observer(text); }
+                        yield ModelEvent::Reasoning(text.clone());
                     }
                     if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
                         report_progress(&progress, &mut last_progress, ModelProgress::Generating);

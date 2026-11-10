@@ -95,6 +95,26 @@ fn print_and_json_modes_accept_positional_prompts() {
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
+            assert_eq!(records[0]["type"], "session");
+            assert_eq!(records[0]["version"], 3);
+            let updates: Vec<_> = records
+                .iter()
+                .filter_map(|event| event.get("assistantMessageEvent"))
+                .filter(|update| {
+                    matches!(
+                        update["type"].as_str(),
+                        Some("thinking_delta" | "text_delta")
+                    )
+                })
+                .collect();
+            assert_eq!(updates.len(), 2);
+            assert_eq!(updates[0]["type"], "thinking_delta");
+            assert_eq!(updates[1]["type"], "text_delta");
+            assert!(
+                records
+                    .iter()
+                    .any(|event| event["type"] == "agent_end" && event["success"] == true)
+            );
             assert!(
                 records
                     .iter()

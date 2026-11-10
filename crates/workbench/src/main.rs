@@ -1172,13 +1172,32 @@ async fn execute(mut args: Cli) -> Result<()> {
     }
     thinking::adjust(&mut args);
     args.record_model_selection(&mut session)?;
+    if args.mode == Some(OutputMode::Json)
+        && matches!(command, Command::Run { .. } | Command::Resume)
+    {
+        let mut header = rpc_entries::session_header(&session, &args.workspace);
+        if let Some(parent) = session.parent_session() {
+            header["parentSession"] = json!(parent);
+        }
+        output(header);
+    }
     let runtime = runtime::configure(&args, false).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
     session.set_retry_control(runtime.retry.clone());
     let result = async {
         let registry = &runtime.registry;
         let agent = runtime.agent(&args);
-        let mut observer = |event: Notification<'_>| observe(event, args.trace);
+        let mut stream = (args.mode == Some(OutputMode::Json)
+            && matches!(command, Command::Run { .. } | Command::Resume))
+            .then(rpc_events::Stream::default);
+        let mut observer = |event: Notification<'_>| {
+            if let Some(stream) = &mut stream {
+                for event in stream.notify(&event, &args) {
+                    output(event);
+                }
+            }
+            observe(event, args.trace);
+        };
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
     tokio::spawn(async move {
@@ -1308,12 +1327,20 @@ async fn execute(mut args: Cli) -> Result<()> {
         _ => unreachable!(),
     };
     let run_id = args.run_id.unwrap_or_else(Uuid::new_v4);
-    if !initial_images.is_empty() {
+    let image_record = if initial_images.is_empty() {
+        None
+    } else {
         if session.records().iter().any(|record| record.run_id == Some(run_id) || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)) {
             return Err(Error::DuplicateRun(run_id));
         }
         session.append_user_with_images(input.take().unwrap_or_default(), initial_images, Some(run_id))?;
-        observer(Notification::Committed(session.records().last().expect("appended user input")));
+        session.records().last()
+    };
+    if args.mode == Some(OutputMode::Json) {
+        output(json!({"type":"agent_start"}));
+    }
+    if let Some(record) = image_record {
+        observer(Notification::Committed(record));
     }
     let answer = agent
         .run_correlated(
@@ -1324,7 +1351,16 @@ async fn execute(mut args: Cli) -> Result<()> {
             &cancel,
             &mut observer,
         )
-        .await?;
+        .await;
+    if let Some(stream) = &mut stream {
+        let aborted = matches!(&answer, Err(Error::Cancelled));
+        for event in stream.settle(aborted) {
+            output(event);
+        }
+        output(json!({"type":"agent_end","success":answer.is_ok(),"messages":stream.messages,"willRetry":false}));
+        output(json!({"type":"agent_settled","aborted":stream.aborted()}));
+    }
+    let answer = answer?;
     output(json!({"type": "answer", "content": answer}));
     Ok(())
     }.await;
@@ -1356,6 +1392,9 @@ fn observe(event: Notification<'_>, trace: bool) {
             output(json!({"type": "request", "request": request}))
         }
         Notification::Text(delta) if trace => output(json!({"type": "text_delta", "delta": delta})),
+        Notification::Reasoning(delta) if trace => {
+            output(json!({"type":"reasoning_delta","delta":delta}))
+        }
         Notification::ToolCallDelta(delta) if trace => {
             output(json!({"type":"tool_call_delta","toolCallDelta":delta}))
         }

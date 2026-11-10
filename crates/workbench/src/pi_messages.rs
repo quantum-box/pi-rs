@@ -20,7 +20,6 @@ const MAX_BLOCKS: usize = 256;
 const REPLAY_ORIGIN: &str = "pi-rs:pi-messages-origin";
 
 type ProgressObserver = Arc<dyn Fn(Progress) + Send + Sync>;
-type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,7 +40,6 @@ pub(super) struct PiMessages {
     headers: HeaderMap,
     thinking: Option<String>,
     progress: Option<ProgressObserver>,
-    reasoning: Option<ReasoningObserver>,
     radius: Option<Radius>,
     probe_catalog: bool,
 }
@@ -102,7 +100,6 @@ impl PiMessages {
             headers: HeaderMap::new(),
             thinking: None,
             progress: None,
-            reasoning: None,
             radius: None,
             probe_catalog: true,
         })
@@ -213,13 +210,8 @@ impl PiMessages {
         self
     }
 
-    pub(super) fn observe(
-        mut self,
-        progress: impl Fn(Progress) + Send + Sync + 'static,
-        reasoning: impl Fn(&str) + Send + Sync + 'static,
-    ) -> Self {
+    pub(super) fn observe(mut self, progress: impl Fn(Progress) + Send + Sync + 'static) -> Self {
         self.progress = Some(Arc::new(progress));
-        self.reasoning = Some(Arc::new(reasoning));
         self
     }
 
@@ -480,9 +472,7 @@ impl Model for PiMessages {
                             yield ModelEvent::Text(delta.into());
                         } else {
                             reasoning.push_str(delta);
-                            if let Some(observer) = &client.reasoning {
-                                observer(delta);
-                            }
+                            yield ModelEvent::Reasoning(delta.into());
                         }
                     }
                     kind @ ("text_end" | "thinking_end") => {
@@ -499,9 +489,7 @@ impl Model for PiMessages {
                                 yield ModelEvent::Text(suffix.into());
                             } else if event["redacted"] != true {
                                 reasoning.push_str(suffix);
-                                if let Some(observer) = &client.reasoning {
-                                    observer(suffix);
-                                }
+                                yield ModelEvent::Reasoning(suffix.into());
                             }
                         }
                         block.raw[key] = json!(content);

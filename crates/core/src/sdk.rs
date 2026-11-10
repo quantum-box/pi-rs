@@ -21,6 +21,7 @@ pub enum SessionEvent {
     Record(Arc<Record>),
     Request(Arc<ModelRequest>),
     Text(String),
+    Reasoning(String),
     ToolCallDelta(crate::ToolCallDelta),
     Retry(crate::RetryEvent),
     QueueUpdated {
@@ -739,6 +740,7 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         Notification::Committed(record) => SessionEvent::Record(Arc::new((*record).clone())),
         Notification::Request(request) => SessionEvent::Request(Arc::new((*request).clone())),
         Notification::Text(text) => SessionEvent::Text((*text).into()),
+        Notification::Reasoning(text) => SessionEvent::Reasoning((*text).into()),
         Notification::ToolCallDelta(delta) => SessionEvent::ToolCallDelta((*delta).clone()),
         Notification::Retry(event) => SessionEvent::Retry(event.clone()),
         Notification::SummaryRequest => return,

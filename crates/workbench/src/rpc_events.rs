@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pi_rs::{
-    Event, Invocation, ModelFailure, ModelMetadata, Outcome, Record, ToolCall, ToolCallDelta,
-    Usage, UsageReport,
+    Event, Invocation, ModelFailure, ModelMetadata, Notification, Outcome, Record, ToolCall,
+    ToolCallDelta, Usage, UsageReport,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -76,6 +76,28 @@ impl Stream {
                 if let Ok(delta) = ToolCallDelta::deserialize(&event["toolCallDelta"]) {
                     self.tool_delta(delta, &mut events);
                 }
+            }
+            _ => {}
+        }
+        events
+    }
+
+    pub fn notify(&mut self, event: &Notification<'_>, args: &Cli) -> Vec<Value> {
+        let mut events = Vec::new();
+        match event {
+            Notification::SummaryRequest => {
+                self.finish_turn(&mut events);
+                self.summary = true;
+            }
+            Notification::Committed(record) => self.record(record.event.clone(), args, &mut events),
+            Notification::Text(delta) if !self.assistant.is_null() => {
+                self.delta("text", delta, &mut events);
+            }
+            Notification::Reasoning(delta) if !self.assistant.is_null() => {
+                self.delta("thinking", delta, &mut events);
+            }
+            Notification::ToolCallDelta(delta) if !self.assistant.is_null() && !self.ended => {
+                self.tool_delta((*delta).clone(), &mut events);
             }
             _ => {}
         }

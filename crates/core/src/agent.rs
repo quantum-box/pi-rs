@@ -129,6 +129,8 @@ pub enum Notification<'a> {
     Request(&'a ModelRequest),
     /// Transient text. Only a fully completed response is committed.
     Text(&'a str),
+    /// Transient, provider-visible reasoning text.
+    Reasoning(&'a str),
     /// Transient tool call fragments. Tool dispatch uses only the completed response.
     ToolCallDelta(&'a crate::ToolCallDelta),
 }
@@ -784,6 +786,7 @@ impl Agent<'_> {
         let mut content = String::new();
         let mut metadata = ModelMetadata::default();
         let mut tool_delta_bytes = 0_usize;
+        let mut reasoning_delta_bytes = 0_usize;
         let collect = async {
             let opening = self.model.stream_with_id(request_id, request);
             tokio::pin!(opening);
@@ -811,6 +814,12 @@ impl Agent<'_> {
                         }
                         observer(Notification::Text(&delta));
                         content.push_str(&delta);
+                    }
+                    ModelEvent::Reasoning(delta) => {
+                        reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
+                        if reasoning_delta_bytes <= MAX_RESPONSE_BYTES {
+                            observer(Notification::Reasoning(&delta));
+                        }
                     }
                     ModelEvent::ToolCallDelta(delta) => {
                         tool_delta_bytes = tool_delta_bytes.saturating_add(

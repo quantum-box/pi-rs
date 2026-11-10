@@ -314,6 +314,7 @@ pub enum UsageReport {
 #[derive(Clone, Debug)]
 pub enum ModelEvent {
     Text(String),
+    Reasoning(String),
     ToolCallDelta(ToolCallDelta),
     Metadata(ModelMetadata),
     Complete {

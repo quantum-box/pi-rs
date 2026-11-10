@@ -652,6 +652,7 @@ impl Model for Google {
                                 if let Some(observer) = &observe_reasoning {
                                     observer(text);
                                 }
+                                yield ModelEvent::Reasoning(text.into());
                             } else {
                                 report_progress(&progress, &mut last_progress, Progress::Generating);
                                 yield ModelEvent::Text(text.into());

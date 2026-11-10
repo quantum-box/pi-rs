@@ -8,6 +8,14 @@ use super::rpc_messages::Projection;
 
 const UNKNOWN_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
+pub(super) fn session_header(session: &Session, cwd: &std::path::Path) -> Value {
+    json!({
+        "type":"session", "version":3, "id":session.session_id(),
+        "timestamp":session.records().first().and_then(|record| record.timestamp.as_deref()).unwrap_or(UNKNOWN_TIMESTAMP),
+        "cwd":session.working_directory().map_or_else(|| cwd.to_string_lossy().into_owned(), str::to_owned)
+    })
+}
+
 #[derive(Clone, Copy, Default)]
 struct Position {
     visible: Option<u64>,
@@ -71,11 +79,7 @@ impl Entries {
             }
             id = entry["parentId"].as_str();
         }
-        let header = json!({
-            "type":"session", "version":3, "id":session.session_id(),
-            "timestamp":session.records().first().and_then(|record| record.timestamp.as_deref()).unwrap_or(UNKNOWN_TIMESTAMP),
-            "cwd":session.working_directory().map_or_else(|| cwd.to_string_lossy().into_owned(), str::to_owned)
-        });
+        let header = session_header(session, cwd);
         let mut body = serde_json::to_vec(&header)?;
         body.push(b'\n');
         let mut parent = Value::Null;

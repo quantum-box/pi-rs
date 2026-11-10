@@ -430,7 +430,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             .connect_provider(&args.provider, Some(&args.model))?
             .with_context_probes(args.allow_model_probes())
             .with_model_options(args, super::thinking::reported(args).is_some())?
-            .observe(args.trace);
+            .observe();
 
         Ok(Runtime {
             retry: pi_rs::RetryControl::new(args.settings.retry_settings()),
