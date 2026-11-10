@@ -1582,3 +1582,16 @@ The pinned reference's in-memory session manager confirms the normalization
 cases. Tests cover rejected inputs leaving existing records unchanged, Unicode
 names, line-break handling, explicit clearing and reopened sessions. A CLI/RPC
 smoke check verifies startup naming, error responses and a subsequent valid rename.
+
+### Empty-label compatibility checkpoint
+
+Empty label strings now clear the bookmark through the core, SDK and CLI paths,
+matching Pi. The label projection also treats empty strings in previously saved
+or imported records as removals. Whitespace-only labels retain their content,
+as in the reference. Invalid targets leave the journal unchanged.
+
+Core tests cover writes, replay of legacy empty-string entries and invalid
+targets. The pinned reference confirms empty versus whitespace label behavior.
+
+A CLI/RPC smoke check verifies removal and whitespace labels in the session tree.
+The full workspace tests and all-target Clippy pass.

@@ -750,6 +750,7 @@ impl Session {
         if target == 0 || target > self.records.len() as u64 {
             return Err(Error::Session("invalid label target".into()));
         }
+        let label = label.filter(|label| !label.is_empty());
         self.append(Event::Label { target, label })?;
         Ok(())
     }
@@ -758,7 +759,7 @@ impl Session {
         let mut labels = BTreeMap::new();
         for record in &self.records {
             if let Event::Label { target, label } = &record.event {
-                if let Some(label) = label {
+                if let Some(label) = label.as_ref().filter(|label| !label.is_empty()) {
                     labels.insert(*target, label.clone());
                 } else {
                     labels.remove(target);
@@ -1860,6 +1861,40 @@ pub fn sanitize_session_name(name: &str) -> String {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+
+    #[test]
+    fn empty_labels_clear_bookmarks_in_new_and_legacy_records() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("question".into(), vec![], None)
+            .unwrap();
+        let target = session.head();
+        session.set_label(target, Some("bookmark".into())).unwrap();
+        assert_eq!(
+            session.labels().get(&target).map(String::as_str),
+            Some("bookmark")
+        );
+        session.set_label(target, Some(String::new())).unwrap();
+        assert!(session.labels().is_empty());
+        assert!(matches!(
+            &session.records().last().unwrap().event,
+            Event::Label { label: None, .. }
+        ));
+        session.set_label(target, Some(" ".into())).unwrap();
+        assert_eq!(session.labels().get(&target).map(String::as_str), Some(" "));
+        session
+            .append(Event::Label {
+                target,
+                label: Some(String::new()),
+            })
+            .unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(restored.labels().is_empty());
+        let before = session.records().len();
+        assert!(session.set_label(0, None).is_err());
+        assert!(session.set_label(u64::MAX, None).is_err());
+        assert_eq!(session.records().len(), before);
+    }
 
     #[test]
     fn display_names_sanitize_line_breaks_and_allow_explicit_clearing() {
