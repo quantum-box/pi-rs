@@ -88,6 +88,35 @@ impl Line {
             .collect();
     }
 
+    pub fn mark_cursor(&mut self, column: usize) {
+        let mut used = 0;
+        let mut offset = 0;
+        let mut cursor = None;
+        'spans: for span in &self.spans {
+            for (start, grapheme) in span.text.grapheme_indices(true) {
+                let size = UnicodeWidthStr::width(grapheme);
+                if column < used + size {
+                    cursor = Some(offset + start..offset + start + grapheme.len());
+                    break 'spans;
+                }
+                used += size;
+            }
+            offset += span.text.len();
+        }
+        if let Some(bytes) = cursor {
+            self.style_bytes(bytes, |span| span.inverse = !span.inverse);
+        } else {
+            if column > used {
+                self.spans
+                    .push(Span::new(" ".repeat(column - used), Color::Reset));
+            }
+            self.spans.push(Span {
+                inverse: true,
+                ..Span::new(" ", Color::Reset)
+            });
+        }
+    }
+
     pub fn draw(&self, out: &mut impl Write, width: usize) -> std::io::Result<()> {
         queue!(
             out,

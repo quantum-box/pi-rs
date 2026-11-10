@@ -14,7 +14,7 @@ remaining acceptance work for that surface.
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
-| Terminal | Default `pi` startup, Unicode multiline editor with word-aware wrapping, visual movement, character jumps and kill ring, text/image clipboard paste, fullscreen transcript search and semantic prompt jumps, configurable scrolling and scrollbar, mouse text selection with clipboard copy, exit transcript or resume hint, prompt history, Markdown, aligned tables, links and syntax highlighting, configurable transcript padding, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings for editor and selectors, model and thinking default selection, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and real-terminal image clipping verification |
+| Terminal | Default `pi` startup, Unicode multiline editor with word-aware wrapping, visual movement, character jumps and kill ring, text/image clipboard paste, fullscreen transcript search and semantic prompt jumps, configurable scrolling and scrollbar, mouse text selection with clipboard copy, exit transcript or resume hint, prompt history, Markdown, aligned tables, links and syntax highlighting, configurable transcript padding and hardware or software cursor, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings for editor and selectors, model and thinking default selection, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and real-terminal image clipping verification |
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, configurable Bash and Windows PowerShell with session metadata and Pi-style exit and truncation text, structured read, search, listing and shell truncation details, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
@@ -2525,3 +2525,12 @@ to one cell and can switch to zero from `/settings` in either terminal
 mode. Existing transcript entries, stream content and exit replay use
 the same layout. PTY checks covered changing the setting in both modes
 and repainting existing Kitty placements at the new column.
+
+### Terminal cursor checkpoint
+
+The Pi `showHardwareCursor` setting and `PI_HARDWARE_CURSOR=1` fallback
+select the native cursor or a reverse-video software caret. Text input,
+dialog editors, and transcript search keep the real cursor positioned
+for the terminal while the software caret is active. The setting updates
+from `/settings` in both modes. PTY checks covered a wide Unicode character,
+configuration precedence, live toggling, and exit restoration.

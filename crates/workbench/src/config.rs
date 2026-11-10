@@ -166,6 +166,12 @@ impl Settings {
             .as_f64()
             .map_or(60, |width| width.min(f64::from(u16::MAX)) as usize)
     }
+    pub fn show_hardware_cursor(&self) -> bool {
+        self.boolean("showHardwareCursor").unwrap_or_else(|| {
+            std::env::var_os("PI_HARDWARE_CURSOR").is_some_and(|value| value == "1")
+        })
+    }
+
     pub fn output_padding(&self) -> usize {
         usize::from(self.value["outputPad"].as_u64() != Some(0))
     }

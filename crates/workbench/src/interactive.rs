@@ -1080,6 +1080,7 @@ impl View {
             .unwrap_or("auto");
         let body_width = width - usize::from(scrollbar_mode == "always" && width > 1);
         let height = usize::from(height.max(7));
+        let hardware_cursor = args.settings.show_hardware_cursor();
         let (prompt, cursor_row, column) = self.prompt_rows(args, width, height);
         let prompt_height = prompt.len();
         let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
@@ -1125,8 +1126,17 @@ impl View {
         if let Some(picker) = &self.picker {
             lines = picker.render(theme, width, body_height, keys);
         }
+        let dialog_cursor = self
+            .dialog()
+            .and_then(|dialog| dialog.cursor(width, body_height));
         if let Some(dialog) = self.dialog() {
             lines = dialog.render(theme, width, body_height);
+            if !hardware_cursor
+                && let Some((row, column)) = dialog_cursor
+                && let Some(line) = lines.get_mut(row)
+            {
+                line.mark_cursor(column);
+            }
         } else {
             lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
         }
@@ -1238,7 +1248,11 @@ impl View {
         .draw(&mut out, width)?;
         for (row, line) in prompt.iter().enumerate() {
             queue!(out, MoveTo(0, (border_row + 1 + row) as u16))?;
-            Line::plain(line, theme.color("text")).draw(&mut out, width)?;
+            let mut line = Line::plain(line, theme.color("text"));
+            if row == cursor_row && !hardware_cursor && !modal && self.search.is_none() {
+                line.mark_cursor(column);
+            }
+            line.draw(&mut out, width)?;
         }
         for (row, line) in below.iter().enumerate() {
             queue!(
@@ -1271,7 +1285,11 @@ impl View {
             let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
             let left = width.saturating_sub(search_width + 1);
             let top = header_rows + usize::from(body_height > 3);
-            let (overlay, cursor_row, cursor_column) = search.overlay(theme, keys, search_width);
+            let (mut overlay, cursor_row, cursor_column) =
+                search.overlay(theme, keys, search_width);
+            if !hardware_cursor && let Some(line) = overlay.get_mut(cursor_row) {
+                line.mark_cursor(cursor_column);
+            }
             for (row, line) in overlay.iter().take(body_height).enumerate() {
                 queue!(out, MoveTo(left as u16, (top + row) as u16))?;
                 line.draw(&mut out, search_width)?;
@@ -1279,22 +1297,25 @@ impl View {
             if cursor_row < body_height {
                 queue!(
                     out,
-                    MoveTo((left + cursor_column) as u16, (top + cursor_row) as u16),
-                    Show
+                    MoveTo((left + cursor_column) as u16, (top + cursor_row) as u16)
                 )?;
+                if hardware_cursor {
+                    queue!(out, Show)?;
+                }
             }
-        } else if let Some(dialog) = self.dialog() {
-            if let Some((row, column)) = dialog.cursor(width, body_height) {
-                queue!(out, MoveTo(column as u16, (row + header_rows) as u16), Show)?;
-            } else {
-                queue!(out, Hide)?;
+        } else if let Some((row, column)) = dialog_cursor {
+            queue!(out, MoveTo(column as u16, (row + header_rows) as u16))?;
+            if hardware_cursor {
+                queue!(out, Show)?;
             }
-        } else {
+        } else if !modal {
             queue!(
                 out,
-                MoveTo(column as u16, (border_row + 1 + cursor_row) as u16),
-                Show
+                MoveTo(column as u16, (border_row + 1 + cursor_row) as u16)
             )?;
+            if hardware_cursor {
+                queue!(out, Show)?;
+            }
         }
         out.flush()?;
         Ok(())
@@ -1351,6 +1372,7 @@ impl View {
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
+        let hardware_cursor = args.settings.show_hardware_cursor();
         let image_width = self.image_width(args);
         let output_pad = args.settings.output_padding();
         let layout = RegularLayout {
@@ -1477,8 +1499,18 @@ impl View {
                     picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
             }
         }
+        let dialog_height = height - prompt_height - 4 - below.len();
+        let dialog_cursor = self
+            .dialog()
+            .and_then(|dialog| dialog.cursor(width, dialog_height));
         if let Some(dialog) = self.dialog() {
-            active = dialog.render(theme, width, height - prompt_height - 4 - below.len());
+            active = dialog.render(theme, width, dialog_height);
+            if !hardware_cursor
+                && let Some((row, column)) = dialog_cursor
+                && let Some(line) = active.get_mut(row)
+            {
+                line.mark_cursor(column);
+            }
         } else {
             let available = height - prompt_height - 4 - below.len();
             let mut widgets = self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor);
@@ -1519,8 +1551,13 @@ impl View {
         )
         .draw(&mut out, width)?;
         queue!(out, Print("\r\n"))?;
-        for line in &prompt {
-            Line::plain(line, theme.color("text")).draw(&mut out, width)?;
+        for (row, line) in prompt.iter().enumerate() {
+            let mut line = Line::plain(line, theme.color("text"));
+            if row == cursor && !hardware_cursor && self.picker.is_none() && self.dialog().is_none()
+            {
+                line.mark_cursor(column);
+            }
+            line.draw(&mut out, width)?;
             queue!(out, Print("\r\n"))?;
         }
         for line in &below {
@@ -1546,19 +1583,21 @@ impl View {
         .draw(&mut out, width)?;
         self.regular.cursor_row = active.len() + 1 + cursor;
         self.regular.region_height = active.len() + prompt_height + 4 + below.len();
-        let (column, show_cursor) = if let Some(dialog) = self.dialog() {
-            let position = dialog.cursor(width, height - prompt_height - 4 - below.len());
-            self.regular.cursor_row = position.map_or(0, |(row, _)| row);
-            (position.map_or(0, |(_, column)| column), position.is_some())
+        let (column, show_cursor) = if self.dialog().is_some() {
+            self.regular.cursor_row = dialog_cursor.map_or(0, |(row, _)| row);
+            (
+                dialog_cursor.map_or(0, |(_, column)| column),
+                dialog_cursor.is_some(),
+            )
         } else {
-            (column, true)
+            (column, self.picker.is_none())
         };
         queue!(
             out,
             MoveUp((self.regular.region_height - self.regular.cursor_row - 1) as u16),
             MoveToColumn(column as u16)
         )?;
-        if show_cursor {
+        if hardware_cursor && show_cursor {
             queue!(out, Show)?;
         } else {
             queue!(out, Hide)?;
@@ -3216,6 +3255,20 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     selection: Selection::Setting(
                                         "editorPaddingX".into(),
                                         json!((padding + 1) % 4),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
+                                        "Hardware cursor · {}",
+                                        if args.settings.show_hardware_cursor() {
+                                            "on"
+                                        } else {
+                                            "off"
+                                        }
+                                    ),
+                                    selection: Selection::Setting(
+                                        "showHardwareCursor".into(),
+                                        json!(!args.settings.show_hardware_cursor()),
                                     ),
                                 },
                                 Item {
