@@ -11,7 +11,7 @@ use pi_rs::{
     Error, Extension, Outcome, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolReply,
     ToolSpec,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::io::AsyncReadExt;
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -290,7 +290,7 @@ impl Tool for CodingTool {
         }
         let result = match self.kind {
             Kind::Read => self.read(&args),
-            Kind::Write => self.write(&args),
+            Kind::Write => self.write(&args).map(Outcome::Succeeded),
             Kind::Edit => {
                 return self
                     .edit(&args)
@@ -301,7 +301,7 @@ impl Tool for CodingTool {
             Kind::Bash | Kind::PowerShell => return self.bash(&args, &context.cancellation).await,
         };
         match result {
-            Ok(value) => Outcome::Succeeded(value),
+            Ok(outcome) => outcome,
             Err(error) => Outcome::Failed(error.to_string()),
         }
     }
@@ -336,11 +336,18 @@ impl Tool for CodingTool {
         let outcome = self.invoke(args, context).await;
         match outcome {
             Outcome::Structured { data, attachments } if matches!(self.kind, Kind::Read) => {
-                let image = data["content"]
+                let mut image = data["content"]
                     .as_array()
                     .and_then(|blocks| blocks.iter().find(|block| block["type"] == "image"))
                     .cloned()
-                    .unwrap_or(data);
+                    .unwrap_or_else(|| data.clone());
+                if image["type"] == "image" {
+                    let note = data["content"]
+                        .as_array()
+                        .and_then(|blocks| blocks.iter().find_map(|block| block["text"].as_str()))
+                        .unwrap_or_default();
+                    image["note"] = json!(note);
+                }
                 Outcome::Structured {
                     data: image,
                     attachments,
@@ -404,7 +411,7 @@ impl CodingTool {
         ]})))
     }
 
-    fn read(&self, args: &Value) -> Result<String> {
+    fn read(&self, args: &Value) -> Result<Outcome> {
         let path = self.path(string(args, "path")?)?;
         let offset = usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1))
             .unwrap_or(usize::MAX);
@@ -501,7 +508,7 @@ impl CodingTool {
         })
     }
 
-    fn list(&self, args: &Value) -> Result<String> {
+    fn list(&self, args: &Value) -> Result<Outcome> {
         let path = self.path(args["path"].as_str().unwrap_or("."))?;
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
@@ -530,35 +537,25 @@ impl CodingTool {
             }
         }
         if results.is_empty() {
-            return Ok("(empty directory)".into());
+            return Ok(Outcome::Succeeded("(empty directory)".into()));
         }
-        let mut output = results.join("\n");
-        let byte_limit_reached = output.len() > MAX_OUTPUT_BYTES;
-        if byte_limit_reached {
-            // Pi retains complete output lines and adds one combined notice.
-            let end = output.as_bytes()[..=MAX_OUTPUT_BYTES]
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .unwrap_or(0);
-            output.truncate(end);
-        }
+        let mut details = Map::new();
         let mut notices = Vec::new();
         if entry_limit_reached {
+            details.insert("entryLimitReached".into(), json!(limit));
             notices.push(format!(
                 "{limit} entries limit reached. Use limit={} for more",
                 limit.saturating_mul(2)
             ));
         }
-        if byte_limit_reached {
-            notices.push("50.0KB limit reached".into());
-        }
-        if !notices.is_empty() {
-            output.push_str(&format!("\n\n[{}]", notices.join(". ")));
-        }
-        Ok(output)
+        Ok(crate::tool_output::listing(
+            results.join("\n"),
+            details,
+            notices,
+        ))
     }
 
-    fn search(&self, args: &Value) -> Result<String> {
+    fn search(&self, args: &Value) -> Result<Outcome> {
         let base = self.path(args["path"].as_str().unwrap_or("."))?;
         let is_find = matches!(self.kind, Kind::Find);
         let limit = args["limit"]
@@ -657,33 +654,19 @@ impl CodingTool {
             Some(grep) => grep.finish(),
             None => {
                 if results.is_empty() {
-                    return Ok("No files found matching pattern".into());
+                    return Ok(Outcome::Succeeded("No files found matching pattern".into()));
                 }
                 results.sort();
-                let reached = results.len() >= limit;
-                let mut output = results.join("\n");
-                let byte_limit = output.len() > MAX_OUTPUT_BYTES;
-                if byte_limit {
-                    let end = output.as_bytes()[..=MAX_OUTPUT_BYTES]
-                        .iter()
-                        .rposition(|byte| *byte == b'\n')
-                        .unwrap_or(0);
-                    output.truncate(end);
-                }
+                let mut details = Map::new();
                 let mut notices = Vec::new();
-                if reached {
+                if results.len() >= limit {
+                    details.insert("resultLimitReached".into(), json!(limit));
                     notices.push(format!(
                         "{limit} results limit reached. Use limit={} for more, or refine pattern",
                         limit.saturating_mul(2)
                     ));
                 }
-                if byte_limit {
-                    notices.push("50.0KB limit reached".into());
-                }
-                if !notices.is_empty() {
-                    output.push_str(&format!("\n\n[{}]", notices.join(". ")));
-                }
-                output
+                crate::tool_output::listing(results.join("\n"), details, notices)
             }
         })
     }
@@ -1258,7 +1241,7 @@ mod tests {
             kind: Kind::Read,
         };
         assert_eq!(
-            local.read(&json!({"path":skill})).unwrap(),
+            local.read(&json!({"path":skill})).unwrap().tool_content(),
             "personal skill"
         );
     }
@@ -1294,7 +1277,8 @@ mod tests {
         );
         assert_eq!(
             tool.read(&json!({"path":"src/a.txt","offset":2,"limit":1}))
-                .unwrap(),
+                .unwrap()
+                .tool_content(),
             "日本語\n\n[2 more lines in file. Use offset=3 to continue.]"
         );
         assert!(
@@ -1318,11 +1302,20 @@ mod tests {
             kind: Kind::Read,
             ..tool
         };
-        assert_eq!(reader.read(&json!({"path":url.as_str()})).unwrap(), "hello");
+        assert_eq!(
+            reader
+                .read(&json!({"path":url.as_str()}))
+                .unwrap()
+                .tool_content(),
+            "hello"
+        );
         assert!(reader.read(&json!({"path":"@../escape"})).is_err());
         std::fs::write(root.path().join("Capture d’ecran.txt"), "curly").unwrap();
         assert_eq!(
-            reader.read(&json!({"path":"Capture d'ecran.txt"})).unwrap(),
+            reader
+                .read(&json!({"path":"Capture d'ecran.txt"}))
+                .unwrap()
+                .tool_content(),
             "curly"
         );
         let editor = CodingTool {
@@ -1344,12 +1337,18 @@ mod tests {
             unrestricted: false,
             kind: Kind::List,
         };
-        assert_eq!(tool.list(&json!({})).unwrap(), "(empty directory)");
+        assert_eq!(
+            tool.list(&json!({})).unwrap().tool_content(),
+            "(empty directory)"
+        );
         std::fs::write(root.path().join("Zeta"), "").unwrap();
         std::fs::write(root.path().join("alpha"), "").unwrap();
         std::fs::create_dir(root.path().join("Beta")).unwrap();
-        assert_eq!(tool.list(&json!({})).unwrap(), "alpha\nBeta/\nZeta");
-        let output = tool.list(&json!({"limit":1})).unwrap();
+        assert_eq!(
+            tool.list(&json!({})).unwrap().tool_content(),
+            "alpha\nBeta/\nZeta"
+        );
+        let output = tool.list(&json!({"limit":1})).unwrap().tool_content();
         assert!(output.starts_with("alpha\n"));
         assert!(output.contains("1 entries limit reached"));
     }
@@ -1368,7 +1367,7 @@ mod tests {
         for name in &names {
             std::fs::write(root.path().join(name), "").unwrap();
         }
-        let output = tool.list(&json!({"limit":300})).unwrap();
+        let output = tool.list(&json!({"limit":300})).unwrap().tool_content();
         let (body, notice) = output.rsplit_once("\n\n").unwrap();
         assert!(body.len() <= MAX_OUTPUT_BYTES);
         assert_eq!(body.lines().collect::<Vec<_>>(), names[..254]);
@@ -1376,9 +1375,9 @@ mod tests {
             notice,
             "[300 entries limit reached. Use limit=600 for more. 50.0KB limit reached]"
         );
-        let output = tool.list(&json!({"limit":301})).unwrap();
+        let output = tool.list(&json!({"limit":301})).unwrap().tool_content();
         assert!(output.ends_with("\n\n[50.0KB limit reached]"));
-        let output = tool.list(&json!({"limit":1})).unwrap();
+        let output = tool.list(&json!({"limit":1})).unwrap().tool_content();
         assert_eq!(
             output,
             format!(
@@ -1396,7 +1395,10 @@ mod tests {
             kind: Kind::Find,
             ..tool
         };
-        let output = find.search(&json!({"pattern":"*", "limit":300})).unwrap();
+        let output = find
+            .search(&json!({"pattern":"*", "limit":300}))
+            .unwrap()
+            .tool_content();
         let (body, notice) = output.rsplit_once("\n\n").unwrap();
         assert_eq!(body.lines().collect::<Vec<_>>(), names[..254]);
         assert_eq!(
@@ -1424,7 +1426,7 @@ mod tests {
         for name in &names {
             std::fs::write(root.path().join(name), "").unwrap();
         }
-        let output = tool.list(&json!({})).unwrap();
+        let output = tool.list(&json!({})).unwrap().tool_content();
         let (body, notice) = output.rsplit_once("\n\n").unwrap();
         assert_eq!(body.len(), MAX_OUTPUT_BYTES);
         assert_eq!(body.lines().collect::<Vec<_>>(), names[..256]);
@@ -1444,12 +1446,15 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"**/*.rs"})).unwrap(),
+            tool.search(&json!({"pattern":"**/*.rs"}))
+                .unwrap()
+                .tool_content(),
             ".git/objects/sample.rs\nnode_modules/nested/sample.rs\nsrc/sample.rs"
         );
         assert_eq!(
             tool.search(&json!({"pattern":"**/*.rs", "path":"node_modules"}))
-                .unwrap(),
+                .unwrap()
+                .tool_content(),
             "nested/sample.rs"
         );
     }
@@ -1467,20 +1472,31 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"*.rs"})).unwrap(),
+            tool.search(&json!({"pattern":"*.rs"}))
+                .unwrap()
+                .tool_content(),
             "src/nested/Upper.RS\nsrc/sample.rs"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"*.RS"})).unwrap(),
+            tool.search(&json!({"pattern":"*.RS"}))
+                .unwrap()
+                .tool_content(),
             "src/nested/Upper.RS"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"src/**/*.rs"})).unwrap(),
+            tool.search(&json!({"pattern":"src/**/*.rs"}))
+                .unwrap()
+                .tool_content(),
             "src/nested/Upper.RS\nsrc/sample.rs"
         );
-        assert_eq!(tool.search(&json!({"pattern":"src"})).unwrap(), "src/");
         assert_eq!(
-            tool.search(&json!({"pattern":"*"})).unwrap(),
+            tool.search(&json!({"pattern":"src"}))
+                .unwrap()
+                .tool_content(),
+            "src/"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"*"})).unwrap().tool_content(),
             ".hidden\nsrc/\nsrc/nested/\nsrc/nested/Upper.RS\nsrc/sample.rs"
         );
         assert!(
@@ -1503,11 +1519,15 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"*.rs"})).unwrap(),
+            tool.search(&json!({"pattern":"*.rs"}))
+                .unwrap()
+                .tool_content(),
             "a.rs\nb.rs"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"*.rs","limit":1})).unwrap(),
+            tool.search(&json!({"pattern":"*.rs","limit":1}))
+                .unwrap()
+                .tool_content(),
             "a.rs\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]"
         );
     }
@@ -1526,7 +1546,7 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"*"})).unwrap(),
+            tool.search(&json!({"pattern":"*"})).unwrap().tool_content(),
             "alias\nbroken\nsrc/\nsrc/a.rs"
         );
     }
@@ -1541,7 +1561,9 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"**/*.rs"})).unwrap(),
+            tool.search(&json!({"pattern":"**/*.rs"}))
+                .unwrap()
+                .tool_content(),
             "main.rs"
         );
         let tool = CodingTool {
@@ -1551,7 +1573,8 @@ mod tests {
         };
         assert_eq!(
             tool.search(&json!({"pattern":"fn", "path":"main.rs"}))
-                .unwrap(),
+                .unwrap()
+                .tool_content(),
             "main.rs:1: fn main() {}"
         );
     }

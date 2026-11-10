@@ -39,3 +39,62 @@ pub(super) fn format_size(bytes: u64) -> String {
     let tenths = (u128::from(bytes) * 10 + scale / 2) / scale;
     format!("{}.{}{unit}", tenths / 10, tenths % 10)
 }
+
+pub(super) const UNLIMITED_LINES: u64 = 9_007_199_254_740_991;
+
+pub(super) fn finish(
+    mut output: String,
+    details: serde_json::Map<String, serde_json::Value>,
+    notices: &[String],
+) -> pi_rs::Outcome {
+    if !notices.is_empty() {
+        output.push_str("\n\n[");
+        output.push_str(&notices.join(". "));
+        output.push(']');
+    }
+    if details.is_empty() {
+        pi_rs::Outcome::Succeeded(output)
+    } else {
+        pi_rs::Outcome::SucceededWithDetails {
+            output,
+            details: serde_json::Value::Object(details),
+        }
+    }
+}
+
+pub(super) fn listing(
+    mut output: String,
+    mut details: serde_json::Map<String, serde_json::Value>,
+    mut notices: Vec<String>,
+) -> pi_rs::Outcome {
+    if output.len() > MAX_BYTES {
+        let total_lines = output.split_terminator('\n').count();
+        let total_bytes = output.len();
+        let end = output.as_bytes()[..=MAX_BYTES]
+            .iter()
+            .rposition(|byte| *byte == b'\n');
+        let first_line_exceeds_limit = end.is_none();
+        output.truncate(end.unwrap_or(0));
+        let output_lines = end.map_or(0, |_| {
+            output.bytes().filter(|byte| *byte == b'\n').count() + 1
+        });
+        details.insert(
+            "truncation".into(),
+            serde_json::json!(Truncation {
+                content: &output,
+                truncated: true,
+                truncated_by: Some(Limit::Bytes),
+                total_lines: total_lines as u64,
+                total_bytes: total_bytes as u64,
+                output_lines,
+                output_bytes: output.len(),
+                last_line_partial: false,
+                first_line_exceeds_limit,
+                max_lines: UNLIMITED_LINES,
+                max_bytes: MAX_BYTES,
+            }),
+        );
+        notices.push("50.0KB limit reached".into());
+    }
+    finish(output, details, &notices)
+}

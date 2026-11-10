@@ -3,17 +3,17 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use encoding_rs::{CoderResult, UTF_8};
-use pi_rs::{Error, Result};
+use pi_rs::{Error, Outcome, Result};
+use serde_json::json;
 
-const MAX_BYTES: usize = 50 * 1024;
-const MAX_LINES: usize = 2000;
+use super::tool_output::{Limit, MAX_BYTES, MAX_LINES, Truncation, format_size};
 
 pub(super) fn read(
     path: &Path,
     display_path: &str,
     offset: usize,
     limit: Option<usize>,
-) -> Result<String> {
+) -> Result<Outcome> {
     let file = std::fs::File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(Error::Config("expected a regular text file".into()));
@@ -21,96 +21,113 @@ pub(super) fn read(
     let mut reader = BufReader::new(file);
     let mut buffer = Vec::new();
     let mut decoded = [0; 8192];
-    let mut selected = Vec::new();
-    let mut bytes = 0;
-    let mut total_lines = 0;
-    let mut byte_limited = false;
-    let mut oversized_first = None;
+    let mut head = Vec::new();
+    let mut head_bytes = 0;
+    let mut first_line_bytes = 0;
+    let mut input_lines = 0;
+    let mut input_bytes = 0;
+    let mut input_ends_in_empty_line = false;
+    let mut file_lines = 0;
+    let mut byte_limit = false;
     let mut last_newline = false;
     loop {
         let (length, newline) = line(&mut reader, &mut buffer, &mut decoded)?;
-        if length == 0 && total_lines != 0 && !last_newline {
+        if length == 0 && file_lines != 0 && !last_newline {
             break;
         }
-        let final_empty = length == 0;
-        let index = total_lines;
-        total_lines += 1;
+        let index = file_lines;
+        file_lines += 1;
         last_newline = newline;
-        let trailing_newline_fits = final_empty
-            && index == offset + selected.len()
-            && selected.len() == MAX_LINES
-            && bytes < MAX_BYTES;
-        if index >= offset
-            && selected.len() < limit.unwrap_or(usize::MAX)
-            && (selected.len() < MAX_LINES || trailing_newline_fits)
-            && !byte_limited
-        {
-            let length = length - usize::from(newline);
-            let separator = usize::from(!selected.is_empty());
-            if length + separator + bytes > MAX_BYTES {
-                byte_limited = true;
-                if selected.is_empty() {
-                    oversized_first = Some(length);
+        let line_bytes = length - usize::from(newline);
+        if index >= offset && input_lines < limit.unwrap_or(usize::MAX) {
+            if input_lines == 0 {
+                first_line_bytes = line_bytes;
+            }
+            let separator = usize::from(input_lines != 0);
+            input_lines += 1;
+            input_bytes += line_bytes + separator;
+            input_ends_in_empty_line = line_bytes == 0;
+            let keep_trailing_empty = head.len() == MAX_LINES && line_bytes == 0;
+            if !byte_limit && (head.len() < MAX_LINES || keep_trailing_empty) {
+                if head_bytes + line_bytes + separator > MAX_BYTES {
+                    byte_limit = true;
+                } else {
+                    if newline {
+                        buffer.pop();
+                    }
+                    let text = std::str::from_utf8(&buffer).expect("decoded UTF-8 line");
+                    head_bytes += text.len() + separator;
+                    head.push(text.to_owned());
                 }
-            } else {
-                if newline {
-                    buffer.pop();
-                }
-                let text = std::str::from_utf8(&buffer).expect("decoded UTF-8 line");
-                bytes += text.len() + separator;
-                selected.push(text.to_owned());
             }
         }
-        if final_empty {
+        if length == 0 {
             break;
         }
     }
-    if offset >= total_lines {
+    if offset >= file_lines {
         return Err(Error::Config(format!(
-            "Offset {} is beyond end of file ({total_lines} lines total)",
+            "Offset {} is beyond end of file ({file_lines} lines total)",
             offset.saturating_add(1)
         )));
     }
-    if let Some(length) = oversized_first {
-        return Ok(format!(
-            "[Line {} is {}, exceeds 50.0KB limit. Use bash: sed -n '{}p' {display_path} | head -c {MAX_BYTES}]",
-            offset + 1,
-            format_size(length),
-            offset + 1
-        ));
-    }
-    let end = offset + selected.len();
-    let mut output = selected.join("\n");
-    if end < total_lines {
-        if byte_limited || limit.is_none_or(|limit| limit > MAX_LINES) {
-            output.push_str(&format!(
-                "\n\n[Showing lines {}-{end} of {total_lines}{}. Use offset={} to continue.]",
-                offset + 1,
-                if byte_limited { " (50.0KB limit)" } else { "" },
-                end + 1
-            ));
-        } else {
+
+    let total_lines = input_lines - usize::from(input_ends_in_empty_line);
+    let truncated = total_lines > MAX_LINES || input_bytes > MAX_BYTES;
+    if !truncated {
+        let mut output = head.join("\n");
+        let end = offset + input_lines;
+        if end < file_lines {
             output.push_str(&format!(
                 "\n\n[{} more lines in file. Use offset={} to continue.]",
-                total_lines - end,
+                file_lines - end,
                 end + 1
             ));
         }
+        return Ok(Outcome::Succeeded(output));
     }
-    Ok(output)
-}
 
-fn format_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        return format!("{bytes}B");
-    }
-    let (scale, unit) = if bytes < 1024 * 1024 {
-        (1024, "KB")
+    head.truncate(total_lines.min(MAX_LINES));
+    let content = head.join("\n");
+    let first_line_exceeds_limit = first_line_bytes > MAX_BYTES;
+    let truncated_by = if head.len() == MAX_LINES || head.len() == total_lines {
+        Limit::Lines
     } else {
-        (1024 * 1024, "MB")
+        Limit::Bytes
     };
-    let tenths = (bytes as u128 * 10 + scale / 2) / scale;
-    format!("{}.{}{unit}", tenths / 10, tenths % 10)
+    let details = json!({"truncation": Truncation {
+        content: &content,
+        truncated: true,
+        truncated_by: Some(truncated_by),
+        total_lines: total_lines as u64,
+        total_bytes: input_bytes as u64,
+        output_lines: head.len(),
+        output_bytes: content.len(),
+        last_line_partial: false,
+        first_line_exceeds_limit,
+        max_lines: MAX_LINES as u64,
+        max_bytes: MAX_BYTES,
+    }});
+    let start = offset + 1;
+    let output = if first_line_exceeds_limit {
+        let display_path = shell_words::quote(display_path);
+        format!(
+            "[Line {start} is {}, exceeds 50.0KB limit. Use bash: sed -n '{start}p' {display_path} | head -c {MAX_BYTES}]",
+            format_size(first_line_bytes as u64),
+        )
+    } else {
+        let end = offset + head.len();
+        let reason = if matches!(truncated_by, Limit::Bytes) {
+            " (50.0KB limit)"
+        } else {
+            ""
+        };
+        format!(
+            "{content}\n\n[Showing lines {start}-{end} of {file_lines}{reason}. Use offset={} to continue.]",
+            end + 1
+        )
+    };
+    Ok(Outcome::SucceededWithDetails { output, details })
 }
 
 // Decode complete lines while retaining only a bounded prefix for display.
@@ -148,6 +165,9 @@ fn line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn read(path: &Path, name: &str, offset: usize, limit: Option<usize>) -> Result<String> {
+        super::read(path, name, offset, limit).map(|outcome| outcome.tool_content())
+    }
     #[test]
     fn pages_preserve_empty_lines_and_report_continuation() {
         let file = tempfile::NamedTempFile::new().unwrap();

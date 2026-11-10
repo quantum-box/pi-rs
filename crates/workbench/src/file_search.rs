@@ -6,8 +6,10 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch,
 };
-use pi_rs::{Error, Result};
-use serde_json::Value;
+use pi_rs::{Error, Outcome, Result};
+use serde_json::{Map, Value, json};
+
+use super::tool_output::{self, Limit, MAX_BYTES, Truncation, UNLIMITED_LINES};
 
 pub(super) struct Grep {
     matcher: RegexMatcher,
@@ -61,48 +63,62 @@ impl Grep {
         )?;
         Ok(self.output.matches < self.output.limit)
     }
-    pub fn finish(self) -> String {
-        if self.output.matches == 0 && self.output.lines.is_empty() && !self.output.byte_limit {
-            return "No matches found".into();
+    pub fn finish(self) -> Outcome {
+        let output = self.output;
+        if output.matches == 0 {
+            return Outcome::Succeeded("No matches found".into());
         }
-        let mut text = self.output.lines.join("\n");
+        let text = output.lines.join("\n");
+        let mut details = Map::new();
         let mut notices = Vec::new();
-        if self.output.matches == self.output.limit {
+        if output.matches == output.limit {
+            details.insert("matchLimitReached".into(), json!(output.limit));
             notices.push(format!(
                 "{} matches limit reached. Use limit={} for more, or refine pattern",
-                self.output.limit,
-                self.output.limit.saturating_mul(2)
+                output.limit,
+                output.limit.saturating_mul(2)
             ));
         }
-        if self.output.byte_limit {
+        if output.total_bytes > MAX_BYTES {
+            details.insert(
+                "truncation".into(),
+                json!(Truncation {
+                    content: &text,
+                    truncated: true,
+                    truncated_by: Some(Limit::Bytes),
+                    total_lines: output.total_lines as u64,
+                    total_bytes: output.total_bytes as u64,
+                    output_lines: output.lines.len(),
+                    output_bytes: text.len(),
+                    last_line_partial: false,
+                    first_line_exceeds_limit: output.lines.is_empty(),
+                    max_lines: UNLIMITED_LINES,
+                    max_bytes: MAX_BYTES,
+                }),
+            );
             notices.push("50.0KB limit reached".into());
         }
-        if self.output.long_lines {
+        if output.long_lines {
+            details.insert("linesTruncated".into(), json!(true));
             notices
                 .push("Some lines truncated to 500 chars. Use read tool to see full lines".into());
         }
-        if !notices.is_empty() {
-            text.push_str(&format!("\n\n[{}]", notices.join(". ")));
-        }
-        text
+        tool_output::finish(text, details, &notices)
     }
 }
 
 #[derive(Default)]
 struct Output {
     lines: Vec<String>,
-    bytes: usize,
+    total_bytes: usize,
+    total_lines: usize,
     matches: usize,
     limit: usize,
-    byte_limit: bool,
     long_lines: bool,
 }
 impl Output {
     fn line(&mut self, display: &str, line: &ContextLine, matched: bool) {
         self.long_lines |= line.truncated;
-        if self.byte_limit {
-            return;
-        }
         let number = line.number;
         let text = &line.text;
         let line = if matched {
@@ -110,13 +126,11 @@ impl Output {
         } else {
             format!("{display}-{number}- {text}")
         };
-        let added = line.len() + usize::from(!self.lines.is_empty());
-        if self.bytes + added > 50 * 1024 {
-            self.byte_limit = true;
-            return;
+        self.total_bytes += line.len() + usize::from(self.total_lines > 0);
+        self.total_lines += 1;
+        if self.total_bytes <= MAX_BYTES {
+            self.lines.push(line);
         }
-        self.bytes += added;
-        self.lines.push(line);
     }
 }
 
@@ -244,13 +258,13 @@ mod tests {
         let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100).unwrap();
         assert!(grep.search(file.path(), "text").unwrap());
         assert_eq!(
-            grep.finish(),
+            grep.finish().tool_content(),
             "text-1- before\ntext:2: match one\ntext-3- match two\ntext-2- match one\ntext:3: match two\ntext-4- after"
         );
         let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 1).unwrap();
         assert!(!grep.search(file.path(), "text").unwrap());
         assert_eq!(
-            grep.finish(),
+            grep.finish().tool_content(),
             "text-1- before\ntext:2: match one\ntext-3- match two\n\n[1 matches limit reached. Use limit=2 for more, or refine pattern]"
         );
     }
@@ -266,7 +280,7 @@ mod tests {
         let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100).unwrap();
         assert!(grep.search(file.path(), "text").unwrap());
         assert_eq!(
-            grep.finish(),
+            grep.finish().tool_content(),
             "text:1: match first\ntext-2- after\ntext-5- before\ntext:6: match last"
         );
     }
@@ -278,7 +292,7 @@ mod tests {
         let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100).unwrap();
         assert!(grep.search(file.path(), "text").unwrap());
         assert_eq!(
-            grep.finish(),
+            grep.finish().tool_content(),
             "text-1- before\ntext:2: match last\ntext-3- "
         );
     }
@@ -307,7 +321,7 @@ mod tests {
         .unwrap();
         let mut grep = Grep::new(&json!({"pattern":"match"}), 111).unwrap();
         assert!(!grep.search(file.path(), "text").unwrap());
-        let output = grep.finish();
+        let output = grep.finish().tool_content();
         assert!(output.ends_with("[111 matches limit reached. Use limit=222 for more, or refine pattern. 50.0KB limit reached. Some lines truncated to 500 chars. Use read tool to see full lines]"));
         let body = output.split("\n\n").next().unwrap();
         assert_eq!(body.len(), 51098);
@@ -331,7 +345,7 @@ mod tests {
         )
         .unwrap();
         assert!(!grep.search(file.path(), "large.txt").unwrap());
-        let output = grep.finish();
+        let output = grep.finish().tool_content();
         assert!(output.contains("large.txt-400001- before"));
         assert!(output.contains("large.txt:400002: TARGET"));
         assert!(output.contains("large.txt-400003- after"));
@@ -343,13 +357,13 @@ mod tests {
         std::fs::write(file.path(), format!("a.b{}\naxb\n", "界".repeat(2000))).unwrap();
         let mut grep = Grep::new(&json!({"pattern":"a.b","literal":true}), 100).unwrap();
         assert!(grep.search(file.path(), "text").unwrap());
-        let output = grep.finish();
+        let output = grep.finish().tool_content();
         assert!(output.starts_with("text:1: a.b"));
         assert!(output.contains("Some lines truncated"));
         assert!(!output.contains("axb"));
         assert!(output.len() < 2000);
         let mut grep = Grep::new(&json!({"pattern":"nothing"}), 100).unwrap();
         grep.search(file.path(), "text").unwrap();
-        assert_eq!(grep.finish(), "No matches found");
+        assert_eq!(grep.finish().tool_content(), "No matches found");
     }
 }
