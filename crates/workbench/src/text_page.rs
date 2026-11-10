@@ -2,6 +2,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use encoding_rs::{CoderResult, UTF_8};
 use pi_rs::{Error, Result};
 
 const MAX_BYTES: usize = 50 * 1024;
@@ -19,6 +20,7 @@ pub(super) fn read(
     }
     let mut reader = BufReader::new(file);
     let mut buffer = Vec::new();
+    let mut decoded = [0; 8192];
     let mut selected = Vec::new();
     let mut bytes = 0;
     let mut total_lines = 0;
@@ -26,7 +28,7 @@ pub(super) fn read(
     let mut oversized_first = None;
     let mut last_newline = false;
     loop {
-        let (length, newline) = line(&mut reader, &mut buffer)?;
+        let (length, newline) = line(&mut reader, &mut buffer, &mut decoded)?;
         if length == 0 && total_lines != 0 && !last_newline {
             break;
         }
@@ -54,17 +56,9 @@ pub(super) fn read(
                 if newline {
                     buffer.pop();
                 }
-                let text = String::from_utf8_lossy(&buffer).into_owned();
-                // Invalid UTF-8 expands when decoded, so check the actual output too.
-                if text.len() + separator + bytes > MAX_BYTES {
-                    byte_limited = true;
-                    if selected.is_empty() {
-                        oversized_first = Some(text.len());
-                    }
-                } else {
-                    bytes += text.len() + separator;
-                    selected.push(text);
-                }
+                let text = std::str::from_utf8(&buffer).expect("decoded UTF-8 line");
+                bytes += text.len() + separator;
+                selected.push(text.to_owned());
             }
         }
         if final_empty {
@@ -108,31 +102,45 @@ pub(super) fn read(
 
 fn format_size(bytes: usize) -> String {
     if bytes < 1024 {
-        format!("{bytes}B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+        return format!("{bytes}B");
     }
+    let (scale, unit) = if bytes < 1024 * 1024 {
+        (1024, "KB")
+    } else {
+        (1024 * 1024, "MB")
+    };
+    let tenths = (bytes as u128 * 10 + scale / 2) / scale;
+    format!("{}.{}{unit}", tenths / 10, tenths % 10)
 }
 
-// Retain only a bounded prefix while counting the complete line.
-fn line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> std::io::Result<(usize, bool)> {
+// Decode complete lines while retaining only a bounded prefix for display.
+fn line(
+    reader: &mut impl BufRead,
+    output: &mut Vec<u8>,
+    decoded: &mut [u8],
+) -> std::io::Result<(usize, bool)> {
     output.clear();
+    let mut decoder = UTF_8.new_decoder_without_bom_handling();
     let mut length = 0;
     loop {
         let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            return Ok((length, false));
-        }
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let count = newline.map_or(buffer.len(), |position| position + 1);
-        let keep = (MAX_BYTES + 1).saturating_sub(output.len()).min(count);
-        output.extend_from_slice(&buffer[..keep]);
-        length += count;
+        let last = buffer.is_empty() || newline.is_some();
+        let mut input = &buffer[..count];
+        loop {
+            let (result, consumed, written, _) = decoder.decode_to_utf8(input, decoded, last);
+            let keep = (MAX_BYTES + 1).saturating_sub(output.len()).min(written);
+            output.extend_from_slice(&decoded[..keep]);
+            length += written;
+            if result == CoderResult::InputEmpty {
+                break;
+            }
+            input = &input[consumed..];
+        }
         reader.consume(count);
-        if newline.is_some() {
-            return Ok((length, true));
+        if last {
+            return Ok((length, newline.is_some()));
         }
     }
 }
@@ -206,6 +214,42 @@ mod tests {
             read(file.path(), "large.txt", 0, None).unwrap(),
             "[Line 1 is 2.0MB, exceeds 50.0KB limit. Use bash: sed -n '1p' large.txt | head -c 51200]"
         );
+    }
+
+    #[test]
+    fn malformed_utf8_sizes_count_all_decoded_replacement_bytes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = vec![0xff; 60_000];
+        bytes.extend_from_slice(b"\nnext");
+        std::fs::write(file.path(), bytes).unwrap();
+        assert_eq!(
+            read(file.path(), "fixture", 0, None).unwrap(),
+            "[Line 1 is 175.8KB, exceeds 50.0KB limit. Use bash: sed -n '1p' fixture | head -c 51200]"
+        );
+        assert_eq!(read(file.path(), "fixture", 1, None).unwrap(), "next");
+        assert_eq!(format_size(50 * 1024 + 256), "50.3KB");
+        assert_eq!(format_size(1024 * 1024 + 256 * 1024), "1.3MB");
+    }
+
+    #[test]
+    fn streaming_utf8_keeps_boms_and_decodes_across_buffer_boundaries() {
+        let mut source = b"\xef\xbb\xbf".to_vec();
+        source.extend_from_slice("界".as_bytes());
+        source.extend_from_slice(b"\xe2\x82\n\xf0\x9f");
+        let mut reader = BufReader::with_capacity(2, source.as_slice());
+        let mut output = Vec::new();
+        let mut decoded = [0; 8];
+        let expected = "\u{feff}界\u{fffd}\n";
+        assert_eq!(
+            line(&mut reader, &mut output, &mut decoded).unwrap(),
+            (expected.len(), true)
+        );
+        assert_eq!(output, expected.as_bytes());
+        assert_eq!(
+            line(&mut reader, &mut output, &mut decoded).unwrap(),
+            (3, false)
+        );
+        assert_eq!(output, "\u{fffd}".as_bytes());
     }
 
     #[test]

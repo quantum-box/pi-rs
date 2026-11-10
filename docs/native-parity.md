@@ -1694,3 +1694,18 @@ covering terminal newlines, explicit limits, oversized lines and combined
 line/byte limits. Regression tests cover the same boundaries.
 
 Full workspace tests and all-target Clippy pass.
+
+### Streaming UTF-8 read checkpoint
+
+The text reader now counts decoded UTF-8 bytes throughout a line, including
+replacement bytes beyond the retained prefix. The decoder preserves BOMs and
+handles code points and malformed subsequences spanning read-buffer boundaries.
+Displayed text remains bounded, and an oversized line's full decoded size is
+reported. Size rounding follows Pi's one-decimal KB/MB values at half ties.
+
+CLI tool calls compare exactly with the pinned reference for malformed input,
+BOMs, split and incomplete sequences, offset continuation and rounding, as well
+as the earlier newline and truncation boundaries. Focused tests exercise a
+small streaming buffer and verify the complete decoded byte count.
+
+Full workspace tests and all-target Clippy pass.
