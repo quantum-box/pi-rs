@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage | Model-provider OAuth and credential refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence and refresh; add/remove/list commands; tool catalog notifications | Interactive scope upgrades |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh and interactive scope upgrades; add/remove/list commands; tool catalog notifications | Interactive authorization during initial discovery |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
@@ -133,6 +133,19 @@ Unchanged notified catalogs are reused for up to 30 seconds. Legacy HTTP
 servers and connections without an acknowledged subscription keep polling at
 model request boundaries. Loopback checks covered notifications on both
 transports and changes discovered through legacy HTTP polling.
+
+OAuth HTTP calls that receive a typed 403 scope challenge can request consent
+in the terminal or RPC UI. After consent, the browser requests the union of
+the existing and required scopes with the saved client and callback. The
+connection rebinds to the new credential generation and retries once with
+the original operation ID. Declining keeps the existing credentials, and a
+grant with insufficient scopes leaves the previous credential file in place.
+Headless runs report the required scopes for an explicit login. Initial
+discovery uses the scopes granted through `pi mcp login`.
+
+Loopback RPC and PTY checks covered consent, decline, scope union, one retry,
+and credential generation changes. The existing OAuth and live catalog checks
+passed with the same implementation.
 
 ### Image and file-tool checkpoint
 
@@ -2031,7 +2044,7 @@ streams text, thought summaries, and tool calls. It encodes image inputs and
 tool results, records measured usage including thought tokens, and preserves
 ordered signed response parts for the same model across tools and journal
 reopening. Gemini 2.5 and newer model families use their budget or level
-controls. A truncated response keeps its text and does not dispatch its calls.
+controls. A truncated response keeps its text and skips tool dispatch.
 
 Loopback checks covered these paths and a PTY showed thinking, generation,
 and the final answer. [Generate Content API](https://ai.google.dev/api/generate-content?hl=en)

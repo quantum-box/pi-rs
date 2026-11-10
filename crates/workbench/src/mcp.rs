@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -11,15 +11,18 @@ use pi_rs::{Error, Extension, Outcome, Result, Tool, ToolContext, ToolSpec};
 use rmcp::{
     RoleClient,
     model::{CallToolResponse, ProtocolVersion, SubscriptionFilter},
-    service::{ClientLifecycleMode, ClientServiceExt, NotificationContext, RunningService},
+    service::{
+        ClientLifecycleMode, ClientServiceExt, NotificationContext, RunningService, ServiceError,
+    },
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
-        streamable_http_client::StreamableHttpClientTransportConfig,
+        streamable_http_client::{InsufficientScopeError, StreamableHttpClientTransportConfig},
     },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -274,8 +277,14 @@ enum CallResult {
     Data(Value),
     Task(String),
 }
+#[derive(Clone, PartialEq, Eq)]
+struct ConnectionIdentity {
+    digest: String,
+    oauth_generation: Option<Uuid>,
+}
+
 struct Connection {
-    identity: String,
+    identity: RwLock<ConnectionIdentity>,
     service: tokio::sync::Mutex<RunningService<RoleClient, NativeClient>>,
     timeout: Duration,
     name: String,
@@ -284,6 +293,13 @@ struct Connection {
     closed: AtomicBool,
 }
 impl Connection {
+    fn identity(&self) -> ConnectionIdentity {
+        self.identity
+            .read()
+            .expect("MCP connection identity")
+            .clone()
+    }
+
     async fn active_service(
         &self,
     ) -> Result<tokio::sync::MutexGuard<'_, RunningService<RoleClient, NativeClient>>> {
@@ -297,7 +313,7 @@ impl Connection {
         if service.is_closed() || service.peer().is_transport_closed() {
             let replacement =
                 McpExtension::connect(&self.name, &self.config, &self.workspace).await?;
-            if replacement.connection.identity != self.identity
+            if replacement.connection.identity() != self.identity()
                 || self.closed.load(Ordering::SeqCst)
             {
                 replacement.close().await;
@@ -311,6 +327,31 @@ impl Connection {
             drop(incoming);
         }
         Ok(service)
+    }
+
+    async fn rebind_after_upgrade(&self, previous: Uuid, generation: Uuid) -> Result<()> {
+        let mut service = self.service.lock().await;
+        if self.closed.load(Ordering::SeqCst) || self.identity().oauth_generation != Some(previous)
+        {
+            return Err(Error::Config(
+                "MCP connection changed during reauthorization".into(),
+            ));
+        }
+        let replacement = McpExtension::connect(&self.name, &self.config, &self.workspace).await?;
+        let identity = replacement.connection.identity();
+        if self.closed.load(Ordering::SeqCst) || identity.oauth_generation != Some(generation) {
+            replacement.close().await;
+            return Err(Error::Config(
+                "MCP credentials changed during reauthorization".into(),
+            ));
+        }
+        let mut incoming = replacement.connection.service.lock().await;
+        std::mem::swap(&mut *service, &mut *incoming);
+        *self.identity.write().expect("MCP connection identity") = identity;
+        drop(incoming);
+        drop(service);
+        replacement.close().await;
+        Ok(())
     }
 }
 impl Drop for Connection {
@@ -409,6 +450,7 @@ impl McpExtension {
             }
         };
         let mut identity = connection_identity(name, config, workspace)?;
+        let mut oauth_generation = None;
         let service = if let Some(command) = &config.command {
             if config.url.is_some()
                 || config
@@ -503,6 +545,10 @@ impl McpExtension {
                     }
                     let (client, generation) = crate::mcp_auth::client(name, url, client).await?;
                     identity.update(generation.as_bytes());
+                    oauth_generation =
+                        Some(Uuid::parse_str(&generation).map_err(|_| {
+                            Error::Config("invalid MCP credential generation".into())
+                        })?);
                     NativeClient::default()
                         .serve_with_lifecycle(
                             StreamableHttpClientTransport::with_client(client, transport_config),
@@ -533,7 +579,10 @@ impl McpExtension {
         };
         listen_for_tool_changes(&service, config.command.is_some()).await;
         let connection = Arc::new(Connection {
-            identity: format!("{:x}", identity.finalize()),
+            identity: RwLock::new(ConnectionIdentity {
+                digest: format!("{:x}", identity.finalize()),
+                oauth_generation,
+            }),
             service: tokio::sync::Mutex::new(service),
             timeout,
             name: name.into(),
@@ -813,6 +862,57 @@ struct McpTool {
     spec: ToolSpec,
     resource: bool,
 }
+enum CallError {
+    Other(String),
+    Scope(Option<String>),
+}
+
+impl From<Error> for CallError {
+    fn from(error: Error) -> Self {
+        Self::Other(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for CallError {
+    fn from(error: serde_json::Error) -> Self {
+        Error::from(error).into()
+    }
+}
+
+fn call_error(error: ServiceError) -> CallError {
+    if let ServiceError::TransportSend(transport) = &error {
+        let mut cause = Some(transport.error.as_ref() as &dyn std::error::Error);
+        while let Some(error) = cause {
+            if let Some(scope) = error.downcast_ref::<InsufficientScopeError>() {
+                return CallError::Scope(scope.get_required_scope().map(str::to_owned));
+            }
+            cause = error.source();
+        }
+    }
+    Error::Config(error.to_string()).into()
+}
+
+fn scope_tokens(required: &str) -> Option<Vec<String>> {
+    if required.len() > 2048 {
+        return None;
+    }
+    let scopes: Vec<_> = required
+        .split(' ')
+        .filter(|scope| !scope.is_empty())
+        .collect();
+    if scopes.is_empty()
+        || scopes.len() > 32
+        || scopes.iter().any(|scope| {
+            !scope
+                .bytes()
+                .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+        })
+    {
+        return None;
+    }
+    Some(scopes.into_iter().map(str::to_owned).collect())
+}
+
 impl McpTool {
     async fn invoke_call(
         &self,
@@ -820,99 +920,162 @@ impl McpTool {
         context: ToolContext,
         host: Option<Arc<dyn pi_rs::ToolHost>>,
     ) -> Outcome {
-        let call = async {
-            if self.resource {
-                self.invoke_resource(arguments).await.map(CallResult::Data)
-            } else {
-                let params = serde_json::from_value(
-                    json!({"name":self.remote_name,"arguments":arguments,"_meta":{"operationId":context.operation_id.to_string()}}),
-                )?;
-                let service = self.connection.active_service().await?;
-                let interaction = service.service().interaction.clone();
-                *interaction
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = host.map(|host| Interaction {
-                    host,
-                    cancellation: context.cancellation.clone(),
-                });
-                let _interaction = InteractionGuard(interaction);
-                let result = service
-                    .call_tool_once(params)
-                    .await
-                    .map_err(|error| Error::Config(error.to_string()))?;
-                match result {
-                    CallToolResponse::Complete(result) => {
-                        Ok(CallResult::Data(serde_json::to_value(result)?))
-                    }
-                    CallToolResponse::Task(task) => {
-                        Ok(CallResult::Task(serde_json::to_string(&TaskReference {
-                            connection: self.connection.identity.clone(),
-                            task_id: task.task.task_id,
-                        })?))
-                    }
-                    _ => Err(Error::Config(
-                        "MCP tool requires additional client input".into(),
-                    )),
+        let attempt = || async {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => {
+                    Err(CallError::Other("MCP request cancelled after dispatch".into()))
                 }
+                result = tokio::time::timeout(
+                    self.connection.timeout, self.call_once(&arguments, &context, host.as_ref()),
+                ) => result.unwrap_or_else(|_| {
+                    Err(CallError::Other("MCP request timed out after dispatch".into()))
+                }),
             }
         };
-        tokio::select! {
-            _ = context.cancellation.cancelled() => Outcome::Unknown("MCP request cancelled after dispatch".into()),
-            result = tokio::time::timeout(self.connection.timeout, call) => match result {
-                Ok(Ok(CallResult::Data(data))) if data["isError"] == true => Outcome::Failed(data.to_string()),
-                Ok(Ok(CallResult::Data(data))) => Outcome::Structured { data, attachments: vec![] },
-                Ok(Ok(CallResult::Task(reference))) => Outcome::Pending { reference },
-                Ok(Err(error)) => Outcome::Unknown(error.to_string()),
-                Err(_) => Outcome::Unknown("MCP request timed out after dispatch".into()),
+        let mut result = attempt().await;
+        if let Err(CallError::Scope(required)) = &result {
+            let Some(scopes) = required.as_deref().and_then(scope_tokens) else {
+                return Outcome::Failed("MCP server requires additional OAuth scopes but did not supply a valid scope list".into());
+            };
+            let authorized = tokio::select! {
+                _ = context.cancellation.cancelled() => Err(Error::Cancelled),
+                result = self.authorize_scopes(&scopes, host.as_deref()) => result,
+            };
+            if let Err(error) = authorized {
+                return Outcome::Failed(error.to_string());
             }
+            // The typed HTTP 403 rejected the request before tool dispatch.
+            // Retry once with the same operation identifier and new authorization.
+            result = attempt().await;
+        }
+        match result {
+            Ok(CallResult::Data(data)) if data["isError"] == true => {
+                Outcome::Failed(data.to_string())
+            }
+            Ok(CallResult::Data(data)) => Outcome::Structured {
+                data,
+                attachments: vec![],
+            },
+            Ok(CallResult::Task(reference)) => Outcome::Pending { reference },
+            Err(CallError::Scope(_)) => Outcome::Failed(
+                "MCP server still requires additional OAuth scopes after reauthorization".into(),
+            ),
+            Err(CallError::Other(error)) => Outcome::Unknown(error),
         }
     }
-    async fn invoke_resource(&self, arguments: Value) -> Result<Value> {
+
+    async fn authorize_scopes(
+        &self,
+        scopes: &[String],
+        host: Option<&dyn pi_rs::ToolHost>,
+    ) -> Result<()> {
+        let connection = &self.connection;
+        let Some(previous) = connection.identity().oauth_generation else {
+            return Err(Error::Config(
+                "MCP server requires additional scopes for its configured credentials".into(),
+            ));
+        };
+        let url = connection
+            .config
+            .url
+            .as_deref()
+            .expect("OAuth requires HTTP");
+        let scope_text = scopes.join(" ");
+        let host = host.filter(|host| host.has_ui()).ok_or_else(|| {
+            Error::Config(format!(
+                "MCP {} requires OAuth scopes {scope_text}; sign in with these scopes",
+                connection.name
+            ))
+        })?;
+        let confirmation = host.ui(pi_rs::UiRequest::Confirm {
+            title: format!("MCP permissions for {}", connection.name),
+            message: format!("Allow additional OAuth scopes: {scope_text}? The browser will open to authorize them."),
+            timeout: Some(120_000),
+        }).await.map_err(|_| Error::Config("MCP scope confirmation failed".into()))?;
+        if confirmation != pi_rs::UiResponse::Confirmed(true) {
+            return Err(Error::Config("MCP scope upgrade declined".into()));
+        }
+        let generation =
+            crate::mcp_auth::upgrade(&connection.name, url, previous, scopes, |_| {}).await?;
+        connection.rebind_after_upgrade(previous, generation).await
+    }
+
+    async fn call_once(
+        &self,
+        arguments: &Value,
+        context: &ToolContext,
+        host: Option<&Arc<dyn pi_rs::ToolHost>>,
+    ) -> std::result::Result<CallResult, CallError> {
+        if self.resource {
+            return self.invoke_resource(arguments).await.map(CallResult::Data);
+        }
+        let params = serde_json::from_value(
+            json!({"name":self.remote_name,"arguments":arguments,"_meta":{"operationId":context.operation_id.to_string()}}),
+        )?;
+        let service = self.connection.active_service().await?;
+        let interaction = service.service().interaction.clone();
+        *interaction
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = host.map(|host| Interaction {
+            host: host.clone(),
+            cancellation: context.cancellation.clone(),
+        });
+        let _interaction = InteractionGuard(interaction);
+        let result = service.call_tool_once(params).await.map_err(call_error)?;
+        match result {
+            CallToolResponse::Complete(result) => {
+                Ok(CallResult::Data(serde_json::to_value(result)?))
+            }
+            CallToolResponse::Task(task) => {
+                Ok(CallResult::Task(serde_json::to_string(&TaskReference {
+                    connection: self.connection.identity().digest,
+                    task_id: task.task.task_id,
+                })?))
+            }
+            _ => Err(Error::Config("MCP tool requires additional client input".into()).into()),
+        }
+    }
+    async fn invoke_resource(&self, arguments: &Value) -> std::result::Result<Value, CallError> {
         let service = self.connection.active_service().await?;
         match self.remote_name.as_str() {
             "list_resources" => {
-                let resources = service
-                    .list_all_resources()
-                    .await
-                    .map_err(|error| Error::Config(error.to_string()))?;
+                let resources = service.list_all_resources().await.map_err(call_error)?;
                 Ok(json!({"resources":resources}))
             }
             "list_resource_templates" => {
                 let templates = service
                     .list_all_resource_templates()
                     .await
-                    .map_err(|error| Error::Config(error.to_string()))?;
+                    .map_err(call_error)?;
                 Ok(json!({"resourceTemplates":templates}))
             }
             "list_prompts" => {
-                let prompts = service
-                    .list_all_prompts()
-                    .await
-                    .map_err(|error| Error::Config(error.to_string()))?;
+                let prompts = service.list_all_prompts().await.map_err(call_error)?;
                 Ok(json!({"prompts":prompts}))
             }
             "get_prompt" => {
                 let prompt = service
-                    .get_prompt(serde_json::from_value(arguments)?)
+                    .get_prompt(serde_json::from_value(arguments.clone())?)
                     .await
-                    .map_err(|error| Error::Config(error.to_string()))?;
+                    .map_err(call_error)?;
                 Ok(serde_json::to_value(prompt)?)
             }
             "read_resource" => {
                 let result = service
                     .read_resource_once(serde_json::from_value(json!({"uri":arguments["uri"]}))?)
                     .await
-                    .map_err(|error| Error::Config(error.to_string()))?;
+                    .map_err(call_error)?;
                 match result {
                     rmcp::model::ReadResourceResponse::Complete(result) => {
                         Ok(serde_json::to_value(result)?)
                     }
-                    _ => Err(Error::Config(
-                        "MCP resource requires additional client input".into(),
-                    )),
+                    _ => Err(
+                        Error::Config("MCP resource requires additional client input".into())
+                            .into(),
+                    ),
                 }
             }
-            _ => Err(Error::Config("unknown MCP resource operation".into())),
+            _ => Err(Error::Config("unknown MCP resource operation".into()).into()),
         }
     }
 }
@@ -980,13 +1143,15 @@ impl Tool for McpTool {
     }
     async fn poll(&self, reference: &str, context: ToolContext) -> Option<Outcome> {
         let task: TaskReference = serde_json::from_str(reference).ok()?;
-        if task.connection != self.connection.identity {
-            return None;
-        }
         loop {
             let params = serde_json::from_value(json!({"taskId":task.task_id})).ok()?;
             let response = match self.connection.active_service().await {
-                Ok(service) => service.get_task(params).await,
+                Ok(service) => {
+                    if task.connection != self.connection.identity().digest {
+                        return None;
+                    }
+                    service.get_task(params).await
+                }
                 Err(_) => {
                     return Some(Outcome::Pending {
                         reference: reference.into(),

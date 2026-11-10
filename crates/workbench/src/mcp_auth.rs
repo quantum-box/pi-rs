@@ -17,6 +17,7 @@ struct FileCredentials {
     path: PathBuf,
     generation: Option<Uuid>,
     new_login: bool,
+    upgrade: Option<Arc<UpgradeGuard>>,
     registration: Arc<Mutex<Option<ClientRegistration>>>,
     // Blocking writes retain this lock even if their async caller is cancelled.
     lease: Arc<Mutex<Weak<std::fs::File>>>,
@@ -25,6 +26,8 @@ struct FileCredentials {
 struct ClientRegistration {
     client_secret: Option<String>,
     redirect_uri: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requested_scopes: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Envelope {
@@ -32,6 +35,25 @@ struct Envelope {
     credentials: StoredCredentials,
     #[serde(default)]
     registration: Option<ClientRegistration>,
+}
+
+struct UpgradeGuard {
+    generation: Uuid,
+    scopes: Vec<String>,
+}
+
+struct Upgrade {
+    previous: Envelope,
+    scopes: Vec<String>,
+}
+
+enum Registration<'a> {
+    New {
+        client_id: Option<&'a str>,
+        client_secret: Option<&'a str>,
+        metadata_url: Option<&'a str>,
+    },
+    Upgrade(Box<Upgrade>),
 }
 impl FileCredentials {
     fn new(name: &str, url: &str) -> Result<Self> {
@@ -44,6 +66,7 @@ impl FileCredentials {
                 .join(format!("{digest:x}.json")),
             generation: None,
             new_login: false,
+            upgrade: None,
             registration: Arc::default(),
             lease: Arc::default(),
         })
@@ -71,8 +94,17 @@ impl FileCredentials {
         }
         Ok(Some(envelope))
     }
-    fn write(&self, credentials: StoredCredentials) -> std::result::Result<(), AuthError> {
-        let current = if self.new_login { None } else { self.read()? };
+    fn write(&self, mut credentials: StoredCredentials) -> std::result::Result<(), AuthError> {
+        let current = if self.new_login && self.upgrade.is_none() {
+            None
+        } else {
+            self.read()?
+        };
+        if self.upgrade.as_ref().is_some_and(|upgrade| {
+            current.as_ref().map(|envelope| envelope.generation) != Some(upgrade.generation)
+        }) {
+            return Err(AuthError::AuthorizationRequired);
+        }
         if !self.new_login && self.generation.is_some() && current.is_none() {
             return Err(AuthError::AuthorizationRequired);
         }
@@ -86,6 +118,21 @@ impl FileCredentials {
                     .as_ref()
                     .and_then(|envelope| envelope.registration.clone())
             });
+        if self.new_login
+            && credentials.granted_scopes.is_empty()
+            && let Some(registration) = &registration
+        {
+            // OAuth omits scope when it grants exactly the requested set.
+            credentials.granted_scopes = registration.requested_scopes.clone();
+        }
+        if self.upgrade.as_ref().is_some_and(|upgrade| {
+            upgrade
+                .scopes
+                .iter()
+                .any(|scope| !credentials.granted_scopes.contains(scope))
+        }) {
+            return Err(AuthError::AuthorizationRequired);
+        }
         let generation = if self.new_login {
             self.generation.unwrap_or_else(Uuid::new_v4)
         } else {
@@ -275,7 +322,19 @@ pub async fn login_with_secret(
     scopes: &[String],
     announce: impl Fn(&str),
 ) -> Result<()> {
-    authorize(name, url, client_id, client_secret, None, scopes, announce).await
+    authorize(
+        name,
+        url,
+        Registration::New {
+            client_id,
+            client_secret,
+            metadata_url: None,
+        },
+        scopes,
+        announce,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Use a hosted client metadata document, falling back to dynamic registration.
@@ -289,10 +348,53 @@ pub async fn login_with_metadata(
     authorize(
         name,
         url,
-        None,
-        None,
-        Some(client_metadata_url),
+        Registration::New {
+            client_id: None,
+            client_secret: None,
+            metadata_url: Some(client_metadata_url),
+        },
         scopes,
+        announce,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub(crate) async fn upgrade(
+    name: &str,
+    url: &str,
+    previous: Uuid,
+    requested: &[String],
+    announce: impl Fn(&str),
+) -> Result<Uuid> {
+    let store = FileCredentials::new(name, url)?;
+    let guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
+    let envelope = store
+        .read()
+        .map_err(auth_error)?
+        .filter(|envelope| envelope.generation == previous)
+        .ok_or_else(|| auth_error(AuthError::AuthorizationRequired))?;
+    drop(guard);
+    let mut scopes = envelope.credentials.granted_scopes.clone();
+    for scope in requested {
+        if !scopes.contains(scope) {
+            scopes.push(scope.clone());
+        }
+    }
+    if scopes.len() == envelope.credentials.granted_scopes.len() {
+        return Err(Error::Config(
+            "MCP server rejected credentials that already have the requested scopes".into(),
+        ));
+    }
+    let upgrade = Upgrade {
+        previous: envelope,
+        scopes: scopes.clone(),
+    };
+    authorize(
+        name,
+        url,
+        Registration::Upgrade(Box::new(upgrade)),
+        &scopes,
         announce,
     )
     .await
@@ -301,12 +403,10 @@ pub async fn login_with_metadata(
 async fn authorize(
     name: &str,
     url: &str,
-    client_id: Option<&str>,
-    client_secret: Option<&str>,
-    client_metadata_url: Option<&str>,
+    registration: Registration<'_>,
     scopes: &[String],
     announce: impl Fn(&str),
-) -> Result<()> {
+) -> Result<Uuid> {
     use rmcp::transport::auth::{AuthorizationRequest, AuthorizationSession};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -322,6 +422,24 @@ async fn authorize(
             "MCP OAuth requires HTTPS or loopback HTTP without embedded credentials".into(),
         ));
     }
+    let (client_id, client_secret, client_metadata_url, upgrade) = match &registration {
+        Registration::New {
+            client_id,
+            client_secret,
+            metadata_url,
+        } => (*client_id, *client_secret, *metadata_url, None),
+        Registration::Upgrade(upgrade) => {
+            let client = upgrade.previous.registration.as_ref().ok_or_else(|| {
+                Error::Config("MCP registration is missing; sign in again before upgrading".into())
+            })?;
+            (
+                Some(upgrade.previous.credentials.client_id.as_str()),
+                client.client_secret.as_deref(),
+                None,
+                Some(upgrade),
+            )
+        }
+    };
     if client_secret.is_some() && client_id.is_none() {
         return Err(Error::Config(
             "--client-secret-env requires --client-id".into(),
@@ -329,10 +447,25 @@ async fn authorize(
     }
     let mut store = FileCredentials::new(name, url)?;
     store.new_login = true;
-    store.generation = Some(Uuid::new_v4());
+    let generation = Uuid::new_v4();
+    store.generation = Some(generation);
+    if let Some(upgrade) = upgrade {
+        store.upgrade = Some(Arc::new(UpgradeGuard {
+            generation: upgrade.previous.generation,
+            scopes: upgrade.scopes.clone(),
+        }));
+    }
     let mut manager = AuthorizationManager::new(url).await.map_err(auth_error)?;
     manager.set_credential_store(store.clone());
     let metadata = manager.resolve_metadata().await.map_err(auth_error)?;
+    if let Some(upgrade) = upgrade
+        && (metadata.metadata.issuer.is_none()
+            || metadata.metadata.issuer != upgrade.previous.credentials.issuer)
+    {
+        return Err(Error::Config(
+            "MCP authorization issuer changed; sign in again before upgrading".into(),
+        ));
+    }
     let supports_client_metadata = metadata
         .metadata
         .additional_fields
@@ -340,7 +473,27 @@ async fn authorize(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     manager.set_metadata(metadata.metadata);
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = if let Some(upgrade) = upgrade {
+        let redirect = &upgrade
+            .previous
+            .registration
+            .as_ref()
+            .expect("registered client")
+            .redirect_uri;
+        let redirect = reqwest_mcp::Url::parse(redirect)
+            .map_err(|_| Error::Config("invalid saved MCP callback URL".into()))?;
+        redirect
+            .port()
+            .filter(|_| {
+                redirect.scheme() == "http"
+                    && redirect.host_str() == Some("127.0.0.1")
+                    && redirect.path() == "/callback"
+            })
+            .ok_or_else(|| Error::Config("invalid saved MCP callback URL".into()))?
+    } else {
+        0
+    };
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let callback = format!(
         "http://127.0.0.1:{}/callback",
         listener.local_addr()?.port()
@@ -368,6 +521,7 @@ async fn authorize(
         .unwrap_or_else(|error| error.into_inner()) = Some(ClientRegistration {
         client_secret: secret.clone(),
         redirect_uri: callback.clone(),
+        requested_scopes: scopes.clone(),
     });
     let mut request = AuthorizationRequest::new(&callback)
         .with_client_name("pi-rs")
@@ -386,6 +540,17 @@ async fn authorize(
         .map_err(|(_, error)| auth_error(error))?;
     let authorization = reqwest_mcp::Url::parse(session.get_authorization_url())
         .map_err(|_| Error::Config("invalid MCP authorization URL".into()))?;
+    if let Some((_, requested)) = authorization
+        .query_pairs()
+        .find(|(name, _)| name == "scope")
+        && let Some(registration) = store
+            .registration
+            .lock()
+            .expect("MCP client registration")
+            .as_mut()
+    {
+        registration.requested_scopes = requested.split_whitespace().map(str::to_owned).collect();
+    }
     let expected_state = authorization
         .query_pairs()
         .find(|(name, _)| name == "state")
@@ -426,7 +591,7 @@ async fn authorize(
             });
             let redirect = target
                 .and_then(|target| reqwest_mcp::Url::parse(&callback).ok()?.join(target).ok());
-            let valid = redirect.as_ref().is_some_and(|redirect| {
+            let valid = redirect.filter(|redirect| {
                 let states: Vec<_> = redirect
                     .query_pairs()
                     .filter(|(name, _)| name == "state")
@@ -435,16 +600,22 @@ async fn authorize(
                     .query_pairs()
                     .filter(|(name, _)| name == "code")
                     .count();
-                states.len() == 1 && states[0].1 == expected_state && codes == 1
+                let errors = redirect
+                    .query_pairs()
+                    .filter(|(name, _)| name == "error")
+                    .count();
+                states.len() == 1 && states[0].1 == expected_state && codes + errors == 1
             });
-            if !valid {
+            let Some(redirect) = valid else {
                 let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 17\r\nConnection: close\r\n\r\nInvalid callback.").await;
                 continue;
+            };
+            if redirect.query_pairs().any(|(name, _)| name == "error") {
+                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 21\r\nConnection: close\r\n\r\nAuthorization failed.").await;
+                return Err(Error::Config("MCP OAuth authorization was declined".into()));
             }
             let _guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
-            let result = session
-                .handle_callback_url(redirect.as_ref().expect("validated redirect").as_str())
-                .await;
+            let result = session.handle_callback_url(redirect.as_str()).await;
             let response = if result.is_ok() {
                 b"HTTP/1.1 200 OK\r\nContent-Length: 34\r\nConnection: close\r\n\r\nSigned in. You may close this tab.".as_slice()
             } else {
@@ -457,12 +628,53 @@ async fn authorize(
     tokio::select! {
         result = tokio::time::timeout(Duration::from_secs(600), receive) => result.map_err(|_| Error::Config("MCP login timed out".into()))?,
         _ = tokio::signal::ctrl_c() => Err(Error::Cancelled),
-    }
+    }?;
+    Ok(generation)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scope_upgrade_preserves_prior_credentials_without_all_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = Uuid::new_v4();
+        let login = FileCredentials {
+            path: directory.path().join("credentials.json"),
+            generation: Some(first),
+            new_login: true,
+            upgrade: None,
+            registration: Arc::default(),
+            lease: Arc::default(),
+        };
+        let credential = |scopes: &[&str]| {
+            StoredCredentials::new(
+                "client".into(),
+                None,
+                scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                None,
+            )
+        };
+        login.save(credential(&["read"])).await.unwrap();
+        let upgraded_generation = Uuid::new_v4();
+        let upgrade = FileCredentials {
+            generation: Some(upgraded_generation),
+            upgrade: Some(Arc::new(UpgradeGuard {
+                generation: first,
+                scopes: vec!["read".into(), "extra".into()],
+            })),
+            ..login.clone()
+        };
+        assert!(upgrade.save(credential(&["extra"])).await.is_err());
+        assert_eq!(login.read().unwrap().unwrap().generation, first);
+        upgrade.save(credential(&["read", "extra"])).await.unwrap();
+        assert_eq!(
+            login.read().unwrap().unwrap().generation,
+            upgraded_generation
+        );
+        assert!(upgrade.save(credential(&["read", "extra"])).await.is_err());
+    }
 
     #[tokio::test]
     async fn generations_survive_refresh_and_reject_replaced_credentials() {
@@ -472,12 +684,14 @@ mod tests {
             path: directory.path().join("credentials.json"),
             generation: Some(first),
             new_login: true,
+            upgrade: None,
             registration: Arc::default(),
             lease: Arc::default(),
         };
         *login.registration.lock().unwrap() = Some(ClientRegistration {
             client_secret: Some("fixture-client-secret".into()),
             redirect_uri: "http://127.0.0.1:12345/callback".into(),
+            requested_scopes: Vec::new(),
         });
         login
             .save(StoredCredentials::new("first".into(), None, vec![], None))
@@ -486,6 +700,7 @@ mod tests {
         let client = FileCredentials {
             generation: Some(first),
             new_login: false,
+            upgrade: None,
             registration: Arc::default(),
             ..login.clone()
         };
@@ -567,6 +782,7 @@ mod tests {
             path,
             generation: Some(Uuid::new_v4()),
             new_login: true,
+            upgrade: None,
             registration: Arc::default(),
             lease: Arc::default(),
         };
@@ -600,6 +816,7 @@ mod tests {
             path: directory.path().join("credentials.json"),
             generation: None,
             new_login: false,
+            upgrade: None,
             registration: Arc::default(),
             lease: Arc::default(),
         };
