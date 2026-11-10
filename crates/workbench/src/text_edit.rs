@@ -11,6 +11,7 @@ struct Edit {
     new_text: String,
 }
 struct Replacement {
+    edit_index: usize,
     start: usize,
     end: usize,
     text: String,
@@ -108,11 +109,20 @@ fn edits(arguments: &Value) -> Result<Vec<Edit>> {
     if edits.is_empty() {
         return Err(Error::Config("at least one edit is required".into()));
     }
-    for edit in &mut edits {
+    let count = edits.len();
+    let path = arguments["path"].as_str().unwrap_or_default();
+    for (index, edit) in edits.iter_mut().enumerate() {
         edit.old_text = lf(&edit.old_text);
         edit.new_text = lf(&edit.new_text);
         if edit.old_text.is_empty() {
-            return Err(Error::Config("oldText must not be empty".into()));
+            let field = if count == 1 {
+                "oldText".into()
+            } else {
+                format!("edits[{index}].oldText")
+            };
+            return Err(Error::Config(format!(
+                "{field} must not be empty in {path}."
+            )));
         }
     }
     Ok(edits)
@@ -202,49 +212,72 @@ pub fn apply(original: &str, arguments: &Value) -> Result<(String, usize)> {
         .is_some_and(|index| body[..index].ends_with('\r'));
     let normalized = lf(body);
     let fuzzy_content = fuzzy(&normalized);
-    let use_fuzzy = edits
-        .iter()
-        .any(|edit| !normalized.contains(&edit.old_text));
+    let edits: Vec<_> = edits
+        .into_iter()
+        .map(|edit| {
+            let fuzzy_old = fuzzy(&edit.old_text);
+            (edit, fuzzy_old)
+        })
+        .collect();
+    let use_fuzzy = edits.iter().any(|(edit, fuzzy_old)| {
+        !normalized.contains(&edit.old_text)
+            && !fuzzy_old.is_empty()
+            && fuzzy_content.contains(fuzzy_old)
+    });
+    let path = arguments["path"].as_str().unwrap_or_default();
     let base = if use_fuzzy {
         &fuzzy_content
     } else {
         &normalized
     };
     let mut replacements = Vec::new();
-    for edit in edits {
-        let fuzzy_old = fuzzy(&edit.old_text);
+    for (edit_index, (edit, fuzzy_old)) in edits.into_iter().enumerate() {
+        let (start, length) = base.find(&edit.old_text)
+            .map(|start| (start, edit.old_text.len()))
+            .or_else(|| {
+                if fuzzy_old.is_empty() {
+                    None
+                } else {
+                    fuzzy_content.find(&fuzzy_old).map(|start| (start, fuzzy_old.len()))
+                }
+            })
+            .ok_or_else(|| Error::Config(if count == 1 {
+                format!("Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines.")
+            } else {
+                format!("Could not find edits[{edit_index}] in {path}. The oldText must match exactly including all whitespace and newlines.")
+            }))?;
         let occurrences = if fuzzy_old.is_empty() {
-            base.match_indices(&edit.old_text).take(2).count()
+            base.matches(&edit.old_text).count()
         } else {
-            fuzzy_content.match_indices(&fuzzy_old).take(2).count()
+            fuzzy_content.matches(&fuzzy_old).count()
         };
         if occurrences > 1 {
-            return Err(Error::Config(
-                "oldText matches more than once after normalization".into(),
-            ));
+            return Err(Error::Config(if count == 1 {
+                format!(
+                    "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
+                )
+            } else {
+                format!(
+                    "Found {occurrences} occurrences of edits[{edit_index}] in {path}. Each oldText must be unique. Please provide more context to make it unique."
+                )
+            }));
         }
-        if use_fuzzy && fuzzy_old.is_empty() {
-            return Err(Error::Config(
-                "oldText was not found after normalization".into(),
-            ));
-        }
-        let (start, length) = base
-            .find(&edit.old_text)
-            .map(|start| (start, edit.old_text.len()))
-            .or_else(|| base.find(&fuzzy_old).map(|start| (start, fuzzy_old.len())))
-            .ok_or_else(|| Error::Config("oldText was not found".into()))?;
         replacements.push(Replacement {
+            edit_index,
             start,
             end: start + length,
             text: edit.new_text,
         });
     }
     replacements.sort_by_key(|replacement| replacement.start);
-    if replacements
+    if let Some(pair) = replacements
         .windows(2)
-        .any(|pair| pair[0].end > pair[1].start)
+        .find(|pair| pair[0].end > pair[1].start)
     {
-        return Err(Error::Config("edits overlap in the original file".into()));
+        return Err(Error::Config(format!(
+            "edits[{}] and edits[{}] overlap in {path}. Merge them into one edit or target disjoint regions.",
+            pair[0].edit_index, pair[1].edit_index
+        )));
     }
     let changed = if use_fuzzy {
         preserve_lines(&normalized, base, replacements)?
@@ -252,7 +285,13 @@ pub fn apply(original: &str, arguments: &Value) -> Result<(String, usize)> {
         replace(base.clone(), &replacements, 0)
     };
     if changed == normalized {
-        return Err(Error::Config("replacement produced no changes".into()));
+        return Err(Error::Config(if count == 1 {
+            format!(
+                "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+            )
+        } else {
+            format!("No changes made to {path}. The replacements produced identical content.")
+        }));
     }
     let restored = if crlf {
         changed.replace('\n', "\r\n")
@@ -312,6 +351,26 @@ mod tests {
         let (changed, _) = apply("Ａlpha  \n‘beta’  \nkeep\t\n", &json!({"edits":[{"oldText":"Ａlpha","newText":"‘beta’"},{"oldText":"'beta'","newText":"done"}]})).unwrap();
         assert_eq!(changed, "‘beta’\ndone\nkeep\t\n");
     }
+    #[test]
+    fn diagnostics_report_original_edit_indices_and_exact_occurrence_counts() {
+        let repeated = apply(
+            "one one one",
+            &json!({"path":"example","oldText":"one","newText":"two"}),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(repeated, Error::Config(message) if message.starts_with("Found 3 occurrences of the text in example."))
+        );
+        let overlap = apply("abcdef", &json!({"path":"example","edits":[{"oldText":"cde","newText":"x"},{"oldText":"abc","newText":"y"}]})).unwrap_err();
+        assert!(
+            matches!(overlap, Error::Config(message) if message.starts_with("edits[1] and edits[0] overlap in example."))
+        );
+        let missing = apply("abc", &json!({"path":"example","edits":[{"oldText":"a","newText":"x"},{"oldText":"z","newText":"y"}]})).unwrap_err();
+        assert!(
+            matches!(missing, Error::Config(message) if message.starts_with("Could not find edits[1] in example."))
+        );
+    }
+
     #[test]
     fn ambiguity_overlap_and_noop_leave_the_file_unchanged() {
         assert!(apply("Ａ\nA\n", &json!({"oldText":"A","newText":"b"})).is_err());

@@ -26,3 +26,5 @@ Resume row layout and relative activity-age units in src/ui/picker.rs follow
 Pi v1.5.0 session-selector.ts.
 
 Numbered edit result layout in src/text_edit.rs follows Pi v1.5.0 edit-diff.ts.
+
+Edit matching diagnostics in src/text_edit.rs follow Pi v1.5.0 edit-diff.ts.

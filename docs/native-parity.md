@@ -1744,3 +1744,18 @@ changes in a BOM/CRLF file. A PTY check reopens the journal, renders the numbere
 diff and expands the later hunk.
 
 Workspace tests, the numbered-rendering regression and all-target Clippy pass.
+
+### Edit diagnostics checkpoint
+
+Missing, duplicate, overlapping, empty and unchanged replacements report the
+requested path and the applicable original edit indices. Duplicate diagnostics
+count every non-overlapping match in normalized text. A failed lookup is reported
+before an occurrence check. The batch switches to fuzzy matching when at least
+one target requires it and matches. Whitespace-only targets require an exact
+match.
+
+The local CLI compares the diagnostic text with Pi inside the native tool
+failure envelope and verifies rejection before file writes.
+
+The nine-case CLI comparison, successful edit regression, workspace tests and
+all-target Clippy pass.

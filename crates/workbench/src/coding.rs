@@ -269,7 +269,7 @@ impl Tool for CodingTool {
 
     async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
         if matches!(self.kind, Kind::Edit) {
-            crate::text_edit::prepare_arguments(arguments).map_err(|error| error.to_string())
+            crate::text_edit::prepare_arguments(arguments).map_err(edit_error_text)
         } else {
             Ok(arguments)
         }
@@ -293,7 +293,7 @@ impl Tool for CodingTool {
             Kind::Edit => {
                 return self
                     .edit(&args)
-                    .unwrap_or_else(|error| Outcome::Failed(error.to_string()));
+                    .unwrap_or_else(|error| Outcome::Failed(edit_error_text(error)));
             }
             Kind::Grep | Kind::Find => self.search(&args),
             Kind::List => self.list(&args),
@@ -939,6 +939,13 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     #[cfg(unix)]
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+fn edit_error_text(error: Error) -> String {
+    match error {
+        Error::Config(message) => message,
+        error => error.to_string(),
+    }
 }
 
 fn bounded(mut output: String) -> String {
