@@ -56,6 +56,9 @@
     "hideThinkingBlock": {
       "type": "boolean"
     },
+    "quietStartup": {
+      "enum": [false, "header", true]
+    },
     "doubleEscapeAction": {
       "enum": ["tree", "fork", "none"]
     },

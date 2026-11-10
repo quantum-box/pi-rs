@@ -1927,3 +1927,11 @@ The PTY fixture verified that changing the scope leaves the settings file
 alone until saving, preserves the chosen order for cycling, and selects the
 first configured model after restarting. Unavailable catalog entries and
 cross-provider selection remain separate work.
+
+### Startup visibility checkpoint
+
+`quietStartup: true` suppresses the terminal startup header and key hints.
+`"header"` keeps them and suppresses the model scope details. `--verbose`
+restores both. The fullscreen layout reuses the header row when quiet startup
+is enabled. A PTY fixture covers all three settings and the flag override in
+fullscreen and regular modes.

@@ -183,6 +183,9 @@ struct Cli {
     /// Skip automatic remote catalog and package downloads.
     #[arg(long, global = true)]
     offline: bool,
+    /// Show startup information even when quietStartup is configured.
+    #[arg(long, global = true)]
+    verbose: bool,
     /// Enable local read, write, edit, bash, grep, find, and ls tools.
     #[arg(long, global = true)]
     coding_tools: bool,

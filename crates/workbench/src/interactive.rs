@@ -512,11 +512,29 @@ impl View {
                 _ => {}
             }
         }
-        self.append(if crate::ui::keys::windows_keybindings() {
-            "Enter to send · Ctrl+Q to queue · Ctrl+O tools · Ctrl+T thinking · /help"
-        } else {
-            "Enter to send · Alt+Enter to queue · Ctrl+O tools · Ctrl+T thinking · /help"
-        });
+        if show_startup_header(args) {
+            self.append(if crate::ui::keys::windows_keybindings() {
+                "Enter to send · Ctrl+Q to queue · Ctrl+O tools · Ctrl+T thinking · /help"
+            } else {
+                "Enter to send · Alt+Enter to queue · Ctrl+O tools · Ctrl+T thinking · /help"
+            });
+        }
+        if (args.verbose
+            || args.settings.value()["quietStartup"].as_str() != Some("header")
+                && show_startup_header(args))
+            && !args.model_scope.is_empty()
+        {
+            let scope = args
+                .model_scope
+                .iter()
+                .map(|choice| match &choice.thinking {
+                    Some(level) => format!("{}:{level}", choice.model),
+                    None => choice.model.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.append(&format!("Models in scope · {scope}"));
+        }
         Ok(())
     }
     fn add_images(&mut self, images: &[pi_rs::ImageContent]) {
@@ -784,7 +802,8 @@ impl View {
         if self.dialog().is_some() {
             below.clear();
         }
-        let body_height = height.saturating_sub(prompt_height + 5 + below.len());
+        let header_rows = usize::from(show_startup_header(args));
+        let body_height = height.saturating_sub(prompt_height + 4 + header_rows + below.len());
         let mut lines: Vec<Line> = self
             .lines
             .iter()
@@ -833,17 +852,19 @@ impl View {
         let status = format!("{status}{}{}", self.draft_status(), self.extension_status());
         self.graphics.clear_placements(&mut out)?;
         queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
-        Line::plain(
-            &format!(
-                "pi v{} · {} · /help",
-                env!("CARGO_PKG_VERSION"),
-                self.session_name.as_deref().unwrap_or("new session")
-            ),
-            theme.color("accent"),
-        )
-        .draw(&mut out, width)?;
+        if header_rows != 0 {
+            Line::plain(
+                &format!(
+                    "pi v{} · {} · /help",
+                    env!("CARGO_PKG_VERSION"),
+                    self.session_name.as_deref().unwrap_or("new session")
+                ),
+                theme.color("accent"),
+            )
+            .draw(&mut out, width)?;
+        }
         for (row, line) in lines[start..end].iter().enumerate() {
-            queue!(out, MoveTo(0, (row + 1) as u16))?;
+            queue!(out, MoveTo(0, (row + header_rows) as u16))?;
             line.draw(&mut out, width)?;
             self.graphics.paint(
                 line,
@@ -903,7 +924,7 @@ impl View {
             .min(width - 1);
         if let Some(dialog) = self.dialog() {
             if let Some((row, column)) = dialog.cursor(width, body_height) {
-                queue!(out, MoveTo(column as u16, (row + 1) as u16), Show)?;
+                queue!(out, MoveTo(column as u16, (row + header_rows) as u16), Show)?;
             } else {
                 queue!(out, Hide)?;
             }
@@ -984,7 +1005,7 @@ impl View {
             )?;
         } else {
             queue!(out, Print("\r\n"))?;
-            if self.regular.committed == 0 || redraw {
+            if (self.regular.committed == 0 || redraw) && show_startup_header(args) {
                 Line::plain(
                     &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
                     theme.color("accent"),
@@ -2490,6 +2511,10 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         view.finish_regular()?;
     }
     Ok(())
+}
+
+fn show_startup_header(args: &Cli) -> bool {
+    args.verbose || args.settings.boolean("quietStartup") != Some(true)
 }
 
 fn is_busy(worker: &Option<Worker>) -> bool {
