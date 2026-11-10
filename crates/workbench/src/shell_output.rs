@@ -2,8 +2,13 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-const DISPLAY_BYTES: usize = 50 * 1024;
-const DISPLAY_LINES: usize = 2000;
+use encoding_rs::{CoderResult, Decoder, UTF_8};
+use serde_json::{Value, json};
+
+use super::tool_output::{
+    Limit, MAX_BYTES as DISPLAY_BYTES, MAX_LINES as DISPLAY_LINES, Truncation, format_size,
+};
+
 const SCRIPT_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
@@ -11,8 +16,7 @@ pub(super) struct Accumulator {
     head: Vec<u8>,
     tail: Vec<u8>,
     bytes: u64,
-    newlines: u64,
-    last_byte: Option<u8>,
+    display: DisplayTail,
     file: Option<tempfile::NamedTempFile>,
 }
 
@@ -22,6 +26,7 @@ pub(super) struct Output {
     pub script: String,
     pub script_truncated: bool,
     pub path: Option<PathBuf>,
+    pub details: Option<Value>,
 }
 
 impl Accumulator {
@@ -30,18 +35,8 @@ impl Accumulator {
             return Ok(());
         }
         self.bytes += bytes.len() as u64;
-        self.newlines += bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
-        self.last_byte = bytes.last().copied();
-        if self.file.is_none()
-            && (self.bytes > DISPLAY_BYTES as u64 || self.lines() > DISPLAY_LINES as u64)
-        {
-            let mut file = tempfile::Builder::new()
-                .prefix("pi-bash-")
-                .suffix(".log")
-                .tempfile()?;
-            file.write_all(&self.head)?;
-            self.file = Some(file);
-        }
+        self.display.decode(bytes, false);
+        self.spill()?;
         if let Some(file) = &mut self.file {
             file.write_all(bytes)?;
         }
@@ -55,35 +50,23 @@ impl Accumulator {
         Ok(())
     }
 
-    fn lines(&self) -> u64 {
-        self.newlines + u64::from(self.last_byte.is_some_and(|byte| byte != b'\n'))
+    fn spill(&mut self) -> std::io::Result<()> {
+        if self.file.is_none() && (self.bytes > DISPLAY_BYTES as u64 || self.display.is_truncated())
+        {
+            let mut file = tempfile::Builder::new()
+                .prefix("pi-bash-")
+                .suffix(".log")
+                .tempfile()?;
+            file.write_all(&self.head)?;
+            self.file = Some(file);
+        }
+        Ok(())
     }
 
     pub fn finish(mut self) -> std::io::Result<Output> {
-        let display = if self.file.is_none() {
-            String::from_utf8_lossy(&self.head).into_owned()
-        } else {
-            let tail = decode_tail(&self.tail);
-            let mut selected = Vec::new();
-            let mut size = 0;
-            for line in tail.split_terminator('\n').rev().take(DISPLAY_LINES) {
-                let next = line.len() + usize::from(!selected.is_empty());
-                if size + next > DISPLAY_BYTES {
-                    if selected.is_empty() {
-                        let mut start = line.len().saturating_sub(DISPLAY_BYTES);
-                        while !line.is_char_boundary(start) {
-                            start += 1;
-                        }
-                        selected.push(&line[start..]);
-                    }
-                    break;
-                }
-                selected.push(line);
-                size += next;
-            }
-            selected.reverse();
-            selected.join("\n")
-        };
+        self.display.decode(&[], true);
+        self.spill()?;
+        let (display, limit, lines, partial) = self.display.snapshot();
         let script_truncated = self.bytes > SCRIPT_BYTES as u64;
         let script = if script_truncated {
             let half = SCRIPT_BYTES / 2;
@@ -94,7 +77,8 @@ impl Accumulator {
                 self.bytes - SCRIPT_BYTES as u64
             )
         } else {
-            String::from_utf8_lossy(&self.head).into_owned()
+            let text = String::from_utf8_lossy(&self.head);
+            text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()
         };
         let path = if let Some(mut file) = self.file.take() {
             file.flush()?;
@@ -104,18 +88,45 @@ impl Accumulator {
             None
         };
         let display_without_notice = display.clone();
-        let display = match &path {
-            Some(path) => {
-                let shown = display.split_terminator('\n').count();
-                let start = self.lines().saturating_sub(shown as u64) + 1;
-                format!(
-                    "{display}\n\n[Showing lines {start}-{} of {} (2000 line / 50 KiB limit). Full output: {}]",
-                    self.lines(),
-                    self.lines(),
-                    path.display()
-                )
+        let details = limit.map(|limit| {
+            json!({
+                "truncation": Truncation {
+                    content: &display,
+                    truncated: true,
+                    truncated_by: Some(limit),
+                    total_lines: self.display.lines(),
+                    total_bytes: self.display.bytes,
+                    output_lines: lines,
+                    output_bytes: display.len(),
+                    last_line_partial: partial,
+                    first_line_exceeds_limit: false,
+                    max_lines: DISPLAY_LINES as u64,
+                    max_bytes: DISPLAY_BYTES,
+                },
+                "fullOutputPath": path,
+            })
+        });
+        let display = match (limit, path.as_ref()) {
+            (Some(limit), Some(path)) => {
+                let end = self.display.lines();
+                let notice = if partial {
+                    format!(
+                        "Showing last {} of line {end} (line is {})",
+                        format_size(display.len() as u64),
+                        format_size(self.display.last_line_bytes()),
+                    )
+                } else {
+                    let start = end.saturating_sub(lines as u64) + 1;
+                    let bytes = if matches!(limit, Limit::Bytes) {
+                        " (50.0KB limit)"
+                    } else {
+                        ""
+                    };
+                    format!("Showing lines {start}-{end} of {end}{bytes}")
+                };
+                format!("{display}\n\n[{notice}. Full output: {}]", path.display())
             }
-            None => display,
+            _ => display,
         };
         Ok(Output {
             display,
@@ -123,7 +134,125 @@ impl Accumulator {
             script,
             script_truncated,
             path,
+            details,
         })
+    }
+}
+
+struct DisplayTail {
+    decoder: Decoder,
+    tail: String,
+    starts_at_boundary: bool,
+    bytes: u64,
+    newlines: u64,
+    current_line: u64,
+    last_complete_line: u64,
+}
+
+impl Default for DisplayTail {
+    fn default() -> Self {
+        Self {
+            decoder: UTF_8.new_decoder_with_bom_removal(),
+            tail: String::new(),
+            starts_at_boundary: true,
+            bytes: 0,
+            newlines: 0,
+            current_line: 0,
+            last_complete_line: 0,
+        }
+    }
+}
+
+impl DisplayTail {
+    fn decode(&mut self, mut input: &[u8], finished: bool) {
+        let mut buffer = [0; 8192];
+        loop {
+            let (result, consumed, written, _) =
+                self.decoder.decode_to_utf8(input, &mut buffer, finished);
+            let text = std::str::from_utf8(&buffer[..written]).expect("UTF-8 decoder output");
+            self.bytes += written as u64;
+            for chunk in text.split_inclusive('\n') {
+                if let Some(line) = chunk.strip_suffix('\n') {
+                    self.newlines += 1;
+                    self.last_complete_line = self.current_line + line.len() as u64;
+                    self.current_line = 0;
+                } else {
+                    self.current_line += chunk.len() as u64;
+                }
+            }
+            self.tail.push_str(text);
+            if self.tail.len() > 4 * DISPLAY_BYTES {
+                let mut start = self.tail.len() - 2 * DISPLAY_BYTES;
+                while !self.tail.is_char_boundary(start) {
+                    start += 1;
+                }
+                self.starts_at_boundary = self.tail.as_bytes()[start - 1] == b'\n';
+                self.tail.drain(..start);
+            }
+            if result == CoderResult::InputEmpty {
+                break;
+            }
+            input = &input[consumed..];
+        }
+    }
+
+    fn lines(&self) -> u64 {
+        self.newlines + u64::from(self.current_line != 0)
+    }
+
+    fn last_line_bytes(&self) -> u64 {
+        if self.current_line == 0 {
+            self.last_complete_line
+        } else {
+            self.current_line
+        }
+    }
+
+    fn is_truncated(&self) -> bool {
+        self.bytes > DISPLAY_BYTES as u64 || self.lines() > DISPLAY_LINES as u64
+    }
+
+    fn snapshot(&self) -> (String, Option<Limit>, usize, bool) {
+        if !self.is_truncated() {
+            return (self.tail.clone(), None, self.lines() as usize, false);
+        }
+        let mut tail = self.tail.as_str();
+        if !self.starts_at_boundary
+            && let Some(index) = tail.find('\n')
+            && index + 1 < tail.len()
+        {
+            tail = &tail[index + 1..];
+        }
+        let mut selected = Vec::new();
+        let mut bytes = 0;
+        let mut partial = false;
+        let mut limit = if self.bytes > DISPLAY_BYTES as u64 {
+            Limit::Bytes
+        } else {
+            Limit::Lines
+        };
+        for line in tail.split_terminator('\n').rev().take(DISPLAY_LINES) {
+            let next = line.len() + usize::from(!selected.is_empty());
+            if bytes + next > DISPLAY_BYTES {
+                limit = Limit::Bytes;
+                if selected.is_empty() {
+                    let mut start = line.len().saturating_sub(DISPLAY_BYTES);
+                    while !line.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    selected.push(&line[start..]);
+                    partial = true;
+                }
+                break;
+            }
+            selected.push(line);
+            bytes += next;
+        }
+        if selected.len() == DISPLAY_LINES {
+            limit = Limit::Lines;
+        }
+        selected.reverse();
+        (selected.join("\n"), Some(limit), selected.len(), partial)
     }
 }
 
@@ -175,6 +304,31 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), input);
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn oversized_last_line_reports_utf8_bytes_and_partial_line_metadata() {
+        let text = "界".repeat(100_000);
+        let mut accumulator = Accumulator::default();
+        for chunk in text.as_bytes().chunks(313) {
+            accumulator.append(chunk).unwrap();
+        }
+        accumulator.append(b"\n").unwrap();
+        let output = accumulator.finish().unwrap();
+        let details = output.details.unwrap();
+        let truncation = &details["truncation"];
+        assert_eq!(truncation["truncatedBy"], "bytes");
+        assert_eq!(truncation["lastLinePartial"], true);
+        assert_eq!(truncation["totalLines"], 1);
+        assert_eq!(truncation["totalBytes"], 300001);
+        assert_eq!(truncation["outputBytes"], 51198);
+        assert!(
+            output
+                .display
+                .contains("Showing last 50.0KB of line 1 (line is 293.0KB)")
+        );
+        assert!(!output.display.contains('�'));
+        std::fs::remove_file(output.path.unwrap()).unwrap();
+    }
+
     #[test]
     fn large_multibyte_output_has_bounded_views_and_complete_file() {
         let input = format!("head\n{}\ntail\n", "界".repeat(SCRIPT_BYTES));

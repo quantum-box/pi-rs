@@ -26,6 +26,7 @@ pub mod oauth_callback;
 mod shell_output;
 mod text_edit;
 mod text_page;
+mod tool_output;
 
 pub fn agent_dir() -> PathBuf {
     std::env::var_os("PI_RS_HOME")

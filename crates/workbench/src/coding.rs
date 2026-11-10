@@ -85,10 +85,11 @@ impl CodingTools {
             output,
             exit_code: result.status.code(),
             cancelled: result.cancelled,
-            truncated: result.output.path.is_some(),
+            truncated: result.output.details.is_some(),
             full_output_path: result
                 .output
-                .path
+                .details
+                .and(result.output.path)
                 .map(|path| path.to_string_lossy().into_owned()),
             exclude_from_context: false,
         })
@@ -274,7 +275,7 @@ impl Tool for CodingTool {
             Ok(arguments)
         }
     }
-    async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
         if matches!(self.kind, Kind::Read) {
             match self.read_image(&args) {
                 Ok(Some(data)) => {
@@ -297,7 +298,7 @@ impl Tool for CodingTool {
             }
             Kind::Grep | Kind::Find => self.search(&args),
             Kind::List => self.list(&args),
-            Kind::Bash | Kind::PowerShell => self.bash(&args).await,
+            Kind::Bash | Kind::PowerShell => return self.bash(&args, &context.cancellation).await,
         };
         match result {
             Ok(value) => Outcome::Succeeded(value),
@@ -312,9 +313,14 @@ impl Tool for CodingTool {
         _host: Arc<dyn ToolHost>,
     ) -> ToolReply {
         if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
-            return match self.shell(&args).await {
+            return match self.shell(&args, &context.cancellation).await {
                 Ok(result) => {
-                    let mut data = json!({"output":result.output.script,"truncated":result.output.script_truncated,"exit_code":exit_code(result.status),"wall_time_seconds":result.elapsed});
+                    let elapsed = if self.unrestricted {
+                        (result.elapsed * 10.0).round() / 10.0
+                    } else {
+                        result.elapsed
+                    };
+                    let mut data = json!({"output":result.output.script,"truncated":result.output.script_truncated,"exit_code":exit_code(result.status),"wall_time_seconds":elapsed});
                     if result.output.script_truncated {
                         data["full_output_path"] = json!(result.output.path);
                     }
@@ -682,23 +688,61 @@ impl CodingTool {
         })
     }
 
-    async fn bash(&self, args: &Value) -> Result<String> {
-        let result = self.shell(args).await?;
-        let output = format!("{}\nExit status: {}", result.output.display, result.status);
-        if !result.status.success() {
-            return Err(Error::Config(output));
+    async fn bash(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Outcome {
+        let result = match self.shell(args, cancellation).await {
+            Ok(result) => result,
+            Err(Error::Config(message)) if self.unrestricted => return Outcome::Failed(message),
+            Err(error) => return Outcome::Failed(error.to_string()),
+        };
+        if !self.unrestricted {
+            let output = format!("{}\nExit status: {}", result.output.display, result.status);
+            return if result.status.success() {
+                Outcome::Succeeded(output)
+            } else {
+                Outcome::Failed(Error::Config(output).to_string())
+            };
         }
-        Ok(output)
+        let output = if result.output.display.is_empty() {
+            "(no output)".into()
+        } else {
+            result.output.display
+        };
+        match result.status.code() {
+            Some(0) => match result.output.details {
+                Some(details) => Outcome::SucceededWithDetails { output, details },
+                None => Outcome::Succeeded(output),
+            },
+            Some(code) => Outcome::Failed(shell_status(
+                &output,
+                &format!("Command exited with code {code}"),
+            )),
+            None => Outcome::Failed(shell_status(
+                &output,
+                "Command terminated without an exit code",
+            )),
+        }
     }
-    async fn shell(&self, args: &Value) -> Result<ShellResult> {
-        let result = self
-            .shell_stream(args, &pi_rs::CancellationToken::new(), &mut |_| {})
-            .await?;
+
+    async fn shell(
+        &self,
+        args: &Value,
+        cancellation: &pi_rs::CancellationToken,
+    ) -> Result<ShellResult> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let result = self.shell_stream(args, cancellation, &mut |_| {}).await?;
         if result.timed_out {
-            return Err(Error::Config(format!(
-                "{}\nCommand timed out after {} seconds",
-                result.output.display,
+            let status = format!(
+                "Command timed out after {} seconds",
                 shell_timeout(args)?.expect("elapsed timeout").as_secs_f64()
+            );
+            return Err(Error::Config(shell_status(&result.output.display, &status)));
+        }
+        if result.cancelled {
+            return Err(Error::Config(shell_status(
+                &result.output.display,
+                "Command aborted",
             )));
         }
         Ok(result)
@@ -961,6 +1005,14 @@ fn bounded(mut output: String) -> String {
         output.push_str("\n[Output truncated at 50 KiB]");
     }
     output
+}
+
+fn shell_status(output: &str, status: &str) -> String {
+    if output.is_empty() {
+        status.to_owned()
+    } else {
+        format!("{output}\n\n{status}")
+    }
 }
 
 fn shell_timeout(args: &Value) -> Result<Option<Duration>> {
@@ -1521,11 +1573,15 @@ mod tests {
         } else {
             ("printf before; sleep 5", 0.05)
         };
-        let error = tool
-            .bash(&json!({"command":command, "timeout":timeout}))
+        let Outcome::Failed(error) = tool
+            .bash(
+                &json!({"command":command, "timeout":timeout}),
+                &pi_rs::CancellationToken::new(),
+            )
             .await
-            .unwrap_err()
-            .to_string();
+        else {
+            panic!("expected a timeout")
+        };
         assert!(error.contains("before"));
         assert!(error.contains(&format!("timed out after {timeout}")));
         assert_eq!(shell_timeout(&json!({})).unwrap(), None);
@@ -1545,7 +1601,10 @@ mod tests {
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            tool.shell(&json!({"command":"sleep 1 & printf done"})),
+            tool.shell(
+                &json!({"command":"sleep 1 & printf done"}),
+                &pi_rs::CancellationToken::new(),
+            ),
         )
         .await
         .unwrap()
@@ -1571,15 +1630,45 @@ mod tests {
         } else {
             "printf out; printf err >&2; exit 7"
         };
-        let output = tool
-            .bash(&json!({"command":command}))
+        let Outcome::Failed(output) = tool
+            .bash(
+                &json!({"command":command}),
+                &pi_rs::CancellationToken::new(),
+            )
             .await
-            .unwrap_err()
-            .to_string();
+        else {
+            panic!("expected a nonzero exit")
+        };
         assert!(output.contains("out"));
         assert!(output.contains("err"));
         assert!(output.contains('7'));
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_shell_uses_pi_output_and_status_text() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            root: root.path().to_path_buf(),
+            kind: Kind::Bash,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        assert_eq!(
+            tool.bash(&json!({"command":"printf hello"}), &cancellation)
+                .await,
+            Outcome::Succeeded("hello".into())
+        );
+        assert_eq!(
+            tool.bash(&json!({"command":"true"}), &cancellation).await,
+            Outcome::Succeeded("(no output)".into())
+        );
+        assert_eq!(
+            tool.bash(&json!({"command":"printf hello; exit 7"}), &cancellation)
+                .await,
+            Outcome::Failed("hello\n\nCommand exited with code 7".into())
+        );
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_default_shell_preserves_unicode_and_kills_child_processes() {
@@ -1603,7 +1692,10 @@ mod tests {
             kind: Kind::PowerShell,
         };
         let output = tool
-            .shell(&json!({"command":"Write-Output '日本語'"}))
+            .shell(
+                &json!({"command":"Write-Output '日本語'"}),
+                &pi_rs::CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(output.output.script.contains("日本語"));
@@ -1626,9 +1718,12 @@ mod tests {
             "Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-Command',\"{script}\"; Start-Sleep -Seconds 20"
         );
         assert!(
-            tool.shell(&json!({"command":command,"timeout":5}))
-                .await
-                .is_err()
+            tool.shell(
+                &json!({"command":command,"timeout":5}),
+                &pi_rs::CancellationToken::new()
+            )
+            .await
+            .is_err()
         );
         assert!(
             root.path().join("ready.txt").exists(),
