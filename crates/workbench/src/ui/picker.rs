@@ -30,13 +30,19 @@ pub struct Picker {
     active_session: Option<PathBuf>,
     session_action: Option<SessionAction>,
     session_error: Option<String>,
-    relevance_sort: bool,
+    session_sort: SessionSort,
     all_workspaces: bool,
     named_only: bool,
     show_path: bool,
     named_sessions: std::collections::HashSet<PathBuf>,
     session_documents: std::collections::BTreeMap<PathBuf, super::session_search::Document>,
     tree: Option<TreeState>,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum SessionSort {
+    Threaded,
+    Recent,
+    Relevance,
 }
 #[derive(Clone)]
 enum SessionAction {
@@ -60,7 +66,7 @@ impl Picker {
             active_session: None,
             session_action: None,
             session_error: None,
-            relevance_sort: false,
+            session_sort: SessionSort::Threaded,
             all_workspaces: false,
             named_only: false,
             show_path: false,
@@ -161,7 +167,7 @@ impl Picker {
                 }
             })
             .collect();
-        if self.relevance_sort && !query.is_empty() {
+        if self.session_sort != SessionSort::Recent && !query.trim().is_empty() {
             matches.sort_by_key(|item| {
                 if let Selection::Resume(path) = &item.selection
                     && let Some(document) = self.session_documents.get(path)
@@ -177,7 +183,32 @@ impl Picker {
                 )
             });
         }
+        if self.active_session.is_some()
+            && self.session_sort == SessionSort::Threaded
+            && query.trim().is_empty()
+            && let Some(rows) = self.session_layout(&matches)
+        {
+            return rows.into_iter().map(|row| matches[row.index]).collect();
+        }
         matches
+    }
+    fn session_layout(&self, items: &[&Item]) -> Option<Vec<super::session_threads::Row>> {
+        let entries: Option<Vec<_>> = items
+            .iter()
+            .map(|item| {
+                let Selection::Resume(path) = &item.selection else {
+                    return None;
+                };
+                Some((
+                    path.clone(),
+                    self.session_documents
+                        .get(path)
+                        .and_then(|document| document.parent.clone()),
+                ))
+            })
+            .collect();
+        let (paths, parents): (Vec<_>, Vec<_>) = entries?.into_iter().unzip();
+        Some(super::session_threads::layout(&paths, &parents))
     }
     pub fn input(&mut self, key: KeyEvent, keys: &super::keys::Keys) -> Input {
         if let Some(action) = self.session_action.clone() {
@@ -221,7 +252,11 @@ impl Picker {
                 return Input::Continue;
             }
             if keys.matches("app.session.toggleSort", key) {
-                self.relevance_sort = !self.relevance_sort;
+                self.session_sort = match self.session_sort {
+                    SessionSort::Threaded => SessionSort::Recent,
+                    SessionSort::Recent => SessionSort::Relevance,
+                    SessionSort::Relevance => SessionSort::Threaded,
+                };
                 self.selected = 0;
                 return Input::Continue;
             }
@@ -371,6 +406,16 @@ impl Picker {
             theme.color("accent"),
         )];
         let items = self.matches();
+        let mut prefixes = vec![String::new(); items.len()];
+        if self.active_session.is_some()
+            && self.session_sort == SessionSort::Threaded
+            && self.query.trim().is_empty()
+            && let Some(rows) = self.session_layout(&items)
+        {
+            for row in rows {
+                prefixes[row.index] = row.prefix;
+            }
+        }
         let available = height
             .saturating_sub(
                 3 + usize::from(self.session_error.is_some())
@@ -381,8 +426,9 @@ impl Picker {
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
             let mut line = Line::plain(
                 &format!(
-                    "{} {}",
+                    "{} {}{}",
                     if index == self.selected { "›" } else { " " },
+                    prefixes[index],
                     if self.show_path {
                         match &item.selection {
                             Selection::Resume(path) => {
@@ -446,10 +492,16 @@ impl Picker {
             ));
         }
         let hint = if self.active_session.is_some() {
-            if self.relevance_sort {
-                "Fuzzy order · Ctrl+S recent · Ctrl+R rename · Ctrl+D delete · Esc cancel"
-            } else {
-                "Recent order · Ctrl+S fuzzy · Ctrl+R rename · Ctrl+D delete · Esc cancel"
+            match self.session_sort {
+                SessionSort::Threaded => {
+                    "Threaded · Ctrl+S recent · Ctrl+R rename · Ctrl+D delete · Esc cancel"
+                }
+                SessionSort::Recent => {
+                    "Recent · Ctrl+S relevance · Ctrl+R rename · Ctrl+D delete · Esc cancel"
+                }
+                SessionSort::Relevance => {
+                    "Relevance · Ctrl+S threaded · Ctrl+R rename · Ctrl+D delete · Esc cancel"
+                }
             }
         } else if self.tree.is_some() {
             "Type to search · Alt+←/→ fold/navigate · Shift+L label · Enter checkout · Esc cancel"
@@ -613,6 +665,75 @@ mod tests {
         picker.input(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &keys);
         assert!(picker.matches().is_empty());
     }
+    #[test]
+    fn session_threads_group_parents_and_cycle_through_reference_sort_modes() {
+        let parent = PathBuf::from("parent.jsonl");
+        let child = PathBuf::from("child.jsonl");
+        let other = PathBuf::from("other.jsonl");
+        let paths = [child.clone(), other.clone(), parent.clone()];
+        let mut picker = Picker::sessions(
+            paths
+                .iter()
+                .map(|path| Item {
+                    label: path.to_string_lossy().into_owned(),
+                    selection: Selection::Resume(path.clone()),
+                })
+                .collect(),
+            parent.clone(),
+            std::collections::HashSet::from([child.clone()]),
+        );
+        let mut documents = std::collections::BTreeMap::new();
+        for path in &paths {
+            let mut document = super::super::session_search::Document::new(
+                path.to_string_lossy().into_owned(),
+                String::new(),
+                String::new(),
+                "needle".into(),
+                true,
+            );
+            if *path == child {
+                document.parent = Some(parent.clone());
+            }
+            documents.insert(path.clone(), document);
+        }
+        picker.set_session_documents(documents);
+        let selected = |picker: &Picker| {
+            picker
+                .matches()
+                .into_iter()
+                .map(|item| match &item.selection {
+                    Selection::Resume(path) => path.clone(),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selected(&picker),
+            vec![parent.clone(), child.clone(), other.clone()]
+        );
+        picker.query = "needle".into();
+        assert_eq!(selected(&picker), paths);
+        picker.query.clear();
+        let keys = super::super::keys::Keys::load().unwrap();
+        picker.input(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert_eq!(selected(&picker), paths);
+        picker.input(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert!(picker.session_sort == SessionSort::Relevance);
+        picker.input(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert!(picker.session_sort == SessionSort::Threaded);
+        picker.named_only = true;
+        assert_eq!(selected(&picker), vec![child]);
+    }
+
     #[test]
     fn session_search_uses_body_and_workspace_metadata_in_shared_directories() {
         let local = PathBuf::from("shared/local.jsonl");

@@ -17,7 +17,7 @@ remaining acceptance work for that surface.
 | Terminal | Default `pi` startup, Unicode multiline editor and kill ring, text/image clipboard paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks, file completion, external editor, user keybindings, cancel, session controls | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity |
-| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, threaded session selectors, Radius sharing |
+| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, Radius sharing |
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, reasoning-effort control | Full provider catalog, provider-native adapters, capability-aware thinking levels, retry configuration |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
@@ -1647,3 +1647,18 @@ queries and scores and cover field boundaries, phrases, invalid expressions,
 Unicode and shared-directory filtering. A real PTY check searches transcript
 text, opens the selected session and verifies terminal restoration. Full
 workspace tests and all-target Clippy pass.
+
+### Threaded resume selector checkpoint
+
+The resume picker defaults to parent-session groups and cycles through threaded,
+recent and relevance order. Groups and siblings follow their newest descendant's
+activity. Thread branches show the parent/child relationship. Search switches to
+a flat relevance-sorted list in threaded mode, while recent mode preserves the
+incoming order. Scope and named-only filters apply before grouping.
+
+Missing or filtered-out parents leave their children visible as roots. Cyclic
+parent references are broken for presentation without modifying stored history.
+Tests cover grouping, descendant ordering, filters, search flattening and sort
+cycling. PTY checks verify branch rendering and all three modes, and repeat the
+transcript-search/open-session check. Full workspace tests and all-target Clippy
+pass.

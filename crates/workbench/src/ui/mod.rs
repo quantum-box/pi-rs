@@ -7,4 +7,5 @@ pub mod keys;
 pub mod picker;
 pub mod render;
 pub mod session_search;
+pub mod session_threads;
 pub mod theme;

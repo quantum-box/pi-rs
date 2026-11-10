@@ -1346,16 +1346,22 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                         let local = std::path::Path::new(cwd)
                             .canonicalize()
                             .is_ok_and(|cwd| cwd == workspace);
-                        documents.insert(
-                            path.clone(),
-                            super::ui::session_search::Document::new(
-                                session.name().unwrap_or_default().into(),
-                                session.session_id().to_string(),
-                                cwd.into(),
-                                messages,
-                                local,
-                            ),
+                        let mut document = super::ui::session_search::Document::new(
+                            session.name().unwrap_or_default().into(),
+                            session.session_id().to_string(),
+                            cwd.into(),
+                            messages,
+                            local,
                         );
+                        document.parent = session.parent_session().map(|parent| {
+                            let parent = PathBuf::from(parent);
+                            if parent.is_absolute() {
+                                parent
+                            } else {
+                                args.workspace.join(parent)
+                            }
+                        });
+                        documents.insert(path.clone(), document);
                         items.push(Item {
                             label: format!(
                                 "{title} · {}",

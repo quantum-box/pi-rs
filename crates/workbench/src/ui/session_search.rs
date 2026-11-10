@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 
 pub struct Document {
     pub local: bool,
+    pub parent: Option<std::path::PathBuf>,
     fields: [String; 4],
     lower: [String; 4],
     normalized: OnceLock<[String; 4]>,
@@ -13,6 +14,7 @@ impl Document {
         let lower = fields.each_ref().map(|field| field.to_lowercase());
         Self {
             local,
+            parent: None,
             fields,
             lower,
             normalized: OnceLock::new(),
