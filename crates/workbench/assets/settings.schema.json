@@ -67,6 +67,12 @@
     "hideThinkingBlock": {
       "type": "boolean"
     },
+    "terminal": {
+      "type": "object",
+      "properties": {
+        "showTerminalProgress": { "type": "boolean" }
+      }
+    },
     "quietStartup": {
       "enum": [false, "header", true]
     },

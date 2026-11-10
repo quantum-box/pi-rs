@@ -2386,3 +2386,12 @@ continuations and session restarts. Text and summary fragments are combined
 into their logical blocks, and encrypted blocks stay separate. Replay is
 bound to the original endpoint and model. A loopback RPC check exercised
 restart, encrypted-only thinking and a switch to a different model endpoint.
+
+### Terminal progress indicator
+
+The `terminal.showTerminalProgress` setting and the `/settings` toggle
+publish the same OSC 9;4 indeterminate indicator as Pi while a model
+request or compaction runs. A one-second keepalive maintains it in
+terminals that clear stale indicators. Completion and terminal teardown
+clear the indicator. The settings toggle edits only the user-level member
+of the terminal settings object.

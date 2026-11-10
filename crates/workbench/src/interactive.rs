@@ -95,6 +95,7 @@ pub(super) fn latest_session(
 struct Terminal {
     alternate: bool,
     images: Cleanup,
+    progress: Option<Instant>,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -113,6 +114,7 @@ impl Terminal {
         let guard = Self {
             alternate: mode != Some(TuiMode::Regular),
             images,
+            progress: None,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -130,6 +132,20 @@ impl Terminal {
         #[cfg(any(unix, windows))]
         execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
         Ok(guard)
+    }
+    fn update_progress(&mut self, active: bool) -> Result<()> {
+        if active
+            && self
+                .progress
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        {
+            execute!(std::io::stdout(), Print("\x1b]9;4;3\x07"))?;
+            self.progress = Some(Instant::now());
+        } else if !active && self.progress.is_some() {
+            execute!(std::io::stdout(), Print("\x1b]9;4;0\x07"))?;
+            self.progress = None;
+        }
+        Ok(())
     }
     #[cfg(unix)]
     fn keyboard_reply(&mut self, supported: bool) -> Result<()> {
@@ -175,6 +191,7 @@ impl Terminal {
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
+        let _ = self.update_progress(false);
         if self.alternate {
             self.images.clear();
         }
@@ -2390,6 +2407,12 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             view.scrollbar_activity = None;
             dirty = true;
         }
+        if let Some(terminal) = &mut _terminal {
+            terminal.update_progress(
+                args.settings.terminal_progress()
+                    && worker.as_ref().is_some_and(|worker| worker.busy),
+            )?;
+        }
         if (dirty && last_frame.elapsed() >= frame_interval)
             || ((is_busy(&worker) || view.remote_task.is_some())
                 && last_frame.elapsed() >= Duration::from_millis(100))
@@ -3005,6 +3028,20 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 .boolean("fullscreenCopyOnSelect")
                                 .unwrap_or(true);
                             items.extend([
+                                Item {
+                                    label: format!(
+                                        "Terminal progress · {} (toggle)",
+                                        if args.settings.terminal_progress() {
+                                            "on"
+                                        } else {
+                                            "off"
+                                        },
+                                    ),
+                                    selection: Selection::Setting(
+                                        "terminal.showTerminalProgress".into(),
+                                        json!(!args.settings.terminal_progress()),
+                                    ),
+                                },
                                 Item {
                                     label: format!("Fullscreen exit output · {exit_output}"),
                                     selection: Selection::Setting(
@@ -3733,6 +3770,9 @@ fn select(
                     args,
                     json!({"type":"set_auto_compaction","enabled":enabled}),
                 )?;
+            } else if key == "terminal.showTerminalProgress" {
+                args.settings
+                    .set_user_member("terminal", "showTerminalProgress", value.clone())?;
             } else if key == "theme" {
                 let next = Theme::load(
                     value

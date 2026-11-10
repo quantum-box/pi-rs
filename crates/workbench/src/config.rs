@@ -105,28 +105,7 @@ impl Settings {
         }
     }
     pub fn set_auto_retry_enabled(&mut self, enabled: bool) -> Result<()> {
-        let path = agent_dir().join("settings.json");
-        let update = |settings: &mut Map<String, Value>| -> Result<()> {
-            settings
-                .entry("retry")
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-                .ok_or_else(|| Error::Config("retry must be an object".into()))?
-                .insert("enabled".into(), Value::Bool(enabled));
-            Ok(())
-        };
-        update_object(&path, |settings| {
-            update(settings)?;
-            validate_settings(&Value::Object(settings.clone()), &path)
-        })?;
-        if !self.value.is_object() {
-            self.value = serde_json::json!({});
-        }
-        update(self.value.as_object_mut().expect("settings object"))?;
-        if let Some((_, layer)) = self.resource_layers.first_mut() {
-            update(layer.as_object_mut().expect("settings layer"))?;
-        }
-        Ok(())
+        self.set_user_member("retry", "enabled", Value::Bool(enabled))
     }
     pub fn auto_compaction_enabled(&self) -> bool {
         self.value["compaction"]["enabled"]
@@ -154,14 +133,22 @@ impl Settings {
         }
     }
     pub fn set_auto_compaction_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.set_user_member("compaction", "enabled", Value::Bool(enabled))
+    }
+    pub fn terminal_progress(&self) -> bool {
+        self.value["terminal"]["showTerminalProgress"]
+            .as_bool()
+            .unwrap_or(false)
+    }
+    pub fn set_user_member(&mut self, key: &str, member: &str, value: Value) -> Result<()> {
         let path = agent_dir().join("settings.json");
         let update = |settings: &mut Map<String, Value>| -> Result<()> {
-            let compaction = settings
-                .entry("compaction")
+            settings
+                .entry(key)
                 .or_insert_with(|| Value::Object(Map::new()))
                 .as_object_mut()
-                .ok_or_else(|| Error::Config("compaction must be an object".into()))?;
-            compaction.insert("enabled".into(), Value::Bool(enabled));
+                .ok_or_else(|| Error::Config(format!("{key} must be an object")))?
+                .insert(member.into(), value.clone());
             Ok(())
         };
         update_object(&path, |settings| {
