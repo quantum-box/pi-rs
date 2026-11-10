@@ -196,14 +196,20 @@ impl Search {
         }
     }
 
-    pub fn highlight(&self, lines: &mut [Line], visible: Range<usize>) {
+    pub fn highlight(&self, lines: &mut [Line], visible: Range<usize>, theme: &Theme) {
         for (index, found) in self.matches.iter().enumerate() {
             let current = index == self.selected;
             for segment in found
                 .iter()
                 .filter(|segment| visible.contains(&segment.row))
             {
-                highlight_segment(&mut lines[segment.row], segment.bytes.clone(), current);
+                lines[segment.row].style_bytes(segment.bytes.clone(), |span| {
+                    span.background = Some(theme.color("searchMatchBg"));
+                    span.color = theme.color("searchMatchText");
+                    span.inverse |= current;
+                    span.bold |= current;
+                    span.underline |= !current;
+                });
             }
         }
     }
@@ -282,41 +288,6 @@ fn find_matches(rows: &[String], query: &str) -> Vec<Match> {
         .collect()
 }
 
-fn highlight_segment(line: &mut Line, bytes: Range<usize>, current: bool) {
-    let mut offset = 0;
-    line.spans = std::mem::take(&mut line.spans)
-        .into_iter()
-        .flat_map(|span| {
-            let start = bytes.start.saturating_sub(offset);
-            let end = bytes.end.saturating_sub(offset).min(span.text.len());
-            offset += span.text.len();
-            if start >= end {
-                return vec![span];
-            }
-            let mut pieces = Vec::with_capacity(3);
-            for (range, matched) in [
-                (0..start, false),
-                (start..end, true),
-                (end..span.text.len(), false),
-            ] {
-                if !range.is_empty() {
-                    let mut piece = Span {
-                        text: span.text[range].into(),
-                        ..span.clone()
-                    };
-                    if matched {
-                        piece.inverse = true;
-                        piece.bold |= current;
-                        piece.underline |= current;
-                    }
-                    pieces.push(piece);
-                }
-            }
-            pieces
-        })
-        .collect();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +306,8 @@ mod tests {
         assert_eq!(search.result(), "2/2");
         search.navigate(true);
         assert_eq!(search.update(&lines, 2), Some(0..2));
-        search.highlight(&mut lines, 0..2);
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        search.highlight(&mut lines, 0..2, &theme);
         assert!(
             lines[0]
                 .spans

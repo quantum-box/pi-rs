@@ -24,6 +24,30 @@ impl Viewport {
         self.top.unwrap_or(self.max)
     }
 
+    pub fn scroll_by(&mut self, delta: isize) {
+        self.seek(self.top().saturating_add_signed(delta));
+    }
+
+    pub fn seek(&mut self, row: usize) {
+        self.top = (row < self.max).then_some(row);
+    }
+
+    pub fn scrollbar(&self) -> Option<Range<usize>> {
+        if self.height == 0 || self.max == 0 {
+            return None;
+        }
+        let size = (self.height * self.height / (self.height + self.max)).max(1);
+        let top = self.top() * (self.height - size) / self.max;
+        Some(top..top + size)
+    }
+
+    pub fn seek_scrollbar(&mut self, row: usize) {
+        if let Some(thumb) = self.scrollbar() {
+            let track = self.height.saturating_sub(thumb.len()).max(1);
+            self.seek(row.saturating_sub(thumb.len() / 2).min(track) * self.max / track);
+        }
+    }
+
     pub fn reveal(&mut self, rows: Range<usize>) {
         let top = self.top();
         let target = if rows.start < top || rows.end > top.saturating_add(self.height) {
@@ -94,5 +118,50 @@ mod tests {
         assert_eq!(viewport.top(), 54);
         viewport.follow();
         assert_eq!(viewport.top(), 81);
+    }
+}
+
+#[derive(Default)]
+pub struct Wheel {
+    last: Option<(std::time::Instant, isize)>,
+    average: Option<f64>,
+    carry: f64,
+}
+
+impl Wheel {
+    pub fn lines(
+        &mut self,
+        direction: isize,
+        fixed: Option<f64>,
+        now: std::time::Instant,
+    ) -> isize {
+        if let Some(fixed) = fixed {
+            *self = Self::default();
+            return fixed.clamp(1.0, 100.0).floor() as isize;
+        }
+        if cfg!(target_os = "macos")
+            && ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+                .iter()
+                .all(|name| std::env::var_os(name).is_none())
+        {
+            return 1;
+        }
+        let previous = self.last.replace((now, direction));
+        let gap = previous
+            .filter(|(_, previous_direction)| *previous_direction == direction)
+            .map(|(time, _)| now.duration_since(time).as_secs_f64() * 1000.0);
+        let Some(gap) = gap.filter(|gap| *gap <= 200.0) else {
+            self.average = None;
+            self.carry = 0.0;
+            return 1;
+        };
+        if gap < 5.0 {
+            return 1;
+        }
+        let average = self.average.map_or(gap, |previous| (previous + gap) / 2.0);
+        self.average = Some(average);
+        let lines = (100.0 / average).clamp(1.0, 6.0) + self.carry;
+        self.carry = lines.fract();
+        lines.floor() as isize
     }
 }

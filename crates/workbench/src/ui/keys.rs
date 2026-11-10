@@ -50,6 +50,7 @@ impl Keys {
             ("tui.input.newLine", &["shift+enter", "ctrl+j"]),
             ("tui.input.submit", &["enter"]),
             ("tui.input.tab", &["tab"]),
+            ("tui.input.copy", &["ctrl+c"]),
             ("tui.select.up", &["up"]),
             ("tui.select.down", &["down"]),
             ("tui.select.pageUp", &["pageup"]),
@@ -208,7 +209,8 @@ impl Keys {
                     || action.starts_with("tui.altScreen.")
                     || matches!(
                         action.as_str(),
-                        "app.thinking.save"
+                        "tui.input.copy"
+                            | "app.thinking.save"
                             | "app.session.rename"
                             | "app.session.delete"
                             | "app.session.deleteNoninvasive"

@@ -7,15 +7,18 @@ use crate::ui::{
     editor::Editor,
     images::{self, Cleanup, InlineImage, Renderer},
     keys::Keys,
+    mouse_selection::MouseSelection,
     picker::{Input, Item, Picker, Selection, TreeEntryKind, TreeFilter},
     render::{Entry, Line, ToolPart},
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
-    viewport::Viewport,
+    viewport::{Viewport, Wheel},
 };
 use crossterm::cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use crossterm::style::{Print, ResetColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
@@ -114,7 +117,12 @@ impl Terminal {
             keyboard: KeyboardProtocol::Probing,
         };
         if guard.alternate {
-            execute!(std::io::stdout(), EnterAlternateScreen)?;
+            execute!(
+                std::io::stdout(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableFocusChange
+            )?;
         }
         execute!(std::io::stdout(), EnableBracketedPaste, Hide)?;
         #[cfg(unix)]
@@ -181,7 +189,12 @@ impl Drop for Terminal {
         let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
-            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            let _ = execute!(
+                std::io::stdout(),
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         } else {
             let _ = execute!(std::io::stdout(), Print("\r\n"));
         }
@@ -310,6 +323,12 @@ struct View {
     clipboard: Option<std::sync::mpsc::Receiver<Result<super::clipboard::Content>>>,
     viewport: Viewport,
     search: Option<Search>,
+    mouse: MouseSelection,
+    wheel: Wheel,
+    fullscreen_width: usize,
+    scrollbar_activity: Option<Instant>,
+    scrollbar_dragging: bool,
+    flash: Option<(String, Instant)>,
     tokens: u64,
     history: Vec<String>,
     history_index: Option<usize>,
@@ -527,6 +546,10 @@ impl View {
         self.lines.clear();
         self.viewport.follow();
         self.search = None;
+        self.mouse.clear();
+        self.scrollbar_dragging = false;
+        self.scrollbar_activity = None;
+        self.flash = None;
         self.streaming.clear();
         self.thinking.clear();
         self.draft_images.clear();
@@ -900,6 +923,91 @@ impl View {
         self.request_started = None;
         self.phase = None;
     }
+    fn copy_selection(&mut self) -> bool {
+        let Some(text) = self.mouse.text() else {
+            return false;
+        };
+        let message = match sessions::copy_text(&text) {
+            Ok(()) => "Copied!".to_owned(),
+            Err(error) => format!("Copy failed: {error}"),
+        };
+        self.flash = Some((message, Instant::now()));
+        true
+    }
+
+    fn fullscreen_mouse(&mut self, event: MouseEvent, args: &Cli) -> bool {
+        if self.picker.is_some() || self.dialog().is_some() {
+            return false;
+        }
+        let now = Instant::now();
+        let scrollbar = args.settings.string("fullscreenScrollbar") != Some("hidden")
+            && self.viewport.scrollbar().is_some();
+        let on_scrollbar = scrollbar
+            && self.fullscreen_width > 1
+            && usize::from(event.column) + 1 >= self.fullscreen_width
+            && self.mouse.contains_row(event.row);
+        match event.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if self.mouse.contains_row(event.row) =>
+            {
+                let direction = if event.kind == MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                };
+                let lines = self.wheel.lines(
+                    direction,
+                    args.settings.value()["fullscreenWheelScrollLines"].as_f64(),
+                    now,
+                );
+                let multiplier = if event.modifiers.contains(KeyModifiers::ALT) {
+                    5
+                } else {
+                    1
+                };
+                self.viewport.scroll_by(direction * lines * multiplier);
+                self.scrollbar_activity = Some(now);
+            }
+            MouseEventKind::Down(MouseButton::Left) if on_scrollbar => {
+                self.mouse.clear();
+                self.scrollbar_dragging = true;
+                self.viewport
+                    .seek_scrollbar(self.mouse.relative_row(event.row));
+                self.scrollbar_activity = Some(now);
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_dragging => {
+                self.viewport
+                    .seek_scrollbar(self.mouse.relative_row(event.row));
+                self.scrollbar_activity = Some(now);
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.scrollbar_dragging => {
+                self.scrollbar_dragging = false;
+                self.scrollbar_activity = Some(now);
+            }
+            MouseEventKind::Moved if on_scrollbar => {
+                self.scrollbar_activity = Some(now);
+            }
+            MouseEventKind::Down(MouseButton::Right) if self.search.is_none() => {
+                self.paste_clipboard();
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.search.is_none() => {
+                self.mouse.press(event.column, event.row, now);
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.search.is_none() => {
+                self.mouse.drag(event.column, event.row);
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.search.is_none() => {
+                if self.mouse.release(event.column, event.row)
+                    && args.settings.boolean("fullscreenCopyOnSelect") != Some(false)
+                {
+                    self.copy_selection();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn prompt_rows(
         &mut self,
         args: &Cli,
@@ -930,6 +1038,12 @@ impl View {
         }
         let (width, height) = terminal::size()?;
         let width = usize::from(width.max(1));
+        self.fullscreen_width = width;
+        let scrollbar_mode = args
+            .settings
+            .string("fullscreenScrollbar")
+            .unwrap_or("auto");
+        let body_width = width - usize::from(scrollbar_mode == "always" && width > 1);
         let height = usize::from(height.max(7));
         let (prompt, cursor_row, column) = self.prompt_rows(args, width, height);
         let prompt_height = prompt.len();
@@ -946,19 +1060,20 @@ impl View {
             if matches!(entry, Entry::User(_)) {
                 prompts.push(lines.len());
             }
-            lines.extend(entry.render(theme, width, self.expand_tools, !self.hide_thinking));
+            lines.extend(entry.render(theme, body_width, self.expand_tools, !self.hide_thinking));
         }
         if !self.thinking.is_empty() {
             lines.extend(Entry::Thinking(self.thinking.clone()).render(
                 theme,
-                width,
+                body_width,
                 false,
                 !self.hide_thinking,
             ));
         }
         if !self.streaming.is_empty() {
-            lines
-                .extend(Entry::Assistant(self.streaming.clone()).render(theme, width, false, true));
+            lines.extend(
+                Entry::Assistant(self.streaming.clone()).render(theme, body_width, false, true),
+            );
         }
         if let Some(picker) = &self.picker {
             lines = picker.render(theme, width, body_height, keys);
@@ -981,8 +1096,16 @@ impl View {
             self.viewport.top()
         };
         let end = (start + body_height).min(lines.len());
-        if !modal && let Some(search) = &self.search {
-            search.highlight(&mut lines, start..end);
+        if modal {
+            self.mouse.clear();
+        } else {
+            self.mouse
+                .update(&lines, start, header_rows..header_rows + body_height);
+            if let Some(search) = &self.search {
+                search.highlight(&mut lines, start..end, theme);
+            } else {
+                self.mouse.highlight(&mut lines, start..end);
+            }
         }
         let mut out = std::io::stdout().lock();
         let elapsed = self
@@ -1000,7 +1123,14 @@ impl View {
         } else {
             String::new()
         };
-        let status = format!("{status}{}{}", self.draft_status(), self.extension_status());
+        let status = format!(
+            "{status}{}{}{}",
+            self.draft_status(),
+            self.extension_status(),
+            self.flash
+                .as_ref()
+                .map_or(String::new(), |(message, _)| format!("{message} ")),
+        );
         self.graphics.clear_placements(&mut out)?;
         queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
         if header_rows != 0 {
@@ -1016,13 +1146,37 @@ impl View {
         }
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + header_rows) as u16))?;
-            line.draw(&mut out, width)?;
+            line.draw(&mut out, if modal { width } else { body_width })?;
             self.graphics.paint(
                 line,
                 &mut out,
                 row,
                 images::visible_rows(&lines[start + row..end]),
             )?;
+        }
+        if !modal
+            && width > 1
+            && (scrollbar_mode == "always"
+                || (scrollbar_mode == "auto"
+                    && (self.scrollbar_activity.is_some() || self.scrollbar_dragging)))
+            && let Some(thumb) = self.viewport.scrollbar()
+        {
+            for row in 0..body_height {
+                let (glyph, role) = if thumb.contains(&row) {
+                    (
+                        if self.scrollbar_dragging {
+                            "█"
+                        } else {
+                            "┃"
+                        },
+                        "scrollbarThumb",
+                    )
+                } else {
+                    ("│", "scrollbarTrack")
+                };
+                queue!(out, MoveTo((width - 1) as u16, (row + header_rows) as u16))?;
+                Line::plain(glyph, theme.color(role)).draw(&mut out, 1)?;
+            }
         }
         let border_row = height - prompt_height - 4 - below.len();
         queue!(out, MoveTo(0, border_row as u16))?;
@@ -1112,6 +1266,23 @@ impl View {
             )?;
             self.regular.started = false;
         }
+        Ok(())
+    }
+
+    fn replay_transcript(&mut self, theme: &Theme) -> Result<()> {
+        self.graphics.reset();
+        let width = usize::from(terminal::size()?.0.max(1));
+        let mut out = std::io::stdout().lock();
+        queue!(out, MoveToColumn(0), Print("\r\n"))?;
+        for entry in &self.lines {
+            for line in entry.render(theme, width, self.expand_tools, !self.hide_thinking) {
+                line.draw(&mut out, width)?;
+                self.graphics
+                    .paint(&line, &mut out, usize::MAX, usize::MAX)?;
+                queue!(out, Print("\r\n"))?;
+            }
+        }
+        out.flush()?;
         Ok(())
     }
 
@@ -2153,6 +2324,21 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             }
         }
         dirty |= view.poll_clipboard();
+        if view
+            .flash
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(2))
+        {
+            view.flash = None;
+            dirty = true;
+        }
+        if view
+            .scrollbar_activity
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            view.scrollbar_activity = None;
+            dirty = true;
+        }
         if (dirty && last_frame.elapsed() >= frame_interval)
             || ((is_busy(&worker) || view.remote_task.is_some())
                 && last_frame.elapsed() >= Duration::from_millis(100))
@@ -2213,12 +2399,25 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         };
         match event {
             Event::Resize(..) => {
+                view.mouse.clear();
+                view.scrollbar_dragging = false;
                 if view.graphics.enabled() {
                     images::query_cell_size()?;
                 }
                 if args.tui_mode == Some(TuiMode::Regular) {
                     view.finish_regular()?;
                 }
+                dirty = true;
+            }
+            Event::Mouse(event) if args.tui_mode != Some(TuiMode::Regular) => {
+                if view.fullscreen_mouse(event, &args) {
+                    last_idle_interrupt = None;
+                    dirty = true;
+                }
+            }
+            Event::FocusLost if args.tui_mode != Some(TuiMode::Regular) => {
+                view.mouse.focus_lost();
+                view.scrollbar_dragging = false;
                 dirty = true;
             }
             Event::Paste(text) => {
@@ -2383,6 +2582,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 if args.tui_mode != Some(TuiMode::Regular) {
                     if keys.matches("tui.altScreen.search", key) {
                         last_idle_interrupt = None;
+                        view.mouse.clear();
                         view.search = view.search.is_none().then(Search::default);
                         continue;
                     }
@@ -2402,6 +2602,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     }
                     if let Some(action) = keys.viewport_action(key) {
                         view.viewport.navigate(action);
+                        view.scrollbar_activity = Some(Instant::now());
                         continue;
                     }
                     if let Some(search) = &mut view.search {
@@ -2409,6 +2610,10 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         continue;
                     }
                 }
+                if keys.matches("tui.input.copy", key) && view.copy_selection() {
+                    continue;
+                }
+                view.mouse.clear();
                 let action = keys
                     .action(
                         key,
@@ -2719,7 +2924,51 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             let padding = args.settings.value()["editorPaddingX"]
                                 .as_u64()
                                 .unwrap_or(0);
+                            let exit_output = args
+                                .settings
+                                .string("fullscreenExitOutput")
+                                .unwrap_or("transcript");
+                            let scrollbar = args
+                                .settings
+                                .string("fullscreenScrollbar")
+                                .unwrap_or("auto");
+                            let copy_on_select = args
+                                .settings
+                                .boolean("fullscreenCopyOnSelect")
+                                .unwrap_or(true);
                             items.extend([
+                                Item {
+                                    label: format!("Fullscreen exit output · {exit_output}"),
+                                    selection: Selection::Setting(
+                                        "fullscreenExitOutput".into(),
+                                        json!(if exit_output == "transcript" {
+                                            "resume-hint"
+                                        } else {
+                                            "transcript"
+                                        }),
+                                    ),
+                                },
+                                Item {
+                                    label: format!("Fullscreen scrollbar · {scrollbar}"),
+                                    selection: Selection::Setting(
+                                        "fullscreenScrollbar".into(),
+                                        json!(match scrollbar {
+                                            "auto" => "always",
+                                            "always" => "hidden",
+                                            _ => "auto",
+                                        }),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
+                                        "Fullscreen copy on select · {}",
+                                        if copy_on_select { "on" } else { "off" }
+                                    ),
+                                    selection: Selection::Setting(
+                                        "fullscreenCopyOnSelect".into(),
+                                        json!(!copy_on_select),
+                                    ),
+                                },
                                 Item {
                                     label: format!("Editor padding · {padding}"),
                                     selection: Selection::Setting(
@@ -2750,6 +2999,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 "steeringMode",
                                 "followUpMode",
                                 "tuiMode",
+                                "fullscreenWheelScrollLines",
                                 "sessionDir",
                                 "sessionShareDestination",
                                 "defaultProjectTrust",
@@ -2916,6 +3166,21 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     drop(worker);
     if args.tui_mode == Some(TuiMode::Regular) {
         view.finish_regular()?;
+    }
+    drop(_terminal.take());
+    if args.tui_mode != Some(TuiMode::Regular)
+        && args.settings.string("fullscreenExitOutput") != Some("resume-hint")
+    {
+        view.replay_transcript(&theme)?;
+    }
+    if !args.no_session && args.session.is_file() {
+        let path = args.session.to_string_lossy();
+        let path = if cfg!(windows) {
+            format!("'{}'", path.replace('\'', "''"))
+        } else {
+            shell_words::quote(&path).into_owned()
+        };
+        println!("Resume this session with pi --session {path}");
     }
     Ok(())
 }
@@ -3317,6 +3582,7 @@ fn select(
                         .as_deref()
                         .unwrap_or_else(|| std::path::Path::new(""))
                 ),
+                "fullscreenWheelScrollLines" => json!("auto"),
                 "defaultProjectTrust" => json!("ask"),
                 "defaultTools" => json!(["read", "bash", "edit", "write"]),
                 "modelThinkingLevels" => json!({}),

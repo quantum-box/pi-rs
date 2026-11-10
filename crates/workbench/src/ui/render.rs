@@ -1,5 +1,6 @@
 //! Styled, terminal-safe transcript rendering shared by all themes.
 use std::io::Write;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use crossterm::{
@@ -19,6 +20,7 @@ use super::theme::Theme;
 pub struct Span {
     pub text: String,
     pub color: Color,
+    pub background: Option<Color>,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -30,6 +32,7 @@ impl Span {
         Self {
             text: clean(&text.into()),
             color,
+            background: None,
             bold: false,
             italic: false,
             underline: false,
@@ -52,6 +55,39 @@ impl Line {
             image: None,
         }
     }
+    pub fn style_bytes(&mut self, bytes: Range<usize>, style: impl Fn(&mut Span)) {
+        let mut offset = 0;
+        self.spans = std::mem::take(&mut self.spans)
+            .into_iter()
+            .flat_map(|span| {
+                let start = bytes.start.saturating_sub(offset);
+                let end = bytes.end.saturating_sub(offset).min(span.text.len());
+                offset += span.text.len();
+                if start >= end {
+                    return vec![span];
+                }
+                let mut pieces = Vec::with_capacity(3);
+                for (range, matched) in [
+                    (0..start, false),
+                    (start..end, true),
+                    (end..span.text.len(), false),
+                ] {
+                    if !range.is_empty() {
+                        let mut piece = Span {
+                            text: span.text[range].into(),
+                            ..span.clone()
+                        };
+                        if matched {
+                            style(&mut piece);
+                        }
+                        pieces.push(piece);
+                    }
+                }
+                pieces
+            })
+            .collect();
+    }
+
     pub fn draw(&self, out: &mut impl Write, width: usize) -> std::io::Result<()> {
         queue!(
             out,
@@ -63,6 +99,7 @@ impl Line {
             queue!(
                 out,
                 SetForegroundColor(span.color),
+                SetBackgroundColor(span.background.or(self.background).unwrap_or(Color::Reset)),
                 SetAttribute(if span.bold {
                     Attribute::Bold
                 } else {
@@ -101,6 +138,7 @@ impl Line {
         queue!(
             out,
             SetAttribute(Attribute::Reset),
+            SetBackgroundColor(self.background.unwrap_or(Color::Reset)),
             Print(" ".repeat(width.saturating_sub(used))),
             ResetColor
         )
