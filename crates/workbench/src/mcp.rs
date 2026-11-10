@@ -241,7 +241,7 @@ async fn elicit_url(
         }
         _ => return Ok(ElicitResult::new(ElicitationAction::Cancel)),
     }
-    open_browser(&url)
+    crate::oauth_callback::open_browser(&url)
         .await
         .map_err(|_| ErrorData::internal_error("could not launch browser", None))?;
     let answer = interaction
@@ -256,40 +256,6 @@ async fn elicit_url(
         Ok(pi_rs::UiResponse::Confirmed(true)) => ElicitationAction::Accept,
         _ => ElicitationAction::Cancel,
     }))
-}
-
-pub(crate) async fn open_browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("open");
-        command.arg("--").arg(url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("rundll32");
-        command.arg("url.dll,FileProtocolHandler").arg(url);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut command = {
-        let mut command = tokio::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    command
-        .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let status = tokio::time::timeout(Duration::from_secs(10), command.status())
-        .await
-        .map_err(|_| Error::Config("browser launch timed out".into()))?
-        .map_err(|_| Error::Config("could not launch browser".into()))?;
-    if !status.success() {
-        return Err(Error::Config("could not launch browser".into()));
-    }
-    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]

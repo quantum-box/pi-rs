@@ -615,7 +615,6 @@ async fn authorize(
 ) -> Result<Uuid> {
     use rmcp::transport::auth::{AuthorizationRequest, AuthorizationSession};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     safe_http_url(url)?;
     let (options, upgrade) = match &registration {
@@ -781,79 +780,18 @@ async fn authorize(
         .map(|(_, state)| state.into_owned())
         .ok_or_else(|| Error::Config("OAuth state is missing".into()))?;
     announce(session.get_authorization_url());
-    crate::mcp::open_browser(session.get_authorization_url()).await?;
+    crate::oauth_callback::open_browser(session.get_authorization_url()).await?;
     let receive = async {
-        loop {
-            let (mut stream, _) = listener.accept().await?;
-            let mut bytes = Vec::new();
-            let read = async {
-                while bytes.len() <= 8192 && !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
-                    let mut chunk = [0_u8; 1024];
-                    let count = stream.read(&mut chunk).await?;
-                    if count == 0 {
-                        break;
-                    }
-                    bytes.extend_from_slice(&chunk[..count]);
-                }
-                Ok::<_, std::io::Error>(())
-            };
-            if !tokio::time::timeout(Duration::from_secs(3), read)
-                .await
-                .is_ok_and(|result| result.is_ok())
-            {
-                continue;
-            }
-            let target = std::str::from_utf8(&bytes)
-                .ok()
-                .and_then(|request| request.lines().next())
-                .and_then(|line| line.strip_prefix("GET "))
-                .and_then(|line| line.strip_suffix(" HTTP/1.1"));
-            let target = target.filter(|target| {
-                target.starts_with('/')
-                    && !target.starts_with("//")
-                    && bytes.len() <= 8192
-                    && bytes.windows(4).any(|part| part == b"\r\n\r\n")
-            });
-            let redirect = target
-                .and_then(|target| callback.join(target).ok())
-                .filter(|target| {
-                    target.origin() == callback.origin()
-                        && target.path() == callback.path()
-                        && target.fragment().is_none()
-                });
-            let valid = redirect.filter(|redirect| {
-                let states: Vec<_> = redirect
-                    .query_pairs()
-                    .filter(|(name, _)| name == "state")
-                    .collect();
-                let codes = redirect
-                    .query_pairs()
-                    .filter(|(name, _)| name == "code")
-                    .count();
-                let errors = redirect
-                    .query_pairs()
-                    .filter(|(name, _)| name == "error")
-                    .count();
-                states.len() == 1 && states[0].1 == expected_state && codes + errors == 1
-            });
-            let Some(redirect) = valid else {
-                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 17\r\nConnection: close\r\n\r\nInvalid callback.").await;
-                continue;
-            };
-            if redirect.query_pairs().any(|(name, _)| name == "error") {
-                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 21\r\nConnection: close\r\n\r\nAuthorization failed.").await;
-                return Err(Error::Config("MCP OAuth authorization was declined".into()));
-            }
-            let _guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
-            let result = session.handle_callback_url(redirect.as_str()).await;
-            let response = if result.is_ok() {
-                b"HTTP/1.1 200 OK\r\nContent-Length: 34\r\nConnection: close\r\n\r\nSigned in. You may close this tab.".as_slice()
-            } else {
-                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 21\r\nConnection: close\r\n\r\nAuthorization failed.".as_slice()
-            };
-            let _ = stream.write_all(response).await;
-            return result.map(|_| ()).map_err(auth_error);
+        let incoming =
+            crate::oauth_callback::receive(&listener, &callback, &expected_state).await?;
+        if incoming.code().is_none() {
+            incoming.reply(false).await;
+            return Err(Error::Config("MCP OAuth authorization was declined".into()));
         }
+        let _guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
+        let result = session.handle_callback_url(incoming.url.as_str()).await;
+        incoming.reply(result.is_ok()).await;
+        result.map(|_| ()).map_err(auth_error)
     };
     tokio::select! {
         result = tokio::time::timeout(Duration::from_secs(600), receive) => result.map_err(|_| Error::Config("MCP login timed out".into()))?,

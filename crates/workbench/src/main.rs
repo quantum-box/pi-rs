@@ -29,6 +29,7 @@ mod packages;
 mod process;
 mod providers;
 use providers::Provider;
+mod radius_auth;
 mod resource_paths;
 mod resources;
 mod rpc;
@@ -530,6 +531,18 @@ enum Command {
         #[command(subcommand)]
         command: mcp_config::McpCommand,
     },
+    /// Sign in to Radius and save an endpoint-bound OAuth credential.
+    Login {
+        #[arg(value_parser = ["radius"])]
+        provider: String,
+        #[arg(long)]
+        device_code: bool,
+    },
+    /// Remove the saved Radius OAuth credential.
+    Logout {
+        #[arg(value_parser = ["radius"])]
+        provider: String,
+    },
     Run {
         prompt: String,
     },
@@ -866,6 +879,31 @@ async fn execute(mut args: Cli) -> Result<()> {
     }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
         return mcp_config::command(&args, command.clone()).await;
+    }
+    match args.command.as_ref() {
+        Some(Command::Login {
+            provider,
+            device_code,
+        }) => {
+            let gateway = radius_auth::Gateway::configured()?;
+            let method = if *device_code {
+                radius_auth::Method::Device
+            } else {
+                radius_auth::Method::Browser
+            };
+            tokio::select! {
+                result = gateway.login(method, |notice| eprintln!("{notice}")) => result?,
+                _ = tokio::signal::ctrl_c() => return Err(Error::Cancelled),
+            }
+            output(json!({"type":"logged_in","provider":provider}));
+            return Ok(());
+        }
+        Some(Command::Logout { provider }) => {
+            let removed = radius_auth::Gateway::configured()?.logout().await?;
+            output(json!({"type":"logged_out","provider":provider,"removed":removed}));
+            return Ok(());
+        }
+        _ => {}
     }
 
     let directory = interactive::session_path(&args.workspace, args.session_dir.as_deref())

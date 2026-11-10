@@ -20,6 +20,8 @@ mod coding_paths;
 mod file_search;
 pub mod mcp;
 pub mod mcp_auth;
+#[doc(hidden)]
+pub mod oauth_callback;
 mod shell_output;
 mod text_edit;
 mod text_page;

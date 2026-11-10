@@ -451,9 +451,14 @@ pub fn copy_text(text: &str) -> Result<()> {
 pub(super) enum ShareDestination {
     Radius {
         endpoint: reqwest::Url,
-        token: String,
+        credential: RadiusCredential,
     },
     Gist,
+}
+
+pub(super) enum RadiusCredential {
+    ApiKey(String),
+    OAuth(super::radius_auth::Gateway),
 }
 
 #[derive(Serialize)]
@@ -469,28 +474,36 @@ impl ShareDestination {
         if destination == "gist" {
             return Ok(Self::Gist);
         }
-        let Some(token) = std::env::var("RADIUS_API_KEY")
+        let gateway = super::radius_auth::Gateway::configured()?;
+        let endpoint = match std::env::var("PI_RS_RADIUS_SHARE_URL") {
+            Ok(url) => share_url(&url)?,
+            Err(_) => gateway.url("/v1/artifacts"),
+        };
+        let key = std::env::var("RADIUS_API_KEY")
             .ok()
-            .filter(|key| !key.trim().is_empty())
-        else {
+            .filter(|key| !key.trim().is_empty());
+        let credential = if let Some(key) = key {
+            RadiusCredential::ApiKey(key)
+        } else if gateway.url("/").origin() == endpoint.origin() && gateway.has_credential()? {
+            RadiusCredential::OAuth(gateway)
+        } else {
             return if destination == "radius" {
                 Err(Error::Config(
-                    "Radius authentication is not configured. Set RADIUS_API_KEY.".into(),
+                    "Radius authentication is not configured. Run '/login radius' or set RADIUS_API_KEY.".into(),
                 ))
             } else {
                 Ok(Self::Gist)
             };
         };
-        let endpoint = share_url(
-            &std::env::var("PI_RS_RADIUS_SHARE_URL")
-                .unwrap_or_else(|_| "https://radius.pi.dev/v1/artifacts".into()),
-        )?;
         if endpoint.query().is_some() || endpoint.fragment().is_some() {
             return Err(Error::Config(
                 "Radius share endpoint cannot include a query or fragment".into(),
             ));
         }
-        Ok(Self::Radius { endpoint, token })
+        Ok(Self::Radius {
+            endpoint,
+            credential,
+        })
     }
 
     pub(super) fn status(&self) -> &'static str {
@@ -504,11 +517,20 @@ impl ShareDestination {
         match self {
             Self::Radius {
                 mut endpoint,
-                token,
+                credential,
             } => {
                 let body = super::rpc_entries::Entries::new(&session)
                     .write_share_branch(&session, workspace)?;
                 drop(session);
+                let token = match credential {
+                    RadiusCredential::ApiKey(key) => key,
+                    RadiusCredential::OAuth(gateway) => gateway
+                        .access(std::time::Duration::from_secs(300))
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Config("Radius credentials were removed. Sign in again.".into())
+                        })?,
+                };
                 endpoint
                     .query_pairs_mut()
                     .append_pair("visibility", "organization")

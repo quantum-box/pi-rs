@@ -19,7 +19,7 @@ remaining acceptance work for that surface.
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, named profiles for those APIs, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
-| Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage | Model-provider OAuth and credential refresh |
+| Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh | OAuth and refresh for other model providers |
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Input hooks for queued SDK controls, remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; add/remove/list commands; tool catalog notifications | Provider-token forwarding and automatic default client metadata identity |
@@ -2183,9 +2183,9 @@ Radius receives the current branch as Pi v3 JSONL with organization
 visibility. Gist returns both the Pi viewer link and the Gist URL. The
 terminal shows upload progress and accepts Escape to cancel.
 
-This checkpoint authenticates Radius using `RADIUS_API_KEY`. The
-`PI_RS_RADIUS_SHARE_URL` environment override can point to a configured
-artifact endpoint. Native journals do not yet record the complete
+Radius accepts `RADIUS_API_KEY` and a saved OAuth credential for the
+gateway. The `PI_RS_RADIUS_SHARE_URL` environment override can point to a
+configured artifact endpoint. Native journals do not yet record the complete
 system prompt and tool schemas for the viewer's `pi.share` metadata.
 
 ### Streamed tool call arguments
@@ -2201,3 +2201,17 @@ object. Dispatch still uses the completed, journaled assistant response.
 A loopback server held the final argument fragment until the RPC client
 observed the first one. The fixture covered stable indexes after
 reasoning, final arguments and tool output, and abort before completion.
+
+### Radius OAuth
+
+`pi login radius` signs in through a local browser callback with PKCE
+and state validation. Use `--device-code` to sign in from another
+device. The terminal's `/login radius` offers both methods and Escape
+cancels the flow. `pi logout radius` and `/logout radius` clear the
+gateway's saved credentials.
+
+Credentials are private and bound to the configured `PI_RADIUS_GATEWAY`
+origin. Radius sharing refreshes expiring credentials, serializes
+concurrent refreshes and saves rotated refresh tokens. A local OAuth
+fixture exercised both login methods, a rejected callback, cancellation,
+concurrent refresh, endpoint isolation, authenticated share and logout.

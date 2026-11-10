@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Cli, TuiMode, process::Worker, sessions};
+use super::{Cli, TuiMode, process::Worker, radius_auth, sessions};
 
 pub(super) fn new_session_path() -> PathBuf {
     session_path(&std::env::current_dir().unwrap_or_default(), None)
@@ -189,11 +189,58 @@ struct ModelDiscovery {
     intent: ModelListIntent,
 }
 
-struct ShareTask {
+enum RemoteEvent {
+    Notice(String),
+    Finished(Result<Vec<String>>),
+}
+
+struct RemoteTask {
     status: &'static str,
+    cancelled: &'static str,
     started: Instant,
-    receiver: std::sync::mpsc::Receiver<Result<sessions::SharedSession>>,
+    receiver: std::sync::mpsc::Receiver<RemoteEvent>,
     _cancel: tokio::sync::oneshot::Sender<()>,
+}
+
+impl RemoteTask {
+    fn start<F, Fut>(status: &'static str, cancelled: &'static str, work: F) -> Self
+    where
+        F: FnOnce(std::sync::mpsc::Sender<RemoteEvent>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Vec<String>>>,
+    {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (cancel, cancel_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_rx => Ok(None),
+                        result = work(sender.clone()) => result.map(Some),
+                    }
+                })
+            })();
+            match result {
+                Ok(Some(lines)) => {
+                    let _ = sender.send(RemoteEvent::Finished(Ok(lines)));
+                }
+                Err(error) => {
+                    let _ = sender.send(RemoteEvent::Finished(Err(error)));
+                }
+                Ok(None) => {}
+            }
+        });
+        Self {
+            status,
+            cancelled,
+            started: Instant::now(),
+            receiver,
+            _cancel: cancel,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -212,7 +259,7 @@ struct View {
     session_name: Option<String>,
     resources: super::resources::Resources,
     model_list: Option<ModelDiscovery>,
-    share: Option<ShareTask>,
+    remote_task: Option<RemoteTask>,
     available_models: Vec<String>,
     pending_request: Option<Value>,
     thinking: String,
@@ -333,11 +380,11 @@ impl View {
     }
 
     fn draft_status(&self) -> String {
-        if let Some(share) = &self.share {
+        if let Some(task) = &self.remote_task {
             format!(
                 "{} {:.1}s · Esc cancels · ",
-                share.status,
-                share.started.elapsed().as_secs_f32()
+                task.status,
+                task.started.elapsed().as_secs_f32()
             )
         } else if self.clipboard.is_some() {
             "Reading clipboard · ".into()
@@ -1346,40 +1393,19 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             let status = destination.status();
             let path = args.session.clone();
             let workspace = args.workspace.clone();
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let (cancel, cancelled) = tokio::sync::oneshot::channel();
-            std::thread::spawn(move || {
-                let result = (|| {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-                    runtime.block_on(async {
-                        tokio::select! {
-                            biased;
-                            _ = cancelled => Ok(None),
-                            result = async {
-                                let session = Session::snapshot(path)?;
-                                destination.share(session, &workspace).await
-                            } => result.map(Some),
-                        }
-                    })
-                })();
-                match result {
-                    Ok(Some(shared)) => {
-                        let _ = sender.send(Ok(shared));
-                    }
-                    Err(error) => {
-                        let _ = sender.send(Err(error));
-                    }
-                    Ok(None) => {}
-                }
-            });
-            view.share = Some(ShareTask {
+            view.remote_task = Some(RemoteTask::start(
                 status,
-                started: Instant::now(),
-                receiver,
-                _cancel: cancel,
-            });
+                "Share cancelled",
+                move |_| async move {
+                    let session = Session::snapshot(path)?;
+                    let shared = destination.share(session, &workspace).await?;
+                    let mut lines = vec![format!("Share URL: {}", shared.url)];
+                    if let Some(gist) = shared.gist {
+                        lines.push(format!("Gist: {gist}"));
+                    }
+                    Ok(lines)
+                },
+            ));
         }
         "/model" if rest.is_empty() => {
             args.reload_model_profiles()?;
@@ -1389,10 +1415,18 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
         }
+        "/login" if rest.eq_ignore_ascii_case("radius") => show_radius_methods(view),
+        "/login" if rest.eq_ignore_ascii_case("radius browser") => {
+            start_radius_login(view, radius_auth::Method::Browser)?;
+        }
+        "/login" if rest.eq_ignore_ascii_case("radius device-code") => {
+            start_radius_login(view, radius_auth::Method::Device)?;
+        }
+        "/logout" if rest.eq_ignore_ascii_case("radius") => start_radius_logout(view)?,
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
-                let items = args
+                let mut items = args
                     .model_profiles
                     .providers()
                     .filter(|provider| login || args.model_keys.has(provider))
@@ -1405,14 +1439,28 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                         },
                     })
                     .collect::<Vec<_>>();
+                if login
+                    || radius_auth::Gateway::configured()
+                        .and_then(|gateway| gateway.has_credential())
+                        .unwrap_or(false)
+                {
+                    items.push(Item {
+                        label: "radius · OAuth".into(),
+                        selection: if login {
+                            Selection::RadiusMethods
+                        } else {
+                            Selection::LogoutRadius
+                        },
+                    });
+                }
                 if items.is_empty() {
-                    view.append("No saved provider API keys");
+                    view.append("No saved provider credentials");
                 } else {
                     view.picker = Some(Picker::new(
                         if login {
-                            "Save provider API key"
+                            "Sign in to a provider"
                         } else {
-                            "Remove saved provider API key"
+                            "Sign out of a provider"
                         },
                         items,
                     ));
@@ -1985,15 +2033,18 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
         }
-        if let Some(share) = &view.share {
-            match share.receiver.try_recv() {
-                Ok(result) => {
-                    view.share = None;
+        if let Some(task) = &view.remote_task {
+            match task.receiver.try_recv() {
+                Ok(RemoteEvent::Notice(notice)) => {
+                    view.append(&notice);
+                    dirty = true;
+                }
+                Ok(RemoteEvent::Finished(result)) => {
+                    view.remote_task = None;
                     match result {
-                        Ok(shared) => {
-                            view.append(&format!("Share URL: {}", shared.url));
-                            if let Some(gist) = shared.gist {
-                                view.append(&format!("Gist: {gist}"));
+                        Ok(lines) => {
+                            for line in lines {
+                                view.append(&line);
                             }
                         }
                         Err(error) => view.append(&error.to_string()),
@@ -2001,8 +2052,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    view.share = None;
-                    view.append("Share stopped");
+                    view.remote_task = None;
+                    view.append("Operation stopped");
                     dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -2010,7 +2061,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         }
         dirty |= view.poll_clipboard();
         if (dirty && last_frame.elapsed() >= frame_interval)
-            || ((is_busy(&worker) || view.share.is_some())
+            || ((is_busy(&worker) || view.remote_task.is_some())
                 && last_frame.elapsed() >= Duration::from_millis(100))
         {
             view.draw(&args, &theme, is_busy(&worker))?;
@@ -2064,7 +2115,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
             Event::Paste(text) => {
-                if view.share.is_some() {
+                if view.remote_task.is_some() {
                     continue;
                 }
                 last_idle_interrupt = None;
@@ -2079,10 +2130,11 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
-                if view.share.is_some() {
+                if let Some(task) = &view.remote_task {
                     if keys.action(key, true) == Some("app.interrupt") {
-                        view.share = None;
-                        view.append("Share cancelled");
+                        let message = task.cancelled;
+                        view.remote_task = None;
+                        view.append(message);
                     }
                     continue;
                 }
@@ -2786,6 +2838,56 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     Ok(())
 }
 
+fn show_radius_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Sign in to Radius",
+        vec![
+            Item {
+                label: "Sign in with browser".into(),
+                selection: Selection::LoginRadius(radius_auth::Method::Browser),
+            },
+            Item {
+                label: "Sign in with device code".into(),
+                selection: Selection::LoginRadius(radius_auth::Method::Device),
+            },
+        ],
+    ));
+}
+
+fn start_radius_login(view: &mut View, method: radius_auth::Method) -> Result<()> {
+    let gateway = radius_auth::Gateway::configured()?;
+    view.remote_task = Some(RemoteTask::start(
+        "Signing in to Radius",
+        "Radius login cancelled",
+        move |sender| async move {
+            gateway
+                .login(method, |notice| {
+                    let _ = sender.send(RemoteEvent::Notice(notice.to_string()));
+                })
+                .await?;
+            Ok(vec!["Signed in to Radius".into()])
+        },
+    ));
+    Ok(())
+}
+
+fn start_radius_logout(view: &mut View) -> Result<()> {
+    let gateway = radius_auth::Gateway::configured()?;
+    view.remote_task = Some(RemoteTask::start(
+        "Signing out of Radius",
+        "Radius logout cancelled",
+        move |_| async move {
+            let message = if gateway.logout().await? {
+                "Signed out of Radius"
+            } else {
+                "No saved Radius credentials"
+            };
+            Ok(vec![message.into()])
+        },
+    ));
+    Ok(())
+}
+
 fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
     if view.model_list.is_some() {
         return;
@@ -3021,6 +3123,9 @@ fn select(
         }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
         Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
+        Selection::RadiusMethods => show_radius_methods(view),
+        Selection::LoginRadius(method) => start_radius_login(view, method)?,
+        Selection::LogoutRadius => start_radius_logout(view)?,
         Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
