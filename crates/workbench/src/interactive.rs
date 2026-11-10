@@ -354,6 +354,7 @@ struct View {
     scrollbar_dragging: bool,
     flash: Option<(String, Instant)>,
     tokens: u64,
+    cache_stats: super::cache_stats::Tracker,
     model_operations: std::collections::HashSet<String>,
     history: Vec<String>,
     history_index: Option<usize>,
@@ -567,6 +568,37 @@ impl View {
             self.regular.committed = self.regular.committed.saturating_sub(removed);
         }
     }
+    fn observe_cache(&mut self, record: &pi_rs::Record, args: &Cli) {
+        if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
+            && args.settings.boolean("showCacheMissNotices") == Some(true)
+        {
+            self.lines.push(Entry::Warning(notice));
+        }
+    }
+
+    fn receive_worker(&mut self, mut value: Value, args: &Cli) {
+        self.receive(&value);
+        if value["type"] == "record"
+            && matches!(
+                value["record"]["event"]["type"].as_str(),
+                Some(
+                    "model_selected"
+                        | "model_requested"
+                        | "model_finished"
+                        | "assistant"
+                        | "compacted"
+                        | "branch_summary"
+                )
+            )
+            && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
+        {
+            if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
+                self.cache_stats.select_provider(args.provider.id());
+            }
+            self.observe_cache(&record, args);
+        }
+    }
+
     fn restore(&mut self, args: &Cli) -> Result<()> {
         let session = Session::open(&args.session)?;
         if session.host_binding().is_some() {
@@ -598,6 +630,7 @@ impl View {
         self.history.clear();
         self.history_index = None;
         self.tokens = 0;
+        self.cache_stats = super::cache_stats::Tracker::default();
         self.model_operations.clear();
         for record in session.branch() {
             match &record.event {
@@ -677,6 +710,7 @@ impl View {
                 }
                 _ => {}
             }
+            self.observe_cache(record, args);
         }
         if show_startup_header(args) {
             self.append(if crate::ui::keys::windows_keybindings() {
@@ -795,7 +829,7 @@ impl View {
             *finished = true;
         }
     }
-    fn receive(&mut self, value: Value) {
+    fn receive(&mut self, value: &Value) {
         match value["type"].as_str() {
             Some("response") if value["command"] == "clear_queue" && self.restoring_queue => {
                 self.restoring_queue = false;
@@ -1660,6 +1694,23 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 &args.session,
                 &session,
             ))?);
+            let stats = &view.cache_stats;
+            if stats.miss_count > 0 {
+                let cost = if stats.missed_cost >= 0.0001 {
+                    format!(" ${:.3}", stats.missed_cost)
+                } else {
+                    String::new()
+                };
+                let misses = if stats.miss_count == 1 {
+                    "miss"
+                } else {
+                    "misses"
+                };
+                view.append(&format!(
+                    "Cache Re-billed{cost} ({} tokens, {} {misses})",
+                    stats.missed_tokens, stats.miss_count
+                ));
+            }
         }
         "/name" => {
             let mut session = Session::open(&args.session)?;
@@ -2406,7 +2457,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         view.request_started = None;
                     }
                 }
-                view.receive(value);
+                view.receive_worker(value, &args);
                 if settled {
                     active.busy = false;
                     view.dialogs.clear();
@@ -2439,7 +2490,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     let _ = reader.join();
                 }
                 for value in finished.events.try_iter() {
-                    view.receive(value);
+                    view.receive_worker(value, &args);
                 }
                 view.settle();
                 view.dialogs.clear();
@@ -3066,6 +3117,25 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     selection: Selection::Setting(
                                         "hideThinkingBlock".into(),
                                         json!(!view.hide_thinking),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
+                                        "Cache miss notices · {} (toggle)",
+                                        if args.settings.boolean("showCacheMissNotices")
+                                            == Some(true)
+                                        {
+                                            "on"
+                                        } else {
+                                            "off"
+                                        }
+                                    ),
+                                    selection: Selection::Setting(
+                                        "showCacheMissNotices".into(),
+                                        json!(
+                                            args.settings.boolean("showCacheMissNotices")
+                                                != Some(true)
+                                        ),
                                     ),
                                 },
                                 Item {
@@ -4433,7 +4503,7 @@ mod tests {
             ("thinking", "思考中"),
             ("generating", "回答生成中"),
         ] {
-            view.receive(json!({"type":"model_progress","stage":stage}));
+            view.receive(&json!({"type":"model_progress","stage":stage}));
             assert_eq!(view.phase, Some(label));
         }
         assert!(view.streaming.is_empty());

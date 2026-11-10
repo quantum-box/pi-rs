@@ -2671,3 +2671,13 @@ prompt cache lifetimes. JSON model listings, RPC, and Codemode include
 the metadata. Custom declarations merge individual limit, resize, and
 lifetime fields. Release checks covered the offline catalogs, nested
 overrides, invalid values, and the existing image resize and cost paths.
+
+### Cache miss notices checkpoint
+
+`showCacheMissNotices` is available from `/settings` and defaults off.
+Both terminal modes derive notices from measured, completed chat turns
+during a run and when reopening a session. Model switches and recorded
+idle gaps appear in the notice. `/session` totals re-billed tokens and
+estimated cost even when notices are disabled. Compaction and branch
+summaries reset the comparison baseline. Failed requests and summary
+usage stay out of the conversation cache comparison.

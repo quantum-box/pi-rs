@@ -17,6 +17,7 @@ mod attachments;
 mod auth_cli;
 mod backend;
 mod builtin_chat;
+mod cache_stats;
 mod cli_compat;
 mod clipboard;
 mod config;

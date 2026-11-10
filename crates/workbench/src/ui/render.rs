@@ -183,6 +183,7 @@ pub enum ToolPart {
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
+    Warning(String),
     User(String),
     Assistant(String),
     Thinking(String),
@@ -218,6 +219,9 @@ impl Entry {
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::new(text, theme.color("muted"))], width),
+            Self::Warning(text) => {
+                return wrap(&[Span::new(text, theme.color("warning"))], width);
+            }
             Self::User(text) => {
                 let mut lines = wrap(&[Span::new(text, theme.color("userMessageText"))], inner);
                 for line in &mut lines {
