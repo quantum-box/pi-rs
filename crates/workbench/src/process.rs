@@ -142,6 +142,16 @@ impl Worker {
         if args.mode == Some(super::OutputMode::Rpc) {
             command.args(["--mode", "rpc"]);
         }
+        for (name, value) in &args.extension_flags {
+            match value {
+                pi_rs::ExtensionFlagValue::Boolean(true) => command.arg(format!("--{name}")),
+                pi_rs::ExtensionFlagValue::Boolean(false) => command.arg(format!("--{name}=false")),
+                pi_rs::ExtensionFlagValue::String(value) => {
+                    command.arg(format!("--{name}={value}"))
+                }
+            };
+        }
+
         command
             .args(operation)
             .stdin(Stdio::piped())
@@ -269,6 +279,7 @@ fn configuration(args: &Cli) -> Value {
     json!({
         "workspace":args.workspace,
         "provider":args.provider.id(),"endpoint":args.model_endpoint_for(&args.provider, Some(&args.model)),"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
+        "extension_flags":args.extension_flags,
         "model_profiles":args.model_profiles.revision(),"model_keys":args.model_keys.revision(),
         "block_images":args.settings.block_model_images(),
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,

@@ -69,6 +69,8 @@ struct Cli {
     #[arg(skip)]
     model_keys: model_auth::Keys,
     #[arg(skip)]
+    extension_flags: cli_compat::ExtensionFlags,
+    #[arg(skip)]
     initial_connection: Option<(Provider, String)>,
     #[arg(skip)]
     initial_model_endpoint: Option<String>,
@@ -747,10 +749,27 @@ fn main() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() {
-    let matches = cli_compat::parse(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    let (matches, extension_flags) =
+        cli_compat::parse(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        args.extension_flags = extension_flags;
+        if let Some(flag) = args.extension_flags.keys().next()
+            && !matches!(
+                args.command,
+                None | Some(
+                    Command::Run { .. }
+                        | Command::Resume
+                        | Command::Interactive
+                        | Command::Serve
+                        | Command::Compact { .. }
+                        | Command::Review { .. }
+                )
+            )
+        {
+            return Err(Error::Config(format!("unknown option --{flag}")));
+        }
         args.offline |= std::env::var("PI_OFFLINE").ok().is_some_and(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),

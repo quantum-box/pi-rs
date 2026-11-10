@@ -2,7 +2,7 @@
 pub mod codemode;
 mod process;
 pub mod tool_search;
-pub use process::{ExecutableExtension, serve_extension};
+pub use process::{ExecutableExtension, extension_flag, serve_extension};
 use std::sync::Arc;
 
 use pi_rs_core::{

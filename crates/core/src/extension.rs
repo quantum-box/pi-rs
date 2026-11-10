@@ -11,6 +11,23 @@ use crate::{
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
 
+/// A native extension's command-line option and its default value.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExtensionFlag {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub default: ExtensionFlagValue,
+}
+
+/// Command-line flag types supported by native extensions.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ExtensionFlagValue {
+    Boolean(bool),
+    String(String),
+}
+
 pub struct ToolContext {
     /// Persisted before execution. Pass this to external systems as an idempotency or lookup key.
     pub operation_id: Uuid,
@@ -186,6 +203,11 @@ pub trait Extension: Send + Sync {
 
     fn commands(&self) -> &[&str] {
         &[]
+    }
+
+    /// Flags exposed to the host by this extension.
+    fn cli_flags(&self) -> Vec<ExtensionFlag> {
+        Vec::new()
     }
 
     /// Command names owned by a runtime-loaded extension.

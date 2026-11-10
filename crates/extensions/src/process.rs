@@ -1,20 +1,62 @@
 //! Versioned process boundary for user-authored Rust extensions.
+use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use pi_rs_core::{
-    CancellationToken, Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState,
-    InputAction, InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RequestPurpose,
-    Result, Tool, ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec,
+    CancellationToken, Compaction, Decision, Error, Extension, ExtensionFlag, ExtensionFlagValue,
+    ExtensionResult, ExtensionState, InputAction, InputEvent, LifecycleEvent, Message,
+    ModelRequest, Outcome, RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost,
+    ToolReply, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
 const PROTOCOL: u16 = 1;
+const FLAGS_ENV: &str = "PI_RS_NATIVE_EXTENSION_FLAGS";
+
+/// Read a configured flag in a native executable extension callback.
+pub fn extension_flag(name: &str) -> Option<ExtensionFlagValue> {
+    static FLAGS: LazyLock<BTreeMap<String, ExtensionFlagValue>> = LazyLock::new(|| {
+        std::env::var(FLAGS_ENV)
+            .ok()
+            .and_then(|values| serde_json::from_str(&values).ok())
+            .unwrap_or_default()
+    });
+    FLAGS.get(name).cloned()
+}
+
+#[derive(Clone)]
+struct Endpoint {
+    path: PathBuf,
+    flags: Option<Arc<str>>,
+}
+
+impl Endpoint {
+    fn command(&self, protocol: &str) -> Command {
+        let mut command = Command::new(&self.path);
+        if let Some(flags) = &self.flags {
+            command.env(FLAGS_ENV, flags.as_ref());
+        } else {
+            command.env_remove(FLAGS_ENV);
+        }
+        command
+            .arg(protocol)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        command
+    }
+}
 
 fn extension_context(request: &ModelRequest) -> ModelRequest {
     ModelRequest {
@@ -149,6 +191,8 @@ struct Description {
     id: String,
     dependencies: Vec<String>,
     commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    flags: Vec<ExtensionFlag>,
     tools: Vec<DescriptionTool>,
     #[serde(default)]
     host_calls: bool,
@@ -204,7 +248,7 @@ impl From<DecisionValue> for Decision {
 /// Explicitly selected native executable. State is supplied by the journal on
 /// every request, so a process restart does not reset its logical state.
 pub struct ExecutableExtension {
-    executable: PathBuf,
+    endpoint: Endpoint,
     description: Description,
 }
 impl ExecutableExtension {
@@ -213,25 +257,84 @@ impl ExecutableExtension {
         if !executable.is_file() {
             return Err(Error::Config("extension executable must be a file".into()));
         }
+        let endpoint = Endpoint {
+            path: executable,
+            flags: None,
+        };
         let description =
-            call(&executable, ProtocolRequest::Describe, None).map_err(Error::Config)?;
-        Ok(Self {
-            executable,
+            call(&endpoint, ProtocolRequest::Describe, None).map_err(Error::Config)?;
+        let mut extension = Self {
+            endpoint,
             description,
-        })
+        };
+        extension.apply_flags(&mut BTreeMap::new())?;
+        Ok(extension)
+    }
+
+    /// Apply the values owned by this executable, leaving other flags for the host.
+    pub fn apply_flags(
+        &mut self,
+        overrides: &mut BTreeMap<String, ExtensionFlagValue>,
+    ) -> Result<()> {
+        let mut values = BTreeMap::new();
+        for flag in &self.description.flags {
+            if flag.name.is_empty()
+                || flag.name.len() > 128
+                || !flag.name.as_bytes()[0].is_ascii_alphabetic()
+                || !flag
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+                || values.contains_key(&flag.name)
+            {
+                return Err(Error::Config(format!(
+                    "invalid or duplicate extension flag {:?}",
+                    flag.name
+                )));
+            }
+            let value = match (overrides.get(&flag.name).cloned(), &flag.default) {
+                (None, default) => default.clone(),
+                (Some(ExtensionFlagValue::Boolean(value)), ExtensionFlagValue::Boolean(_)) => {
+                    ExtensionFlagValue::Boolean(value)
+                }
+                (Some(ExtensionFlagValue::String(value)), ExtensionFlagValue::Boolean(_)) => {
+                    ExtensionFlagValue::Boolean(value.parse::<bool>().map_err(|_| {
+                        Error::Config(format!("--{} requires true or false", flag.name))
+                    })?)
+                }
+                (Some(ExtensionFlagValue::String(value)), ExtensionFlagValue::String(_)) => {
+                    ExtensionFlagValue::String(value)
+                }
+                (Some(ExtensionFlagValue::Boolean(_)), ExtensionFlagValue::String(_)) => {
+                    return Err(Error::Config(format!("--{} requires a value", flag.name)));
+                }
+            };
+            values.insert(flag.name.clone(), value);
+        }
+        if !values.is_empty() {
+            let encoded = serde_json::to_string(&values)?;
+            if encoded.len() > 16 * 1024 {
+                return Err(Error::Config("native extension flags exceed 16 KiB".into()));
+            }
+            self.endpoint.flags = Some(Arc::from(encoded));
+            for name in values.keys() {
+                overrides.remove(name);
+            }
+        }
+        Ok(())
     }
     fn request<T: serde::de::DeserializeOwned>(
         &self,
         request: ProtocolRequest,
     ) -> ExtensionResult<T> {
-        call(&self.executable, request, None)
+        call(&self.endpoint, request, None)
     }
 
     async fn request_async<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         request: ProtocolRequest,
     ) -> ExtensionResult<T> {
-        let path = self.executable.clone();
+        let path = self.endpoint.clone();
         let guard = CancelOnDrop(CancellationToken::new());
         let cancelled = guard.0.clone();
         tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
@@ -253,7 +356,10 @@ impl Extension for ExecutableExtension {
             .collect()
     }
     fn command_source(&self) -> Option<&Path> {
-        Some(&self.executable)
+        Some(&self.endpoint.path)
+    }
+    fn cli_flags(&self) -> Vec<ExtensionFlag> {
+        self.description.flags.clone()
     }
     fn command_names(&self) -> Vec<&str> {
         self.description
@@ -268,7 +374,7 @@ impl Extension for ExecutableExtension {
             .iter()
             .map(|tool| {
                 Arc::new(ExecutableTool {
-                    executable: self.executable.clone(),
+                    endpoint: self.endpoint.clone(),
                     spec: tool.spec.clone(),
                     execution: tool.execution,
                     can_poll: tool.can_poll,
@@ -370,7 +476,7 @@ impl Extension for ExecutableExtension {
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
         };
-        let path = self.executable.clone();
+        let path = self.endpoint.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
         let cancelled = guard.0.clone();
         let result: DecisionValue =
@@ -420,7 +526,7 @@ impl Extension for ExecutableExtension {
 }
 
 struct ExecutableTool {
-    executable: PathBuf,
+    endpoint: Endpoint,
     spec: ToolSpec,
     execution: ToolExecution,
     can_poll: bool,
@@ -434,7 +540,7 @@ impl ExecutableTool {
         request: ProtocolRequest,
         cancellation: CancellationToken,
     ) -> ExtensionResult<T> {
-        let path = self.executable.clone();
+        let path = self.endpoint.clone();
         let guard = CancelOnDrop(cancellation.child_token());
         let cancelled = guard.0.clone();
         tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
@@ -464,7 +570,7 @@ impl ExecutableTool {
             programmatic,
         };
         if self.host_calls {
-            let path = self.executable.clone();
+            let path = self.endpoint.clone();
             let guard = CancelOnDrop(context.cancellation.child_token());
             let cancellation = guard.0.clone();
             let runtime = tokio::runtime::Handle::current();
@@ -564,7 +670,7 @@ impl Tool for ExecutableTool {
             reference: reference.into(),
             operation_id: context.operation_id.to_string(),
         };
-        let path = self.executable.clone();
+        let path = self.endpoint.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
         let cancelled = guard.0.clone();
         tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
@@ -634,23 +740,13 @@ fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Exten
 }
 
 fn call_duplex(
-    path: &Path,
+    endpoint: &Endpoint,
     request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
     cancellation: &CancellationToken,
     runtime: &tokio::runtime::Handle,
 ) -> ExtensionResult<ToolReply> {
-    let mut command = Command::new(path);
-    command
-        .arg("--pi-rs-extension-v2")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    let command = endpoint.command("--pi-rs-extension-v2");
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
     let output = child.stdout().take().expect("piped stdout");
@@ -818,7 +914,7 @@ impl Drop for CancelOnDrop {
 }
 
 fn call<T: serde::de::DeserializeOwned>(
-    path: &Path,
+    endpoint: &Endpoint,
     request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
@@ -826,17 +922,7 @@ fn call<T: serde::de::DeserializeOwned>(
     if bytes.len() as u64 > MAX_MESSAGE {
         return Err("extension request exceeds 4 MiB".into());
     }
-    let mut command = Command::new(path);
-    command
-        .arg("--pi-rs-extension-v1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    let command = endpoint.command("--pi-rs-extension-v1");
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
     let output = child.stdout().take().expect("piped stdout");
@@ -1019,6 +1105,7 @@ async fn dispatch_with_host(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            flags: extension.cli_flags(),
             host_calls: true,
             input_hook: extension.handles_input(),
             lifecycle_hook: extension.handles_lifecycle(),

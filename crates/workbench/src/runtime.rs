@@ -379,6 +379,8 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
                 .map(|path| path.to_string_lossy().into_owned()),
         );
         let mut seen = std::collections::BTreeSet::new();
+        let mut flags = args.extension_flags.clone();
+        let mut flag_names = super::cli_compat::reserved_flag_names();
         for name in extension_names
             .iter()
             .filter(|name| seen.insert((*name).clone()))
@@ -392,8 +394,25 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
                         "unsupported native built-in extension {name}"
                     )));
                 }
-                _ => extensions.push(Arc::new(pi_rs_extensions::ExecutableExtension::load(name)?)),
+                _ => {
+                    let mut extension = pi_rs_extensions::ExecutableExtension::load(name)?;
+                    if !args.disable_extension.iter().any(|id| id == extension.id()) {
+                        for flag in extension.cli_flags() {
+                            if !flag_names.insert(flag.name.clone()) {
+                                return Err(pi_rs::Error::Config(format!(
+                                    "extension flag --{} is already registered",
+                                    flag.name
+                                )));
+                            }
+                        }
+                        extension.apply_flags(&mut flags)?;
+                    }
+                    extensions.push(Arc::new(extension));
+                }
             }
+        }
+        if let Some(name) = flags.keys().next() {
+            return Err(pi_rs::Error::Config(format!("unknown option --{name}")));
         }
         #[cfg(feature = "evaluation-fixtures")]
         if let Some(endpoint) = args.fixtures.as_deref() {
