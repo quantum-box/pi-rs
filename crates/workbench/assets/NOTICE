@@ -28,3 +28,5 @@ Pi v1.5.0 session-selector.ts.
 Numbered edit result layout in src/text_edit.rs follows Pi v1.5.0 edit-diff.ts.
 
 Edit matching diagnostics in src/text_edit.rs follow Pi v1.5.0 edit-diff.ts.
+
+Model scope resolution in src/model_selection.rs follows Pi v1.5.0 model-resolver.ts.

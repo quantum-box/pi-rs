@@ -36,6 +36,10 @@
     "defaultModel": {
       "type": "string"
     },
+    "enabledModels": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
     "sessionDir": {
       "type": "string"
     },

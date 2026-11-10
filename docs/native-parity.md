@@ -1792,3 +1792,24 @@ a tag or namespace is interpreted only once.
 CLI and RPC loopback checks cover provider validation, qualified discovery,
 thinking suffixes, and literal tagged IDs through a worker. Workspace tests
 and all-target Clippy pass.
+
+### Model scope resolution checkpoint
+
+Startup uses `enabledModels` when a CLI model scope is absent. CLI scope
+patterns take precedence. Exact catalog IDs beat partial matching, including
+literal brackets and thinking-like tags. A partial ID selects the latest
+matching alias before dated versions. Globs can match both bare and qualified
+IDs, respect slash boundaries, and retain all matches in catalog order.
+
+Scope diagnostics warn about unmatched patterns and invalid thinking suffixes.
+The resolver keeps valid candidates and falls back to normal model selection
+when every pattern misses. Pattern order and the first occurrence of each
+model determine cycling order and thinking settings. Listing filters match
+multiple whitespace- or slash-separated terms against provider and ID.
+
+Catalog-backed model references share the partial resolver. Direct startup
+uses the literal/suffix fallback when it has no catalog. The available
+catalog currently comes from the configured Ollama-compatible endpoint.
+
+The pinned reference comparison, CLI/RPC checks, workspace tests and all-target
+Clippy pass.

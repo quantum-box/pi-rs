@@ -14,88 +14,164 @@ pub fn unqualified(value: &str) -> &str {
         .map_or(value, |(_, model)| model.trim())
 }
 
-pub fn split(value: &str, available: &[String]) -> Result<Choice> {
-    let named = unqualified(value);
-    if named.is_empty() {
-        return Err(Error::Config("model ID is required".into()));
-    }
-    if let Some(model) = available
+fn exact<'a>(value: &str, available: &'a [String]) -> Option<&'a String> {
+    available
         .iter()
-        .find(|model| model.eq_ignore_ascii_case(named))
+        .find(|model| model.eq_ignore_ascii_case(unqualified(value)))
         .or_else(|| {
             available
                 .iter()
                 .find(|model| model.eq_ignore_ascii_case(value.trim()))
         })
-    {
-        return Ok(Choice {
-            model: model.clone(),
-            thinking: None,
-        });
-    }
-    if let Some((model, thinking)) = named.rsplit_once(':')
-        && !model.is_empty()
+}
+
+fn thinking_suffix(value: &str) -> Option<(&str, &str)> {
+    let (model, thinking) = value.rsplit_once(':')?;
+    (!model.is_empty()
         && matches!(
             thinking,
             "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-        )
-    {
-        return Ok(Choice {
-            model: model.into(),
-            thinking: Some(thinking.into()),
-        });
-    }
-    Ok(Choice {
-        model: named.into(),
-        thinking: None,
+        ))
+    .then_some((model, thinking))
+}
+
+fn is_alias(model: &str) -> bool {
+    !model.rsplit_once('-').is_some_and(|(_, suffix)| {
+        suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit())
     })
 }
-pub fn scope(patterns: &str, available: &[String]) -> Result<Vec<Choice>> {
-    let mut choices: Vec<Choice> = Vec::new();
-    for value in patterns.split(',').map(str::trim) {
-        if value.is_empty() {
-            return Err(Error::Config(
-                "model scope contains an empty pattern".into(),
+
+fn partial<'a>(value: &str, available: &'a [String]) -> Option<&'a String> {
+    let query = unqualified(value).to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    available
+        .iter()
+        .filter_map(|model| {
+            let lower = model.to_lowercase();
+            lower
+                .contains(&query)
+                .then_some(((is_alias(model), lower), model))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, model)| model)
+}
+
+fn catalog_choice(
+    value: &str,
+    available: &[String],
+    lenient: bool,
+) -> Option<(Choice, Option<String>)> {
+    let mut text = value.trim();
+    let mut thinking = None;
+    let mut warning = None;
+    loop {
+        if let Some(model) = exact(text, available).or_else(|| partial(text, available)) {
+            return Some((
+                Choice {
+                    model: model.clone(),
+                    thinking: if warning.is_some() { None } else { thinking },
+                },
+                warning,
             ));
         }
-        let choice = split(value, available)?;
-        let exact = available
-            .iter()
-            .find(|model| model.eq_ignore_ascii_case(&choice.model));
-        let matches: Vec<_> = if let Some(model) = exact {
-            vec![model]
-        } else if choice.model.contains(['*', '?']) {
-            let matcher = globset::GlobBuilder::new(&choice.model)
-                .case_insensitive(true)
-                .build()
-                .map_err(|error| Error::Config(error.to_string()))?
-                .compile_matcher();
-            available
-                .iter()
-                .filter(|model| matcher.is_match(model))
-                .collect()
+        if let Some((base, level)) = thinking_suffix(text) {
+            thinking.get_or_insert_with(|| level.to_owned());
+            text = base;
+        } else if lenient {
+            let (base, suffix) = text.rsplit_once(':')?;
+            if base.is_empty() {
+                return None;
+            }
+            warning.get_or_insert_with(|| format!("Invalid thinking level \"{suffix}\" in pattern \"{value}\". Using default instead."));
+            text = base;
         } else {
-            available
-                .iter()
-                .filter(|model| fuzzy(&choice.model, model))
-                .collect()
-        };
-        if matches.is_empty() {
-            return Err(Error::Config(format!(
-                "no available model matches {:?}",
-                choice.model
-            )));
+            return None;
         }
-        for model in matches {
-            if choices.iter().all(|choice| choice.model != *model) {
-                choices.push(Choice {
+    }
+}
+
+pub fn split(value: &str, available: &[String]) -> Result<Choice> {
+    let named = unqualified(value);
+    if named.is_empty() {
+        return Err(Error::Config("model ID is required".into()));
+    }
+    if let Some((choice, _)) = catalog_choice(value, available, false) {
+        return Ok(choice);
+    }
+    let (model, thinking) = thinking_suffix(named).map_or((named, None), |(model, level)| {
+        (model, Some(level.to_owned()))
+    });
+    Ok(Choice {
+        model: model.into(),
+        thinking,
+    })
+}
+
+#[derive(Default)]
+pub struct Scope {
+    pub choices: Vec<Choice>,
+    pub warnings: Vec<String>,
+}
+
+pub fn scope<'a>(patterns: impl IntoIterator<Item = &'a str>, available: &[String]) -> Scope {
+    let mut scope = Scope::default();
+    for pattern in patterns
+        .into_iter()
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+    {
+        let choices = if pattern.contains(['*', '?', '[']) {
+            let (pattern, thinking) = thinking_suffix(pattern)
+                .map_or((pattern, None), |(base, level)| (base, Some(level)));
+            let matches = if let Some(model) = exact(pattern, available) {
+                vec![model]
+            } else if let Ok(glob) = globset::GlobBuilder::new(pattern)
+                .case_insensitive(true)
+                .literal_separator(true)
+                .backslash_escape(true)
+                .build()
+            {
+                let matcher = glob.compile_matcher();
+                available
+                    .iter()
+                    .filter(|model| {
+                        matcher.is_match(model) || matcher.is_match(format!("ollama/{model}"))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            matches
+                .into_iter()
+                .map(|model| Choice {
                     model: model.clone(),
-                    thinking: choice.thinking.clone(),
-                });
+                    thinking: thinking.map(str::to_owned),
+                })
+                .collect()
+        } else if let Some((choice, warning)) = catalog_choice(pattern, available, true) {
+            scope.warnings.extend(warning);
+            vec![choice]
+        } else {
+            Vec::new()
+        };
+        if choices.is_empty() {
+            scope
+                .warnings
+                .push(format!("No models match pattern \"{pattern}\""));
+        }
+        for choice in choices {
+            if scope
+                .choices
+                .iter()
+                .all(|existing| existing.model != choice.model)
+            {
+                scope.choices.push(choice);
             }
         }
     }
-    Ok(choices)
+    scope
 }
 pub fn fuzzy(query: &str, value: &str) -> bool {
     let value = value.to_lowercase();
@@ -146,14 +222,14 @@ mod tests {
             "ollama/literal:low"
         );
         assert_eq!(split("other/qwen:4b", &[]).unwrap().model, "other/qwen:4b");
-        assert_eq!(scope("ollama/org/*:medium", &models).unwrap().len(), 2);
+        assert_eq!(scope(["ollama/org/*:medium"], &models).choices.len(), 2);
         assert!(split("ollama/", &models).is_err());
     }
 
     #[test]
     fn scopes_keep_pattern_order_deduplicate_and_filter_case_insensitively() {
         let models = vec!["alpha:4b".into(), "beta:8b".into(), "beta:4b".into()];
-        let choices = scope("BETA*:high,alpha:4b,bt4", &models).unwrap();
+        let choices = scope(["BETA*:high", "alpha:4b", "beta:4"], &models).choices;
         assert_eq!(
             choices
                 .iter()
@@ -162,9 +238,61 @@ mod tests {
             vec!["beta:8b", "beta:4b", "alpha:4b"]
         );
         assert_eq!(choices[0].thinking.as_deref(), Some("high"));
-        assert!(scope("missing", &models).is_err());
-        assert!(scope("alpha:4b,", &models).is_err());
+        assert_eq!(scope(["missing"], &models).warnings.len(), 1);
+        assert_eq!(scope(["alpha:4b", ""], &models).choices.len(), 1);
     }
+    #[test]
+    fn scope_prefers_aliases_and_reports_unmatched_patterns_and_invalid_thinking() {
+        let models = vec![
+            "alpha-1".into(),
+            "alpha-1-20260101".into(),
+            "alpha-2".into(),
+            "alpha-3-20260501".into(),
+            "org/bracketed[1m]".into(),
+            "org/item-1".into(),
+            "org/item-2".into(),
+            "org/nested/item-2".into(),
+        ];
+        let scope = scope(
+            [
+                "missing",
+                "alpha:invalid",
+                "ollama/org/bracketed[1m]:high",
+                "ollama/org/item-[12]:low",
+            ],
+            &models,
+        );
+        assert_eq!(
+            scope.choices,
+            vec![
+                Choice {
+                    model: "alpha-2".into(),
+                    thinking: None
+                },
+                Choice {
+                    model: "org/bracketed[1m]".into(),
+                    thinking: Some("high".into())
+                },
+                Choice {
+                    model: "org/item-1".into(),
+                    thinking: Some("low".into())
+                },
+                Choice {
+                    model: "org/item-2".into(),
+                    thinking: Some("low".into())
+                },
+            ]
+        );
+        assert_eq!(
+            scope.warnings,
+            [
+                "No models match pattern \"missing\"",
+                "Invalid thinking level \"invalid\" in pattern \"alpha:invalid\". Using default instead.",
+            ]
+        );
+        assert_eq!(split("alpha:medium", &models).unwrap().model, "alpha-2");
+    }
+
     #[test]
     fn restored_sessions_stay_inside_the_requested_scope() {
         use clap::Parser;

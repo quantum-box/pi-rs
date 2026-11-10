@@ -506,7 +506,30 @@ async fn execute(mut args: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let available = if args.list_models.is_some() || args.models.is_some() {
+    let patterns: Vec<_> = if let Some(patterns) = &args.models {
+        patterns.split(',').collect()
+    } else if matches!(
+        args.command,
+        None | Some(
+            Command::Run { .. }
+                | Command::Resume
+                | Command::Interactive
+                | Command::Compact { .. }
+                | Command::Review { .. }
+        )
+    ) {
+        args.settings.value()["enabledModels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let available = if args.list_models.is_some()
+        || patterns.iter().any(|pattern| !pattern.trim().is_empty())
+    {
         args.provider
             .connect(&args.endpoint, args.model_token())?
             .models()
@@ -515,11 +538,16 @@ async fn execute(mut args: Cli) -> Result<()> {
         Vec::new()
     };
     if let Some(search) = &args.list_models {
-        let search = model_selection::unqualified(search);
-        for model in available
-            .iter()
-            .filter(|model| model_selection::fuzzy(search, model))
-        {
+        let terms: Vec<_> = search
+            .split(|character: char| character.is_whitespace() || character == '/')
+            .filter(|term| !term.is_empty())
+            .collect();
+        for model in available.iter().filter(|model| {
+            let candidate = format!("{} {model}", args.provider.id());
+            terms
+                .iter()
+                .all(|term| model_selection::fuzzy(term, &candidate))
+        }) {
             if args.mode == Some(OutputMode::Json) {
                 output(json!({"type":"model","model":model}));
             } else {
@@ -537,18 +565,21 @@ async fn execute(mut args: Cli) -> Result<()> {
             args.thinking_explicit = true;
         }
     }
-    if let Some(patterns) = &args.models {
-        args.model_scope = model_selection::scope(patterns, &available)?;
-        if !args.model_explicit {
-            let choice = args
-                .model_scope
-                .iter()
-                .find(|choice| choice.model == args.model)
-                .unwrap_or(&args.model_scope[0]);
-            args.model = choice.model.clone();
-            if !args.thinking_explicit && choice.thinking.is_some() {
-                args.thinking = choice.thinking.clone();
-            }
+    let scope = model_selection::scope(patterns, &available);
+    for warning in scope.warnings {
+        eprintln!("Warning: {warning}");
+    }
+    args.model_scope = scope.choices;
+    if !args.model_explicit
+        && let Some(choice) = args
+            .model_scope
+            .iter()
+            .find(|choice| choice.model == args.model)
+            .or_else(|| args.model_scope.first())
+    {
+        args.model = choice.model.clone();
+        if !args.thinking_explicit && choice.thinking.is_some() {
+            args.thinking = choice.thinking.clone();
         }
     }
 
