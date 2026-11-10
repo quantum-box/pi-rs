@@ -52,6 +52,7 @@ enum Registration<'a> {
         client_id: Option<&'a str>,
         client_secret: Option<&'a str>,
         metadata_url: Option<&'a str>,
+        challenge: Option<&'a str>,
     },
     Upgrade(Box<Upgrade>),
 }
@@ -178,9 +179,10 @@ fn auth_error(error: AuthError) -> Error {
         AuthError::AuthorizationRequired
         | AuthError::TokenExpired
         | AuthError::TokenRefreshRejected(_) => {
-            return Error::AuthorizationRequired(
-                "MCP OAuth login required; run pi mcp login for this server".into(),
-            );
+            return Error::AuthorizationRequired {
+                message: "MCP OAuth login required; run pi mcp login for this server".into(),
+                challenge: None,
+            };
         }
         AuthError::RegistrationFailed(_) => {
             "MCP OAuth client registration failed; use --client-id for a pre-registered client"
@@ -298,6 +300,13 @@ pub async fn client(
     Ok((AuthClient::new(client, manager), identity))
 }
 
+pub(crate) fn has_credentials(name: &str, url: &str) -> Result<bool> {
+    Ok(FileCredentials::new(name, url)?
+        .read()
+        .map_err(auth_error)?
+        .is_some())
+}
+
 pub async fn logout(name: &str, url: &str) -> Result<()> {
     let store = FileCredentials::new(name, url)?;
     let _guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
@@ -331,6 +340,7 @@ pub async fn login_with_secret(
             client_id,
             client_secret,
             metadata_url: None,
+            challenge: None,
         },
         scopes,
         announce,
@@ -354,9 +364,27 @@ pub async fn login_with_metadata(
             client_id: None,
             client_secret: None,
             metadata_url: Some(client_metadata_url),
+            challenge: None,
         },
         scopes,
         announce,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub async fn login_discovered(name: &str, url: &str, challenge: Option<&str>) -> Result<()> {
+    authorize(
+        name,
+        url,
+        Registration::New {
+            client_id: None,
+            client_secret: None,
+            metadata_url: None,
+            challenge,
+        },
+        &[],
+        |_| {},
     )
     .await
     .map(|_| ())
@@ -424,12 +452,13 @@ async fn authorize(
             "MCP OAuth requires HTTPS or loopback HTTP without embedded credentials".into(),
         ));
     }
-    let (client_id, client_secret, client_metadata_url, upgrade) = match &registration {
+    let (client_id, client_secret, client_metadata_url, challenge, upgrade) = match &registration {
         Registration::New {
             client_id,
             client_secret,
             metadata_url,
-        } => (*client_id, *client_secret, *metadata_url, None),
+            challenge,
+        } => (*client_id, *client_secret, *metadata_url, *challenge, None),
         Registration::Upgrade(upgrade) => {
             let client = upgrade.previous.registration.as_ref().ok_or_else(|| {
                 Error::Config("MCP registration is missing; sign in again before upgrading".into())
@@ -437,6 +466,7 @@ async fn authorize(
             (
                 Some(upgrade.previous.credentials.client_id.as_str()),
                 client.client_secret.as_deref(),
+                None,
                 None,
                 Some(upgrade),
             )
@@ -459,7 +489,16 @@ async fn authorize(
     }
     let mut manager = AuthorizationManager::new(url).await.map_err(auth_error)?;
     manager.set_credential_store(store.clone());
-    let metadata = manager.resolve_metadata().await.map_err(auth_error)?;
+    let metadata = manager
+        .resolve_metadata_from_challenge(challenge)
+        .await
+        .map_err(auth_error)?;
+    if challenge.is_some()
+        && metadata.source
+            == rmcp::transport::auth::AuthorizationMetadataSource::LegacyEndpointFallback
+    {
+        return Err(auth_error(AuthError::NoAuthorizationSupport));
+    }
     if let Some(upgrade) = upgrade
         && (metadata.metadata.issuer.is_none()
             || metadata.metadata.issuer != upgrade.previous.credentials.issuer)

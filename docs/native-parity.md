@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage | Model-provider OAuth and credential refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent and interactive scope upgrades; add/remove/list commands; tool catalog notifications | Discovery-triggered OAuth without an explicit OAuth setting and remaining upstream OAuth client configuration |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent and interactive scope upgrades; add/remove/list commands; tool catalog notifications | Remaining upstream OAuth client configuration |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
@@ -2085,4 +2085,7 @@ and `pi mcp list` keep their noninteractive behavior.
 
 Loopback checks covered rejection without a browser launch, initial consent
 through both terminal and RPC, tool execution during the same turn, and
-credential reuse in a fresh process.
+credential reuse in a fresh process. HTTP servers can also trigger sign-in
+with a Bearer challenge when OAuth has not been configured explicitly. A
+fixture exercised challenge-specific metadata and scope, and confirmed the
+credential was usable after restart without editing `mcp.json`.

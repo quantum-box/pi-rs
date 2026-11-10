@@ -18,8 +18,11 @@ pub enum Error {
     Extension { id: String, message: String },
     #[error("configuration: {0}")]
     Config(String),
-    #[error("authorization required: {0}")]
-    AuthorizationRequired(String),
+    #[error("authorization required: {message}")]
+    AuthorizationRequired {
+        message: String,
+        challenge: Option<String>,
+    },
     #[error("execution cancelled")]
     Cancelled,
     #[error("execution budget exhausted")]

@@ -525,6 +525,10 @@ impl McpExtension {
                     .map_err(|_| Error::Config("invalid MCP header value".into()))?;
                 headers.insert(name, value);
             }
+            let manual_auth = headers.contains_key(&reqwest_mcp::header::AUTHORIZATION);
+            let may_authorize = config.oauth != Some(false) && !manual_auth;
+            let use_oauth = config.oauth == Some(true)
+                || (may_authorize && crate::mcp_auth::has_credentials(name, url)?);
             let client = reqwest_mcp::Client::builder()
                 .redirect(reqwest_mcp::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
@@ -533,12 +537,8 @@ impl McpExtension {
             let initialize = async {
                 let transport_config = StreamableHttpClientTransportConfig::with_uri(url.clone())
                     .custom_headers(headers);
-                if config.oauth == Some(true) {
-                    if config
-                        .headers
-                        .keys()
-                        .any(|name| name.eq_ignore_ascii_case("authorization"))
-                    {
+                if use_oauth {
+                    if manual_auth {
                         return Err(Error::Config(
                             "MCP OAuth cannot be combined with an Authorization header".into(),
                         ));
@@ -564,7 +564,22 @@ impl McpExtension {
                         .await
                 }
                 .map_err(|error| {
-                    if config.oauth == Some(true) {
+                    let challenge = error.auth_challenge().filter(|challenge| {
+                        challenge
+                            .split_ascii_whitespace()
+                            .next()
+                            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("Bearer"))
+                    });
+                    if may_authorize
+                        && (challenge.is_some() || (use_oauth && error.is_authorization_required()))
+                    {
+                        Error::AuthorizationRequired {
+                            message: format!(
+                                "MCP {name} needs OAuth sign-in; run pi mcp login {name}"
+                            ),
+                            challenge: challenge.map(str::to_owned),
+                        }
+                    } else if use_oauth {
                         Error::Config(format!("MCP {name} OAuth connection failed"))
                     } else {
                         Error::Config(format!("MCP {name} initialization failed: {error}"))

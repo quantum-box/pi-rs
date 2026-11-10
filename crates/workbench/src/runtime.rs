@@ -18,7 +18,7 @@ pub struct Runtime {
     system_prompt: String,
     pub resources: resources::Resources,
     catalog: Arc<LiveMcpCatalog>,
-    mcp_sign_in: std::collections::VecDeque<(String, pi_rs_workbench::mcp::ServerConfig)>,
+    mcp_sign_in: std::collections::VecDeque<mcp_config::PendingSignIn>,
 }
 impl Runtime {
     pub fn command_catalog(&self, args: &Cli) -> serde_json::Value {
@@ -133,7 +133,12 @@ impl Runtime {
         ui: &dyn ExtensionUi,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        while let Some((name, config)) = self.mcp_sign_in.front().cloned() {
+        while let Some(mcp_config::PendingSignIn {
+            name,
+            config,
+            challenge,
+        }) = self.mcp_sign_in.front().cloned()
+        {
             let current = || {
                 mcp_config::configurations(args)?
                     .remove(&name)
@@ -173,7 +178,8 @@ impl Runtime {
                         "MCP configuration changed before sign-in".into(),
                     ));
                 }
-                pi_rs_workbench::mcp_auth::login(&name, url, None, &[], |_| {}).await?;
+                pi_rs_workbench::mcp_auth::login_discovered(&name, url, challenge.as_deref())
+                    .await?;
                 if current()?.as_ref() != Some(&config) {
                     return Err(pi_rs::Error::Config(
                         "MCP configuration changed during sign-in".into(),

@@ -116,7 +116,14 @@ pub async fn connect_all(args: &Cli, report: bool) -> Result<Vec<Arc<McpExtensio
 #[derive(Default)]
 pub(super) struct Discovery {
     pub connected: Vec<Arc<McpExtension>>,
-    pub sign_in: Vec<(String, ServerConfig)>,
+    pub sign_in: Vec<PendingSignIn>,
+}
+
+#[derive(Clone)]
+pub(super) struct PendingSignIn {
+    pub name: String,
+    pub config: ServerConfig,
+    pub challenge: Option<String>,
 }
 
 pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Result<Discovery> {
@@ -169,8 +176,12 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
                 }
                 discovery.connected.push(Arc::new(extension));
             }
-            Err(Error::AuthorizationRequired(_)) if interactive => {
-                discovery.sign_in.push((name, config));
+            Err(Error::AuthorizationRequired { challenge, .. }) if interactive => {
+                discovery.sign_in.push(PendingSignIn {
+                    name,
+                    config,
+                    challenge,
+                });
             }
             Err(error) => {
                 if report {
