@@ -1520,6 +1520,18 @@ fn conversation_entries_since(
             _ => None,
         })
         .collect();
+    let replay_by_request: BTreeMap<_, _> = path
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ModelFinished {
+                request_id,
+                metadata,
+                failure: None,
+                ..
+            } => metadata.replay.as_ref().map(|replay| (*request_id, replay)),
+            _ => None,
+        })
+        .collect();
     let edits: BTreeMap<_, _> = path
         .iter()
         .filter_map(|record| match &record.event {
@@ -1576,12 +1588,14 @@ fn conversation_entries_since(
             Event::Assistant {
                 content,
                 invocations,
+                request_id,
                 ..
             } => {
                 messages.push((
                     record.id,
                     Message::Assistant {
                         content: content.clone(),
+                        replay: request_id.and_then(|id| replay_by_request.get(&id).map(|replay| (*replay).clone())),
                         calls: invocations
                             .iter()
                             .map(|inv| {
@@ -1630,7 +1644,11 @@ fn repair_tool_pairs(messages: Vec<(u64, Message)>) -> Vec<(u64, Message)> {
     let mut messages = messages.into_iter().peekable();
     while let Some((source, message)) = messages.next() {
         match message {
-            Message::Assistant { content, mut calls } => {
+            Message::Assistant {
+                content,
+                mut calls,
+                mut replay,
+            } => {
                 let mut results = Vec::new();
                 while matches!(messages.peek(), Some((_, Message::Tool { .. }))) {
                     results.push(messages.next().expect("peeked tool result"));
@@ -1642,11 +1660,22 @@ fn repair_tool_pairs(messages: Vec<(u64, Message)>) -> Vec<(u64, Message)> {
                         _ => None,
                     })
                     .collect();
+                let original_calls = calls.len();
                 calls.retain(|call| result_ids.contains(call.id.as_str()));
+                if calls.len() != original_calls {
+                    replay = None;
+                }
                 let call_ids: std::collections::BTreeSet<_> =
                     calls.iter().map(|call| call.id.clone()).collect();
                 if !content.is_empty() || !calls.is_empty() {
-                    projected.push((source, Message::Assistant { content, calls }));
+                    projected.push((
+                        source,
+                        Message::Assistant {
+                            content,
+                            calls,
+                            replay,
+                        },
+                    ));
                 }
                 projected.extend(results.into_iter().filter(|(_, message)| matches!(message, Message::Tool { call_id, .. } if call_ids.contains(call_id))));
             }
@@ -1691,6 +1720,7 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
         },
         Message::Assistant { .. } => Message::Assistant {
             content: text,
+            replay: None,
             calls: blocks
                 .into_iter()
                 .filter_map(|block| match block {

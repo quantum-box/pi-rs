@@ -228,6 +228,8 @@ pub enum Message {
     Assistant {
         content: String,
         calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<Box<ProviderReplay>>,
     },
     Tool {
         call_id: String,
@@ -274,6 +276,9 @@ pub struct ModelMetadata {
     /// Provider-supplied visible reasoning, retained for session presentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Complete ordered assistant content required for provider-specific continuations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<Box<ProviderReplay>>,
 }
 
 /// Canonical provider and model names reported by the host adapter.
@@ -281,6 +286,12 @@ pub struct ModelMetadata {
 pub struct ResolvedModelIdentity {
     pub provider: String,
     pub model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderReplay {
+    pub identity: ResolvedModelIdentity,
+    pub blocks: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

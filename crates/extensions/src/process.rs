@@ -7,14 +7,66 @@ use std::time::{Duration, Instant};
 
 use pi_rs_core::{
     CancellationToken, Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState,
-    ModelRequest, Outcome, RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost,
-    ToolReply, ToolSpec,
+    Message, ModelRequest, Outcome, RequestPurpose, Result, Tool, ToolContext, ToolExecution,
+    ToolHost, ToolReply, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
 const PROTOCOL: u16 = 1;
+
+fn extension_context(request: &ModelRequest) -> ModelRequest {
+    ModelRequest {
+        model: request.model.clone(),
+        messages: request
+            .messages
+            .iter()
+            .map(|message| match message {
+                Message::Assistant { content, calls, .. } => Message::Assistant {
+                    content: content.clone(),
+                    calls: calls.clone(),
+                    replay: None,
+                },
+                _ => message.clone(),
+            })
+            .collect(),
+        tools: request.tools.clone(),
+        max_output_tokens: request.max_output_tokens,
+    }
+}
+
+fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) {
+    let same_model = original.model == updated.model;
+    for (index, message) in updated.messages.iter_mut().enumerate() {
+        let Message::Assistant {
+            content,
+            calls,
+            replay,
+        } = message
+        else {
+            continue;
+        };
+        if !same_model {
+            *replay = None;
+            continue;
+        }
+        let matching = |previous: &Message| match previous {
+            Message::Assistant {
+                content: original_content,
+                calls: original_calls,
+                replay,
+            } if original_content == content && original_calls == calls => replay.clone(),
+            _ => None,
+        };
+        // Tool IDs identify a continuation even if a hook inserted other messages.
+        *replay = original.messages.get(index).and_then(matching).or_else(|| {
+            (!calls.is_empty())
+                .then(|| original.messages.iter().find_map(matching))
+                .flatten()
+        });
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -216,10 +268,12 @@ impl Extension for ExecutableExtension {
         request: &mut ModelRequest,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
-        *request = self.request(ProtocolRequest::Context {
-            request: request.clone(),
+        let mut updated = self.request(ProtocolRequest::Context {
+            request: extension_context(request),
             state: state.cloned(),
         })?;
+        restore_provider_replay(request, &mut updated);
+        *request = updated;
         Ok(())
     }
     async fn before_request(
@@ -229,16 +283,19 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
         let message = ProtocolRequest::BeforeRequest {
-            request: request.clone(),
+            request: extension_context(request),
             summary: purpose == RequestPurpose::Summary,
             state: state.cloned(),
         };
         let path = self.executable.clone();
         let guard = CancelOnDrop(CancellationToken::new());
         let cancelled = guard.0.clone();
-        *request = tokio::task::spawn_blocking(move || call(&path, message, Some(&cancelled)))
-            .await
-            .map_err(|error| error.to_string())??;
+        let mut updated =
+            tokio::task::spawn_blocking(move || call(&path, message, Some(&cancelled)))
+                .await
+                .map_err(|error| error.to_string())??;
+        restore_provider_replay(request, &mut updated);
+        *request = updated;
         Ok(())
     }
     fn command(

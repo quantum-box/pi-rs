@@ -310,6 +310,49 @@ fn push_user(events: &mut Vec<Event>, value: &Value) -> Result<()> {
     }
     Ok(())
 }
+fn anthropic_replay(message: &Value) -> Option<Box<pi_rs::ProviderReplay>> {
+    if message["provider"] != "anthropic" || message["api"] != "anthropic-messages" {
+        return None;
+    }
+    let model = message["model"].as_str()?;
+    let mut signed = false;
+    let mut replay = Vec::new();
+    for block in message["content"].as_array()? {
+        let raw = match block["type"].as_str()? {
+            "text" => serde_json::json!({"type":"text","text":block["text"].as_str()?}),
+            "toolCall" => serde_json::json!({
+                "type":"tool_use", "id":block["id"].as_str()?, "name":block["name"].as_str()?,
+                "input":block["arguments"].as_object()?,
+            }),
+            "thinking" => {
+                let Some(signature) = block["thinkingSignature"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                else {
+                    continue;
+                };
+                signed = true;
+                if block["redacted"] == true {
+                    serde_json::json!({"type":"redacted_thinking","data":signature})
+                } else {
+                    serde_json::json!({"type":"thinking","thinking":block["thinking"].as_str()?,"signature":signature})
+                }
+            }
+            _ => return None,
+        };
+        replay.push(raw);
+    }
+    signed.then(|| {
+        Box::new(pi_rs::ProviderReplay {
+            identity: pi_rs::ResolvedModelIdentity {
+                provider: "anthropic".into(),
+                model: model.into(),
+            },
+            blocks: replay,
+        })
+    })
+}
+
 fn convert(
     entry: &Value,
     branch: &mut Branch,
@@ -376,6 +419,7 @@ fn convert(
                             cache_creation_input_tokens: message["usage"]["cacheWrite"].as_u64(),
                             finish_reason: message["stopReason"].as_str().map(str::to_owned),
                             reasoning,
+                            replay: anthropic_replay(message),
                             resolved_model: message["model"].as_str().map(|model| {
                                 pi_rs::ResolvedModelIdentity {
                                     provider: message["provider"]

@@ -550,7 +550,7 @@ fn encode_message(message: Message) -> Vec<Value> {
             vec![json!({"role":"user","content":blocks})]
         }
         Message::Tool { call_id, content } => encode_tool_result(&call_id, content),
-        Message::Assistant { content, calls } => {
+        Message::Assistant { content, calls, .. } => {
             let mut message = json!({"role": "assistant", "content": content});
             if !calls.is_empty() {
                 message["tool_calls"] = Value::Array(

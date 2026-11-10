@@ -6,7 +6,7 @@ use std::time::Duration;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
     ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 use reqwest::{Client, Response, Url, header::HeaderValue};
@@ -23,6 +23,16 @@ pub struct CatalogEntry {
     pub max_output_tokens: Option<u32>,
     pub reasoning: Option<bool>,
     pub images: Option<bool>,
+    pub thinking_levels: Vec<String>,
+    thinking: Option<ThinkingMode>,
+    can_disable_thinking: bool,
+    effort_levels: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ThinkingMode {
+    Adaptive,
+    Budgeted,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -43,6 +53,7 @@ pub struct Anthropic {
     api_key: HeaderValue,
     catalog: Arc<RwLock<BTreeMap<String, CatalogEntry>>>,
     probe_context: bool,
+    thinking_level: Option<String>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -84,6 +95,7 @@ impl Anthropic {
             api_key,
             catalog: Default::default(),
             probe_context: true,
+            thinking_level: None,
             progress: None,
             reasoning: None,
         })
@@ -92,6 +104,34 @@ impl Anthropic {
     pub fn with_context_probe(mut self, enabled: bool) -> Self {
         self.probe_context = enabled;
         self
+    }
+
+    pub fn with_thinking(mut self, level: Option<&str>) -> Self {
+        self.thinking_level = level.map(str::to_owned);
+        self
+    }
+
+    pub async fn model(&self, model: &str) -> Option<CatalogEntry> {
+        if let Some(details) = self.cached_model(model) {
+            return Some(details);
+        }
+        if !self.probe_context {
+            return None;
+        }
+        let mut url = self.models_url();
+        url.path_segments_mut().ok()?.push(model);
+        let details = tokio::time::timeout(Duration::from_secs(2), async {
+            let response = send(self.authenticate(self.client.get(url))).await.ok()?;
+            decode_model(&read_json(response).await.ok()?)
+        })
+        .await
+        .ok()
+        .flatten()?;
+        self.catalog
+            .write()
+            .ok()?
+            .insert(model.into(), details.clone());
+        Some(details)
     }
 
     pub fn with_progress(mut self, observer: impl Fn(Progress) + Send + Sync + 'static) -> Self {
@@ -183,12 +223,51 @@ fn decode_model(model: &Value) -> Option<CatalogEntry> {
             .and_then(|value| u32::try_from(value).ok())
             .filter(|count| *count > 0)
     };
+    let capabilities = &model["capabilities"];
+    let types = &capabilities["thinking"]["types"];
+    let thinking = if types["adaptive"]["supported"] == true {
+        Some(ThinkingMode::Adaptive)
+    } else if types["enabled"]["supported"] == true {
+        Some(ThinkingMode::Budgeted)
+    } else {
+        None
+    };
+    let can_disable_thinking = types["disabled"]["supported"].as_bool().unwrap_or(true);
+    let mut thinking_levels = Vec::new();
+    let mut effort_levels = false;
+    if can_disable_thinking || thinking.is_none() {
+        thinking_levels.push("off".into());
+    }
+    match thinking {
+        Some(ThinkingMode::Adaptive) => {
+            thinking_levels.extend(
+                ["low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .filter(|level| capabilities["effort"][*level]["supported"] == true)
+                    .map(str::to_owned),
+            );
+            effort_levels = thinking_levels.iter().any(|level| level != "off");
+            if !effort_levels {
+                thinking_levels.push("high".into());
+            }
+        }
+        Some(ThinkingMode::Budgeted) => thinking_levels.extend(
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(str::to_owned),
+        ),
+        None => {}
+    }
     Some(CatalogEntry {
         id: model["id"].as_str().filter(|id| !id.is_empty())?.into(),
         context_window: tokens("max_input_tokens"),
         max_output_tokens: tokens("max_tokens"),
         reasoning: model["capabilities"]["thinking"]["supported"].as_bool(),
-        images: model["capabilities"]["image_input"]["supported"].as_bool(),
+        images: capabilities["image_input"]["supported"].as_bool(),
+        thinking_levels,
+        thinking,
+        can_disable_thinking,
+        effort_levels,
     })
 }
 
@@ -245,17 +324,21 @@ fn encode_request(request: ModelRequest) -> Result<Value> {
                 }
                 ("user", blocks)
             }
-            Message::Assistant { content, calls } => {
-                let mut blocks: Vec<_> = text_block(content).into_iter().collect();
-                for call in calls {
-                    let input = serde_json::from_str::<Value>(&call.arguments)
-                        .ok()
-                        .filter(Value::is_object)
-                        .unwrap_or_else(|| json!({}));
-                    blocks.push(
-                        json!({"type":"tool_use","id":call.id,"name":call.name,"input":input}),
-                    );
-                }
+            Message::Assistant {
+                content,
+                calls,
+                replay,
+            } => {
+                let blocks = match replay {
+                    Some(replay) if replay_matches(&replay, &request.model, &content, &calls) => {
+                        replay.blocks
+                    }
+                    _ => {
+                        let mut blocks: Vec<_> = text_block(content).into_iter().collect();
+                        blocks.extend(calls.into_iter().map(|call| tool_block(&call)));
+                        blocks
+                    }
+                };
                 ("assistant", blocks)
             }
             Message::Tool { call_id, content } => (
@@ -301,23 +384,171 @@ fn text_block(content: String) -> Option<Value> {
     (!content.is_empty()).then(|| json!({"type":"text","text":content}))
 }
 
+fn configure_thinking(
+    body: &mut Value,
+    details: Option<&CatalogEntry>,
+    level: &str,
+    max_output: u32,
+) -> Result<()> {
+    if level == "off" {
+        if let Some(model) = details.filter(|model| model.thinking.is_some()) {
+            if !model.can_disable_thinking {
+                return Err(Error::Config(
+                    "selected Anthropic model cannot disable thinking".into(),
+                ));
+            }
+            body["thinking"] = json!({"type":"disabled"});
+        }
+        return Ok(());
+    }
+    let details = details
+        .filter(|model| model.thinking_levels.iter().any(|value| value == level))
+        .ok_or_else(|| {
+            Error::Config("selected Anthropic model does not advertise that thinking level".into())
+        })?;
+    match details.thinking {
+        Some(ThinkingMode::Adaptive) => {
+            body["thinking"] = json!({"type":"adaptive"});
+            // A model can advertise adaptive thinking without effort controls.
+            if details.effort_levels {
+                body["output_config"] = json!({"effort":level});
+            }
+        }
+        Some(ThinkingMode::Budgeted) => {
+            let preferred = match level {
+                "minimal" | "low" => 1024,
+                "medium" => 4096,
+                "high" => 8192,
+                "xhigh" => 16_384,
+                _ => 32_768,
+            };
+            let budget = preferred.min(max_output.saturating_sub(1024).max(1024));
+            if budget >= max_output {
+                return Err(Error::Config(
+                    "Anthropic budgeted thinking needs at least 1025 output tokens".into(),
+                ));
+            }
+            body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn tool_block(call: &ToolCall) -> Value {
+    let input = serde_json::from_str::<Value>(&call.arguments)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    json!({"type":"tool_use","id":call.id,"name":call.name,"input":input})
+}
+
+fn replay_matches(replay: &ProviderReplay, model: &str, text: &str, calls: &[ToolCall]) -> bool {
+    if replay.identity.provider != "anthropic" || replay.identity.model != model {
+        return false;
+    }
+    let rendered = replay
+        .blocks
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect::<String>();
+    if rendered != text {
+        return false;
+    }
+    let mut replay_calls = replay
+        .blocks
+        .iter()
+        .filter(|block| block["type"] == "tool_use");
+    for call in calls {
+        let Some(block) = replay_calls.next() else {
+            return false;
+        };
+        let expected = tool_block(call);
+        if ["id", "name", "input"]
+            .iter()
+            .any(|key| block[*key] != expected[*key])
+        {
+            return false;
+        }
+    }
+    replay_calls.next().is_none()
+}
+
+struct ResponseBlock {
+    raw: Value,
+    text: String,
+    signature: String,
+    complete: bool,
+}
+
+impl ResponseBlock {
+    fn new(raw: &Value) -> Self {
+        let key = if raw["type"] == "thinking" {
+            "thinking"
+        } else {
+            "text"
+        };
+        Self {
+            raw: raw.clone(),
+            text: raw[key].as_str().unwrap_or_default().into(),
+            signature: raw["signature"].as_str().unwrap_or_default().into(),
+            complete: false,
+        }
+    }
+
+    fn signed(&self) -> bool {
+        matches!(
+            self.raw["type"].as_str(),
+            Some("thinking" | "redacted_thinking")
+        )
+    }
+
+    fn finish(mut self) -> Result<Value> {
+        if !self.complete {
+            return Err(Error::Model(
+                "Anthropic content block ended prematurely".into(),
+            ));
+        }
+        match self.raw["type"].as_str() {
+            Some("text") => self.raw["text"] = json!(self.text),
+            Some("thinking") if !self.signature.is_empty() => {
+                self.raw["thinking"] = json!(self.text);
+                self.raw["signature"] = json!(self.signature);
+            }
+            Some("thinking") => {
+                return Err(Error::Model(
+                    "Anthropic thinking block is missing a signature".into(),
+                ));
+            }
+            Some("redacted_thinking") if self.raw["data"].as_str().is_none_or(str::is_empty) => {
+                return Err(Error::Model(
+                    "Anthropic redacted thinking block is empty".into(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(self.raw)
+    }
+}
+
 struct Call {
     id: String,
     name: String,
-    input: Value,
+    raw: Value,
     fragments: String,
     complete: bool,
 }
 
 impl Call {
-    fn finish(self) -> Result<ToolCall> {
+    fn finish(mut self) -> Result<(ToolCall, Value)> {
         if !self.complete {
             return Err(Error::Model(
                 "Anthropic tool block ended prematurely".into(),
             ));
         }
         let input = if self.fragments.is_empty() {
-            self.input
+            self.raw["input"].take()
         } else {
             serde_json::from_str(&self.fragments)
                 .map_err(|_| Error::Model("invalid Anthropic tool input JSON".into()))?
@@ -327,11 +558,13 @@ impl Call {
                 "Anthropic tool input must be an object".into(),
             ));
         }
-        Ok(ToolCall {
+        let call = ToolCall {
             id: self.id,
             name: self.name,
             arguments: input.to_string(),
-        })
+        };
+        self.raw["input"] = input;
+        Ok((call, self.raw))
     }
 }
 
@@ -372,35 +605,24 @@ impl StreamUsage {
 #[async_trait::async_trait]
 impl Model for Anthropic {
     async fn context_window(&self, model: &str) -> Option<u32> {
-        if let Some(details) = self.cached_model(model) {
-            return details.context_window;
-        }
-        if !self.probe_context {
-            return None;
-        }
-        let mut url = self.models_url();
-        url.path_segments_mut().ok()?.push(model);
-        let details = tokio::time::timeout(Duration::from_secs(2), async {
-            let response = send(self.authenticate(self.client.get(url))).await.ok()?;
-            decode_model(&read_json(response).await.ok()?)
-        })
-        .await
-        .ok()
-        .flatten()?;
-        let window = details.context_window;
-        self.catalog.write().ok()?.insert(model.into(), details);
-        window
+        self.model(model).await?.context_window
     }
 
     async fn stream(&self, mut request: ModelRequest) -> Result<ModelStream> {
-        if let Some(limit) = self
-            .cached_model(&request.model)
-            .and_then(|model| model.max_output_tokens)
-        {
+        let details = if self.thinking_level.is_some() {
+            self.model(&request.model).await
+        } else {
+            self.cached_model(&request.model)
+        };
+        if let Some(limit) = details.as_ref().and_then(|model| model.max_output_tokens) {
             request.max_output_tokens = request.max_output_tokens.min(limit);
         }
         let requested_model = request.model.clone();
-        let body = encode_request(request)?;
+        let max_output_tokens = request.max_output_tokens;
+        let mut body = encode_request(request)?;
+        if let Some(level) = self.thinking_level.as_deref() {
+            configure_thinking(&mut body, details.as_ref(), level, max_output_tokens)?;
+        }
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
@@ -434,6 +656,7 @@ impl Model for Anthropic {
                 }
             };
             let mut calls = BTreeMap::<u64, Call>::new();
+            let mut blocks = BTreeMap::<u64, ResponseBlock>::new();
             let mut usage = StreamUsage::default();
             let mut metadata = ModelMetadata::default();
             let mut reasoning_text = String::new();
@@ -460,46 +683,82 @@ impl Model for Anthropic {
                         usage.update(&message["usage"], &mut metadata);
                     }
                     Some("content_block_start") if started => {
+                        let index = block_index(&value)?;
                         let block = &value["content_block"];
-                        match block["type"].as_str() {
-                            Some("tool_use") => {
-                                let index = block_index(&value)?;
-                                let id = required(&block["id"], "tool ID")?;
-                                let name = required(&block["name"], "tool name")?;
-                                if calls.len() >= 64 || calls.insert(index, Call {
-                                    id: id.into(), name: name.into(), input: block["input"].clone(), fragments: String::new(), complete: false,
-                                }).is_some() {
-                                    Err(Error::Model("invalid Anthropic tool block index".into()))?;
-                                }
-                                report(Progress::PreparingTool);
+                        if blocks.contains_key(&index) || calls.contains_key(&index)
+                            || blocks.len().saturating_add(calls.len()) >= 256
+                        {
+                            Err(Error::Model("invalid Anthropic content block index".into()))?;
+                        }
+                        if block["type"] == "tool_use" {
+                            let id = required(&block["id"], "tool ID")?;
+                            let name = required(&block["name"], "tool name")?;
+                            if calls.len() >= 64 {
+                                Err(Error::Model("too many Anthropic tool calls".into()))?;
                             }
-                            Some("text") => {
-                                if let Some(text) = block["text"].as_str().filter(|text| !text.is_empty()) {
+                            calls.insert(index, Call {
+                                id: id.into(), name: name.into(), raw: block.clone(),
+                                fragments: String::new(), complete: false,
+                            });
+                            report(Progress::PreparingTool);
+                        } else {
+                            let captured = ResponseBlock::new(block);
+                            match block["type"].as_str() {
+                                Some("text") if !captured.text.is_empty() => {
                                     report(Progress::Generating);
-                                    yield ModelEvent::Text(text.into());
+                                    yield ModelEvent::Text(captured.text.clone());
                                 }
+                                Some("thinking" | "redacted_thinking") => {
+                                    report(Progress::Thinking);
+                                    if !captured.text.is_empty() && block["type"] == "thinking" {
+                                        reasoning_text.push_str(&captured.text);
+                                        if let Some(observer) = &reasoning { observer(&captured.text); }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
+                            blocks.insert(index, captured);
                         }
                     }
                     Some("content_block_delta") if started => {
+                        let index = block_index(&value)?;
                         let delta = &value["delta"];
+                        let captured = blocks.get_mut(&index).filter(|block| !block.complete);
                         match delta["type"].as_str() {
                             Some("text_delta") => {
+                                let captured = captured.filter(|block| block.raw["type"] == "text")
+                                    .ok_or_else(|| Error::Model("Anthropic text delta has no open block".into()))?;
                                 if let Some(text) = delta["text"].as_str().filter(|text| !text.is_empty()) {
+                                    captured.text.push_str(text);
                                     report(Progress::Generating);
                                     yield ModelEvent::Text(text.into());
                                 }
                             }
                             Some("thinking_delta") => {
+                                let captured = captured.filter(|block| block.raw["type"] == "thinking")
+                                    .ok_or_else(|| Error::Model("Anthropic thinking delta has no open block".into()))?;
                                 if let Some(text) = delta["thinking"].as_str().filter(|text| !text.is_empty()) {
+                                    captured.text.push_str(text);
                                     report(Progress::Thinking);
                                     reasoning_text.push_str(text);
                                     if let Some(observer) = &reasoning { observer(text); }
                                 }
                             }
+                            Some("signature_delta") => {
+                                let captured = captured.filter(|block| block.raw["type"] == "thinking")
+                                    .ok_or_else(|| Error::Model("Anthropic signature delta has no open block".into()))?;
+                                captured.signature.push_str(delta["signature"].as_str().unwrap_or_default());
+                            }
+                            Some("citations_delta") => {
+                                if let Some(captured) = captured.filter(|block| block.raw["type"] == "text") {
+                                    if !captured.raw["citations"].is_array() {
+                                        captured.raw["citations"] = json!([]);
+                                    }
+                                    captured.raw["citations"].as_array_mut().expect("citations array")
+                                        .push(delta["citation"].clone());
+                                }
+                            }
                             Some("input_json_delta") => {
-                                let index = block_index(&value)?;
                                 let call = calls.get_mut(&index).filter(|call| !call.complete)
                                     .ok_or_else(|| Error::Model("Anthropic tool input has no open block".into()))?;
                                 call.fragments.push_str(delta["partial_json"].as_str().unwrap_or_default());
@@ -508,8 +767,12 @@ impl Model for Anthropic {
                         }
                     }
                     Some("content_block_stop") if started => {
-                        if let Some(call) = calls.get_mut(&block_index(&value)?) {
+                        let index = block_index(&value)?;
+                        if let Some(call) = calls.get_mut(&index) {
                             call.complete = true;
+                        }
+                        if let Some(block) = blocks.get_mut(&index) {
+                            block.complete = true;
                         }
                     }
                     Some("message_delta") if started => {
@@ -525,17 +788,39 @@ impl Model for Anthropic {
                         }
                     }
                     Some("message_stop") if started => {
-                        if !reasoning_text.is_empty() {
-                            metadata.reasoning = Some(reasoning_text);
-                            yield ModelEvent::Metadata(metadata.clone());
-                        }
                         match metadata.finish_reason.as_deref() {
                             Some("stop" | "length") if calls.is_empty() => {}
                             Some("tool_calls") if !calls.is_empty() => {}
                             _ => Err(Error::Model("Anthropic response did not finish successfully".into()))?,
                         }
-                        let calls = calls.into_values().map(Call::finish).collect::<Result<Vec<_>>>()?;
-                        yield ModelEvent::Complete { calls, usage: usage.finish() };
+                        let signed = blocks.values().any(ResponseBlock::signed);
+                        let mut replay = BTreeMap::new();
+                        if signed {
+                            for (index, block) in blocks {
+                                replay.insert(index, block.finish()?);
+                            }
+                        }
+                        let mut completed_calls = Vec::new();
+                        for (index, call) in calls {
+                            let (call, raw) = call.finish()?;
+                            if signed {
+                                replay.insert(index, raw);
+                            }
+                            completed_calls.push(call);
+                        }
+                        if !reasoning_text.is_empty() {
+                            metadata.reasoning = Some(reasoning_text);
+                        }
+                        if signed {
+                            metadata.replay = Some(Box::new(ProviderReplay {
+                                identity: ResolvedModelIdentity { provider: "anthropic".into(), model: requested_model },
+                                blocks: replay.into_values().collect(),
+                            }));
+                        }
+                        if metadata != previous {
+                            yield ModelEvent::Metadata(metadata);
+                        }
+                        yield ModelEvent::Complete { calls: completed_calls, usage: usage.finish() };
                         return;
                     }
                     Some("error") => {
@@ -575,18 +860,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thinking_controls_respect_advertised_effort_and_output_budget() {
+        let adaptive = decode_model(&json!({
+            "id":"adaptive",
+            "capabilities":{
+                "thinking":{"types":{"adaptive":{"supported":true},"disabled":{"supported":false}}},
+                "effort":{"low":{"supported":true},"high":{"supported":true}}
+            }
+        }))
+        .unwrap();
+        assert_eq!(adaptive.thinking_levels, ["low", "high"]);
+        let mut body = json!({});
+        assert!(configure_thinking(&mut body, Some(&adaptive), "off", 2048).is_err());
+        configure_thinking(&mut body, Some(&adaptive), "high", 2048).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+
+        let legacy = decode_model(&json!({
+            "id":"legacy","capabilities":{"thinking":{"types":{"enabled":{"supported":true}}}}
+        }))
+        .unwrap();
+        let mut body = json!({});
+        assert!(configure_thinking(&mut body, Some(&legacy), "high", 1024).is_err());
+        configure_thinking(&mut body, Some(&legacy), "high", 2048).unwrap();
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"enabled","budget_tokens":1024})
+        );
+    }
+
+    #[test]
     fn tool_blocks_must_close_with_an_object_before_dispatch() {
         let call = |complete, fragments: &str| Call {
             id: "toolu_fixture".into(),
             name: "read".into(),
-            input: json!({}),
+            raw: json!({"type":"tool_use","id":"toolu_fixture","name":"read","input":{}}),
             fragments: fragments.into(),
             complete,
         };
         assert!(call(false, r#"{"path":"file.txt"}"#).finish().is_err());
         assert!(call(true, r#"{"path":"file.txt""#).finish().is_err());
         assert!(call(true, "[]").finish().is_err());
-        let result = call(true, r#"{"path":"file.txt"}"#).finish().unwrap();
+        let (result, _) = call(true, r#"{"path":"file.txt"}"#).finish().unwrap();
         assert_eq!(result.arguments, r#"{"path":"file.txt"}"#);
     }
 }

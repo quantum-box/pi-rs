@@ -91,7 +91,7 @@ impl Client {
                                 max_output_tokens: entry.max_output_tokens,
                                 reasoning: entry.reasoning,
                                 images: entry.images,
-                                thinking_levels: None,
+                                thinking_levels: Some(entry.thinking_levels),
                             },
                         ))
                     })
@@ -113,7 +113,20 @@ impl Client {
                 Self::Ollama(client.with_reported_reasoning_effort(thinking))
             }
             Self::Ollama(client) => Self::Ollama(client.with_reasoning_effort(thinking)),
-            Self::Anthropic(client) => Self::Anthropic(client),
+            Self::Anthropic(client) => Self::Anthropic(client.with_thinking(thinking)),
+        }
+    }
+
+    pub async fn thinking_levels(&self, model: &str) -> Option<Vec<String>> {
+        match self {
+            Self::Ollama(client) => {
+                client
+                    .model_details(&[model.into()])
+                    .await
+                    .remove(model)?
+                    .thinking_levels
+            }
+            Self::Anthropic(client) => client.model(model).await.map(|entry| entry.thinking_levels),
         }
     }
 

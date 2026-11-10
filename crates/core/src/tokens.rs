@@ -22,7 +22,7 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
         Message::System { content } | Message::User { content } => text_chars(content),
         Message::UserWithImages { content, images } => text_chars(content)
             .saturating_add((images.len() as u64).saturating_mul(ESTIMATED_IMAGE_CHARS)),
-        Message::Assistant { content, calls } => {
+        Message::Assistant { content, calls, .. } => {
             calls.iter().fold(text_chars(content), |chars, call| {
                 let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
                     .map(|value| value.to_string())
@@ -136,6 +136,7 @@ mod tests {
         assert_eq!(
             estimate_message_tokens(&Message::Assistant {
                 content: "ok".into(),
+                replay: None,
                 calls: vec![crate::ToolCall {
                     id: "not-counted".into(),
                     name: "read".into(),

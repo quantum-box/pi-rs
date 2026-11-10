@@ -18,7 +18,7 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius sharing |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint and native Anthropic Messages, API keys and bearer tokens, asynchronous searchable model selector, branch-local model/thinking selection, Ollama capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, signed thinking replay and live provider switching |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint and native Anthropic Messages, API keys and bearer tokens, asynchronous searchable model selector, branch-local model/thinking selection, Ollama capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, provider-specific thinking for other services and live provider switching |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
@@ -1951,5 +1951,22 @@ the existing agent error categories. The journal records the selected
 provider separately from the model ID and accepts older records.
 
 A loopback fixture verified pagination, authentication, image input, a real
-native read tool round trip, usage and RPC. Live account sign-in, provider
-switching within a running session and signed thinking replay remain open.
+native read tool round trip, usage and RPC. Live account sign-in and provider switching within a running session remain open.
+
+### Anthropic thinking checkpoint
+
+The native Anthropic adapter reads the model's advertised thinking mode and
+effort levels. It selects adaptive effort or a bounded manual thinking budget
+and reports thinking progress even when the provider omits visible text.
+Unsupported levels follow the shared model-aware controls.
+
+Signed and redacted blocks are retained in the original assistant block order
+for the same provider and model. Tool continuations replay those blocks along
+with the tool use and result. A context edit invalidates replay when it
+changes the assistant text or tool calls. Native executable context hooks
+receive the portable messages and retain replay for unchanged turns.
+
+A loopback fixture verified adaptive effort, signed and redacted block replay
+through a real tool call, and replay after reopening the journal. Pi JSONL
+imports also recover signed blocks from native Anthropic Messages history.
+Live account verification remains separate work.

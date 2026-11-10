@@ -2375,7 +2375,7 @@ fn branch_excerpt(entry: Message) -> String {
         Message::UserWithImages { content, images } => {
             format!("User: {content}\n[{} image(s)]", images.len())
         }
-        Message::Assistant { content, calls } => {
+        Message::Assistant { content, calls, .. } => {
             let mut excerpt = format!("Assistant: {content}");
             for call in calls {
                 excerpt.push_str(&format!("\nTool call {}: {}", call.name, call.arguments));

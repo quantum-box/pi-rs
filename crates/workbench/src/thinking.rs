@@ -16,13 +16,15 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if let Some(levels) = reported(args) {
         return levels.to_vec();
     }
-    if args.provider == super::Provider::Anthropic {
-        let levels = vec!["off".into()];
-        args.thinking_profile = Some((args.model.clone(), levels.clone()));
-        return levels;
-    }
+    let fallback = || {
+        if args.provider == super::Provider::Anthropic {
+            vec!["off".into()]
+        } else {
+            LEVELS.iter().map(|level| (*level).into()).collect()
+        }
+    };
     if !args.allow_model_probes() {
-        return LEVELS.iter().map(|level| (*level).into()).collect();
+        return fallback();
     }
     let model = args.model.clone();
     let provider = args.provider;
@@ -35,11 +37,7 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
             .ok()?;
         runtime.block_on(async {
             let client = provider.connect(&endpoint, token).ok()?;
-            client
-                .model_details(std::slice::from_ref(&model))
-                .await
-                .remove(&model)?
-                .thinking_levels
+            client.thinking_levels(&model).await
         })
     })
     .join()
@@ -49,7 +47,7 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         args.thinking_profile = Some((args.model.clone(), levels.clone()));
         levels
     } else {
-        LEVELS.iter().map(|level| (*level).into()).collect()
+        fallback()
     }
 }
 
@@ -70,7 +68,7 @@ fn clamp<'a>(requested: &str, levels: &'a [String]) -> &'a str {
 pub(super) fn adjust(args: &mut Cli) {
     if let Some(requested) = args.thinking.clone() {
         let levels = available(args);
-        if reported(args).is_some() {
+        if reported(args).is_some() || args.provider == super::Provider::Anthropic {
             args.thinking = Some(clamp(&requested, &levels).into());
         }
     }

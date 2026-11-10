@@ -1174,7 +1174,7 @@ async fn split_turn_retention_preserves_tool_pairs_and_projects_late_edits() {
     let retained_final = final_cut.conversation_at(final_cut.head()).unwrap();
     assert_eq!(retained_final.len(), 2);
     assert!(
-        matches!(&retained_final[1], Message::Assistant { content, calls } if content == "remove this final reply" && calls.is_empty())
+        matches!(&retained_final[1], Message::Assistant { content, calls, .. } if content == "remove this final reply" && calls.is_empty())
     );
     let user = session
         .records()
