@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 
-use clap::{Arg, ArgMatches, Command, CommandFactory};
+use clap::{Arg, ArgMatches, Command, CommandFactory, FromArgMatches};
 use pi_rs::ExtensionFlagValue;
 
 pub(super) type ExtensionFlags = BTreeMap<String, ExtensionFlagValue>;
@@ -145,6 +145,76 @@ pub(super) fn reserved_flag_names() -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+pub(super) fn extension_help(argv: &[OsString]) -> Option<String> {
+    use pi_rs::Extension;
+
+    let (matches, _) = parse(
+        argv.iter()
+            .filter(|argument| *argument != "--help" && *argument != "-h")
+            .cloned(),
+    )
+    .ok()?;
+    let mut args = super::Cli::from_arg_matches(&matches).ok()?;
+    if args.command.is_some() {
+        return None;
+    }
+    let explicit_trust = if args.no_trust {
+        Some(false)
+    } else if args.trust || args.project.is_some() {
+        Some(true)
+    } else {
+        None
+    };
+    args.trusted = super::config::project_trust(&args.workspace, explicit_trust)
+        .ok()?
+        .unwrap_or(false);
+    args.settings = super::config::Settings::load(&args.workspace, args.trusted).ok()?;
+    let resources = super::resources::Resources::load(&args).ok()?;
+    let mut flags = BTreeMap::new();
+    let reserved = reserved_flag_names();
+    for path in resources.extensions {
+        let Ok(extension) = pi_rs_extensions::ExecutableExtension::load(&path) else {
+            continue;
+        };
+        if args.disable_extension.iter().any(|id| id == extension.id()) {
+            continue;
+        }
+        for flag in extension.cli_flags() {
+            if reserved.contains(&flag.name) {
+                continue;
+            }
+            let usage = match flag.default {
+                ExtensionFlagValue::Boolean(_) => format!("--{}", flag.name),
+                ExtensionFlagValue::String(_) => format!("--{} <value>", flag.name),
+            };
+            let description = flag
+                .description
+                .unwrap_or_else(|| format!("Registered by {}", extension.id()));
+            let description: String = description
+                .chars()
+                .take(200)
+                .map(|character| {
+                    if character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect();
+            flags.entry(usage).or_insert(description);
+        }
+    }
+    if flags.is_empty() {
+        return None;
+    }
+    let mut help = String::from("\nExtension CLI flags:\n");
+    for (usage, description) in flags {
+        use std::fmt::Write as _;
+        let _ = writeln!(help, "  {usage:<25} {description}");
+    }
+    Some(help)
+}
+
 fn option_values(command: &Command, option: &str) -> (usize, bool) {
     let argument = if let Some(long) = option.strip_prefix("--") {
         let (name, attached) = long
@@ -178,8 +248,6 @@ fn option_values(command: &Command, option: &str) -> (usize, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::FromArgMatches;
-
     fn cli(args: &[&str]) -> super::super::Cli {
         let (matches, _) = parse(args.iter().map(OsString::from)).unwrap();
         super::super::Cli::from_arg_matches(&matches).unwrap()

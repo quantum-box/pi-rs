@@ -749,8 +749,18 @@ fn main() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() {
-    let (matches, extension_flags) =
-        cli_compat::parse(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    let argv: Vec<_> = std::env::args_os().collect();
+    let (matches, extension_flags) = match cli_compat::parse(argv.iter().cloned()) {
+        Ok(parsed) => parsed,
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+            let _ = error.print();
+            if let Some(help) = cli_compat::extension_help(&argv) {
+                print!("{help}");
+            }
+            return;
+        }
+        Err(error) => error.exit(),
+    };
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
