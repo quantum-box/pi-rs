@@ -405,17 +405,18 @@ impl Cli {
                         .filter(|key| !key.trim().is_empty())
                         .map(model_auth::Credential::Literal);
                 }
-                let url = reqwest::Url::parse(endpoint).ok()?;
-                let token = match (provider, url.scheme(), url.host_str()) {
-                    (Provider::Anthropic, "https", Some("api.anthropic.com")) => {
-                        std::env::var("ANTHROPIC_API_KEY").ok()
-                    }
-                    (Provider::Google, "https", Some("generativelanguage.googleapis.com")) => {
-                        std::env::var("GEMINI_API_KEY").ok()
-                    }
-                    _ => None,
+                if endpoint != provider.default_endpoint() {
+                    return None;
+                }
+                let variable = match provider {
+                    Provider::Anthropic => "ANTHROPIC_API_KEY",
+                    Provider::Google => "GEMINI_API_KEY",
+                    _ => return None,
                 };
-                token.map(model_auth::Credential::Literal)
+                std::env::var(variable)
+                    .ok()
+                    .filter(|key| !key.trim().is_empty())
+                    .map(model_auth::Credential::Literal)
             })
     }
 
