@@ -552,6 +552,16 @@ fn convert(
         }
         "branch_summary" => {
             let usage = append_imported_usage(&mut events, &entry["usage"]);
+            let files = |key: &str| {
+                entry["details"][key]
+                    .as_array()
+                    .filter(|_| entry["fromHook"] != true)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            };
             events.push(Event::BranchSummary {
                 summary: required(entry, "summary")?.into(),
                 from: entry["fromId"]
@@ -560,6 +570,8 @@ fn convert(
                     .map(|branch| branch.head),
                 target: None,
                 usage,
+                read_files: files("readFiles"),
+                modified_files: files("modifiedFiles"),
             });
         }
         "custom_message" => push_user(&mut events, &entry["content"])?,

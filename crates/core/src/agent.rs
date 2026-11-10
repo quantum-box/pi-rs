@@ -1635,8 +1635,8 @@ impl Agent<'_> {
             selected
         };
         session.validate_checkout(target)?;
-        let entries = session.abandoned_entries(selected);
-        if entries.is_empty() {
+        let abandoned = session.abandoned_branch(selected);
+        if abandoned.messages.is_empty() {
             return commit(session, Event::Checkout { target }, observer);
         }
         let mut request = ModelRequest {
@@ -1677,7 +1677,7 @@ impl Agent<'_> {
             }))
             .saturating_sub(32);
         let mut excerpts = Vec::new();
-        for entry in entries.into_iter().rev() {
+        for entry in abandoned.messages.into_iter().rev() {
             let excerpt = branch_excerpt(entry);
             let tokens = crate::estimate_message_tokens(&Message::User {
                 content: excerpt.clone(),
@@ -1702,9 +1702,8 @@ impl Agent<'_> {
         });
         let allowance = request.max_output_tokens;
         let reply = self
-            .reply::<AgentInput>(session, request, false, cancel, observer, None)
-            .await?
-            .outcome?;
+            .reply_for_branch_summary(session, request, cancel, observer)
+            .await?;
         if !reply.invocations.is_empty() {
             return Err(Error::Model("branch summary attempted a tool call".into()));
         }
@@ -1717,11 +1716,21 @@ impl Agent<'_> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let summary = if reply.content.trim().is_empty() {
+        let mut summary = if reply.content.trim().is_empty() {
             "No summary generated".into()
         } else {
             reply.content
         };
+        let read_files: Vec<_> = abandoned.read_files.into_iter().collect();
+        let modified_files: Vec<_> = abandoned.modified_files.into_iter().collect();
+        for (tag, files) in [
+            ("read-files", &read_files),
+            ("modified-files", &modified_files),
+        ] {
+            if !files.is_empty() {
+                summary.push_str(&format!("\n\n<{tag}>\n{}\n</{tag}>", files.join("\n")));
+            }
+        }
         commit(
             session,
             Event::BranchSummary {
@@ -1729,9 +1738,73 @@ impl Agent<'_> {
                 from: Some(from),
                 target: Some(target),
                 usage: reply.usage,
+                read_files,
+                modified_files,
             },
             observer,
         )
+    }
+
+    async fn reply_for_branch_summary(
+        &self,
+        session: &mut Session,
+        request: ModelRequest,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<Reply> {
+        let control = session.retry_control();
+        let mut retries = 0_u32;
+        let outcome = loop {
+            if cancel.is_cancelled() {
+                break Err(Error::Cancelled);
+            }
+            let attempt = match Box::pin(self.reply::<AgentInput>(
+                session,
+                request.clone(),
+                false,
+                cancel,
+                observer,
+                None,
+            ))
+            .await
+            {
+                Ok(attempt) => attempt.outcome,
+                Err(error) => break Err(error),
+            };
+            let settings = control.settings();
+            let Err(Error::RetryableModel(message)) = &attempt else {
+                break attempt;
+            };
+            if !settings.enabled
+                || retries >= settings.max_retries
+                || (retries as usize).saturating_add(1) >= self.limits.model_requests
+            {
+                break attempt;
+            }
+            retries += 1;
+            let delay_ms = settings.delay_ms(retries);
+            let waiting = control.begin_wait();
+            observer(Notification::Retry(crate::RetryEvent::Start {
+                attempt: retries,
+                max_attempts: settings.max_retries,
+                delay_ms,
+                error_message: message.clone(),
+            }));
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break Err(Error::Cancelled),
+                _ = waiting.cancel.cancelled() => break Err(Error::Cancelled),
+                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+            }
+        };
+        if retries > 0 {
+            observer(Notification::Retry(crate::RetryEvent::End {
+                success: outcome.is_ok(),
+                attempt: retries,
+                final_error: outcome.as_ref().err().map(ToString::to_string),
+            }));
+        }
+        outcome
     }
 
     async fn summarize_selected<T: Into<AgentInput> + Send>(

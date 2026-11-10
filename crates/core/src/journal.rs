@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -193,10 +193,36 @@ pub enum Event {
         target: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        read_files: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modified_files: Vec<String>,
     },
     ExtensionStates {
         states: ExtensionStates,
     },
+}
+
+#[derive(Default)]
+pub(crate) struct AbandonedBranch {
+    pub messages: Vec<Message>,
+    pub read_files: BTreeSet<String>,
+    pub modified_files: BTreeSet<String>,
+}
+
+impl AbandonedBranch {
+    fn collect_file(&mut self, call: &crate::ToolCall) {
+        let files = match call.name.as_str() {
+            "read" => &mut self.read_files,
+            "edit" | "write" => &mut self.modified_files,
+            _ => return,
+        };
+        if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            && let Some(path) = arguments["path"].as_str().filter(|path| !path.is_empty())
+        {
+            files.insert(path.to_owned());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -414,31 +440,54 @@ impl Session {
         Ok(project_messages(&branch, ops))
     }
 
-    pub(crate) fn abandoned_entries(&self, target: u64) -> Vec<Message> {
-        let retained: std::collections::BTreeSet<_> =
-            self.path(target).iter().map(|record| record.id).collect();
+    pub(crate) fn abandoned_branch(&self, target: u64) -> AbandonedBranch {
+        let retained: BTreeSet<_> = self.path(target).iter().map(|record| record.id).collect();
         let branch = self.branch();
         let first_abandoned = branch
             .iter()
             .rposition(|record| retained.contains(&record.id))
             .map_or(0, |index| index + 1);
+        let mut abandoned = AbandonedBranch::default();
         let Some(first) = branch.get(first_abandoned) else {
-            return Vec::new();
+            return abandoned;
         };
         let mut messages = conversation_entries_since(&branch, self.operations(), first.id);
         messages.retain(|(_, message)| !matches!(message, Message::Tool { .. }));
+        for (_, message) in &messages {
+            if let Message::Assistant { calls, .. } = message {
+                for call in calls {
+                    abandoned.collect_file(call);
+                }
+            }
+        }
         for record in &branch[first_abandoned..] {
-            if let Event::Compacted { summary, .. } = &record.event {
-                messages.push((
+            match &record.event {
+                Event::Compacted { summary, .. } => messages.push((
                     record.id,
                     Message::User {
                         content: format!("Prior conversation summary:\n{summary}"),
                     },
-                ));
+                )),
+                Event::BranchSummary {
+                    read_files,
+                    modified_files,
+                    ..
+                } => {
+                    abandoned.read_files.extend(read_files.iter().cloned());
+                    abandoned
+                        .modified_files
+                        .extend(modified_files.iter().cloned());
+                }
+                Event::ToolPlanned { invocation, .. } => abandoned.collect_file(&invocation.call),
+                _ => {}
             }
         }
         messages.sort_by_key(|(id, _)| *id);
-        messages.into_iter().map(|(_, message)| message).collect()
+        abandoned.messages = messages.into_iter().map(|(_, message)| message).collect();
+        abandoned
+            .read_files
+            .retain(|path| !abandoned.modified_files.contains(path));
+        abandoned
     }
 
     /// Current projected messages, including calls whose tools are still running.
@@ -1483,7 +1532,7 @@ fn conversation_entries_since(
             Event::BranchSummary { summary, .. } => messages.push((
                 record.id,
                 Message::User {
-                    content: format!("The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n{summary}"),
+                    content: format!("The following is a summary of a branch that this conversation came back from:\n\n<summary>\n{summary}</summary>"),
                 },
             )),
             Event::UserImages { images } => {
@@ -1749,7 +1798,7 @@ mod session_metadata_tests {
                 .unwrap();
         }
         assert_eq!(
-            session.abandoned_entries(2),
+            session.abandoned_branch(2).messages,
             [Message::User {
                 content: "abandoned context".into()
             }]
@@ -1760,6 +1809,8 @@ mod session_metadata_tests {
                 from: Some(3),
                 target: Some(2),
                 usage: None,
+                read_files: vec!["source.txt".into()],
+                modified_files: vec!["result.txt".into()],
             })
             .unwrap();
         let restored = Session::from_records(session.records().to_vec()).unwrap();
@@ -1774,9 +1825,12 @@ mod session_metadata_tests {
         );
         assert_eq!(restored.current_messages(), fork.current_messages());
         assert!(
-            matches!(&restored.current_messages()[1], Message::User { content } if content.ends_with("decision from the old branch"))
+            matches!(&restored.current_messages()[1], Message::User { content } if content.contains("decision from the old branch"))
         );
         assert_eq!(restored.records()[2].id, 3);
+        let abandoned = restored.abandoned_branch(2);
+        assert!(abandoned.read_files.contains("source.txt"));
+        assert!(abandoned.modified_files.contains("result.txt"));
         assert!(matches!(
             &fork.records()[2].event,
             Event::BranchSummary {

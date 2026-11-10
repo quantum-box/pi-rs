@@ -301,6 +301,15 @@ impl View {
             )
         }
     }
+    fn working_phase(&self) -> &'static str {
+        match (self.branch_summary.is_some(), self.phase) {
+            (true, Some("再試行待ち")) => "要約の再試行待ち",
+            (true, _) => "Summarizing branch",
+            (false, Some(phase)) => phase,
+            _ => "処理中",
+        }
+    }
+
     fn draft_status(&self) -> String {
         if self.clipboard.is_some() {
             "Reading clipboard · ".into()
@@ -804,11 +813,7 @@ impl View {
             format!(
                 "{} {} {:.1}s · Escで取消 ",
                 spinner[(elapsed.as_millis() / 100) as usize % spinner.len()],
-                if self.branch_summary.is_some() {
-                    "Summarizing branch"
-                } else {
-                    self.phase.unwrap_or("処理中")
-                },
+                self.working_phase(),
                 elapsed.as_secs_f32()
             )
         } else {
@@ -1056,14 +1061,7 @@ impl View {
             .map(|start| start.elapsed().as_secs_f32())
             .unwrap_or_default();
         let status = if busy {
-            format!(
-                "{} {elapsed:.1}s · Escで取消 ",
-                if self.branch_summary.is_some() {
-                    "Summarizing branch"
-                } else {
-                    self.phase.unwrap_or("処理中")
-                }
-            )
+            format!("{} {elapsed:.1}s · Escで取消 ", self.working_phase())
         } else {
             String::new()
         };
