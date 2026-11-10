@@ -18,9 +18,9 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages, Google Gemini Generate Content, and Radius Pi Messages, named profiles for those APIs and Pi Messages, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages, Google Gemini Generate Content, and Radius Pi Messages, named profiles for those APIs, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh | OAuth and refresh for other model providers |
-| Native extensions | Rust tool, prompt input, context, policy, command, state/migration, compaction and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
+| Native extensions | Rust tool, prompt input, context, policy, command, state/migration, compaction and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Automatic default client metadata identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture | Non-chat model invocation and remaining execution-limit fidelity |
@@ -2310,3 +2310,16 @@ The native executable protocol advertises lifecycle support during
 discovery. An independently built Rust extension verified turn order
 across a retry and a tool call, successful and failed runs, and a
 non-fatal callback failure.
+
+### Native modal components
+
+A Rust extension can request a custom modal component with styled
+text spans, theme color roles and key actions. The terminal wraps and
+scrolls the content in both display modes. Extensions receive the
+selected action value and can open a new view with updated content.
+Escape and Ctrl+C cancel the current component. RPC clients receive
+the same component payload and submit a declared action value.
+
+An independently compiled native extension verified scrolling, key
+actions, component updates, cancellation and terminal restoration in
+both display modes, as well as the correlated RPC responses.

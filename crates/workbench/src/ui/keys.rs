@@ -209,7 +209,7 @@ impl Keys {
             .join("\n")
     }
 }
-fn normalize(mut key: KeyEvent) -> KeyEvent {
+pub(super) fn normalize(mut key: KeyEvent) -> KeyEvent {
     if key.code == KeyCode::BackTab {
         key.code = KeyCode::Tab;
         key.modifiers |= KeyModifiers::SHIFT;
@@ -220,7 +220,7 @@ fn normalize(mut key: KeyEvent) -> KeyEvent {
     key
 }
 
-fn parse(text: &str) -> Result<KeyEvent> {
+pub(super) fn parse(text: &str) -> Result<KeyEvent> {
     let lower = text.to_lowercase();
     let mut rest = lower.as_str();
     let mut modifiers = KeyModifiers::NONE;

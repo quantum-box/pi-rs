@@ -11,6 +11,30 @@ pub enum WidgetPlacement {
     BelowEditor,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiComponentSpan {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub underline: bool,
+    #[serde(default)]
+    pub inverse: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiComponentAction {
+    pub key: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "method",
@@ -43,6 +67,14 @@ pub enum UiRequest {
         title: String,
         #[serde(default, rename = "prefill", alias = "initialValue")]
         initial_value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<u64>,
+    },
+    /// A modal native component. Return the selected action value, or cancel.
+    Custom {
+        title: String,
+        lines: Vec<Vec<UiComponentSpan>>,
+        actions: Vec<UiComponentAction>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout: Option<u64>,
     },
@@ -80,7 +112,8 @@ impl UiRequest {
             Self::Select { timeout, .. }
             | Self::Confirm { timeout, .. }
             | Self::Input { timeout, .. }
-            | Self::Editor { timeout, .. } => *timeout,
+            | Self::Editor { timeout, .. }
+            | Self::Custom { timeout, .. } => *timeout,
             _ => None,
         }
     }
@@ -109,6 +142,33 @@ impl UiRequest {
         {
             return Err("extension widgets support at most 128 lines".into());
         }
+        if let Self::Custom { lines, actions, .. } = self {
+            if lines.len() > 256
+                || lines.iter().map(Vec::len).sum::<usize>() > 1024
+                || lines
+                    .iter()
+                    .flatten()
+                    .map(|span| span.text.len())
+                    .sum::<usize>()
+                    > 64 * 1024
+            {
+                return Err("extension component exceeds its rendering limits".into());
+            }
+            let mut keys = std::collections::BTreeSet::new();
+            if actions.is_empty()
+                || actions.len() > 64
+                || actions.iter().any(|action| {
+                    action.key.trim().is_empty()
+                        || action.key.len() > 64
+                        || action.key.chars().any(char::is_control)
+                        || action.value.is_empty()
+                        || action.value.len() > 1024
+                        || !keys.insert(action.key.to_lowercase())
+                })
+            {
+                return Err("extension component needs 1–64 actions with unique keys".into());
+            }
+        }
         Ok(())
     }
     pub fn accepts_response(&self, response: &UiResponse) -> bool {
@@ -116,6 +176,9 @@ impl UiRequest {
             (_, UiResponse::Cancelled) => true,
             (Self::Select { options, .. }, UiResponse::Text(value)) => options.contains(value),
             (Self::Confirm { .. }, UiResponse::Confirmed(_)) => true,
+            (Self::Custom { actions, .. }, UiResponse::Text(value)) => {
+                actions.iter().any(|action| &action.value == value)
+            }
             (
                 Self::Input { .. } | Self::Editor { .. } | Self::GetEditorText,
                 UiResponse::Text(value),
@@ -130,6 +193,7 @@ impl UiRequest {
                 | Self::Confirm { .. }
                 | Self::Input { .. }
                 | Self::Editor { .. }
+                | Self::Custom { .. }
                 | Self::GetEditorText
         )
     }

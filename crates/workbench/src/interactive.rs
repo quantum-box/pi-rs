@@ -289,6 +289,7 @@ impl View {
         let id: uuid::Uuid = serde_json::from_value(value["id"].clone())?;
         let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
         request.validate().map_err(Error::Config)?;
+        crate::ui::dialog::Dialog::validate_keys(&request)?;
         match request {
             pi_rs::UiRequest::Notify { message, .. } => self.append(&message),
             pi_rs::UiRequest::SetStatus { key, text } => {

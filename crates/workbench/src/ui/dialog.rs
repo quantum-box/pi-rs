@@ -1,13 +1,14 @@
 //! Native extension dialogs use the same editor and keybindings as the prompt.
 use super::{
     editor::Editor,
-    keys::Keys,
+    keys::{self, Keys},
     render::{Line, Span, wrap},
     theme::Theme,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use pi_rs::{UiRequest, UiResponse};
+use pi_rs::{Error, Result, UiRequest, UiResponse};
 use std::borrow::Cow;
+use std::cell::Cell;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -16,10 +17,31 @@ pub struct Dialog {
     request: UiRequest,
     editor: Editor,
     selected: usize,
+    scroll_max: Cell<usize>,
     error: Option<String>,
     masked: bool,
 }
 impl Dialog {
+    pub fn validate_keys(request: &UiRequest) -> Result<()> {
+        if let UiRequest::Custom { actions, .. } = request {
+            let mut seen = Vec::with_capacity(actions.len());
+            for action in actions {
+                let key = keys::parse(&action.key)?;
+                if key.code == KeyCode::Esc
+                    || key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    || seen.contains(&key)
+                {
+                    return Err(Error::Config(
+                        "extension component key is reserved or repeated".into(),
+                    ));
+                }
+                seen.push(key);
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(id: Uuid, request: UiRequest) -> Self {
         let mut editor = Editor::default();
         if let UiRequest::Input { initial_value, .. } | UiRequest::Editor { initial_value, .. } =
@@ -32,6 +54,7 @@ impl Dialog {
             request,
             editor,
             selected: 0,
+            scroll_max: Cell::new(0),
             error: None,
             masked: false,
         }
@@ -93,6 +116,27 @@ impl Dialog {
                 KeyCode::Char('n') => return Some(UiResponse::Confirmed(false)),
                 _ => {}
             },
+            UiRequest::Custom { actions, .. } => {
+                let normalized = keys::normalize(key);
+                if let Some(action) = actions.iter().find(|action| {
+                    keys::parse(&action.key).is_ok_and(|binding| {
+                        binding.code == normalized.code && binding.modifiers == normalized.modifiers
+                    })
+                }) {
+                    return Some(UiResponse::Text(action.value.clone()));
+                }
+                let max = self.scroll_max.get();
+                let position = self.selected.min(max);
+                self.selected = match key.code {
+                    KeyCode::Up => position.saturating_sub(1),
+                    KeyCode::Down => (position + 1).min(max),
+                    KeyCode::PageUp => position.saturating_sub(8),
+                    KeyCode::PageDown => (position + 8).min(max),
+                    KeyCode::Home => 0,
+                    KeyCode::End => max,
+                    _ => position,
+                };
+            }
             UiRequest::Input { .. } | UiRequest::Editor { .. } => {
                 let multiline = matches!(self.request, UiRequest::Editor { .. });
                 if (key.code == KeyCode::Enter
@@ -132,7 +176,8 @@ impl Dialog {
             UiRequest::Select { title, .. }
             | UiRequest::Confirm { title, .. }
             | UiRequest::Input { title, .. }
-            | UiRequest::Editor { title, .. } => title,
+            | UiRequest::Editor { title, .. }
+            | UiRequest::Custom { title, .. } => title,
             _ => "Extension",
         }
     }
@@ -217,6 +262,35 @@ impl Dialog {
                     theme.color("text"),
                 ));
             }
+            UiRequest::Custom { lines: body, .. } => {
+                let rows: Vec<_> = body
+                    .iter()
+                    .flat_map(|line| {
+                        let spans: Vec<_> = line
+                            .iter()
+                            .map(|span| {
+                                let mut rendered = Span::new(
+                                    &span.text,
+                                    theme.color(span.color.as_deref().unwrap_or("text")),
+                                );
+                                rendered.bold = span.bold;
+                                rendered.italic = span.italic;
+                                rendered.underline = span.underline;
+                                rendered.inverse = span.inverse;
+                                rendered
+                            })
+                            .collect();
+                        wrap(&spans, width)
+                    })
+                    .collect();
+                let max = rows.len().saturating_sub(available);
+                self.scroll_max.set(max);
+                lines.extend(
+                    rows.into_iter()
+                        .skip(self.selected.min(max))
+                        .take(available),
+                );
+            }
             UiRequest::Input { placeholder, .. } if self.editor.text.is_empty() => {
                 lines.push(Line::plain(
                     placeholder.as_deref().unwrap_or(""),
@@ -244,14 +318,26 @@ impl Dialog {
             }
             _ => {}
         }
-        lines.push(Line::plain(
-            if matches!(self.request, UiRequest::Editor { .. }) {
-                "Ctrl+S save · Esc cancel"
-            } else {
-                "Enter confirm · Esc cancel"
-            },
-            theme.color("dim"),
-        ));
+        let hint = match &self.request {
+            UiRequest::Editor { .. } => Cow::Borrowed("Ctrl+S save · Esc cancel"),
+            UiRequest::Custom { actions, .. } => {
+                let keys = actions
+                    .iter()
+                    .take(4)
+                    .map(|action| {
+                        format!(
+                            "{} {}",
+                            action.key,
+                            action.label.as_deref().unwrap_or(&action.value)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                Cow::Owned(format!("{keys} · ↑/↓ scroll · Esc cancel"))
+            }
+            _ => Cow::Borrowed("Enter confirm · Esc cancel"),
+        };
+        lines.push(Line::plain(&hint, theme.color("dim")));
         lines.truncate(height);
         lines
     }
@@ -260,6 +346,27 @@ impl Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn component_keys_reject_cancel_bindings_and_alias_collisions() {
+        let request = |keys: &[&str]| UiRequest::Custom {
+            title: "Component".into(),
+            lines: vec![],
+            actions: keys
+                .iter()
+                .map(|key| pi_rs::UiComponentAction {
+                    key: (*key).into(),
+                    value: "action".into(),
+                    label: None,
+                })
+                .collect(),
+            timeout: None,
+        };
+        assert!(Dialog::validate_keys(&request(&["ctrl+s", "enter"])).is_ok());
+        assert!(Dialog::validate_keys(&request(&["escape"])).is_err());
+        assert!(Dialog::validate_keys(&request(&["ctrl+shift+c"])).is_err());
+        assert!(Dialog::validate_keys(&request(&["enter", "return"])).is_err());
+    }
+
     #[test]
     fn error_headers_wrap_without_hiding_the_editor_cursor() {
         let mut dialog = Dialog::new(
