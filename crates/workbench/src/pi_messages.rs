@@ -39,6 +39,7 @@ pub(super) struct PiMessages {
     token: Option<String>,
     headers: HeaderMap,
     thinking: Option<String>,
+    cache_disabled: bool,
     progress: Option<ProgressObserver>,
     radius: Option<Radius>,
     probe_catalog: bool,
@@ -100,6 +101,7 @@ impl PiMessages {
             token,
             headers: HeaderMap::new(),
             thinking: None,
+            cache_disabled: false,
             progress: None,
             radius: None,
             probe_catalog: true,
@@ -235,6 +237,11 @@ impl PiMessages {
         self
     }
 
+    pub(super) fn without_cache(mut self) -> Self {
+        self.cache_disabled = true;
+        self
+    }
+
     pub(super) fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking = level.map(str::to_owned);
         self
@@ -322,7 +329,9 @@ impl PiMessages {
         if let Some(level) = &self.thinking {
             options["reasoning"] = json!(level);
         }
-        if std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long") {
+        if self.cache_disabled {
+            options["cacheRetention"] = json!("none");
+        } else if std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long") {
             options["cacheRetention"] = json!("long");
         }
         json!({

@@ -61,6 +61,20 @@ impl Model for BudgetedModel<'_> {
             .await
     }
 
+    async fn stream_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.budget
+            .reserve(self.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_for_summary(request_id, session_id, request)
+            .await
+    }
+
     async fn record_usage(&self, request_id: Uuid, usage: &UsageReport) -> Result<()> {
         self.budget.settle(self.scope, request_id, usage).await
     }

@@ -1,7 +1,7 @@
 //! Provider selection and shared workbench catalog and progress controls.
 use std::collections::BTreeMap;
 
-use pi_rs::anthropic::Anthropic;
+use pi_rs::anthropic::{Anthropic, CacheRetention};
 use pi_rs::google::Google;
 use pi_rs::ollama::{ModelDetails, Ollama};
 use pi_rs::{Error, Model, ModelRequest, ModelStream, Result};
@@ -252,6 +252,7 @@ impl Client {
         &self,
         request: ModelRequest,
         defaults: &HeaderMap,
+        cache_disabled: bool,
     ) -> Result<ModelStream> {
         match self {
             Self::Ollama(client) if !defaults.is_empty() => {
@@ -260,6 +261,12 @@ impl Client {
                     .with_default_headers(defaults)
                     .stream(request)
                     .await
+            }
+            Self::Anthropic(client) if cache_disabled => {
+                client.clone().without_cache().stream(request).await
+            }
+            Self::PiMessages(client) if cache_disabled => {
+                client.clone().without_cache().stream(request).await
             }
             Self::Anthropic(client) if !defaults.is_empty() => {
                 client
@@ -272,12 +279,11 @@ impl Client {
                 if client.observed {
                     super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
                 }
-                Box::pin(
-                    client
-                        .resolve()
-                        .await?
-                        .stream_with_headers(request, defaults),
-                )
+                Box::pin(client.resolve().await?.stream_with_headers(
+                    request,
+                    defaults,
+                    cache_disabled,
+                ))
                 .await
             }
             _ => self.stream(request).await,
@@ -427,8 +433,20 @@ impl Client {
             }
             Self::Anthropic(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let (supports_long, cache_tools) = args
+                    .model_profiles
+                    .messages_cache_support(&args.provider, metadata.as_ref());
+                let retention = if supports_long
+                    && std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long")
+                {
+                    CacheRetention::Long
+                } else {
+                    CacheRetention::Short
+                };
                 let gateway = matches!(args.provider.id(), "fireworks" | "openrouter");
-                let mut client = client.with_thinking(thinking);
+                let mut client = client
+                    .with_thinking(thinking)
+                    .with_cache_retention(retention, cache_tools);
                 if let Some(metadata) = metadata {
                     client =
                         client.with_empty_thinking_signature(metadata.allows_empty_signature());
@@ -521,7 +539,10 @@ impl Model for Client {
             Self::Anthropic(client) => client.stream(request).await,
             Self::Google(client) => client.stream(request).await,
             Self::PiMessages(client) => client.stream(request).await,
-            Self::Deferred(_) => self.stream_with_headers(request, &HeaderMap::new()).await,
+            Self::Deferred(_) => {
+                self.stream_with_headers(request, &HeaderMap::new(), false)
+                    .await
+            }
         }
     }
 }

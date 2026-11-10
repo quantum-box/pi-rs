@@ -42,7 +42,19 @@ impl Model for WorkbenchModel {
         }
         let stream = self
             .client
-            .stream_with_headers(self.filtered(request), &headers)
+            .stream_with_headers(self.filtered(request), &headers, false)
+            .await?;
+        Ok(self.estimate_usage(stream))
+    }
+    async fn stream_for_summary(
+        &self,
+        _request_id: Uuid,
+        _session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        let stream = self
+            .client
+            .stream_with_headers(self.filtered(request), &HeaderMap::new(), true)
             .await?;
         Ok(self.estimate_usage(stream))
     }

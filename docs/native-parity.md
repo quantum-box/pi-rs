@@ -2514,7 +2514,7 @@ Messages routes use bearer authentication. Environment credentials and
 imported provider-wide keys or OpenRouter OAuth work on the official routes.
 Explicitly stored keys remain bound to their saved endpoints. Loopback tests
 covered adaptive thinking, effort mapping and replay with Fireworks empty
-signatures and OpenRouter signed blocks. Additional cache and
+signatures and OpenRouter signed blocks. Additional cache warming and
 mid-conversation options remain to be matched.
 
 ### Terminal output padding checkpoint
@@ -2632,3 +2632,13 @@ New RPC and TUI prompt images are prepared before the worker accepts
 them, using the active model. Loopback checks covered a raw RPC prompt,
 a follow-up queued during streaming, the journaled resized bytes, and
 rejection of invalid image data before any model request.
+
+### Native Messages cache control checkpoint
+
+The workbench marks the system prompt, last supported conversation block,
+and last tool definition with an ephemeral cache breakpoint.
+`PI_CACHE_RETENTION=long` requests a one-hour breakpoint when supported.
+Fireworks model compatibility controls retention and tool markers.
+Compaction and branch summaries use the uncached model path. Loopback
+checks covered ordinary Messages requests, Fireworks, and model-generated
+compaction. Prompt warming and additional compatible formats remain.

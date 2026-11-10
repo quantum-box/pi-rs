@@ -888,9 +888,14 @@ impl Agent<'_> {
         let mut tool_delta_bytes = 0_usize;
         let mut reasoning_delta_bytes = 0_usize;
         let collect = async {
-            let opening = self
-                .model
-                .stream_in_session(request_id, session.session_id(), request);
+            let session_id = session.session_id();
+            let opening = if retain_reply {
+                self.model
+                    .stream_in_session(request_id, session_id, request)
+            } else {
+                self.model
+                    .stream_for_summary(request_id, session_id, request)
+            };
             tokio::pin!(opening);
             let mut stream = loop {
                 tokio::select! {

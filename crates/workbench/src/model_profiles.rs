@@ -167,6 +167,8 @@ struct ModelCompatibility {
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
+    supports_long_cache_retention: Option<bool>,
+    supports_cache_control_on_tools: Option<bool>,
 }
 
 impl ModelCompatibility {
@@ -183,6 +185,12 @@ impl ModelCompatibility {
             session_affinity_format: newer
                 .session_affinity_format
                 .or(self.session_affinity_format),
+            supports_long_cache_retention: newer
+                .supports_long_cache_retention
+                .or(self.supports_long_cache_retention),
+            supports_cache_control_on_tools: newer
+                .supports_cache_control_on_tools
+                .or(self.supports_cache_control_on_tools),
         }
     }
 }
@@ -828,6 +836,28 @@ impl Profiles {
             model
                 .map(|model| model.compat.chat.clone())
                 .unwrap_or_default(),
+        )
+    }
+
+    pub fn messages_cache_support(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> (bool, bool) {
+        let profile = self
+            .entries
+            .get(provider.id())
+            .map(|profile| &profile.compat);
+        let model = model.map(|model| &model.compat);
+        let capability = |field: fn(&ModelCompatibility) -> Option<bool>| {
+            model
+                .and_then(field)
+                .or_else(|| profile.and_then(field))
+                .unwrap_or(true)
+        };
+        (
+            capability(|compat| compat.supports_long_cache_retention),
+            capability(|compat| compat.supports_cache_control_on_tools),
         )
     }
 

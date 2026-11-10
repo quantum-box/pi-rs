@@ -48,6 +48,15 @@ pub enum Progress {
     PreparingTool,
 }
 
+/// Retention requested for Anthropic Messages prompt breakpoints.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheRetention {
+    #[default]
+    None,
+    Short,
+    Long,
+}
+
 type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone)]
@@ -63,6 +72,8 @@ pub struct Anthropic {
     thinking_level: Option<String>,
     configured_thinking: Option<CatalogEntry>,
     allow_empty_signature: bool,
+    cache_retention: CacheRetention,
+    cache_tools: bool,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -124,6 +135,8 @@ impl Anthropic {
             thinking_level: None,
             configured_thinking: None,
             allow_empty_signature: false,
+            cache_retention: CacheRetention::None,
+            cache_tools: true,
             progress: None,
             reasoning: None,
         })
@@ -180,6 +193,17 @@ impl Anthropic {
 
     pub fn with_empty_thinking_signature(mut self, enabled: bool) -> Self {
         self.allow_empty_signature = enabled;
+        self
+    }
+
+    pub fn with_cache_retention(mut self, retention: CacheRetention, cache_tools: bool) -> Self {
+        self.cache_retention = retention;
+        self.cache_tools = cache_tools;
+        self
+    }
+
+    pub fn without_cache(mut self) -> Self {
+        self.cache_retention = CacheRetention::None;
         self
     }
 
@@ -461,6 +485,41 @@ fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
     Ok(body)
 }
 
+fn apply_cache_control(body: &mut Value, retention: CacheRetention, cache_tools: bool) {
+    let control = match retention {
+        CacheRetention::None => return,
+        CacheRetention::Short => json!({"type":"ephemeral"}),
+        CacheRetention::Long => json!({"type":"ephemeral","ttl":"1h"}),
+    };
+    if let Some(system) = body.get("system").and_then(Value::as_str) {
+        body["system"] = json!([{"type":"text","text":system,"cache_control":control}]);
+    }
+    if cache_tools
+        && let Some(tool) = body
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .and_then(|tools| tools.last_mut())
+    {
+        tool["cache_control"] = control.clone();
+    }
+    if let Some(message) = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+        && message["role"] == "user"
+        && let Some(block) = message
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .and_then(|blocks| blocks.last_mut())
+        && matches!(
+            block["type"].as_str(),
+            Some("text" | "image" | "tool_result")
+        )
+    {
+        block["cache_control"] = control;
+    }
+}
+
 fn text_block(content: String) -> Option<Value> {
     (!content.is_empty()).then(|| json!({"type":"text","text":content}))
 }
@@ -718,6 +777,7 @@ impl Model for Anthropic {
             provider.as_ref() == "openrouter" || self.endpoint.host_str() == Some("openrouter.ai");
         let replay_scope = self.replay_scope.clone();
         let mut body = encode_request(request, &replay_scope)?;
+        apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
         if let Some(level) = self.thinking_level.as_deref() {
             configure_thinking(&mut body, details.as_ref(), level, max_output_tokens)?;
         }
