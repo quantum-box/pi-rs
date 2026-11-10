@@ -2484,7 +2484,10 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 ),
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
-                                    args.endpoint_for(provider),
+                                    args.model_endpoint_for(
+                                        provider,
+                                        (provider == &args.provider).then_some(args.model.as_str()),
+                                    ),
                                     &text,
                                 )
                                 .and_then(|()| super::model_auth::Keys::load())

@@ -67,6 +67,8 @@ struct Cli {
     #[arg(skip)]
     initial_connection: Option<(Provider, String)>,
     #[arg(skip)]
+    initial_model_endpoint: Option<String>,
+    #[arg(skip)]
     connection_explicit: bool,
     #[arg(skip)]
     endpoint_explicit: bool,
@@ -307,7 +309,7 @@ impl Cli {
     }
 
     fn allow_model_probes(&self) -> bool {
-        self.allow_endpoint_probes(&self.endpoint)
+        self.allow_endpoint_probes(self.model_endpoint_for(&self.provider, Some(&self.model)))
     }
 
     fn allow_endpoint_probes(&self, endpoint: &str) -> bool {
@@ -321,9 +323,43 @@ impl Cli {
         Duration::from_secs(self.tool_timeout_secs.unwrap_or(2_147_483))
     }
     fn model_token(&self) -> Option<String> {
-        self.model_credential_for(&self.provider, &self.endpoint)?
-            .literal()
-            .map(str::to_owned)
+        self.model_credential_for(
+            &self.provider,
+            self.model_endpoint_for(&self.provider, Some(&self.model)),
+        )?
+        .literal()
+        .map(str::to_owned)
+    }
+
+    fn model_override_token(&self, provider: &Provider, endpoint: &str) -> Option<String> {
+        self.initial_connection
+            .as_ref()
+            .is_none_or(|(original, address)| {
+                original == provider
+                    && self.initial_model_endpoint.as_deref().unwrap_or(address) == endpoint
+            })
+            .then(|| {
+                self.api_key
+                    .clone()
+                    .or_else(|| std::env::var("PI_RS_MODEL_TOKEN").ok())
+            })
+            .flatten()
+    }
+
+    fn bind_initial_model_endpoint(&mut self) {
+        if self
+            .initial_connection
+            .as_ref()
+            .is_some_and(|(provider, _)| provider == &self.provider)
+        {
+            let qualified = model_selection::qualified_model(&self.model, &self.model_profiles)
+                .filter(|(provider, _)| provider == &self.provider)
+                .map_or(self.model.as_str(), |(_, model)| model);
+            self.initial_model_endpoint = Some(
+                self.model_endpoint_for(&self.provider, Some(qualified))
+                    .to_owned(),
+            );
+        }
     }
 
     fn model_credential_for(
@@ -331,18 +367,7 @@ impl Cli {
         provider: &Provider,
         endpoint: &str,
     ) -> Option<model_auth::Credential> {
-        let initial = self
-            .initial_connection
-            .as_ref()
-            .is_none_or(|(original, address)| original == provider && address == endpoint);
-        let override_key = initial
-            .then(|| {
-                self.api_key
-                    .clone()
-                    .or_else(|| std::env::var("PI_RS_MODEL_TOKEN").ok())
-            })
-            .flatten();
-        override_key
+        self.model_override_token(provider, endpoint)
             .map(model_auth::Credential::Literal)
             .or_else(|| self.model_keys.credential(provider, endpoint).cloned())
             .or_else(|| self.model_profiles.credential(provider, endpoint))
@@ -376,7 +401,7 @@ impl Cli {
         provider: &Provider,
         model: Option<&str>,
     ) -> Result<providers::Client> {
-        let endpoint = self.endpoint_for(provider);
+        let endpoint = self.model_endpoint_for(provider, model);
         let credential = self.model_credential_for(provider, endpoint);
         let settings = self
             .model_profiles
@@ -417,17 +442,25 @@ impl Cli {
         Ok(())
     }
 
+    fn explicit_endpoint_for(&self, provider: &Provider) -> Option<&str> {
+        self.initial_connection
+            .as_ref()
+            .filter(|(original, _)| self.endpoint_explicit && original == provider)
+            .map(|(_, endpoint)| endpoint.as_str())
+    }
+
+    fn model_endpoint_for(&self, provider: &Provider, model: Option<&str>) -> &str {
+        self.explicit_endpoint_for(provider)
+            .or_else(|| model.and_then(|model| self.model_profiles.model_endpoint(provider, model)))
+            .unwrap_or_else(|| self.endpoint_for(provider))
+    }
+
     fn endpoint_for(&self, provider: &Provider) -> &str {
         if provider == &self.provider {
             return &self.endpoint;
         }
-        self.initial_connection
-            .as_ref()
-            .filter(|(original, _)| self.endpoint_explicit && original == provider)
-            .map_or_else(
-                || self.model_profiles.endpoint(provider),
-                |(_, endpoint)| endpoint,
-            )
+        self.explicit_endpoint_for(provider)
+            .unwrap_or_else(|| self.model_profiles.endpoint(provider))
     }
 
     fn reload_model_profiles(&mut self) -> Result<()> {
@@ -755,6 +788,7 @@ async fn run_cli() {
                 args.model.clear();
             }
         }
+        args.bind_initial_model_endpoint();
         if args.tui_mode.is_none() {
             args.tui_mode = Some(if args.settings.string("tuiMode") == Some("regular") {
                 TuiMode::Regular
@@ -907,6 +941,7 @@ async fn execute(mut args: Cli) -> Result<()> {
         })?;
     }
 
+    args.bind_initial_model_endpoint();
     if !args.thinking_explicit {
         args.apply_model_thinking_defaults();
     }

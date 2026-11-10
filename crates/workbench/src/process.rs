@@ -29,7 +29,8 @@ impl Worker {
         let follow_up_mode = super::backend::configured_queue_mode(args, "followUpMode")?;
         let mut command = Command::new(std::env::current_exe()?);
         command.env_remove("PI_RS_MODEL_TOKEN");
-        if let Some(token) = args.model_token() {
+        let endpoint = args.model_endpoint_for(&args.provider, Some(&args.model));
+        if let Some(token) = args.model_override_token(&args.provider, endpoint) {
             command.env("PI_RS_MODEL_TOKEN", token);
         }
 
@@ -43,8 +44,6 @@ impl Worker {
                 args.provider.id(),
                 "--model",
                 &args.model,
-                "--endpoint",
-                &args.endpoint,
                 "--trace",
                 "--stdin-control",
             ])
@@ -56,6 +55,9 @@ impl Worker {
             .arg(args.output_budget.to_string())
             .arg("--model-timeout-secs")
             .arg(args.model_timeout_secs.to_string());
+        if let Some(endpoint) = args.explicit_endpoint_for(&args.provider) {
+            command.arg("--endpoint").arg(endpoint);
+        }
         if args.no_session || args.ephemeral_worker_session {
             command.arg("--ephemeral-worker-session");
         }
@@ -266,7 +268,7 @@ fn configuration(args: &Cli) -> Value {
         .map(|token| format!("{:x}", Sha256::digest(token.as_bytes())));
     json!({
         "workspace":args.workspace,
-        "provider":args.provider.id(),"endpoint":args.endpoint,"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
+        "provider":args.provider.id(),"endpoint":args.model_endpoint_for(&args.provider, Some(&args.model)),"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
         "model_profiles":args.model_profiles.revision(),
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
         "system_prompt":args.system_prompt,"append_system_prompt":args.append_system_prompt,"instruction":args.instruction,"commands":args.allow_commands,

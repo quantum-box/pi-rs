@@ -27,6 +27,7 @@ struct Profile {
     headers: BTreeMap<String, String>,
     auth_header: bool,
     models: Vec<ConfiguredModel>,
+    model_endpoints: BTreeMap<String, String>,
     overrides: BTreeMap<String, ModelMetadata>,
 }
 
@@ -126,6 +127,8 @@ struct ConfiguredModel {
     id: String,
     #[serde(rename = "type")]
     kind: Option<String>,
+    #[serde(rename = "baseUrl")]
+    base_url: Option<String>,
     #[serde(flatten)]
     metadata: ModelMetadata,
 }
@@ -351,7 +354,11 @@ impl Profiles {
                 .models
                 .retain(|model| model.kind.as_deref().is_none_or(|kind| kind == "chat"));
             let mut ids = std::collections::BTreeSet::new();
+            let mut model_endpoints = BTreeMap::new();
             for model in &mut profile.models {
+                if let Some(base) = &model.base_url {
+                    model_endpoints.insert(model.id.clone(), endpoint_from_base(&provider, base)?);
+                }
                 model.metadata.validate(&provider, &model.id)?;
                 model.metadata.headers =
                     validate_headers(std::mem::take(&mut model.metadata.headers))?;
@@ -378,6 +385,7 @@ impl Profiles {
                         headers: validate_headers(profile.headers)?,
                         auth_header: profile.auth_header,
                         models: profile.models,
+                        model_endpoints,
                         overrides: profile.model_overrides,
                     },
                 )
@@ -435,9 +443,22 @@ impl Profiles {
         )
     }
 
+    pub fn model_endpoint(&self, provider: &Provider, model: &str) -> Option<&str> {
+        self.entries
+            .get(provider.id())?
+            .model_endpoints
+            .get(model)
+            .map(String::as_str)
+    }
+
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<Credential> {
         let profile = self.entries.get(provider.id())?;
-        if profile.endpoint != endpoint {
+        if profile.endpoint != endpoint
+            && !profile
+                .model_endpoints
+                .values()
+                .any(|value| value == endpoint)
+        {
             return None;
         }
         Credential::configured(profile.api_key.as_deref()?)
@@ -449,11 +470,12 @@ impl Profiles {
         endpoint: &str,
         model: Option<&str>,
     ) -> RequestHeaders {
-        let Some(profile) = self
-            .entries
-            .get(provider.id())
-            .filter(|profile| profile.endpoint == endpoint)
-        else {
+        let Some(profile) = self.entries.get(provider.id()).filter(|profile| {
+            profile.endpoint == endpoint
+                || model
+                    .and_then(|id| profile.model_endpoints.get(id))
+                    .is_some_and(|value| value == endpoint)
+        }) else {
             return RequestHeaders::default();
         };
         let mut configured = profile.headers.clone();
