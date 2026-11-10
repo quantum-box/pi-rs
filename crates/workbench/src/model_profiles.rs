@@ -126,6 +126,17 @@ struct ConfiguredProfile {
     model_overrides: BTreeMap<String, ModelMetadata>,
 }
 
+fn custom_adapter(entry: &Value) -> Option<Adapter> {
+    if let Some(api) = entry.get("api").filter(|api| !api.is_null()) {
+        return api.as_str().and_then(Adapter::named);
+    }
+    entry["models"]
+        .as_array()?
+        .iter()
+        .filter(|model| model["type"].as_str().is_none_or(|kind| kind == "chat"))
+        .find_map(|model| model["api"].as_str().and_then(Adapter::named))
+}
+
 #[derive(Clone, Deserialize)]
 struct ConfiguredModel {
     id: String,
@@ -501,10 +512,11 @@ impl Profiles {
         let operations = super::operation_models::Catalogue::parse(providers)?;
         let mut entries = BTreeMap::new();
         for (name, entry) in providers {
-            let provider = if let Some(provider) = Provider::named(name) {
-                provider
+            let builtin = Provider::named(name);
+            let provider = if let Some(provider) = &builtin {
+                provider.clone()
             } else {
-                let Some(adapter) = entry["api"].as_str().and_then(Adapter::named) else {
+                let Some(adapter) = custom_adapter(entry) else {
                     continue;
                 };
                 if name.is_empty()
@@ -549,6 +561,13 @@ impl Profiles {
             let mut model_endpoints = BTreeMap::new();
             for model in &mut profile.models {
                 let adapter = match model.api.as_deref() {
+                    None if builtin.is_none() && profile.api.is_none() => {
+                        return Err(Error::Config(format!(
+                            "model {}/{} requires an API when the provider omits api",
+                            provider.id(),
+                            model.id
+                        )));
+                    }
                     None => provider.adapter(),
                     Some(api) => Adapter::named(api).ok_or_else(|| {
                         Error::Config(format!(
@@ -983,6 +1002,36 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+
+    #[test]
+    fn custom_profiles_can_declare_apis_only_on_their_models() {
+        let data = json!({"providers":{"mixed":{
+            "baseUrl":"https://relay.example/v1",
+            "models":[{"id":"chat","api":"openai-completions"},{"id":"message","api":"anthropic-messages"}]
+        }}});
+        let profiles = Profiles::parse(&data).unwrap();
+        let provider = profiles.provider("mixed").unwrap();
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://relay.example/v1/chat/completions"
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, "message"),
+            Adapter::Anthropic
+        );
+        assert_eq!(
+            profiles.model_endpoint(&provider, "message"),
+            Some("https://relay.example/v1/messages")
+        );
+        let mut missing = data;
+        missing["providers"]["mixed"]["models"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("api");
+        assert!(
+            matches!(Profiles::parse(&missing), Err(Error::Config(message)) if message.contains("mixed/message requires an API"))
+        );
+    }
 
     #[test]
     fn runtime_and_configured_keys_are_bound_to_their_connections() {

@@ -2606,3 +2606,10 @@ path. Named Gemini connections bind signed parts to their provider,
 endpoint, and model. Loopback tests covered Chat Completions, Messages,
 and Generate Content within one profile, resuming the original Gemini
 route, and changing the endpoint without forwarding its old signature.
+
+### Per-model-only API configuration checkpoint
+
+Custom providers with a shared base URL can declare the API on each
+model. The catalog chooses the first declared chat API for provider
+discovery, while each model uses its own adapter and route. When the
+provider omits the API, a chat model without its own API is rejected.
