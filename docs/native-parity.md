@@ -1729,3 +1729,18 @@ The patch remains outside the subsequent model request. Remaining display and
 patch edge cases are tracked under local tools and terminal parity.
 
 Workspace tests, the imported-details regression and all-target Clippy pass.
+
+### Numbered edit diff checkpoint
+
+Native edit results preserve a numbered display diff alongside the unified
+patch. The display diff uses old-file numbers for deletions and context,
+new-file numbers for insertions, and four context lines on either side of a
+change. Omitted ranges appear as ellipses. The terminal prefers the numbered
+diff, preserves its column width and uses the existing word highlighting.
+Previously stored unified patches still render through the existing path.
+
+The CLI comparison checks exact numbered and unified diffs for two separate
+changes in a BOM/CRLF file. A PTY check reopens the journal, renders the numbered
+diff and expands the later hunk.
+
+Workspace tests, the numbered-rendering regression and all-target Clippy pass.

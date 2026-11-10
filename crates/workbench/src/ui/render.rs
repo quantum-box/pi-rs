@@ -128,6 +128,7 @@ pub enum Entry {
         failed: bool,
         finished: bool,
         parts: Vec<ToolPart>,
+        numbered_diff: bool,
     },
 }
 impl Entry {
@@ -174,6 +175,7 @@ impl Entry {
                 failed,
                 finished,
                 parts,
+                numbered_diff,
                 ..
             } => {
                 let role = if *failed {
@@ -200,7 +202,9 @@ impl Entry {
                 let output_lines: Vec<_> = output.lines().collect();
                 let limit = if expand_tools { output_lines.len() } else { 10 };
                 let render_text = |text: &str, lines: &mut Vec<Line>| {
-                    if name == "edit" {
+                    if *numbered_diff {
+                        lines.extend(super::diff::render_numbered(text, theme, inner));
+                    } else if name == "edit" {
                         lines.extend(super::diff::render(text, theme, inner));
                     } else {
                         for text in text.split('\n') {
@@ -793,6 +797,7 @@ mod tests {
             output: "before\n[image]\nafter".into(),
             failed: false,
             finished: true,
+            numbered_diff: false,
             parts: vec![
                 ToolPart::Text("before".into()),
                 ToolPart::Image(image),

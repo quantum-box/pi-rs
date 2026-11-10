@@ -27,6 +27,52 @@ fn lf(text: &str) -> String {
 pub(super) fn normalized_content(text: &str) -> String {
     lf(text.strip_prefix('\u{feff}').unwrap_or(text))
 }
+pub(super) fn numbered_diff(diff: &similar::TextDiff<'_, '_, '_, str>, digits: usize) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    let context = 4;
+    for (index, op) in diff.ops().iter().enumerate() {
+        if matches!(op, similar::DiffOp::Equal { .. }) {
+            let range = op.old_range();
+            let leading = if index > 0 {
+                context.min(range.len())
+            } else {
+                0
+            };
+            let trailing = if index + 1 < diff.ops().len() {
+                context.min(range.len() - leading)
+            } else {
+                0
+            };
+            if leading + trailing == 0 {
+                continue;
+            }
+            for row in range.start..range.start + leading {
+                let text = diff.old_slices()[row].trim_end_matches('\n');
+                let _ = writeln!(output, " {:>digits$} {text}", row + 1);
+            }
+            if leading + trailing < range.len() {
+                let _ = writeln!(output, " {:digits$} ...", "");
+            }
+            for row in range.end - trailing..range.end {
+                let text = diff.old_slices()[row].trim_end_matches('\n');
+                let _ = writeln!(output, " {:>digits$} {text}", row + 1);
+            }
+        } else {
+            for change in diff.iter_changes(op) {
+                let (marker, row) = match change.tag() {
+                    similar::ChangeTag::Delete => ('-', change.old_index().expect("deleted line")),
+                    similar::ChangeTag::Insert => ('+', change.new_index().expect("inserted line")),
+                    similar::ChangeTag::Equal => continue,
+                };
+                let text = change.value().trim_end_matches('\n');
+                let _ = writeln!(output, "{marker}{:>digits$} {text}", row + 1);
+            }
+        }
+    }
+    output.pop();
+    output
+}
 fn fuzzy(text: &str) -> String {
     text.nfkc()
         .collect::<String>()

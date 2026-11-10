@@ -430,6 +430,7 @@ impl View {
                             || execution.exit_code.is_some_and(|code| code != 0),
                         finished: true,
                         parts: Vec::new(),
+                        numbered_diff: false,
                     });
                 }
                 pi_rs::Event::UserImages { images } => {
@@ -505,6 +506,7 @@ impl View {
             failed: false,
             finished: false,
             parts: Vec::new(),
+            numbered_diff: false,
         });
     }
     fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
@@ -542,6 +544,8 @@ impl View {
             failed,
             finished,
             parts,
+            name,
+            numbered_diff,
             ..
         }) = self
             .lines
@@ -550,7 +554,14 @@ impl View {
             .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == operation))
         {
             *parts = rendered_parts;
-            *output = display_tool_result(outcome);
+            let diff = match outcome {
+                pi_rs::Outcome::SucceededWithDetails { details, .. } if name == "edit" => {
+                    details["diff"].as_str().filter(|diff| !diff.is_empty())
+                }
+                _ => None,
+            };
+            *numbered_diff = diff.is_some();
+            *output = diff.map_or_else(|| display_tool_result(outcome), str::to_owned);
             *failed = !matches!(
                 outcome,
                 pi_rs::Outcome::Succeeded(_)
@@ -585,6 +596,7 @@ impl View {
                     failed: false,
                     finished: false,
                     parts: Vec::new(),
+                    numbered_diff: false,
                 });
             }
             Some("bash_execution_update") => {
@@ -675,6 +687,7 @@ impl View {
                                     failed: false,
                                     finished: false,
                                     parts: Vec::new(),
+                                    numbered_diff: false,
                                 });
                             }
                         }

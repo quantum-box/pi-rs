@@ -477,6 +477,13 @@ impl CodingTool {
             .iter()
             .find(|op| !matches!(op, similar::DiffOp::Equal { .. }))
             .map(|op| op.new_range().start + 1);
+        let digits = original
+            .split('\n')
+            .count()
+            .max(edited.split('\n').count())
+            .to_string()
+            .len();
+        let display = crate::text_edit::numbered_diff(&diff, digits);
         let patch = diff
             .unified_diff()
             .context_radius(4)
@@ -484,7 +491,7 @@ impl CodingTool {
             .to_string();
         Ok(Outcome::SucceededWithDetails {
             output: format!("Successfully replaced {count} block(s) in {display_path}."),
-            details: json!({"patch":bounded(patch),"firstChangedLine":first_changed_line}),
+            details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
         })
     }
 

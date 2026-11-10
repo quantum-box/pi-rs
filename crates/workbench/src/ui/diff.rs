@@ -103,6 +103,45 @@ pub fn render(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
         .unwrap_or(1)
         .to_string()
         .len();
+    render_rows(&rows, digits, theme, width)
+}
+
+pub fn render_numbered(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
+    let mut digits = 1;
+    let rows: Vec<_> = text
+        .split('\n')
+        .map(|line| {
+            if let Some((marker, body)) = line.split_at_checked(1)
+                && matches!(marker, "-" | "+" | " ")
+            {
+                let trimmed = body.trim_start_matches(' ');
+                if let Some((number, text)) = trimmed.split_once(' ')
+                    && let Ok(number_value) = number.parse::<usize>()
+                {
+                    let kind = match marker {
+                        "-" => Kind::Removed,
+                        "+" => Kind::Added,
+                        _ => Kind::Context,
+                    };
+                    digits = digits.max(body.len() - trimmed.len() + number.len());
+                    return Row {
+                        kind,
+                        number: Some(number_value),
+                        text: text.replace('\t', "   "),
+                    };
+                }
+            }
+            Row {
+                kind: Kind::Text,
+                number: None,
+                text: line.into(),
+            }
+        })
+        .collect();
+    render_rows(&rows, digits, theme, width)
+}
+
+fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut index = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
@@ -163,6 +202,31 @@ pub fn render(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn numbered_edits_keep_explicit_padding_and_word_highlighting() {
+        let theme = Theme::system();
+        let lines = render_numbered(
+            "     ...\n-  6 old value\n+  6 new value\n  10 unchanged",
+            &theme,
+            80,
+        );
+        let text = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(text(&lines[0]), "     ...");
+        assert_eq!(text(&lines[1]), "-  6 old value");
+        assert_eq!(text(&lines[2]), "+  6 new value");
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .any(|span| span.inverse && span.text == "new")
+        );
+    }
+
     #[test]
     fn unified_edits_show_line_numbers_and_changed_words() {
         let theme = Theme::system();

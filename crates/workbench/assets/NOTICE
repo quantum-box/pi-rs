@@ -24,3 +24,5 @@ Session grouping in src/ui/session_threads.rs follows the parent-session tree
 and subtree activity ordering in Pi v1.5.0 session-selector.ts.
 Resume row layout and relative activity-age units in src/ui/picker.rs follow
 Pi v1.5.0 session-selector.ts.
+
+Numbered edit result layout in src/text_edit.rs follows Pi v1.5.0 edit-diff.ts.
