@@ -19,7 +19,7 @@ remaining acceptance work for that surface.
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, configurable Bash and Windows PowerShell with session metadata and Pi-style exit and truncation text, structured read, search, listing and shell truncation details, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages, Google Gemini Generate Content, and Radius Pi Messages, named profiles for those APIs, API keys and bearer tokens, searchable catalog with 506 built-in third-party chat models, model declarations and overrides including model-specific endpoints, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
-| Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh | OAuth and refresh for other model providers |
+| Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh, OpenRouter browser OAuth with manual redirect fallback | OAuth and refresh for other model providers |
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration, compaction and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Automatic default client metadata identity |
@@ -373,7 +373,7 @@ attachment notices in the terminal.
 
 ### Model scope checkpoint
 
-`--list-models [search]` lists models from the configured endpoint, with fuzzy
+`--list-models [search]` lists models from available providers, with fuzzy
 filtering and JSON output support. `--models` selects an ordered, deduplicated
 scope using exact IDs, case-insensitive globs or fuzzy matches. The terminal
 picker and cycling use that scope. Known thinking suffixes such as `:high` are
@@ -2365,3 +2365,18 @@ User models and overrides take precedence. The CLI lists available providers
 together, and `--provider` can restrict the list to one. Built-in environment
 keys and endpoint-bound saved credentials stay off user-configured relays.
 Catalog entries that use other upstream APIs still need their own adapters.
+
+### OpenRouter browser authorization
+
+`/login openrouter` and `pi login openrouter` use OpenRouter's browser
+authorization with S256 PKCE and a unique loopback callback. The terminal
+dialog also accepts a pasted redirect URL or code. The returned key is
+stored in the private auth file and is available only to the official
+OpenRouter chat, classification, and image endpoints. `/logout openrouter`
+removes the saved key. `/login openrouter api-key` opens the existing masked
+API key editor. Browser startup, input masking and cancellation were
+verified in both terminal modes. A loopback fixture exercised code exchange,
+and credential tests verified official-route isolation.
+
+The authorization contract follows
+[OpenRouter's OAuth PKCE documentation](https://openrouter.ai/docs/guides/overview/auth/oauth).

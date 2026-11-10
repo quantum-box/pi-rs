@@ -18,6 +18,7 @@ pub enum Selection {
     Fork(u64),
     Model(String),
     LoginProvider(super::super::Provider),
+    LoginOpenRouter,
     LogoutProvider(super::super::Provider),
     RadiusMethods,
     LoginRadius(crate::radius_auth::Method),

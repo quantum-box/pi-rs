@@ -26,6 +26,7 @@ mod model_auth;
 mod model_listing;
 mod model_profiles;
 mod model_selection;
+mod openrouter_auth;
 mod operation_models;
 mod packages;
 mod pi_messages;
@@ -612,16 +613,16 @@ enum Command {
         #[command(subcommand)]
         command: mcp_config::McpCommand,
     },
-    /// Sign in to Radius and save an endpoint-bound OAuth credential.
+    /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius"])]
+        #[arg(value_parser = ["radius", "openrouter"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
     },
-    /// Remove the saved Radius OAuth credential.
+    /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius"])]
+        #[arg(value_parser = ["radius", "openrouter"])]
         provider: String,
     },
     Run {
@@ -968,21 +969,47 @@ async fn execute(mut args: Cli) -> Result<()> {
             provider,
             device_code,
         }) => {
-            let gateway = radius_auth::Gateway::configured()?;
-            let method = if *device_code {
-                radius_auth::Method::Device
-            } else {
-                radius_auth::Method::Browser
+            let login = async {
+                if provider == "openrouter" {
+                    if *device_code {
+                        return Err(Error::Config(
+                            "OpenRouter uses browser authorization".into(),
+                        ));
+                    }
+                    let mut manual_input = None;
+                    let result = openrouter_auth::login(|url, sender| {
+                        eprintln!("Continue in your browser: {url}");
+                        manual_input = Some(sender);
+                    })
+                    .await;
+                    drop(manual_input);
+                    result
+                } else {
+                    let gateway = radius_auth::Gateway::configured()?;
+                    let method = if *device_code {
+                        radius_auth::Method::Device
+                    } else {
+                        radius_auth::Method::Browser
+                    };
+                    gateway.login(method, |notice| eprintln!("{notice}")).await
+                }
             };
             tokio::select! {
-                result = gateway.login(method, |notice| eprintln!("{notice}")) => result?,
+                biased;
                 _ = tokio::signal::ctrl_c() => return Err(Error::Cancelled),
+                result = login => result?,
             }
             output(json!({"type":"logged_in","provider":provider}));
             return Ok(());
         }
         Some(Command::Logout { provider }) => {
-            let removed = radius_auth::Gateway::configured()?.logout().await?;
+            let removed = if provider == "openrouter" {
+                model_auth::remove(
+                    &Provider::named(provider).expect("built-in OpenRouter provider"),
+                )?
+            } else {
+                radius_auth::Gateway::configured()?.logout().await?
+            };
             output(json!({"type":"logged_out","provider":provider,"removed":removed}));
             return Ok(());
         }

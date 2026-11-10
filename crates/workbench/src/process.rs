@@ -269,7 +269,7 @@ fn configuration(args: &Cli) -> Value {
     json!({
         "workspace":args.workspace,
         "provider":args.provider.id(),"endpoint":args.model_endpoint_for(&args.provider, Some(&args.model)),"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
-        "model_profiles":args.model_profiles.revision(),
+        "model_profiles":args.model_profiles.revision(),"model_keys":args.model_keys.revision(),
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
         "system_prompt":args.system_prompt,"append_system_prompt":args.append_system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
         "tools":args.tools,"exclude_tools":args.exclude_tools,"no_tools":args.no_tools,"no_builtin_tools":args.no_builtin_tools,

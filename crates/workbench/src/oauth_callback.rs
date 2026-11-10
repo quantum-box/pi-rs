@@ -29,6 +29,19 @@ impl Callback {
 }
 
 pub async fn receive(listener: &TcpListener, callback: &Url, state: &str) -> Result<Callback> {
+    receive_matching(listener, callback, Some(state)).await
+}
+
+/// Match an unguessable callback path for providers that do not return OAuth state.
+pub async fn receive_path(listener: &TcpListener, callback: &Url) -> Result<Callback> {
+    receive_matching(listener, callback, None).await
+}
+
+async fn receive_matching(
+    listener: &TcpListener,
+    callback: &Url,
+    state: Option<&str>,
+) -> Result<Callback> {
     loop {
         let (mut stream, _) = listener.accept().await?;
         let mut request = Vec::new();
@@ -56,7 +69,7 @@ pub async fn receive(listener: &TcpListener, callback: &Url, state: &str) -> Res
     }
 }
 
-fn redirect(request: &[u8], callback: &Url, state: &str) -> Option<Url> {
+fn redirect(request: &[u8], callback: &Url, state: Option<&str>) -> Option<Url> {
     if request.len() > 8192 || !request.windows(4).any(|part| part == b"\r\n\r\n") {
         return None;
     }
@@ -79,7 +92,7 @@ fn redirect(request: &[u8], callback: &Url, state: &str) -> Option<Url> {
     let mut states = redirect
         .query_pairs()
         .filter_map(|(key, value)| (key == "state").then_some(value));
-    if states.next().as_deref() != Some(state) || states.next().is_some() {
+    if states.next().as_deref() != state || states.next().is_some() {
         return None;
     }
     let responses = redirect
@@ -140,7 +153,7 @@ mod tests {
         let callback = Url::parse("http://127.0.0.1:1456/oauth/callback").unwrap();
         let request = |target: &str| format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n");
         let accepted = request("/oauth/callback?state=expected&code=browser-code");
-        assert!(redirect(accepted.as_bytes(), &callback, "expected").is_some());
+        assert!(redirect(accepted.as_bytes(), &callback, Some("expected")).is_some());
         for target in [
             "/oauth/callback?state=wrong&code=browser-code",
             "/oauth/callback?state=expected&state=expected&code=browser-code",
@@ -149,7 +162,32 @@ mod tests {
             "/unrelated?state=expected&code=browser-code",
             "//localhost:1456/oauth/callback?state=expected&code=browser-code",
         ] {
-            assert!(redirect(request(target).as_bytes(), &callback, "expected").is_none());
+            assert!(redirect(request(target).as_bytes(), &callback, Some("expected")).is_none());
+        }
+    }
+
+    #[test]
+    fn stateless_callbacks_require_the_unique_path() {
+        let callback = Url::parse("http://127.0.0.1:12345/oauth/callback/random-id").unwrap();
+        let request = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(
+            redirect(
+                request("/oauth/callback/random-id?code=good").as_bytes(),
+                &callback,
+                None
+            )
+            .is_some()
+        );
+        for path in [
+            "/oauth/callback?code=good",
+            "/oauth/callback/other-id?code=good",
+            "/oauth/callback/random-id?code=good&state=unexpected",
+            "/oauth/callback/random-id?code=good&code=duplicate",
+        ] {
+            assert!(
+                redirect(request(path).as_bytes(), &callback, None).is_none(),
+                "{path}"
+            );
         }
     }
 }

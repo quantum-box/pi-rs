@@ -4,6 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use pi_rs::{Error, Result};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::{Provider, config};
 
@@ -72,12 +73,13 @@ async fn resolve_command(command: &str) -> CommandResult {
 #[derive(Clone, Default)]
 pub(super) struct Keys {
     entries: BTreeMap<String, SavedKey>,
+    revision: String,
 }
 
 #[derive(Clone)]
 struct SavedKey {
     endpoint: String,
-    implicit_endpoint: bool,
+    official_routes: bool,
     key: Credential,
 }
 
@@ -93,19 +95,25 @@ impl Keys {
             .into_iter()
             .flatten()
             .filter_map(|(name, entry)| {
-                if entry["type"] != "api_key" {
-                    return None;
-                }
-                let value = entry["key"].as_str()?;
-                let key = if entry["literal"] == true {
-                    valid_key(value).then(|| Credential::Literal(value.into()))?
+                let oauth = name.eq_ignore_ascii_case("openrouter") && entry["type"] == "oauth";
+                let key = if oauth {
+                    let access = entry["access"].as_str()?;
+                    valid_key(access).then(|| Credential::Literal(access.into()))?
                 } else {
-                    match Credential::configured(value)? {
-                        Credential::Command(command) => Credential::StoredCommand(command),
-                        Credential::Literal(value) if valid_key(&value) => {
-                            Credential::Literal(value)
+                    if entry["type"] != "api_key" {
+                        return None;
+                    }
+                    let value = entry["key"].as_str()?;
+                    if entry["literal"] == true {
+                        valid_key(value).then(|| Credential::Literal(value.into()))?
+                    } else {
+                        match Credential::configured(value)? {
+                            Credential::Command(command) => Credential::StoredCommand(command),
+                            Credential::Literal(value) if valid_key(&value) => {
+                                Credential::Literal(value)
+                            }
+                            _ => return None,
                         }
-                        _ => return None,
                     }
                 };
                 let endpoint = match entry.get("endpoint") {
@@ -116,17 +124,30 @@ impl Keys {
                         })?,
                     Some(value) => value.as_str()?,
                 };
+                if oauth
+                    && super::builtin_chat::find("openrouter")
+                        .is_none_or(|builtin| builtin.endpoint() != endpoint)
+                {
+                    return None;
+                }
                 Some((
                     name.to_ascii_lowercase(),
                     SavedKey {
                         endpoint: endpoint.to_owned(),
-                        implicit_endpoint: entry.get("endpoint").is_none(),
+                        official_routes: oauth || entry.get("endpoint").is_none(),
                         key,
                     },
                 ))
             })
             .collect();
-        Self { entries }
+        Self {
+            entries,
+            revision: format!("{:x}", Sha256::digest(value.to_string())),
+        }
+    }
+
+    pub fn revision(&self) -> &str {
+        &self.revision
     }
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<&Credential> {
@@ -148,7 +169,7 @@ impl Keys {
             || (official
                 && (super::operation_models::official_base(provider)
                     == Some(entry.endpoint.as_str())
-                    || (entry.implicit_endpoint && super::builtin_chat::find(provider).is_some()))))
+                    || (entry.official_routes && super::builtin_chat::find(provider).is_some()))))
         .then_some(&entry.key)
     }
 
@@ -178,15 +199,27 @@ pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()>
     })
 }
 
+pub(super) fn save_openrouter_oauth(key: &str) -> Result<()> {
+    let provider = Provider::named("openrouter").expect("built-in OpenRouter provider");
+    config::update_object(&config::agent_dir().join("auth.json"), |data| {
+        data.insert(
+            provider.id().into(),
+            json!({
+                "type":"oauth","access":key,"refresh":"","expires":9_007_199_254_740_991_u64,
+                "endpoint":provider.default_endpoint(),
+            }),
+        );
+        Ok(())
+    })
+}
+
 pub(super) fn remove(provider: &Provider) -> Result<bool> {
     let mut removed = false;
     config::update_object(&config::agent_dir().join("auth.json"), |data| {
-        if data
+        let kind = data
             .get(provider.id())
-            .and_then(|value| value.get("type"))
-            .and_then(Value::as_str)
-            == Some("api_key")
-        {
+            .and_then(|value| value["type"].as_str());
+        if kind == Some("api_key") || (provider.id() == "openrouter" && kind == Some("oauth")) {
             data.remove(provider.id());
             removed = true;
         }
@@ -249,5 +282,34 @@ mod tests {
             keys.get(&Provider::Anthropic, "http://127.0.0.1:8001/v1/messages")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn openrouter_oauth_access_is_limited_to_official_routes() {
+        let provider = Provider::named("openrouter").unwrap();
+        let proxy = "http://127.0.0.1:8000/v1/chat/completions";
+        let official = provider.default_endpoint();
+        let keys = Keys::parse(
+            &json!({"openrouter":{"type":"oauth","access":"fixture-key","endpoint":official}}),
+        );
+        assert_eq!(keys.get(&provider, official), Some("fixture-key"));
+        assert!(keys.get(&provider, proxy).is_none());
+        assert_eq!(
+            keys.operation_credential(
+                "openrouter",
+                "https://openrouter.ai/api/v1/classifications",
+                true
+            )
+            .and_then(Credential::literal),
+            Some("fixture-key")
+        );
+        assert!(
+            keys.operation_credential("openrouter", proxy, false)
+                .is_none()
+        );
+        let invalid = Keys::parse(
+            &json!({"openrouter":{"type":"oauth","access":"fixture-key","endpoint":proxy}}),
+        );
+        assert!(!invalid.has(&provider));
     }
 }

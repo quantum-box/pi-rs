@@ -225,6 +225,7 @@ enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
     ProviderKey(super::Provider),
+    OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
 #[derive(Clone, Copy)]
@@ -241,6 +242,8 @@ struct ModelDiscovery {
 
 enum RemoteEvent {
     Notice(String),
+    OpenRouterCode(tokio::sync::oneshot::Sender<String>),
+    RefreshModelKeys,
     Finished(Result<Vec<String>>),
 }
 
@@ -1688,6 +1691,16 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             start_radius_login(view, radius_auth::Method::Device)?;
         }
         "/logout" if rest.eq_ignore_ascii_case("radius") => start_radius_logout(view)?,
+        "/login"
+            if rest.eq_ignore_ascii_case("openrouter")
+                || rest.eq_ignore_ascii_case("openrouter browser") =>
+        {
+            start_openrouter_login(view)
+        }
+        "/login" if rest.eq_ignore_ascii_case("openrouter api-key") => edit_provider_key(
+            super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
+            view,
+        ),
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -1717,6 +1730,15 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                             Selection::LogoutRadius
                         },
                     });
+                }
+                if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openrouter · OAuth".into(),
+                            selection: Selection::LoginOpenRouter,
+                        },
+                    );
                 }
                 if items.is_empty() {
                     view.append("No saved provider credentials");
@@ -2316,8 +2338,23 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     view.append(&notice);
                     dirty = true;
                 }
+                Ok(RemoteEvent::OpenRouterCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::OpenRouterCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret("OpenRouter code or redirect URL".into()),
+                    ));
+                    dirty = true;
+                }
+                Ok(RemoteEvent::RefreshModelKeys) => {
+                    match super::model_auth::Keys::load() {
+                        Ok(keys) => args.model_keys = keys,
+                        Err(error) => view.append(&error.to_string()),
+                    }
+                    dirty = true;
+                }
                 Ok(RemoteEvent::Finished(result)) => {
                     view.remote_task = None;
+                    clear_openrouter_editor(&mut view);
                     match result {
                         Ok(lines) => {
                             for line in lines {
@@ -2330,6 +2367,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     view.remote_task = None;
+                    clear_openrouter_editor(&mut view);
                     view.append("Operation stopped");
                     dirty = true;
                 }
@@ -2434,7 +2472,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
             Event::Paste(text) => {
-                if view.remote_task.is_some() {
+                if view.remote_task.is_some() && view.local_editor.is_none() {
                     continue;
                 }
                 last_idle_interrupt = None;
@@ -2455,14 +2493,18 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     if keys.action(key, true) == Some("app.interrupt") {
                         let message = task.cancelled;
                         view.remote_task = None;
+                        clear_openrouter_editor(&mut view);
                         view.append(message);
+                        continue;
                     }
-                    continue;
+                    if view.local_editor.is_none() {
+                        continue;
+                    }
                 }
-                if let Some((editor, mut dialog)) = view.local_editor.take() {
+                if let Some((mut editor, mut dialog)) = view.local_editor.take() {
                     match dialog.input(key, &keys) {
                         Some(pi_rs::UiResponse::Text(text)) => {
-                            let result = match &editor {
+                            let result = match &mut editor {
                                 LocalEditor::Setting(name) => serde_json::from_str(&text)
                                     .map_err(Error::from)
                                     .and_then(|value| {
@@ -2482,6 +2524,16 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     *id,
                                     Some(text),
                                 ),
+                                LocalEditor::OpenRouterCode(sender) => {
+                                    if let Some(code) = super::openrouter_auth::manual_code(&text) {
+                                        if let Some(sender) = sender.take() {
+                                            let _ = sender.send(code);
+                                        }
+                                        Ok(())
+                                    } else {
+                                        Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
+                                    }
+                                }
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
                                     args.model_endpoint_for(
@@ -3312,6 +3364,30 @@ fn show_radius_methods(view: &mut View) {
     ));
 }
 
+fn start_openrouter_login(view: &mut View) {
+    view.remote_task = Some(RemoteTask::start(
+        "Signing in to OpenRouter",
+        "OpenRouter login cancelled",
+        |sender| async move {
+            super::openrouter_auth::login(|url, manual| {
+                let _ = sender.send(RemoteEvent::Notice(format!(
+                    "Continue in your browser: {url}"
+                )));
+                let _ = sender.send(RemoteEvent::OpenRouterCode(manual));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to OpenRouter".into()])
+        },
+    ));
+}
+
+fn clear_openrouter_editor(view: &mut View) {
+    if matches!(view.local_editor, Some((LocalEditor::OpenRouterCode(_), _))) {
+        view.local_editor = None;
+    }
+}
+
 fn start_radius_login(view: &mut View, method: radius_auth::Method) -> Result<()> {
     let gateway = radius_auth::Gateway::configured()?;
     view.remote_task = Some(RemoteTask::start(
@@ -3580,6 +3656,7 @@ fn select(
             select_model_input(args, view, &model)?;
         }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
+        Selection::LoginOpenRouter => start_openrouter_login(view),
         Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
         Selection::RadiusMethods => show_radius_methods(view),
         Selection::LoginRadius(method) => start_radius_login(view, method)?,
