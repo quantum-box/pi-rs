@@ -250,7 +250,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         let (request, scheduled) = tokio::select! {
             _ = stop_notify.notified() => break,
             Some(shell) = shell_results.recv() => {
-                cache.clear();
+                cache.clear(&args.session, "conversation context changed");
                 save_shell(shell, &args, &snapshot, &active);
                 continue;
             }
@@ -265,7 +265,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             request = requests.recv() => match request { Some(request) => (request, true), None => break },
             input = queued.recv() => match input {
                 Some(input) => {
-                    cache.clear();
+                    cache.clear(&args.session, "conversation context changed");
                     let mut replies = Vec::new();
                     let result = Session::open(&args.session).and_then(|mut session| {
                         if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
@@ -301,7 +301,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             },
             _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
         };
-        cache.clear();
+        cache.clear(&args.session, "conversation context changed");
         if stopping.load(Ordering::SeqCst) {
             break;
         }

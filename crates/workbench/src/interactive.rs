@@ -355,6 +355,7 @@ struct View {
     flash: Option<(String, Instant)>,
     tokens: u64,
     cache_stats: super::cache_stats::Tracker,
+    cache_warming_status: Option<super::cache_warming::status::State>,
     model_operations: std::collections::HashSet<String>,
     history: Vec<String>,
     history_index: Option<usize>,
@@ -584,6 +585,12 @@ impl View {
     }
 
     fn receive_worker(&mut self, mut value: Value, args: &Cli) {
+        if value["type"] == "cache_warming_status" {
+            if value["session"] == json!(args.session) {
+                self.cache_warming_status = serde_json::from_value(value["status"].take()).ok();
+            }
+            return;
+        }
         self.receive(&value);
         if value["type"] == "record"
             && matches!(
@@ -639,6 +646,7 @@ impl View {
         self.history_index = None;
         self.tokens = 0;
         self.cache_stats = super::cache_stats::Tracker::default();
+        self.cache_warming_status = None;
         self.model_operations.clear();
         for record in session.branch() {
             match &record.event {
@@ -1710,11 +1718,16 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
     match name {
         "/help" | "/hotkeys" => view.append(HELP),
         "/session" => {
-            let session = Session::open(&args.session)?;
+            let session = Session::snapshot(&args.session)?;
             view.append(&serde_json::to_string_pretty(&sessions::summary(
                 &args.session,
                 &session,
             ))?);
+            view.append(&super::cache_warming::status::describe(
+                view.cache_warming_status.as_ref(),
+                args.settings.string("cacheWarming").unwrap_or("streaming"),
+                session.head(),
+            ));
             let stats = &view.cache_stats;
             if stats.miss_count > 0 {
                 let cost = if stats.missed_cost >= 0.0001 {
@@ -2514,6 +2527,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     view.receive_worker(value, &args);
                 }
                 view.settle();
+                view.cache_warming_status = None;
                 view.dialogs.clear();
                 if let Some(id) = view.branch_summary.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
@@ -3492,6 +3506,10 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
+                        } else if input.trim() == "/session" && view.draft_images.is_empty() {
+                            if let Err(error) = slash(&input, &mut args, &mut view) {
+                                view.append(&error.to_string());
+                            }
                         } else if is_busy(&worker) && auth_command {
                             view.append("Wait for the current operation before changing provider authentication");
                         } else if worker.as_ref().is_some_and(|active| active.busy) {
@@ -3513,6 +3531,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             view.editor.replace(input);
                         } else if input.trim() == "/reload" {
                             worker.take();
+                            view.cache_warming_status = None;
                             view.dialogs.clear();
                             view.ui_status.clear();
                             view.widgets.clear();

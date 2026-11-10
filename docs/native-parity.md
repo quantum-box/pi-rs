@@ -2730,3 +2730,13 @@ economics with its own extension state. The last override takes effect.
 A failed handler leaves the current decision in place. Successful forced
 refreshes retain the override note in the journal, terminal, and RPC.
 Legacy executable descriptions opt out by default.
+
+### Cache warming status checkpoint
+
+The terminal `/session` command reports the selected warming mode,
+time until the next decision, an in-flight refresh, and the reason a
+refresh stopped. When pricing is available it shows the expected savings,
+refresh cost, cache miss penalty, and any extension override. The command
+can read the journal during model and tool execution and does not become
+a queued prompt. Changing the active journal head invalidates an idle
+status for the previous head.

@@ -20,6 +20,8 @@ use super::{
     Cli, image_policy::WorkbenchModel, model_profiles::ChatPrice, providers::Adapter, runtime,
 };
 
+pub(super) mod status;
+
 const MAX_IDLE_AGE: Duration = Duration::from_secs(30 * 60);
 const MAX_STREAMING_AGE: Duration = Duration::from_secs(60 * 60);
 const MINIMUM_SAVINGS_USD: f64 = 0.05;
@@ -61,6 +63,27 @@ impl Scope {
         }
     }
 
+    fn age_reason(self) -> &'static str {
+        match self {
+            Self::Idle(_) => "30-minute idle safety limit reached",
+            Self::Streaming(_) => "one-hour safety limit reached",
+        }
+    }
+
+    fn head(self) -> Option<u64> {
+        match self {
+            Self::Idle(head) => Some(head),
+            Self::Streaming(_) => None,
+        }
+    }
+
+    fn phase(self) -> CacheWarmingPhase {
+        match self {
+            Self::Streaming(_) => CacheWarmingPhase::Streaming,
+            Self::Idle(_) => CacheWarmingPhase::Idle,
+        }
+    }
+
     fn probability(self) -> f64 {
         match self {
             Self::Streaming(_) => 1.0,
@@ -96,12 +119,14 @@ struct Context {
     prompt_tokens: u64,
     started: Instant,
     next: Instant,
+    refreshing: Option<status::Decision>,
 }
 
 pub(super) struct Capture<'a> {
     args: &'a Cli,
     controller: Controller,
-    policy: Option<Arc<Policy>>,
+    policy: Result<Arc<Policy>, &'static str>,
+    enabled: bool,
     model: Option<Arc<WorkbenchModel>>,
     registry: Option<Arc<Registry>>,
     session: Option<Uuid>,
@@ -120,36 +145,43 @@ struct Policy {
 }
 
 impl Policy {
-    fn load(args: &Cli) -> Option<Self> {
+    fn load(args: &Cli) -> Result<Self, &'static str> {
+        if Mode::load(&args.workspace).ok_or("cache warming settings unavailable")? == Mode::Off {
+            return Err("cache warming disabled");
+        }
         let profiles = &args.model_profiles;
-        let model = profiles.model(&args.provider, &args.model)?;
+        let model = profiles
+            .model(&args.provider, &args.model)
+            .ok_or("cache lifetime unavailable")?;
         let long_supported = match profiles.model_adapter(&args.provider, &args.model) {
             Adapter::Anthropic => {
                 if args.provider_thinking().is_some_and(|level| level != "off")
                     && model.adaptive_thinking() != Some(true)
                 {
-                    return None;
+                    return Err("request cannot be replayed safely");
                 }
                 profiles
                     .messages_cache_support(&args.provider, Some(&model))
                     .0
             }
-            Adapter::ChatCompletions => {
-                profiles.chat_cache_support(&args.provider, &args.model, Some(&model))?
-            }
+            Adapter::ChatCompletions => profiles
+                .chat_cache_support(&args.provider, &args.model, Some(&model))
+                .ok_or("request disabled prompt caching")?,
             Adapter::PiMessages => true,
-            Adapter::Google => return None,
+            Adapter::Google => return Err("cache lifetime unavailable"),
         };
         let retention = super::providers::cache_retention(long_supported);
-        let ttl = model.prompt_cache_seconds(retention)?;
-        if ttl <= 10.0 || Mode::load(&args.workspace)? == Mode::Off {
-            return None;
+        let ttl = model
+            .prompt_cache_seconds(retention)
+            .ok_or("cache lifetime unavailable")?;
+        if ttl <= 10.0 {
+            return Err("cache lifetime unavailable");
         }
         let delay = (ttl * 900.0).min(ttl * 1000.0 - 10_000.0).floor().max(1.0) / 1000.0;
         if delay > MAX_STREAMING_AGE.as_secs_f64() {
-            return None;
+            return Err("one-hour safety limit reached");
         }
-        Some(Self {
+        Ok(Self {
             delay: Duration::from_secs_f64(delay),
             late_margin: Duration::from_secs_f64((ttl - delay) / 2.0),
             retention,
@@ -157,7 +189,26 @@ impl Policy {
         })
     }
 
-    fn economics(&self, input_tokens: u64) -> Option<(f64, f64)> {
+    fn decision(&self, scope: Scope, prompt_tokens: u64) -> status::Decision {
+        let (warm_cost, miss_cost, available) = self.economics(prompt_tokens).unwrap_or_default();
+        let probability = scope.probability();
+        let action = if probability * miss_cost - warm_cost >= MINIMUM_SAVINGS_USD {
+            CacheWarmingAction::Warm
+        } else {
+            CacheWarmingAction::Stop
+        };
+        status::Decision {
+            phase: scope.phase(),
+            warm_cost,
+            miss_cost,
+            probability,
+            available,
+            action,
+            overridden: false,
+        }
+    }
+
+    fn economics(&self, input_tokens: u64) -> Option<(f64, f64, bool)> {
         let price = self.price.as_ref()?;
         let usage = Usage {
             input_tokens,
@@ -189,14 +240,22 @@ impl Policy {
             },
             &hit,
         )?;
-        Some((warm_cost, (miss_cost - hit_cost).max(0.0)))
+        Some((
+            warm_cost,
+            (miss_cost - hit_cost).max(0.0),
+            input_tokens > 0 && (hit_cost > 0.0 || miss_cost > 0.0),
+        ))
     }
 }
 
 impl<'a> Capture<'a> {
     pub fn new(args: &'a Cli, prompt: bool, controller: Controller) -> Self {
-        let policy = prompt.then(|| Policy::load(args)).flatten().map(Arc::new);
-        let model = policy.as_ref().and_then(|_| {
+        let policy = if prompt {
+            Policy::load(args).map(Arc::new)
+        } else {
+            Err("waiting for first request")
+        };
+        let model = policy.as_ref().ok().and_then(|_| {
             runtime::model_client(args, super::thinking::reported(args).is_some(), false)
                 .ok()
                 .map(Arc::new)
@@ -205,6 +264,7 @@ impl<'a> Capture<'a> {
             args,
             controller,
             policy,
+            enabled: prompt,
             model,
             registry: None,
             session: None,
@@ -236,14 +296,14 @@ impl<'a> Capture<'a> {
     }
 
     pub fn observe(&mut self, event: &Notification<'_>) {
-        if self.model.is_none() {
+        if !self.enabled {
             return;
         }
         match event {
             Notification::SummaryRequest => self.summary = true,
             Notification::Committed(record) => match &record.event {
                 Event::ModelRequested { request_id, .. } => {
-                    self.cancel();
+                    self.cancel("conversation context changed");
                     self.request_id = *request_id;
                 }
                 Event::ModelFinished {
@@ -253,7 +313,7 @@ impl<'a> Capture<'a> {
                     ..
                 } if Some(*request_id) == self.request_id => {
                     if failure.is_some() {
-                        self.cancel();
+                        self.cancel("model request failed");
                     } else if let UsageReport::Measured { usage } = usage {
                         self.completed = Some((*request_id, usage.input_tokens));
                     }
@@ -265,6 +325,7 @@ impl<'a> Capture<'a> {
                         self.prompt_tokens = tokens;
                         if let Some(context) = &self.context {
                             context.lock().expect("cache context").prompt_tokens = tokens;
+                            self.publish_current();
                         }
                     }
                 }
@@ -273,19 +334,21 @@ impl<'a> Capture<'a> {
                 }
                 Event::Compacted { .. } | Event::BranchSummary { .. } => {
                     self.prompt_tokens = 0;
-                    self.cancel();
+                    self.cancel("conversation context changed");
                 }
                 Event::ContextEdited { .. }
                 | Event::BashExecution { .. }
                 | Event::User { .. }
                 | Event::UserWithImages { .. }
                 | Event::UserImages { .. } => {
-                    self.cancel();
+                    self.cancel("conversation context changed");
                 }
                 _ => {}
             },
             Notification::Request(request) => {
-                if !std::mem::take(&mut self.summary) {
+                if std::mem::take(&mut self.summary) {
+                    status::stopped(&self.args.session, "request disabled prompt caching", None);
+                } else {
                     self.start(request);
                 }
             }
@@ -294,12 +357,21 @@ impl<'a> Capture<'a> {
     }
 
     fn start(&mut self, request: &ModelRequest) {
-        let (Some(session), Some(request_id), Some(model), Some(policy)) =
-            (self.session, self.request_id, &self.model, &self.policy)
+        let policy = match &self.policy {
+            Ok(policy) => policy,
+            Err(reason) => {
+                status::stopped(&self.args.session, reason, None);
+                return;
+            }
+        };
+        let (Some(session), Some(request_id), Some(model)) =
+            (self.session, self.request_id, &self.model)
         else {
+            status::stopped(&self.args.session, "cache warming unavailable", None);
             return;
         };
         if request.model != self.args.model {
+            status::stopped(&self.args.session, "conversation context changed", None);
             return;
         }
         let started = Instant::now();
@@ -309,6 +381,7 @@ impl<'a> Capture<'a> {
             prompt_tokens: self.prompt_tokens,
             started,
             next,
+            refreshing: None,
         }));
         self.context = Some(context.clone());
         let mut request = request.clone();
@@ -328,31 +401,67 @@ impl<'a> Capture<'a> {
             context,
             timeout: Duration::from_secs(self.args.model_timeout_secs),
         };
-        self.controller.set(Some(candidate.schedule(next)));
+        self.controller.set(candidate.schedule(next));
     }
 
-    fn cancel(&mut self) {
+    fn publish_current(&self) {
+        if self.controller.has_task()
+            && let (Some(context), Ok(policy)) = (&self.context, &self.policy)
+        {
+            let context = context.lock().expect("cache context");
+            if let Some(decision) = context.refreshing {
+                status::publish(
+                    &self.args.session,
+                    status::State::Refreshing {
+                        decision,
+                        head: context.scope.head(),
+                    },
+                );
+            } else {
+                status::scheduled(
+                    &self.args.session,
+                    context.next,
+                    policy.decision(context.scope, context.prompt_tokens),
+                    context.scope.head(),
+                );
+            }
+        }
+    }
+
+    fn cancel(&mut self, reason: &str) {
         self.context = None;
         self.completed = None;
-        self.controller.set(None);
+        self.controller.clear(&self.args.session, reason);
     }
 
     pub fn settle(&mut self, session: Option<&Session>) {
-        let remains_idle = if let (Some(context), Some(session), Some(request_id)) =
+        if self.context.is_none() {
+            self.controller.resume();
+            return;
+        }
+        let mode = Mode::load(&self.args.workspace);
+        let stop = if let (Some(context), Some(session), Some(request_id)) =
             (&self.context, session, self.request_id)
-            && Mode::load(&self.args.workspace) == Some(Mode::Idle)
+            && mode == Some(Mode::Idle)
             && session.queued_inputs().is_empty()
             && session.cache_request_current(session.session_id(), request_id)
         {
             let mut context = context.lock().expect("cache context");
             let until = context.started + MAX_IDLE_AGE;
             context.scope = Scope::Idle(session.head());
-            context.next <= until && Instant::now() < until
+            (context.next > until || Instant::now() >= until)
+                .then_some("30-minute idle safety limit reached")
+        } else if mode == Some(Mode::Off) {
+            Some("cache warming disabled")
+        } else if session.is_some() && mode == Some(Mode::Streaming) {
+            Some("agent run settled")
         } else {
-            false
+            Some("conversation context changed")
         };
-        if !remains_idle {
-            self.cancel();
+        if let Some(reason) = stop {
+            self.cancel(reason);
+        } else {
+            self.publish_current();
         }
         self.controller.resume();
     }
@@ -378,8 +487,14 @@ impl Controller {
         self.0.waker.wake();
     }
 
-    pub fn clear(&self) {
-        self.set(None);
+    fn has_task(&self) -> bool {
+        self.0.task.lock().expect("cache task").is_some()
+    }
+
+    pub fn clear(&self, path: &Path, reason: &str) {
+        if self.0.task.lock().expect("cache task").take().is_some() {
+            status::stopped(path, reason, None);
+        }
     }
 
     fn park(&self) {
@@ -431,35 +546,48 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn schedule(self, next: Instant) -> Task {
-        self.context.lock().expect("cache context").next = next;
-        Box::pin(async move {
+    fn schedule(self, next: Instant) -> Option<Task> {
+        {
+            let mut context = self.context.lock().expect("cache context");
+            if next > context.started + context.scope.max_age() {
+                status::stopped(&self.path, context.scope.age_reason(), None);
+                return None;
+            }
+            context.next = next;
+            context.refreshing = None;
+            status::scheduled(
+                &self.path,
+                next,
+                self.policy.decision(context.scope, context.prompt_tokens),
+                context.scope.head(),
+            );
+        }
+        Some(Box::pin(async move {
             sleep_until(next).await;
-            let (scope, prompt_tokens, deadline, snapshot) = self.current_snapshot(next)?;
+            let stop = |reason, decision| {
+                status::stopped(&self.path, reason, decision);
+                None
+            };
+            let (scope, prompt_tokens, deadline, snapshot) = match self.current_snapshot(next) {
+                Ok(current) => current,
+                Err(reason) => return stop(reason, None),
+            };
             let states = self.registry.as_ref().map(|_| snapshot.extension_states());
             drop(snapshot);
-            let (warm_cost, miss_cost) = self.policy.economics(prompt_tokens).unwrap_or_default();
-            let probability = scope.probability();
-            let suggested = if probability * miss_cost - warm_cost >= MINIMUM_SAVINGS_USD {
-                CacheWarmingAction::Warm
-            } else {
-                CacheWarmingAction::Stop
-            };
-            let action = if let (Some(registry), Some(states)) = (&self.registry, states) {
+            let mut decision = self.policy.decision(scope, prompt_tokens);
+            let suggested = decision.action;
+            if let (Some(registry), Some(states)) = (&self.registry, states) {
                 let event = CacheWarmingDecision {
                     session_id: self.session,
                     model: self.identity.clone(),
-                    phase: match scope {
-                        Scope::Streaming(_) => CacheWarmingPhase::Streaming,
-                        Scope::Idle(_) => CacheWarmingPhase::Idle,
-                    },
+                    phase: decision.phase,
                     prompt_tokens,
-                    warm_cost,
-                    miss_cost,
-                    continuation_probability: probability,
+                    warm_cost: decision.warm_cost,
+                    miss_cost: decision.miss_cost,
+                    continuation_probability: decision.probability,
                     action: suggested,
                 };
-                timeout_at(
+                let action = timeout_at(
                     deadline,
                     registry.cache_warming_decision(&event, &states, |extension, message| {
                         super::output(serde_json::json!({
@@ -468,50 +596,85 @@ impl Candidate {
                         }));
                     }),
                 )
-                .await
-                .ok()?
-            } else {
-                suggested
-            };
-            if action == CacheWarmingAction::Stop {
-                return None;
+                .await;
+                let Ok(action) = action else {
+                    return stop("cache refresh deadline missed", None);
+                };
+                decision.action = action;
+                decision.overridden = action != suggested;
+            }
+            if decision.action == CacheWarmingAction::Stop {
+                let reason = if decision.overridden {
+                    "stopped by extension"
+                } else if decision.available {
+                    "expected savings below threshold"
+                } else {
+                    "cache economics unavailable"
+                };
+                return stop(reason, Some(decision));
             }
             let deadline = if self.registry.is_some() {
-                self.current_snapshot(next)?.2
+                match self.current_snapshot(next) {
+                    Ok((_, _, deadline, _)) => deadline,
+                    Err(reason) => return stop(reason, None),
+                }
             } else {
                 deadline
             };
             let now = Instant::now();
             if now > deadline {
-                return None;
+                return stop("cache refresh deadline missed", None);
             }
-            let (usage, metadata) = timeout(self.timeout, self.refresh()).await.ok()??;
+            let head = {
+                let mut context = self.context.lock().expect("cache context");
+                context.refreshing = Some(decision);
+                context.scope.head()
+            };
+            status::publish(&self.path, status::State::Refreshing { decision, head });
+            let Ok(Some((usage, metadata))) = timeout(self.timeout, self.refresh()).await else {
+                return stop("cache refresh failed", Some(decision));
+            };
             Some(Receipt {
                 candidate: self,
                 usage,
                 metadata,
                 requested_at: now,
-                note: (action != suggested).then(|| "extension override".to_owned()),
+                note: decision.overridden.then(|| "extension override".to_owned()),
+                decision,
             })
-        })
+        }))
     }
 
-    fn current_snapshot(&self, next: Instant) -> Option<(Scope, u64, Instant, Session)> {
+    fn current_snapshot(
+        &self,
+        next: Instant,
+    ) -> Result<(Scope, u64, Instant, Session), &'static str> {
         let (scope, prompt_tokens, started) = {
             let context = self.context.lock().expect("cache context");
             (context.scope, context.prompt_tokens, context.started)
         };
-        let deadline = (next + self.policy.late_margin).min(started + scope.max_age());
-        if next > deadline
-            || Instant::now() > deadline
-            || !Mode::load(&self.workspace).is_some_and(|mode| scope.allowed(mode))
-        {
-            return None;
+        let until = started + scope.max_age();
+        if next > until || Instant::now() > until {
+            return Err(scope.age_reason());
         }
-        let snapshot = Session::snapshot(&self.path).ok()?;
-        scope
-            .current(&snapshot, self.session)
-            .then_some((scope, prompt_tokens, deadline, snapshot))
+        let deadline = (next + self.policy.late_margin).min(until);
+        if Instant::now() > deadline {
+            return Err("cache refresh deadline missed");
+        }
+        let mode = Mode::load(&self.workspace).ok_or("cache warming settings unavailable")?;
+        if !scope.allowed(mode) {
+            return Err(if mode == Mode::Off {
+                "cache warming disabled"
+            } else {
+                "agent run settled"
+            });
+        }
+        let snapshot =
+            Session::snapshot(&self.path).map_err(|_| "conversation context unavailable")?;
+        if !scope.current(&snapshot, self.session) {
+            return Err("conversation context changed");
+        }
+        Ok((scope, prompt_tokens, deadline, snapshot))
     }
 
     async fn refresh(&self) -> Option<(Usage, ModelMetadata)> {
@@ -545,6 +708,7 @@ pub(super) struct Receipt {
     metadata: ModelMetadata,
     requested_at: Instant,
     note: Option<String>,
+    decision: status::Decision,
 }
 
 impl Receipt {
@@ -562,9 +726,15 @@ impl Receipt {
             return;
         };
         let Ok(mut session) = Session::open(path) else {
+            status::stopped(
+                path,
+                "cache refresh usage could not be recorded",
+                Some(self.decision),
+            );
             return;
         };
         if !scope.current(&session, self.candidate.session) {
+            status::stopped(path, "conversation context changed", None);
             return;
         }
         let cache_hit = self.metadata.cached_input_tokens.unwrap_or_default() > 0;
@@ -575,13 +745,24 @@ impl Receipt {
             self.usage,
             self.note,
         ) else {
+            status::stopped(
+                path,
+                "cache refresh usage could not be recorded",
+                Some(self.decision),
+            );
             return;
         };
         self.candidate.context.lock().expect("cache context").scope = Scope::Idle(record.id);
         observe(record);
         if cache_hit {
             let next = self.requested_at + self.candidate.policy.delay;
-            controller.set(Some(self.candidate.schedule(next)));
+            controller.set(self.candidate.schedule(next));
+        } else {
+            status::stopped(
+                &self.candidate.path,
+                "refresh missed the cache",
+                Some(self.decision),
+            );
         }
     }
 
@@ -600,7 +781,13 @@ impl Receipt {
         };
         if cache_hit {
             let next = self.requested_at + self.candidate.policy.delay;
-            controller.set(Some(self.candidate.schedule(next)));
+            controller.set(self.candidate.schedule(next));
+        } else {
+            status::stopped(
+                &self.candidate.path,
+                "refresh missed the cache",
+                Some(self.decision),
+            );
         }
         Some(input)
     }
