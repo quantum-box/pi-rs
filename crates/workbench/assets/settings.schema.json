@@ -82,6 +82,7 @@
     "terminal": {
       "type": "object",
       "properties": {
+        "clearOnShrink": { "type": "boolean" },
         "showTerminalProgress": { "type": "boolean" },
         "showImages": { "type": "boolean" },
         "imageWidthCells": { "type": "integer", "minimum": 1 }

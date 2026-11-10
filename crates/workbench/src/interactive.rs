@@ -233,6 +233,8 @@ struct RegularLayout {
 #[derive(Default)]
 struct RegularState {
     committed: usize,
+    committed_rows: usize,
+    max_rows: usize,
     cursor_row: usize,
     region_height: usize,
     started: bool,
@@ -1401,87 +1403,26 @@ impl View {
         if self.dialog().is_some() {
             below.clear();
         }
-        let mut out = std::io::stdout().lock();
-        if redraw {
-            self.graphics.clear_placements(&mut out)?;
-            queue!(
-                out,
-                Clear(ClearType::All),
-                MoveTo(0, 0),
-                Clear(ClearType::Purge)
-            )?;
-        }
-        if !redraw {
-            self.graphics.clear_active(&mut out)?;
-        }
-        queue!(out, Hide, MoveToColumn(0))?;
-        if self.regular.started && !redraw {
-            queue!(
-                out,
-                MoveUp(self.regular.cursor_row as u16),
-                Clear(ClearType::FromCursorDown)
-            )?;
-        } else {
-            queue!(out, Print("\r\n"))?;
-            if (self.regular.committed == 0 || redraw) && show_startup_header(args) {
-                Line::plain(
-                    &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
-                    theme.color("accent"),
-                )
-                .draw(&mut out, width)?;
-                queue!(out, Print("\r\n"))?;
-            }
-        }
-        if redraw {
-            for entry in &self.lines[..self.regular.committed] {
-                for line in entry.render(
-                    theme,
-                    width,
-                    self.expand_tools,
-                    !self.hide_thinking,
-                    image_width,
-                    output_pad,
-                ) {
-                    line.draw(&mut out, width)?;
-                    self.graphics
-                        .paint(&line, &mut out, usize::MAX, usize::MAX)?;
-                    queue!(out, Print("\r\n"))?;
-                }
-            }
-        }
+        let render_entry = |entry: &Entry| {
+            entry.render(
+                theme,
+                width,
+                self.expand_tools,
+                !self.hide_thinking,
+                image_width,
+                output_pad,
+            )
+        };
+        let pending = || {
+            self.lines[self.regular.committed..]
+                .iter()
+                .flat_map(render_entry)
+        };
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let committing = !busy && !modal;
         let mut active = Vec::new();
-        if !busy && self.picker.is_none() && self.dialog().is_none() {
-            for entry in &self.lines[self.regular.committed..] {
-                for line in entry.render(
-                    theme,
-                    width,
-                    self.expand_tools,
-                    !self.hide_thinking,
-                    image_width,
-                    output_pad,
-                ) {
-                    line.draw(&mut out, width)?;
-                    self.graphics
-                        .paint(&line, &mut out, usize::MAX, usize::MAX)?;
-                    queue!(out, Print("\r\n"))?;
-                }
-            }
-            self.regular.committed = self.lines.len();
-        } else {
-            active.extend(
-                self.lines[self.regular.committed..]
-                    .iter()
-                    .flat_map(|entry| {
-                        entry.render(
-                            theme,
-                            width,
-                            self.expand_tools,
-                            !self.hide_thinking,
-                            image_width,
-                            output_pad,
-                        )
-                    }),
-            );
+        if !committing {
+            active.extend(pending());
             active.extend(Entry::Thinking(self.thinking.clone()).render(
                 theme,
                 width,
@@ -1521,6 +1462,76 @@ impl View {
             }
             active.extend(widgets);
         }
+        let region_height = active.len() + prompt_height + 4 + below.len();
+        let rows_to_match = self
+            .regular
+            .max_rows
+            .saturating_sub(self.regular.committed_rows + region_height);
+        let redraw = redraw
+            || (args.settings.clear_terminal_on_shrink()
+                && !modal
+                && rows_to_match > 0
+                && (!committing || pending().take(rows_to_match).count() < rows_to_match));
+        let mut out = std::io::stdout().lock();
+        if redraw {
+            self.graphics.clear_placements(&mut out)?;
+            queue!(
+                out,
+                Clear(ClearType::All),
+                MoveTo(0, 0),
+                Clear(ClearType::Purge)
+            )?;
+        }
+        if !redraw {
+            self.graphics.clear_active(&mut out)?;
+        }
+        queue!(out, Hide, MoveToColumn(0))?;
+        if self.regular.started && !redraw {
+            queue!(
+                out,
+                MoveUp(self.regular.cursor_row as u16),
+                Clear(ClearType::FromCursorDown)
+            )?;
+        } else {
+            queue!(out, Print("\r\n"))?;
+            if (self.regular.committed == 0 || redraw) && show_startup_header(args) {
+                Line::plain(
+                    &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
+                    theme.color("accent"),
+                )
+                .draw(&mut out, width)?;
+                queue!(out, Print("\r\n"))?;
+            }
+        }
+        if redraw {
+            self.regular.committed_rows = 0;
+            for line in self.lines[..self.regular.committed]
+                .iter()
+                .flat_map(render_entry)
+            {
+                line.draw(&mut out, width)?;
+                self.graphics
+                    .paint(&line, &mut out, usize::MAX, usize::MAX)?;
+                queue!(out, Print("\r\n"))?;
+                self.regular.committed_rows += 1;
+            }
+        }
+        if committing {
+            for line in pending() {
+                line.draw(&mut out, width)?;
+                self.graphics
+                    .paint(&line, &mut out, usize::MAX, usize::MAX)?;
+                queue!(out, Print("\r\n"))?;
+                self.regular.committed_rows += 1;
+            }
+            self.regular.committed = self.lines.len();
+        }
+        let total_rows = self.regular.committed_rows + region_height;
+        self.regular.max_rows = if redraw {
+            total_rows
+        } else {
+            self.regular.max_rows.max(total_rows)
+        };
         for (row, line) in active.iter().enumerate() {
             line.draw(&mut out, width)?;
             self.graphics.paint_active(
@@ -1582,7 +1593,7 @@ impl View {
         )
         .draw(&mut out, width)?;
         self.regular.cursor_row = active.len() + 1 + cursor;
-        self.regular.region_height = active.len() + prompt_height + 4 + below.len();
+        self.regular.region_height = region_height;
         let (column, show_cursor) = if self.dialog().is_some() {
             self.regular.cursor_row = dialog_cursor.map_or(0, |(row, _)| row);
             (
@@ -3255,6 +3266,20 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     selection: Selection::Setting(
                                         "editorPaddingX".into(),
                                         json!((padding + 1) % 4),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
+                                        "Clear on shrink · {}",
+                                        if args.settings.clear_terminal_on_shrink() {
+                                            "on"
+                                        } else {
+                                            "off"
+                                        }
+                                    ),
+                                    selection: Selection::Setting(
+                                        "terminal.clearOnShrink".into(),
+                                        json!(!args.settings.clear_terminal_on_shrink()),
                                     ),
                                 },
                                 Item {
