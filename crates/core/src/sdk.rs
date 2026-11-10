@@ -699,6 +699,7 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         Notification::Request(request) => SessionEvent::Request(Arc::new((*request).clone())),
         Notification::Text(text) => SessionEvent::Text((*text).into()),
         Notification::Retry(event) => SessionEvent::Retry(event.clone()),
+        Notification::SummaryRequest => return,
     };
     let _ = events.send(event);
 }

@@ -48,6 +48,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut pending_bash: Option<Value> = None;
     let mut pending_compact: Option<Value> = None;
     let mut pending_queries: Vec<Value> = Vec::new();
+    let mut stream = super::rpc_events::Stream::default();
     loop {
         if let Some(active) = &mut worker {
             for event in active.events.try_iter() {
@@ -68,6 +69,8 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     &mut pending_abort,
                     &mut pending_bash,
                     &mut pending_compact,
+                    &mut stream,
+                    &args,
                 )?;
             }
             if let Some(status) = active.child.try_wait()? {
@@ -88,6 +91,8 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         &mut pending_abort,
                         &mut pending_bash,
                         &mut pending_compact,
+                        &mut stream,
+                        &args,
                     )?;
                 }
                 for request in pending_queries.drain(..) {
@@ -99,8 +104,14 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     )?;
                 }
                 if finished.busy {
-                    emit(json!({"type":"agent_end","success":status.success()}))?;
-                    emit(json!({"type":"agent_settled"}))?;
+                    for event in stream.settle(false) {
+                        emit(event)?;
+                    }
+                    emit(
+                        json!({"type":"agent_end","success":status.success(),"messages":stream.messages,"willRetry":false}),
+                    )?;
+                    emit(json!({"type":"agent_settled","aborted":stream.aborted()}))?;
+                    stream.reset();
                 }
                 if let Some(request) = pending_abort.take() {
                     response(&request, Ok(None))?;
@@ -319,7 +330,16 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
             continue;
         }
+        let previous_thinking = args.thinking.clone();
         let result = command(&request, &mut args, &mut worker);
+        if result.is_ok()
+            && previous_thinking.as_deref().unwrap_or("off")
+                != args.thinking.as_deref().unwrap_or("off")
+        {
+            emit(
+                json!({"type":"thinking_level_changed","level":args.thinking.as_deref().unwrap_or("off")}),
+            )?;
+        }
         response(&request, result)?;
     }
     drop(worker);
@@ -395,7 +415,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         "cycle_model" if !busy(worker) => {
             let (available, _) = available_models(args, false)?;
             if available.is_empty() {
-                return Ok(None);
+                return Ok(Some(Value::Null));
             }
             let next = available
                 .iter()
@@ -419,9 +439,9 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             super::thinking::set(args, level)?;
             Ok(None)
         }
-        "cycle_thinking_level" if !busy(worker) => {
-            Ok(super::thinking::cycle(args)?.map(|level| json!({"level":level})))
-        }
+        "cycle_thinking_level" if !busy(worker) => Ok(Some(
+            super::thinking::cycle(args)?.map_or(Value::Null, |level| json!({"level":level})),
+        )),
 
         "switch_session" if !busy(worker) => {
             let path = request["sessionPath"]
@@ -537,7 +557,11 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .as_str()
                 .ok_or_else(|| Error::Config("name is required".into()))?;
             let name = sessions::validate_name(name).map_err(Error::Config)?;
-            Session::open(&args.session)?.set_name(&name)?;
+            let mut session = Session::open(&args.session)?;
+            if session.name() != Some(name.as_str()) {
+                session.set_name(&name)?;
+                emit(json!({"type":"session_info_changed","name":name}))?;
+            }
             Ok(None)
         }
         "export_html" if !busy(worker) => {
@@ -757,11 +781,23 @@ fn forward_event(
     pending_abort: &mut Option<Value>,
     pending_bash: &mut Option<Value>,
     pending_compact: &mut Option<Value>,
+    stream: &mut super::rpc_events::Stream,
+    args: &Cli,
 ) -> Result<()> {
     match event["type"].as_str() {
         Some("response") if event["command"] == "compact" => {
             pending_compact.take();
             *busy = false;
+            let mut completed = json!({
+                "type":"compaction_end","reason":"manual",
+                "aborted":stream.aborted(),"willRetry":false,
+            });
+            if event["success"] == true {
+                completed["result"] = event["data"].clone();
+            } else {
+                completed["errorMessage"] = event["error"].clone();
+            }
+            emit(completed)?;
             emit(event)?;
             if let Some(request) = pending_abort.take() {
                 response(&request, Ok(None))?;
@@ -769,6 +805,11 @@ fn forward_event(
             Ok(())
         }
         Some("backend_ready" | "bash_execution_start") => Ok(()),
+        Some("bash_execution_update") => {
+            let mut event = event;
+            event["delta"] = event["output"].clone();
+            emit(event)
+        }
         Some("bash_execution_end") => {
             if let Some(request) = pending_bash.take() {
                 let result = if let Some(error) = event["error"].as_str() {
@@ -782,18 +823,38 @@ fn forward_event(
         }
         Some("agent_started") => {
             *busy = true;
+            stream.reset();
+            if pending_compact.is_some() {
+                emit(json!({"type":"compaction_start","reason":"manual"}))?;
+            }
             emit(json!({"type":"agent_start"}))
         }
         Some("agent_settled") => {
             *busy = pending_compact.is_some();
-            emit(json!({"type":"agent_end","success":event["success"]}))?;
-            emit(json!({"type":"agent_settled"}))?;
+            for mapped in stream.settle(event["aborted"] == true) {
+                emit(mapped)?;
+            }
+            emit(
+                json!({"type":"agent_end","success":event["success"],"messages":stream.messages,"willRetry":false}),
+            )?;
+            emit(json!({"type":"agent_settled","aborted":stream.aborted()}))?;
             if let Some(request) = pending_abort.take() {
                 response(&request, Ok(None))?;
             }
             Ok(())
         }
-        _ => emit_event(event),
+        _ => {
+            for mapped in stream.observe(&event, args) {
+                emit(mapped)?;
+            }
+            if matches!(
+                event["type"].as_str(),
+                Some("text_delta" | "summary_request_start")
+            ) {
+                return Ok(());
+            }
+            emit(event)
+        }
     }
 }
 
@@ -808,16 +869,6 @@ fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
         _ => {}
     }
     emit(value)
-}
-
-fn emit_event(event: Value) -> Result<()> {
-    if event["type"] == "text_delta" {
-        emit(
-            json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":event["delta"]}}),
-        )
-    } else {
-        emit(event)
-    }
 }
 
 fn emit(value: Value) -> Result<()> {
@@ -838,12 +889,16 @@ mod tests {
         let mut abort = None;
         let mut bash = None;
         let mut compact = Some(json!({"type":"compact","id":"focus"}));
+        let mut stream = super::super::rpc_events::Stream::default();
+        let args = Cli::try_parse_from(["pi"]).unwrap();
         forward_event(
             json!({"type":"agent_settled","success":true}),
             &mut busy,
             &mut abort,
             &mut bash,
             &mut compact,
+            &mut stream,
+            &args,
         )
         .unwrap();
         assert!(busy);
@@ -853,7 +908,16 @@ mod tests {
             "type": "response", "command": "compact", "id": "focus",
             "success": true, "data": {"summary": "done"},
         });
-        forward_event(response, &mut busy, &mut abort, &mut bash, &mut compact).unwrap();
+        forward_event(
+            response,
+            &mut busy,
+            &mut abort,
+            &mut bash,
+            &mut compact,
+            &mut stream,
+            &args,
+        )
+        .unwrap();
         assert!(!busy);
         assert!(compact.is_none());
         assert!(abort.is_none());

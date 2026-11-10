@@ -118,6 +118,8 @@ pub struct Agent<'a> {
 pub enum Notification<'a> {
     Retry(crate::RetryEvent),
     Committed(&'a Record),
+    /// The following model request generates a compaction summary.
+    SummaryRequest,
     /// Final logical context after extensions, before provider encoding. May contain sensitive data.
     Request(&'a ModelRequest),
     /// Transient text. Only a fully completed response is committed.
@@ -754,6 +756,9 @@ impl Agent<'_> {
             retain_reply.then(|| request.tools.iter().map(|tool| tool.name.clone()).collect());
         let context_head = session.head();
         let context_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
+        if !retain_reply {
+            observer(Notification::SummaryRequest);
+        }
         commit(
             session,
             Event::ModelRequested {

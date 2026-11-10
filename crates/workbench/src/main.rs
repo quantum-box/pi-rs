@@ -30,6 +30,7 @@ use providers::Provider;
 mod resource_paths;
 mod resources;
 mod rpc;
+mod rpc_events;
 mod runtime;
 mod session_import;
 mod sessions;
@@ -1086,6 +1087,7 @@ fn observe(event: Notification<'_>, trace: bool) {
     }
     match event {
         Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
+        Notification::SummaryRequest if trace => output(json!({"type":"summary_request_start"})),
         Notification::Committed(record) if trace => {
             output(json!({"type": "record", "record": record}))
         }

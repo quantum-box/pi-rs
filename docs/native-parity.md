@@ -15,7 +15,7 @@ remaining acceptance work for that surface.
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
 | Terminal | Default `pi` startup, Unicode multiline editor and kill ring, text/image clipboard paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
-| CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
+| CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius sharing |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint and native Anthropic Messages, API keys and bearer tokens, asynchronous searchable model selector, branch-local model/thinking selection, Ollama capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, provider-specific thinking for other services and live provider switching |
@@ -28,7 +28,7 @@ remaining acceptance work for that surface.
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
-## Current RPC subset
+## RPC support
 
 The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `get_state`, `get_messages`, `new_session`, `set_model`, `compact`,
@@ -39,8 +39,12 @@ The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,
 `edit_context`, `bash`, `abort_bash`, `clear_queue`, `set_steering_mode`,
 `set_follow_up_mode`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, and `shutdown`. Responses carry the request ID and a
 success flag. Prompt acceptance is separate from completion; wait for
-`agent_settled`. The interface emits native journal events plus text updates.
-Additional Pi RPC commands and complete event-schema parity remain in progress.
+`agent_settled`. The interface emits native journal events alongside Pi-style
+message start, update and end events, including indexed text and reasoning
+blocks, tool calls, tool results and turn boundaries. Tool-call blocks become
+available when their provider response is complete. Session entry and message
+snapshot schemas, incremental tool arguments, and additional session events
+remain in progress.
 
 ## Verification
 

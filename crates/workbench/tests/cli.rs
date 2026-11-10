@@ -572,12 +572,25 @@ fn api_key_override_reaches_direct_and_rpc_requests_without_persistence() {
         let settled = event["type"] == "agent_settled";
         events.push(event);
         if settled {
-            assert!(
-                events
-                    .iter()
-                    .any(|event| event["type"] == "agent_end" && event["success"] == true),
-                "{events:?}"
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "agent_end")
+                .expect("agent end precedes settlement");
+            assert_eq!(end["success"], true, "{events:?}");
+            assert_eq!(end["messages"][0]["role"], "user");
+            assert_eq!(end["messages"][1]["role"], "assistant");
+            let update = events
+                .iter()
+                .find(|event| event["assistantMessageEvent"]["type"] == "text_delta")
+                .expect("streamed text update");
+            assert_eq!(update["assistantMessageEvent"]["contentIndex"], 1);
+            assert_eq!(update["message"]["content"][0]["type"], "thinking");
+            assert_eq!(update["message"]["content"][1]["text"], "fixture answer");
+            assert_eq!(
+                update["message"],
+                update["assistantMessageEvent"]["partial"]
             );
+            assert_eq!(events.last().unwrap()["aborted"], false);
             break;
         }
     }

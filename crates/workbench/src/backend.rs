@@ -411,7 +411,9 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         if let Err(error) = &result {
             output(json!({"type":"error","message":error.to_string()}));
         }
-        output(json!({"type":"agent_settled","success":result.is_ok()}));
+        output(
+            json!({"type":"agent_settled","success":result.is_ok(),"aborted":matches!(result, Err(Error::Cancelled))}),
+        );
         if let Some(id) = compact_response {
             control_response(
                 "compact",
