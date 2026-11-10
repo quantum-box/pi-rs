@@ -679,7 +679,10 @@ fn rpc_shell_finishes_while_the_model_is_streaming() {
     until(&|event| event["record"]["event"]["type"] == "model_requested");
     send(serde_json::json!({"type":"bash","id":"shell","command":"echo parallel-shell"}));
     let shell = until(&|event| event["type"] == "response" && event["id"] == "shell");
-    let before_settlement = std::fs::read_to_string(&journal).unwrap();
+    // Windows prevents reading a journal locked by the running agent.
+    send(serde_json::json!({"type":"get_entries","id":"before-settlement"}));
+    let before_settlement =
+        until(&|event| event["type"] == "response" && event["id"] == "before-settlement");
     release.send(()).unwrap();
     until(&|event| event["type"] == "agent_settled");
     let after_settlement = std::fs::read_to_string(&journal).unwrap();
@@ -700,7 +703,14 @@ fn rpc_shell_finishes_while_the_model_is_streaming() {
         shell["data"]["output"].as_str().unwrap().trim(),
         "parallel-shell"
     );
-    assert!(!before_settlement.contains("parallel-shell"));
+    assert_eq!(before_settlement["success"], true);
+    assert!(
+        !before_settlement["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["event"]["type"] == "bash_execution")
+    );
     assert!(after_settlement.contains("parallel-shell"));
 }
 
