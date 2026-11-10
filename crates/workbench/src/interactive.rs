@@ -3111,6 +3111,13 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
                         } else if input.trim() == "/settings" {
+                            let cache_mode =
+                                args.settings.string("cacheWarming").unwrap_or("streaming");
+                            let next_cache_mode = match cache_mode {
+                                "streaming" => "idle",
+                                "idle" => "off",
+                                _ => "streaming",
+                            };
                             let mut items = vec![
                                 Item {
                                     label: format!(
@@ -3164,6 +3171,13 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     selection: Selection::Setting(
                                         "defaultModel".into(),
                                         json!(args.configured_model_name(&args.model)),
+                                    ),
+                                },
+                                Item {
+                                    label: format!("Cache warming · {cache_mode} (cycle)"),
+                                    selection: Selection::Setting(
+                                        "cacheWarming".into(),
+                                        json!(next_cache_mode),
                                     ),
                                 },
                                 Item {
@@ -4128,6 +4142,11 @@ fn select(
                 *theme = next;
             } else {
                 args.settings.set_user(&key, value.clone())?;
+            }
+            if key == "cacheWarming"
+                && let Some(worker) = worker
+            {
+                worker.send(json!({"type":"cache_warming_changed"}))?;
             }
             match key.as_str() {
                 "expandTools" => view.expand_tools = value.as_bool().unwrap_or(false),

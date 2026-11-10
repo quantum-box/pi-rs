@@ -2704,3 +2704,19 @@ Refresh usage is journaled and projected as a Pi usage entry. Response
 content stays out of the conversation. This checkpoint covers idle
 requests with thinking off. Streaming warming and extension decisions
 remain.
+
+### Streaming prompt cache refresh checkpoint
+
+Persistent terminal and RPC workers default to warming eligible caches
+while the agent is waiting for the model or running tools. The worker
+records measured refresh usage against the current model request through
+the agent's journal writer. It cancels stale refreshes when context or
+the request changes. In idle mode the same timer or in-flight refresh
+can continue after the run settles. The terminal settings picker cycles
+through streaming, idle, and off.
+
+Anthropic models with published adaptive thinking can reuse their exact
+thinking options. Budgeted thinking is skipped because the one-token
+refresh cap would change its request. Loopback checks cover streaming,
+tool execution, adaptive thinking, and the transition to idle. Extension
+decisions and detailed warming status remain.

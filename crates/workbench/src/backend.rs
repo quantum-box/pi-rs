@@ -30,6 +30,7 @@ enum Request {
         reported_thinking: bool,
         session: PathBuf,
     },
+    CacheWarmingChanged,
     Prompt {
         content: Option<String>,
         #[serde(default)]
@@ -211,7 +212,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     )));
     read_requests(
         commands,
-        inputs,
+        inputs.clone(),
         active.clone(),
         stopping.clone(),
         ui.clone(),
@@ -244,27 +245,27 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     });
     output(json!({"type":"backend_ready"}));
     let mut continue_queue = false;
-    let mut cache_task = None;
+    let cache = super::cache_warming::Controller::default();
     while !stopping.load(Ordering::SeqCst) {
         let (request, scheduled) = tokio::select! {
             _ = stop_notify.notified() => break,
             Some(shell) = shell_results.recv() => {
-                cache_task = None;
+                cache.clear();
                 save_shell(shell, &args, &snapshot, &active);
                 continue;
             }
-            receipt = super::cache_warming::wait(&mut cache_task) => {
-                cache_task = receipt.and_then(|receipt| {
-                    receipt.persist(&args.session, |record| {
+            receipt = cache.wait() => {
+                if let Some(receipt) = receipt {
+                    receipt.persist(&args.session, &cache, |record| {
                         observe_snapshot(pi_rs::Notification::Committed(record), args.trace, &snapshot);
-                    })
-                });
+                    });
+                }
                 continue;
             }
             request = requests.recv() => match request { Some(request) => (request, true), None => break },
             input = queued.recv() => match input {
                 Some(input) => {
-                    cache_task = None;
+                    cache.clear();
                     let mut replies = Vec::new();
                     let result = Session::open(&args.session).and_then(|mut session| {
                         if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
@@ -300,9 +301,12 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             },
             _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
         };
-        cache_task = None;
+        cache.clear();
         if stopping.load(Ordering::SeqCst) {
             break;
+        }
+        if matches!(request, Request::CacheWarmingChanged) {
+            continue;
         }
         if let Request::Configure {
             model,
@@ -377,8 +381,11 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         }
         let mut completed_shells = Vec::new();
         let mut run_session = None;
-        let mut cache_capture =
-            super::cache_warming::Capture::new(&args, matches!(&request, Request::Prompt { .. }));
+        let mut cache_capture = super::cache_warming::Capture::new(
+            &args,
+            matches!(&request, Request::Prompt { .. }),
+            cache.clone(),
+        );
         let mut operation = Box::pin(async {
             if matches!(&request, Request::Prompt { .. } | Request::McpStatus) {
                 tokio::select! {
@@ -404,6 +411,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             args.record_model_selection(session)?;
             initialize_queue_modes(session, &args)?;
             snapshot.lock().expect("session snapshot").refresh(session);
+            cache_capture.initialize(session);
             let agent = runtime.agent(&args, session.session_id());
             let mut observer = |event: pi_rs::Notification<'_>| {
                 cache_capture.observe(&event);
@@ -636,9 +644,22 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             }
             Ok::<(), Error>(())
         });
-        let result = loop {
+        let mut pending_usage = None;
+        let mut result = loop {
             tokio::select! {
                 result = &mut operation => break result,
+                receipt = cache.wait(), if pending_usage.is_none() => {
+                    if let Some(input) = receipt.and_then(|receipt| receipt.account(&cache))
+                        && let Err(mpsc::error::TrySendError::Full(input)) = inputs.try_send(input)
+                    {
+                        pending_usage = Some(input);
+                    }
+                }
+                permit = inputs.reserve(), if pending_usage.is_some() && !cache.is_parked() => {
+                    if let Ok(permit) = permit && !cache.is_parked() {
+                        permit.send(pending_usage.take().expect("pending cache usage"));
+                    }
+                }
                 Some(shell) = shell_results.recv(), if completed_shells.len() < 32 => {
                     finish_shell(&shell, &active);
                     if let Ok(execution) = shell.result {
@@ -649,11 +670,17 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         };
         drop(operation);
         active.lock().expect("worker control").token = None;
-        if result.is_ok() && completed_shells.is_empty() {
-            cache_task = run_session
-                .as_ref()
-                .and_then(|session| cache_capture.schedule(session, &args));
+        if let (Some(input), Some(session)) = (pending_usage, run_session.as_mut()) {
+            let recorded = input.apply(session, &mut |event| {
+                observe_snapshot(event, args.trace, &snapshot)
+            });
+            result = result.and(recorded);
         }
+        cache_capture.settle(
+            run_session
+                .as_ref()
+                .filter(|_| result.is_ok() && completed_shells.is_empty()),
+        );
         for execution in completed_shells {
             let recorded = match run_session.as_mut() {
                 Some(session) => record_shell(session, &execution, &args, &snapshot),
@@ -959,7 +986,10 @@ fn read_requests(
                 }
                 Request::Shutdown => break,
                 request => {
-                    let counted = !matches!(request, Request::Configure { .. });
+                    let counted = !matches!(
+                        request,
+                        Request::Configure { .. } | Request::CacheWarmingChanged
+                    );
                     if counted {
                         active.lock().expect("worker control").queued += 1;
                     }

@@ -895,15 +895,48 @@ impl Session {
         &mut self,
         session_id: Uuid,
         head: u64,
-        mut metadata: ModelMetadata,
+        metadata: ModelMetadata,
         usage: Usage,
     ) -> Result<Option<&Record>> {
         if self.host_binding().is_some() || self.session_id() != session_id || self.head != head {
             return Ok(None);
         }
+        self.append_cache_warm(metadata, usage).map(Some)
+    }
+
+    /// A refresh during a run belongs to the latest unchanged model request.
+    pub fn cache_request_current(&self, session_id: Uuid, request_id: Uuid) -> bool {
+        self.session_id() == session_id
+            && self.host_binding().is_none()
+            && self
+                .branch()
+                .into_iter()
+                .rev()
+                .find_map(|record| match record.event {
+                    Event::ModelRequested {
+                        request_id: current,
+                        ..
+                    } => Some(current == Some(request_id)),
+                    Event::Compacted { .. }
+                    | Event::BranchSummary { .. }
+                    | Event::ContextEdited { .. }
+                    | Event::BashExecution { .. }
+                    | Event::User { .. }
+                    | Event::UserWithImages { .. }
+                    | Event::UserImages { .. } => Some(false),
+                    _ => None,
+                })
+                == Some(true)
+    }
+
+    pub(crate) fn append_cache_warm(
+        &mut self,
+        mut metadata: ModelMetadata,
+        usage: Usage,
+    ) -> Result<&Record> {
         metadata.replay = None;
         metadata.reasoning = None;
-        self.append(Event::CacheWarm { metadata, usage }).map(Some)
+        self.append(Event::CacheWarm { metadata, usage })
     }
 
     fn record_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {

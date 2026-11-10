@@ -72,6 +72,13 @@ impl From<String> for QueuedInput {
 /// Messages and acknowledged queue controls accepted during an agent run.
 pub enum AgentInput {
     Message(QueuedMessage),
+    /// Accounting for a cache refresh sent by the local embedding runtime.
+    CacheWarm {
+        session_id: Uuid,
+        request_id: Uuid,
+        metadata: Box<ModelMetadata>,
+        usage: Usage,
+    },
     Enqueue {
         message: QueuedMessage,
         reply: tokio::sync::oneshot::Sender<Result<()>>,

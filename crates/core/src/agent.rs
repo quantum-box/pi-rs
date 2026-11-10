@@ -2579,6 +2579,18 @@ fn queue_input(
 ) -> Result<()> {
     let input = match input {
         AgentInput::Message(message) => message,
+        AgentInput::CacheWarm {
+            session_id,
+            request_id,
+            metadata,
+            usage,
+        } => {
+            if session.cache_request_current(session_id, request_id) {
+                let record = session.append_cache_warm(*metadata, usage)?;
+                observer(Notification::Committed(record));
+            }
+            return Ok(());
+        }
         AgentInput::Enqueue { message, reply } => {
             return reply_to_control(queue_message(session, message, observer), reply);
         }
@@ -2821,8 +2833,29 @@ mod queue_tests {
             .await
             .unwrap();
         let cancellation = CancellationToken::new();
+        let request = std::sync::Mutex::new(None);
+        let session_id = session.session_id();
         let driver = async {
             ready.notified().await;
+            let request_id = request.lock().unwrap().unwrap();
+            for request_id in [Uuid::new_v4(), request_id] {
+                sender
+                    .send(AgentInput::CacheWarm {
+                        session_id,
+                        request_id,
+                        metadata: Box::new(ModelMetadata {
+                            cached_input_tokens: Some(2000),
+                            reasoning: Some("discard this cache response".into()),
+                            ..ModelMetadata::default()
+                        }),
+                        usage: Usage {
+                            input_tokens: 2000,
+                            output_tokens: 1,
+                        },
+                    })
+                    .await
+                    .unwrap();
+            }
             let (reply, result) = oneshot::channel();
             sender
                 .send(AgentInput::SetQueueMode {
@@ -2847,7 +2880,13 @@ mod queue_tests {
             assert_eq!(removed[0].input.content, "later");
             cancellation.cancel();
         };
-        let mut observer = |_: Notification<'_>| {};
+        let mut observer = |event: Notification<'_>| {
+            if let Notification::Committed(record) = event
+                && let Event::ModelRequested { request_id, .. } = record.event
+            {
+                *request.lock().unwrap() = request_id;
+            }
+        };
         let (result, ()) = tokio::join!(
             agent.run_correlated(
                 &mut session,
@@ -2860,6 +2899,17 @@ mod queue_tests {
             driver
         );
         assert!(matches!(result, Err(Error::Cancelled)));
+        let receipts = session
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::CacheWarm { metadata, .. } => Some(metadata),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), 1);
+        assert!(receipts[0].reasoning.is_none());
+        assert_eq!(session.statistics().tokens.cache_read, 2000);
         assert!(session.queued_inputs().is_empty());
         assert_eq!(
             session.queue_mode(InputKind::FollowUp),
