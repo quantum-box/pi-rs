@@ -22,7 +22,7 @@ remaining acceptance work for that surface.
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh, OpenRouter browser OAuth with manual redirect fallback | OAuth and refresh for other model providers |
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration, compaction and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events, general component render callbacks, and extension flags in CLI help |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
-| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Automatic default client metadata identity |
+| MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
@@ -2466,3 +2466,18 @@ when a flag is omitted, and unknown or conflicting flags return errors.
 An independently built Rust extension verified default values, argument
 validation, Unicode strings, and access from context and tool callbacks
 in direct, RPC, and terminal runs.
+
+### MCP client metadata selection
+
+Set `mcpClientMetadataBaseUrl` in user settings to the HTTPS directory
+hosting the application's Client ID Metadata Documents. pi-rs selects
+`client.json` when the authorization server returns its issuer in
+authorization responses. Otherwise it selects `<server-id>/client.json`
+with a matching server-specific loopback callback. The ID is the first
+nine SHA-256 bytes of the canonical MCP URL encoded as base64url.
+Explicit client IDs and documents take precedence. Servers that lack
+public metadata support use dynamic registration in auto mode.
+
+A loopback OAuth fixture covered both document paths, dynamic registration,
+and precedence. The hosted documents are supplied by the configured
+application identity. [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)

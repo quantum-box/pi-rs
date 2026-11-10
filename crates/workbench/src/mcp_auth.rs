@@ -3,10 +3,11 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use pi_rs::{Error, Result};
 use rmcp::transport::auth::{
-    AuthClient, AuthError, AuthorizationManager, CredentialRefreshGuard, CredentialStore,
-    StoredCredentials,
+    AuthClient, AuthError, AuthorizationManager, AuthorizationMetadata, CredentialRefreshGuard,
+    CredentialStore, StoredCredentials,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -522,6 +523,72 @@ fn safe_http_url(value: &str) -> Result<reqwest_mcp::Url> {
     Ok(url)
 }
 
+fn client_metadata_base() -> Result<Option<reqwest_mcp::Url>> {
+    let path = crate::agent_dir().join("settings.json");
+    let settings: serde_json::Value = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|_| Error::Config("invalid MCP client metadata settings".into()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(value) = settings.get("mcpClientMetadataBaseUrl") else {
+        return Ok(None);
+    };
+    let invalid =
+        || Error::Config("mcpClientMetadataBaseUrl requires an HTTPS directory URL".into());
+    let base = value.as_str().ok_or_else(invalid).and_then(safe_http_url)?;
+    if base.scheme() != "https" || base.query().is_some() {
+        return Err(invalid());
+    }
+    Ok(Some(base))
+}
+
+fn advertised(metadata: &AuthorizationMetadata, key: &str) -> bool {
+    metadata
+        .additional_fields
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+fn supports_public_metadata(metadata: &AuthorizationMetadata) -> bool {
+    advertised(metadata, "client_id_metadata_document_supported")
+        && metadata
+            .additional_fields
+            .get("token_endpoint_auth_methods_supported")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|methods| methods.iter().any(|method| method == "none"))
+}
+
+fn metadata_callback(callback: &reqwest_mcp::Url) -> bool {
+    callback.path() == "/callback" && matches!(callback.host_str(), Some("localhost" | "127.0.0.1"))
+}
+
+fn metadata_document(
+    mut base: reqwest_mcp::Url,
+    resource: &str,
+    callback: &mut reqwest_mcp::Url,
+    metadata: &AuthorizationMetadata,
+) -> Result<reqwest_mcp::Url> {
+    {
+        let mut path = base
+            .path_segments_mut()
+            .map_err(|()| Error::Config("invalid MCP client metadata directory".into()))?;
+        path.pop_if_empty();
+        if metadata.issuer.is_none()
+            || !advertised(metadata, "authorization_response_iss_parameter_supported")
+        {
+            let resource = safe_http_url(resource)?;
+            let hash = Sha256::digest(resource.as_str().as_bytes());
+            let id = URL_SAFE_NO_PAD.encode(&hash[..9]);
+            path.push(&id);
+            callback.set_path(&format!("/callback/{id}"));
+        }
+        path.push("client.json");
+    }
+    Ok(base)
+}
+
 async fn callback_listener(
     url: Option<&str>,
     port: Option<u16>,
@@ -653,21 +720,19 @@ async fn authorize(
         ));
     }
     if options.registration == ClientRegistrationMode::Cimd
-        && (options.client_id.is_some()
-            || options.client_name.is_some()
-            || options.metadata_url.is_none())
+        && (options.client_id.is_some() || options.client_name.is_some())
     {
         return Err(Error::Config(
-            "OAuth cimd registration requires clientMetadataUrl and no clientId or clientName"
+            "OAuth cimd registration requires a metadata document without clientId or clientName"
                 .into(),
         ));
     }
-    let (listener, callback) =
+    let (listener, mut callback) =
         callback_listener(options.callback_url, options.callback_port).await?;
-    let client_metadata_url = options
+    let explicit_metadata = options
         .metadata_url
         .filter(|_| options.registration != ClientRegistrationMode::Dcr);
-    if let Some(url) = client_metadata_url
+    if let Some(url) = explicit_metadata
         && safe_http_url(url)?.scheme() != "https"
     {
         return Err(Error::Config(
@@ -705,14 +770,26 @@ async fn authorize(
             "MCP authorization issuer changed; sign in again before upgrading".into(),
         ));
     }
-    let supports_client_metadata = metadata
-        .additional_fields
-        .get("client_id_metadata_document_supported")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if options.registration == ClientRegistrationMode::Cimd && !supports_client_metadata {
+    let supports_client_metadata = advertised(&metadata, "client_id_metadata_document_supported");
+    let generated_metadata = if explicit_metadata.is_none()
+        && options.registration != ClientRegistrationMode::Dcr
+        && options.client_id.is_none()
+        && options.client_name.is_none()
+        && supports_public_metadata(&metadata)
+        && metadata_callback(&callback)
+        && let Some(base) = client_metadata_base()?
+    {
+        Some(metadata_document(base, url, &mut callback, &metadata)?)
+    } else {
+        None
+    };
+    let client_metadata_url =
+        explicit_metadata.or_else(|| generated_metadata.as_ref().map(reqwest_mcp::Url::as_str));
+    if options.registration == ClientRegistrationMode::Cimd
+        && (!supports_client_metadata || client_metadata_url.is_none())
+    {
         return Err(Error::Config(
-            "MCP authorization server does not support client metadata documents".into(),
+            "OAuth cimd registration requires a supported client metadata document".into(),
         ));
     }
     manager.set_metadata(metadata);
