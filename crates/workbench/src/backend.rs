@@ -51,6 +51,11 @@ enum Request {
         rpc: bool,
         id: Option<serde_json::Value>,
     },
+    BranchSummary {
+        selected: u64,
+        instructions: Option<String>,
+        reserve_tokens: u64,
+    },
     Steer {
         content: String,
         #[serde(default)]
@@ -340,6 +345,12 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                             "tokensBefore": tokens_before,
                         });
                     }
+                }
+                Request::BranchSummary { selected, instructions, reserve_tokens } => {
+                    Box::pin(agent.summarize_branch(
+                        &mut session, selected, instructions.as_deref(), reserve_tokens,
+                        &cancel, &mut observer,
+                    )).await?;
                 }
                 Request::McpStatus => runtime.mcp_status(&args)?,
                 Request::Bash { command, exclude_from_context, request_id } => {

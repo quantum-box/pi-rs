@@ -17,7 +17,7 @@ remaining acceptance work for that surface.
 | Terminal | Default `pi` startup, Unicode multiline editor and kill ring, text/image clipboard paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity |
-| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, richer tree navigation and branch summaries, Radius sharing |
+| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, branch-summary file tracking, Radius sharing |
 | Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, Ollama capability-aware thinking levels, agent retry configuration | Full provider catalog, provider-native adapters and thinking capabilities for additional providers |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
@@ -1892,3 +1892,23 @@ Shell entries copy their command, and structured tool results copy their text
 blocks. Selecting the current head is a no-op. The fork picker opens on the
 most recent user message and reports when the branch contains none. A PTY
 fixture exercised full Unicode clipboard text and the fork preselection.
+
+### Branch summary checkpoint
+
+Selecting a different tree position offers checkout without a summary, model
+summarization, or summarization with custom instructions. The
+`branchSummary.skipPrompt` setting selects direct checkout, and
+`branchSummary.reserveTokens` controls context reserved for the summary request.
+The request uses only the abandoned part of the conversation, has no tools,
+and honors cancellation and the configured output budget.
+
+A single journal record attaches the completed summary at the chosen position.
+It preserves the abandoned branch and does not replace retained context.
+Cancelled or failed requests leave the original position active. Summaries
+survive reopening, branch cloning, Pi JSONL import and HTML export. Native
+extensions for tree navigation, retry behavior and cumulative file-operation
+metadata remain separate parity work.
+
+A loopback model and PTY verified custom instructions, common-ancestor
+exclusion, a tool-free request, atomic attachment, cancellation and terminal
+restoration. The journal test checks the summary's parent and branch replay.

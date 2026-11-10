@@ -304,6 +304,10 @@ pub fn html(session: &Session) -> String {
                 "<details><summary>Compacted context</summary><pre>{}</pre></details>",
                 escape(summary)
             )),
+            Event::BranchSummary { summary, .. } => html.push_str(&format!(
+                "<details><summary>Branch summary</summary><pre>{}</pre></details>",
+                escape(summary)
+            )),
             _ => {}
         }
     }
@@ -396,7 +400,9 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
                 partial,
                 ..
             } => Some(Cow::Borrowed(partial.as_str())),
-            Event::Compacted { summary, .. } => Some(Cow::Borrowed(summary.as_str())),
+            Event::Compacted { summary, .. } | Event::BranchSummary { summary, .. } => {
+                Some(Cow::Borrowed(summary.as_str()))
+            }
             _ => None,
         })
         .filter(|text| !text.trim().is_empty())

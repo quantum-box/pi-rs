@@ -1170,6 +1170,14 @@ fn metadata(record: &pi_rs::Record) -> Value {
         } => {
             json!({"event": "compacted", "retain_from": retain_from, "usage": usage})
         }
+        Event::BranchSummary {
+            from,
+            target,
+            usage,
+            ..
+        } => {
+            json!({"event":"branch_summary", "from":from, "target":target, "usage":usage})
+        }
         Event::UserImages { images } => json!({"event":"user_images","images":images.len()}),
         Event::SourceEntry { format, .. } => json!({"event":"source_entry","format":format}),
         Event::SystemCheckpoint {

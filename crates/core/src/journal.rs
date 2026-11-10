@@ -184,6 +184,16 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
     },
+    /// Summary of a branch left behind, optionally committed at a new position.
+    BranchSummary {
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+    },
     ExtensionStates {
         states: ExtensionStates,
     },
@@ -402,6 +412,33 @@ impl Session {
         let ops = operations(&branch);
         ensure_settled(ops.clone())?;
         Ok(project_messages(&branch, ops))
+    }
+
+    pub(crate) fn abandoned_entries(&self, target: u64) -> Vec<Message> {
+        let retained: std::collections::BTreeSet<_> =
+            self.path(target).iter().map(|record| record.id).collect();
+        let branch = self.branch();
+        let first_abandoned = branch
+            .iter()
+            .rposition(|record| retained.contains(&record.id))
+            .map_or(0, |index| index + 1);
+        let Some(first) = branch.get(first_abandoned) else {
+            return Vec::new();
+        };
+        let mut messages = conversation_entries_since(&branch, self.operations(), first.id);
+        messages.retain(|(_, message)| !matches!(message, Message::Tool { .. }));
+        for record in &branch[first_abandoned..] {
+            if let Event::Compacted { summary, .. } = &record.event {
+                messages.push((
+                    record.id,
+                    Message::User {
+                        content: format!("Prior conversation summary:\n{summary}"),
+                    },
+                ));
+            }
+        }
+        messages.sort_by_key(|(id, _)| *id);
+        messages.into_iter().map(|(_, message)| message).collect()
     }
 
     /// Current projected messages, including calls whose tools are still running.
@@ -866,6 +903,10 @@ impl Session {
                 Event::Compacted { retain_from, .. } => {
                     *retain_from = retain_from.and_then(|id| ids.get(&id).copied());
                 }
+                Event::BranchSummary { from, target, .. } => {
+                    *from = from.and_then(|id| ids.get(&id).copied());
+                    *target = None;
+                }
                 Event::Label { target, .. } | Event::ContextEdited { target, .. } => {
                     if let Some(id) = ids.get(target) {
                         *target = *id;
@@ -903,6 +944,12 @@ impl Session {
 
     /// Fork from an existing record. The abandoned branch stays available by ID.
     pub fn checkout(&mut self, target: u64) -> Result<()> {
+        self.validate_checkout(target)?;
+        self.append(Event::Checkout { target })?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_checkout(&self, target: u64) -> Result<()> {
         if target == 0
             || (target == 1 && self.host_binding().is_some())
             || target > self.records.len() as u64
@@ -916,7 +963,6 @@ impl Session {
         for path in [self.branch(), self.path(target)] {
             ensure_settled(operations(&path))?;
         }
-        self.append(Event::Checkout { target })?;
         Ok(())
     }
 
@@ -966,12 +1012,19 @@ impl Session {
             Event::Checkout { target } => target,
             _ => id,
         };
+        let parent = match &event {
+            Event::BranchSummary {
+                target: Some(target),
+                ..
+            } => Some(*target),
+            _ => (self.head != 0).then_some(self.head),
+        };
         let record = Record {
             timestamp: Some(record_timestamp()),
             run_id: self.run_id,
             version: FORMAT_VERSION,
             id,
-            parent: (self.head != 0).then_some(self.head),
+            parent,
             event,
         };
         if let Err(err) = self.store.append(&record) {
@@ -1075,9 +1128,25 @@ fn validated_head(records: &[Record]) -> Result<u64> {
     let mut version = 1;
     for (index, record) in records.iter().enumerate() {
         let id = index as u64 + 1;
+        let is_prior_position = |target: u64| {
+            target > 0
+                && target < id
+                && !matches!(records[target as usize - 1].event, Event::Checkout { .. })
+        };
+        let expected_parent = match &record.event {
+            Event::BranchSummary { target, from, .. } => {
+                if target.is_some_and(|target| !is_prior_position(target))
+                    || from.is_some_and(|from| !is_prior_position(from))
+                {
+                    return Err(Error::Session("invalid branch summary position".into()));
+                }
+                target.or((head != 0).then_some(head))
+            }
+            _ => (head != 0).then_some(head),
+        };
         if !(version..=FORMAT_VERSION).contains(&record.version)
             || record.id != id
-            || record.parent != (head != 0).then_some(head)
+            || record.parent != expected_parent
             || matches!(record.event, Event::Created { .. }) != (id == 1)
         {
             return Err(Error::Session(format!("invalid journal record {id}")));
@@ -1096,13 +1165,7 @@ fn validated_head(records: &[Record]) -> Result<u64> {
         }
         version = record.version;
         head = match record.event {
-            Event::Checkout { target }
-                if target > 0
-                    && target < id
-                    && !matches!(records[target as usize - 1].event, Event::Checkout { .. }) =>
-            {
-                target
-            }
+            Event::Checkout { target } if is_prior_position(target) => target,
             Event::Checkout { .. } => return Err(Error::Session("invalid checkout target".into())),
             _ => id,
         };
@@ -1358,6 +1421,14 @@ pub(crate) fn conversation_entries(
             _ => None,
         })
         .unwrap_or(0);
+    conversation_entries_since(path, operations, retain_from)
+}
+
+fn conversation_entries_since(
+    path: &[&Record],
+    operations: Vec<(Invocation, OperationState)>,
+    retain_from: u64,
+) -> Vec<(u64, Message)> {
     let results: BTreeMap<_, _> = operations
         .into_iter()
         .filter_map(|(inv, state)| match state {
@@ -1407,6 +1478,12 @@ pub(crate) fn conversation_entries(
                 Message::UserWithImages {
                     content: content.clone(),
                     images: images.clone(),
+                },
+            )),
+            Event::BranchSummary { summary, .. } => messages.push((
+                record.id,
+                Message::User {
+                    content: format!("The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n{summary}"),
                 },
             )),
             Event::UserImages { images } => {
@@ -1658,6 +1735,56 @@ mod session_metadata_tests {
         );
         assert_eq!(session.records().len(), source_records);
         assert!(session.records().iter().any(|record| matches!(&record.event, Event::Assistant { content, .. } if content == "old answer")));
+    }
+
+    #[test]
+    fn branch_summary_replays_and_forks_at_the_new_position() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        for content in ["shared context", "abandoned context"] {
+            session
+                .append(Event::User {
+                    content: content.into(),
+                    input_id: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            session.abandoned_entries(2),
+            [Message::User {
+                content: "abandoned context".into()
+            }]
+        );
+        session
+            .append(Event::BranchSummary {
+                summary: "decision from the old branch".into(),
+                from: Some(3),
+                target: Some(2),
+                usage: None,
+            })
+            .unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        let fork = Session::from_records(restored.fork_records(restored.head()).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .branch()
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            [1, 2, 4]
+        );
+        assert_eq!(restored.current_messages(), fork.current_messages());
+        assert!(
+            matches!(&restored.current_messages()[1], Message::User { content } if content.ends_with("decision from the old branch"))
+        );
+        assert_eq!(restored.records()[2].id, 3);
+        assert!(matches!(
+            &fork.records()[2].event,
+            Event::BranchSummary {
+                from: None,
+                target: None,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -171,12 +171,20 @@ struct RegularState {
     layout: Option<RegularLayout>,
 }
 
+enum LocalEditor {
+    Setting(String),
+    BranchSummary(u64),
+}
+
 #[derive(Default)]
 struct View {
     regular: RegularState,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
-    setting_editor: Option<(String, crate::ui::dialog::Dialog)>,
+    local_editor: Option<(LocalEditor, crate::ui::dialog::Dialog)>,
+    tree_confirmation: Option<u64>,
+    branch_summary: Option<u64>,
+    branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: std::collections::BTreeMap<String, (Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
@@ -204,7 +212,7 @@ struct View {
 }
 impl View {
     fn dialog(&self) -> Option<&crate::ui::dialog::Dialog> {
-        self.setting_editor
+        self.local_editor
             .as_ref()
             .map(|(_, dialog)| dialog)
             .or_else(|| self.dialogs.front())
@@ -397,7 +405,8 @@ impl View {
         self.draft_images.clear();
         self.clipboard = None;
         self.dialogs.clear();
-        self.setting_editor = None;
+        self.local_editor = None;
+        self.tree_confirmation = None;
         self.restoring_queue = false;
         self.ui_status.clear();
         self.widgets.clear();
@@ -464,6 +473,9 @@ impl View {
                     for invocation in invocations {
                         self.add_tool(invocation);
                     }
+                }
+                pi_rs::Event::BranchSummary { summary, .. } => {
+                    self.append(&format!("Branch summary\n{summary}"));
                 }
                 pi_rs::Event::ToolPlanned { invocation, .. } => self.add_tool(invocation),
                 pi_rs::Event::ToolFinished {
@@ -792,7 +804,11 @@ impl View {
             format!(
                 "{} {} {:.1}s · Escで取消 ",
                 spinner[(elapsed.as_millis() / 100) as usize % spinner.len()],
-                self.phase.unwrap_or("処理中"),
+                if self.branch_summary.is_some() {
+                    "Summarizing branch"
+                } else {
+                    self.phase.unwrap_or("処理中")
+                },
                 elapsed.as_secs_f32()
             )
         } else {
@@ -1042,7 +1058,11 @@ impl View {
         let status = if busy {
             format!(
                 "{} {elapsed:.1}s · Escで取消 ",
-                self.phase.unwrap_or("処理中")
+                if self.branch_summary.is_some() {
+                    "Summarizing branch"
+                } else {
+                    self.phase.unwrap_or("処理中")
+                }
             )
         } else {
             String::new()
@@ -1502,6 +1522,10 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                         | pi_rs::Event::Assistant { content, .. } => {
                             content.chars().take(70).collect::<String>()
                         }
+                        pi_rs::Event::BranchSummary { summary, .. } => format!(
+                            "Branch summary: {}",
+                            summary.chars().take(56).collect::<String>()
+                        ),
                         _ => super::metadata(record)["event"]
                             .as_str()
                             .unwrap_or("record")
@@ -1538,7 +1562,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                         }
                         pi_rs::Event::Assistant { .. }
                         | pi_rs::Event::BashExecution { .. }
-                        | pi_rs::Event::Compacted { .. } => TreeEntryKind::Message,
+                        | pi_rs::Event::Compacted { .. }
+                        | pi_rs::Event::BranchSummary { .. } => TreeEntryKind::Message,
                         pi_rs::Event::ModelFinished {
                             failure: Some(_), ..
                         } => TreeEntryKind::Message,
@@ -1738,6 +1763,16 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     continue;
                 }
                 let settled = value["type"] == "agent_settled";
+                let success = value["success"] == true;
+                if view.branch_summary.is_some() {
+                    match value["type"].as_str() {
+                        Some("text_delta" | "reasoning_delta") => continue,
+                        Some("error") => {
+                            view.branch_error = value["message"].as_str().map(str::to_owned)
+                        }
+                        _ => {}
+                    }
+                }
                 if value["type"] == "agent_started" {
                     active.busy = true;
                 }
@@ -1746,6 +1781,25 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     active.busy = false;
                     view.dialogs.clear();
                     view.settle();
+                    if let Some(id) = view.branch_summary.take() {
+                        let result = if success {
+                            restore_tree_position(&mut args, &mut view, id)
+                        } else {
+                            reopen_tree(&mut args, &mut view, id).map(|()| {
+                                if let Some(picker) = &mut view.picker {
+                                    picker.show_feedback(Err(view
+                                        .branch_error
+                                        .take()
+                                        .unwrap_or_else(|| {
+                                            "Branch summary did not complete".into()
+                                        })));
+                                }
+                            })
+                        };
+                        if let Err(error) = result {
+                            view.append(&error.to_string());
+                        }
+                    }
                 }
                 dirty = true;
             }
@@ -1759,6 +1813,11 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 }
                 view.settle();
                 view.dialogs.clear();
+                if let Some(id) = view.branch_summary.take()
+                    && let Err(error) = reopen_tree(&mut args, &mut view, id)
+                {
+                    view.append(&error.to_string());
+                }
                 if !status.success() {
                     view.append(&format!(
                         "Run stopped ({status}). Use /session to inspect its saved journal."
@@ -1825,7 +1884,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             }
             Event::Paste(text) => {
                 last_idle_interrupt = None;
-                if let Some((_, dialog)) = view.setting_editor.as_mut() {
+                if let Some((_, dialog)) = view.local_editor.as_mut() {
                     dialog.paste(&text);
                 } else if let Some(dialog) = view.dialogs.front_mut() {
                     dialog.paste(&text);
@@ -1836,30 +1895,41 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
-                if let Some((name, mut dialog)) = view.setting_editor.take() {
+                if let Some((editor, mut dialog)) = view.local_editor.take() {
                     match dialog.input(key, &keys) {
                         Some(pi_rs::UiResponse::Text(text)) => {
-                            let result = serde_json::from_str(&text).map_err(Error::from).and_then(
-                                |value| {
-                                    select(
-                                        Selection::Setting(name.clone(), value),
-                                        &mut args,
-                                        &mut view,
-                                        &mut theme,
-                                        &mut worker,
-                                    )
-                                },
-                            );
-                            match result {
-                                Ok(()) => view.append("Setting saved"),
-                                Err(error) => {
-                                    dialog.set_error(error.to_string());
-                                    view.setting_editor = Some((name, dialog));
-                                }
+                            let result = match &editor {
+                                LocalEditor::Setting(name) => serde_json::from_str(&text)
+                                    .map_err(Error::from)
+                                    .and_then(|value| {
+                                        select(
+                                            Selection::Setting(name.clone(), value),
+                                            &mut args,
+                                            &mut view,
+                                            &mut theme,
+                                            &mut worker,
+                                        )
+                                    })
+                                    .map(|()| view.append("Setting saved")),
+                                LocalEditor::BranchSummary(id) => start_branch_summary(
+                                    &args,
+                                    &mut view,
+                                    &mut worker,
+                                    *id,
+                                    Some(text),
+                                ),
+                            };
+                            if let Err(error) = result {
+                                dialog.set_error(error.to_string());
+                                view.local_editor = Some((editor, dialog));
                             }
                         }
-                        Some(_) => {}
-                        None => view.setting_editor = Some((name, dialog)),
+                        Some(_) => {
+                            if let LocalEditor::BranchSummary(id) = editor {
+                                confirm_tree(&mut view, id);
+                            }
+                        }
+                        None => view.local_editor = Some((editor, dialog)),
                     }
                     continue;
                 }
@@ -1878,7 +1948,13 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 if let Some(mut picker) = view.picker.take() {
                     match picker.input(key, &keys) {
                         Input::Continue => view.picker = Some(picker),
-                        Input::Cancel => {}
+                        Input::Cancel => {
+                            if let Some(id) = view.tree_confirmation.take()
+                                && let Err(error) = reopen_tree(&mut args, &mut view, id)
+                            {
+                                view.append(&error.to_string());
+                            }
+                        }
                         Input::CopyTreeRecord(id) => {
                             picker.show_feedback(
                                 Session::open(&args.session)
@@ -1905,6 +1981,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             view.picker = Some(picker);
                         }
                         Input::Select(selection) => {
+                            view.tree_confirmation = None;
                             if let Err(error) =
                                 select(selection, &mut args, &mut view, &mut theme, &mut worker)
                             {
@@ -2052,6 +2129,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     "tui.input.tab" => complete_input(&args, &mut view),
                     "app.model.select" if !is_busy(&worker) => start_model_picker(&args, &mut view),
                     "tui.input.submit" | "app.message.followUp" => {
+                        if view.branch_summary.is_some() {
+                            continue;
+                        }
                         if view.clipboard.is_some() {
                             continue;
                         }
@@ -2233,6 +2313,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 "packages",
                                 "codemode",
                                 "compaction",
+                                "branchSummary",
                                 "retry",
                             ] {
                                 items.push(Item {
@@ -2447,6 +2528,91 @@ fn start_model_picker(args: &Cli, view: &mut View) {
     view.append("Loading available models…");
 }
 
+fn reopen_tree(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
+    slash("/tree", args, view)?;
+    if let Some(picker) = &mut view.picker {
+        picker.focus_record(id);
+    }
+    Ok(())
+}
+
+fn confirm_tree(view: &mut View, id: u64) {
+    view.tree_confirmation = Some(id);
+    view.picker = Some(Picker::new(
+        "Summarize branch?",
+        [
+            ("No summary", Selection::CheckoutWithoutSummary(id)),
+            ("Summarize", Selection::CheckoutWithSummary(id)),
+            (
+                "Summarize with custom prompt",
+                Selection::EditBranchSummary(id),
+            ),
+        ]
+        .into_iter()
+        .map(|(label, selection)| Item {
+            label: label.into(),
+            selection,
+        })
+        .collect(),
+    ));
+}
+
+fn checkout_tree(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
+    let mut session = Session::open(&args.session)?;
+    let record = &session.records()[id as usize - 1];
+    let target = match record.event {
+        pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. } => {
+            record.parent.unwrap_or(1)
+        }
+        _ => id,
+    };
+    session.checkout(target)?;
+    drop(session);
+    restore_tree_position(args, view, id)
+}
+
+fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
+    let input = Session::open(&args.session)?
+        .records()
+        .get(id.saturating_sub(1) as usize)
+        .and_then(|record| match &record.event {
+            pi_rs::Event::User { content, .. } | pi_rs::Event::UserWithImages { content, .. } => {
+                Some(content.clone())
+            }
+            _ => None,
+        });
+    restore_workspace(args)?;
+    view.restore(args)?;
+    if let Some(input) = input {
+        view.editor.replace(input);
+    }
+    Ok(())
+}
+
+fn start_branch_summary(
+    args: &Cli,
+    view: &mut View,
+    worker: &mut Option<Worker>,
+    id: u64,
+    instructions: Option<String>,
+) -> Result<()> {
+    let configured_reserve = &args.settings.value()["branchSummary"]["reserveTokens"];
+    let reserve_tokens = configured_reserve
+        .as_u64()
+        .or_else(|| configured_reserve.as_f64().map(|tokens| tokens as u64))
+        .unwrap_or(16_384);
+    start_request(
+        args,
+        json!({
+            "type":"branch_summary", "selected":id, "instructions":instructions, "reserve_tokens":reserve_tokens
+        }),
+        worker,
+    )?;
+    view.branch_error = None;
+    view.branch_summary = Some(id);
+    Ok(())
+}
+
 fn select(
     selection: Selection,
     args: &mut Cli,
@@ -2494,25 +2660,26 @@ fn select(
             }
         }
         Selection::Checkout(id) => {
-            let mut session = Session::open(&args.session)?;
-            if id == session.head() {
+            if id == Session::open(&args.session)?.head() {
                 view.append("Already at this point");
-                return Ok(());
+            } else if args.settings.value()["branchSummary"]["skipPrompt"] == true {
+                checkout_tree(args, view, id)?;
+            } else {
+                confirm_tree(view, id);
             }
-            let record = &session.records()[id as usize - 1];
-            let (target, input) = match &record.event {
-                pi_rs::Event::User { content, .. }
-                | pi_rs::Event::UserWithImages { content, .. } => {
-                    (record.parent.unwrap_or(1), Some(content.clone()))
-                }
-                _ => (id, None),
-            };
-            session.checkout(target)?;
-            drop(session);
-            view.restore(args)?;
-            if let Some(input) = input {
-                view.editor.replace(input);
-            }
+        }
+        Selection::CheckoutWithoutSummary(id) => checkout_tree(args, view, id)?,
+        Selection::CheckoutWithSummary(id) => start_branch_summary(args, view, worker, id, None)?,
+        Selection::EditBranchSummary(id) => {
+            let dialog = crate::ui::dialog::Dialog::new(
+                uuid::Uuid::new_v4(),
+                pi_rs::UiRequest::Editor {
+                    title: "Custom summarization instructions".into(),
+                    initial_value: None,
+                    timeout: None,
+                },
+            );
+            view.local_editor = Some((LocalEditor::BranchSummary(id), dialog));
         }
         Selection::Fork(id) => {
             slash(&format!("/fork {id}"), args, view)?;
@@ -2545,6 +2712,7 @@ fn select(
                 "steeringMode" | "followUpMode" => json!("one-at-a-time"),
                 "codemode" => json!({"mode":"on", "inlineBudget":3000}),
                 "retry" => serde_json::to_value(args.settings.retry_settings())?,
+                "branchSummary" => json!({"reserveTokens":16384,"skipPrompt":false}),
                 "compaction" => {
                     let tokens = args.settings.compaction_tokens(&args.model);
                     json!({"enabled":args.settings.auto_compaction_enabled(), "reserveTokens":tokens.reserve_tokens, "keepRecentTokens":tokens.keep_recent_tokens})
@@ -2567,7 +2735,7 @@ fn select(
                     timeout: None,
                 },
             );
-            view.setting_editor = Some((key, dialog));
+            view.local_editor = Some((LocalEditor::Setting(key), dialog));
         }
         Selection::Setting(key, value) => {
             if key == "autoRetryEnabled" {

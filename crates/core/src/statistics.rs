@@ -139,7 +139,7 @@ fn statistics(session: &Session) -> SessionStats {
                     stats.cost = None;
                 }
             }
-            Event::Compacted { usage, .. } => {
+            Event::Compacted { usage, .. } | Event::BranchSummary { usage, .. } => {
                 if let Some(usage) = usage
                     && Some(*usage) != pending_summary
                 {

@@ -551,10 +551,15 @@ fn convert(
             });
         }
         "branch_summary" => {
-            append_imported_usage(&mut events, &entry["usage"]);
-            events.push(Event::User {
-                content: format!("Prior branch summary:\n{}", required(entry, "summary")?),
-                input_id: None,
+            let usage = append_imported_usage(&mut events, &entry["usage"]);
+            events.push(Event::BranchSummary {
+                summary: required(entry, "summary")?.into(),
+                from: entry["fromId"]
+                    .as_str()
+                    .and_then(|id| branches.get(id))
+                    .map(|branch| branch.head),
+                target: None,
+                usage,
             });
         }
         "custom_message" => push_user(&mut events, &entry["content"])?,
