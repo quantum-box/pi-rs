@@ -25,6 +25,8 @@ mod model_listing;
 mod model_selection;
 mod packages;
 mod process;
+mod providers;
+use providers::Provider;
 mod resource_paths;
 mod resources;
 mod rpc;
@@ -123,7 +125,7 @@ struct Cli {
         ignore_case = true
     )]
     provider: Provider,
-    /// Model served by the Ollama endpoint.
+    /// Model served by the selected provider.
     #[arg(long, default_value = "qwen2.5:7b", global = true)]
     model: String,
     /// Comma-separated model IDs or patterns used for startup and cycling.
@@ -141,7 +143,7 @@ struct Cli {
     /// Thinking effort for models that support reasoning.
     #[arg(long, global = true, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
     thinking: Option<String>,
-    /// Full URL of the Ollama-compatible chat completions endpoint.
+    /// Full provider endpoint URL. Defaults to the provider's standard endpoint.
     #[arg(
         long,
         default_value = "http://127.0.0.1:11434/v1/chat/completions",
@@ -272,7 +274,22 @@ impl Cli {
         self.api_key
             .clone()
             .or_else(|| std::env::var("PI_RS_MODEL_TOKEN").ok())
+            .or_else(|| {
+                (self.provider == Provider::Anthropic
+                    && reqwest::Url::parse(&self.endpoint).ok().is_some_and(|url| {
+                        url.scheme() == "https" && url.host_str() == Some("api.anthropic.com")
+                    }))
+                .then(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .flatten()
+            })
     }
+    fn configured_model_name(&self, model: &str) -> String {
+        match self.provider {
+            Provider::Ollama => model.into(),
+            Provider::Anthropic => format!("anthropic/{model}"),
+        }
+    }
+
     fn apply_model_thinking_defaults(&mut self) {
         self.thinking = self
             .model_scope
@@ -281,12 +298,35 @@ impl Cli {
             .and_then(|choice| choice.thinking.clone())
             .or_else(|| {
                 self.settings
-                    .thinking_for_model(&self.model)
+                    .thinking_for_model(self.provider.id(), &self.model)
                     .map(str::to_owned)
             })
             .or_else(|| self.thinking.clone());
     }
-    fn restore_model_selection(&mut self, model: String, thinking: Option<String>) {
+    fn recorded_provider(&self) -> Option<&'static str> {
+        (self.provider != Provider::Ollama).then(|| self.provider.id())
+    }
+
+    fn record_model_selection(&self, session: &mut Session) -> Result<()> {
+        session.select_provider_model(
+            self.recorded_provider(),
+            &self.model,
+            self.thinking.as_deref(),
+        )
+    }
+
+    fn restore_model_selection(
+        &mut self,
+        model: String,
+        thinking: Option<String>,
+        provider: Option<&str>,
+    ) {
+        if !provider
+            .unwrap_or("ollama")
+            .eq_ignore_ascii_case(self.provider.id())
+        {
+            return;
+        }
         if !self.model_explicit
             && (self.model_scope.is_empty()
                 || self.model_scope.iter().any(|choice| choice.model == model))
@@ -302,28 +342,10 @@ impl Cli {
                 .or_else(|| (self.model == model).then_some(thinking).flatten())
                 .or_else(|| {
                     self.settings
-                        .thinking_for_model(&self.model)
+                        .thinking_for_model(self.provider.id(), &self.model)
                         .map(str::to_owned)
                 })
                 .or_else(|| self.thinking.clone());
-        }
-    }
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum Provider {
-    Ollama,
-}
-impl Provider {
-    fn id(self) -> &'static str {
-        match self {
-            Self::Ollama => "ollama",
-        }
-    }
-
-    fn connect(self, endpoint: &str, token: Option<String>) -> Result<pi_rs::ollama::Ollama> {
-        match self {
-            Self::Ollama => pi_rs::ollama::Ollama::new(endpoint, token),
         }
     }
 }
@@ -485,10 +507,36 @@ async fn run_cli() {
         args.trusted = decision.unwrap_or(false);
         args.trust_pending = decision.is_none();
         args.settings = config::Settings::load(&args.workspace, args.trusted)?;
-        if matches.value_source("model") != Some(clap::parser::ValueSource::CommandLine)
-            && let Some(model) = args.settings.string("defaultModel")
-        {
-            args.model = model.into();
+        let configured_model = args.settings.string("defaultModel");
+        let provider_prefix = |model: &str| {
+            model
+                .split_once('/')
+                .and_then(|(prefix, _)| Provider::named(prefix))
+        };
+        let configured_provider = configured_model
+            .and_then(provider_prefix)
+            .or_else(|| {
+                args.settings
+                    .string("defaultProvider")
+                    .and_then(Provider::named)
+            })
+            .unwrap_or(Provider::Ollama);
+        if matches.value_source("provider") != Some(clap::parser::ValueSource::CommandLine) {
+            args.provider = if args.model_explicit {
+                provider_prefix(&args.model).unwrap_or(configured_provider)
+            } else {
+                configured_provider
+            };
+        }
+        if matches.value_source("endpoint") != Some(clap::parser::ValueSource::CommandLine) {
+            args.endpoint = args.provider.default_endpoint().into();
+        }
+        if !args.model_explicit {
+            if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
+                args.model = model.into();
+            } else if args.provider == Provider::Anthropic {
+                args.model.clear();
+            }
         }
         if args.tui_mode.is_none() {
             args.tui_mode = Some(if args.settings.string("tuiMode") == Some("regular") {
@@ -569,25 +617,42 @@ async fn execute(mut args: Cli) -> Result<()> {
     if let Some(search) = &args.list_models {
         return model_listing::list(&args, search).await;
     }
-    let available =
-        if args.allow_model_probes() && patterns.iter().any(|pattern| !pattern.trim().is_empty()) {
-            args.provider
-                .connect(&args.endpoint, args.model_token())?
-                .models()
-                .await?
-        } else {
-            Vec::new()
-        };
+    let needs_default_model = args.model.is_empty()
+        && matches!(
+            args.command,
+            None | Some(
+                Command::Run { .. }
+                    | Command::Resume
+                    | Command::Interactive
+                    | Command::Compact { .. }
+                    | Command::Review { .. }
+            )
+        );
+    let available = if args.allow_model_probes()
+        && (needs_default_model || patterns.iter().any(|pattern| !pattern.trim().is_empty()))
+    {
+        args.provider
+            .connect(&args.endpoint, args.model_token())?
+            .models()
+            .await?
+    } else {
+        Vec::new()
+    };
+    if needs_default_model {
+        args.model = available.first().cloned().ok_or_else(|| {
+            Error::Config("no model is available for the selected provider; pass --model".into())
+        })?;
+    }
     // The hidden worker command receives an already-resolved, literal model ID.
-    if !matches!(args.command, Some(Command::Serve)) {
-        let selected = model_selection::split(&args.model, &available)?;
+    if !args.model.is_empty() && !matches!(args.command, Some(Command::Serve)) {
+        let selected = model_selection::split(&args.model, &available, args.provider.id())?;
         args.model = selected.model;
         if !args.thinking_explicit && selected.thinking.is_some() {
             args.thinking = selected.thinking;
             args.thinking_explicit = true;
         }
     }
-    let scope = model_selection::scope(patterns, &available);
+    let scope = model_selection::scope(patterns, &available, args.provider.id());
     for warning in scope.warnings {
         eprintln!("Warning: {warning}");
     }
@@ -867,10 +932,10 @@ async fn execute(mut args: Cli) -> Result<()> {
         _ => {}
     }
     if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking);
+        args.restore_model_selection(model, thinking, session.model_provider());
     }
     thinking::adjust(&mut args);
-    session.select_model(&args.model, args.thinking.as_deref())?;
+    args.record_model_selection(&mut session)?;
     let runtime = runtime::configure(&args).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
     session.set_retry_control(runtime.retry.clone());
@@ -1091,8 +1156,16 @@ fn metadata(record: &pi_rs::Record) -> Value {
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),
         Event::ParentSession { .. } => json!({"event":"parent_session"}),
         Event::SessionInfo { name, cwd } => json!({"event":"session_info","name":name,"cwd":cwd}),
-        Event::ModelSelected { model, thinking } => {
-            json!({"event":"model_selected","model":model,"thinking":thinking})
+        Event::ModelSelected {
+            model,
+            thinking,
+            provider,
+        } => {
+            let mut value = json!({"event":"model_selected","model":model,"thinking":thinking});
+            if let Some(provider) = provider {
+                value["provider"] = json!(provider);
+            }
+            value
         }
         Event::ContextEdited { target, .. } => json!({"event":"context_edited","target":target}),
         Event::Label { target, label } => json!({"event":"label","target":target,"label":label}),

@@ -117,6 +117,7 @@ pub struct Picker {
 }
 
 struct ModelScope {
+    provider: &'static str,
     catalog: Vec<String>,
     enabled: Vec<String>,
 }
@@ -160,11 +161,19 @@ impl Picker {
             model_scope: None,
         }
     }
-    pub fn scoped_models(catalog: Vec<String>, mut enabled: Vec<String>) -> Self {
+    pub fn scoped_models(
+        provider: &'static str,
+        catalog: Vec<String>,
+        mut enabled: Vec<String>,
+    ) -> Self {
         let available: std::collections::HashSet<_> = catalog.iter().collect();
         enabled.retain(|model| available.contains(model));
         let mut picker = Self {
-            model_scope: Some(ModelScope { catalog, enabled }),
+            model_scope: Some(ModelScope {
+                provider,
+                catalog,
+                enabled,
+            }),
             ..Self::new("Model Configuration", vec![])
         };
         picker.refresh_model_scope(None);
@@ -191,8 +200,9 @@ impl Picker {
             )
             .map(|model| Item {
                 label: format!(
-                    "{} {model} [ollama]",
-                    if enabled.contains(model) { "✓" } else { " " }
+                    "{} {model} [{}]",
+                    if enabled.contains(model) { "✓" } else { " " },
+                    scope.provider
                 ),
                 selection: Selection::Model(model.clone()),
             })
@@ -1135,7 +1145,7 @@ mod tests {
     #[test]
     fn scoped_models_reorder_and_filter_the_enabled_set() {
         let catalog = ["alpha", "beta", "gamma"].map(str::to_owned).to_vec();
-        let mut picker = Picker::scoped_models(catalog.clone(), catalog);
+        let mut picker = Picker::scoped_models("ollama", catalog.clone(), catalog);
         let keys = super::super::keys::Keys::load().unwrap();
         picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
         assert_eq!(picker.model_scope().unwrap().1, ["beta", "gamma"]);

@@ -259,7 +259,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             if session.working_directory().is_none() {
                 session.set_working_directory(&args.workspace)?;
             }
-            session.select_model(&args.model, args.thinking.as_deref())?;
+            args.record_model_selection(&mut session)?;
             initialize_queue_modes(&mut session, &args)?;
             *snapshot.lock().expect("session snapshot") = session.records().to_vec();
             let agent = runtime.agent(&args);

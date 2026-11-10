@@ -1330,7 +1330,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         "/model" if rest.is_empty() => start_model_picker(args, view, ModelListIntent::Select),
         "/scoped-models" => start_model_picker(args, view, ModelListIntent::Scope),
         "/model" => {
-            let selected = super::model_selection::split(rest, &view.available_models)?;
+            let selected =
+                super::model_selection::split(rest, &view.available_models, args.provider.id())?;
             args.model = selected.model;
             if selected.thinking.is_some() {
                 args.thinking = selected.thinking;
@@ -1338,7 +1339,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 apply_scoped_thinking(args);
             }
             super::thinking::adjust(args);
-            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
+            args.record_model_selection(&mut Session::open(&args.session)?)?;
             view.append(&format!("Model › {rest}"));
         }
         "/thinking" if rest.is_empty() => {
@@ -1744,7 +1745,11 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                         .map(|choice| choice.model.clone())
                                         .collect()
                                 };
-                                view.picker = Some(Picker::scoped_models(models, enabled));
+                                view.picker = Some(Picker::scoped_models(
+                                    args.provider.id(),
+                                    models,
+                                    enabled,
+                                ));
                             }
                             ModelListIntent::Cycle { reverse } => {
                                 view.available_models = models;
@@ -2025,9 +2030,10 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         }
                         Input::Save(selection) => {
                             let result = match selection {
-                                Selection::Model(model) => {
-                                    args.settings.set_user("defaultModel", json!(model))
-                                }
+                                Selection::Model(model) => args.settings.set_user(
+                                    "defaultModel",
+                                    json!(args.configured_model_name(&model)),
+                                ),
                                 Selection::Thinking(thinking) => args
                                     .settings
                                     .set_user("defaultThinkingLevel", json!(thinking)),
@@ -2287,7 +2293,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     label: format!("Save default model · {}", args.model),
                                     selection: Selection::Setting(
                                         "defaultModel".into(),
-                                        json!(args.model),
+                                        json!(args.configured_model_name(&args.model)),
                                     ),
                                 },
                                 Item {
@@ -2560,7 +2566,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     args.model = view.available_models[next].clone();
     apply_scoped_thinking(args);
     super::thinking::adjust(args);
-    Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
+    args.record_model_selection(&mut Session::open(&args.session)?)?;
     Ok(())
 }
 
@@ -2802,7 +2808,7 @@ fn select(
             args.model = model;
             apply_scoped_thinking(args);
             super::thinking::adjust(args);
-            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
+            args.record_model_selection(&mut Session::open(&args.session)?)?;
         }
         Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
         Selection::EditSetting(key) => {
@@ -2828,7 +2834,9 @@ fn select(
                 "retry" => serde_json::to_value(args.settings.retry_settings())?,
                 "branchSummary" => json!({"reserveTokens":16384,"skipPrompt":false}),
                 "compaction" => {
-                    let tokens = args.settings.compaction_tokens(&args.model);
+                    let tokens = args
+                        .settings
+                        .compaction_tokens(args.provider.id(), &args.model);
                     json!({"enabled":args.settings.auto_compaction_enabled(), "reserveTokens":tokens.reserve_tokens, "keepRecentTokens":tokens.keep_recent_tokens})
                 }
                 _ => json!([]),
@@ -2953,16 +2961,16 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
         session.set_name(name)?;
     }
     if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking);
+        args.restore_model_selection(model, thinking, session.model_provider());
     }
     super::thinking::adjust(args);
-    session.select_model(&args.model, args.thinking.as_deref())?;
+    args.record_model_selection(&mut session)?;
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = Session::open(&args.session)?;
     if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking);
+        args.restore_model_selection(model, thinking, session.model_provider());
     }
     if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);

@@ -38,10 +38,10 @@ impl Settings {
     pub fn string(&self, key: &str) -> Option<&str> {
         self.value.get(key)?.as_str()
     }
-    pub fn thinking_for_model(&self, model: &str) -> Option<&str> {
+    pub fn thinking_for_model(&self, provider: &str, model: &str) -> Option<&str> {
         let levels = self.value.get("modelThinkingLevels");
         levels
-            .and_then(|levels| levels.get(format!("ollama/{model}")))
+            .and_then(|levels| levels.get(format!("{provider}/{model}")))
             .or_else(|| levels.and_then(|levels| levels.get(model)))
             .and_then(Value::as_str)
             .or_else(|| self.string("defaultThinkingLevel"))
@@ -133,9 +133,9 @@ impl Settings {
             .as_bool()
             .unwrap_or(true)
     }
-    pub fn compaction_tokens(&self, model: &str) -> pi_rs::CompactionTokens {
+    pub fn compaction_tokens(&self, provider: &str, model: &str) -> pi_rs::CompactionTokens {
         let compaction = &self.value["compaction"];
-        let overrides = &compaction["modelOverrides"][format!("ollama/{model}")];
+        let overrides = &compaction["modelOverrides"][format!("{provider}/{model}")];
         let token_value = |name: &str| {
             overrides
                 .get(name)
@@ -468,28 +468,28 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            settings.compaction_tokens("first"),
+            settings.compaction_tokens("ollama", "first"),
             pi_rs::CompactionTokens {
                 reserve_tokens: Some(50),
                 keep_recent_tokens: Some(300)
             }
         );
         assert_eq!(
-            settings.compaction_tokens("second"),
+            settings.compaction_tokens("ollama", "second"),
             pi_rs::CompactionTokens {
                 reserve_tokens: Some(200),
                 keep_recent_tokens: Some(0)
             }
         );
         assert_eq!(
-            settings.compaction_tokens("other"),
+            settings.compaction_tokens("ollama", "other"),
             pi_rs::CompactionTokens {
                 reserve_tokens: Some(200),
                 keep_recent_tokens: Some(300)
             }
         );
         assert_eq!(
-            Settings::default().compaction_tokens("first"),
+            Settings::default().compaction_tokens("ollama", "first"),
             pi_rs::CompactionTokens::pi_defaults()
         );
         validate_settings(settings.value(), Path::new("settings.json")).unwrap();
@@ -502,14 +502,14 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            settings.compaction_tokens("test"),
+            settings.compaction_tokens("ollama", "test"),
             pi_rs::CompactionTokens {
                 reserve_tokens: Some(0),
                 keep_recent_tokens: Some(0)
             }
         );
         assert_eq!(
-            settings.compaction_tokens("other"),
+            settings.compaction_tokens("ollama", "other"),
             pi_rs::CompactionTokens {
                 reserve_tokens: Some(0),
                 keep_recent_tokens: Some(20_000)
@@ -520,7 +520,7 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            only_keep.compaction_tokens("test"),
+            only_keep.compaction_tokens("ollama", "test"),
             pi_rs::CompactionTokens {
                 reserve_tokens: Some(16_384),
                 keep_recent_tokens: Some(17)
@@ -536,7 +536,7 @@ mod tests {
         };
         validate_settings(settings.value(), Path::new("settings.json")).unwrap();
         assert_eq!(
-            settings.compaction_tokens("test"),
+            settings.compaction_tokens("ollama", "test"),
             pi_rs::CompactionTokens {
                 reserve_tokens: Some(0),
                 keep_recent_tokens: Some(42)
@@ -569,9 +569,9 @@ mod tests {
             value: json!({"defaultThinkingLevel":"low", "modelThinkingLevels":{"ollama/a":"high", "a":"medium", "b":"max"}}),
             ..Settings::default()
         };
-        assert_eq!(settings.thinking_for_model("a"), Some("high"));
-        assert_eq!(settings.thinking_for_model("b"), Some("max"));
-        assert_eq!(settings.thinking_for_model("c"), Some("low"));
+        assert_eq!(settings.thinking_for_model("ollama", "a"), Some("high"));
+        assert_eq!(settings.thinking_for_model("ollama", "b"), Some("max"));
+        assert_eq!(settings.thinking_for_model("ollama", "c"), Some("low"));
         validate_settings(settings.value(), Path::new("settings.json")).unwrap();
     }
 

@@ -404,7 +404,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             args.model = available[next].clone();
             args.apply_model_thinking_defaults();
             super::thinking::adjust(args);
-            Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
+            args.record_model_selection(&mut Session::open(&args.session)?)?;
             Ok(Some(
                 json!({"model":model_value(args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
             ))
@@ -512,7 +512,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             args.model = model.to_owned();
             args.apply_model_thinking_defaults();
             super::thinking::adjust(args);
-            Session::open(&args.session)?.select_model(model, args.thinking.as_deref())?;
+            args.record_model_selection(&mut Session::open(&args.session)?)?;
             Ok(Some(model_value(args.provider, model)))
         }
         "edit_context" if !busy(worker) => {

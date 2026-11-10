@@ -2079,6 +2079,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "pi-rs-anthropic",
  "pi-rs-core",
  "pi-rs-ollama",
  "pi-rs-review",
@@ -2102,6 +2103,21 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "pi-rs-anthropic"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "eventsource-stream",
+ "futures-util",
+ "pi-rs-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

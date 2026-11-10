@@ -78,6 +78,8 @@ pub enum Event {
     ModelSelected {
         model: String,
         thinking: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     HostBound {
         scope_digest: String,
@@ -624,7 +626,9 @@ impl Session {
             .iter()
             .rev()
             .find_map(|record| match &record.event {
-                Event::ModelSelected { model, thinking } => Some((model.clone(), thinking.clone())),
+                Event::ModelSelected {
+                    model, thinking, ..
+                } => Some((model.clone(), thinking.clone())),
                 _ => None,
             })
             .or_else(|| {
@@ -635,14 +639,37 @@ impl Session {
             })
     }
 
+    pub fn model_provider(&self) -> Option<&str> {
+        self.branch()
+            .into_iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::ModelSelected { provider, .. } => Some(provider.as_deref()),
+                _ => None,
+            })
+            .flatten()
+    }
+
     pub fn select_model(&mut self, model: &str, thinking: Option<&str>) -> Result<()> {
+        self.select_provider_model(None, model, thinking)
+    }
+
+    pub fn select_provider_model(
+        &mut self,
+        provider: Option<&str>,
+        model: &str,
+        thinking: Option<&str>,
+    ) -> Result<()> {
         if model.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
-        if self.model_selection() != Some((model.into(), thinking.map(str::to_owned))) {
+        if self.model_selection() != Some((model.into(), thinking.map(str::to_owned)))
+            || self.model_provider() != provider
+        {
             self.append(Event::ModelSelected {
                 model: model.into(),
                 thinking: thinking.map(str::to_owned),
+                provider: provider.map(str::to_owned),
             })?;
         }
         Ok(())

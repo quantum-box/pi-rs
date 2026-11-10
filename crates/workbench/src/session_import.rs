@@ -92,6 +92,7 @@ struct Branch {
     context_target: Option<u64>,
     calls: BTreeMap<String, Uuid>,
     model: String,
+    provider: Option<String>,
     thinking: Option<String>,
     store: BTreeMap<String, Value>,
 }
@@ -499,9 +500,11 @@ fn convert(
         }
         "model_change" => {
             branch.model = required(entry, "modelId")?.into();
+            branch.provider = entry["provider"].as_str().map(str::to_owned);
             events.push(Event::ModelSelected {
                 model: branch.model.clone(),
                 thinking: branch.thinking.clone(),
+                provider: branch.provider.clone(),
             });
         }
         "thinking_level_change" => {
@@ -510,6 +513,7 @@ fn convert(
                 events.push(Event::ModelSelected {
                     model: branch.model.clone(),
                     thinking: branch.thinking.clone(),
+                    provider: branch.provider.clone(),
                 });
             }
         }

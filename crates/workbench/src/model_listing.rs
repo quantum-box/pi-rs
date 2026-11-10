@@ -91,7 +91,8 @@ fn table(provider: &str, models: &[String], details: &BTreeMap<String, ModelDeta
             model.clone(),
             info.and_then(|info| info.context_window)
                 .map_or_else(|| "?".into(), format_tokens),
-            "?".into(),
+            info.and_then(|info| info.max_output_tokens)
+                .map_or_else(|| "?".into(), format_tokens),
             capability(info.and_then(|info| info.reasoning)).into(),
             capability(info.and_then(|info| info.images)).into(),
         ]);
@@ -125,6 +126,7 @@ mod tests {
             "日本語".into(),
             ModelDetails {
                 context_window: Some(131_072),
+                max_output_tokens: None,
                 reasoning: Some(true),
                 images: Some(false),
                 thinking_levels: None,

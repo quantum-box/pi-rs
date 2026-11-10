@@ -33,6 +33,8 @@ pub struct Ollama {
 pub struct ModelDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    #[serde(rename = "maxTokens", skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,6 +326,7 @@ fn decode_model_details(value: &Value) -> ModelDetails {
     }
     ModelDetails {
         context_window,
+        max_output_tokens: None,
         reasoning,
         images: capability("vision"),
         thinking_levels: (!levels.is_empty()).then_some(levels),

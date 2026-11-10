@@ -16,6 +16,11 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     if let Some(levels) = reported(args) {
         return levels.to_vec();
     }
+    if args.provider == super::Provider::Anthropic {
+        let levels = vec!["off".into()];
+        args.thinking_profile = Some((args.model.clone(), levels.clone()));
+        return levels;
+    }
     if !args.allow_model_probes() {
         return LEVELS.iter().map(|level| (*level).into()).collect();
     }
@@ -95,7 +100,11 @@ pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
 }
 
 fn persist(args: &mut Cli, level: &str) -> Result<()> {
-    Session::open(&args.session)?.select_model(&args.model, Some(level))?;
+    Session::open(&args.session)?.select_provider_model(
+        args.recorded_provider(),
+        &args.model,
+        Some(level),
+    )?;
     args.thinking = Some(level.into());
     Ok(())
 }

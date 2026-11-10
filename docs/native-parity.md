@@ -18,7 +18,7 @@ remaining acceptance work for that surface.
 | CLI modes | Interactive, `--print`, `--mode json`, basic `--mode rpc`, existing subcommands | Full Pi argument and output compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius sharing |
-| Model access | Ollama and configurable OpenAI-compatible chat endpoint, bearer token, asynchronous searchable model selector, branch-local model/thinking selection, Ollama capability-aware thinking levels, agent retry configuration | Full provider catalog, provider-native adapters and thinking capabilities for additional providers |
+| Model access | Ollama, configurable OpenAI-compatible chat endpoint and native Anthropic Messages, API keys and bearer tokens, asynchronous searchable model selector, branch-local model/thinking selection, Ollama capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, signed thinking replay and live provider switching |
 | Authentication | Host-supplied model token | Provider login/logout, OAuth, credential storage and refresh |
 | Native extensions | Rust tool, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Remaining Pi events and custom terminal components |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
@@ -1935,3 +1935,21 @@ cross-provider selection remain separate work.
 restores both. The fullscreen layout reuses the header row when quiet startup
 is enabled. A PTY fixture covers all three settings and the flag override in
 fullscreen and regular modes.
+
+### Native Anthropic provider checkpoint
+
+`--provider anthropic` or an `anthropic/<model>` reference selects the native
+Messages API. The standard endpoint reads `ANTHROPIC_API_KEY`. An explicit
+`--api-key` or host-provided model token can be used with a custom endpoint.
+The token is excluded from output and session records. One provider is
+selected per invocation.
+
+The Rust adapter supports paginated catalog discovery, reported context
+and output limits, image inputs, text and tool-call streaming, tool results
+and cache-aware token usage. It translates request and stream errors into
+the existing agent error categories. The journal records the selected
+provider separately from the model ID and accepts older records.
+
+A loopback fixture verified pagination, authentication, image input, a real
+native read tool round trip, usage and RPC. Live account sign-in, provider
+switching within a running session and signed thinking replay remain open.

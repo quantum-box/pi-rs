@@ -1,6 +1,7 @@
 //! Shared local runtime construction for print, RPC and terminal sessions.
+use super::providers::Client;
 use super::{Cli, DEFAULT_SYSTEM_PROMPT, mcp_config, output, resources};
-use pi_rs::{Agent, Extension, Limits, ProjectResources, Registry, Result, ollama::Ollama};
+use pi_rs::{Agent, Extension, Limits, ProjectResources, Registry, Result};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde_json::json;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::time::Duration;
 pub struct Runtime {
     pub auto_compaction: pi_rs::AutoCompactionControl,
     pub retry: pi_rs::RetryControl,
-    provider: Ollama,
+    provider: Client,
     pub registry: Registry,
     system_prompt: String,
     pub resources: resources::Resources,
@@ -76,8 +77,10 @@ impl Runtime {
     }
 
     pub fn agent<'a>(&'a self, args: &'a Cli) -> Agent<'a> {
-        self.auto_compaction
-            .set_token_settings(args.settings.compaction_tokens(&args.model));
+        self.auto_compaction.set_token_settings(
+            args.settings
+                .compaction_tokens(args.provider.id(), &args.model),
+        );
         Agent {
             model: &self.provider,
             model_name: &args.model,
@@ -121,18 +124,10 @@ impl Runtime {
     }
 
     pub fn set_thinking(&mut self, thinking: Option<&str>, reported: bool) {
-        self.provider = reasoning_effort(self.provider.clone(), thinking, reported);
+        self.provider = self.provider.clone().with_thinking(thinking, reported);
     }
     pub async fn close(&self) -> Result<()> {
         self.registry.shutdown().await
-    }
-}
-
-fn reasoning_effort(provider: Ollama, thinking: Option<&str>, reported: bool) -> Ollama {
-    if reported {
-        provider.with_reported_reasoning_effort(thinking)
-    } else {
-        provider.with_reasoning_effort(thinking)
     }
 }
 
@@ -323,20 +318,15 @@ pub async fn configure(args: &Cli) -> Result<Runtime> {
             servers: std::sync::Mutex::new(mcp_connections.clone()),
         });
         registry.set_refresher(catalog.clone());
-        let show_reasoning = args.trace;
-        let provider = reasoning_effort(
-            args.provider
-                .connect(&args.endpoint, args.model_token())?
-                .with_native_probes(args.allow_model_probes()),
-            args.thinking.as_deref(),
-            super::thinking::reported(args).is_some(),
-        )
-        .with_progress(|stage| output(json!({"type":"model_progress","stage":stage})))
-        .with_reasoning(move |delta| {
-            if show_reasoning {
-                output(json!({"type":"reasoning_delta","delta":delta}));
-            }
-        });
+        let provider = args
+            .provider
+            .connect(&args.endpoint, args.model_token())?
+            .with_context_probes(args.allow_model_probes())
+            .with_thinking(
+                args.thinking.as_deref(),
+                super::thinking::reported(args).is_some(),
+            )
+            .observe(args.trace);
 
         Ok(Runtime {
             retry: pi_rs::RetryControl::new(args.settings.retry_settings()),

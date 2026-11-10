@@ -6,18 +6,18 @@ pub struct Choice {
     pub model: String,
     pub thinking: Option<String>,
 }
-pub fn unqualified(value: &str) -> &str {
+fn unqualified<'a>(value: &'a str, provider: &str) -> &'a str {
     let value = value.trim();
     value
         .split_once('/')
-        .filter(|(provider, _)| provider.eq_ignore_ascii_case("ollama"))
+        .filter(|(prefix, _)| prefix.eq_ignore_ascii_case(provider))
         .map_or(value, |(_, model)| model.trim())
 }
 
-fn exact<'a>(value: &str, available: &'a [String]) -> Option<&'a String> {
+fn exact<'a>(value: &str, available: &'a [String], provider: &str) -> Option<&'a String> {
     available
         .iter()
-        .find(|model| model.eq_ignore_ascii_case(unqualified(value)))
+        .find(|model| model.eq_ignore_ascii_case(unqualified(value, provider)))
         .or_else(|| {
             available
                 .iter()
@@ -41,8 +41,8 @@ fn is_alias(model: &str) -> bool {
     })
 }
 
-fn partial<'a>(value: &str, available: &'a [String]) -> Option<&'a String> {
-    let query = unqualified(value).to_lowercase();
+fn partial<'a>(value: &str, available: &'a [String], provider: &str) -> Option<&'a String> {
+    let query = unqualified(value, provider).to_lowercase();
     if query.is_empty() {
         return None;
     }
@@ -62,12 +62,15 @@ fn catalog_choice(
     value: &str,
     available: &[String],
     lenient: bool,
+    provider: &str,
 ) -> Option<(Choice, Option<String>)> {
     let mut text = value.trim();
     let mut thinking = None;
     let mut warning = None;
     loop {
-        if let Some(model) = exact(text, available).or_else(|| partial(text, available)) {
+        if let Some(model) =
+            exact(text, available, provider).or_else(|| partial(text, available, provider))
+        {
             return Some((
                 Choice {
                     model: model.clone(),
@@ -92,12 +95,12 @@ fn catalog_choice(
     }
 }
 
-pub fn split(value: &str, available: &[String]) -> Result<Choice> {
-    let named = unqualified(value);
+pub fn split(value: &str, available: &[String], provider: &str) -> Result<Choice> {
+    let named = unqualified(value, provider);
     if named.is_empty() {
         return Err(Error::Config("model ID is required".into()));
     }
-    if let Some((choice, _)) = catalog_choice(value, available, false) {
+    if let Some((choice, _)) = catalog_choice(value, available, false, provider) {
         return Ok(choice);
     }
     let (model, thinking) = thinking_suffix(named).map_or((named, None), |(model, level)| {
@@ -115,7 +118,11 @@ pub struct Scope {
     pub warnings: Vec<String>,
 }
 
-pub fn scope<'a>(patterns: impl IntoIterator<Item = &'a str>, available: &[String]) -> Scope {
+pub fn scope<'a>(
+    patterns: impl IntoIterator<Item = &'a str>,
+    available: &[String],
+    provider: &str,
+) -> Scope {
     let mut scope = Scope::default();
     for pattern in patterns
         .into_iter()
@@ -125,7 +132,7 @@ pub fn scope<'a>(patterns: impl IntoIterator<Item = &'a str>, available: &[Strin
         let choices = if pattern.contains(['*', '?', '[']) {
             let (pattern, thinking) = thinking_suffix(pattern)
                 .map_or((pattern, None), |(base, level)| (base, Some(level)));
-            let matches = if let Some(model) = exact(pattern, available) {
+            let matches = if let Some(model) = exact(pattern, available, provider) {
                 vec![model]
             } else if let Ok(glob) = globset::GlobBuilder::new(pattern)
                 .case_insensitive(true)
@@ -137,7 +144,7 @@ pub fn scope<'a>(patterns: impl IntoIterator<Item = &'a str>, available: &[Strin
                 available
                     .iter()
                     .filter(|model| {
-                        matcher.is_match(model) || matcher.is_match(format!("ollama/{model}"))
+                        matcher.is_match(model) || matcher.is_match(format!("{provider}/{model}"))
                     })
                     .collect()
             } else {
@@ -150,7 +157,7 @@ pub fn scope<'a>(patterns: impl IntoIterator<Item = &'a str>, available: &[Strin
                     thinking: thinking.map(str::to_owned),
                 })
                 .collect()
-        } else if let Some((choice, warning)) = catalog_choice(pattern, available, true) {
+        } else if let Some((choice, warning)) = catalog_choice(pattern, available, true, provider) {
             scope.warnings.extend(warning);
             vec![choice]
         } else {
@@ -184,7 +191,15 @@ pub fn fuzzy(query: &str, value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Choice, Scope};
+
+    fn split(value: &str, available: &[String]) -> pi_rs::Result<Choice> {
+        super::split(value, available, "ollama")
+    }
+
+    fn scope<'a>(patterns: impl IntoIterator<Item = &'a str>, available: &[String]) -> Scope {
+        super::scope(patterns, available, "ollama")
+    }
     #[test]
     fn preserves_model_tags_and_extracts_only_known_thinking_levels() {
         assert_eq!(split("qwen3.5:4b", &[]).unwrap().model, "qwen3.5:4b");
@@ -302,12 +317,12 @@ mod tests {
             thinking: Some("high".into()),
         }];
         args.model = "beta:4b".into();
-        args.restore_model_selection("alpha:4b".into(), Some("low".into()));
+        args.restore_model_selection("alpha:4b".into(), Some("low".into()), None);
         assert_eq!(args.model, "beta:4b");
         assert_eq!(args.thinking.as_deref(), Some("high"));
         args.thinking_explicit = true;
         args.thinking = Some("off".into());
-        args.restore_model_selection("beta:4b".into(), Some("low".into()));
+        args.restore_model_selection("beta:4b".into(), Some("low".into()), None);
         assert_eq!(args.thinking.as_deref(), Some("off"));
     }
 }
