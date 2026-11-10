@@ -6,4 +6,5 @@ pub mod input;
 pub mod keys;
 pub mod picker;
 pub mod render;
+pub mod session_search;
 pub mod theme;

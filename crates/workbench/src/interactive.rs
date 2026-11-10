@@ -1304,6 +1304,8 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         "/resume" if rest.is_empty() => {
             let mut items = Vec::new();
             let mut named = std::collections::HashSet::new();
+            let mut documents = std::collections::BTreeMap::new();
+            let workspace = args.workspace.canonicalize()?;
             if let Some(parent) = args.session.parent() {
                 for path in sessions::stored_paths(parent)? {
                     if let Ok(session) = Session::open(&path) {
@@ -1318,7 +1320,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                             .map(str::to_owned)
                             .or_else(|| {
                                 session
-                                    .branch()
+                                    .records()
                                     .iter()
                                     .find_map(|record| match &record.event {
                                         pi_rs::Event::User { content, .. }
@@ -1329,6 +1331,31 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                                     })
                             })
                             .unwrap_or_else(|| "Empty session".into());
+                        let messages = session
+                            .records()
+                            .iter()
+                            .filter_map(|record| match &record.event {
+                                pi_rs::Event::User { content, .. }
+                                | pi_rs::Event::UserWithImages { content, .. }
+                                | pi_rs::Event::Assistant { content, .. } => Some(content.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let cwd = session.working_directory().unwrap_or_default();
+                        let local = std::path::Path::new(cwd)
+                            .canonicalize()
+                            .is_ok_and(|cwd| cwd == workspace);
+                        documents.insert(
+                            path.clone(),
+                            super::ui::session_search::Document::new(
+                                session.name().unwrap_or_default().into(),
+                                session.session_id().to_string(),
+                                cwd.into(),
+                                messages,
+                                local,
+                            ),
+                        );
                         items.push(Item {
                             label: format!(
                                 "{title} · {}",
@@ -1339,7 +1366,9 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     }
                 }
             }
-            view.picker = Some(Picker::sessions(items, args.session.clone(), named));
+            let mut picker = Picker::sessions(items, args.session.clone(), named);
+            picker.set_session_documents(documents);
+            view.picker = Some(picker);
         }
         "/resume" => {
             let path = PathBuf::from(rest);

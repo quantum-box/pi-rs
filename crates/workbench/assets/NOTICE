@@ -17,3 +17,6 @@ Pi v1.5.0 edit-diff.ts under the same MIT license.
 
 The terminal input decoders adapt Crossterm 0.29.0 (MIT).
 See CROSSTERM-LICENSE for its license and copyright notice.
+
+Session search token parsing and fuzzy scoring in src/ui/session_search.rs
+adapt Pi v1.5.0 session-selector-search.ts and packages/tui/src/fuzzy.ts.

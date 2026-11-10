@@ -35,6 +35,7 @@ pub struct Picker {
     named_only: bool,
     show_path: bool,
     named_sessions: std::collections::HashSet<PathBuf>,
+    session_documents: std::collections::BTreeMap<PathBuf, super::session_search::Document>,
     tree: Option<TreeState>,
 }
 #[derive(Clone)]
@@ -64,6 +65,7 @@ impl Picker {
             named_only: false,
             show_path: false,
             named_sessions: Default::default(),
+            session_documents: Default::default(),
             tree: None,
         }
     }
@@ -77,6 +79,12 @@ impl Picker {
             named_sessions: named,
             ..Self::new("Resume session", items)
         }
+    }
+    pub fn set_session_documents(
+        &mut self,
+        documents: std::collections::BTreeMap<PathBuf, super::session_search::Document>,
+    ) {
+        self.session_documents = documents;
     }
     pub fn tree(
         items: Vec<Item>,
@@ -118,13 +126,18 @@ impl Picker {
     }
     fn matches(&self) -> Vec<&Item> {
         let query = self.query.to_lowercase();
+        let session_query = super::session_search::Query::new(&self.query);
         let mut matches: Vec<_> = self
             .items
             .iter()
             .filter(|item| {
                 if let (Some(active), Selection::Resume(path)) =
                     (&self.active_session, &item.selection)
-                    && ((!self.all_workspaces && path.parent() != active.parent())
+                    && ((!self.all_workspaces
+                        && !self
+                            .session_documents
+                            .get(path)
+                            .map_or(path.parent() == active.parent(), |document| document.local))
                         || (self.named_only && !self.named_sessions.contains(path)))
                 {
                     return false;
@@ -134,6 +147,11 @@ impl Picker {
                     && !tree.visible.contains(id)
                 {
                     return false;
+                }
+                if let Selection::Resume(path) = &item.selection
+                    && let Some(document) = self.session_documents.get(path)
+                {
+                    return session_query.score(document).is_some();
                 }
                 let label = item.label.to_lowercase();
                 if self.active_session.is_some() {
@@ -145,8 +163,18 @@ impl Picker {
             .collect();
         if self.relevance_sort && !query.is_empty() {
             matches.sort_by_key(|item| {
+                if let Selection::Resume(path) = &item.selection
+                    && let Some(document) = self.session_documents.get(path)
+                {
+                    return (session_query.score(document).unwrap_or(i64::MAX), 0);
+                }
                 let label = item.label.to_lowercase();
-                (label.find(&query).unwrap_or(usize::MAX), label.len())
+                (
+                    label
+                        .find(&query)
+                        .map_or(i64::MAX, |position| position as i64),
+                    label.len(),
+                )
             });
         }
         matches
@@ -585,6 +613,57 @@ mod tests {
         picker.input(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &keys);
         assert!(picker.matches().is_empty());
     }
+    #[test]
+    fn session_search_uses_body_and_workspace_metadata_in_shared_directories() {
+        let local = PathBuf::from("shared/local.jsonl");
+        let remote = PathBuf::from("shared/remote.jsonl");
+        let mut picker = Picker::sessions(
+            vec![
+                Item {
+                    label: "Visible title".into(),
+                    selection: Selection::Resume(local.clone()),
+                },
+                Item {
+                    label: "Other title".into(),
+                    selection: Selection::Resume(remote.clone()),
+                },
+            ],
+            local.clone(),
+            Default::default(),
+        );
+        picker.set_session_documents(std::collections::BTreeMap::from([
+            (
+                local.clone(),
+                super::super::session_search::Document::new(
+                    "Visible title".into(),
+                    "a".into(),
+                    "/one".into(),
+                    "hidden transcript needle".into(),
+                    true,
+                ),
+            ),
+            (
+                remote,
+                super::super::session_search::Document::new(
+                    "Other title".into(),
+                    "b".into(),
+                    "/two".into(),
+                    "needle".into(),
+                    false,
+                ),
+            ),
+        ]));
+        picker.query = "needle".into();
+        assert_eq!(picker.matches().len(), 1);
+        assert!(
+            matches!(&picker.matches()[0].selection, Selection::Resume(path) if *path == local)
+        );
+        picker.all_workspaces = true;
+        assert_eq!(picker.matches().len(), 2);
+        picker.query = "re:transcript.*needle".into();
+        assert_eq!(picker.matches().len(), 1);
+    }
+
     #[test]
     fn cancelling_deletion_retains_the_search_and_selection() {
         let path = PathBuf::from("victim.jsonl");

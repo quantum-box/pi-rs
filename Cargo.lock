@@ -2202,6 +2202,7 @@ dependencies = [
  "clap",
  "crossterm",
  "crossterm_winapi",
+ "fancy-regex",
  "futures-util",
  "globset",
  "grep-regex",

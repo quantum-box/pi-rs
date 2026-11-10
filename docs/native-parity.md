@@ -1625,3 +1625,25 @@ from other workspaces and malformed journals are skipped. Tests cover both
 ordering rules, imported message timestamps and metadata updates. A CLI smoke
 check verifies continuation in a shared session directory. Full workspace tests
 and all-target Clippy pass.
+
+### Resume transcript search checkpoint
+
+The resume picker searches session names, IDs, working directories and all
+user/assistant text across saved branches. Space-separated tokens must all
+match. Quoted phrases normalize whitespace. `re:` queries use a case-insensitive
+native regular-expression engine with a bounded backtracking limit, including
+lookaround support. Invalid expressions produce no matches. Remaining JavaScript
+regular-expression edge compatibility has not been declared complete.
+
+Name and working-directory fields support Pi's fuzzy alignment and letter/digit
+swap. Message text and IDs use literal matching. Relevance sorting uses the same
+match tiers and alignment scores, preserving recent order for ties. Lowercase
+transcript text is cached and phrase normalization is lazy.
+
+Workspace filtering now checks the session's recorded working directory,
+including when multiple workspaces share a session directory. Session titles
+use the first saved user message when no name exists. Tests compare reference
+queries and scores and cover field boundaries, phrases, invalid expressions,
+Unicode and shared-directory filtering. A real PTY check searches transcript
+text, opens the selected session and verifies terminal restoration. Full
+workspace tests and all-target Clippy pass.
