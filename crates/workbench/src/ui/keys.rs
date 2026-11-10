@@ -97,6 +97,13 @@ impl Keys {
             ("app.tree.foldOrUp", &["alt+left", "ctrl+left"]),
             ("app.tree.unfoldOrDown", &["alt+right", "ctrl+right"]),
             ("app.tree.editLabel", &["shift+l"]),
+            ("app.tree.filter.default", &["ctrl+d"]),
+            ("app.tree.filter.noTools", &["ctrl+t"]),
+            ("app.tree.filter.userOnly", &["ctrl+u"]),
+            ("app.tree.filter.labeledOnly", &["ctrl+l"]),
+            ("app.tree.filter.all", &["ctrl+a"]),
+            ("app.tree.filter.cycleForward", &["ctrl+o"]),
+            ("app.tree.filter.cycleBackward", &["ctrl+shift+o"]),
             ("app.session.rename", &["ctrl+r"]),
             ("app.session.delete", &["ctrl+d"]),
             ("app.session.deleteNoninvasive", &["ctrl+backspace"]),
@@ -155,18 +162,17 @@ impl Keys {
         self.bindings
             .iter()
             .find(|(action, keys)| {
-                if matches!(
-                    action.as_str(),
-                    "app.tree.foldOrUp"
-                        | "app.tree.unfoldOrDown"
-                        | "app.tree.editLabel"
-                        | "app.session.rename"
-                        | "app.session.delete"
-                        | "app.session.deleteNoninvasive"
-                        | "app.session.toggleSort"
-                        | "app.session.toggleNamedFilter"
-                        | "app.session.togglePath"
-                ) {
+                if action.starts_with("app.tree.")
+                    || matches!(
+                        action.as_str(),
+                        "app.session.rename"
+                            | "app.session.delete"
+                            | "app.session.deleteNoninvasive"
+                            | "app.session.toggleSort"
+                            | "app.session.toggleNamedFilter"
+                            | "app.session.togglePath"
+                    )
+                {
                     return false;
                 }
                 if (action.as_str() == "app.exit") != empty

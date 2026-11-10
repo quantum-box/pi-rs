@@ -49,6 +49,12 @@
     "hideThinkingBlock": {
       "type": "boolean"
     },
+    "doubleEscapeAction": {
+      "enum": ["tree", "fork", "none"]
+    },
+    "treeFilterMode": {
+      "enum": ["default", "no-tools", "user-only", "labeled-only", "all"]
+    },
     "extensions": {
       "type": "array",
       "items": {

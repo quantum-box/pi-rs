@@ -1852,3 +1852,19 @@ Loopback checks cover toggle, off-only and named controls, model switches,
 clamping and worker transmission. A real PTY check with local Qwen verifies
 the available levels, selection persistence and terminal restoration.
 Workspace tests and all-target Clippy pass.
+
+### Terminal session navigation checkpoint
+
+With an empty draft, two interrupts within 500 ms open the session tree by
+default. The `doubleEscapeAction` setting selects the tree, the fork picker,
+or no action. During a running request the interrupt still cancels it. An idle
+interrupt clears an unsubmitted shell command.
+
+The tree opens with `treeFilterMode` and supports the reference's direct filter
+bindings and forward/backward cycling. Its filters separate user messages,
+tool results, labeled records and bookkeeping. When a filter hides the current
+selection, the picker selects its nearest visible ancestor when available.
+Both defaults can be changed in `/settings`. The native `all` view includes
+journal bookkeeping. A PTY fixture exercised all three interrupt settings,
+filter shortcuts and settings persistence, and the existing branch navigation
+fixture verified folding, label editing, checkout and terminal restoration.

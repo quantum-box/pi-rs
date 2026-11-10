@@ -24,6 +24,77 @@ pub struct Item {
     pub label: String,
     pub selection: Selection,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TreeEntryKind {
+    User,
+    Tool,
+    Message,
+    Bookkeeping,
+    Hidden,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TreeFilter {
+    Default,
+    NoTools,
+    UserOnly,
+    LabeledOnly,
+    All,
+}
+
+impl TreeFilter {
+    const MODES: [(Self, &'static str, &'static str); 5] = [
+        (Self::Default, "default", "app.tree.filter.default"),
+        (Self::NoTools, "no-tools", "app.tree.filter.noTools"),
+        (Self::UserOnly, "user-only", "app.tree.filter.userOnly"),
+        (
+            Self::LabeledOnly,
+            "labeled-only",
+            "app.tree.filter.labeledOnly",
+        ),
+        (Self::All, "all", "app.tree.filter.all"),
+    ];
+
+    pub fn parse(value: &str) -> Self {
+        Self::MODES
+            .iter()
+            .find(|(_, name, _)| *name == value)
+            .map_or(Self::Default, |(mode, _, _)| *mode)
+    }
+
+    pub fn next(self) -> Self {
+        self.cycle(1)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::MODES[self.index()].1
+    }
+
+    fn index(self) -> usize {
+        Self::MODES
+            .iter()
+            .position(|(mode, _, _)| *mode == self)
+            .expect("tree filter")
+    }
+
+    fn cycle(self, offset: usize) -> Self {
+        Self::MODES[(self.index() + offset) % Self::MODES.len()].0
+    }
+
+    fn filter_for_key(self, key: KeyEvent, keys: &super::keys::Keys) -> Option<Self> {
+        if keys.matches("app.tree.filter.cycleForward", key) {
+            return Some(self.next());
+        }
+        if keys.matches("app.tree.filter.cycleBackward", key) {
+            return Some(self.cycle(Self::MODES.len() - 1));
+        }
+        Self::MODES
+            .iter()
+            .find(|(_, _, action)| keys.matches(action, key))
+            .map(|(mode, _, _)| if self == *mode { Self::Default } else { *mode })
+    }
+}
+
 pub struct Picker {
     pub title: String,
     items: Vec<Item>,
@@ -96,11 +167,12 @@ impl Picker {
     }
     pub fn tree(
         items: Vec<Item>,
-        parents: std::collections::BTreeMap<u64, Option<u64>>,
+        entries: std::collections::BTreeMap<u64, (Option<u64>, TreeEntryKind)>,
         labels: std::collections::BTreeMap<u64, String>,
         head: u64,
+        filter: TreeFilter,
     ) -> Self {
-        let tree = TreeState::new(parents, labels, head);
+        let tree = TreeState::new(entries, labels, head, filter);
         let mut items: std::collections::BTreeMap<_, _> = items
             .into_iter()
             .filter_map(|item| {
@@ -124,13 +196,27 @@ impl Picker {
         picker
     }
     pub fn focus_record(&mut self, id: u64) {
-        if let Some(index) = self
+        let visible: std::collections::HashMap<_, _> = self
             .matches()
             .iter()
-            .position(|item| matches!(item.selection, Selection::Checkout(value) if value == id))
-        {
-            self.selected = index;
+            .enumerate()
+            .filter_map(|(index, item)| match item.selection {
+                Selection::Checkout(id) => Some((id, index)),
+                _ => None,
+            })
+            .collect();
+        let mut target = Some(id);
+        while let Some(id) = target {
+            if let Some(&index) = visible.get(&id) {
+                self.selected = index;
+                return;
+            }
+            target = self
+                .tree
+                .as_ref()
+                .and_then(|tree| tree.parents.get(&id).copied().flatten());
         }
+        self.selected = visible.len().saturating_sub(1);
     }
     fn matches(&self) -> Vec<&Item> {
         let query = self.query.to_lowercase();
@@ -150,9 +236,9 @@ impl Picker {
                 {
                     return false;
                 }
-                if query.is_empty()
-                    && let (Some(tree), Selection::Checkout(id)) = (&self.tree, &item.selection)
-                    && !tree.visible.contains(id)
+                if let (Some(tree), Selection::Checkout(id)) = (&self.tree, &item.selection)
+                    && (!tree.passes_filter(*id)
+                        || (query.is_empty() && !tree.visible.contains(id)))
                 {
                     return false;
                 }
@@ -169,7 +255,10 @@ impl Picker {
                 }
             })
             .collect();
-        if self.session_sort != SessionSort::Recent && !query.trim().is_empty() {
+        if self.tree.is_none()
+            && self.session_sort != SessionSort::Recent
+            && !query.trim().is_empty()
+        {
             matches.sort_by_key(|item| {
                 if let Selection::Resume(path) = &item.selection
                     && let Some(document) = self.session_documents.get(path)
@@ -297,6 +386,15 @@ impl Picker {
                         Selection::Checkout(id) => Some(id),
                         _ => None,
                     });
+            let tree = self.tree.as_mut().expect("tree picker");
+            if let Some(filter) = tree.filter.filter_for_key(key, keys) {
+                tree.filter = filter;
+                tree.collapsed.clear();
+                tree.rebuild_visible();
+                let focus = selected.unwrap_or(tree.head);
+                self.focus_record(focus);
+                return Input::Continue;
+            }
             if let Some(id) = selected {
                 if keys.matches("app.tree.editLabel", key) {
                     self.query = self
@@ -486,8 +584,12 @@ impl Picker {
                 Line::plain(hint, theme.color("dim")),
             ];
         }
+        let filter = self
+            .tree
+            .as_ref()
+            .map_or_else(String::new, |tree| format!(" · {}", tree.filter.name()));
         let mut lines = vec![Line::plain(
-            &format!("{} · {}", self.title, self.query),
+            &format!("{}{filter} · {}", self.title, self.query),
             theme.color("accent"),
         )];
         let items = self.matches();
@@ -623,7 +725,7 @@ impl Picker {
                 }
             }
         } else if self.tree.is_some() {
-            "Type to search · Alt+←/→ fold/navigate · Shift+L label · Enter checkout · Esc cancel"
+            "Ctrl+O filter · Alt+←/→ fold/navigate · Shift+L label · Enter checkout · Esc cancel"
         } else {
             "Type to search · ↑↓ to select · Enter to open · Esc to cancel"
         };
@@ -633,6 +735,8 @@ impl Picker {
 }
 
 struct TreeState {
+    kinds: std::collections::BTreeMap<u64, TreeEntryKind>,
+    filter: TreeFilter,
     parents: std::collections::BTreeMap<u64, Option<u64>>,
     children: std::collections::BTreeMap<u64, Vec<u64>>,
     labels: std::collections::BTreeMap<u64, String>,
@@ -645,10 +749,15 @@ struct TreeState {
 }
 impl TreeState {
     fn new(
-        parents: std::collections::BTreeMap<u64, Option<u64>>,
+        entries: std::collections::BTreeMap<u64, (Option<u64>, TreeEntryKind)>,
         labels: std::collections::BTreeMap<u64, String>,
         head: u64,
+        filter: TreeFilter,
     ) -> Self {
+        let (parents, kinds): (std::collections::BTreeMap<_, _>, _) = entries
+            .into_iter()
+            .map(|(id, (parent, kind))| ((id, parent), (id, kind)))
+            .unzip();
         let mut children = std::collections::BTreeMap::<_, Vec<_>>::new();
         let mut roots = Vec::new();
         for (&id, parent) in &parents {
@@ -659,6 +768,8 @@ impl TreeState {
             }
         }
         let mut tree = Self {
+            kinds,
+            filter,
             parents,
             children,
             labels,
@@ -681,6 +792,22 @@ impl TreeState {
         tree.rebuild_visible();
         tree
     }
+    fn passes_filter(&self, id: u64) -> bool {
+        let kind = self.kinds[&id];
+        if kind == TreeEntryKind::Hidden {
+            return false;
+        }
+        match self.filter {
+            TreeFilter::Default => kind != TreeEntryKind::Bookkeeping,
+            TreeFilter::NoTools => {
+                !matches!(kind, TreeEntryKind::Tool | TreeEntryKind::Bookkeeping)
+            }
+            TreeFilter::UserOnly => kind == TreeEntryKind::User,
+            TreeFilter::LabeledOnly => self.labels.contains_key(&id),
+            TreeFilter::All => true,
+        }
+    }
+
     fn rebuild_visible(&mut self) {
         self.visible.clear();
         let mut pending = self.roots.clone();
@@ -749,7 +876,7 @@ mod tests {
     use super::*;
     #[test]
     fn tree_folding_search_navigation_and_labels_preserve_record_identity() {
-        let parents = [
+        let entries = [
             (1, None),
             (2, Some(1)),
             (3, Some(2)),
@@ -757,6 +884,7 @@ mod tests {
             (5, Some(4)),
         ]
         .into_iter()
+        .map(|(id, parent)| (id, (parent, TreeEntryKind::Message)))
         .collect();
         let items = (1..=5)
             .map(|id| Item {
@@ -766,9 +894,10 @@ mod tests {
             .collect();
         let mut picker = Picker::tree(
             items,
-            parents,
+            entries,
             [(1, "root".into())].into_iter().collect(),
             5,
+            TreeFilter::Default,
         );
         let keys = super::super::keys::Keys::load().unwrap();
         assert_eq!(picker.selected, 4);
@@ -800,6 +929,54 @@ mod tests {
         assert!(
             matches!(picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys), Input::Select(Selection::Label(1, value)) if value == "updated")
         );
+    }
+
+    #[test]
+    fn tree_filters_preserve_the_nearest_visible_ancestor() {
+        use TreeEntryKind::{Bookkeeping, Hidden, Message, Tool, User};
+
+        let entries = [Bookkeeping, User, Hidden, Tool, Message]
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| (i as u64 + 1, ((i > 0).then_some(i as u64), kind)))
+            .collect();
+        let items = (1..=5)
+            .map(|id| Item {
+                label: format!("node {id}"),
+                selection: Selection::Checkout(id),
+            })
+            .collect();
+        let mut picker = Picker::tree(
+            items,
+            entries,
+            [(2, "labeled".into())].into_iter().collect(),
+            5,
+            TreeFilter::NoTools,
+        );
+        let keys = super::super::keys::Keys::load().unwrap();
+        let rows = |picker: &Picker| {
+            picker
+                .matches()
+                .iter()
+                .filter_map(|item| match item.selection {
+                    Selection::Checkout(id) => Some(id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&picker), [2, 5]);
+        assert_eq!(picker.selected, 1);
+        let control = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+        picker.input(control('o'), &keys);
+        assert_eq!(rows(&picker), [2]);
+        assert_eq!(picker.selected, 0);
+        picker.input(control('o'), &keys);
+        assert_eq!(rows(&picker), [2]);
+        picker.input(control('a'), &keys);
+        assert_eq!(rows(&picker), [1, 2, 4, 5]);
+        assert_eq!(picker.selected, 1);
+        picker.input(control('d'), &keys);
+        assert_eq!(rows(&picker), [2, 4, 5]);
     }
 
     #[test]

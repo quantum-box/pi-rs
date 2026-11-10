@@ -7,7 +7,7 @@ use crate::ui::{
     editor::Editor,
     images::{self, Cleanup, InlineImage, Renderer},
     keys::Keys,
-    picker::{Input, Item, Picker, Selection},
+    picker::{Input, Item, Picker, Selection, TreeEntryKind, TreeFilter},
     render::{Entry, Line, ToolPart},
     theme::{Theme, ThemeWatcher},
 };
@@ -1524,13 +1524,38 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                     }
                 })
                 .collect();
-            let parents = session
+            let head = session.head();
+            let entries = session
                 .records()
                 .iter()
                 .filter(|record| !matches!(record.event, pi_rs::Event::Checkout { .. }))
-                .map(|record| (record.id, record.parent))
+                .map(|record| {
+                    let kind = match &record.event {
+                        pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. } => {
+                            TreeEntryKind::User
+                        }
+                        pi_rs::Event::ToolFinished { .. } | pi_rs::Event::ToolReconciled { .. } => {
+                            TreeEntryKind::Tool
+                        }
+                        pi_rs::Event::Assistant { content, .. }
+                            if content.trim().is_empty() && record.id != head =>
+                        {
+                            TreeEntryKind::Hidden
+                        }
+                        pi_rs::Event::Assistant { .. }
+                        | pi_rs::Event::BashExecution { .. }
+                        | pi_rs::Event::Compacted { .. } => TreeEntryKind::Message,
+                        pi_rs::Event::ModelFinished {
+                            failure: Some(_), ..
+                        } => TreeEntryKind::Message,
+                        _ => TreeEntryKind::Bookkeeping,
+                    };
+                    (record.id, (record.parent, kind))
+                })
                 .collect();
-            view.picker = Some(Picker::tree(items, parents, labels, session.head()));
+            let filter =
+                TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
+            view.picker = Some(Picker::tree(items, entries, labels, head, filter));
         }
         "/checkout" => {
             let id = rest
@@ -1618,6 +1643,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     let mut dirty = true;
     let frame_interval = Duration::from_millis(16);
     let mut last_frame = Instant::now() - frame_interval;
+    let mut last_idle_interrupt: Option<Instant> = None;
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     loop {
@@ -1804,6 +1830,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
             Event::Paste(text) => {
+                last_idle_interrupt = None;
                 if let Some((_, dialog)) = view.setting_editor.as_mut() {
                     dialog.paste(&text);
                 } else if let Some(dialog) = view.dialogs.front_mut() {
@@ -1889,6 +1916,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         view.editor.text.is_empty() && view.draft_images.is_empty(),
                     )
                     .unwrap_or("");
+                if action != "app.interrupt" || is_busy(&worker) {
+                    last_idle_interrupt = None;
+                }
                 if view.editor.action(action) {
                     continue;
                 }
@@ -1932,6 +1962,29 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         }
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
+                        }
+                    }
+                    "app.interrupt" => {
+                        let action = args.settings.string("doubleEscapeAction").unwrap_or("tree");
+                        if view.editor.text.starts_with('!') {
+                            view.editor.take();
+                            last_idle_interrupt = None;
+                        } else if action != "none"
+                            && view.editor.text.trim().is_empty()
+                            && view.draft_images.is_empty()
+                            && view.clipboard.is_none()
+                        {
+                            let now = Instant::now();
+                            if last_idle_interrupt.take().is_some_and(|last| {
+                                now.duration_since(last) < Duration::from_millis(500)
+                            }) {
+                                let command = if action == "fork" { "/fork" } else { "/tree" };
+                                if let Err(error) = slash(command, &mut args, &mut view) {
+                                    view.append(&error.to_string());
+                                }
+                            } else {
+                                last_idle_interrupt = Some(now);
+                            }
                         }
                     }
                     "app.session.new" | "app.session.tree" | "app.session.fork"
@@ -2132,6 +2185,32 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                     ),
                                 },
                             ];
+                            let escape =
+                                args.settings.string("doubleEscapeAction").unwrap_or("tree");
+                            let next_escape = match escape {
+                                "tree" => "fork",
+                                "fork" => "none",
+                                _ => "tree",
+                            };
+                            let tree_filter = TreeFilter::parse(
+                                args.settings.string("treeFilterMode").unwrap_or("default"),
+                            );
+                            items.extend([
+                                Item {
+                                    label: format!("Double-escape action · {escape}"),
+                                    selection: Selection::Setting(
+                                        "doubleEscapeAction".into(),
+                                        json!(next_escape),
+                                    ),
+                                },
+                                Item {
+                                    label: format!("Tree filter mode · {}", tree_filter.name()),
+                                    selection: Selection::Setting(
+                                        "treeFilterMode".into(),
+                                        json!(tree_filter.next().name()),
+                                    ),
+                                },
+                            ]);
                             for name in [
                                 "theme",
                                 "defaultModel",
