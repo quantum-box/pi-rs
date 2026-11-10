@@ -508,7 +508,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         "fork" | "clone" if !busy(worker) => {
             let session = Session::open(&args.session)?;
             let (target, text) = if name == "fork" {
-                let id = record_id(&request["entryId"])?;
+                let entry = record_id(&request["entryId"])?;
+                let id = super::rpc_entries::editable_record(&session, entry);
                 let record = session
                     .records()
                     .iter()
@@ -517,7 +518,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 match &record.event {
                     pi_rs::Event::User { content, .. }
                     | pi_rs::Event::UserWithImages { content, .. } => {
-                        (record.parent.unwrap_or(1), Some(content.clone()))
+                        let source = &session.records()[entry as usize - 1];
+                        (source.parent.unwrap_or(1), Some(content.clone()))
                     }
                     _ => return Err(Error::Config("fork must select a user message".into())),
                 }
@@ -585,9 +587,11 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Ok(Some(model_value(args.provider, model)))
         }
         "edit_context" if !busy(worker) => {
-            let target = request["target"]
-                .as_u64()
-                .ok_or_else(|| Error::Config("target must be a record ID".into()))?;
+            let session = &mut Session::open(&args.session)?;
+            let target = super::rpc_entries::editable_record(
+                session,
+                record_id(request.get("targetId").unwrap_or(&request["target"]))?,
+            );
             let replacement = request
                 .get("replacement")
                 .ok_or_else(|| Error::Config("replacement is required".into()))?;
@@ -598,7 +602,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                     replacement.get("content").unwrap_or(replacement).clone(),
                 )?)
             };
-            Session::open(&args.session)?.edit_context(target, replacement)?;
+            session.edit_context(target, replacement)?;
             Ok(None)
         }
         "set_session_name" if !busy(worker) => {
@@ -689,32 +693,23 @@ pub(super) fn snapshot_response(
             Ok(state)
         }
         "get_entries" => {
-            let since = request.get("since").map(record_id).transpose()?;
-            if since.is_some_and(|id| !session.records().iter().any(|record| record.id == id)) {
-                return Err(Error::Config("unknown since entry".into()));
+            let mut result =
+                super::rpc_entries::Entries::new(session).after(request.get("since"))?;
+            if request["includeNative"] == true {
+                result["nativeEntries"] = json!(session.records());
+                result["nativeLeafId"] = json!(session.head().to_string());
             }
-            let entries: Vec<_> = session
-                .records()
-                .iter()
-                .filter(|record| since.is_none_or(|id| record.id > id))
-                .collect();
-            Ok(json!({"entries":entries,"leafId":session.head().to_string()}))
+            Ok(result)
         }
-        "get_tree" => Ok(json!({"tree":session_tree(session),"leafId":session.head().to_string()})),
-        "get_fork_messages" => {
-            let messages: Vec<_> = session
-                .branch()
-                .iter()
-                .filter_map(|record| match &record.event {
-                    pi_rs::Event::User { content, .. }
-                    | pi_rs::Event::UserWithImages { content, .. } => {
-                        Some(json!({"entryId":record.id.to_string(),"text":content}))
-                    }
-                    _ => None,
-                })
-                .collect();
-            Ok(json!({"messages":messages}))
+        "get_tree" => {
+            let mut result = super::rpc_entries::Entries::new(session).tree();
+            if request["includeNative"] == true {
+                result["nativeTree"] = json!(session_tree(session));
+                result["nativeLeafId"] = json!(session.head().to_string());
+            }
+            Ok(result)
         }
+        "get_fork_messages" => Ok(super::rpc_entries::Entries::new(session).fork_messages()),
         "get_last_assistant_text" => {
             let text =
                 session
@@ -1145,7 +1140,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(entries["entries"][0]["id"], second);
+        assert_eq!(entries["entries"][0]["id"], second.to_string());
+        assert_eq!(entries["entries"][0]["type"], "message");
+        assert_eq!(entries["entries"][0]["parentId"], first.to_string());
         let forks = command(&json!({"type":"get_fork_messages"}), &mut args, &mut worker)
             .unwrap()
             .unwrap();

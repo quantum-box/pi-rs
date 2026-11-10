@@ -723,7 +723,7 @@ fn rpc_controls_apply_while_idle_and_streaming() {
     send(serde_json::json!({"type":"bash","id":"shell","command":"echo parallel-shell"}));
     let shell = until(&|event| event["type"] == "response" && event["id"] == "shell");
     // Windows prevents reading a journal locked by the running agent.
-    send(serde_json::json!({"type":"get_entries","id":"before-settlement"}));
+    send(serde_json::json!({"type":"get_entries","id":"before-settlement","includeNative":true}));
     let before_settlement =
         until(&|event| event["type"] == "response" && event["id"] == "before-settlement");
     release.send(()).unwrap();
@@ -748,7 +748,7 @@ fn rpc_controls_apply_while_idle_and_streaming() {
     );
     assert_eq!(before_settlement["success"], true);
     assert!(
-        !before_settlement["data"]["entries"]
+        !before_settlement["data"]["nativeEntries"]
             .as_array()
             .unwrap()
             .iter()

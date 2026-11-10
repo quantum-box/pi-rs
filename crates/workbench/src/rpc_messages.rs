@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::Provider;
 
+#[derive(Clone, Copy, Default)]
 struct ModelIdentity<'a> {
     provider: &'a str,
     model: &'a str,
@@ -51,17 +52,10 @@ pub(super) fn count(session: &Session) -> usize {
 pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let branch = session.branch();
     let entries = session.current_message_entries();
-    let mut requests = HashMap::new();
-    let mut finished = HashMap::new();
-    let mut selected_models = HashMap::new();
+    let projection = Projection::new(branch.iter().copied());
     let mut imported_entries = HashMap::new();
     let mut import = None;
-    let mut tools: HashMap<Uuid, &Invocation> = HashMap::new();
     let mut edited = HashSet::new();
-    let mut selected = ModelIdentity {
-        provider: "ollama",
-        model: "",
-    };
     let mut retained_from = 0;
     for record in &branch {
         if let Event::SourceEntry { format, entry } = &record.event {
@@ -75,59 +69,6 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             import = None;
         }
         match &record.event {
-            Event::ModelSelected {
-                provider, model, ..
-            } => {
-                selected = ModelIdentity {
-                    provider: provider.as_deref().unwrap_or("ollama"),
-                    model,
-                };
-            }
-            Event::ModelRequested {
-                model,
-                request_id: Some(id),
-                ..
-            } => {
-                requests.insert(
-                    *id,
-                    ModelIdentity {
-                        provider: selected.provider,
-                        model,
-                    },
-                );
-            }
-            Event::ModelFinished {
-                request_id,
-                metadata,
-                usage,
-                ..
-            } => {
-                let measured = match usage {
-                    UsageReport::Measured { usage } => Some(*usage),
-                    _ => None,
-                };
-                finished.insert(
-                    *request_id,
-                    Finished {
-                        metadata,
-                        usage: measured,
-                    },
-                );
-            }
-            Event::Assistant { invocations, .. } => {
-                selected_models.insert(
-                    record.id,
-                    ModelIdentity {
-                        provider: selected.provider,
-                        model: selected.model,
-                    },
-                );
-                tools.extend(
-                    invocations
-                        .iter()
-                        .map(|invocation| (invocation.operation_id, invocation)),
-                );
-            }
             Event::ContextEdited { target, .. } => {
                 edited.insert(*target);
             }
@@ -157,7 +98,143 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             }
         }
         let timestamp = record.timestamp_millis().unwrap_or_default();
-        let value = match &message {
+        let value = projection.message(session, record, &message, edited.contains(&id));
+        let value = imported_entries
+            .get(&id)
+            .and_then(|source| imported_message(source, &value, timestamp, edited.contains(&id)))
+            .unwrap_or(value);
+        visible.push(value);
+        native.push(message);
+    }
+    visible.extend(excluded_shells.filter_map(shell_message));
+    (visible, native)
+}
+
+#[derive(Default)]
+pub(super) struct Projection<'a> {
+    requests: HashMap<Uuid, ModelIdentity<'a>>,
+    finished: HashMap<Uuid, Finished<'a>>,
+    models: HashMap<u64, ModelIdentity<'a>>,
+    tools: HashMap<Uuid, &'a Invocation>,
+}
+
+impl<'a> Projection<'a> {
+    pub(super) fn new(records: impl IntoIterator<Item = &'a Record>) -> Self {
+        let mut projection = Self::default();
+        for record in records {
+            projection.record(record);
+        }
+        projection
+    }
+
+    pub(super) fn record(&mut self, record: &'a Record) {
+        let selected = if let Event::ModelSelected {
+            provider, model, ..
+        } = &record.event
+        {
+            Some(ModelIdentity {
+                provider: provider.as_deref().unwrap_or("ollama"),
+                model,
+            })
+        } else {
+            record
+                .parent
+                .and_then(|parent| self.models.get(&parent).copied())
+        };
+        if let Some(selected) = selected {
+            self.models.insert(record.id, selected);
+        }
+        match &record.event {
+            Event::ModelRequested {
+                model,
+                request_id: Some(id),
+                ..
+            } => {
+                self.requests.insert(
+                    *id,
+                    ModelIdentity {
+                        provider: selected.map_or("ollama", |selected| selected.provider),
+                        model,
+                    },
+                );
+            }
+            Event::ModelFinished {
+                request_id,
+                metadata,
+                usage,
+                ..
+            } => {
+                let usage = match usage {
+                    UsageReport::Measured { usage } => Some(*usage),
+                    _ => None,
+                };
+                self.finished
+                    .insert(*request_id, Finished { metadata, usage });
+            }
+            Event::Assistant { invocations, .. } => {
+                self.tools.extend(
+                    invocations
+                        .iter()
+                        .map(|invocation| (invocation.operation_id, invocation)),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn raw_message(&self, session: &Session, record: &Record) -> Option<Value> {
+        let message = match &record.event {
+            Event::User { content, .. } => Message::User {
+                content: content.clone(),
+            },
+            Event::UserWithImages {
+                content, images, ..
+            } => Message::UserWithImages {
+                content: content.clone(),
+                images: images.clone(),
+            },
+            Event::Assistant {
+                content,
+                invocations,
+                ..
+            } => Message::Assistant {
+                content: content.clone(),
+                calls: invocations
+                    .iter()
+                    .map(|invocation| invocation.call.clone())
+                    .collect(),
+                replay: None,
+            },
+            Event::ToolFinished {
+                operation_id,
+                outcome,
+                ..
+            }
+            | Event::ToolReconciled {
+                operation_id,
+                outcome,
+            } => Message::Tool {
+                call_id: self.tools.get(operation_id)?.call.id.clone(),
+                content: outcome.tool_content(),
+            },
+            Event::BashExecution { .. } => return shell_message(record),
+            Event::SystemCheckpoint { content, .. } => Message::System {
+                content: content.clone(),
+            },
+            _ => return None,
+        };
+        Some(self.message(session, record, &message, false))
+    }
+
+    fn message(
+        &self,
+        session: &Session,
+        record: &Record,
+        message: &Message,
+        edited: bool,
+    ) -> Value {
+        let timestamp = record.timestamp_millis().unwrap_or_default();
+        match message {
             Message::System { content } => {
                 json!({"role":"system","content":content,"timestamp":timestamp})
             }
@@ -194,10 +271,10 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                     } => (*request_id, *usage),
                     _ => (None, None),
                 };
-                let finalized = request.and_then(|request| finished.get(&request));
+                let finalized = request.and_then(|request| self.finished.get(&request));
                 let model = request
-                    .and_then(|request| requests.get(&request))
-                    .or_else(|| selected_models.get(&id));
+                    .and_then(|request| self.requests.get(&request))
+                    .or_else(|| self.models.get(&record.id));
                 let provider = replay
                     .as_ref()
                     .map(|replay| replay.identity.provider.as_str())
@@ -220,7 +297,7 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                 let mut blocks = Vec::new();
                 if let Some(reasoning) =
                     finalized.and_then(|entry| entry.metadata.reasoning.as_ref())
-                    && !edited.contains(&id)
+                    && !edited
                 {
                     blocks.push(json!({"type":"thinking","thinking":reasoning}));
                 }
@@ -271,7 +348,7 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                     _ => None,
                 };
                 let name = operation
-                    .and_then(|(id, _)| tools.get(id))
+                    .and_then(|(id, _)| self.tools.get(id))
                     .map_or("", |invocation| invocation.call.name.as_str());
                 let outcome = operation.map(|(_, outcome)| outcome);
                 let mut value = super::rpc_events::tool_result_value(content, outcome);
@@ -282,16 +359,8 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
                 value["isError"] = json!(outcome.is_some_and(super::rpc_events::tool_failed));
                 value
             }
-        };
-        let value = imported_entries
-            .get(&id)
-            .and_then(|source| imported_message(source, &value, timestamp, edited.contains(&id)))
-            .unwrap_or(value);
-        visible.push(value);
-        native.push(message);
+        }
     }
-    visible.extend(excluded_shells.filter_map(shell_message));
-    (visible, native)
 }
 
 fn matches_imported_message(source: &Value, event: &Event) -> bool {
@@ -347,7 +416,7 @@ fn shell_message(record: &Record) -> Option<Value> {
     Some(value)
 }
 
-fn compaction_tokens(session: &Session, record: &Record) -> u64 {
+pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
     let Some(parent) = record.parent else {
         return 0;
     };

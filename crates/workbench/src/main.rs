@@ -32,6 +32,7 @@ use providers::Provider;
 mod resource_paths;
 mod resources;
 mod rpc;
+mod rpc_entries;
 mod rpc_events;
 mod rpc_messages;
 mod runtime;
