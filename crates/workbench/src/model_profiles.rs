@@ -274,10 +274,10 @@ impl Profiles {
         let data = config::read_object(&path)?;
         let mut profiles = Self::parse(&data)?;
         if std::env::var_os("PI_RADIUS_GATEWAY").is_some() {
-            let endpoint = super::radius_auth::Gateway::configured_origin()?
-                .join("/messages")
-                .expect("valid Radius endpoint")
-                .to_string();
+            let endpoint = super::radius_auth::model_endpoint(
+                &super::radius_auth::Gateway::configured_origin()?,
+            )
+            .to_string();
             if let Some(profile) = profiles.entries.get_mut("radius")
                 && data["providers"].as_object().is_some_and(|providers| {
                     providers.iter().any(|(name, entry)| {

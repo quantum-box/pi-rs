@@ -229,7 +229,7 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
                     return Ok(token);
                 }
                 let gateway = super::radius_auth::Gateway::configured()?;
-                if gateway.url("/messages").as_str() != endpoint {
+                if gateway.model_endpoint().as_str() != endpoint {
                     return Ok(None);
                 }
                 gateway.access(std::time::Duration::from_secs(60)).await

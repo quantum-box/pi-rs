@@ -11,7 +11,8 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-const DEFAULT_GATEWAY: &str = "https://radius.pi.dev";
+pub(super) const DEFAULT_GATEWAY: &str = "https://radius.pi.dev/";
+pub(super) const DEFAULT_MODEL_ENDPOINT: &str = "https://radius.pi.dev/v1/messages";
 const CALLBACK: &str = "http://127.0.0.1:1456/oauth/callback";
 const CLIENT_ID: &str = "pi-gateway";
 const SCOPE: &str = "gateway offline_access";
@@ -56,6 +57,21 @@ struct Credential {
     expires: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    login_id: Option<String>,
+}
+
+impl Credential {
+    fn login_id(&self) -> String {
+        self.login_id
+            .clone()
+            .unwrap_or_else(|| format!("{:x}", Sha256::digest(self.refresh.as_bytes())))
+    }
+
+    fn access(self) -> (String, String) {
+        let binding = self.login_id();
+        (self.access, binding)
+    }
 }
 
 #[derive(Deserialize)]
@@ -103,6 +119,10 @@ impl Gateway {
         self.origin.join(path).expect("valid Radius endpoint")
     }
 
+    pub(super) fn model_endpoint(&self) -> Url {
+        model_endpoint(&self.origin)
+    }
+
     fn credential(&self) -> Result<Option<Credential>> {
         let value = super::config::read_object(&auth_path())?;
         let Some(entry) = value.get("radius").filter(|entry| entry["type"] == "oauth") else {
@@ -121,6 +141,10 @@ impl Gateway {
 
     pub(super) fn has_credential(&self) -> Result<bool> {
         Ok(self.credential()?.is_some())
+    }
+
+    pub(super) fn cached_login_id(&self) -> Result<Option<String>> {
+        Ok(self.credential()?.map(|credential| credential.login_id()))
     }
 
     pub(super) async fn login(&self, method: Method, announce: impl Fn(Notice)) -> Result<()> {
@@ -146,19 +170,29 @@ impl Gateway {
     }
 
     pub(super) async fn access(&self, min_validity: Duration) -> Result<Option<String>> {
+        Ok(self
+            .access_with_login(min_validity)
+            .await?
+            .map(|(token, _)| token))
+    }
+
+    pub(super) async fn access_with_login(
+        &self,
+        min_validity: Duration,
+    ) -> Result<Option<(String, String)>> {
         let Some(credential) = self.credential()? else {
             return Ok(None);
         };
         let min_validity = u64::try_from(min_validity.as_millis()).unwrap_or(u64::MAX);
         if credential.expires > now().saturating_add(min_validity) {
-            return Ok(Some(credential.access));
+            return Ok(Some(credential.access()));
         }
         let _guard = auth_lock().await?;
         let Some(credential) = self.credential()? else {
             return Ok(None);
         };
         if credential.expires > now().saturating_add(min_validity) {
-            return Ok(Some(credential.access));
+            return Ok(Some(credential.access()));
         }
         let result = self
             .token(&[
@@ -174,7 +208,7 @@ impl Gateway {
         };
         let refreshed = self.credential_from_token(token, Some(credential))?;
         save(&refreshed)?;
-        Ok(Some(refreshed.access))
+        Ok(Some(refreshed.access()))
     }
 
     async fn login_browser(&self, announce: impl Fn(Notice)) -> Result<()> {
@@ -331,6 +365,9 @@ impl Gateway {
         token: Token,
         previous: Option<Credential>,
     ) -> Result<Credential> {
+        let login_id = previous
+            .as_ref()
+            .map_or_else(|| Uuid::new_v4().to_string(), Credential::login_id);
         let (prior_refresh, prior_scope) = previous
             .map(|credential| (Some(credential.refresh), credential.scope))
             .unwrap_or_default();
@@ -348,8 +385,18 @@ impl Gateway {
             expires: now()
                 .saturating_add(token.expires_in.saturating_mul(1000).saturating_sub(60_000)),
             scope: token.scope.or(prior_scope),
+            login_id: Some(login_id),
         })
     }
+}
+
+pub(super) fn model_endpoint(origin: &Url) -> Url {
+    let path = if origin.as_str() == DEFAULT_GATEWAY {
+        "/v1/messages"
+    } else {
+        "/messages"
+    };
+    origin.join(path).expect("valid Radius endpoint")
 }
 
 fn trusted_url(value: &str) -> Result<Url> {

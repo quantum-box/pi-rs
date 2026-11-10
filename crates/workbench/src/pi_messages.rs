@@ -51,7 +51,8 @@ struct Radius {
 }
 
 struct CachedCatalog {
-    token_hash: [u8; 32],
+    binding: String,
+    token_hash: Option<[u8; 32]>,
     value: Arc<radius_catalog::Catalog>,
 }
 
@@ -110,48 +111,77 @@ impl PiMessages {
         self
     }
 
-    async fn access(&self) -> Result<String> {
+    async fn access(&self) -> Result<(String, String)> {
         if let Some(token) = &self.token {
-            return Ok(token.clone());
+            return Ok((token.clone(), key_binding(token)));
         }
         let radius = self.radius.as_ref().expect("OAuth is only used by Radius");
         radius
             .gateway
-            .access(std::time::Duration::from_secs(60))
+            .access_with_login(std::time::Duration::from_secs(60))
             .await?
+            .map(|(token, login)| (token, format!("oauth:{login}")))
             .ok_or_else(|| Error::Config("Radius credentials were removed. Sign in again.".into()))
     }
 
     async fn catalog(&self) -> Result<Option<Arc<radius_catalog::Catalog>>> {
-        if self.radius.is_none() {
-            return Ok(None);
-        }
-        let token = self.access().await?;
-        self.catalog_for(&token).await
-    }
-
-    async fn catalog_for(&self, token: &str) -> Result<Option<Arc<radius_catalog::Catalog>>> {
         let Some(radius) = &self.radius else {
             return Ok(None);
         };
-        let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        if !self.probe_catalog {
+            let binding = match &self.token {
+                Some(token) => Some(key_binding(token)),
+                None => radius
+                    .gateway
+                    .cached_login_id()?
+                    .map(|login| format!("oauth:{login}")),
+            };
+            return match binding {
+                Some(binding) => self.catalog_for(&binding, None).await,
+                None => Ok(None),
+            };
+        }
+        let (token, binding) = self.access().await?;
+        self.catalog_for(&binding, Some(&token)).await
+    }
+
+    async fn catalog_for(
+        &self,
+        binding: &str,
+        token: Option<&str>,
+    ) -> Result<Option<Arc<radius_catalog::Catalog>>> {
+        let Some(radius) = &self.radius else {
+            return Ok(None);
+        };
+        let token_hash = token.map(|token| <[u8; 32]>::from(Sha256::digest(token.as_bytes())));
         let mut cached = radius.catalog.lock().await;
-        if let Some(cached) = cached
-            .as_ref()
-            .filter(|cached| cached.token_hash == token_hash)
-        {
+        if let Some(cached) = cached.as_ref().filter(|cached| {
+            cached.binding == binding && (token.is_none() || cached.token_hash == token_hash)
+        }) {
             return Ok(Some(cached.value.clone()));
         }
-        if !self.probe_catalog {
-            return Ok(None);
-        }
-        let value =
-            Arc::new(radius_catalog::load(&self.client, radius.gateway.url("/"), token).await?);
-        *cached = Some(CachedCatalog {
+        let gateway = radius.gateway.url("/");
+        let fallback = || {
+            radius_catalog::cached(&gateway, binding).or_else(|| radius_catalog::baseline(&gateway))
+        };
+        let value = if let Some(token) = token {
+            match radius_catalog::load(&self.client, &gateway, token).await {
+                Ok(catalog) => {
+                    let _ = radius_catalog::remember(&gateway, binding, &catalog);
+                    Some(Arc::new(catalog))
+                }
+                Err(error @ Error::RetryableModel(_)) => Some(fallback().ok_or(error)?),
+                Err(error) => return Err(error),
+            }
+        } else {
+            fallback()
+        };
+        *cached = value.as_ref().map(|value| CachedCatalog {
+            binding: binding.to_owned(),
             token_hash,
             value: value.clone(),
         });
-        Ok(Some(value))
+        Ok(value)
     }
 
     pub(super) async fn models(&self) -> Result<Vec<String>> {
@@ -303,6 +333,10 @@ impl PiMessages {
     }
 }
 
+fn key_binding(token: &str) -> String {
+    format!("key:{:x}", Sha256::digest(token.as_bytes()))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Text,
@@ -380,8 +414,16 @@ impl Model for PiMessages {
             progress(Progress::WaitingForModel);
         }
         let mut client = self.clone();
-        let token = self.access().await?;
-        if let Some(catalog) = self.catalog_for(&token).await.ok().flatten() {
+        let (token, binding) = self.access().await?;
+        let catalog = match self
+            .catalog_for(&binding, self.probe_catalog.then_some(token.as_str()))
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(Error::RetryableModel(_)) => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(catalog) = catalog {
             client.endpoint = catalog.endpoint.clone();
             client.origin_hash = format!("{:x}", Sha256::digest(client.endpoint.as_str()));
             if let Some(model) = catalog

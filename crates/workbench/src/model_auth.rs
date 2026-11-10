@@ -125,7 +125,10 @@ impl Keys {
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<&Credential> {
         let entry = self.entries.get(provider.id())?;
-        (entry.endpoint == endpoint).then_some(&entry.key)
+        let legacy_radius = provider == &Provider::Radius
+            && endpoint == super::radius_auth::DEFAULT_MODEL_ENDPOINT
+            && entry.endpoint == "https://radius.pi.dev/messages";
+        (entry.endpoint == endpoint || legacy_radius).then_some(&entry.key)
     }
 
     #[cfg(test)]

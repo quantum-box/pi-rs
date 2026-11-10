@@ -90,7 +90,7 @@ impl Provider {
             Self::Ollama => "http://127.0.0.1:11434/v1/chat/completions",
             Self::Anthropic => pi_rs::anthropic::DEFAULT_ENDPOINT,
             Self::Google => pi_rs::google::DEFAULT_ENDPOINT,
-            Self::Radius => "https://radius.pi.dev/messages",
+            Self::Radius => super::radius_auth::DEFAULT_MODEL_ENDPOINT,
             Self::Custom { .. } => "",
         }
     }
@@ -119,7 +119,7 @@ impl Provider {
             Adapter::PiMessages => {
                 if self == &Self::Radius {
                     let gateway = super::radius_auth::Gateway::configured()?;
-                    if gateway.url("/messages").as_str() == endpoint {
+                    if gateway.model_endpoint().as_str() == endpoint {
                         if token.is_none() && !gateway.has_credential()? {
                             return Err(missing_key());
                         }

@@ -346,7 +346,7 @@ impl Cli {
             .or_else(|| {
                 if provider == &Provider::Radius {
                     let gateway = radius_auth::Gateway::configured_origin().ok()?;
-                    if gateway.join("/messages").ok()?.as_str() == endpoint {
+                    if radius_auth::model_endpoint(&gateway).as_str() == endpoint {
                         return std::env::var("RADIUS_API_KEY")
                             .ok()
                             .filter(|key| !key.trim().is_empty())

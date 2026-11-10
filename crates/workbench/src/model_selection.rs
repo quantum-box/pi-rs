@@ -84,9 +84,14 @@ impl Catalog {
 
 pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Catalog> {
     let client = args.connect_provider(&provider, None)?;
+    let client = if provider == Provider::Radius {
+        client.with_context_probes(probe)
+    } else {
+        client
+    };
     let mut models = args.model_profiles.model_ids(&provider);
     let mut probe_details = false;
-    if probe {
+    if probe || provider == Provider::Radius {
         match client.models().await {
             Ok(discovered) => {
                 let mut seen: std::collections::BTreeSet<_> = models.iter().cloned().collect();
@@ -123,8 +128,10 @@ pub async fn catalogs(args: &Cli, automatic: bool) -> Result<Vec<Catalog>> {
     );
     let discovered = futures_util::future::join_all(providers.filter_map(|provider| {
         let probe = !automatic || args.allow_endpoint_probes(args.endpoint_for(&provider));
-        (probe || !args.model_profiles.model_ids(&provider).is_empty())
-            .then_some(catalog(args, provider, probe))
+        (probe
+            || provider == Provider::Radius
+            || !args.model_profiles.model_ids(&provider).is_empty())
+        .then_some(catalog(args, provider, probe))
     }))
     .await;
     let mut catalogs = Vec::new();
