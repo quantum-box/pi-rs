@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod compatibility;
+mod reasoning_details;
 pub use compatibility::ChatCompatibility;
 
 use pi_rs_core::{
@@ -192,18 +193,24 @@ impl Ollama {
     }
 
     fn compatible_message(&self, message: Message, identity: &ResolvedModelIdentity) -> Vec<Value> {
-        let reason = match &message {
-            Message::Assistant {
-                replay: Some(replay),
-                ..
-            } if replay.identity == *identity => replay
-                .blocks
-                .iter()
-                .find(|block| block["type"] == "reasoning_content")
-                .and_then(|block| block["text"].as_str())
-                .map(str::to_owned),
-            _ => None,
-        };
+        let mut reasoning = None;
+        let mut details = Vec::new();
+        if let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &message
+            && replay.identity == *identity
+        {
+            for block in &replay.blocks {
+                if block["type"] == "reasoning_content" {
+                    reasoning = block["text"].as_str().map(str::to_owned);
+                } else if self.compatibility.preserves_reasoning_details()
+                    && reasoning_details::is_valid(block)
+                {
+                    details.push(block.clone());
+                }
+            }
+        }
         let mut messages = encode_message(message);
         let Some(first) = messages.first_mut() else {
             return messages;
@@ -221,7 +228,10 @@ impl Ollama {
                 .requires_reasoning_content_on_assistant_messages
                 == Some(true)
         {
-            first["reasoning_content"] = json!(reason.unwrap_or_default());
+            first["reasoning_content"] = json!(reasoning.unwrap_or_default());
+        }
+        if !details.is_empty() {
+            first["reasoning_details"] = Value::Array(details);
         }
         messages
     }
@@ -482,6 +492,7 @@ impl Model for Ollama {
         let requested_model = request.model.clone();
         let identity = self.replay_identity(&requested_model);
         let infer_finish = self.compatibility.supports_finish_reason == Some(false);
+        let preserve_details = self.compatibility.preserves_reasoning_details();
         let preserve_reasoning = self.supports_reasoning != Some(false)
             && self
                 .compatibility
@@ -585,6 +596,7 @@ impl Model for Ollama {
             let mut usage = None;
             let mut metadata = ModelMetadata::default();
             let mut reasoning_text = String::new();
+            let mut replay_blocks = Vec::new();
             loop {
                 let event = tokio::select! {
                     event = events.next() => event,
@@ -614,14 +626,16 @@ impl Model for Ollama {
                     let calls = calls.into_values().map(|call| ToolCall {
                         id: call.id, name: call.name, arguments: call.arguments,
                     }).collect();
+                    if preserve_reasoning && !reasoning_text.is_empty() {
+                        replay_blocks.push(json!({"type":"reasoning_content","text":reasoning_text}));
+                    }
+                    if !replay_blocks.is_empty() {
+                        metadata.replay = Some(Box::new(ProviderReplay { identity, blocks: replay_blocks }));
+                    }
                     if !reasoning_text.is_empty() {
-                        if preserve_reasoning {
-                            metadata.replay = Some(Box::new(ProviderReplay {
-                                identity,
-                                blocks: vec![json!({"type":"reasoning_content","text":reasoning_text})],
-                            }));
-                        }
                         metadata.reasoning = Some(reasoning_text);
+                    }
+                    if metadata.reasoning.is_some() || metadata.replay.is_some() {
                         yield ModelEvent::Metadata(metadata);
                     }
                     yield ModelEvent::Complete { calls, usage };
@@ -653,11 +667,22 @@ impl Model for Ollama {
                     if choice.index != 0 || metadata.finish_reason.is_some() {
                         Err(Error::Model("unexpected choice in model stream".into()))?;
                     }
-                    if let Some(text) = choice.delta.reasoning.as_ref().or(choice.delta.reasoning_content.as_ref()).filter(|text| !text.is_empty()) {
+                    if let Some(text) = [
+                        choice.delta.reasoning,
+                        choice.delta.reasoning_content,
+                        choice.delta.reasoning_text,
+                    ].into_iter().flatten().find(|text| !text.is_empty()) {
                         report_progress(&progress, &mut last_progress, ModelProgress::Thinking);
-                        reasoning_text.push_str(text);
-                        if let Some(observer) = &reasoning { observer(text); }
-                        yield ModelEvent::Reasoning(text.clone());
+                        reasoning_text.push_str(&text);
+                        if let Some(observer) = &reasoning { observer(&text); }
+                        yield ModelEvent::Reasoning(text);
+                    }
+                    if preserve_details
+                        && let Some(Value::Array(details)) = choice.delta.reasoning_details
+                    {
+                        for detail in details {
+                            reasoning_details::append(&mut replay_blocks, detail);
+                        }
                     }
                     if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
                         report_progress(&progress, &mut last_progress, ModelProgress::Generating);
@@ -790,6 +815,8 @@ struct Delta {
     content: Option<String>,
     reasoning: Option<String>,
     reasoning_content: Option<String>,
+    reasoning_text: Option<String>,
+    reasoning_details: Option<Value>,
     tool_calls: Option<Vec<WireCall>>,
 }
 

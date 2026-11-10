@@ -2380,3 +2380,9 @@ and credential tests verified official-route isolation.
 
 The authorization contract follows
 [OpenRouter's OAuth PKCE documentation](https://openrouter.ai/docs/guides/overview/auth/oauth).
+
+OpenRouter chat also preserves structured `reasoning_details` across tool
+continuations and session restarts. Text and summary fragments are combined
+into their logical blocks, and encrypted blocks stay separate. Replay is
+bound to the original endpoint and model. A loopback RPC check exercised
+restart, encrypted-only thinking and a switch to a different model endpoint.

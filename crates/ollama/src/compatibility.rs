@@ -63,6 +63,10 @@ impl ChatCompatibility {
         }
     }
 
+    pub(super) fn preserves_reasoning_details(&self) -> bool {
+        matches!(self.thinking_format, Some(ThinkingFormat::Openrouter))
+    }
+
     pub(super) fn request_options(&self, body: &mut Value, max_tokens: u32, has_tools: bool) {
         let tokens = match self.max_tokens_field {
             Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
