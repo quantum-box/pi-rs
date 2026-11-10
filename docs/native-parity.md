@@ -1759,3 +1759,19 @@ failure envelope and verifies rejection before file writes.
 
 The nine-case CLI comparison, successful edit regression, workspace tests and
 all-target Clippy pass.
+
+### CLI short aliases checkpoint
+
+The CLI accepts Pi's `-v`, `-nt`, `-nbt`, `-xt`, `-ne`, `-ns`, `-np`, `-nc`,
+`-a` and `-na` forms plus `--approve` and `--no-approve`. Approval uses the native
+trust controls and their conflict validation. Version output is shared with
+`--version` and `-V`.
+
+Multi-character aliases are recognized at option positions before native
+argument parsing. Option values, attached values, the trailing prompt and
+arguments after `--` retain their original spelling. Tests cover clustered
+short options, nested command options and literal values. A real CLI check
+verifies tool filtering, resource discovery, approval and the literal prompt
+delivered to a loopback model.
+
+Workspace tests and all-target Clippy pass.

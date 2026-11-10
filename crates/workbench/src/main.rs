@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{FromArgMatches, Parser, Subcommand, ValueEnum};
 use pi_rs::{
     CancellationToken, Compaction, Error, Event, InputKind, Notification, OperationState, Outcome,
     QueuedInput, Result, Session,
@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 mod attachments;
 mod backend;
+mod cli_compat;
 mod clipboard;
 mod config;
 mod extension_ui;
@@ -37,7 +38,12 @@ static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
 
 #[derive(Parser, Clone)]
-#[command(name = "pi-rs", version, about)]
+#[command(
+    name = "pi-rs",
+    version,
+    about,
+    after_help = "Pi aliases: -v (--version), -nt (--no-tools), -nbt (--no-builtin-tools), -xt (--exclude-tools), -ne (--no-extensions), -ns (--no-skills), -np (--no-prompt-templates), -nc (--no-context-files), -na (--no-approve)."
+)]
 struct Cli {
     #[arg(skip)]
     settings: config::Settings,
@@ -58,10 +64,16 @@ struct Cli {
     #[arg(skip)]
     trust_pending: bool,
     /// Load this project's executable configuration.
-    #[arg(long, global = true, conflicts_with = "no_trust")]
+    #[arg(
+        short = 'a',
+        long,
+        visible_alias = "approve",
+        global = true,
+        conflicts_with = "no_trust"
+    )]
     trust: bool,
     /// Ignore this project's executable configuration.
-    #[arg(long, global = true)]
+    #[arg(long, visible_alias = "no-approve", global = true)]
     no_trust: bool,
     /// Path to the private append-only session journal.
     #[arg(long, default_value_os_t = interactive::new_session_path())]
@@ -386,7 +398,7 @@ enum Control {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let matches = Cli::command().get_matches();
+    let matches = cli_compat::parse(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
