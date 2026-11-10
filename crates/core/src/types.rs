@@ -355,6 +355,16 @@ pub trait Model: Send + Sync {
         self.stream(request).await
     }
 
+    /// Provide the active session identity while preserving request-ID handling.
+    async fn stream_in_session(
+        &self,
+        request_id: Uuid,
+        _session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream_with_id(request_id, request).await
+    }
+
     /// Called after the usage record is durable and before tools or another request.
     async fn record_usage(&self, _request_id: Uuid, _usage: &UsageReport) -> Result<()> {
         Ok(())

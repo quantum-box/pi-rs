@@ -135,6 +135,16 @@ impl Anthropic {
         self
     }
 
+    /// Add request defaults while preserving explicitly configured headers.
+    pub fn with_default_headers(mut self, headers: &HeaderMap) -> Self {
+        for (name, value) in headers {
+            self.headers
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+        self
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self

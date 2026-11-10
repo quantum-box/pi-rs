@@ -1,6 +1,8 @@
 //! Apply the workbench's image policy to the final outbound model context.
 use pi_rs::{Message, Model, ModelRequest, ModelStream, Result};
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use super::providers::Client;
 
@@ -9,6 +11,7 @@ pub(super) const BLOCKED_IMAGE: &str = "Image reading is disabled.";
 pub(super) struct WorkbenchModel {
     pub client: Client,
     pub block_images: bool,
+    pub session_affinity: &'static [&'static str],
 }
 
 #[async_trait::async_trait]
@@ -17,11 +20,35 @@ impl Model for WorkbenchModel {
         self.client.context_window(model).await
     }
 
-    async fn stream(&self, mut request: ModelRequest) -> Result<ModelStream> {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        self.client.stream(self.filtered(request)).await
+    }
+
+    async fn stream_in_session(
+        &self,
+        _request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        let mut headers = HeaderMap::new();
+        if !self.session_affinity.is_empty() {
+            let value = HeaderValue::from_str(&session_id.to_string()).expect("UUID header value");
+            for &name in self.session_affinity {
+                headers.insert(name, value.clone());
+            }
+        }
+        self.client
+            .stream_with_headers(self.filtered(request), &headers)
+            .await
+    }
+}
+
+impl WorkbenchModel {
+    fn filtered(&self, mut request: ModelRequest) -> ModelRequest {
         if self.block_images {
             remove_images(&mut request.messages);
         }
-        self.client.stream(request).await
+        request
     }
 }
 

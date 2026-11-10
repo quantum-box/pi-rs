@@ -2514,8 +2514,8 @@ Messages routes use bearer authentication. Environment credentials and
 imported provider-wide keys or OpenRouter OAuth work on the official routes.
 Explicitly stored keys remain bound to their saved endpoints. Loopback tests
 covered adaptive thinking, effort mapping and replay with Fireworks empty
-signatures and OpenRouter signed blocks. Session affinity and additional
-cache and mid-conversation options remain to be matched.
+signatures and OpenRouter signed blocks. Additional cache and
+mid-conversation options remain to be matched.
 
 ### Terminal output padding checkpoint
 
@@ -2557,3 +2557,13 @@ can show a readable prefix while the last diagram line is incomplete.
 Completed output retains source and a warning when that last line failed.
 The journal, print output, and model context retain the original Markdown.
 Detailed warnings for partially accepted flowchart statements remain.
+
+### Model session affinity checkpoint
+
+The model adapter receives the durable session UUID for each agent
+request. OpenRouter uses `x-session-id`. Fireworks follows the pinned
+Messages or Chat Completions compatibility settings. Named profiles
+and models can disable automatic affinity or select another format.
+Explicit request headers retain precedence. Loopback checks verified
+both APIs, command-resolved credentials, journal reopening, distinct
+sessions, and header overrides.

@@ -27,7 +27,7 @@ struct Profile {
     api_key: Option<String>,
     headers: BTreeMap<String, String>,
     auth_header: bool,
-    compat: ChatCompatibility,
+    compat: ModelCompatibility,
     models: Vec<ConfiguredModel>,
     model_endpoints: BTreeMap<String, String>,
     overrides: BTreeMap<String, ModelMetadata>,
@@ -119,7 +119,7 @@ struct ConfiguredProfile {
     #[serde(default)]
     auth_header: bool,
     #[serde(default)]
-    compat: ChatCompatibility,
+    compat: ModelCompatibility,
     #[serde(default)]
     models: Vec<ConfiguredModel>,
     #[serde(default)]
@@ -138,6 +138,14 @@ struct ConfiguredModel {
     metadata: ModelMetadata,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum AffinityFormat {
+    Openrouter,
+    Openai,
+    OpenaiNosession,
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelCompatibility {
@@ -145,6 +153,8 @@ struct ModelCompatibility {
     chat: ChatCompatibility,
     allow_empty_signature: Option<bool>,
     force_adaptive_thinking: Option<bool>,
+    send_session_affinity_headers: Option<bool>,
+    session_affinity_format: Option<AffinityFormat>,
 }
 
 impl ModelCompatibility {
@@ -155,6 +165,12 @@ impl ModelCompatibility {
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
+            send_session_affinity_headers: newer
+                .send_session_affinity_headers
+                .or(self.send_session_affinity_headers),
+            session_affinity_format: newer
+                .session_affinity_format
+                .or(self.session_affinity_format),
         }
     }
 }
@@ -628,13 +644,58 @@ impl Profiles {
         let profile = self
             .entries
             .get(provider.id())
-            .map(|profile| profile.compat.clone())
+            .map(|profile| profile.compat.chat.clone())
             .unwrap_or_default();
         builtin.overlay(profile).overlay(
             model
                 .map(|model| model.compat.chat.clone())
                 .unwrap_or_default(),
         )
+    }
+
+    pub fn session_affinity(
+        &self,
+        provider: &Provider,
+        model: &str,
+        endpoint: &str,
+    ) -> &'static [&'static str] {
+        let adapter = self.model_adapter(provider, model);
+        if !matches!(adapter, Adapter::Anthropic | Adapter::ChatCompletions) {
+            return &[];
+        }
+        let profile = self
+            .entries
+            .get(provider.id())
+            .map(|profile| &profile.compat);
+        let model = self.model(provider, model);
+        let model = model.as_ref().map(|model| &model.compat);
+        let openrouter = provider.id() == "openrouter"
+            || reqwest::Url::parse(endpoint)
+                .ok()
+                .is_some_and(|url| url.host_str() == Some("openrouter.ai"));
+        let send = model
+            .and_then(|compat| compat.send_session_affinity_headers)
+            .or_else(|| profile.and_then(|compat| compat.send_session_affinity_headers))
+            .unwrap_or(openrouter);
+        if !send {
+            return &[];
+        }
+        let format = model
+            .and_then(|compat| compat.session_affinity_format)
+            .or_else(|| profile.and_then(|compat| compat.session_affinity_format))
+            .unwrap_or(if openrouter {
+                AffinityFormat::Openrouter
+            } else {
+                AffinityFormat::Openai
+            });
+        match (adapter, format) {
+            (_, AffinityFormat::Openrouter) => &["x-session-id"],
+            (Adapter::Anthropic, _) => &["x-session-affinity"],
+            (_, AffinityFormat::Openai) => {
+                &["session_id", "x-client-request-id", "x-session-affinity"]
+            }
+            (_, AffinityFormat::OpenaiNosession) => &["x-client-request-id", "x-session-affinity"],
+        }
     }
 
     pub fn model_ids(&self, provider: &Provider) -> Vec<String> {

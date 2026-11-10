@@ -488,6 +488,11 @@ fn model_client(args: &Cli, reported: bool) -> Result<super::image_policy::Workb
             .with_model_options(args, reported)?
             .observe(),
         block_images: args.settings.block_model_images(),
+        session_affinity: args.model_profiles.session_affinity(
+            &args.provider,
+            &args.model,
+            args.model_endpoint_for(&args.provider, Some(&args.model)),
+        ),
     })
 }
 

@@ -5,6 +5,7 @@ use pi_rs::anthropic::Anthropic;
 use pi_rs::google::Google;
 use pi_rs::ollama::{ModelDetails, Ollama};
 use pi_rs::{Error, Model, ModelRequest, ModelStream, Result};
+use reqwest::header::HeaderMap;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -237,6 +238,42 @@ impl Client {
             probe_context: true,
             observed: false,
         }))
+    }
+
+    pub async fn stream_with_headers(
+        &self,
+        request: ModelRequest,
+        defaults: &HeaderMap,
+    ) -> Result<ModelStream> {
+        match self {
+            Self::Ollama(client) if !defaults.is_empty() => {
+                client
+                    .clone()
+                    .with_default_headers(defaults)
+                    .stream(request)
+                    .await
+            }
+            Self::Anthropic(client) if !defaults.is_empty() => {
+                client
+                    .clone()
+                    .with_default_headers(defaults)
+                    .stream(request)
+                    .await
+            }
+            Self::Deferred(client) => {
+                if client.observed {
+                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
+                }
+                Box::pin(
+                    client
+                        .resolve()
+                        .await?
+                        .stream_with_headers(request, defaults),
+                )
+                .await
+            }
+            _ => self.stream(request).await,
+        }
     }
 
     pub fn aliases(&self) -> Vec<(String, String)> {
@@ -476,12 +513,7 @@ impl Model for Client {
             Self::Anthropic(client) => client.stream(request).await,
             Self::Google(client) => client.stream(request).await,
             Self::PiMessages(client) => client.stream(request).await,
-            Self::Deferred(client) => {
-                if client.observed {
-                    super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
-                }
-                client.resolve().await?.stream(request).await
-            }
+            Self::Deferred(_) => self.stream_with_headers(request, &HeaderMap::new()).await,
         }
     }
 }
