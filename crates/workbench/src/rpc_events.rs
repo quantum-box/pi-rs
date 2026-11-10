@@ -191,6 +191,9 @@ impl Stream {
                 if let Some(identity) = &self.metadata.resolved_model {
                     self.assistant["responseModel"] = json!(identity.model);
                 }
+                if !self.metadata.diagnostics.is_empty() {
+                    self.assistant["diagnostics"] = json!(self.metadata.diagnostics);
+                }
                 self.assistant["stopReason"] = json!(if self.metadata.finish_reason.as_deref()
                     == Some("length")
                 {

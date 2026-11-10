@@ -1,13 +1,14 @@
 //! Native Anthropic Messages and Models API integration.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
-    Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
-    ProviderReplay, ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
+    AnthropicInputTransformations, AssistantDiagnostic, Error, Message, Model, ModelApi,
+    ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay, ReportedUsageCost,
+    ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 use reqwest::{
     Client, Response, Url,
@@ -813,6 +814,7 @@ impl Model for Anthropic {
                 ..ModelMetadata::default()
             };
             let mut reasoning_text = String::new();
+            let mut input_transformations = None;
             let mut started = false;
             while let Some(event) = events.next().await {
                 let event = event.map_err(|error| match error {
@@ -834,6 +836,7 @@ impl Model for Anthropic {
                             model: message["model"].as_str().unwrap_or(&requested_model).into(),
                         });
                         usage.update(&message["usage"], &mut metadata);
+                        input_transformations = AnthropicInputTransformations::from_value(&message["input_transformations"]);
                     }
                     Some("content_block_start") if started => {
                         let index = block_index(&value)?;
@@ -944,6 +947,9 @@ impl Model for Anthropic {
                     }
                     Some("message_delta") if started => {
                         usage.update(&value["usage"], &mut metadata);
+                        if value["input_transformations"].is_array() {
+                            input_transformations = AnthropicInputTransformations::from_value(&value["input_transformations"]);
+                        }
                         if openrouter
                             && let Some(cost) = ReportedUsageCost::deserialize(&value["usage"])
                                 .ok().and_then(|accounting| accounting.total())
@@ -984,6 +990,11 @@ impl Model for Anthropic {
                         }
                         if !reasoning_text.is_empty() {
                             metadata.reasoning = Some(reasoning_text);
+                        }
+                        if let Some(details) = input_transformations {
+                            let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+                            let timestamp = i64::try_from(millis).unwrap_or(i64::MAX);
+                            metadata.diagnostics.push(AssistantDiagnostic::AnthropicInputTransformations { timestamp, details });
                         }
                         if signed {
                             metadata.replay = Some(Box::new(ProviderReplay {
@@ -1032,6 +1043,33 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_transformations_keep_only_diagnostic_fields() {
+        let details = AnthropicInputTransformations::from_value(&json!([
+            {"type":"thinking_dropped","path":"messages[1].content[0]","reason":"invalid_signature","thinking":"private"},
+            null,
+            {"type":"other","reason":3}
+        ]))
+        .unwrap();
+        let diagnostic = AssistantDiagnostic::AnthropicInputTransformations {
+            timestamp: 123,
+            details,
+        };
+        assert_eq!(diagnostic.dropped_thinking_blocks(), 1);
+        assert_eq!(
+            serde_json::to_value(diagnostic).unwrap(),
+            json!({
+                "type":"anthropic_input_transformations",
+                "timestamp":123,
+                "details":{"transformations":[
+                    {"type":"thinking_dropped","path":"messages[1].content[0]","reason":"invalid_signature"},
+                    {"type":"other"}
+                ]}
+            })
+        );
+        assert!(AnthropicInputTransformations::from_value(&json!([])).is_none());
+    }
 
     #[test]
     fn thinking_controls_respect_advertised_effort_and_output_budget() {

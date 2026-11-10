@@ -57,6 +57,7 @@ impl SummaryUsageMetadata {
         let mut metadata = metadata.clone();
         metadata.replay = None;
         metadata.reasoning = None;
+        metadata.diagnostics.clear();
         Some((
             *usage,
             Self {
@@ -1012,6 +1013,7 @@ impl Session {
     ) -> Result<&Record> {
         metadata.replay = None;
         metadata.reasoning = None;
+        metadata.diagnostics.clear();
         self.append(Event::CacheWarm {
             metadata,
             usage,

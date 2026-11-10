@@ -482,6 +482,9 @@ fn convert(
                             provider_api: message["api"].as_str().and_then(pi_rs::ModelApi::named),
                             finish_reason: message["stopReason"].as_str().map(str::to_owned),
                             reasoning,
+                            diagnostics: pi_rs::AssistantDiagnostic::from_pi_diagnostics(
+                                &message["diagnostics"],
+                            ),
                             replay: anthropic_replay(message).or_else(|| google_replay(message)),
                             resolved_model: message["model"].as_str().map(|model| {
                                 pi_rs::ResolvedModelIdentity {

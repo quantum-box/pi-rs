@@ -448,9 +448,91 @@ pub struct ModelMetadata {
     /// Provider-supplied visible reasoning, retained for session presentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<AssistantDiagnostic>,
     /// Complete ordered assistant content required for provider-specific continuations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<Box<ProviderReplay>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AssistantDiagnostic {
+    AnthropicInputTransformations {
+        timestamp: i64,
+        details: AnthropicInputTransformations,
+    },
+}
+
+impl AssistantDiagnostic {
+    pub fn from_pi_diagnostics(value: &Value) -> Vec<Self> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(16)
+            .filter_map(|diagnostic| {
+                if diagnostic["type"] != "anthropic_input_transformations" {
+                    return None;
+                }
+                Some(Self::AnthropicInputTransformations {
+                    timestamp: diagnostic["timestamp"].as_i64()?,
+                    details: AnthropicInputTransformations::from_value(
+                        &diagnostic["details"]["transformations"],
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn dropped_thinking_blocks(&self) -> usize {
+        match self {
+            Self::AnthropicInputTransformations { details, .. } => details
+                .transformations
+                .iter()
+                .filter(|transformation| transformation.kind == "thinking_dropped")
+                .count(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnthropicInputTransformations {
+    transformations: Vec<AnthropicInputTransformation>,
+}
+
+impl AnthropicInputTransformations {
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let transformations: Vec<_> = value
+            .as_array()?
+            .iter()
+            .take(256)
+            .filter_map(|transformation| {
+                let field = |key: &str| {
+                    transformation[key]
+                        .as_str()
+                        .filter(|text| text.len() <= 1024)
+                        .map(str::to_owned)
+                };
+                Some(AnthropicInputTransformation {
+                    kind: field("type")?,
+                    path: field("path"),
+                    reason: field("reason"),
+                })
+            })
+            .collect();
+        (!transformations.is_empty()).then_some(Self { transformations })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct AnthropicInputTransformation {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 /// Canonical provider and model names reported by the host adapter.
@@ -475,6 +557,8 @@ pub enum UsageReport {
 }
 
 #[derive(Clone, Debug)]
+// Keep the SDK event shape stable as optional provider metadata grows.
+#[allow(clippy::large_enum_variant)]
 pub enum ModelEvent {
     Text(String),
     Reasoning(String),

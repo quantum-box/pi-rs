@@ -359,6 +359,8 @@ struct View {
     flash: Option<(String, Instant)>,
     tokens: u64,
     cache_stats: super::cache_stats::Tracker,
+    pending_thinking_drop: Option<(uuid::Uuid, usize)>,
+    previous_thinking_drop: usize,
     cache_warming_status: Option<super::cache_warming::status::State>,
     model_operations: std::collections::HashSet<String>,
     history: Vec<String>,
@@ -588,6 +590,35 @@ impl View {
         }
     }
 
+    fn observe_thinking_drop(&mut self, event: &pi_rs::Event) -> Option<usize> {
+        match event {
+            pi_rs::Event::ModelFinished {
+                request_id,
+                metadata,
+                failure: None,
+                ..
+            } => {
+                let count = metadata
+                    .diagnostics
+                    .iter()
+                    .map(pi_rs::AssistantDiagnostic::dropped_thinking_blocks)
+                    .sum();
+                self.pending_thinking_drop = Some((*request_id, count));
+            }
+            pi_rs::Event::Assistant { request_id, .. } => {
+                let count = self
+                    .pending_thinking_drop
+                    .take()
+                    .filter(|(id, _)| Some(id) == request_id.as_ref())
+                    .map_or(0, |(_, count)| count);
+                let previous = std::mem::replace(&mut self.previous_thinking_drop, count);
+                return (count > previous).then_some(count);
+            }
+            _ => {}
+        }
+        None
+    }
+
     fn add_summary(&mut self, record: &pi_rs::Record, session: Option<&Session>) {
         let (kind, text) = match &record.event {
             pi_rs::Event::Compacted {
@@ -689,6 +720,18 @@ impl View {
             self.add_summary(&record, None);
             self.show_summary_billing(&record, &[], args);
             self.observe_cache(&record, args);
+            if let Some(count) = self.observe_thinking_drop(&record.event)
+                && args.settings.boolean("showCacheMissNotices") == Some(true)
+            {
+                let noun = if count == 1 {
+                    "thinking block"
+                } else {
+                    "thinking blocks"
+                };
+                self.lines.push(Entry::Warning(format!(
+                    "Anthropic dropped {count} {noun} (details in session)"
+                )));
+            }
         }
     }
 
@@ -727,6 +770,8 @@ impl View {
         self.history_index = None;
         self.tokens = 0;
         self.cache_stats = super::cache_stats::Tracker::default();
+        self.pending_thinking_drop = None;
+        self.previous_thinking_drop = 0;
         self.cache_warming_status = None;
         self.model_operations.clear();
         let records = session.records();
@@ -838,6 +883,7 @@ impl View {
             self.add_summary(record, Some(&session));
             self.show_summary_billing(record, records, args);
             self.observe_cache(record, args);
+            self.observe_thinking_drop(&record.event);
         }
         if show_startup_header(args) {
             self.append(if crate::ui::keys::windows_keybindings() {

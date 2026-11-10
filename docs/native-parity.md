@@ -2761,3 +2761,13 @@ assistant transcript. New compactions record their pre-compaction
 context size, and imported sessions retain Pi's `tokensBefore`.
 Loopback and PTY checks covered live compaction and branch summaries,
 imported journals, custom bindings, individual clicks, and billing.
+
+### Anthropic input transformation diagnostics checkpoint
+
+Anthropic Messages responses retain bounded input transformation diagnostics
+in the assistant's journal metadata and RPC message. A final SSE array
+supersedes the initial array, including when it is empty. Pi JSONL imports
+retain the diagnostic timestamp and transformation type, path, and reason.
+With `showCacheMissNotices` enabled, both terminal modes warn when the
+number of dropped thinking blocks increases compared to the previous
+assistant response on the active branch. Reopening restores that baseline.

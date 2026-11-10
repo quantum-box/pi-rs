@@ -404,6 +404,9 @@ impl Projection {
                 if let Some(identity) = &metadata.resolved_model {
                     value["responseModel"] = json!(identity.model);
                 }
+                if !metadata.diagnostics.is_empty() {
+                    value["diagnostics"] = json!(metadata.diagnostics);
+                }
                 value
             }
             Message::Tool { call_id, content } => {
