@@ -97,6 +97,7 @@ struct Branch {
 }
 struct Importer {
     records: Vec<Record>,
+    timestamp: Option<String>,
 }
 impl Importer {
     fn append(&mut self, branch: &mut Branch, event: Event) -> u64 {
@@ -110,6 +111,7 @@ impl Importer {
             .unwrap_or(0);
         if current_head != branch.head {
             self.records.push(Record {
+                timestamp: self.timestamp.clone(),
                 version: 2,
                 id: self.records.len() as u64 + 1,
                 parent: Some(current_head),
@@ -121,6 +123,7 @@ impl Importer {
         }
         let id = self.records.len() as u64 + 1;
         self.records.push(Record {
+            timestamp: self.timestamp.clone(),
             version: 2,
             id,
             parent: (branch.head != 0).then_some(branch.head),
@@ -147,6 +150,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
     }
     let mut importer = Importer {
         records: Vec::new(),
+        timestamp: header["timestamp"].as_str().map(str::to_owned),
     };
     let mut root = Branch::default();
     importer.append(
@@ -178,6 +182,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
     let mut branches = BTreeMap::<String, Branch>::new();
     let mut previous = None;
     for (index, entry) in entries.into_iter().enumerate().skip(1) {
+        importer.timestamp = entry["timestamp"].as_str().map(str::to_owned);
         let id = if version == 1 {
             entry["id"]
                 .as_str()
@@ -611,6 +616,36 @@ mod tests {
     use super::*;
     use pi_rs::Message;
     use serde_json::json;
+    #[test]
+    fn imported_timestamps_and_label_changes_preserve_source_times() {
+        let created = "2026-01-02T03:04:05.000Z";
+        let labeled = "2026-01-02T03:06:07.123Z";
+        let session = import_pi(vec![
+            json!({"type":"session","version":3,"timestamp":created}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"label","id":"l","parentId":"u","targetId":"u","label":"bookmark","timestamp":labeled}),
+        ]).unwrap();
+        assert_eq!(session.records()[0].timestamp.as_deref(), Some(created));
+        let user = session
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    record.event,
+                    Event::User { .. } | Event::UserWithImages { .. }
+                )
+            })
+            .unwrap();
+        assert!(user.timestamp.is_none());
+        let target = *session.labels().keys().next().unwrap();
+        assert_eq!(
+            session.label_timestamps().get(&target).map(String::as_str),
+            Some(labeled)
+        );
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(restored.label_timestamps(), session.label_timestamps());
+    }
+
     #[test]
     fn imports_parent_session_without_adding_model_context() {
         let session = import_pi(vec![

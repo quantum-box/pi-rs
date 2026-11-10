@@ -704,12 +704,17 @@ fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
 
 fn session_tree(session: &Session) -> Vec<Value> {
     let labels = session.labels();
+    let label_timestamps = session.label_timestamps();
     let mut children = std::collections::BTreeMap::<u64, Vec<Value>>::new();
     let mut roots = Vec::new();
     for record in session.records().iter().rev() {
         let mut descendants = children.remove(&record.id).unwrap_or_default();
         descendants.reverse();
-        let node = json!({"entry":record,"children":descendants,"label":labels.get(&record.id)});
+        let mut node =
+            json!({"entry":record,"children":descendants,"label":labels.get(&record.id)});
+        if let Some(timestamp) = label_timestamps.get(&record.id) {
+            node["labelTimestamp"] = json!(timestamp);
+        }
         match record.parent {
             Some(parent) => children.entry(parent).or_default().push(node),
             None => roots.push(node),

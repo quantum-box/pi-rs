@@ -192,6 +192,8 @@ pub enum Event {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<Uuid>,
     pub version: u32,
     pub id: u64,
@@ -769,6 +771,25 @@ impl Session {
         labels
     }
 
+    /// Last known label modification time, absent for legacy records without timestamps.
+    pub fn label_timestamps(&self) -> BTreeMap<u64, String> {
+        let mut timestamps = BTreeMap::new();
+        for record in &self.records {
+            if let Event::Label { target, label } = &record.event {
+                if label.as_ref().is_some_and(|label| !label.is_empty()) {
+                    if let Some(timestamp) = &record.timestamp {
+                        timestamps.insert(*target, timestamp.clone());
+                    } else {
+                        timestamps.remove(target);
+                    }
+                } else {
+                    timestamps.remove(target);
+                }
+            }
+        }
+        timestamps
+    }
+
     /// Export one settled branch with fresh session identity and remapped record references.
     pub fn fork_records(&self, target: u64) -> Result<Vec<Record>> {
         if self.host_binding().is_some() {
@@ -789,7 +810,10 @@ impl Session {
             record.id = ids[&record.id];
             record.parent = record.parent.and_then(|parent| ids.get(&parent).copied());
             match &mut record.event {
-                Event::Created { session_id } => *session_id = Uuid::new_v4(),
+                Event::Created { session_id } => {
+                    *session_id = Uuid::new_v4();
+                    record.timestamp = Some(record_timestamp());
+                }
                 Event::ModelRequested { context_head, .. } => {
                     *context_head = context_head.and_then(|id| ids.get(&id).copied());
                 }
@@ -903,6 +927,7 @@ impl Session {
             _ => id,
         };
         let record = Record {
+            timestamp: Some(record_timestamp()),
             run_id: self.run_id,
             version: FORMAT_VERSION,
             id,
@@ -1842,6 +1867,10 @@ mod system_checkpoint_tests {
     }
 }
 
+fn record_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 /// Normalize a display name using Pi's line-break and ECMAScript whitespace rules.
 pub fn sanitize_session_name(name: &str) -> String {
     name.split(['\r', '\n'])
@@ -1861,6 +1890,51 @@ pub fn sanitize_session_name(name: &str) -> String {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+
+    #[test]
+    fn timestamps_survive_reopening_and_legacy_records_remain_undated() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.set_name("dated").unwrap();
+        for record in session.records() {
+            let timestamp = record.timestamp.as_deref().unwrap();
+            assert!(chrono::DateTime::parse_from_rfc3339(timestamp).is_ok());
+            assert!(timestamp.ends_with('Z'));
+        }
+        let original = session.records().to_vec();
+        let restored = Session::from_records(original.clone()).unwrap();
+        assert_eq!(restored.records()[1].timestamp, original[1].timestamp);
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        for record in legacy.as_array_mut().unwrap() {
+            record.as_object_mut().unwrap().remove("timestamp");
+        }
+        let legacy: Vec<Record> = serde_json::from_value(legacy).unwrap();
+        let restored = Session::from_records(legacy).unwrap();
+        assert!(
+            restored
+                .records()
+                .iter()
+                .all(|record| record.timestamp.is_none())
+        );
+        let fork = session.fork_records(session.head()).unwrap();
+        assert_eq!(fork[1].timestamp, original[1].timestamp);
+        assert!(fork[0].timestamp.is_some());
+    }
+
+    #[test]
+    fn label_timestamps_track_the_latest_change_and_clear_with_labels() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.set_label(1, Some("first".into())).unwrap();
+        assert_eq!(
+            session.label_timestamps().get(&1),
+            session.records().last().unwrap().timestamp.as_ref()
+        );
+        let mut records = session.records().to_vec();
+        records.last_mut().unwrap().timestamp = None;
+        let restored = Session::from_records(records).unwrap();
+        assert!(restored.label_timestamps().is_empty());
+        session.set_label(1, None).unwrap();
+        assert!(session.label_timestamps().is_empty());
+    }
 
     #[test]
     fn empty_labels_clear_bookmarks_in_new_and_legacy_records() {

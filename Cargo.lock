@@ -2111,6 +2111,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "cap-std",
+ "chrono",
  "futures-util",
  "jsonschema",
  "serde",

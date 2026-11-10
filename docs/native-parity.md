@@ -1595,3 +1595,18 @@ targets. The pinned reference confirms empty versus whitespace label behavior.
 
 A CLI/RPC smoke check verifies removal and whitespace labels in the session tree.
 The full workspace tests and all-target Clippy pass.
+
+### Durable history timestamps checkpoint
+
+New native journal entries carry UTC timestamps with millisecond precision.
+Previously saved records without timestamps still load without synthesized
+dates. Pi imports preserve source timestamps, including absent timestamps,
+and JSONL export and snapshots retain them. Forks timestamp their new session
+header while preserving the copied history's original timestamps.
+
+RPC tree nodes expose `labelTimestamp` when the latest nonempty label has a known
+timestamp. Clearing a label removes it, and an undated label update does not
+reuse a previous change's timestamp. Core and importer tests cover these cases.
+
+A CLI/RPC check verifies persisted UTC timestamps and label timestamp removal.
+The full workspace tests and all-target Clippy pass.
