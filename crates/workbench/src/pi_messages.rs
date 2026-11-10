@@ -653,6 +653,7 @@ fn terminal_metadata(
         cost_usd: stats["cost"]["total"].as_number().cloned(),
         cost_breakdown: pi_rs::UsageCostBreakdown::from_value(&stats["cost"]),
         cost_from_provider: stats["cost"]["totalFromProvider"].as_bool(),
+        provider_api: Some(pi_rs::ModelApi::PiMessages),
         resolved_model: Some(ResolvedModelIdentity {
             provider: provider.into(),
             model: event["responseModel"].as_str().unwrap_or(model).into(),

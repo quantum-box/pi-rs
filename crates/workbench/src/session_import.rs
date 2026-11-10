@@ -474,6 +474,7 @@ fn convert(
                             cache_write_1h_tokens: message["usage"]["cacheWrite1h"].as_u64(),
                             cached_input_tokens: message["usage"]["cacheRead"].as_u64(),
                             cache_creation_input_tokens: message["usage"]["cacheWrite"].as_u64(),
+                            provider_api: message["api"].as_str().and_then(pi_rs::ModelApi::named),
                             finish_reason: message["stopReason"].as_str().map(str::to_owned),
                             reasoning,
                             replay: anthropic_replay(message).or_else(|| google_replay(message)),

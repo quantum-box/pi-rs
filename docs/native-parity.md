@@ -2596,3 +2596,13 @@ and RPC retain the component costs, the one-hour token count, and whether
 the total came from the provider. Existing journal records can omit these
 fields. Loopback checks covered tier boundaries, nested cache usage,
 provider totals, and the detailed RPC projection.
+
+### Durable model API and Gemini route checkpoint
+
+Native model metadata records the API used for each completed request.
+RPC history uses that API even when models share a provider or the turn
+contains no signed reasoning. Older journals retain the prior inference
+path. Named Gemini connections bind signed parts to their provider,
+endpoint, and model. Loopback tests covered Chat Completions, Messages,
+and Generate Content within one profile, resuming the original Gemini
+route, and changing the endpoint without forwarding its old signature.

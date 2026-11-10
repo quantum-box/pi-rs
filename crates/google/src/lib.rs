@@ -6,8 +6,8 @@ use std::time::Duration;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ResolvedModelIdentity, Result, ToolCall, Usage, extract_tool_images,
+    Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    ProviderReplay, ResolvedModelIdentity, Result, ToolCall, Usage, extract_tool_images,
 };
 use reqwest::{
     Client, Response, Url,
@@ -43,6 +43,8 @@ pub struct Google {
     client: Client,
     endpoint: Url,
     api_key: HeaderValue,
+    provider: Arc<str>,
+    replay_scope: Arc<str>,
     headers: HeaderMap,
     catalog: Arc<RwLock<BTreeMap<String, CatalogEntry>>>,
     probe_context: bool,
@@ -83,6 +85,8 @@ impl Google {
             client,
             endpoint,
             api_key,
+            provider: Arc::from("google"),
+            replay_scope: Arc::from("google"),
             headers: HeaderMap::new(),
             catalog: Arc::default(),
             probe_context: true,
@@ -90,6 +94,13 @@ impl Google {
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Bind signed Gemini parts to a named provider and its model route.
+    pub fn with_provider(mut self, provider: &str, replay_scope: impl Into<Arc<str>>) -> Self {
+        self.provider = Arc::from(provider);
+        self.replay_scope = replay_scope.into();
+        self
     }
 
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
@@ -384,9 +395,9 @@ fn check_status(response: Response) -> Result<Response> {
     }
 }
 
-fn identity(model: &str) -> ResolvedModelIdentity {
+fn identity(provider: &str, model: &str) -> ResolvedModelIdentity {
     ResolvedModelIdentity {
-        provider: "google".into(),
+        provider: provider.into(),
         model: model.into(),
     }
 }
@@ -413,8 +424,12 @@ fn push_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>, merge:
     }
 }
 
-fn wire_request(request: &ModelRequest, thinking: Option<&str>) -> Result<Value> {
-    let identity = identity(model_id(&request.model));
+fn wire_request(
+    request: &ModelRequest,
+    thinking: Option<&str>,
+    replay_scope: &str,
+) -> Result<Value> {
+    let identity = identity(replay_scope, model_id(&request.model));
     let gemini_v3 = gemini_major(&identity.model).is_some_and(|version| version >= 3);
     let explicit_tool_ids = uses_tool_call_ids(&identity.model);
     let mut contents = Vec::new();
@@ -564,7 +579,7 @@ impl Model for Google {
         } else {
             self.thinking.as_deref()
         };
-        let body = wire_request(&request, thinking)?;
+        let body = wire_request(&request, thinking, &self.replay_scope)?;
         let mut url = self.url(Some(&format!("{model}:streamGenerateContent")));
         url.query_pairs_mut().append_pair("alt", "sse");
         let mut last_progress = None;
@@ -585,9 +600,14 @@ impl Model for Google {
         let response = check_status(response)?;
         let progress = self.progress.clone();
         let observe_reasoning = self.reasoning.clone();
+        let provider = self.provider.clone();
+        let replay_scope = self.replay_scope.clone();
         Ok(Box::pin(async_stream::try_stream! {
             let mut stream = response.bytes_stream().eventsource();
-            let mut metadata = ModelMetadata::default();
+            let mut metadata = ModelMetadata {
+                provider_api: Some(ModelApi::GoogleGenerativeAi),
+                ..ModelMetadata::default()
+            };
             let mut calls = Vec::new();
             let mut call_ids = BTreeSet::new();
             let mut blocks = Vec::new();
@@ -618,7 +638,7 @@ impl Model for Google {
                     metadata.provider_request_id = Some(id.into());
                 }
                 if let Some(version) = value["modelVersion"].as_str().filter(|version| valid_model_id(version)) {
-                    metadata.resolved_model = Some(identity(version));
+                    metadata.resolved_model = Some(identity(&provider, version));
                 }
                 if let Some(stats) = value.get("usageMetadata") {
                     let count = |key: &str| stats[key].as_u64().unwrap_or_default();
@@ -697,7 +717,7 @@ impl Model for Google {
                 Some(_) => Err(Error::Model("Google Gemini did not complete the response".into()))?,
             }.into());
             if !blocks.is_empty() {
-                metadata.replay = Some(Box::new(ProviderReplay { identity: identity(&model), blocks }));
+                metadata.replay = Some(Box::new(ProviderReplay { identity: identity(&replay_scope, &model), blocks }));
             }
             metadata.reasoning = (!reasoning.is_empty()).then_some(reasoning);
             yield ModelEvent::Metadata(metadata);
@@ -737,7 +757,7 @@ mod tests {
                         arguments: r#"{"path":"a"}"#.into(),
                     }],
                     replay: Some(Box::new(ProviderReplay {
-                        identity: identity("gemini-3.5-flash"),
+                        identity: identity("google", "gemini-3.5-flash"),
                         blocks: vec![original.clone()],
                     })),
                 },
@@ -752,7 +772,7 @@ mod tests {
             tools: Vec::new(),
             max_output_tokens: 1024,
         };
-        let wire = wire_request(&request, Some("low")).unwrap();
+        let wire = wire_request(&request, Some("low"), "google").unwrap();
         assert_eq!(wire["contents"][0]["parts"][0], original);
         assert_eq!(
             wire["contents"][1]["parts"][0]["functionResponse"]["id"],
@@ -764,7 +784,7 @@ mod tests {
             "Follow-up after the tool result"
         );
         request.model = "gemini-3.1-pro".into();
-        let other = wire_request(&request, Some("low")).unwrap();
+        let other = wire_request(&request, Some("low"), "google").unwrap();
         let call = &other["contents"][0]["parts"][0];
         assert_eq!(call["functionCall"]["id"], "logical-call");
         assert_ne!(call["thoughtSignature"], original["thoughtSignature"]);

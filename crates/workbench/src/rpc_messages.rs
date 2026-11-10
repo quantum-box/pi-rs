@@ -305,15 +305,14 @@ impl Projection {
                 let model = request
                     .and_then(|request| self.requested(records, request))
                     .or_else(|| self.selected(records, record.id));
-                let messages_provider = replay.as_ref().and_then(|replay| {
-                    replay
-                        .identity
-                        .provider
-                        .strip_prefix("anthropic-messages:")?
-                        .split_once(':')
-                        .map(|(provider, _)| provider)
+                let replay_route = replay.as_ref().and_then(|replay| {
+                    let (api, rest) = replay.identity.provider.split_once(':')?;
+                    let (provider, _) = rest.split_once(':')?;
+                    matches!(api, "anthropic-messages" | "google-generative-ai")
+                        .then_some((api, provider))
                 });
-                let provider = messages_provider
+                let provider = replay_route
+                    .map(|(_, provider)| provider)
                     .or_else(|| {
                         replay
                             .as_ref()
@@ -333,8 +332,9 @@ impl Projection {
                 let provider = model
                     .filter(|selected| Provider::named(selected.provider).is_none())
                     .map_or(provider, |selected| selected.provider);
-                let api = messages_provider
-                    .map(|_| "anthropic-messages")
+                let api = finalized
+                    .and_then(|entry| entry.metadata.provider_api.map(pi_rs::ModelApi::as_str))
+                    .or_else(|| replay_route.map(|(api, _)| api))
                     .unwrap_or_else(|| {
                         Provider::named(provider)
                             .or_else(|| {

@@ -6,8 +6,8 @@ use std::time::Duration;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
+    Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    ProviderReplay, ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 use reqwest::{
     Client, Response, Url,
@@ -757,7 +757,10 @@ impl Model for Anthropic {
             let mut calls = BTreeMap::<u64, Call>::new();
             let mut blocks = BTreeMap::<u64, ResponseBlock>::new();
             let mut usage = StreamUsage::default();
-            let mut metadata = ModelMetadata::default();
+            let mut metadata = ModelMetadata {
+                provider_api: Some(ModelApi::AnthropicMessages),
+                ..ModelMetadata::default()
+            };
             let mut reasoning_text = String::new();
             let mut started = false;
             while let Some(event) = events.next().await {

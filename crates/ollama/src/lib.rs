@@ -16,8 +16,8 @@ mod reasoning_details;
 pub use compatibility::ChatCompatibility;
 
 use pi_rs_core::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
+    Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    ProviderReplay, ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 
 type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
@@ -604,7 +604,10 @@ impl Model for Ollama {
             }).eventsource();
             let mut calls = BTreeMap::<usize, CallDelta>::new();
             let mut usage = None;
-            let mut metadata = ModelMetadata::default();
+            let mut metadata = ModelMetadata {
+                provider_api: Some(ModelApi::OpenaiCompletions),
+                ..ModelMetadata::default()
+            };
             let mut reasoning_text = String::new();
             let mut replay_blocks = Vec::new();
             loop {

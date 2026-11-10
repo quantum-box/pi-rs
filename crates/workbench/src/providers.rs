@@ -7,6 +7,7 @@ use pi_rs::ollama::{ModelDetails, Ollama};
 use pi_rs::{Error, Model, ModelRequest, ModelStream, Result};
 use reqwest::header::HeaderMap;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use super::{Cli, model_auth::Credential, model_profiles::RequestHeaders, pi_messages::PiMessages};
@@ -99,6 +100,15 @@ impl Provider {
         }
     }
 
+    fn replay_scope(&self, adapter: Adapter, endpoint: &str) -> String {
+        format!(
+            "{}:{}:{:x}",
+            adapter.api(),
+            self.id(),
+            Sha256::digest(endpoint)
+        )
+    }
+
     pub fn connect(
         &self,
         adapter: Adapter,
@@ -137,19 +147,17 @@ impl Provider {
                     Anthropic::new(endpoint, &token)?
                 };
                 if self != &Self::Anthropic {
-                    use sha2::{Digest, Sha256};
-                    let scope = format!(
-                        "anthropic-messages:{}:{:x}",
-                        self.id(),
-                        Sha256::digest(endpoint)
-                    );
-                    client = client.with_provider(self.id(), scope);
+                    client = client.with_provider(self.id(), self.replay_scope(adapter, endpoint));
                 }
                 Ok(Client::Anthropic(client))
             }
             Adapter::Google => {
                 let token = token.ok_or_else(missing_key)?;
-                Ok(Client::Google(Google::new(endpoint, &token)?))
+                let mut client = Google::new(endpoint, &token)?;
+                if self != &Self::Google {
+                    client = client.with_provider(self.id(), self.replay_scope(adapter, endpoint));
+                }
+                Ok(Client::Google(client))
             }
             Adapter::PiMessages => {
                 if self == &Self::Radius {

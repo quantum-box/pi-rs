@@ -362,6 +362,37 @@ impl UsageCostBreakdown {
     }
 }
 
+/// Native chat transports recorded in a session.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelApi {
+    OpenaiCompletions,
+    AnthropicMessages,
+    GoogleGenerativeAi,
+    PiMessages,
+}
+
+impl ModelApi {
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "openai-completions" => Some(Self::OpenaiCompletions),
+            "anthropic-messages" => Some(Self::AnthropicMessages),
+            "google-generative-ai" => Some(Self::GoogleGenerativeAi),
+            "pi-messages" => Some(Self::PiMessages),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenaiCompletions => "openai-completions",
+            Self::AnthropicMessages => "anthropic-messages",
+            Self::GoogleGenerativeAi => "google-generative-ai",
+            Self::PiMessages => "pi-messages",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelMetadata {
     /// Provider, importer, or catalog estimate in USD, absent when unknown.
@@ -383,6 +414,9 @@ pub struct ModelMetadata {
     pub provider_prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<ResolvedModelIdentity>,
+    /// API actually used for this request, independent of the provider's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_api: Option<ModelApi>,
     pub finish_reason: Option<String>,
     /// Provider-supplied visible reasoning, retained for session presentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
