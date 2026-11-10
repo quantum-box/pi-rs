@@ -83,6 +83,7 @@ impl Provider {
         Self::ALL
             .into_iter()
             .find(|provider| name.eq_ignore_ascii_case(provider.id()))
+            .or_else(|| super::builtin_chat::find(name).map(|builtin| builtin.provider()))
     }
 
     pub fn default_endpoint(&self) -> &'static str {
@@ -91,7 +92,9 @@ impl Provider {
             Self::Anthropic => pi_rs::anthropic::DEFAULT_ENDPOINT,
             Self::Google => pi_rs::google::DEFAULT_ENDPOINT,
             Self::Radius => super::radius_auth::DEFAULT_MODEL_ENDPOINT,
-            Self::Custom { .. } => "",
+            Self::Custom { id, .. } => {
+                super::builtin_chat::find(id).map_or("", |builtin| builtin.endpoint())
+            }
         }
     }
 
@@ -107,7 +110,19 @@ impl Provider {
             })
         };
         match self.adapter() {
-            Adapter::ChatCompletions => Ok(Client::Ollama(Ollama::new(endpoint, token)?)),
+            Adapter::ChatCompletions => {
+                if token.is_none()
+                    && let Some(builtin) = super::builtin_chat::find(self.id())
+                    && builtin.endpoint() == endpoint
+                {
+                    return Err(Error::Config(format!(
+                        "set {} or pass --api-key for {}",
+                        builtin.env(),
+                        self.id()
+                    )));
+                }
+                Ok(Client::Ollama(Ollama::new(endpoint, token)?))
+            }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
                 Ok(Client::Anthropic(Anthropic::new(endpoint, &token)?))

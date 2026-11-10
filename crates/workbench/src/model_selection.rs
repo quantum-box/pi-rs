@@ -91,7 +91,9 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
     };
     let mut models = args.model_profiles.model_ids(&provider);
     let mut probe_details = false;
-    if probe || provider == Provider::Radius {
+    let bundled = super::builtin_chat::find(provider.id())
+        .is_some_and(|builtin| args.endpoint_for(&provider) == builtin.endpoint());
+    if (probe && !bundled) || provider == Provider::Radius {
         match client.models().await {
             Ok(discovered) => {
                 let mut seen: std::collections::BTreeSet<_> = models.iter().cloned().collect();

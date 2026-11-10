@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{Provider, config, model_auth::Credential, providers::Adapter};
+use super::{Provider, builtin_chat, config, model_auth::Credential, providers::Adapter};
 
 #[derive(Clone, Default)]
 pub(super) struct Profiles {
@@ -281,6 +281,11 @@ impl ModelMetadata {
     }
 }
 
+static BUILTIN_MODELS: LazyLock<BTreeMap<String, Vec<ConfiguredModel>>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../assets/builtin-chat-models.json"))
+        .expect("bundled Pi chat models")
+});
+
 impl Profiles {
     pub fn load() -> Result<Self> {
         let path = config::agent_dir().join("models.json");
@@ -428,12 +433,22 @@ impl Profiles {
     }
 
     pub fn providers(&self) -> impl Iterator<Item = Provider> + '_ {
-        Provider::ALL.into_iter().chain(
-            self.entries
-                .values()
-                .filter(|profile| matches!(profile.provider, Provider::Custom { .. }))
-                .map(|profile| profile.provider.clone()),
-        )
+        Provider::ALL
+            .into_iter()
+            .chain(
+                builtin_chat::PROVIDERS
+                    .iter()
+                    .map(|builtin| builtin.provider()),
+            )
+            .chain(
+                self.entries
+                    .values()
+                    .filter(|profile| {
+                        matches!(profile.provider, Provider::Custom { .. })
+                            && builtin_chat::find(profile.provider.id()).is_none()
+                    })
+                    .map(|profile| profile.provider.clone()),
+            )
     }
 
     pub fn endpoint(&self, provider: &Provider) -> &str {
@@ -513,30 +528,53 @@ impl Profiles {
         provider: &Provider,
         model: Option<&ModelMetadata>,
     ) -> ChatCompatibility {
-        let defaults = self
+        let builtin = builtin_chat::find(provider.id())
+            .map(|builtin| {
+                ChatCompatibility::deserialize(builtin.compatibility())
+                    .expect("bundled Pi chat compatibility")
+            })
+            .unwrap_or_default();
+        let profile = self
             .entries
             .get(provider.id())
             .map(|profile| profile.compat.clone())
             .unwrap_or_default();
-        defaults.overlay(model.map(|model| model.compat.clone()).unwrap_or_default())
+        builtin
+            .overlay(profile)
+            .overlay(model.map(|model| model.compat.clone()).unwrap_or_default())
     }
 
     pub fn model_ids(&self, provider: &Provider) -> Vec<String> {
-        self.entries
+        let mut ids: Vec<_> = self
+            .entries
             .get(provider.id())
             .into_iter()
             .flat_map(|profile| profile.models.iter().map(|model| model.id.clone()))
-            .collect()
+            .collect();
+        if let Some(models) = BUILTIN_MODELS.get(provider.id()) {
+            let configured: std::collections::BTreeSet<_> = ids.iter().cloned().collect();
+            ids.extend(
+                models
+                    .iter()
+                    .filter(|model| !configured.contains(&model.id))
+                    .map(|model| model.id.clone()),
+            );
+        }
+        ids
     }
 
     pub fn model(&self, provider: &Provider, id: &str) -> Option<ModelMetadata> {
-        let profile = self.entries.get(provider.id())?;
+        let profile = self.entries.get(provider.id());
         let model = profile
-            .models
-            .iter()
-            .find(|model| model.id == id)
+            .and_then(|profile| profile.models.iter().find(|model| model.id == id))
+            .or_else(|| {
+                BUILTIN_MODELS
+                    .get(provider.id())?
+                    .iter()
+                    .find(|model| model.id == id)
+            })
             .map(|model| model.metadata.clone().with_model_defaults());
-        match profile.overrides.get(id) {
+        match profile.and_then(|profile| profile.overrides.get(id)) {
             Some(overrides) => Some(model.unwrap_or_default().overlay(overrides)),
             None => model,
         }
@@ -570,6 +608,11 @@ fn endpoint_from_base(provider: &Provider, base: &str) -> Result<String> {
     let path = url.path().trim_end_matches('/');
     let path = if path.ends_with(suffix) {
         path.to_owned()
+    } else if path.is_empty()
+        && provider.id() == "deepseek"
+        && url.host_str() == Some("api.deepseek.com")
+    {
+        suffix.to_owned()
     } else if path.is_empty() && provider.adapter() != Adapter::PiMessages {
         format!("/v1{suffix}")
     } else {

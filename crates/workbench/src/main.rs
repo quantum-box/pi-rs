@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 mod attachments;
 mod backend;
+mod builtin_chat;
 mod cli_compat;
 mod clipboard;
 mod config;
@@ -381,6 +382,13 @@ impl Cli {
                             .map(model_auth::Credential::Literal);
                     }
                     return None;
+                }
+                if let Some(builtin) = builtin_chat::find(provider.id()) {
+                    return (builtin.endpoint() == endpoint)
+                        .then(|| std::env::var(builtin.env()).ok())
+                        .flatten()
+                        .filter(|key| !key.trim().is_empty())
+                        .map(model_auth::Credential::Literal);
                 }
                 let url = reqwest::Url::parse(endpoint).ok()?;
                 let token = match (provider, url.scheme(), url.host_str()) {

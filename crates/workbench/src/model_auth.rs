@@ -77,6 +77,7 @@ pub(super) struct Keys {
 #[derive(Clone)]
 struct SavedKey {
     endpoint: String,
+    implicit_endpoint: bool,
     key: Credential,
 }
 
@@ -119,6 +120,7 @@ impl Keys {
                     name.to_ascii_lowercase(),
                     SavedKey {
                         endpoint: endpoint.to_owned(),
+                        implicit_endpoint: entry.get("endpoint").is_none(),
                         key,
                     },
                 ))
@@ -144,8 +146,9 @@ impl Keys {
         let entry = self.entries.get(provider)?;
         (entry.endpoint == endpoint
             || (official
-                && super::operation_models::official_base(provider)
-                    == Some(entry.endpoint.as_str())))
+                && (super::operation_models::official_base(provider)
+                    == Some(entry.endpoint.as_str())
+                    || (entry.implicit_endpoint && super::builtin_chat::find(provider).is_some()))))
         .then_some(&entry.key)
     }
 
