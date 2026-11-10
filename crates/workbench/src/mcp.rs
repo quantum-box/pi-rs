@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::mcp_provider_auth::ProviderClient;
+pub use crate::mcp_provider_auth::TokenResolver;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
@@ -44,8 +47,14 @@ pub struct ServerConfig {
     pub enabled: Option<bool>,
     pub exposure: Option<String>,
     pub oauth: Option<crate::mcp_auth::OAuthSetting>,
+    pub auth: Option<ProviderAuth>,
     #[serde(default)]
     pub tool_exposure: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ProviderAuth {
+    pub provider: String,
 }
 
 impl ServerConfig {
@@ -280,6 +289,7 @@ struct Connection {
     name: String,
     config: ServerConfig,
     workspace: PathBuf,
+    provider_token: Option<TokenResolver>,
     closed: AtomicBool,
 }
 impl Connection {
@@ -301,8 +311,13 @@ impl Connection {
             return Err(Error::Config("MCP connection is closed".into()));
         }
         if service.is_closed() || service.peer().is_transport_closed() {
-            let replacement =
-                McpExtension::connect(&self.name, &self.config, &self.workspace).await?;
+            let replacement = McpExtension::connect_with_provider_token(
+                &self.name,
+                &self.config,
+                &self.workspace,
+                self.provider_token.clone(),
+            )
+            .await?;
             if replacement.connection.identity() != self.identity()
                 || self.closed.load(Ordering::SeqCst)
             {
@@ -400,6 +415,15 @@ pub struct McpExtension {
 }
 impl McpExtension {
     pub async fn connect(name: &str, config: &ServerConfig, workspace: &Path) -> Result<Self> {
+        Self::connect_with_provider_token(name, config, workspace, None).await
+    }
+
+    pub async fn connect_with_provider_token(
+        name: &str,
+        config: &ServerConfig,
+        workspace: &Path,
+        provider_token: Option<TokenResolver>,
+    ) -> Result<Self> {
         if name.is_empty()
             || !name
                 .bytes()
@@ -427,6 +451,29 @@ impl McpExtension {
         if config.oauth_required() && config.command.is_some() {
             return Err(Error::Config("MCP OAuth requires an HTTP server".into()));
         }
+        let provider_token = if let Some(auth) = &config.auth {
+            if auth.provider.trim().is_empty() || config.command.is_some() || config.url.is_none() {
+                return Err(Error::Config(
+                    "MCP auth.provider requires a provider name and HTTP server".into(),
+                ));
+            }
+            if config.oauth_required()
+                || config
+                    .headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+            {
+                return Err(Error::Config(
+                    "MCP auth.provider cannot be combined with OAuth or an Authorization header"
+                        .into(),
+                ));
+            }
+            Some(provider_token.ok_or_else(|| {
+                Error::Config("MCP provider authentication is unavailable".into())
+            })?)
+        } else {
+            None
+        };
         let timeout = Duration::from_secs(config.timeout.unwrap_or(60).clamp(1, 3600));
         let lifecycle = match config.protocol_version.as_deref() {
             None => ClientLifecycleMode::Initialize,
@@ -516,12 +563,18 @@ impl McpExtension {
                 headers.insert(name, value);
             }
             let manual_auth = headers.contains_key(&reqwest_mcp::header::AUTHORIZATION);
-            let may_authorize = config.oauth_allowed() && !manual_auth;
+            let may_authorize = config.oauth_allowed() && !manual_auth && provider_token.is_none();
             let use_oauth = config.oauth_required()
                 || (may_authorize && crate::mcp_auth::has_credentials(name, url)?);
             let client = reqwest_mcp::Client::builder()
                 .redirect(reqwest_mcp::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(10));
+            let client = if provider_token.is_some() {
+                client.no_proxy()
+            } else {
+                client
+            };
+            let client = client
                 .build()
                 .map_err(|error| Error::Config(error.to_string()))?;
             let initialize = async {
@@ -539,6 +592,18 @@ impl McpExtension {
                         Some(Uuid::parse_str(&generation).map_err(|_| {
                             Error::Config("invalid MCP credential generation".into())
                         })?);
+                    NativeClient::default()
+                        .serve_with_lifecycle(
+                            StreamableHttpClientTransport::with_client(client, transport_config),
+                            lifecycle,
+                        )
+                        .await
+                } else if let Some(resolver) = provider_token.clone() {
+                    let client = ProviderClient {
+                        client,
+                        endpoint: Arc::from(url.as_str()),
+                        resolver,
+                    };
                     NativeClient::default()
                         .serve_with_lifecycle(
                             StreamableHttpClientTransport::with_client(client, transport_config),
@@ -571,6 +636,8 @@ impl McpExtension {
                         }
                     } else if use_oauth {
                         Error::Config(format!("MCP {name} OAuth connection failed"))
+                    } else if provider_token.is_some() {
+                        Error::Config(format!("MCP {name} provider authentication failed"))
                     } else {
                         Error::Config(format!("MCP {name} initialization failed: {error}"))
                     }
@@ -593,6 +660,7 @@ impl McpExtension {
             name: name.into(),
             config: config.clone(),
             workspace: workspace.to_owned(),
+            provider_token,
             closed: AtomicBool::new(false),
         });
         Self::discover(connection).await
@@ -1090,6 +1158,9 @@ fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> R
     identity.update(json!({"name":name,"command":config.command,"args":config.args,"url":config.url,"cwd":config.cwd,"workspace":workspace}).to_string());
     if let Some(version) = &config.protocol_version {
         identity.update(version.as_bytes());
+    }
+    if let Some(auth) = &config.auth {
+        identity.update(json!(["provider", auth.provider]).to_string());
     }
     Ok(identity)
 }

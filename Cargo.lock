@@ -2264,6 +2264,7 @@ dependencies = [
  "sha2 0.10.9",
  "shell-words",
  "similar",
+ "sse-stream",
  "syntect",
  "tempfile",
  "tokio",

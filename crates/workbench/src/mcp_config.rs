@@ -71,6 +71,11 @@ pub fn configurations(args: &Cli) -> Result<BTreeMap<String, Value>> {
         let project = config::read_object(&args.workspace.join(".pi/mcp.json"))?;
         if let Some(entries) = project.get("mcpServers").and_then(Value::as_object) {
             for (name, entry) in entries {
+                if entry.get("auth").is_some() {
+                    return Err(Error::Config(format!(
+                        "project MCP server {name} cannot use auth.provider"
+                    )));
+                }
                 if !["command", "url", "type"]
                     .iter()
                     .any(|key| entry.get(*key).is_some())
@@ -159,9 +164,9 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
             }
             continue;
         }
-        let workspace = args.workspace.clone();
+        let args = args.clone();
         pending.push(async move {
-            let result = McpExtension::connect(&name, &config, &workspace).await;
+            let result = connect(&args, &name, &config).await;
             (name, config, result)
         });
     }
@@ -195,6 +200,40 @@ pub(super) async fn discover(args: &Cli, report: bool, interactive: bool) -> Res
         }
     }
     Ok(discovery)
+}
+
+async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExtension> {
+    use pi_rs_workbench::mcp::TokenResolver;
+    let resolver: Option<TokenResolver> = server.auth.as_ref().map(|auth| {
+        let args = args.clone();
+        let provider = auth.provider.clone();
+        Arc::new(move || {
+            let mut args = args.clone();
+            let provider = provider.clone();
+            Box::pin(async move {
+                args.model_profiles = super::model_profiles::Profiles::load()?;
+                args.model_keys = super::model_auth::Keys::load()?;
+                let provider = args.model_profiles.provider(&provider).ok_or_else(|| {
+                    Error::Config("MCP auth.provider does not name an installed provider".into())
+                })?;
+                let endpoint = if args.endpoint_explicit {
+                    args.endpoint_for(&provider)
+                } else {
+                    args.model_profiles.endpoint(&provider)
+                };
+                let token = args.model_token_for(&provider, endpoint);
+                if token.is_some() || provider != super::Provider::Radius {
+                    return Ok(token);
+                }
+                let gateway = super::radius_auth::Gateway::configured()?;
+                if gateway.url("/messages").as_str() != endpoint {
+                    return Ok(None);
+                }
+                gateway.access(std::time::Duration::from_secs(60)).await
+            }) as futures_util::future::BoxFuture<'static, Result<Option<String>>>
+        }) as TokenResolver
+    });
+    McpExtension::connect_with_provider_token(name, server, &args.workspace, resolver).await
 }
 
 pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
@@ -298,6 +337,12 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             let value = document.get("mcpServers").and_then(|servers| servers.get(&name))
                 .ok_or_else(|| Error::Config("MCP server is not configured in this scope; use --local for a project server".into()))?;
             let server: ServerConfig = serde_json::from_value(value.clone())?;
+            if let Some(auth) = &server.auth {
+                return Err(Error::Config(format!(
+                    "MCP {name} uses credentials from provider {}; sign in to that provider",
+                    auth.provider
+                )));
+            }
             let url = server
                 .url
                 .as_deref()
@@ -362,6 +407,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 let current: ServerConfig = serde_json::from_value(server.clone())?;
                 if current.url.as_deref() != Some(url)
                     || current.oauth != server_oauth
+                    || current.auth.is_some()
                     || current.command.is_some()
                     || current
                         .headers
@@ -387,6 +433,12 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     .ok_or_else(|| Error::Config("MCP server is not configured".into()))?
                     .clone(),
             )?;
+            if let Some(auth) = &server.auth {
+                return Err(Error::Config(format!(
+                    "MCP {name} uses credentials from provider {}; sign out of that provider",
+                    auth.provider
+                )));
+            }
             let url = server
                 .url
                 .as_deref()
