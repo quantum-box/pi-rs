@@ -6,23 +6,49 @@ pub struct Choice {
     pub model: String,
     pub thinking: Option<String>,
 }
-pub fn split(value: &str) -> Choice {
-    if let Some((model, thinking)) = value.rsplit_once(':')
+pub fn unqualified(value: &str) -> &str {
+    let value = value.trim();
+    value
+        .split_once('/')
+        .filter(|(provider, _)| provider.eq_ignore_ascii_case("ollama"))
+        .map_or(value, |(_, model)| model.trim())
+}
+
+pub fn split(value: &str, available: &[String]) -> Result<Choice> {
+    let named = unqualified(value);
+    if named.is_empty() {
+        return Err(Error::Config("model ID is required".into()));
+    }
+    if let Some(model) = available
+        .iter()
+        .find(|model| model.eq_ignore_ascii_case(named))
+        .or_else(|| {
+            available
+                .iter()
+                .find(|model| model.eq_ignore_ascii_case(value.trim()))
+        })
+    {
+        return Ok(Choice {
+            model: model.clone(),
+            thinking: None,
+        });
+    }
+    if let Some((model, thinking)) = named.rsplit_once(':')
         && !model.is_empty()
         && matches!(
             thinking,
             "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
         )
     {
-        return Choice {
+        return Ok(Choice {
             model: model.into(),
             thinking: Some(thinking.into()),
-        };
+        });
     }
-    Choice {
-        model: value.into(),
+    Ok(Choice {
+        model: named.into(),
         thinking: None,
-    }
+    })
 }
 pub fn scope(patterns: &str, available: &[String]) -> Result<Vec<Choice>> {
     let mut choices: Vec<Choice> = Vec::new();
@@ -32,7 +58,7 @@ pub fn scope(patterns: &str, available: &[String]) -> Result<Vec<Choice>> {
                 "model scope contains an empty pattern".into(),
             ));
         }
-        let choice = split(value);
+        let choice = split(value, available)?;
         let exact = available
             .iter()
             .find(|model| model.eq_ignore_ascii_case(&choice.model));
@@ -85,15 +111,45 @@ mod tests {
     use super::*;
     #[test]
     fn preserves_model_tags_and_extracts_only_known_thinking_levels() {
-        assert_eq!(split("qwen3.5:4b").model, "qwen3.5:4b");
+        assert_eq!(split("qwen3.5:4b", &[]).unwrap().model, "qwen3.5:4b");
         assert_eq!(
-            split("qwen3.5:4b:high"),
+            split("qwen3.5:4b:high", &[]).unwrap(),
             Choice {
                 model: "qwen3.5:4b".into(),
                 thinking: Some("high".into())
             }
         );
     }
+    #[test]
+    fn qualified_references_keep_exact_tags_and_unrelated_namespaces() {
+        let models = vec![
+            "org/qwen:high".into(),
+            "org/qwen:4b".into(),
+            "ollama/literal:low".into(),
+        ];
+        assert_eq!(
+            split("OLLAMA/org/qwen:high", &models).unwrap(),
+            Choice {
+                model: "org/qwen:high".into(),
+                thinking: None
+            }
+        );
+        assert_eq!(
+            split("ollama/org/qwen:4b:high", &models).unwrap(),
+            Choice {
+                model: "org/qwen:4b".into(),
+                thinking: Some("high".into())
+            }
+        );
+        assert_eq!(
+            split("ollama/literal:low", &models).unwrap().model,
+            "ollama/literal:low"
+        );
+        assert_eq!(split("other/qwen:4b", &[]).unwrap().model, "other/qwen:4b");
+        assert_eq!(scope("ollama/org/*:medium", &models).unwrap().len(), 2);
+        assert!(split("ollama/", &models).is_err());
+    }
+
     #[test]
     fn scopes_keep_pattern_order_deduplicate_and_filter_case_insensitively() {
         let models = vec!["alpha:4b".into(), "beta:8b".into(), "beta:4b".into()];

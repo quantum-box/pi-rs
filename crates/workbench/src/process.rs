@@ -38,6 +38,8 @@ impl Worker {
             .arg("--workspace")
             .arg(&args.workspace)
             .args([
+                "--provider",
+                args.provider.id(),
                 "--model",
                 &args.model,
                 "--endpoint",
@@ -234,7 +236,7 @@ fn configuration(args: &Cli) -> Value {
         .map(|token| format!("{:x}", Sha256::digest(token.as_bytes())));
     json!({
         "workspace":args.workspace,
-        "endpoint":args.endpoint,"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
+        "provider":args.provider.id(),"endpoint":args.endpoint,"token_fingerprint":token_fingerprint,"extensions":args.extensions,"disabled":args.disable_extension,
         "project":args.project,"skills":args.skill,"trusted":args.trusted,"orders":args.orders,
         "system_prompt":args.system_prompt,"append_system_prompt":args.append_system_prompt,"instruction":args.instruction,"commands":args.allow_commands,
         "tools":args.tools,"exclude_tools":args.exclude_tools,"no_tools":args.no_tools,"no_builtin_tools":args.no_builtin_tools,

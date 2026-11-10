@@ -380,7 +380,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         }
 
         "get_available_models" => Ok(Some(
-            json!({"models":available_models(args)?.iter().map(|model| model_value(model)).collect::<Vec<_>>()}),
+            json!({"models":available_models(args)?.iter().map(|model| model_value(args.provider, model)).collect::<Vec<_>>()}),
         )),
         "cycle_model" if !busy(worker) => {
             let available = available_models(args)?;
@@ -395,7 +395,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             args.apply_model_thinking_defaults();
             Session::open(&args.session)?.select_model(&args.model, args.thinking.as_deref())?;
             Ok(Some(
-                json!({"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
+                json!({"model":model_value(args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
             ))
         }
         "get_available_thinking_levels" => Ok(Some(json!({"levels":THINKING_LEVELS}))),
@@ -492,11 +492,12 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         "set_model" if !busy(worker) => {
             if request["provider"]
                 .as_str()
-                .is_some_and(|provider| provider != "ollama")
+                .is_some_and(|provider| !provider.eq_ignore_ascii_case(args.provider.id()))
             {
-                return Err(Error::Config(
-                    "this endpoint uses the ollama provider".into(),
-                ));
+                return Err(Error::Config(format!(
+                    "this endpoint uses the {} provider",
+                    args.provider.id()
+                )));
             }
             let model = request["modelId"]
                 .as_str()
@@ -505,7 +506,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             args.model = model.to_owned();
             args.apply_model_thinking_defaults();
             Session::open(&args.session)?.select_model(model, args.thinking.as_deref())?;
-            Ok(Some(model_value(model)))
+            Ok(Some(model_value(args.provider, model)))
         }
         "edit_context" if !busy(worker) => {
             let target = request["target"]
@@ -564,7 +565,7 @@ pub(super) fn snapshot_command(name: &str) -> bool {
 }
 
 fn state_flags(args: &Cli, worker: &Option<Worker>) -> Result<Value> {
-    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(&args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.bashing && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.busy && worker.bashing),"model":model_value(args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
     state["autoCompactionEnabled"] = json!(args.settings.auto_compaction_enabled());
     state["steeringMode"] = json!(
         worker
@@ -652,8 +653,8 @@ pub(super) fn snapshot_response(
 
 const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-fn model_value(model: &str) -> Value {
-    json!({"id":model,"name":model,"provider":"ollama"})
+fn model_value(provider: super::Provider, model: &str) -> Value {
+    json!({"id":model,"name":model,"provider":provider.id()})
 }
 
 fn available_models(args: &Cli) -> Result<Vec<String>> {
@@ -664,13 +665,14 @@ fn available_models(args: &Cli) -> Result<Vec<String>> {
             .map(|choice| choice.model.clone())
             .collect());
     }
+    let provider = args.provider;
     let endpoint = args.endpoint.clone();
     let token = args.model_token();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(pi_rs::ollama::Ollama::new(&endpoint, token)?.models())
+        runtime.block_on(provider.connect(&endpoint, token)?.models())
     })
     .join()
     .map_err(|_| Error::Config("model discovery worker stopped".into()))?

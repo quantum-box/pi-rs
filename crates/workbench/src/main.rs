@@ -110,6 +110,15 @@ struct Cli {
     /// Include full requests, tool payloads and streamed text in stdout JSONL.
     #[arg(long, global = true)]
     trace: bool,
+    /// Model provider used by this invocation.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "ollama",
+        ignore_case = true
+    )]
+    provider: Provider,
     /// Model served by the Ollama endpoint.
     #[arg(long, default_value = "qwen2.5:7b", global = true)]
     model: String,
@@ -280,6 +289,24 @@ impl Cli {
                         .map(str::to_owned)
                 })
                 .or_else(|| self.thinking.clone());
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Provider {
+    Ollama,
+}
+impl Provider {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+        }
+    }
+
+    fn connect(self, endpoint: &str, token: Option<String>) -> Result<pi_rs::ollama::Ollama> {
+        match self {
+            Self::Ollama => pi_rs::ollama::Ollama::new(endpoint, token),
         }
     }
 }
@@ -479,41 +506,48 @@ async fn execute(mut args: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let selected = model_selection::split(&args.model);
-    args.model = selected.model;
-    if !args.thinking_explicit && selected.thinking.is_some() {
-        args.thinking = selected.thinking;
-        args.thinking_explicit = true;
-    }
-    if args.list_models.is_some() || args.models.is_some() {
-        let available = pi_rs::ollama::Ollama::new(&args.endpoint, args.model_token())?
+    let available = if args.list_models.is_some() || args.models.is_some() {
+        args.provider
+            .connect(&args.endpoint, args.model_token())?
             .models()
-            .await?;
-        if let Some(search) = &args.list_models {
-            for model in available
-                .iter()
-                .filter(|model| model_selection::fuzzy(search, model))
-            {
-                if args.mode == Some(OutputMode::Json) {
-                    output(json!({"type":"model","model":model}));
-                } else {
-                    println!("{model}");
-                }
+            .await?
+    } else {
+        Vec::new()
+    };
+    if let Some(search) = &args.list_models {
+        let search = model_selection::unqualified(search);
+        for model in available
+            .iter()
+            .filter(|model| model_selection::fuzzy(search, model))
+        {
+            if args.mode == Some(OutputMode::Json) {
+                output(json!({"type":"model","model":model}));
+            } else {
+                println!("{model}");
             }
-            return Ok(());
         }
-        if let Some(patterns) = &args.models {
-            args.model_scope = model_selection::scope(patterns, &available)?;
-            if !args.model_explicit {
-                let choice = args
-                    .model_scope
-                    .iter()
-                    .find(|choice| choice.model == args.model)
-                    .unwrap_or(&args.model_scope[0]);
-                args.model = choice.model.clone();
-                if !args.thinking_explicit && choice.thinking.is_some() {
-                    args.thinking = choice.thinking.clone();
-                }
+        return Ok(());
+    }
+    // The hidden worker command receives an already-resolved, literal model ID.
+    if !matches!(args.command, Some(Command::Serve)) {
+        let selected = model_selection::split(&args.model, &available)?;
+        args.model = selected.model;
+        if !args.thinking_explicit && selected.thinking.is_some() {
+            args.thinking = selected.thinking;
+            args.thinking_explicit = true;
+        }
+    }
+    if let Some(patterns) = &args.models {
+        args.model_scope = model_selection::scope(patterns, &available)?;
+        if !args.model_explicit {
+            let choice = args
+                .model_scope
+                .iter()
+                .find(|choice| choice.model == args.model)
+                .unwrap_or(&args.model_scope[0]);
+            args.model = choice.model.clone();
+            if !args.thinking_explicit && choice.thinking.is_some() {
+                args.thinking = choice.thinking.clone();
             }
         }
     }

@@ -1287,7 +1287,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         "/share" => view.append(&sessions::share_gist(&Session::open(&args.session)?)?),
         "/model" if rest.is_empty() => start_model_picker(args, view),
         "/model" => {
-            let selected = super::model_selection::split(rest);
+            let selected = super::model_selection::split(rest, &view.available_models)?;
             args.model = selected.model;
             if selected.thinking.is_some() {
                 args.thinking = selected.thinking;
@@ -2355,6 +2355,7 @@ fn start_model_picker(args: &Cli, view: &mut View) {
         return;
     }
     let scope = args.model_scope.clone();
+    let provider = args.provider;
     let endpoint = args.endpoint.clone();
     let token = args.model_token();
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -2363,7 +2364,7 @@ fn start_model_picker(args: &Cli, view: &mut View) {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let provider = pi_rs::ollama::Ollama::new(&endpoint, token)?;
+            let provider = provider.connect(&endpoint, token)?;
             if scope.is_empty() {
                 runtime.block_on(provider.models())
             } else {

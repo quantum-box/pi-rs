@@ -1775,3 +1775,20 @@ verifies tool filtering, resource discovery, approval and the literal prompt
 delivered to a loopback model.
 
 Workspace tests and all-target Clippy pass.
+
+### Qualified Ollama model selection checkpoint
+
+`--provider ollama` selects the existing Ollama adapter and validates the
+provider name. The provider travels through runtime creation, discovery, the
+RPC model response and worker startup. Model references accept the
+`ollama/` qualifier in CLI selection, model scopes, listing filters and the
+terminal model command. Other namespaces remain part of the model ID.
+
+An available catalog gives literal model tags priority over thinking suffixes.
+Direct startup without a catalog uses the existing suffix syntax and makes no
+discovery request. Resolved IDs are passed literally to the hidden worker, so
+a tag or namespace is interpreted only once.
+
+CLI and RPC loopback checks cover provider validation, qualified discovery,
+thinking suffixes, and literal tagged IDs through a worker. Workspace tests
+and all-target Clippy pass.
