@@ -189,6 +189,13 @@ struct ModelDiscovery {
     intent: ModelListIntent,
 }
 
+struct ShareTask {
+    status: &'static str,
+    started: Instant,
+    receiver: std::sync::mpsc::Receiver<Result<sessions::SharedSession>>,
+    _cancel: tokio::sync::oneshot::Sender<()>,
+}
+
 #[derive(Default)]
 struct View {
     regular: RegularState,
@@ -205,6 +212,7 @@ struct View {
     session_name: Option<String>,
     resources: super::resources::Resources,
     model_list: Option<ModelDiscovery>,
+    share: Option<ShareTask>,
     available_models: Vec<String>,
     pending_request: Option<Value>,
     thinking: String,
@@ -325,7 +333,13 @@ impl View {
     }
 
     fn draft_status(&self) -> String {
-        if self.clipboard.is_some() {
+        if let Some(share) = &self.share {
+            format!(
+                "{} {:.1}s · Esc cancels · ",
+                share.status,
+                share.started.elapsed().as_secs_f32()
+            )
+        } else if self.clipboard.is_some() {
             "Reading clipboard · ".into()
         } else if !self.draft_images.is_empty() {
             format!("{} image(s) attached · ", self.draft_images.len())
@@ -1327,7 +1341,46 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             sessions::copy_last(&Session::open(&args.session)?)?;
             view.append("Copied last response");
         }
-        "/share" => view.append(&sessions::share_gist(&Session::open(&args.session)?)?),
+        "/share" => {
+            let destination = sessions::ShareDestination::configured(&args.settings)?;
+            let status = destination.status();
+            let path = args.session.clone();
+            let workspace = args.workspace.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let (cancel, cancelled) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(async {
+                        tokio::select! {
+                            biased;
+                            _ = cancelled => Ok(None),
+                            result = async {
+                                let session = Session::snapshot(path)?;
+                                destination.share(session, &workspace).await
+                            } => result.map(Some),
+                        }
+                    })
+                })();
+                match result {
+                    Ok(Some(shared)) => {
+                        let _ = sender.send(Ok(shared));
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                    }
+                    Ok(None) => {}
+                }
+            });
+            view.share = Some(ShareTask {
+                status,
+                started: Instant::now(),
+                receiver,
+                _cancel: cancel,
+            });
+        }
         "/model" if rest.is_empty() => {
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Select);
@@ -1932,9 +1985,33 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
         }
+        if let Some(share) = &view.share {
+            match share.receiver.try_recv() {
+                Ok(result) => {
+                    view.share = None;
+                    match result {
+                        Ok(shared) => {
+                            view.append(&format!("Share URL: {}", shared.url));
+                            if let Some(gist) = shared.gist {
+                                view.append(&format!("Gist: {gist}"));
+                            }
+                        }
+                        Err(error) => view.append(&error.to_string()),
+                    }
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    view.share = None;
+                    view.append("Share stopped");
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         dirty |= view.poll_clipboard();
         if (dirty && last_frame.elapsed() >= frame_interval)
-            || (is_busy(&worker) && last_frame.elapsed() >= Duration::from_millis(100))
+            || ((is_busy(&worker) || view.share.is_some())
+                && last_frame.elapsed() >= Duration::from_millis(100))
         {
             view.draw(&args, &theme, is_busy(&worker))?;
             dirty = false;
@@ -1987,6 +2064,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 dirty = true;
             }
             Event::Paste(text) => {
+                if view.share.is_some() {
+                    continue;
+                }
                 last_idle_interrupt = None;
                 if let Some((_, dialog)) = view.local_editor.as_mut() {
                     dialog.paste(&text);
@@ -1999,6 +2079,13 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
+                if view.share.is_some() {
+                    if keys.action(key, true) == Some("app.interrupt") {
+                        view.share = None;
+                        view.append("Share cancelled");
+                    }
+                    continue;
+                }
                 if let Some((editor, mut dialog)) = view.local_editor.take() {
                     match dialog.input(key, &keys) {
                         Some(pi_rs::UiResponse::Text(text)) => {
@@ -2451,6 +2538,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 "followUpMode",
                                 "tuiMode",
                                 "sessionDir",
+                                "sessionShareDestination",
                                 "defaultProjectTrust",
                                 "defaultTools",
                                 "extensions",

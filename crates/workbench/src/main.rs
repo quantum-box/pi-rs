@@ -1053,8 +1053,11 @@ async fn execute(mut args: Cli) -> Result<()> {
             return Ok(());
         }
         Command::Share => {
-            let url = sessions::share_gist(&session)?;
-            output(json!({"type":"shared","url":url}));
+            let destination = sessions::ShareDestination::configured(&args.settings)?;
+            let shared = destination.share(session, &args.workspace).await?;
+            let mut event = serde_json::to_value(shared)?;
+            event["type"] = json!("shared");
+            output(event);
             return Ok(());
         }
         Command::ContextEdit {

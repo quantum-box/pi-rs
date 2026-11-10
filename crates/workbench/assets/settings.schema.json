@@ -3,6 +3,7 @@
   "title": "Native Pi settings",
   "type": "object",
   "properties": {
+    "sessionShareDestination": { "enum": ["auto", "radius", "gist"] },
     "retry": {
       "type": "object",
       "properties": {

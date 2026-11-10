@@ -53,6 +53,45 @@ impl Entries {
         Ok(result)
     }
 
+    pub(super) fn write_share_branch(
+        self,
+        session: &Session,
+        cwd: &std::path::Path,
+    ) -> Result<Vec<u8>> {
+        let by_id: HashMap<_, _> = self
+            .values
+            .iter()
+            .map(|entry| (entry["id"].as_str().expect("entry has id"), entry))
+            .collect();
+        let mut branch = Vec::new();
+        let mut id = self.leaf.as_deref();
+        while let Some(entry) = id.and_then(|id| by_id.get(id)) {
+            if entry["customType"] != "pi-rs:extension-states" {
+                branch.push(*entry);
+            }
+            id = entry["parentId"].as_str();
+        }
+        let header = json!({
+            "type":"session", "version":3, "id":session.session_id(),
+            "timestamp":session.records().first().and_then(|record| record.timestamp.as_deref()).unwrap_or(UNKNOWN_TIMESTAMP),
+            "cwd":session.working_directory().map_or_else(|| cwd.to_string_lossy().into_owned(), str::to_owned)
+        });
+        let mut body = serde_json::to_vec(&header)?;
+        body.push(b'\n');
+        let mut parent = Value::Null;
+        for entry in branch.into_iter().rev() {
+            let mut entry = entry.clone();
+            entry["parentId"] = parent;
+            serde_json::to_writer(&mut body, &entry)?;
+            body.push(b'\n');
+            if body.len() > 128 * 1024 * 1024 {
+                return Err(Error::Config("session share exceeds 128 MiB".into()));
+            }
+            parent = entry["id"].clone();
+        }
+        Ok(body)
+    }
+
     pub(super) fn tree(self) -> Value {
         let mut labels = HashMap::new();
         for entry in &self.values {
@@ -483,5 +522,17 @@ mod tests {
             &session.records()[editable_record(&session, target) as usize - 1].event,
             Event::User { content, .. } if content == "second branch"
         ));
+        let share = Entries::new(&session)
+            .write_share_branch(&session, std::path::Path::new("."))
+            .unwrap();
+        let share: Vec<Value> = share
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(share[0]["type"], "session");
+        assert_eq!(share[0]["version"], 3);
+        assert_eq!(share[1], entries[0]);
+        assert_eq!(share[2..], entries[2..]);
     }
 }

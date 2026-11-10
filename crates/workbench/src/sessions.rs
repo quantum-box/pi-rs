@@ -448,25 +448,178 @@ pub fn copy_text(text: &str) -> Result<()> {
     Err(Error::Config("no working clipboard command found".into()))
 }
 
-pub fn share_gist(session: &Session) -> Result<String> {
-    let directory = tempfile::tempdir()?;
-    let file = directory.path().join("session.html");
-    export(session, &file)?;
-    let output = Command::new("gh")
-        .args([
-            "gist",
-            "create",
-            "--desc",
-            session.name().unwrap_or("Pi session"),
-        ])
-        .arg(&file)
-        .output()?;
+pub(super) enum ShareDestination {
+    Radius {
+        endpoint: reqwest::Url,
+        token: String,
+    },
+    Gist,
+}
+
+#[derive(Serialize)]
+pub(super) struct SharedSession {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gist: Option<String>,
+}
+
+impl ShareDestination {
+    pub(super) fn configured(settings: &super::config::Settings) -> Result<Self> {
+        let destination = settings.string("sessionShareDestination").unwrap_or("auto");
+        if destination == "gist" {
+            return Ok(Self::Gist);
+        }
+        let Some(token) = std::env::var("RADIUS_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+        else {
+            return if destination == "radius" {
+                Err(Error::Config(
+                    "Radius authentication is not configured. Set RADIUS_API_KEY.".into(),
+                ))
+            } else {
+                Ok(Self::Gist)
+            };
+        };
+        let endpoint = share_url(
+            &std::env::var("PI_RS_RADIUS_SHARE_URL")
+                .unwrap_or_else(|_| "https://radius.pi.dev/v1/artifacts".into()),
+        )?;
+        if endpoint.query().is_some() || endpoint.fragment().is_some() {
+            return Err(Error::Config(
+                "Radius share endpoint cannot include a query or fragment".into(),
+            ));
+        }
+        Ok(Self::Radius { endpoint, token })
+    }
+
+    pub(super) fn status(&self) -> &'static str {
+        match self {
+            Self::Radius { .. } => "Uploading to Radius",
+            Self::Gist => "Creating gist",
+        }
+    }
+
+    pub(super) async fn share(self, session: Session, workspace: &Path) -> Result<SharedSession> {
+        match self {
+            Self::Radius {
+                mut endpoint,
+                token,
+            } => {
+                let body = super::rpc_entries::Entries::new(&session)
+                    .write_share_branch(&session, workspace)?;
+                drop(session);
+                endpoint
+                    .query_pairs_mut()
+                    .append_pair("visibility", "organization")
+                    .append_pair("title", "Pi session");
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(std::time::Duration::from_secs(120))
+                    .build()
+                    .map_err(|_| {
+                        Error::Config("Could not initialize the Radius share client".into())
+                    })?;
+                let mut response = client
+                    .post(endpoint)
+                    .bearer_auth(token)
+                    .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|_| Error::Config("Could not upload the session to Radius".into()))?;
+                if !response.status().is_success() {
+                    return Err(Error::Config(format!(
+                        "Radius upload failed ({})",
+                        response.status()
+                    )));
+                }
+                let mut body = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| Error::Config("Could not read the Radius share response".into()))?
+                {
+                    if body.len() + chunk.len() > 64 * 1024 {
+                        return Err(Error::Config("Radius share response exceeds 64 KiB".into()));
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                let body: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+                    Error::Config("Radius returned an invalid share response".into())
+                })?;
+                let url = body["artifact"]["canonical_url"]
+                    .as_str()
+                    .ok_or_else(|| Error::Config("Radius did not return a share URL".into()))?;
+                Ok(SharedSession {
+                    url: share_url(url)?.into(),
+                    gist: None,
+                })
+            }
+            Self::Gist => {
+                let directory = tempfile::tempdir()?;
+                let file = directory.path().join("session.html");
+                export(&session, &file)?;
+                let name = session.name().unwrap_or("Pi session").to_owned();
+                drop(session);
+                share_gist(&file, &name).await
+            }
+        }
+    }
+}
+
+fn share_url(value: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| Error::Config("Invalid session share URL".into()))?;
+    let loopback = url
+        .host_str()
+        .and_then(|host| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .is_some_and(|ip| ip.is_loopback());
+    if url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+    {
+        return Err(Error::Config(
+            "Session share URL must use HTTPS or a loopback HTTP address".into(),
+        ));
+    }
+    Ok(url)
+}
+
+async fn share_gist(file: &Path, name: &str) -> Result<SharedSession> {
+    let mut viewer = share_url(
+        &std::env::var("PI_SHARE_VIEWER_URL").unwrap_or_else(|_| "https://pi.dev/session/".into()),
+    )?;
+    let output = tokio::process::Command::new("gh")
+        .args(["gist", "create", "--public=false", "--desc", name])
+        .arg(file)
+        .stdin(Stdio::null())
+        .env("GH_PROMPT_DISABLED", "1")
+        .kill_on_drop(true)
+        .output()
+        .await?;
     if !output.status.success() {
         return Err(Error::Config(
             String::from_utf8_lossy(&output.stderr).trim().into(),
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+    let gist = share_url(String::from_utf8_lossy(&output.stdout).trim())?;
+    let id = gist
+        .path_segments()
+        .and_then(Iterator::last)
+        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| Error::Config("GitHub CLI did not return a gist ID".into()))?;
+    viewer.set_fragment(Some(id));
+    Ok(SharedSession {
+        url: viewer.into(),
+        gist: Some(gist.into()),
+    })
 }
 
 #[cfg(test)]

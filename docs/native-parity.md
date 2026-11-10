@@ -17,7 +17,7 @@ remaining acceptance work for that surface.
 | Terminal | Default `pi` startup, Unicode multiline editor and kill ring, text/image clipboard paste, scrolling, prompt history, Markdown, aligned tables, links and syntax highlighting, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and clipped-image behavior |
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, bash, Windows PowerShell selection, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
-| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, GitHub gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius sharing |
+| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint, native Anthropic Messages and Google Gemini Generate Content, named profiles for those APIs, API keys and bearer tokens, searchable catalog, model declarations and overrides, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage | Model-provider OAuth and credential refresh |
 | Native extensions | Rust tool, prompt input, context, policy, command, state/migration and compaction hooks; standard notes/TODO/plan/review; separately built executable loading, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access and positioned widgets | Input hooks for queued SDK controls, remaining Pi events and custom terminal components |
@@ -2172,3 +2172,18 @@ the model picker and replaces its worker when the profile changes.
 Loopback checks exercised native and custom authentication headers, model
 override order, endpoint isolation, redacted errors and a live terminal
 worker reload.
+
+### Session sharing destinations
+
+`/share` and `pi share` honor `sessionShareDestination`. The default
+`auto` uses Radius when a Radius API key is available and otherwise
+creates a secret Gist. Explicit `radius` requires a Radius credential,
+and a failed upload never sends the session to the other destination.
+Radius receives the current branch as Pi v3 JSONL with organization
+visibility. Gist returns both the Pi viewer link and the Gist URL. The
+terminal shows upload progress and accepts Escape to cancel.
+
+This checkpoint authenticates Radius using `RADIUS_API_KEY`. The
+`PI_RS_RADIUS_SHARE_URL` environment override can point to a configured
+artifact endpoint. Native journals do not yet record the complete
+system prompt and tool schemas for the viewer's `pi.share` metadata.
