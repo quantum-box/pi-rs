@@ -1,10 +1,11 @@
-//! Apply the workbench's image policy to the final outbound model context.
-use pi_rs::{Message, Model, ModelRequest, ModelStream, Result};
+//! Apply workbench request policy and catalog usage estimates.
+use futures_util::StreamExt;
+use pi_rs::{Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::providers::Client;
+use super::{model_profiles::ChatPrice, providers::Client};
 
 pub(super) const BLOCKED_IMAGE: &str = "Image reading is disabled.";
 
@@ -12,6 +13,7 @@ pub(super) struct WorkbenchModel {
     pub client: Client,
     pub block_images: bool,
     pub session_affinity: &'static [&'static str],
+    pub price: Option<ChatPrice>,
 }
 
 #[async_trait::async_trait]
@@ -21,7 +23,8 @@ impl Model for WorkbenchModel {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
-        self.client.stream(self.filtered(request)).await
+        let stream = self.client.stream(self.filtered(request)).await?;
+        Ok(self.estimate_usage(stream))
     }
 
     async fn stream_in_session(
@@ -37,13 +40,38 @@ impl Model for WorkbenchModel {
                 headers.insert(name, value.clone());
             }
         }
-        self.client
+        let stream = self
+            .client
             .stream_with_headers(self.filtered(request), &headers)
-            .await
+            .await?;
+        Ok(self.estimate_usage(stream))
     }
 }
 
 impl WorkbenchModel {
+    fn estimate_usage(&self, mut stream: ModelStream) -> ModelStream {
+        let Some(price) = self.price else {
+            return stream;
+        };
+        Box::pin(async_stream::try_stream! {
+            let mut metadata = ModelMetadata::default();
+            while let Some(event) = stream.next().await {
+                let event = event?;
+                if let ModelEvent::Metadata(current) = &event {
+                    metadata.clone_from(current);
+                }
+                if let ModelEvent::Complete { usage: Some(usage), .. } = &event
+                    && metadata.cost_usd.is_none()
+                    && let Some(cost) = price.estimate(*usage, &metadata)
+                {
+                    metadata.cost_usd = Some(cost);
+                    yield ModelEvent::Metadata(metadata.clone());
+                }
+                yield event;
+            }
+        })
+    }
+
     fn filtered(&self, mut request: ModelRequest) -> ModelRequest {
         if self.block_images {
             remove_images(&mut request.messages);

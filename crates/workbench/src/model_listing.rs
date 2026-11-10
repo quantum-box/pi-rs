@@ -42,13 +42,18 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         for model in models {
             let detail = details.remove(&model);
             if args.mode == Some(OutputMode::Json) {
-                output(with_details(
-                    json!({
-                        "type":"model", "model":model, "name":catalog.display_name(&model),
-                        "provider":provider,
-                    }),
-                    detail.as_ref(),
-                ));
+                let mut row = json!({
+                    "type":"model", "model":model, "name":catalog.display_name(&model),
+                    "provider":provider,
+                });
+                if let Some(cost) = args
+                    .model_profiles
+                    .model(&catalog.provider, &model)
+                    .and_then(|model| model.cost)
+                {
+                    row["cost"] = cost.value();
+                }
+                output(with_details(row, detail.as_ref()));
             } else {
                 rows.push(table_row(provider, model, detail.as_ref()));
             }

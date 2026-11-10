@@ -790,8 +790,11 @@ fn model_value(args: &Cli, provider: &super::Provider, model: &str) -> Value {
         .and_then(|metadata| metadata.name.as_deref())
         .unwrap_or(model);
     let adapter = args.model_profiles.model_adapter(provider, model);
-    let value = json!({"id":model,"name":name,"provider":provider.id(),"api":adapter.api()});
+    let mut value = json!({"id":model,"name":name,"provider":provider.id(),"api":adapter.api()});
     if let Some(configured) = configured {
+        if let Some(cost) = configured.cost {
+            value["cost"] = cost.value();
+        }
         let mut details = pi_rs::ollama::ModelDetails::default();
         configured.apply(adapter, &mut details);
         super::model_listing::with_details(value, Some(&details))

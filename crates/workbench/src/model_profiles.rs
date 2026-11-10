@@ -175,6 +175,67 @@ impl ModelCompatibility {
     }
 }
 
+/// Model prices in dollars per million tokens.
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChatPrice {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+}
+
+impl ChatPrice {
+    fn overlay(self, newer: Self) -> Self {
+        Self {
+            input: newer.input.or(self.input),
+            output: newer.output.or(self.output),
+            cache_read: newer.cache_read.or(self.cache_read),
+            cache_write: newer.cache_write.or(self.cache_write),
+        }
+    }
+
+    fn valid(self) -> bool {
+        [self.input, self.output, self.cache_read, self.cache_write]
+            .into_iter()
+            .flatten()
+            .all(|amount| amount.is_finite() && amount >= 0.0)
+    }
+
+    pub fn value(self) -> Value {
+        serde_json::json!({
+            "input": self.input.unwrap_or_default(),
+            "output": self.output.unwrap_or_default(),
+            "cacheRead": self.cache_read.unwrap_or_default(),
+            "cacheWrite": self.cache_write.unwrap_or_default(),
+        })
+    }
+
+    pub fn estimate(
+        self,
+        usage: pi_rs::Usage,
+        metadata: &pi_rs::ModelMetadata,
+    ) -> Option<serde_json::Number> {
+        let reads = metadata
+            .cached_input_tokens
+            .unwrap_or_default()
+            .min(usage.input_tokens);
+        let other_input = usage.input_tokens - reads;
+        let writes = metadata
+            .cache_creation_input_tokens
+            .unwrap_or_default()
+            .min(other_input);
+        let input = other_input - writes;
+        serde_json::Number::from_f64(
+            (input as f64 * self.input.unwrap_or_default()
+                + usage.output_tokens as f64 * self.output.unwrap_or_default()
+                + reads as f64 * self.cache_read.unwrap_or_default()
+                + writes as f64 * self.cache_write.unwrap_or_default())
+                / 1_000_000.0,
+        )
+    }
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ModelMetadata {
@@ -182,6 +243,7 @@ pub(super) struct ModelMetadata {
     pub context_window: Option<u32>,
     pub max_tokens: Option<u32>,
     pub reasoning: Option<bool>,
+    pub cost: Option<ChatPrice>,
     #[serde(default)]
     compat: ModelCompatibility,
     input: Option<Vec<Modality>>,
@@ -229,6 +291,10 @@ impl ModelMetadata {
             context_window: overrides.context_window.or(self.context_window),
             max_tokens: overrides.max_tokens.or(self.max_tokens),
             reasoning: overrides.reasoning.or(self.reasoning),
+            cost: match (self.cost, overrides.cost) {
+                (Some(base), Some(newer)) => Some(base.overlay(newer)),
+                (base, newer) => newer.or(base),
+            },
             input: overrides.input.clone().or(self.input),
             ..self
         }
@@ -242,6 +308,7 @@ impl ModelMetadata {
                 .is_some_and(|name| name.trim().is_empty())
             || self.context_window == Some(0)
             || self.max_tokens == Some(0)
+            || self.cost.is_some_and(|cost| !cost.valid())
         {
             return Err(Error::Config(format!(
                 "invalid model metadata for {}/{id}",
