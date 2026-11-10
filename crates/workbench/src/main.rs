@@ -1713,8 +1713,16 @@ fn metadata(record: &pi_rs::Record) -> Value {
             metadata.reasoning = None;
             json!({"event": "model_finished", "request_id": request_id, "metadata": metadata, "usage": usage, "failure": failure})
         }
-        Event::CacheWarm { metadata, usage } => {
-            json!({"event":"cache_warm","metadata":metadata,"usage":usage})
+        Event::CacheWarm {
+            metadata,
+            usage,
+            note,
+        } => {
+            let mut value = json!({"event":"cache_warm","metadata":metadata,"usage":usage});
+            if let Some(note) = note {
+                value["note"] = json!(note);
+            }
+            value
         }
         Event::TurnFinished { assistant_record } => {
             json!({"event": "turn_finished", "assistant_record": assistant_record})

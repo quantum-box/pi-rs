@@ -78,6 +78,7 @@ pub enum AgentInput {
         request_id: Uuid,
         metadata: Box<ModelMetadata>,
         usage: Usage,
+        note: Option<String>,
     },
     Enqueue {
         message: QueuedMessage,

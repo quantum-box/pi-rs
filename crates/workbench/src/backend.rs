@@ -411,7 +411,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             args.record_model_selection(session)?;
             initialize_queue_modes(session, &args)?;
             snapshot.lock().expect("session snapshot").refresh(session);
-            cache_capture.initialize(session);
+            cache_capture.initialize(session, &runtime.registry);
             let agent = runtime.agent(&args, session.session_id());
             let mut observer = |event: pi_rs::Notification<'_>| {
                 cache_capture.observe(&event);

@@ -235,15 +235,23 @@ impl Cursor {
                     None
                 }
             }
-            Event::CacheWarm { metadata, usage } => {
+            Event::CacheWarm {
+                metadata,
+                usage,
+                note,
+            } => {
                 let identity = metadata.resolved_model.as_ref();
-                Some(json!({
+                let mut entry = json!({
                     "type":"usage",
                     "kind":"cache_warm",
                     "provider":identity.map(|id| id.provider.as_str()).unwrap_or_default(),
                     "model":identity.map(|id| id.model.as_str()).unwrap_or_default(),
                     "usage":super::rpc_events::usage_value(*usage, metadata)
-                }))
+                });
+                if let Some(note) = note {
+                    entry["note"] = json!(note);
+                }
+                Some(entry)
             }
             // An imported source entry already includes the visible representation.
             _ if parent

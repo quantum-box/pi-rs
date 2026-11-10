@@ -11,6 +11,34 @@ use crate::{
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheWarmingAction {
+    Warm,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheWarmingPhase {
+    Streaming,
+    Idle,
+}
+
+/// The default cache refresh decision and the inputs visible to native extensions.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheWarmingDecision {
+    pub session_id: Uuid,
+    pub model: crate::ResolvedModelIdentity,
+    pub phase: CacheWarmingPhase,
+    pub prompt_tokens: u64,
+    pub warm_cost: f64,
+    pub miss_cost: f64,
+    pub continuation_probability: f64,
+    pub action: CacheWarmingAction,
+}
+
 /// A native extension's command-line option and its default value.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtensionFlag {
@@ -263,6 +291,18 @@ pub trait Extension: Send + Sync {
         Ok(())
     }
 
+    fn handles_cache_warming(&self) -> bool {
+        false
+    }
+
+    async fn cache_warming_decision(
+        &self,
+        _event: &CacheWarmingDecision,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<CacheWarmingAction>> {
+        Ok(None)
+    }
+
     /// Release long-lived clients and subprocesses owned by this extension.
     async fn shutdown(&self) -> ExtensionResult<()> {
         Ok(())
@@ -366,6 +406,37 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub fn has_cache_warming_hooks(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.handles_cache_warming())
+    }
+
+    /// Each handler sees the original decision. The last override takes effect.
+    pub async fn cache_warming_decision(
+        &self,
+        event: &CacheWarmingDecision,
+        states: &ExtensionStates,
+        mut on_error: impl FnMut(&str, &str),
+    ) -> CacheWarmingAction {
+        let mut action = event.action;
+        for extension in self
+            .extensions
+            .iter()
+            .filter(|extension| extension.handles_cache_warming())
+        {
+            match extension
+                .cache_warming_decision(event, states.get(extension.id()))
+                .await
+            {
+                Ok(Some(override_action)) => action = override_action,
+                Ok(None) => {}
+                Err(message) => on_error(extension.id(), &message),
+            }
+        }
+        action
+    }
+
     pub fn has_input_hooks(&self) -> bool {
         self.extensions
             .iter()

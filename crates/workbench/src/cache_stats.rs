@@ -115,7 +115,11 @@ impl Tracker {
             {
                 return self.imported_warm(entry, record.timestamp_millis());
             }
-            Event::CacheWarm { metadata, usage } => {
+            Event::CacheWarm {
+                metadata,
+                usage,
+                note,
+            } => {
                 return self.warmed(
                     Previous {
                         identity: metadata.resolved_model.clone(),
@@ -127,7 +131,7 @@ impl Tracker {
                         .cost_usd
                         .as_ref()
                         .and_then(serde_json::Number::as_f64),
-                    None,
+                    note.as_deref(),
                 );
             }
             Event::ModelSelected { provider, .. } => self.selected_provider = provider.clone(),

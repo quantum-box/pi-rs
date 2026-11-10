@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use futures_util::{StreamExt, task::AtomicWaker};
 use pi_rs::{
-    AgentInput, CacheRetention, Event, Model, ModelEvent, ModelMetadata, ModelRequest,
-    Notification, ResolvedModelIdentity, Session, Usage, UsageReport,
+    AgentInput, CacheRetention, CacheWarmingAction, CacheWarmingDecision, CacheWarmingPhase, Event,
+    Model, ModelEvent, ModelMetadata, ModelRequest, Notification, Registry, ResolvedModelIdentity,
+    Session, Usage, UsageReport,
 };
-use tokio::time::{Instant, sleep_until, timeout};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use uuid::Uuid;
 
 use super::{
@@ -102,6 +103,7 @@ pub(super) struct Capture<'a> {
     controller: Controller,
     policy: Option<Arc<Policy>>,
     model: Option<Arc<WorkbenchModel>>,
+    registry: Option<Arc<Registry>>,
     session: Option<Uuid>,
     request_id: Option<Uuid>,
     context: Option<Arc<Mutex<Context>>>,
@@ -114,7 +116,7 @@ struct Policy {
     delay: Duration,
     late_margin: Duration,
     retention: CacheRetention,
-    price: ChatPrice,
+    price: Option<ChatPrice>,
 }
 
 impl Policy {
@@ -151,11 +153,12 @@ impl Policy {
             delay: Duration::from_secs_f64(delay),
             late_margin: Duration::from_secs_f64((ttl - delay) / 2.0),
             retention,
-            price: model.cost?,
+            price: model.cost,
         })
     }
 
-    fn economical(&self, input_tokens: u64, scope: Scope) -> bool {
+    fn economics(&self, input_tokens: u64) -> Option<(f64, f64)> {
+        let price = self.price.as_ref()?;
         let usage = Usage {
             input_tokens,
             output_tokens: 0,
@@ -170,30 +173,23 @@ impl Policy {
             ..Default::default()
         };
         let total = |usage: Usage, metadata: &ModelMetadata| {
-            self.price
+            price
                 .estimate(usage, metadata)
                 .and_then(|price| price.total())
                 .and_then(|total| total.as_f64())
         };
-        let Some(hit_cost) = total(usage, &hit) else {
-            return false;
-        };
-        let Some(miss_cost) = total(usage, &written)
+        let hit_cost = total(usage, &hit)?;
+        let miss_cost = total(usage, &written)
             .filter(|cost| *cost > 0.0)
-            .or_else(|| total(usage, &ModelMetadata::default()))
-        else {
-            return false;
-        };
-        let Some(warm_cost) = total(
+            .or_else(|| total(usage, &ModelMetadata::default()))?;
+        let warm_cost = total(
             Usage {
                 output_tokens: 1,
                 ..usage
             },
             &hit,
-        ) else {
-            return false;
-        };
-        scope.probability() * (miss_cost - hit_cost).max(0.0) - warm_cost >= MINIMUM_SAVINGS_USD
+        )?;
+        Some((warm_cost, (miss_cost - hit_cost).max(0.0)))
     }
 }
 
@@ -210,6 +206,7 @@ impl<'a> Capture<'a> {
             controller,
             policy,
             model,
+            registry: None,
             session: None,
             request_id: None,
             context: None,
@@ -219,10 +216,13 @@ impl<'a> Capture<'a> {
         }
     }
 
-    pub fn initialize(&mut self, session: &Session) {
+    pub fn initialize(&mut self, session: &Session, registry: &Registry) {
         if self.model.is_none() {
             return;
         }
+        self.registry = registry
+            .has_cache_warming_hooks()
+            .then(|| Arc::new(registry.clone()));
         self.session = Some(session.session_id());
         self.prompt_tokens = session
             .branch()
@@ -323,6 +323,7 @@ impl<'a> Capture<'a> {
             },
             request,
             model: model.clone(),
+            registry: self.registry.clone(),
             policy: policy.clone(),
             context,
             timeout: Duration::from_secs(self.args.model_timeout_secs),
@@ -423,6 +424,7 @@ struct Candidate {
     identity: ResolvedModelIdentity,
     request: ModelRequest,
     model: Arc<WorkbenchModel>,
+    registry: Option<Arc<Registry>>,
     policy: Arc<Policy>,
     context: Arc<Mutex<Context>>,
     timeout: Duration,
@@ -433,20 +435,52 @@ impl Candidate {
         self.context.lock().expect("cache context").next = next;
         Box::pin(async move {
             sleep_until(next).await;
-            let (scope, prompt_tokens, started) = {
-                let context = self.context.lock().expect("cache context");
-                (context.scope, context.prompt_tokens, context.started)
+            let (scope, prompt_tokens, deadline, snapshot) = self.current_snapshot(next)?;
+            let states = self.registry.as_ref().map(|_| snapshot.extension_states());
+            drop(snapshot);
+            let (warm_cost, miss_cost) = self.policy.economics(prompt_tokens).unwrap_or_default();
+            let probability = scope.probability();
+            let suggested = if probability * miss_cost - warm_cost >= MINIMUM_SAVINGS_USD {
+                CacheWarmingAction::Warm
+            } else {
+                CacheWarmingAction::Stop
             };
-            let deadline = (next + self.policy.late_margin).min(started + scope.max_age());
-            if next > deadline
-                || Instant::now() > deadline
-                || !self.policy.economical(prompt_tokens, scope)
-                || !Mode::load(&self.workspace).is_some_and(|mode| scope.allowed(mode))
-                || !Session::snapshot(&self.path)
-                    .is_ok_and(|session| scope.current(&session, self.session))
-            {
+            let action = if let (Some(registry), Some(states)) = (&self.registry, states) {
+                let event = CacheWarmingDecision {
+                    session_id: self.session,
+                    model: self.identity.clone(),
+                    phase: match scope {
+                        Scope::Streaming(_) => CacheWarmingPhase::Streaming,
+                        Scope::Idle(_) => CacheWarmingPhase::Idle,
+                    },
+                    prompt_tokens,
+                    warm_cost,
+                    miss_cost,
+                    continuation_probability: probability,
+                    action: suggested,
+                };
+                timeout_at(
+                    deadline,
+                    registry.cache_warming_decision(&event, &states, |extension, message| {
+                        super::output(serde_json::json!({
+                            "type": "extension_error", "extension": extension,
+                            "event": "cache_warming_decision", "message": message
+                        }));
+                    }),
+                )
+                .await
+                .ok()?
+            } else {
+                suggested
+            };
+            if action == CacheWarmingAction::Stop {
                 return None;
             }
+            let deadline = if self.registry.is_some() {
+                self.current_snapshot(next)?.2
+            } else {
+                deadline
+            };
             let now = Instant::now();
             if now > deadline {
                 return None;
@@ -457,8 +491,27 @@ impl Candidate {
                 usage,
                 metadata,
                 requested_at: now,
+                note: (action != suggested).then(|| "extension override".to_owned()),
             })
         })
+    }
+
+    fn current_snapshot(&self, next: Instant) -> Option<(Scope, u64, Instant, Session)> {
+        let (scope, prompt_tokens, started) = {
+            let context = self.context.lock().expect("cache context");
+            (context.scope, context.prompt_tokens, context.started)
+        };
+        let deadline = (next + self.policy.late_margin).min(started + scope.max_age());
+        if next > deadline
+            || Instant::now() > deadline
+            || !Mode::load(&self.workspace).is_some_and(|mode| scope.allowed(mode))
+        {
+            return None;
+        }
+        let snapshot = Session::snapshot(&self.path).ok()?;
+        scope
+            .current(&snapshot, self.session)
+            .then_some((scope, prompt_tokens, deadline, snapshot))
     }
 
     async fn refresh(&self) -> Option<(Usage, ModelMetadata)> {
@@ -491,6 +544,7 @@ pub(super) struct Receipt {
     usage: Usage,
     metadata: ModelMetadata,
     requested_at: Instant,
+    note: Option<String>,
 }
 
 impl Receipt {
@@ -514,9 +568,13 @@ impl Receipt {
             return;
         }
         let cache_hit = self.metadata.cached_input_tokens.unwrap_or_default() > 0;
-        let Ok(Some(record)) =
-            session.record_cache_warm(self.candidate.session, head, self.metadata, self.usage)
-        else {
+        let Ok(Some(record)) = session.record_cache_warm_with_note(
+            self.candidate.session,
+            head,
+            self.metadata,
+            self.usage,
+            self.note,
+        ) else {
             return;
         };
         self.candidate.context.lock().expect("cache context").scope = Scope::Idle(record.id);
@@ -538,6 +596,7 @@ impl Receipt {
             request_id,
             usage: self.usage,
             metadata: Box::new(self.metadata),
+            note: self.note,
         };
         if cache_hit {
             let next = self.requested_at + self.candidate.policy.delay;

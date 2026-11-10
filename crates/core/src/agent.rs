@@ -2584,9 +2584,10 @@ fn queue_input(
             request_id,
             metadata,
             usage,
+            note,
         } => {
             if session.cache_request_current(session_id, request_id) {
-                let record = session.append_cache_warm(*metadata, usage)?;
+                let record = session.append_cache_warm(*metadata, usage, note)?;
                 observer(Notification::Committed(record));
             }
             return Ok(());
@@ -2852,6 +2853,7 @@ mod queue_tests {
                             input_tokens: 2000,
                             output_tokens: 1,
                         },
+                        note: None,
                     })
                     .await
                     .unwrap();

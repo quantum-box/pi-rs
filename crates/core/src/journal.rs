@@ -155,6 +155,8 @@ pub enum Event {
     CacheWarm {
         metadata: ModelMetadata,
         usage: Usage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     TurnFinished {
         assistant_record: u64,
@@ -898,10 +900,21 @@ impl Session {
         metadata: ModelMetadata,
         usage: Usage,
     ) -> Result<Option<&Record>> {
+        self.record_cache_warm_with_note(session_id, head, metadata, usage, None)
+    }
+
+    pub fn record_cache_warm_with_note(
+        &mut self,
+        session_id: Uuid,
+        head: u64,
+        metadata: ModelMetadata,
+        usage: Usage,
+        note: Option<String>,
+    ) -> Result<Option<&Record>> {
         if self.host_binding().is_some() || self.session_id() != session_id || self.head != head {
             return Ok(None);
         }
-        self.append_cache_warm(metadata, usage).map(Some)
+        self.append_cache_warm(metadata, usage, note).map(Some)
     }
 
     /// A refresh during a run belongs to the latest unchanged model request.
@@ -933,10 +946,15 @@ impl Session {
         &mut self,
         mut metadata: ModelMetadata,
         usage: Usage,
+        note: Option<String>,
     ) -> Result<&Record> {
         metadata.replay = None;
         metadata.reasoning = None;
-        self.append(Event::CacheWarm { metadata, usage })
+        self.append(Event::CacheWarm {
+            metadata,
+            usage,
+            note,
+        })
     }
 
     fn record_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {

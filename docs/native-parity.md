@@ -2720,3 +2720,13 @@ thinking options. Budgeted thinking is skipped because the one-token
 refresh cap would change its request. Loopback checks cover streaming,
 tool execution, adaptive thinking, and the transition to idle. Extension
 decisions and detailed warming status remain.
+
+### Cache warming extension decision checkpoint
+
+Native Rust extensions can opt into `cache_warming_decision` through the
+embedded trait or executable extension protocol. Each handler receives
+the original action, phase, model, measured prompt size, and estimated
+economics with its own extension state. The last override takes effect.
+A failed handler leaves the current decision in place. Successful forced
+refreshes retain the override note in the journal, terminal, and RPC.
+Legacy executable descriptions opt out by default.

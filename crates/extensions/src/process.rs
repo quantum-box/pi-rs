@@ -7,10 +7,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use pi_rs_core::{
-    CancellationToken, Compaction, Decision, Error, Extension, ExtensionFlag, ExtensionFlagValue,
-    ExtensionResult, ExtensionState, InputAction, InputEvent, LifecycleEvent, Message,
-    ModelRequest, Outcome, RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost,
-    ToolReply, ToolSpec,
+    CacheWarmingAction, CacheWarmingDecision, CancellationToken, Compaction, Decision, Error,
+    Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState, InputAction,
+    InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RequestPurpose, Result, Tool,
+    ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -133,6 +133,10 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    CacheWarmingDecision {
+        event: CacheWarmingDecision,
+        state: Option<ExtensionState>,
+    },
     BeforeRequest {
         request: ModelRequest,
         summary: bool,
@@ -200,6 +204,8 @@ struct Description {
     input_hook: bool,
     #[serde(default)]
     lifecycle_hook: bool,
+    #[serde(default)]
+    cache_warming_hook: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
@@ -409,6 +415,20 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
         self.request_async(ProtocolRequest::Lifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+    fn handles_cache_warming(&self) -> bool {
+        self.description.cache_warming_hook
+    }
+    async fn cache_warming_decision(
+        &self,
+        event: &CacheWarmingDecision,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<CacheWarmingAction>> {
+        self.request_async(ProtocolRequest::CacheWarmingDecision {
             event: event.clone(),
             state: state.cloned(),
         })
@@ -1109,6 +1129,7 @@ async fn dispatch_with_host(
             host_calls: true,
             input_hook: extension.handles_input(),
             lifecycle_hook: extension.handles_lifecycle(),
+            cache_warming_hook: extension.handles_cache_warming(),
             tools: extension
                 .tools()
                 .into_iter()
@@ -1140,6 +1161,11 @@ async fn dispatch_with_host(
         ProtocolRequest::Lifecycle { event, state } => {
             encode(extension.lifecycle(&event, state.as_ref()).await)
         }
+        ProtocolRequest::CacheWarmingDecision { event, state } => encode(
+            extension
+                .cache_warming_decision(&event, state.as_ref())
+                .await,
+        ),
         ProtocolRequest::BeforeRequest {
             mut request,
             summary,
@@ -1294,6 +1320,54 @@ mod tests {
         }))
         .unwrap();
         assert!(!descriptor.prepares_arguments);
+        let descriptor: Description = serde_json::from_value(serde_json::json!({
+            "id":"legacy", "dependencies":[], "commands":[], "tools":[]
+        }))
+        .unwrap();
+        assert!(!descriptor.cache_warming_hook);
+    }
+
+    struct CacheDecisionExtension;
+
+    #[async_trait::async_trait]
+    impl Extension for CacheDecisionExtension {
+        fn id(&self) -> &str {
+            "cache-decision-test"
+        }
+        fn handles_cache_warming(&self) -> bool {
+            true
+        }
+        async fn cache_warming_decision(
+            &self,
+            event: &CacheWarmingDecision,
+            state: Option<&ExtensionState>,
+        ) -> ExtensionResult<Option<CacheWarmingAction>> {
+            assert_eq!(event.action, CacheWarmingAction::Warm);
+            assert_eq!(event.prompt_tokens, 50_000);
+            assert_eq!(state.unwrap().data["pause"], true);
+            Ok(Some(CacheWarmingAction::Stop))
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_warming_protocol_passes_decision_and_private_state() {
+        let extension = Arc::new(CacheDecisionExtension);
+        let descriptor = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(descriptor["cache_warming_hook"], true);
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"cache_warming_decision",
+            "event": {
+                "sessionId":"00000000-0000-0000-0000-000000000001",
+                "model":{"provider":"relay","model":"test"},
+                "phase":"streaming","promptTokens":50_000,"warmCost":0.05,
+                "missCost":0.5,"continuationProbability":1.0,"action":"warm"
+            },
+            "state":{"version":1,"data":{"pause":true}}
+        }))
+        .unwrap();
+        assert_eq!(dispatch(extension, request).await.unwrap(), "stop");
     }
     struct PollTool;
     #[async_trait::async_trait]
