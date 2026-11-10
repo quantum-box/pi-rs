@@ -616,7 +616,11 @@ pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<I
             .and_then(char::from_u32)
     {
         keycode = KeyCode::Char(shifted_c);
-        modifiers.set(KeyModifiers::SHIFT, false);
+        // Keep explicit Shift on letters so Ctrl+F and Ctrl+Shift+F are distinct.
+        // Shifted punctuation remains addressable by the resulting symbol.
+        if !shifted_c.is_alphabetic() && shifted_c != ' ' {
+            modifiers.remove(KeyModifiers::SHIFT);
+        }
     }
 
     let input_event = Event::Key(KeyEvent::new_with_kind_and_state(
@@ -650,6 +654,22 @@ pub(crate) fn parse_csi_special_key_code(buffer: &[u8]) -> io::Result<Option<Int
         } else {
             (KeyModifiers::NONE, KeyEventKind::Press, KeyEventState::NONE)
         };
+
+    if first == 27 {
+        // xterm modifyOtherKeys reports printable and legacy special keys as CSI 27;mod;code~.
+        let codepoint = next_parsed::<u32>(&mut split)?;
+        let character = char::from_u32(codepoint).ok_or_else(could_not_parse_event_error)?;
+        let code = match character {
+            '\x1b' => KeyCode::Esc,
+            '\r' => KeyCode::Enter,
+            '\t' => KeyCode::Tab,
+            '\x08' | '\x7f' => KeyCode::Backspace,
+            character => KeyCode::Char(character),
+        };
+        return Ok(Some(InternalEvent::Event(Event::Key(
+            KeyEvent::new_with_kind_and_state(code, modifiers, kind, state),
+        ))));
+    }
 
     let keycode = match first {
         1 | 7 => KeyCode::Home,

@@ -10,6 +10,8 @@ use crate::ui::{
     picker::{Input, Item, Picker, Selection, TreeEntryKind, TreeFilter},
     render::{Entry, Line, ToolPart},
     theme::{Theme, ThemeWatcher},
+    transcript_search::Search,
+    viewport::Viewport,
 };
 use crossterm::cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::event::{
@@ -90,21 +92,49 @@ pub(super) fn latest_session(
 struct Terminal {
     alternate: bool,
     images: Cleanup,
+    #[cfg(unix)]
+    keyboard: KeyboardProtocol,
 }
+
+#[cfg(unix)]
+#[derive(PartialEq, Eq)]
+enum KeyboardProtocol {
+    Probing,
+    Kitty,
+    Xterm,
+}
+
 impl Terminal {
     fn enter(mode: Option<TuiMode>, images: Cleanup) -> Result<Self> {
         terminal::enable_raw_mode()?;
         let guard = Self {
             alternate: mode != Some(TuiMode::Regular),
             images,
+            #[cfg(unix)]
+            keyboard: KeyboardProtocol::Probing,
         };
         if guard.alternate {
             execute!(std::io::stdout(), EnterAlternateScreen)?;
         }
         execute!(std::io::stdout(), EnableBracketedPaste, Hide)?;
+        #[cfg(unix)]
+        execute!(std::io::stdout(), Print("\x1b[>7u\x1b[?u\x1b[c"))?;
         #[cfg(any(unix, windows))]
         execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
         Ok(guard)
+    }
+    #[cfg(unix)]
+    fn keyboard_reply(&mut self, supported: bool) -> Result<()> {
+        if supported && self.keyboard != KeyboardProtocol::Kitty {
+            if self.keyboard == KeyboardProtocol::Xterm {
+                execute!(std::io::stdout(), Print("\x1b[>4;0m"))?;
+            }
+            self.keyboard = KeyboardProtocol::Kitty;
+        } else if self.keyboard == KeyboardProtocol::Probing {
+            execute!(std::io::stdout(), Print("\x1b[>4;2m"))?;
+            self.keyboard = KeyboardProtocol::Xterm;
+        }
+        Ok(())
     }
     #[cfg(unix)]
     fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
@@ -139,6 +169,13 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         if self.alternate {
             self.images.clear();
+        }
+        #[cfg(unix)]
+        {
+            if self.keyboard == KeyboardProtocol::Xterm {
+                let _ = execute!(std::io::stdout(), Print("\x1b[>4;0m"));
+            }
+            let _ = execute!(std::io::stdout(), Print("\x1b[<u"));
         }
         #[cfg(any(unix, windows))]
         let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
@@ -270,6 +307,8 @@ struct View {
     draft_images: Vec<pi_rs::ImageContent>,
     clipboard: Option<std::sync::mpsc::Receiver<Result<super::clipboard::Content>>>,
     scroll: usize,
+    viewport: Viewport,
+    search: Option<Search>,
     tokens: u64,
     history: Vec<String>,
     history_index: Option<usize>,
@@ -337,6 +376,7 @@ impl View {
             }
             request => {
                 self.scroll = 0;
+                self.search = None;
                 self.dialogs
                     .push_back(crate::ui::dialog::Dialog::new(id, request));
             }
@@ -485,6 +525,9 @@ impl View {
         self.regular.committed = 0;
         self.regular.redraw = true;
         self.lines.clear();
+        self.viewport.follow();
+        self.search = None;
+        self.scroll = 0;
         self.streaming.clear();
         self.thinking.clear();
         self.draft_images.clear();
@@ -874,11 +917,14 @@ impl View {
         }
         let header_rows = usize::from(show_startup_header(args));
         let body_height = height.saturating_sub(prompt_height + 4 + header_rows + below.len());
-        let mut lines: Vec<Line> = self
-            .lines
-            .iter()
-            .flat_map(|entry| entry.render(theme, width, self.expand_tools, !self.hide_thinking))
-            .collect();
+        let mut lines = Vec::new();
+        let mut prompts = Vec::new();
+        for entry in &self.lines {
+            if matches!(entry, Entry::User(_)) {
+                prompts.push(lines.len());
+            }
+            lines.extend(entry.render(theme, width, self.expand_tools, !self.hide_thinking));
+        }
         if !self.thinking.is_empty() {
             lines.extend(Entry::Thinking(self.thinking.clone()).render(
                 theme,
@@ -899,10 +945,22 @@ impl View {
         } else {
             lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
         }
-        let end = lines
-            .len()
-            .saturating_sub(self.scroll.min(lines.len().saturating_sub(body_height)));
-        let start = end.saturating_sub(body_height);
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let start = if modal {
+            0
+        } else {
+            self.viewport.update(lines.len(), body_height, prompts);
+            if let Some(search) = &mut self.search
+                && let Some(rows) = search.update(&lines, self.viewport.top())
+            {
+                self.viewport.reveal(rows);
+            }
+            self.viewport.top()
+        };
+        let end = (start + body_height).min(lines.len());
+        if !modal && let Some(search) = &self.search {
+            search.highlight(&mut lines, start..end);
+        }
         let mut out = std::io::stdout().lock();
         let elapsed = self
             .request_started
@@ -992,7 +1050,23 @@ impl View {
             .last()
             .map_or(0, |line| UnicodeWidthStr::width(line.as_str()))
             .min(width - 1);
-        if let Some(dialog) = self.dialog() {
+        if !modal && let Some(search) = &self.search {
+            let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
+            let left = width.saturating_sub(search_width + 1);
+            let top = header_rows + usize::from(body_height > 3);
+            let (overlay, cursor_row, cursor_column) = search.overlay(theme, keys, search_width);
+            for (row, line) in overlay.iter().take(body_height).enumerate() {
+                queue!(out, MoveTo(left as u16, (top + row) as u16))?;
+                line.draw(&mut out, search_width)?;
+            }
+            if cursor_row < body_height {
+                queue!(
+                    out,
+                    MoveTo((left + cursor_column) as u16, (top + cursor_row) as u16),
+                    Show
+                )?;
+            }
+        } else if let Some(dialog) = self.dialog() {
             if let Some((row, column)) = dialog.cursor(width, body_height) {
                 queue!(out, MoveTo(column as u16, (row + header_rows) as u16), Show)?;
             } else {
@@ -1261,7 +1335,7 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. PageUp/PageDown scroll. Up/Down recall prompts.\nFullscreen: Ctrl+Shift+F finds transcript text. Ctrl+Up/Down jumps between prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>> {
     let (name, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
@@ -1842,9 +1916,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         slash("/resume", &mut args, &mut view)?;
     }
     let mut keys = Keys::load()?;
-    let _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
-    #[cfg(unix)]
-    let mut _terminal = _terminal;
+    let mut _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
     let mut input = crate::ui::input::Reader::new()?;
     if view.graphics.enabled() {
         crate::ui::images::query_cell_size()?;
@@ -2098,6 +2170,20 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         };
         let event = match input.next(input_wait)? {
             Some(crate::ui::input::InputEvent::Event(event)) => event,
+            #[cfg(unix)]
+            Some(crate::ui::input::InputEvent::KeyboardEnhancementFlags(flags)) => {
+                if let Some(terminal) = &mut _terminal {
+                    terminal.keyboard_reply(!flags.is_empty())?;
+                }
+                continue;
+            }
+            #[cfg(unix)]
+            Some(crate::ui::input::InputEvent::PrimaryDeviceAttributes) => {
+                if let Some(terminal) = &mut _terminal {
+                    terminal.keyboard_reply(false)?;
+                }
+                continue;
+            }
             #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::CellSize { width, height }) => {
                 if images::set_cell_dimensions(width, height) {
@@ -2146,6 +2232,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     dialog.paste(&text);
                 } else if let Some(dialog) = view.dialogs.front_mut() {
                     dialog.paste(&text);
+                } else if let Some(search) = &mut view.search {
+                    search.paste(&text);
                 } else {
                     view.editor.insert(&text);
                 }
@@ -2294,6 +2382,47 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     }
                     continue;
                 }
+                if args.tui_mode != Some(TuiMode::Regular) {
+                    if keys.matches("tui.altScreen.search", key) {
+                        last_idle_interrupt = None;
+                        view.search = view.search.is_none().then(Search::default);
+                        continue;
+                    }
+                    if let Some(search) = &mut view.search {
+                        if keys.matches("tui.altScreen.searchClose", key) {
+                            view.search = None;
+                            continue;
+                        }
+                        if keys.matches("tui.altScreen.searchNext", key) {
+                            search.navigate(true);
+                            continue;
+                        }
+                        if keys.matches("tui.altScreen.searchPrevious", key) {
+                            search.navigate(false);
+                            continue;
+                        }
+                    }
+                    if let Some(action) = keys.viewport_action(key) {
+                        view.viewport.navigate(action);
+                        continue;
+                    }
+                    if let Some(search) = &mut view.search {
+                        search.input(key, &keys);
+                        continue;
+                    }
+                } else if let Some(action) = keys.viewport_action(key) {
+                    let scroll = match action {
+                        "tui.altScreen.pageUp" => Some(view.scroll.saturating_add(10)),
+                        "tui.altScreen.pageDown" => Some(view.scroll.saturating_sub(10)),
+                        "tui.altScreen.top" => Some(usize::MAX),
+                        "tui.altScreen.bottom" => Some(0),
+                        _ => None,
+                    };
+                    if let Some(scroll) = scroll {
+                        view.scroll = scroll;
+                        continue;
+                    }
+                }
                 let action = keys
                     .action(
                         key,
@@ -2429,7 +2558,14 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                         if args.tui_mode == Some(TuiMode::Regular) {
                             view.finish_regular()?;
                         }
-                        if let Err(error) = external_editor(&args, &mut view.editor) {
+                        drop(_terminal.take());
+                        let result = external_editor(&args, &mut view.editor);
+                        _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+                        if view.graphics.enabled() {
+                            images::query_cell_size()?;
+                        }
+                        view.graphics.reset();
+                        if let Err(error) = result {
                             view.append(&error.to_string());
                         }
                         view.regular.redraw = true;
@@ -2459,6 +2595,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             break;
                         }
                         view.scroll = 0;
+                        view.viewport.follow();
                         let auth_command =
                             matches!(input.split_whitespace().next(), Some("/login" | "/logout"));
                         if !auth_command {
@@ -2727,10 +2864,6 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             }
                         }
                     }
-                    "tui.altScreen.pageUp" => view.scroll = view.scroll.saturating_add(10),
-                    "tui.altScreen.pageDown" => view.scroll = view.scroll.saturating_sub(10),
-                    "tui.altScreen.top" => view.scroll = usize::MAX,
-                    "tui.altScreen.bottom" => view.scroll = 0,
                     "tui.editor.cursorUp" if view.editor.vertical(false) => {}
                     "tui.editor.cursorDown" if view.editor.vertical(true) => {}
                     "tui.editor.cursorUp" | "tui.editor.historyPrevious"
@@ -3363,21 +3496,12 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
     };
     let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
     file.write_all(editor.text.as_bytes())?;
-    execute!(std::io::stdout(), Show, DisableBracketedPaste)?;
-    if args.tui_mode != Some(TuiMode::Regular) {
-        execute!(std::io::stdout(), LeaveAlternateScreen)?;
-    }
-    terminal::disable_raw_mode()?;
-    let result = std::process::Command::new(program)
+    if !std::process::Command::new(program)
         .args(arguments)
         .arg(file.path())
-        .status();
-    terminal::enable_raw_mode()?;
-    execute!(std::io::stdout(), EnableBracketedPaste, Hide)?;
-    if args.tui_mode != Some(TuiMode::Regular) {
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
-    }
-    if !result?.success() {
+        .status()?
+        .success()
+    {
         return Err(Error::Config(
             "external editor exited unsuccessfully".into(),
         ));

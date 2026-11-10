@@ -50,10 +50,6 @@ impl Decoder {
                 InputEvent::CursorPosition(column, row) => {
                     let _ = (column, row);
                 }
-                InputEvent::KeyboardEnhancementFlags(flags) => {
-                    let _ = flags;
-                }
-                InputEvent::PrimaryDeviceAttributes => {}
                 event => return Some(event),
             }
         }
@@ -65,6 +61,26 @@ impl Decoder {
 mod tests {
     use super::*;
     use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+    #[test]
+    fn preserves_shift_with_kitty_alternate_keys_and_xterm_modified_keys() {
+        let mut decoder = Decoder::default();
+        decoder.push(b"\x1b[?7u\x1b[?1;2c\x1b[102:70;6u\x1b[27;6;70~\x1b[27;2;13~");
+        assert!(
+            matches!(decoder.next(), Some(InputEvent::KeyboardEnhancementFlags(flags)) if flags.bits() == 7)
+        );
+        assert_eq!(decoder.next(), Some(InputEvent::PrimaryDeviceAttributes));
+        for _ in 0..2 {
+            assert!(
+                matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key)))
+                if key.code == KeyCode::Char('F') && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT))
+            );
+        }
+        assert!(
+            matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key)))
+            if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT)
+        );
+    }
 
     #[test]
     fn split_cell_reports_preserve_surrounding_unicode_and_keys() {

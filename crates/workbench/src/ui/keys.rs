@@ -54,6 +54,25 @@ impl Keys {
             ("tui.select.cancel", &["escape", "ctrl+c"]),
             ("tui.altScreen.pageUp", &["pageup"]),
             ("tui.altScreen.pageDown", &["pagedown"]),
+            ("tui.altScreen.halfPageUp", &[]),
+            ("tui.altScreen.halfPageDown", &[]),
+            ("tui.altScreen.lineUp", &[]),
+            ("tui.altScreen.lineDown", &[]),
+            (
+                "tui.altScreen.previousPrompt",
+                &["ctrl+shift+up", "ctrl+up"],
+            ),
+            (
+                "tui.altScreen.nextPrompt",
+                &["ctrl+shift+down", "ctrl+down"],
+            ),
+            ("tui.altScreen.search", &["ctrl+shift+f"]),
+            ("tui.altScreen.searchNext", &["enter", "ctrl+g"]),
+            (
+                "tui.altScreen.searchPrevious",
+                &["shift+enter", "ctrl+shift+g"],
+            ),
+            ("tui.altScreen.searchClose", &["escape"]),
             ("tui.altScreen.top", &["ctrl+home"]),
             ("tui.altScreen.bottom", &["ctrl+end"]),
             ("app.interrupt", &["escape"]),
@@ -182,6 +201,7 @@ impl Keys {
                 if action.starts_with("app.tree.")
                     || action.starts_with("app.models.")
                     || action.starts_with("tui.select.")
+                    || action.starts_with("tui.altScreen.")
                     || matches!(
                         action.as_str(),
                         "app.thinking.save"
@@ -205,6 +225,23 @@ impl Keys {
             })
             .map(|(action, _)| action.as_str())
     }
+    pub fn viewport_action(&self, key: KeyEvent) -> Option<&'static str> {
+        [
+            "tui.altScreen.pageUp",
+            "tui.altScreen.pageDown",
+            "tui.altScreen.halfPageUp",
+            "tui.altScreen.halfPageDown",
+            "tui.altScreen.lineUp",
+            "tui.altScreen.lineDown",
+            "tui.altScreen.previousPrompt",
+            "tui.altScreen.nextPrompt",
+            "tui.altScreen.top",
+            "tui.altScreen.bottom",
+        ]
+        .into_iter()
+        .find(|action| self.matches(action, key))
+    }
+
     pub fn hint(&self, action: &str) -> String {
         let Some(key) = self.bindings.get(action).and_then(|keys| keys.first()) else {
             return "—".into();
