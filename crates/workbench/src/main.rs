@@ -1060,13 +1060,6 @@ async fn execute(mut args: Cli) -> Result<()> {
         let registry = &runtime.registry;
         let agent = runtime.agent(&args);
         let mut observer = |event: Notification<'_>| observe(event, args.trace);
-        if let Command::Run { prompt } = &mut command {
-            if args.initial_images.is_empty() && agent.try_extension_command(&mut session, prompt, &mut observer)? { return Ok(()); }
-            if let Some(expanded) = runtime.resources.expand(prompt)? { *prompt = expanded; }
-        }
-
-
-
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
     tokio::spawn(async move {
@@ -1077,6 +1070,32 @@ async fn execute(mut args: Cli) -> Result<()> {
     let (sender, mut receiver) = mpsc::channel(32);
     if args.stdin_control {
         read_controls(sender, cancel.clone());
+    }
+    let mut initial_images = args.initial_images.clone();
+    if let Command::Run { prompt } = &mut command {
+        if initial_images.is_empty() && agent.try_extension_command(&mut session, prompt, &mut observer)? {
+            return Ok(());
+        }
+        if registry.has_input_hooks() {
+            let event = pi_rs::InputEvent {
+                text: std::mem::take(prompt),
+                images: initial_images,
+                source: pi_rs::InputSource::Extension,
+                streaming_behavior: None,
+            };
+            let states = session.extension_states();
+            let prepared = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = registry.prepare_input(event, &states) => result?,
+            };
+            let Some(prepared) = prepared else { return Ok(()) };
+            *prompt = prepared.text;
+            initial_images = prepared.images;
+        }
+        if let Some(expanded) = runtime.resources.expand(prompt)? {
+            *prompt = expanded;
+        }
     }
     let mut input = match command {
         Command::Review {
@@ -1170,11 +1189,11 @@ async fn execute(mut args: Cli) -> Result<()> {
         _ => unreachable!(),
     };
     let run_id = args.run_id.unwrap_or_else(Uuid::new_v4);
-    if !args.initial_images.is_empty() {
+    if !initial_images.is_empty() {
         if session.records().iter().any(|record| record.run_id == Some(run_id) || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)) {
             return Err(Error::DuplicateRun(run_id));
         }
-        session.append_user_with_images(input.take().unwrap_or_default(), args.initial_images.clone(), Some(run_id))?;
+        session.append_user_with_images(input.take().unwrap_or_default(), initial_images, Some(run_id))?;
         observer(Notification::Committed(session.records().last().expect("appended user input")));
     }
     let answer = agent

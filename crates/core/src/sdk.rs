@@ -436,7 +436,7 @@ impl AgentSession {
     }
 
     pub async fn prompt(&mut self, input: impl Into<String>) -> Result<String> {
-        self.run(Some(input.into()), Uuid::new_v4(), &mut |_| {})
+        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, &mut |_| {})
             .await
     }
     /// Submit text and images as one durable user message.
@@ -445,15 +445,22 @@ impl AgentSession {
         text: impl Into<String>,
         images: Vec<crate::ImageContent>,
     ) -> Result<String> {
-        self.run_input(Some(text.into()), Some(images), Uuid::new_v4(), &mut |_| {})
-            .await
+        self.run_input(
+            Some(text.into()),
+            Some(images),
+            Uuid::new_v4(),
+            true,
+            &mut |_| {},
+        )
+        .await
     }
     pub async fn prompt_with_observer(
         &mut self,
         input: impl Into<String>,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run(Some(input.into()), Uuid::new_v4(), observer).await
+        self.run_input(Some(input.into()), None, Uuid::new_v4(), true, observer)
+            .await
     }
     pub async fn resume(&mut self) -> Result<String> {
         self.run(None, Uuid::new_v4(), &mut |_| {}).await
@@ -465,19 +472,20 @@ impl AgentSession {
         run_id: Uuid,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.run_input(input, None, run_id, observer).await
+        self.run_input(input, None, run_id, false, observer).await
     }
     async fn run_input(
         &mut self,
         mut input: Option<String>,
-        images: Option<Vec<crate::ImageContent>>,
+        mut images: Option<Vec<crate::ImageContent>>,
         run_id: Uuid,
+        prepare: bool,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         self.ensure_open()?;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
-        let _ = events.send(SessionEvent::RunStarted { run_id });
+        let mut started = false;
         let mut observe = |event: Notification<'_>| {
             emit(&events, &event);
             observer(event);
@@ -490,6 +498,27 @@ impl AgentSession {
             limits: self.limits.clone(),
         };
         let mut result = async {
+            if prepare && self.registry.has_input_hooks() {
+                let event = crate::InputEvent {
+                    text: input.take().unwrap_or_default(),
+                    images: images.take().unwrap_or_default(),
+                    source: crate::InputSource::Extension,
+                    streaming_behavior: None,
+                };
+                let states = self.session.extension_states();
+                let prepared = tokio::select! {
+                    biased;
+                    _ = active.token.cancelled() => return Err(Error::Cancelled),
+                    result = self.registry.prepare_input(event, &states) => result?,
+                };
+                let Some(prepared) = prepared else {
+                    return Ok(String::new());
+                };
+                input = Some(prepared.text);
+                images = (!prepared.images.is_empty()).then_some(prepared.images);
+            }
+            started = true;
+            let _ = events.send(SessionEvent::RunStarted { run_id });
             if let Some(images) = images {
                 self.session.append_user_with_images(
                     input.take().unwrap_or_default(),
@@ -521,10 +550,12 @@ impl AgentSession {
         {
             result = Err(error);
         }
-        let _ = events.send(SessionEvent::RunEnded {
-            run_id,
-            succeeded: result.is_ok(),
-        });
+        if started {
+            let _ = events.send(SessionEvent::RunEnded {
+                run_id,
+                succeeded: result.is_ok(),
+            });
+        }
         result
     }
     pub fn extension_command(
@@ -1006,6 +1037,62 @@ mod tests {
             Ok(())
         }
     }
+    struct InputExtension;
+
+    #[async_trait::async_trait]
+    impl Extension for InputExtension {
+        fn id(&self) -> &str {
+            "input-test"
+        }
+
+        fn handles_input(&self) -> bool {
+            true
+        }
+
+        async fn input(
+            &self,
+            event: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            assert_eq!(event.source, crate::InputSource::Extension);
+            Ok(if event.text == "handled" {
+                crate::InputAction::Handled
+            } else {
+                crate::InputAction::Transform {
+                    text: event.text.to_uppercase(),
+                    images: None,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_hooks_handle_or_transform_input_without_losing_images() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "echo")
+            .extension(Arc::new(InputExtension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let mut events = session.subscribe();
+        assert_eq!(session.prompt("handled").await.unwrap(), "");
+        assert!(events.try_recv().is_err());
+        assert_eq!(model.0.load(Ordering::SeqCst), 0);
+        let image = crate::ImageContent {
+            data: "aGVsbG8=".into(),
+            mime_type: "image/png".into(),
+        };
+        session
+            .prompt_with_images("fixture", vec![image.clone()])
+            .await
+            .unwrap();
+        assert!(session.messages().unwrap().iter().any(|message| matches!(
+            message,
+            Message::UserWithImages { content, images } if content == "FIXTURE" && images.as_slice() == std::slice::from_ref(&image)
+        )));
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn session_owns_history_and_events_and_consumes_queued_followups() {
         let model = Arc::new(EchoModel(AtomicUsize::new(0)));

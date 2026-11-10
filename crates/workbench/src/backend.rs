@@ -375,8 +375,8 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                 |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
             match request {
                 Request::Prompt {
-                    content,
-                    images,
+                    mut content,
+                    mut images,
                     queued_only,
                     require_command,
                     ..
@@ -389,6 +389,31 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                         && agent.try_extension_command(session, input, &mut observer)?
                     {
                         return Ok(());
+                    }
+                    if runtime.registry.has_input_hooks()
+                        && (content.is_some() || !images.is_empty())
+                    {
+                        let event = pi_rs::InputEvent {
+                            text: content.take().unwrap_or_default(),
+                            images,
+                            source: if args.mode == Some(super::OutputMode::Rpc) {
+                                pi_rs::InputSource::Rpc
+                            } else {
+                                pi_rs::InputSource::Interactive
+                            },
+                            streaming_behavior: None,
+                        };
+                        let states = session.extension_states();
+                        let prepared = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(Error::Cancelled),
+                            result = runtime.registry.prepare_input(event, &states) => result?,
+                        };
+                        let Some(prepared) = prepared else {
+                            return Ok(());
+                        };
+                        content = Some(prepared.text);
+                        images = prepared.images;
                     }
                     let mut content = content
                         .map(|input| {

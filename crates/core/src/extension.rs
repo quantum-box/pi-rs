@@ -136,6 +136,38 @@ pub enum RequestPurpose {
     Summary,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputSource {
+    Interactive,
+    Rpc,
+    Extension,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputEvent {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::ImageContent>,
+    pub source: InputSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_behavior: Option<crate::InputKind>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum InputAction {
+    Continue,
+    Transform {
+        text: String,
+        /// Omitting images retains the attachments from the previous hook.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<crate::ImageContent>>,
+    },
+    Handled,
+}
+
 /// Hooks run in registration order. The first denial stops pre-tool hooks.
 /// An error stops the run. A post-tool error commits the known result without state changes.
 /// Post-hooks prepare state updates and must not perform external operations.
@@ -181,6 +213,19 @@ pub trait Extension: Send + Sync {
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         Vec::new()
+    }
+
+    /// Opt in to receiving input before template expansion and model processing.
+    fn handles_input(&self) -> bool {
+        false
+    }
+
+    async fn input(
+        &self,
+        _event: &InputEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<InputAction> {
+        Ok(InputAction::Continue)
     }
 
     /// Release long-lived clients and subprocesses owned by this extension.
@@ -286,6 +331,43 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub fn has_input_hooks(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.handles_input())
+    }
+
+    /// Run opted-in extensions in registration order. A handled input is not submitted.
+    pub async fn prepare_input(
+        &self,
+        mut event: InputEvent,
+        states: &ExtensionStates,
+    ) -> Result<Option<InputEvent>> {
+        for extension in self
+            .extensions
+            .iter()
+            .filter(|extension| extension.handles_input())
+        {
+            match hook(
+                extension.as_ref(),
+                extension.input(&event, states.get(extension.id())).await,
+            )? {
+                InputAction::Continue => {}
+                InputAction::Handled => return Ok(None),
+                InputAction::Transform { text, images } => {
+                    event.text = text;
+                    if let Some(images) = images {
+                        for image in &images {
+                            image.validate()?;
+                        }
+                        event.images = images;
+                    }
+                }
+            }
+        }
+        Ok(Some(event))
+    }
+
     pub fn set_refresher(&mut self, refresher: Arc<dyn RegistryRefresher>) {
         self.refresher = Some(refresher);
     }

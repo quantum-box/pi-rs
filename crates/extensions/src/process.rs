@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use pi_rs_core::{
     CancellationToken, Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState,
-    Message, ModelRequest, Outcome, RequestPurpose, Result, Tool, ToolContext, ToolExecution,
-    ToolHost, ToolReply, ToolSpec,
+    InputAction, InputEvent, Message, ModelRequest, Outcome, RequestPurpose, Result, Tool,
+    ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,6 +83,10 @@ enum ProtocolRequest {
         request: ModelRequest,
         state: Option<ExtensionState>,
     },
+    Input {
+        event: InputEvent,
+        state: Option<ExtensionState>,
+    },
     BeforeRequest {
         request: ModelRequest,
         summary: bool,
@@ -144,6 +148,8 @@ struct Description {
     tools: Vec<DescriptionTool>,
     #[serde(default)]
     host_calls: bool,
+    #[serde(default)]
+    input_hook: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
@@ -254,6 +260,26 @@ impl Extension for ExecutableExtension {
                 }) as Arc<dyn Tool>
             })
             .collect()
+    }
+    fn handles_input(&self) -> bool {
+        self.description.input_hook
+    }
+
+    async fn input(
+        &self,
+        event: &InputEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<InputAction> {
+        let request = ProtocolRequest::Input {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.executable.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+            .await
+            .map_err(|error| error.to_string())?
     }
     fn migrate(
         &self,
@@ -973,6 +999,7 @@ async fn dispatch_with_host(
                 .map(str::to_owned)
                 .collect(),
             host_calls: true,
+            input_hook: extension.handles_input(),
             tools: extension
                 .tools()
                 .into_iter()
@@ -997,6 +1024,9 @@ async fn dispatch_with_host(
         ProtocolRequest::Context { mut request, state } => {
             extension.context(&mut request, state.as_ref())?;
             encode(Ok(request))
+        }
+        ProtocolRequest::Input { event, state } => {
+            encode(extension.input(&event, state.as_ref()).await)
         }
         ProtocolRequest::BeforeRequest {
             mut request,
