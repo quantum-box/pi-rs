@@ -2641,4 +2641,14 @@ and last tool definition with an ephemeral cache breakpoint.
 Fireworks model compatibility controls retention and tool markers.
 Compaction and branch summaries use the uncached model path. Loopback
 checks covered ordinary Messages requests, Fireworks, and model-generated
-compaction. Prompt warming and additional compatible formats remain.
+compaction. Prompt warming remains.
+
+### Compatible chat cache control checkpoint
+
+OpenRouter Anthropic-compatible chat models and profiles declaring
+`cacheControlFormat: "anthropic"` mark the instruction text, last
+applicable conversation text, and last tool. Short and one-hour retention
+respect the model and provider compatibility settings. Other chat models
+keep their standard request shape. Compaction omits automatic cache
+markers and session-affinity headers. Loopback checks covered default
+OpenRouter routing, configured short retention, and compacted history.

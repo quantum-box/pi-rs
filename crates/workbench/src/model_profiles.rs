@@ -158,6 +158,12 @@ enum AffinityFormat {
     OpenaiNosession,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CacheControlFormat {
+    Anthropic,
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelCompatibility {
@@ -169,6 +175,7 @@ struct ModelCompatibility {
     session_affinity_format: Option<AffinityFormat>,
     supports_long_cache_retention: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
+    cache_control_format: Option<CacheControlFormat>,
 }
 
 impl ModelCompatibility {
@@ -191,6 +198,7 @@ impl ModelCompatibility {
             supports_cache_control_on_tools: newer
                 .supports_cache_control_on_tools
                 .or(self.supports_cache_control_on_tools),
+            cache_control_format: newer.cache_control_format.or(self.cache_control_format),
         }
     }
 }
@@ -839,26 +847,55 @@ impl Profiles {
         )
     }
 
+    fn cache_compatibility(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> ModelCompatibility {
+        let base = self
+            .entries
+            .get(provider.id())
+            .map(|profile| profile.compat.clone())
+            .unwrap_or_default();
+        match model {
+            Some(model) => base.overlay(model.compat.clone()),
+            None => base,
+        }
+    }
+
     pub fn messages_cache_support(
         &self,
         provider: &Provider,
         model: Option<&ModelMetadata>,
     ) -> (bool, bool) {
-        let profile = self
-            .entries
-            .get(provider.id())
-            .map(|profile| &profile.compat);
-        let model = model.map(|model| &model.compat);
-        let capability = |field: fn(&ModelCompatibility) -> Option<bool>| {
-            model
-                .and_then(field)
-                .or_else(|| profile.and_then(field))
-                .unwrap_or(true)
-        };
+        let compat = self.cache_compatibility(provider, model);
         (
-            capability(|compat| compat.supports_long_cache_retention),
-            capability(|compat| compat.supports_cache_control_on_tools),
+            compat.supports_long_cache_retention.unwrap_or(true),
+            compat.supports_cache_control_on_tools.unwrap_or(true),
         )
+    }
+
+    pub fn chat_cache_support(
+        &self,
+        provider: &Provider,
+        model_id: &str,
+        model: Option<&ModelMetadata>,
+    ) -> Option<bool> {
+        let compat = self.cache_compatibility(provider, model);
+        let enabled = compat.cache_control_format.is_some()
+            || (provider.id() == "openrouter" && model_id.starts_with("anthropic/"));
+        enabled.then(|| {
+            compat.supports_long_cache_retention.unwrap_or_else(|| {
+                !matches!(
+                    provider.id(),
+                    "together"
+                        | "cloudflare-workers-ai"
+                        | "cloudflare-ai-gateway"
+                        | "nvidia"
+                        | "ant-ling"
+                )
+            })
+        })
     }
 
     pub fn session_affinity(

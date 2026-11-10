@@ -362,6 +362,25 @@ impl UsageCostBreakdown {
     }
 }
 
+/// Retention for an explicit provider prompt-cache breakpoint.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheRetention {
+    #[default]
+    None,
+    Short,
+    Long,
+}
+
+impl CacheRetention {
+    pub fn anthropic_control(self) -> Option<Value> {
+        match self {
+            Self::None => None,
+            Self::Short => Some(serde_json::json!({"type":"ephemeral"})),
+            Self::Long => Some(serde_json::json!({"type":"ephemeral","ttl":"1h"})),
+        }
+    }
+}
+
 /// Native chat transports recorded in a session.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]

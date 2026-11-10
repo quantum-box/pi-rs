@@ -16,8 +16,8 @@ mod reasoning_details;
 pub use compatibility::ChatCompatibility;
 
 use pi_rs_core::{
-    Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
-    ProviderReplay, ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
+    CacheRetention, Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest,
+    ModelStream, ProviderReplay, ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 
 type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
@@ -28,6 +28,7 @@ pub struct Ollama {
     endpoint: Url,
     token: Option<String>,
     headers: HeaderMap,
+    cache_retention: CacheRetention,
     reasoning_effort: Option<String>,
     compatibility: ChatCompatibility,
     supports_reasoning: Option<bool>,
@@ -108,6 +109,7 @@ impl Ollama {
             endpoint,
             token,
             headers: HeaderMap::new(),
+            cache_retention: CacheRetention::None,
             reasoning_effort: None,
             compatibility: ChatCompatibility::default(),
             supports_reasoning: None,
@@ -175,6 +177,12 @@ impl Ollama {
     /// Apply the provider value from an explicit thinking-level map.
     pub fn with_mapped_reasoning_effort(mut self, effort: Option<&str>) -> Self {
         self.reasoning_effort = effort.map(str::to_owned);
+        self
+    }
+
+    /// Use Anthropic-style cache markers on a compatible chat endpoint.
+    pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
+        self.cache_retention = retention;
         self
     }
 
@@ -542,6 +550,9 @@ impl Model for Ollama {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
+        if let Some(control) = self.cache_retention.anthropic_control() {
+            apply_anthropic_cache(&mut body, &control);
+        }
         let builder = self
             .authenticate(self.client.post(self.endpoint.clone()))
             .json(&body);
@@ -737,6 +748,49 @@ impl Model for Ollama {
             Err(Error::RetryableModel("SSE closed before the end marker".into()))?;
         }))
     }
+}
+
+fn apply_anthropic_cache(body: &mut Value, control: &Value) {
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        if let Some(instructions) = messages
+            .iter_mut()
+            .find(|message| matches!(message["role"].as_str(), Some("system" | "developer")))
+        {
+            mark_text_for_cache(instructions, control);
+        }
+        for message in messages.iter_mut().rev() {
+            if matches!(
+                message["role"].as_str(),
+                Some("user" | "assistant" | "tool")
+            ) && mark_text_for_cache(message, control)
+            {
+                break;
+            }
+        }
+    }
+    if let Some(tool) = body
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .and_then(|tools| tools.last_mut())
+    {
+        tool["cache_control"] = control.clone();
+    }
+}
+
+fn mark_text_for_cache(message: &mut Value, control: &Value) -> bool {
+    if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
+        message["content"] = json!([{"type":"text","text":text,"cache_control":control}]);
+        return true;
+    }
+    let Some(text) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|parts| parts.iter_mut().rev().find(|part| part["type"] == "text"))
+    else {
+        return false;
+    };
+    text["cache_control"] = control.clone();
+    true
 }
 
 fn encode_message(message: Message) -> Vec<Value> {

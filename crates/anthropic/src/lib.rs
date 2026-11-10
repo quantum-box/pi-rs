@@ -48,14 +48,7 @@ pub enum Progress {
     PreparingTool,
 }
 
-/// Retention requested for Anthropic Messages prompt breakpoints.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum CacheRetention {
-    #[default]
-    None,
-    Short,
-    Long,
-}
+pub use pi_rs_core::CacheRetention;
 
 type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -486,10 +479,8 @@ fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
 }
 
 fn apply_cache_control(body: &mut Value, retention: CacheRetention, cache_tools: bool) {
-    let control = match retention {
-        CacheRetention::None => return,
-        CacheRetention::Short => json!({"type":"ephemeral"}),
-        CacheRetention::Long => json!({"type":"ephemeral","ttl":"1h"}),
+    let Some(control) = retention.anthropic_control() else {
+        return;
     };
     if let Some(system) = body.get("system").and_then(Value::as_str) {
         body["system"] = json!([{"type":"text","text":system,"cache_control":control}]);

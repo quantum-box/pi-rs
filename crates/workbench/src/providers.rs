@@ -1,10 +1,10 @@
 //! Provider selection and shared workbench catalog and progress controls.
 use std::collections::BTreeMap;
 
-use pi_rs::anthropic::{Anthropic, CacheRetention};
+use pi_rs::anthropic::Anthropic;
 use pi_rs::google::Google;
 use pi_rs::ollama::{ModelDetails, Ollama};
-use pi_rs::{Error, Model, ModelRequest, ModelStream, Result};
+use pi_rs::{CacheRetention, Error, Model, ModelRequest, ModelStream, Result};
 use reqwest::header::HeaderMap;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -51,6 +51,14 @@ impl Adapter {
             Self::Google => "google-generative-ai",
             Self::PiMessages => "pi-messages",
         }
+    }
+}
+
+fn cache_retention(supports_long: bool) -> CacheRetention {
+    if supports_long && std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long") {
+        CacheRetention::Long
+    } else {
+        CacheRetention::Short
     }
 }
 
@@ -255,6 +263,13 @@ impl Client {
         cache_disabled: bool,
     ) -> Result<ModelStream> {
         match self {
+            Self::Ollama(client) if cache_disabled => {
+                client
+                    .clone()
+                    .with_cache_retention(CacheRetention::None)
+                    .stream(request)
+                    .await
+            }
             Self::Ollama(client) if !defaults.is_empty() => {
                 client
                     .clone()
@@ -404,6 +419,12 @@ impl Client {
         Ok(match self {
             Self::Ollama(client) => {
                 let configured = args.model_profiles.model(&args.provider, &args.model);
+                let retention = args
+                    .model_profiles
+                    .chat_cache_support(&args.provider, &args.model, configured.as_ref())
+                    .map(cache_retention)
+                    .unwrap_or_default();
+                let client = client.with_cache_retention(retention);
                 let mapped = configured.as_ref().and_then(|model| {
                     let level = thinking.or((model.reasoning == Some(true)).then_some("off"))?;
                     model.mapped_effort(level)
@@ -436,13 +457,7 @@ impl Client {
                 let (supports_long, cache_tools) = args
                     .model_profiles
                     .messages_cache_support(&args.provider, metadata.as_ref());
-                let retention = if supports_long
-                    && std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long")
-                {
-                    CacheRetention::Long
-                } else {
-                    CacheRetention::Short
-                };
+                let retention = cache_retention(supports_long);
                 let gateway = matches!(args.provider.id(), "fireworks" | "openrouter");
                 let mut client = client
                     .with_thinking(thinking)
