@@ -47,6 +47,9 @@ The list shows the session's selected mode when reopening an existing branch.
 TUI mode changes take effect immediately, including during streaming, without
 closing the settings list. Quiet startup, share destination, default project
 trust and fullscreen wheel speed can also be cycled directly in the list.
+The theme submenu previews the highlighted theme, restores the original on
+cancel, and configures either a single theme or separate light/dark themes for
+automatic terminal-appearance switching.
 
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |

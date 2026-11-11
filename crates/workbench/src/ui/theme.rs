@@ -179,8 +179,10 @@ impl Theme {
                 .and_then(|value| colorfgbg_is_dark(&value))
                 .unwrap_or(true),
         };
-        let name = if let Some((light, dark_name)) = name.split_once('/') {
+        let name = if let Some((light, dark_name)) = parse_auto_theme_setting(name) {
             if dark { dark_name } else { light }
+        } else if name.contains('/') {
+            return Err(Error::Config("invalid automatic theme setting".into()));
         } else {
             name
         };
@@ -379,6 +381,12 @@ impl Theme {
     }
 }
 
+pub fn parse_auto_theme_setting(value: &str) -> Option<(&str, &str)> {
+    let (light, dark) = value.split_once('/')?;
+    let (light, dark) = (light.trim(), dark.trim());
+    (!light.is_empty() && !dark.is_empty() && !dark.contains('/')).then_some((light, dark))
+}
+
 fn resolve(
     value: &Value,
     variables: &BTreeMap<String, Value>,
@@ -518,6 +526,16 @@ fn parse_function_color(text: &str, is_hsl: bool) -> Result<Color> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automatic_theme_setting_requires_two_nonempty_names() {
+        assert_eq!(
+            super::parse_auto_theme_setting(" light / dark "),
+            Some(("light", "dark"))
+        );
+        for invalid in ["light", "/dark", "light/", "light/dark/extra", " / dark"] {
+            assert!(super::parse_auto_theme_setting(invalid).is_none());
+        }
+    }
     use super::*;
     #[test]
     fn terminal_appearance_uses_foreground_direction_when_readable() {

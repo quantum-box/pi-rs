@@ -699,3 +699,115 @@ fn settings_switches_terminal_modes_and_restores_input() {
         output_until(&mut master, |text| text.contains("draft survives"));
     }
 }
+
+#[test]
+fn settings_theme_preview_cancel_and_automatic_selection() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("settings.json"), br#"{"theme":"dark"}"#).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/settings\r").unwrap();
+    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    master.write_all(b"Theme\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Automatic · follow terminal appearance")
+    });
+    master.write_all(b"light").unwrap();
+    output_until(&mut master, |text| text.contains("Theme · light"));
+    let read_theme = || -> String {
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(home.join("settings.json")).unwrap(),
+        )
+        .unwrap()["theme"]
+            .as_str()
+            .unwrap()
+            .into()
+    };
+    assert_eq!(read_theme(), "dark");
+    master.write_all(b"\x03").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Theme · dark") && text.contains("to change")
+    });
+    assert_eq!(read_theme(), "dark");
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Automatic · follow terminal appearance")
+    });
+    master.write_all(b"light\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Theme · light") && text.contains("to change")
+    });
+    assert_eq!(read_theme(), "light");
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Automatic · follow terminal appearance")
+    });
+    master.write_all(b"\x1b[H\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Automatic theme") && text.contains("Light theme · light")
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Light theme") && text.contains("system")
+    });
+    master.write_all(b"system\r").unwrap();
+    output_until(&mut master, |text| text.contains("Light theme · system"));
+    master.write_all(b"\x1b[B\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Dark theme") && text.contains("dark")
+    });
+    master.write_all(b"dark\r").unwrap();
+    output_until(&mut master, |text| text.contains("Dark theme · dark"));
+    master.write_all(b"\x1b[B\x1b[B\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Theme · system/dark") && text.contains("to change")
+    });
+    assert_eq!(read_theme(), "system/dark");
+}

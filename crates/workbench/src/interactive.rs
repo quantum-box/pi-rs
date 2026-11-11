@@ -10,7 +10,7 @@ use crate::ui::{
     keys::Keys,
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
-    picker::{Input, Item, Picker, Selection, TreeEntryKind, TreeFilter},
+    picker::{Input, Item, Picker, Selection, ThemeSettingsAction, TreeEntryKind, TreeFilter},
     render::{Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
@@ -375,6 +375,23 @@ enum LocalEditor {
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeSettingsStage {
+    Single,
+    Automatic,
+    Light,
+    Dark,
+}
+
+struct ThemeSettings {
+    parent: Picker,
+    original: Theme,
+    single: String,
+    light: String,
+    dark: String,
+    stage: ThemeSettingsStage,
+}
+
 #[derive(Clone, Copy)]
 enum ModelListIntent {
     Select,
@@ -469,6 +486,7 @@ struct View {
     widgets: std::collections::BTreeMap<String, (Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
     picker: Option<Picker>,
+    theme_settings: Option<ThemeSettings>,
     session_name: Option<String>,
     resources: super::resources::Resources,
     model_list: Option<ModelDiscovery>,
@@ -3021,7 +3039,10 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         {
             worker.take();
         }
-        if let Some(discovery) = &view.model_list {
+        if view.picker.is_none()
+            && view.dialog().is_none()
+            && let Some(discovery) = &view.model_list
+        {
             let intent = discovery.intent;
             match discovery.receiver.try_recv() {
                 Ok(Ok(models)) => {
@@ -3403,7 +3424,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 };
                 if changed {
                     let selection = args.use_theme.as_deref().unwrap_or("system");
-                    if selection.contains('/') {
+                    if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
+                        if let Ok(next) = settings.preview(picker, &args) {
+                            theme = next;
+                        }
+                    } else if selection.contains('/') {
                         match Theme::load(
                             selection,
                             &args.theme_paths,
@@ -3558,8 +3583,48 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 }
                 if let Some(mut picker) = view.picker.take() {
                     match picker.input(key, &keys) {
-                        Input::Continue => view.picker = Some(picker),
+                        Input::Continue => {
+                            if let Some(settings) = &view.theme_settings {
+                                match settings.preview(&picker, &args) {
+                                    Ok(next) => theme = next,
+                                    Err(error) => picker.show_feedback(Err(error.to_string())),
+                                }
+                            }
+                            view.picker = Some(picker);
+                        }
                         Input::Cancel => {
+                            if let Some(mut settings) = view.theme_settings.take() {
+                                match settings.stage {
+                                    ThemeSettingsStage::Single => {
+                                        theme = Theme::load(
+                                            args.use_theme.as_deref().unwrap_or("system"),
+                                            &args.theme_paths,
+                                            &args.workspace,
+                                            args.trusted,
+                                            false,
+                                        )
+                                        .unwrap_or(settings.original);
+                                        view.picker = Some(settings.parent);
+                                    }
+                                    ThemeSettingsStage::Automatic
+                                    | ThemeSettingsStage::Light
+                                    | ThemeSettingsStage::Dark => {
+                                        settings.stage =
+                                            if settings.stage == ThemeSettingsStage::Automatic {
+                                                ThemeSettingsStage::Single
+                                            } else {
+                                                ThemeSettingsStage::Automatic
+                                            };
+                                        let next = settings.picker(&args);
+                                        if let Ok(preview) = settings.preview(&next, &args) {
+                                            theme = preview;
+                                        }
+                                        view.picker = Some(next);
+                                        view.theme_settings = Some(settings);
+                                    }
+                                }
+                                continue;
+                            }
                             if let Some(id) = view.tree_confirmation.take()
                                 && let Err(error) = reopen_tree(&mut args, &mut view, id)
                             {
@@ -3621,6 +3686,85 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         Input::Select(selection) => {
                             view.tree_confirmation = None;
                             let settings = picker.title == "Settings";
+                            if settings
+                                && matches!(&selection, Selection::EditSetting(name) if name == "theme")
+                            {
+                                let theme_settings = ThemeSettings::new(picker, &args, &theme);
+                                view.picker = Some(theme_settings.picker(&args));
+                                view.theme_settings = Some(theme_settings);
+                                continue;
+                            }
+                            if let Selection::ThemeSettings(action) = selection {
+                                let mut state =
+                                    view.theme_settings.take().expect("theme settings picker");
+                                let commit = match action {
+                                    ThemeSettingsAction::Automatic => {
+                                        state.stage = ThemeSettingsStage::Automatic;
+                                        None
+                                    }
+                                    ThemeSettingsAction::Single => {
+                                        state.stage = ThemeSettingsStage::Single;
+                                        None
+                                    }
+                                    ThemeSettingsAction::Light => {
+                                        state.stage = ThemeSettingsStage::Light;
+                                        None
+                                    }
+                                    ThemeSettingsAction::Dark => {
+                                        state.stage = ThemeSettingsStage::Dark;
+                                        None
+                                    }
+                                    ThemeSettingsAction::Apply => {
+                                        Some(format!("{}/{}", state.light, state.dark))
+                                    }
+                                    ThemeSettingsAction::Pick(name) => match state.stage {
+                                        ThemeSettingsStage::Single => Some(name),
+                                        ThemeSettingsStage::Light => {
+                                            state.light = name;
+                                            state.stage = ThemeSettingsStage::Automatic;
+                                            None
+                                        }
+                                        ThemeSettingsStage::Dark => {
+                                            state.dark = name;
+                                            state.stage = ThemeSettingsStage::Automatic;
+                                            None
+                                        }
+                                        ThemeSettingsStage::Automatic => None,
+                                    },
+                                };
+                                if let Some(name) = commit {
+                                    match select(
+                                        Selection::Theme(name),
+                                        &mut args,
+                                        &mut view,
+                                        &mut theme,
+                                        &mut worker,
+                                    ) {
+                                        Ok(()) => {
+                                            let mut parent = state.parent;
+                                            parent.refresh_settings(settings_items(
+                                                &args,
+                                                &view,
+                                                worker.as_ref(),
+                                            ));
+                                            view.picker = Some(parent);
+                                        }
+                                        Err(error) => {
+                                            picker.show_feedback(Err(error.to_string()));
+                                            view.picker = Some(picker);
+                                            view.theme_settings = Some(state);
+                                        }
+                                    }
+                                } else {
+                                    let next = state.picker(&args);
+                                    if let Ok(preview) = state.preview(&next, &args) {
+                                        theme = preview;
+                                    }
+                                    view.picker = Some(next);
+                                    view.theme_settings = Some(state);
+                                }
+                                continue;
+                            }
                             let result =
                                 select(selection, &mut args, &mut view, &mut theme, &mut worker);
                             if settings {
@@ -4395,6 +4539,106 @@ fn start_tree_navigation(
     Ok(())
 }
 
+impl ThemeSettings {
+    fn new(parent: Picker, args: &Cli, theme: &Theme) -> Self {
+        let selected = args.use_theme.as_deref().unwrap_or("system");
+        let pair = crate::ui::theme::parse_auto_theme_setting(selected);
+        let (light, dark) = pair.unwrap_or((selected, selected));
+        Self {
+            parent,
+            original: theme.clone(),
+            single: theme.name.clone(),
+            light: light.into(),
+            dark: dark.into(),
+            stage: if pair.is_some() {
+                ThemeSettingsStage::Automatic
+            } else {
+                ThemeSettingsStage::Single
+            },
+        }
+    }
+
+    fn picker(&self, args: &Cli) -> Picker {
+        if self.stage == ThemeSettingsStage::Automatic {
+            return Picker::new(
+                "Automatic theme",
+                vec![
+                    Item {
+                        label: format!("Light theme · {}", self.light),
+                        selection: Selection::ThemeSettings(ThemeSettingsAction::Light),
+                    },
+                    Item {
+                        label: format!("Dark theme · {}", self.dark),
+                        selection: Selection::ThemeSettings(ThemeSettingsAction::Dark),
+                    },
+                    Item {
+                        label: "Use automatic theme".into(),
+                        selection: Selection::ThemeSettings(ThemeSettingsAction::Apply),
+                    },
+                    Item {
+                        label: "Choose a single theme".into(),
+                        selection: Selection::ThemeSettings(ThemeSettingsAction::Single),
+                    },
+                ],
+            );
+        }
+        let mut items = Vec::new();
+        if self.stage == ThemeSettingsStage::Single {
+            items.push(Item {
+                label: "Automatic · follow terminal appearance".into(),
+                selection: Selection::ThemeSettings(ThemeSettingsAction::Automatic),
+            });
+        }
+        items.extend(
+            Theme::discover(&args.theme_paths, &args.workspace, args.trusted, false)
+                .into_iter()
+                .map(|name| Item {
+                    label: name.clone(),
+                    selection: Selection::ThemeSettings(ThemeSettingsAction::Pick(name)),
+                }),
+        );
+        let (title, current) = match self.stage {
+            ThemeSettingsStage::Single => ("Theme", &self.single),
+            ThemeSettingsStage::Light => ("Light theme", &self.light),
+            ThemeSettingsStage::Dark => ("Dark theme", &self.dark),
+            ThemeSettingsStage::Automatic => unreachable!(),
+        };
+        let mut picker = Picker::new(title, items);
+        picker.focus_theme(current);
+        picker
+    }
+
+    fn preview(&self, picker: &Picker, args: &Cli) -> Result<Theme> {
+        let candidate = match (self.stage, picker.selected()) {
+            (
+                ThemeSettingsStage::Single,
+                Some(Selection::ThemeSettings(ThemeSettingsAction::Pick(name))),
+            ) => name,
+            (
+                ThemeSettingsStage::Single,
+                Some(Selection::ThemeSettings(ThemeSettingsAction::Automatic)),
+            ) => format!("{}/{}", self.light, self.dark),
+            (
+                ThemeSettingsStage::Light,
+                Some(Selection::ThemeSettings(ThemeSettingsAction::Pick(name))),
+            ) => format!("{name}/{}", self.dark),
+            (
+                ThemeSettingsStage::Dark,
+                Some(Selection::ThemeSettings(ThemeSettingsAction::Pick(name))),
+            ) => format!("{}/{name}", self.light),
+            (ThemeSettingsStage::Single, _) => self.single.clone(),
+            _ => format!("{}/{}", self.light, self.dark),
+        };
+        Theme::load(
+            &candidate,
+            &args.theme_paths,
+            &args.workspace,
+            args.trusted,
+            false,
+        )
+    }
+}
+
 fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
     let cache_mode = args.settings.string("cacheWarming").unwrap_or("streaming");
     let next_cache_mode = match cache_mode {
@@ -4450,6 +4694,10 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         },
         queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
         queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
+        Item {
+            label: format!("Theme · {}", args.use_theme.as_deref().unwrap_or("system")),
+            selection: Selection::EditSetting("theme".into()),
+        },
         Item {
             label: format!(
                 "Tool output · {} (toggle)",
@@ -4808,7 +5056,6 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         },
     ]);
     for name in [
-        "theme",
         "defaultModel",
         "defaultThinkingLevel",
         "modelThinkingLevels",
@@ -5107,6 +5354,11 @@ fn select(
             args.use_theme = Some(name);
             *theme = next;
         }
+        Selection::ThemeSettings(_) => {
+            return Err(Error::Config(
+                "theme settings require the interactive selector".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -5365,6 +5617,19 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn theme_settings_previews_selection_without_changing_original() {
+        use clap::Parser;
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.use_theme = Some("dark".into());
+        let dark = super::Theme::load("dark", &[], &args.workspace, false, false).unwrap();
+        let state = super::ThemeSettings::new(super::Picker::new("Settings", vec![]), &args, &dark);
+        let mut picker = state.picker(&args);
+        picker.paste("light");
+        assert_eq!(state.preview(&picker, &args).unwrap().name, "light");
+        assert_eq!(state.original.name, "dark");
+        assert_eq!(args.use_theme.as_deref(), Some("dark"));
+    }
     #[test]
     fn streams_tool_arguments_without_committing_preview() {
         let mut view = super::View::default();

@@ -1238,11 +1238,13 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
                 Err(error) => panic!("direct request not received: {error}"),
             };
             socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
             let mut reader = BufReader::new(socket.try_clone().unwrap());
             let mut first = String::new();
-            reader.read_line(&mut first).unwrap();
+            if reader.read_line(&mut first).is_err() || first.is_empty() {
+                continue;
+            }
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();

@@ -28,10 +28,20 @@ pub enum Selection {
     LoginRadius(crate::radius_auth::Method),
     LogoutRadius,
     Theme(String),
+    ThemeSettings(ThemeSettingsAction),
     Trust(bool),
     Thinking(String),
     Setting(String, serde_json::Value),
     EditSetting(String),
+}
+#[derive(Clone)]
+pub enum ThemeSettingsAction {
+    Automatic,
+    Single,
+    Light,
+    Dark,
+    Apply,
+    Pick(String),
 }
 pub struct Item {
     pub label: String,
@@ -200,6 +210,18 @@ impl Picker {
         self.query
             .extend(text.chars().filter(|character| !character.is_control()));
         self.selected = 0;
+    }
+
+    pub fn selected(&self) -> Option<Selection> {
+        self.matches()
+            .get(self.selected)
+            .map(|item| item.selection.clone())
+    }
+
+    pub fn focus_theme(&mut self, name: &str) {
+        if let Some(index) = self.matches().iter().position(|item| matches!(&item.selection, Selection::ThemeSettings(ThemeSettingsAction::Pick(value)) if value == name)) {
+            self.selected = index;
+        }
     }
 
     pub fn refresh_settings(&mut self, items: Vec<Item>) {
