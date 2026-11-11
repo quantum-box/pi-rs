@@ -280,47 +280,59 @@ impl Theme {
         self.colors.get(role).copied().unwrap_or(Color::Reset)
     }
     pub fn system() -> Self {
+        // Pi uses the terminal's ANSI slots when no palette has been reported.
         let roles = [
-            ("accent", Color::Cyan),
-            ("border", Color::DarkGrey),
-            ("borderAccent", Color::Cyan),
-            ("borderMuted", Color::DarkGrey),
-            ("text", Color::Reset),
-            ("muted", Color::Grey),
-            ("dim", Color::DarkGrey),
-            ("success", Color::Green),
-            ("warning", Color::Yellow),
-            ("error", Color::Red),
-            ("thinkingText", Color::DarkGrey),
-            ("mdHeading", Color::Yellow),
-            ("mdLink", Color::Blue),
-            ("mdLinkUrl", Color::DarkGrey),
-            ("mdCode", Color::Magenta),
-            ("mdCodeBlock", Color::Green),
-            ("mdQuote", Color::Grey),
-            ("mdQuoteBorder", Color::DarkGrey),
-            ("mdHr", Color::DarkGrey),
-            ("mdListBullet", Color::Cyan),
-            ("toolTitle", Color::Reset),
-            ("toolOutput", Color::Grey),
-            ("toolDiffAdded", Color::Green),
-            ("toolDiffRemoved", Color::Red),
-            ("toolDiffContext", Color::Grey),
-            ("thinkingOff", Color::DarkGrey),
-            ("thinkingMinimal", Color::DarkBlue),
-            ("thinkingLow", Color::Blue),
-            ("thinkingMedium", Color::Magenta),
-            ("thinkingHigh", Color::DarkMagenta),
-            ("thinkingXhigh", Color::Red),
-            ("thinkingMax", Color::Yellow),
-            ("bashMode", Color::Green),
+            ("accent", 5),
+            ("border", 4),
+            ("borderAccent", 5),
+            ("success", 2),
+            ("error", 1),
+            ("warning", 3),
+            ("mdHeading", 3),
+            ("mdLink", 4),
+            ("mdCode", 5),
+            ("mdCodeBlock", 2),
+            ("mdListBullet", 5),
+            ("customMessageLabel", 5),
+            ("toolDiffAdded", 2),
+            ("toolDiffRemoved", 1),
+            ("bashMode", 2),
+            ("syntaxKeyword", 4),
+            ("syntaxFunction", 3),
+            ("syntaxVariable", 6),
+            ("syntaxString", 2),
+            ("syntaxNumber", 5),
+            ("syntaxType", 5),
+            ("thinkingMinimal", 4),
+            ("thinkingLow", 4),
+            ("thinkingMedium", 6),
+            ("thinkingHigh", 5),
+            ("thinkingXhigh", 13),
+            ("thinkingMax", 1),
         ];
         Self {
             name: "system".into(),
             path: None,
             colors: roles
                 .into_iter()
-                .map(|(key, value)| (key.into(), value))
+                .map(|(key, index)| (key.into(), Color::AnsiValue(index)))
+                .chain(
+                    [
+                        ("borderMuted", Color::DarkGrey),
+                        ("muted", Color::Grey),
+                        ("dim", Color::DarkGrey),
+                        ("thinkingText", Color::DarkGrey),
+                        ("mdLinkUrl", Color::DarkGrey),
+                        ("mdQuote", Color::Grey),
+                        ("mdQuoteBorder", Color::DarkGrey),
+                        ("mdHr", Color::DarkGrey),
+                        ("toolOutput", Color::Grey),
+                        ("toolDiffContext", Color::Grey),
+                        ("thinkingOff", Color::DarkGrey),
+                    ]
+                    .into_iter()
+                    .map(|(key, color)| (key.into(), color)),
+                )
                 .collect(),
         }
     }
@@ -533,6 +545,25 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn system_fallback_uses_pi_terminal_palette_slots() {
+        let theme = Theme::system();
+        for (token, index) in [
+            ("accent", 5),
+            ("border", 4),
+            ("success", 2),
+            ("error", 1),
+            ("syntaxString", 2),
+            ("syntaxNumber", 5),
+            ("thinkingXhigh", 13),
+        ] {
+            assert_eq!(theme.color(token), Color::AnsiValue(index), "{token}");
+        }
+        for token in ["text", "toolTitle", "selectedBg", "toolErrorBg"] {
+            assert_eq!(theme.color(token), Color::Reset, "{token}");
+        }
+    }
+
     #[test]
     fn color_functions_accept_pi_syntax_and_validate_ranges() {
         let parse = |text: &str| {
