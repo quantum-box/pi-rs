@@ -304,6 +304,19 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    fn handles_session_transitions(&self) -> bool {
+        false
+    }
+
+    /// Return true to cancel a session switch or fork before it writes anything.
+    async fn before_session_transition(
+        &self,
+        _event: &crate::BeforeSessionTransition,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<bool> {
+        Ok(false)
+    }
+
     async fn before_tree(
         &self,
         _preparation: &crate::TreePreparation,
@@ -424,6 +437,45 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub fn has_session_transition_hooks(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.handles_session_transitions())
+    }
+
+    pub async fn session_transition_cancelled(
+        &self,
+        event: &crate::BeforeSessionTransition,
+        states: &ExtensionStates,
+        timeout: std::time::Duration,
+        observer: &mut crate::Observer<'_>,
+    ) -> bool {
+        let deadline =
+            tokio::time::Instant::now() + timeout.min(std::time::Duration::from_secs(10));
+        for extension in self
+            .extensions
+            .iter()
+            .filter(|extension| extension.handles_session_transitions())
+        {
+            let error = match tokio::time::timeout_at(
+                deadline,
+                extension.before_session_transition(event, states.get(extension.id())),
+            )
+            .await
+            {
+                Ok(Ok(true)) => return true,
+                Ok(Ok(false)) => continue,
+                Ok(Err(error)) => error,
+                Err(_) => "session transition hook timed out".into(),
+            };
+            observer(crate::Notification::ExtensionLifecycleError {
+                extension: extension.id(),
+                event: event.kind(),
+                message: &error,
+            });
+        }
+        false
+    }
     pub fn has_session_lifecycle_hooks(&self) -> bool {
         self.extensions
             .iter()

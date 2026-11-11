@@ -141,6 +141,10 @@ enum ProtocolRequest {
         preparation: TreePreparation,
         state: Option<ExtensionState>,
     },
+    BeforeSessionTransition {
+        event: pi_rs_core::BeforeSessionTransition,
+        state: Option<ExtensionState>,
+    },
     BeforeRequest {
         request: ModelRequest,
         summary: bool,
@@ -218,6 +222,8 @@ struct Description {
     cache_warming_hook: bool,
     #[serde(default)]
     tree_navigation_hook: bool,
+    #[serde(default)]
+    session_transition_hook: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
@@ -477,6 +483,20 @@ impl Extension for ExecutableExtension {
     }
     fn handles_tree_navigation(&self) -> bool {
         self.description.tree_navigation_hook
+    }
+    fn handles_session_transitions(&self) -> bool {
+        self.description.session_transition_hook
+    }
+    async fn before_session_transition(
+        &self,
+        event: &pi_rs_core::BeforeSessionTransition,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<bool> {
+        self.request_async(ProtocolRequest::BeforeSessionTransition {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
     }
     async fn before_tree(
         &self,
@@ -1190,6 +1210,7 @@ async fn dispatch_with_host(
             session_info_hook: true,
             cache_warming_hook: extension.handles_cache_warming(),
             tree_navigation_hook: extension.handles_tree_navigation(),
+            session_transition_hook: extension.handles_session_transitions(),
             tools: extension
                 .tools()
                 .into_iter()
@@ -1229,6 +1250,11 @@ async fn dispatch_with_host(
         ProtocolRequest::BeforeTree { preparation, state } => encode(
             extension
                 .before_tree(&preparation, state.as_ref(), &CancellationToken::new())
+                .await,
+        ),
+        ProtocolRequest::BeforeSessionTransition { event, state } => encode(
+            extension
+                .before_session_transition(&event, state.as_ref())
                 .await,
         ),
         ProtocolRequest::BeforeRequest {

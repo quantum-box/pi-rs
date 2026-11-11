@@ -31,6 +31,10 @@ enum Request {
         session: PathBuf,
     },
     CacheWarmingChanged,
+    CheckSessionTransition {
+        id: Uuid,
+        event: pi_rs::BeforeSessionTransition,
+    },
     SessionInfoChanged {
         session: PathBuf,
         name: Option<String>,
@@ -219,7 +223,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     let (shell_completed, mut shell_results) = mpsc::channel(1);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
-    let initial_records = Session::open(&args.session)?.records().to_vec();
+    let initial_records = match Session::snapshot(&args.session) {
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Session::open(&args.session)?
+        }
+        result => result?,
+    }
+    .records()
+    .to_vec();
     let snapshot = Arc::new(Mutex::new(SessionSnapshot::new(
         initial_records,
         args.mode == Some(super::OutputMode::Rpc),
@@ -329,6 +340,36 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             break;
         }
         if matches!(request, Request::CacheWarmingChanged) {
+            continue;
+        }
+        if let Request::CheckSessionTransition { id, event } = request {
+            let result = if runtime.registry.has_session_transition_hooks() {
+                match Session::snapshot(&args.session) {
+                    Ok(session) if session.host_binding().is_none() => Ok(runtime
+                        .registry
+                        .session_transition_cancelled(
+                            &event,
+                            &session.extension_states(),
+                            args.tool_timeout(),
+                            &mut |notification| observe(notification, args.trace),
+                        )
+                        .await),
+                    Ok(_) => Err(Error::Session(
+                        "managed session transitions require their host".into(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            } else {
+                Ok(false)
+            };
+            match result {
+                Ok(cancelled) => output(
+                    json!({"type":"session_transition_checked","id":id,"cancelled":cancelled}),
+                ),
+                Err(error) => output(
+                    json!({"type":"session_transition_checked","id":id,"error":error.to_string()}),
+                ),
+            }
             continue;
         }
         if let Request::SessionInfoChanged { session, name } = request {
@@ -1095,6 +1136,7 @@ fn read_requests(
                         request,
                         Request::Configure { .. }
                             | Request::CacheWarmingChanged
+                            | Request::CheckSessionTransition { .. }
                             | Request::SessionInfoChanged { .. }
                     );
                     if counted {

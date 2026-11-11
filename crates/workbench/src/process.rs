@@ -33,7 +33,8 @@ pub(super) struct Worker {
     configuration: Value,
     pub(super) child: Child,
     stdin: Option<ChildStdin>,
-    pub(super) events: Receiver<Value>,
+    events: Receiver<Value>,
+    pending_events: Vec<Value>,
     pub(super) readers: Vec<JoinHandle<()>>,
 }
 impl Worker {
@@ -219,6 +220,7 @@ impl Worker {
             child,
             stdin,
             events,
+            pending_events: Vec::new(),
             readers,
         })
     }
@@ -274,6 +276,45 @@ impl Worker {
     pub(super) fn matches(&self, args: &Cli) -> bool {
         self.persistent && self.configuration == configuration(args)
     }
+    pub(super) fn drain_events(&mut self) -> Vec<Value> {
+        let mut events = std::mem::take(&mut self.pending_events);
+        events.extend(
+            self.events
+                .try_iter()
+                .filter(|event| event["type"] != "session_transition_checked"),
+        );
+        events
+    }
+
+    pub(super) fn check_session_transition(
+        active: Option<&mut Self>,
+        event: pi_rs::BeforeSessionTransition,
+    ) -> Result<bool> {
+        let Some(active) = active else {
+            return Ok(false);
+        };
+        let id = json!(uuid::Uuid::new_v4());
+        active.send(json!({"type":"check_session_transition","id":id,"event":event}))?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let event = active
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| {
+                    Error::Config(format!("could not check the session transition: {error}"))
+                })?;
+            if event["type"] == "session_transition_checked" {
+                if event["id"] != id {
+                    continue;
+                }
+                if let Some(error) = event["error"].as_str() {
+                    return Err(Error::Config(error.to_owned()));
+                }
+                return Ok(event["cancelled"] == true);
+            }
+            active.pending_events.push(event);
+        }
+    }
     pub(super) fn notify_session_name(&mut self, args: &Cli, name: Option<String>) -> Result<()> {
         if self.session == args.session {
             self.send(json!({"type":"session_info_changed","session":args.session,"name":name}))?;
@@ -302,12 +343,11 @@ impl Worker {
             shutdown_reason(reason),
             replacing_session.then(|| args.session.clone()),
         ));
+        let pending_events = std::mem::take(&mut active.pending_events);
         drop(slot.take());
-        *slot = Some(Self::start_with_transition(
-            args,
-            &["serve"],
-            Some((reason, previous)),
-        )?);
+        let mut next = Self::start_with_transition(args, &["serve"], Some((reason, previous)))?;
+        next.pending_events = pending_events;
+        *slot = Some(next);
         Ok(())
     }
 

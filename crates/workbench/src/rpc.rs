@@ -52,7 +52,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut stream = super::rpc_events::Stream::default();
     loop {
         if let Some(active) = &mut worker {
-            for event in active.events.try_iter() {
+            for event in active.drain_events() {
                 acknowledge(&mut pending_queries, &event);
                 acknowledge(&mut pending_inputs, &event);
                 match event["type"].as_str() {
@@ -76,7 +76,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
-                for event in finished.events.try_iter() {
+                for event in finished.drain_events() {
                     acknowledge(&mut pending_queries, &event);
                     acknowledge(&mut pending_inputs, &event);
                     forward_event(
@@ -387,6 +387,9 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             None
         };
         let result = command(&request, &mut args, &mut worker).and_then(|data| {
+            if data.as_ref().is_some_and(|data| data["cancelled"] == true) {
+                return Ok(data);
+            }
             let reason = match request["type"].as_str() {
                 Some("new_session") => pi_rs::SessionStartReason::New,
                 Some("switch_session") => pi_rs::SessionStartReason::Resume,
@@ -532,12 +535,24 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .as_str()
                 .ok_or_else(|| Error::Config("sessionPath is required".into()))?;
             let path = args.workspace.join(path);
+            if !path.is_file() {
+                return Err(Error::Config("session file not found".into()));
+            }
+            if Worker::check_session_transition(
+                worker.as_mut(),
+                pi_rs::BeforeSessionTransition::Switch {
+                    reason: pi_rs::SessionSwitchReason::Resume,
+                    target_session_file: Some(path.clone()),
+                },
+            )? {
+                return Ok(Some(json!({"cancelled":true})));
+            }
             switch_session(args, &path)?;
             Ok(Some(json!({"cancelled":false})))
         }
         "fork" | "clone" if !busy(worker) => {
             let session = Session::open(&args.session)?;
-            let (target, text) = if name == "fork" {
+            let (entry_id, position, target, text) = if name == "fork" {
                 let entry = record_id(&request["entryId"])?;
                 let id = super::rpc_entries::editable_record(&session, entry);
                 let record = session
@@ -549,13 +564,29 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                     pi_rs::Event::User { content, .. }
                     | pi_rs::Event::UserWithImages { content, .. } => {
                         let source = &session.records()[entry as usize - 1];
-                        (source.parent.unwrap_or(1), Some(content.clone()))
+                        (
+                            entry,
+                            pi_rs::ForkPosition::Before,
+                            source.parent.unwrap_or(1),
+                            Some(content.clone()),
+                        )
                     }
                     _ => return Err(Error::Config("fork must select a user message".into())),
                 }
             } else {
-                (session.head(), None)
+                (
+                    session.head(),
+                    pi_rs::ForkPosition::At,
+                    session.head(),
+                    None,
+                )
             };
+            if Worker::check_session_transition(
+                worker.as_mut(),
+                pi_rs::BeforeSessionTransition::Fork { entry_id, position },
+            )? {
+                return Ok(Some(json!({"cancelled":true})));
+            }
             let destination = if args.no_session {
                 args.session
                     .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
@@ -582,6 +613,15 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 Some(Value::String(path)) => Some(path.as_str()).filter(|path| !path.is_empty()),
                 Some(_) => return Err(Error::Config("parentSession must be a string".into())),
             };
+            if Worker::check_session_transition(
+                worker.as_mut(),
+                pi_rs::BeforeSessionTransition::Switch {
+                    reason: pi_rs::SessionSwitchReason::New,
+                    target_session_file: None,
+                },
+            )? {
+                return Ok(Some(json!({"cancelled":true})));
+            }
             let destination = if args.no_session {
                 args.session
                     .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))

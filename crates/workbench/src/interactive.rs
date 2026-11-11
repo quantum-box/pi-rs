@@ -1906,7 +1906,12 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
 
 const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. Ctrl+Shift+F finds transcript text. Ctrl+Up/Down jumps between prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
-fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>> {
+fn slash(
+    input: &str,
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Worker>,
+) -> Result<Option<Worker>> {
     let (name, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
     let rest = rest.trim();
     match name {
@@ -2002,7 +2007,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         }
         "/clone" | "/fork" => {
             let session = Session::open(&args.session)?;
-            let (target, input) = if name == "/fork" {
+            let (entry_id, position, target, input) = if name == "/fork" {
                 let target = rest
                     .parse::<u64>()
                     .map_err(|_| Error::Config("use /fork <user-record-id>".into()))?;
@@ -2016,10 +2021,27 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
                 else {
                     return Err(Error::Config("fork must select a user message".into()));
                 };
-                (record.parent.unwrap_or(1), Some(content.clone()))
+                (
+                    record.id,
+                    pi_rs::ForkPosition::Before,
+                    record.parent.unwrap_or(1),
+                    Some(content.clone()),
+                )
             } else {
-                (session.head(), None)
+                (
+                    session.head(),
+                    pi_rs::ForkPosition::At,
+                    session.head(),
+                    None,
+                )
             };
+            if Worker::check_session_transition(
+                worker,
+                pi_rs::BeforeSessionTransition::Fork { entry_id, position },
+            )? {
+                view.append("Session fork cancelled");
+                return Ok(None);
+            }
             let destination = session_path(&args.workspace, args.session_dir.as_deref());
             sessions::fork(
                 &session,
@@ -2206,6 +2228,16 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         }
         "/thinking" => super::thinking::set(args, rest)?,
         "/new" => {
+            if Worker::check_session_transition(
+                worker,
+                pi_rs::BeforeSessionTransition::Switch {
+                    reason: pi_rs::SessionSwitchReason::New,
+                    target_session_file: None,
+                },
+            )? {
+                view.append("New session cancelled");
+                return Ok(None);
+            }
             let mut next = args.clone();
             next.session = session_path(&args.workspace, args.session_dir.as_deref());
             if let Some(directory) = next.session.parent() {
@@ -2298,6 +2330,16 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             let path = PathBuf::from(rest);
             if !path.is_file() {
                 return Err(Error::Config("session file not found".into()));
+            }
+            if Worker::check_session_transition(
+                worker,
+                pi_rs::BeforeSessionTransition::Switch {
+                    reason: pi_rs::SessionSwitchReason::Resume,
+                    target_session_file: Some(path.clone()),
+                },
+            )? {
+                view.append("Session resume cancelled");
+                return Ok(None);
             }
             switch_session(args, view, path)?;
         }
@@ -2527,14 +2569,14 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     view.restore(&args)?;
     view.resources = initial_resources;
     if args.trust_pending {
-        slash("/trust", &mut args, &mut view)?;
+        slash("/trust", &mut args, &mut view, None)?;
     }
     if args
         .resume_session
         .as_ref()
         .is_some_and(|path| path.as_os_str().is_empty())
     {
-        slash("/resume", &mut args, &mut view)?;
+        slash("/resume", &mut args, &mut view, None)?;
     }
     let mut keys = Keys::load()?;
     let mut _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
@@ -2668,7 +2710,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
             if (active.busy || active.bashing) && view.request_started.is_none() {
                 view.request_started = Some(Instant::now());
             }
-            let events: Vec<_> = active.events.try_iter().collect();
+            let events: Vec<_> = active.drain_events();
             for value in events {
                 if value["type"] == "extension_ui_request" {
                     match view.ui_request(&value) {
@@ -2741,7 +2783,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
-                for value in finished.events.try_iter() {
+                for value in finished.drain_events() {
                     view.receive_worker(value, &args);
                 }
                 view.settle();
@@ -3197,7 +3239,9 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 now.duration_since(last) < Duration::from_millis(500)
                             }) {
                                 let command = if action == "fork" { "/fork" } else { "/tree" };
-                                if let Err(error) = slash(command, &mut args, &mut view) {
+                                if let Err(error) =
+                                    slash(command, &mut args, &mut view, worker.as_mut())
+                                {
                                     view.append(&error.to_string());
                                 }
                             } else {
@@ -3215,7 +3259,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             "app.session.fork" => "/fork",
                             _ => "/resume",
                         };
-                        if let Err(error) = slash(command, &mut args, &mut view) {
+                        if let Err(error) = slash(command, &mut args, &mut view, worker.as_mut()) {
                             view.append(&error.to_string());
                         }
                     }
@@ -3727,7 +3771,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 view.editor.replace(input);
                             }
                         } else if input.trim() == "/session" && view.draft_images.is_empty() {
-                            if let Err(error) = slash(&input, &mut args, &mut view) {
+                            if let Err(error) = slash(&input, &mut args, &mut view, worker.as_mut())
+                            {
                                 view.append(&error.to_string());
                             }
                         } else if is_busy(&worker) && auth_command {
@@ -3778,7 +3823,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
                             args.session_transition = Some(pi_rs::SessionStartReason::Reload);
                         } else if input.starts_with('/') {
-                            match slash(&input, &mut args, &mut view) {
+                            match slash(&input, &mut args, &mut view, worker.as_mut()) {
                                 Ok(Some(next)) => worker = Some(next),
                                 Ok(None) => {
                                     if let Some(mut request) = view.pending_request.take() {
@@ -4120,7 +4165,7 @@ fn update_model_scope(
 }
 
 fn reopen_tree(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
-    slash("/tree", args, view)?;
+    slash("/tree", args, view, None)?;
     if let Some(picker) = &mut view.picker {
         picker.focus_record(id);
     }
@@ -4218,7 +4263,7 @@ fn select(
                 }
             }
             drop(session);
-            slash("/resume", args, view)?;
+            slash("/resume", args, view, None)?;
         }
         Selection::DeleteSession(path) => {
             if path.canonicalize()? == args.session.canonicalize()? {
@@ -4232,14 +4277,19 @@ fn select(
             }
             std::fs::remove_file(&path)?;
             drop(session);
-            slash("/resume", args, view)?;
+            slash("/resume", args, view, None)?;
         }
         Selection::Resume(path) => {
-            slash(&format!("/resume {}", path.display()), args, view)?;
+            slash(
+                &format!("/resume {}", path.display()),
+                args,
+                view,
+                worker.as_mut(),
+            )?;
         }
         Selection::Label(id, label) => {
             Session::open(&args.session)?.set_label(id, (!label.is_empty()).then_some(label))?;
-            slash("/tree", args, view)?;
+            slash("/tree", args, view, None)?;
             if let Some(picker) = &mut view.picker {
                 picker.focus_record(id);
             }
@@ -4271,7 +4321,7 @@ fn select(
             view.local_editor = Some((LocalEditor::BranchSummary(id), dialog));
         }
         Selection::Fork(id) => {
-            slash(&format!("/fork {id}"), args, view)?;
+            slash(&format!("/fork {id}"), args, view, worker.as_mut())?;
         }
         Selection::Model(model) => {
             select_model_input(args, view, &model)?;
@@ -4432,7 +4482,7 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
     view.resources = resources;
     *args = next;
     if args.trust_pending {
-        slash("/trust", args, view)?;
+        slash("/trust", args, view, None)?;
     }
     Ok(())
 }
@@ -4684,7 +4734,7 @@ mod tests {
         args.session_dir = Some(sessions.clone());
         let mut view = super::View::default();
 
-        super::slash("/new", &mut args, &mut view).unwrap();
+        super::slash("/new", &mut args, &mut view, None).unwrap();
 
         assert_eq!(args.session.parent(), Some(sessions.as_path()));
         assert!(args.session.is_file());

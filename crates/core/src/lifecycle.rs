@@ -67,6 +67,44 @@ pub enum SessionShutdownReason {
     Fork,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSwitchReason {
+    New,
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkPosition {
+    Before,
+    At,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum BeforeSessionTransition {
+    #[serde(rename = "session_before_switch")]
+    Switch {
+        reason: SessionSwitchReason,
+        target_session_file: Option<PathBuf>,
+    },
+    #[serde(rename = "session_before_fork")]
+    Fork {
+        entry_id: u64,
+        position: ForkPosition,
+    },
+}
+
+impl BeforeSessionTransition {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Switch { .. } => "session_before_switch",
+            Self::Fork { .. } => "session_before_fork",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LifecycleEvent {

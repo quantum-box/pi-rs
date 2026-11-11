@@ -620,6 +620,45 @@ impl AgentSession {
         fork.session_file = Some(destination);
         Ok(fork)
     }
+    /// Fork before or at an entry after consulting the source session's extensions.
+    pub async fn fork_with_hooks(
+        &mut self,
+        entry_id: u64,
+        position: crate::ForkPosition,
+        destination: Option<&Path>,
+    ) -> Result<Self> {
+        self.ensure_open()?;
+        let record = self
+            .session
+            .records()
+            .iter()
+            .find(|record| record.id == entry_id)
+            .ok_or_else(|| Error::Session("invalid fork entry".into()))?;
+        let target = match position {
+            crate::ForkPosition::Before => record.parent.unwrap_or(1),
+            crate::ForkPosition::At => record.id,
+        };
+        self.start().await?;
+        if self.registry.has_session_transition_hooks() {
+            let events = self.events.as_ref().expect("open session");
+            if self
+                .registry
+                .session_transition_cancelled(
+                    &crate::BeforeSessionTransition::Fork { entry_id, position },
+                    &self.session.extension_states(),
+                    self.limits.tool_timeout,
+                    &mut |notification| emit(events, &notification),
+                )
+                .await
+            {
+                return Err(Error::Cancelled);
+            }
+        }
+        match destination {
+            Some(path) => self.fork_to(target, path),
+            None => self.fork_at(target),
+        }
+    }
     pub fn export_jsonl(&self, destination: impl AsRef<Path>) -> Result<()> {
         self.ensure_open()?;
         self.session.export_jsonl(destination)
@@ -1003,6 +1042,73 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct NameHook(Arc<Mutex<Vec<crate::LifecycleEvent>>>);
+
+    struct ForkHook(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl Extension for ForkHook {
+        fn id(&self) -> &str {
+            "fork-hook"
+        }
+        fn handles_session_transitions(&self) -> bool {
+            true
+        }
+        async fn before_session_transition(
+            &self,
+            event: &crate::BeforeSessionTransition,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<bool> {
+            assert!(matches!(event, crate::BeforeSessionTransition::Fork { .. }));
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_fork_hook_can_veto_before_creating_a_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("fork.jsonl");
+        let veto = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .extension(Arc::new(ForkHook(veto.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        session.prompt("selected").await.unwrap();
+        let entry_id = session
+            .journal()
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event, crate::Event::User { content, .. } if content == "selected"
+                )
+            })
+            .unwrap()
+            .id;
+        let head = session.journal().head();
+        assert!(matches!(
+            session
+                .fork_with_hooks(entry_id, crate::ForkPosition::Before, Some(&destination))
+                .await,
+            Err(Error::Cancelled)
+        ));
+        assert!(!destination.exists());
+        assert_eq!(session.journal().head(), head);
+        veto.store(false, Ordering::SeqCst);
+        let before = session
+            .fork_with_hooks(entry_id, crate::ForkPosition::Before, Some(&destination))
+            .await
+            .unwrap();
+        assert_eq!(before.messages().unwrap().len(), 2);
+        let at = session
+            .fork_with_hooks(entry_id, crate::ForkPosition::At, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(at.messages().unwrap().last(), Some(Message::User { content }) if content == "selected")
+        );
+    }
 
     #[async_trait::async_trait]
     impl Extension for NameHook {
