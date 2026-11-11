@@ -339,10 +339,9 @@ pub fn html(session: &Session) -> String {
                 ..
             } => {
                 if !content.is_empty() {
-                    html.push_str(&format!(
-                        "<article><b>Pi</b><pre>{}</pre></article>",
-                        escape(content)
-                    ));
+                    html.push_str("<article><b>Pi</b>");
+                    render_export_markdown(&mut html, content);
+                    html.push_str("</article>");
                 }
                 for invocation in invocations {
                     html.push_str(&format!(
@@ -360,14 +359,16 @@ pub fn html(session: &Session) -> String {
                     html.push_str(&format!("<details class=\"thinking\"><summary>Thinking</summary><pre>{}</pre></details>", escape(reasoning)));
                 }
             }
-            Event::Compacted { summary, .. } => html.push_str(&format!(
-                "<details><summary>Compacted context</summary><pre>{}</pre></details>",
-                escape(summary)
-            )),
-            Event::BranchSummary { summary, .. } => html.push_str(&format!(
-                "<details><summary>Branch summary</summary><pre>{}</pre></details>",
-                escape(summary)
-            )),
+            Event::Compacted { summary, .. } | Event::BranchSummary { summary, .. } => {
+                let label = if matches!(record.event, Event::Compacted { .. }) {
+                    "Compacted context"
+                } else {
+                    "Branch summary"
+                };
+                html.push_str(&format!("<details><summary>{label}</summary>"));
+                render_export_markdown(&mut html, summary);
+                html.push_str("</details>");
+            }
             _ => {}
         }
     }
@@ -376,28 +377,24 @@ pub fn html(session: &Session) -> String {
 }
 
 fn render_user_html(html: &mut String, content: &str, images: &[pi_rs::ImageContent]) {
-    if let Some((name, body, message)) = super::resources::skill_invocation(content) {
+    let text = if let Some((name, body, message)) = super::resources::skill_invocation(content) {
         html.push_str(&format!(
             "<details class=\"skill\"><summary>[skill] {}</summary>",
             escape(name)
         ));
         render_export_markdown(html, body);
         html.push_str("</details>");
-        if message.is_some() || !images.is_empty() {
-            html.push_str("<article class=\"user\"><b>You</b>");
-            if let Some(message) = message {
-                render_export_markdown(html, message);
-            }
-            html.push_str(&images_html(images));
-            html.push_str("</article>");
+        if message.is_none() && images.is_empty() {
+            return;
         }
-        return;
-    }
-    html.push_str(&format!(
-        "<article class=\"user\"><b>You</b><pre>{}</pre>{}</article>",
-        escape(content),
-        images_html(images)
-    ));
+        message.unwrap_or_default()
+    } else {
+        content
+    };
+    html.push_str("<article class=\"user\"><b>You</b>");
+    render_export_markdown(html, text);
+    html.push_str(&images_html(images));
+    html.push_str("</article>");
 }
 
 fn render_export_markdown(html: &mut String, markdown: &str) {

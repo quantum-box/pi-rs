@@ -179,7 +179,8 @@ The TUI displays a folded skill panel with the configured tool expansion key.
 User text remains visible below the panel, including when a session is reopened.
 In fullscreen mode, clicking a skill panel toggles that panel independently.
 HTML exports also fold the skill body and keep user text and images outside
-the fold. Skill content and the accompanying user text render as Markdown.
+the fold. Skill content, conversation messages, and branch and compaction
+summaries render as Markdown.
 Raw HTML is escaped, and Markdown images leave their alt text without loading
 external image sources.
 Prompt-template arguments preserve literal backslashes and quoted empty

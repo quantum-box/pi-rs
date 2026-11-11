@@ -820,7 +820,11 @@ fn export_flag_replaces_html_and_preserves_source() {
     let input = directory.path().join("session.jsonl");
     let mut session = Session::with_store(MemoryStore::default()).unwrap();
     session
-        .append_user_with_images("export <marker>".into(), Vec::new(), None)
+        .append_user_with_images(
+            "export <marker>\n\n## Export heading".into(),
+            Vec::new(),
+            None,
+        )
         .unwrap();
     session.export_jsonl(&input).unwrap();
     let before = std::fs::read(&input).unwrap();
@@ -840,11 +844,10 @@ fn export_flag_replaces_html_and_preserves_source() {
         String::from_utf8_lossy(&output.stdout),
         "Exported to: pi-session-session.html\n"
     );
-    assert!(
-        std::fs::read_to_string(directory.path().join("pi-session-session.html"))
-            .unwrap()
-            .contains("export &lt;marker&gt;")
-    );
+    let document =
+        std::fs::read_to_string(directory.path().join("pi-session-session.html")).unwrap();
+    assert!(document.contains("export &lt;marker&gt;"));
+    assert!(document.contains("<h2>Export heading</h2>"));
     let destination = directory.path().join("transcript.jsonl");
     std::fs::write(&destination, "old").unwrap();
     assert!(export(Some(&destination)).status.success());
