@@ -507,12 +507,14 @@ impl AgentSession {
                 &mut observer,
             )
             .await;
+        if result.is_ok() {
+            self.refresh_input_hooks();
+            if let Some((model, _)) = self.session.model_selection() {
+                self.model_name = model;
+            }
+        }
         let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
         result.and(final_inputs)?;
-        self.refresh_input_hooks();
-        if let Some((model, _)) = self.session.model_selection() {
-            self.model_name = model;
-        }
         let summary_entry = self.session.records()[first_record..]
             .iter()
             .find(|record| matches!(record.event, crate::Event::BranchSummary { .. }))
