@@ -2816,3 +2816,13 @@ normalized name. The terminal resume selector uses the same notification
 when it renames the active session. Pending name notifications are
 delivered before an orderly worker shutdown. Executables built before
 this event continue to receive their supported session events.
+
+SDK subscribers receive `SessionEvent::SessionInfoChanged` after the
+journal record. Embedders can use `AgentSession::set_name_with_hooks`
+to also await the native extension notification. Both forms report the
+normalized name, including a cleared name.
+The first model operation, tree navigation, or hook-aware rename
+delivers the start hook. An embedder can call `AgentSession::start`
+explicitly. An owned fork reports the fork reason and the source path
+when the SDK opened the source file. Closing a started
+session delivers its shutdown hook before releasing registry resources.

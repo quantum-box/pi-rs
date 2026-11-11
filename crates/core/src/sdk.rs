@@ -1,5 +1,5 @@
 //! Owned session API for embedding the agent in long-lived native applications.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, mpsc};
@@ -19,6 +19,9 @@ pub enum SessionEvent {
         run_id: Uuid,
     },
     Record(Arc<Record>),
+    SessionInfoChanged {
+        name: Option<String>,
+    },
     Request(Arc<ModelRequest>),
     Text(String),
     Reasoning(String),
@@ -291,7 +294,10 @@ impl SessionBuilder {
         Ok(self)
     }
     pub fn open(self, path: impl AsRef<Path>) -> Result<AgentSession> {
-        self.build(Session::open(path)?)
+        let path = std::path::absolute(path)?;
+        let mut session = self.build(Session::open(&path)?)?;
+        session.session_file = Some(path);
+        Ok(session)
     }
     pub fn ui(mut self, ui: Arc<dyn crate::ExtensionUi>) -> Self {
         self.registry.set_ui(ui);
@@ -332,6 +338,8 @@ impl SessionBuilder {
                 input_order: Arc::new(tokio::sync::Mutex::new(())),
             },
             closed: false,
+            pending_start: Some((crate::SessionStartReason::Startup, None)),
+            session_file: None,
         })
     }
 }
@@ -349,6 +357,8 @@ pub struct AgentSession {
     control: SessionControl,
     events: Option<broadcast::Sender<SessionEvent>>,
     closed: bool,
+    pending_start: Option<(crate::SessionStartReason, Option<PathBuf>)>,
+    session_file: Option<PathBuf>,
 }
 impl AgentSession {
     pub fn auto_compaction_enabled(&self) -> bool {
@@ -473,7 +483,7 @@ impl AgentSession {
         selected: u64,
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
-        self.ensure_open()?;
+        self.start().await?;
         let first_record = self.session.records().len();
         let editor_text = self
             .session
@@ -529,7 +539,50 @@ impl AgentSession {
         self.ensure_open()?;
         self.session.set_name(name)?;
         self.emit_last();
+        if let Some(events) = &self.events {
+            let _ = events.send(SessionEvent::SessionInfoChanged {
+                name: self.session.name().map(str::to_owned),
+            });
+        }
         Ok(())
+    }
+
+    /// Save the name and deliver the resulting metadata to session lifecycle extensions.
+    pub async fn set_name_with_hooks(&mut self, name: &str) -> Result<()> {
+        self.start().await?;
+        self.set_name(name)?;
+        self.notify_session_event(crate::LifecycleEvent::SessionInfoChanged {
+            name: self.session.name().map(str::to_owned),
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
+    pub async fn start(&mut self) -> Result<()> {
+        self.ensure_open()?;
+        if let Some((reason, previous_session_file)) = self.pending_start.take() {
+            self.notify_session_event(crate::LifecycleEvent::SessionStart {
+                reason,
+                previous_session_file,
+            })
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn notify_session_event(&mut self, event: crate::LifecycleEvent) {
+        if self.registry.has_session_lifecycle_hooks() {
+            let events = self.events.as_ref().expect("open session");
+            crate::lifecycle::notify(
+                &self.registry,
+                event,
+                &self.session.extension_states(),
+                self.limits.tool_timeout,
+                &mut |notification| emit(events, &notification),
+            )
+            .await;
+        }
     }
     /// Changes future model context while retaining the original transcript and effects.
     pub fn edit_context(
@@ -562,7 +615,10 @@ impl AgentSession {
     }
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
         self.ensure_open()?;
-        self.fork_session(self.session.fork_to(record, destination)?)
+        let destination = std::path::absolute(destination)?;
+        let mut fork = self.fork_session(self.session.fork_to(record, &destination)?)?;
+        fork.session_file = Some(destination);
+        Ok(fork)
     }
     pub fn export_jsonl(&self, destination: impl AsRef<Path>) -> Result<()> {
         self.ensure_open()?;
@@ -587,6 +643,7 @@ impl AgentSession {
             .limits(self.limits.clone())
             .build(session)?;
         fork.registry = self.registry.clone();
+        fork.pending_start = Some((crate::SessionStartReason::Fork, self.session_file.clone()));
         fork.refresh_input_hooks();
         Ok(fork)
     }
@@ -638,7 +695,7 @@ impl AgentSession {
         prepare: bool,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
-        self.ensure_open()?;
+        self.start().await?;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let mut started = false;
@@ -778,7 +835,7 @@ impl AgentSession {
         keep_turns: Option<usize>,
         instructions: Option<&str>,
     ) -> Result<()> {
-        self.ensure_open()?;
+        self.start().await?;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let agent = Agent {
@@ -829,6 +886,13 @@ impl AgentSession {
         self.input.close();
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
         while self.input.try_recv().is_ok() {}
+        if self.pending_start.is_none() {
+            self.notify_session_event(crate::LifecycleEvent::SessionShutdown {
+                reason: crate::SessionShutdownReason::Quit,
+                target_session_file: None,
+            })
+            .await;
+        }
         let registry = std::mem::replace(&mut self.registry, Arc::new(Registry::default()));
         let result = if Arc::strong_count(&registry) == 1 {
             registry.shutdown().await
@@ -937,6 +1001,84 @@ mod tests {
     use super::*;
     use crate::{ModelEvent, ModelStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct NameHook(Arc<Mutex<Vec<crate::LifecycleEvent>>>);
+
+    #[async_trait::async_trait]
+    impl Extension for NameHook {
+        fn id(&self) -> &str {
+            "name-hook"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(
+                event,
+                crate::LifecycleEvent::SessionStart { .. }
+                    | crate::LifecycleEvent::SessionInfoChanged { .. }
+                    | crate::LifecycleEvent::SessionShutdown { .. }
+            ) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_name_updates_emit_committed_metadata_and_invoke_async_hooks() {
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("session.jsonl");
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .extension(Arc::new(NameHook(names.clone())))
+            .unwrap()
+            .open(&source)
+            .unwrap();
+        let mut events = session.subscribe();
+        for (input, expected) in [("  設計\nレビュー  ", Some("設計 レビュー")), (" ", None)]
+        {
+            session.set_name_with_hooks(input).await.unwrap();
+            assert_eq!(session.journal().name(), expected);
+            assert!(
+                matches!(events.try_recv().unwrap(), SessionEvent::Record(record)
+                if matches!(record.event, crate::Event::SessionInfo { .. }))
+            );
+            assert!(
+                matches!(events.try_recv().unwrap(), SessionEvent::SessionInfoChanged { name }
+                if name.as_deref() == expected)
+            );
+        }
+        session.start().await.unwrap();
+        let mut fork = session
+            .fork_to(
+                session.journal().head(),
+                directory.path().join("fork.jsonl"),
+            )
+            .unwrap();
+        fork.prompt("begin fork").await.unwrap();
+        fork.close().await.unwrap();
+        session.close().await.unwrap();
+        use crate::{
+            LifecycleEvent as Event, SessionShutdownReason as Stop, SessionStartReason as Start,
+        };
+        assert!(matches!(names.lock().unwrap().as_slice(), [
+            Event::SessionStart { reason: Start::Startup, .. },
+            Event::SessionInfoChanged { name: Some(name) },
+            Event::SessionInfoChanged { name: None },
+            Event::SessionStart { reason: Start::Fork, previous_session_file: Some(previous) },
+            Event::SessionShutdown { reason: Stop::Quit, .. },
+            Event::SessionShutdown { reason: Stop::Quit, .. },
+        ] if name == "設計 レビュー" && previous == &source));
+        assert!(session.set_name_with_hooks("closed").await.is_err());
+    }
 
     struct TreeOptionsHook;
     #[async_trait::async_trait]
