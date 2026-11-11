@@ -415,6 +415,20 @@ impl Tool for CodingTool {
     }
 }
 
+fn directory_collator(locale: &str) -> Result<icu_collator::CollatorBorrowed<'static>> {
+    let locale = locale
+        .split(['.', '@'])
+        .next()
+        .unwrap_or_default()
+        .replace('_', "-");
+    let locale = locale
+        .parse::<icu_locale_core::Locale>()
+        .map(icu_collator::CollatorPreferences::from)
+        .unwrap_or_default();
+    icu_collator::Collator::try_new(locale, Default::default())
+        .map_err(|error| Error::Config(format!("Cannot initialize directory collation: {error}")))
+}
+
 impl CodingTool {
     fn path(&self, value: &str) -> Result<PathBuf> {
         let input = crate::coding_paths::normalize(value)?;
@@ -648,12 +662,19 @@ impl CodingTool {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            entries.push(entry?);
+            let entry = entry?;
+            entries.push((entry.file_name().to_string_lossy().to_lowercase(), entry));
         }
-        entries.sort_by_cached_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
+        let locale = ["LC_ALL", "LANG"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .find(|value| !value.is_empty())
+            .unwrap_or_default();
+        let collator = directory_collator(&locale)?;
+        entries.sort_by(|(left, _), (right, _)| collator.compare(left, right));
         let mut results = Vec::new();
         let mut entry_limit_reached = false;
-        for entry in entries {
+        for (_, entry) in entries {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -1615,6 +1636,36 @@ mod tests {
             .tool_content();
         assert!(output.starts_with("alpha\n"));
         assert!(output.contains("1 entries limit reached"));
+    }
+
+    #[test]
+    fn directory_collation_matches_pi_for_punctuation_and_local_accents() {
+        let sort = |locale, mut names: Vec<&'static str>| {
+            let collator = directory_collator(locale).unwrap();
+            names.sort_by(|left, right| {
+                collator.compare(&left.to_lowercase(), &right.to_lowercase())
+            });
+            names
+        };
+        assert_eq!(
+            sort(
+                "en_US.UTF-8",
+                vec![
+                    "Zeta", "_cache", ".git", "alpha", "éclair", "eagle", "Beta", "-build"
+                ]
+            ),
+            [
+                "_cache", "-build", ".git", "alpha", "Beta", "eagle", "éclair", "Zeta"
+            ]
+        );
+        assert_eq!(
+            sort("sv_SE.UTF-8", vec!["Älmhult", "Zeta", "Åre", "Örebro"]),
+            ["Zeta", "Åre", "Älmhult", "Örebro"]
+        );
+        assert_eq!(
+            sort("C.UTF-8", vec!["Zeta", "Älmhult"]),
+            ["Älmhult", "Zeta"]
+        );
     }
 
     #[test]
