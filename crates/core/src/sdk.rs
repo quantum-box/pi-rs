@@ -969,6 +969,39 @@ impl AgentSession {
             },
         )
     }
+
+    /// Execute an extension command and run the model if its effects request it.
+    pub async fn extension_command_and_run(
+        &mut self,
+        extension: &str,
+        command: &str,
+        arguments: &str,
+    ) -> Result<Option<String>> {
+        self.start().await?;
+        let events = self.events.as_ref().expect("open session").clone();
+        let agent = Agent {
+            model: self.model.as_ref(),
+            model_name: &self.model_name,
+            registry: &self.registry,
+            system_prompt: &self.system_prompt,
+            limits: self.limits.clone(),
+        };
+        let trigger = agent.extension_command_with_trigger(
+            &mut self.session,
+            extension,
+            command,
+            arguments,
+            &mut |event| {
+                self.control.observe(&event);
+                emit(&events, &event);
+            },
+        )?;
+        if trigger {
+            self.resume().await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
     pub fn compact(&mut self, compaction: Compaction) -> Result<()> {
         self.ensure_open()?;
         let events = self.events.as_ref().expect("open session").clone();
@@ -1975,6 +2008,59 @@ mod tests {
                 }),
             ])))
         }
+    }
+
+    struct TriggerCommand;
+    impl Extension for TriggerCommand {
+        fn id(&self) -> &str {
+            "trigger"
+        }
+        fn commands(&self) -> &[&str] {
+            &["trigger"]
+        }
+        fn supports_command_effects(&self) -> bool {
+            true
+        }
+        fn command_effects(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::ExtensionCommandEffects> {
+            Ok(crate::ExtensionCommandEffects {
+                state: None,
+                actions: vec![crate::ExtensionCommandAction::TriggerMessage {
+                    message: crate::CustomMessage {
+                        custom_type: "trigger".into(),
+                        content: crate::ContextContent::Text("go".into()),
+                        display: false,
+                        details: None,
+                    },
+                }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_command_can_trigger_model_turn() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(TriggerCommand))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        assert!(session.extension_command("trigger", "trigger", "").is_err());
+        assert!(session.messages().unwrap().is_empty());
+        assert_eq!(
+            session
+                .extension_command_and_run("trigger", "trigger", "")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("answer 1")
+        );
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        session.close().await.unwrap();
     }
 
     #[tokio::test]

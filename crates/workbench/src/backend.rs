@@ -603,9 +603,16 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     }
                     if images.is_empty()
                         && let Some(input) = content.as_deref()
-                        && agent.try_extension_command(session, input, &mut observer)?
+                        && let Some(trigger) = agent.try_extension_command_with_trigger(
+                            session,
+                            input,
+                            &mut observer,
+                        )?
                     {
-                        return Ok(());
+                        if !trigger {
+                            return Ok(());
+                        }
+                        content = None;
                     }
                     if runtime.registry.has_input_hooks()
                         && (content.is_some() || !images.is_empty())
@@ -682,13 +689,26 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     extension_id,
                     command,
                     arguments,
-                } => agent.extension_command(
-                    session,
-                    &extension_id,
-                    &command,
-                    &arguments,
-                    &mut observer,
-                )?,
+                } => {
+                    if agent.extension_command_with_trigger(
+                        session,
+                        &extension_id,
+                        &command,
+                        &arguments,
+                        &mut observer,
+                    )? {
+                        let answer = Box::pin(agent.run_correlated(
+                            session,
+                            Uuid::new_v4(),
+                            None,
+                            &mut queued,
+                            &cancel,
+                            &mut observer,
+                        ))
+                        .await?;
+                        output(json!({"type":"answer","content":answer}));
+                    }
+                }
                 Request::Compact {
                     summary: Some(summary),
                     keep_turns,

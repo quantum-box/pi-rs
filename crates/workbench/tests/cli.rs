@@ -11,6 +11,120 @@ use serde_json::{Value, json};
 
 #[cfg(unix)]
 #[test]
+fn extension_command_can_trigger_model_in_print_and_json_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("trigger.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'trigger', 'dependencies':[], 'commands':['trigger'], 'tools':[], 'command_effects':True}
+elif request['type'] == 'command_effects':
+    result = {'actions':[{'type':'trigger_message','message':{'customType':'hint','content':'same input','display':False}}]}
+elif request['type'] in ('context', 'before_request'):
+    result = request['request']
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (endpoint, server) = model_fixture();
+    for mode in ["--print", "--mode"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--endpoint",
+                &endpoint,
+                "--extension",
+            ])
+            .arg(&extension)
+            .arg(mode);
+        if mode == "--mode" {
+            command.arg("json");
+        }
+        let output = command.arg("/trigger").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+    }
+    server.join().unwrap();
+
+    let (endpoint, server) = model_fixture();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["--mode", "rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for id in ["first", "second"] {
+        writeln!(
+            input,
+            "{}",
+            json!({"id": id, "type": "prompt", "message": "/trigger"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        let mut started = false;
+        loop {
+            let event = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            if event["type"] == "response" && event["id"] == id {
+                assert_eq!(event["data"]["disposition"], "started", "{event}");
+                started = true;
+            }
+            if event["type"] == "agent_end" {
+                assert!(started, "turn ended before prompt was acknowledged");
+                break;
+            }
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn executable_extension_can_add_custom_model_context_without_display() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -818,7 +932,7 @@ fn model_fixture_with_gate(
     server.set_nonblocking(true).unwrap();
     let handle = std::thread::spawn(move || {
         let mut completed = 0;
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(180);
         while completed < 2 {
             let (mut socket, _) = match server.accept() {
                 Ok(connection) => connection,

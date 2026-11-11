@@ -1559,13 +1559,18 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             command,
             arguments,
         } => {
-            return agent.extension_command(
+            let trigger = agent.extension_command_with_trigger(
                 &mut session,
                 &extension_id,
                 &command,
                 &arguments,
                 &mut observer,
-            );
+            )?;
+            if trigger {
+                let answer = agent.run_correlated(&mut session, Uuid::new_v4(), None, &mut receiver, &cancel, &mut observer).await?;
+                output(json!({"type":"answer","content":answer}));
+            }
+            return Ok(());
         }
         Command::Compact {
             summary: Some(summary),
@@ -1620,9 +1625,10 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             if index == 0 && skip_initial_prompt {
                 continue;
             }
-            if images.is_empty() && agent.try_extension_command(&mut session, prompt, &mut observer)? {
-                continue;
-            }
+            if images.is_empty() && let Some(trigger) = agent.try_extension_command_with_trigger(&mut session, prompt, &mut observer)? {
+                if !trigger { continue; }
+                input = None;
+            } else {
             if registry.has_input_hooks() {
                 let event = pi_rs::InputEvent {
                     text: std::mem::take(prompt),
@@ -1642,6 +1648,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             }
             if let Some(expanded) = runtime.resources.expand(prompt) {
                 *prompt = expanded;
+            }
             }
         }
         let run_id = if index == 0 { args.run_id } else { None }.unwrap_or_else(Uuid::new_v4);
