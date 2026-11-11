@@ -793,6 +793,7 @@ async fn run_cli() {
         }
         Err(error) => error.exit(),
     };
+    let mut output_truncated = false;
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
@@ -909,7 +910,7 @@ async fn run_cli() {
         if matches.value_source("session") != Some(clap::parser::ValueSource::CommandLine) {
             args.session = interactive::session_path(&args.workspace, args.session_dir.as_deref());
         }
-        Box::pin(execute(args)).await
+        Box::pin(execute(args, &mut output_truncated)).await
     }
     .await;
     if let Err(err) = result {
@@ -920,9 +921,13 @@ async fn run_cli() {
             1
         });
     }
+    if output_truncated {
+        eprintln!("Response was truncated: the model reached its output token limit.");
+        std::process::exit(1);
+    }
 }
 
-async fn execute(mut args: Cli) -> Result<()> {
+async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     if let Some(paths) = &args.export_session {
         let input = &paths[0];
         let output_path = paths
@@ -1520,7 +1525,13 @@ async fn execute(mut args: Cli) -> Result<()> {
         let mut images = std::mem::take(&mut initial_images);
         let mut stream = (args.mode == Some(OutputMode::Json))
             .then(rpc_events::Stream::default);
+        let mut truncated = false;
         let mut observer = |event: Notification<'_>| {
+            if let Notification::Committed(record) = &event
+                && let Event::ModelFinished { metadata, .. } = &record.event
+            {
+                truncated = metadata.finish_reason.as_deref() == Some("length");
+            }
             if let Some(stream) = &mut stream {
                 for event in stream.notify(&event, &args) {
                     output(event);
@@ -1585,13 +1596,14 @@ async fn execute(mut args: Cli) -> Result<()> {
         }
         let answer = answer?;
         if TEXT_OUTPUT.load(Ordering::Relaxed) {
-            last_answer = Some(answer);
+            last_answer = Some((answer, truncated));
         } else {
             output(json!({"type":"answer","content":answer}));
         }
     }
-    if let Some(answer) = last_answer {
+    if let Some((answer, truncated)) = last_answer {
         output(json!({"type":"answer","content":answer}));
+        *output_truncated = truncated;
     }
     Ok(())
     }.await;
@@ -1610,12 +1622,6 @@ async fn execute(mut args: Cli) -> Result<()> {
 }
 
 fn observe(event: Notification<'_>, trace: bool) {
-    if TEXT_OUTPUT.load(Ordering::Relaxed)
-        && let Notification::Committed(record) = &event
-        && matches!(&record.event, Event::ModelFinished { metadata, .. } if metadata.finish_reason.as_deref() == Some("length"))
-    {
-        eprintln!("Response reached the output token limit.");
-    }
     match event {
         Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
         Notification::SummaryRequest if trace => output(json!({"type":"summary_request_start"})),

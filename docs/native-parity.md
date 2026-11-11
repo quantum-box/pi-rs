@@ -441,6 +441,11 @@ prints the final answer, and JSON emits each turn. Piped stdin is decoded as
 UTF-8 with replacement, trimmed, and concatenated before the attachment text
 and initial prompt, without an added separator.
 
+When the final text-mode answer reaches the provider's output limit, the CLI
+prints the partial answer and exits with status 1. An earlier truncated turn
+does not determine the exit status of a later successful answer. JSON mode
+reports the stop reason in its message events.
+
 The owned SDK exposes `prompt_with_images`. Idle RPC `prompt` requests accept
 image blocks, including image-only input. Image-bearing input is committed as
 one journal entry, restored across sessions and preserved in forks. Invalid
