@@ -784,6 +784,34 @@ impl View {
             self.regular.committed = self.regular.committed.saturating_sub(removed);
         }
     }
+    fn show_custom_message(&mut self, message: &pi_rs::CustomMessage) {
+        if !message.display {
+            return;
+        }
+        let mut text = String::new();
+        let mut images = Vec::new();
+        match &message.content {
+            pi_rs::ContextContent::Text(value) => text.push_str(value),
+            pi_rs::ContextContent::Blocks(blocks) => {
+                for block in blocks {
+                    match block {
+                        pi_rs::ContentBlock::Text { text: value } => text.push_str(value),
+                        pi_rs::ContentBlock::Image { data, mime_type } => {
+                            images.push(pi_rs::ImageContent {
+                                data: data.clone(),
+                                mime_type: mime_type.clone(),
+                            })
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.append(&format!("{}: {}", message.custom_type, text));
+        if !images.is_empty() {
+            self.add_images(&images);
+        }
+    }
     fn observe_cache(&mut self, record: &pi_rs::Record, args: &Cli) {
         if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
             && args.settings.boolean("showCacheMissNotices") == Some(true)
@@ -946,10 +974,14 @@ impl View {
                         | "assistant"
                         | "compacted"
                         | "branch_summary"
+                        | "custom_message"
                 )
             )
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
         {
+            if let pi_rs::Event::CustomMessage { message } = &record.event {
+                self.show_custom_message(message);
+            }
             if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
                 self.cache_stats.select_provider(args.provider.id());
             }
@@ -1033,6 +1065,7 @@ impl View {
             .collect();
         for record in session.branch() {
             match &record.event {
+                pi_rs::Event::CustomMessage { message } => self.show_custom_message(message),
                 pi_rs::Event::User { content, .. }
                 | pi_rs::Event::UserWithImages { content, .. } => {
                     self.history.push(content.clone());
@@ -6037,6 +6070,24 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn custom_message_display_flag_controls_terminal_visibility() {
+        let mut view = super::View::default();
+        let mut message = pi_rs::CustomMessage {
+            custom_type: "example".into(),
+            content: pi_rs::ContextContent::Text("visible content".into()),
+            display: false,
+            details: Some(serde_json::json!({"private": "metadata"})),
+        };
+        view.show_custom_message(&message);
+        assert!(view.lines.is_empty());
+        message.display = true;
+        view.show_custom_message(&message);
+        assert!(
+            matches!(&view.lines[..], [super::Entry::Notice(text)] if text == "example: visible content")
+        );
+    }
+
     #[test]
     fn thinking_model_picker_keeps_current_model_when_discovery_fails() {
         use clap::Parser;

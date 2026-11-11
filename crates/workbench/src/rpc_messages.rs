@@ -385,6 +385,29 @@ impl Projection {
         edited: bool,
     ) -> Value {
         let timestamp = record.timestamp_millis().unwrap_or_default();
+        if let Event::CustomMessage { message: custom } = &record.event {
+            let content = if edited {
+                match message {
+                    Message::User { content } => json!(content),
+                    Message::UserWithImages { content, images } => {
+                        let mut blocks = Vec::new();
+                        if !content.is_empty() {
+                            blocks.push(json!({"type":"text", "text":content}));
+                        }
+                        blocks.extend(images.iter().map(|image| json!({"type":"image", "mimeType":image.mime_type, "data":image.data})));
+                        json!(blocks)
+                    }
+                    _ => json!(custom.content),
+                }
+            } else {
+                json!(custom.content)
+            };
+            let mut value = json!({"role":"custom", "customType":custom.custom_type, "content":content, "display":custom.display, "timestamp":timestamp});
+            if let Some(details) = &custom.details {
+                value["details"] = details.clone();
+            }
+            return value;
+        }
         match message {
             Message::System { content } => {
                 json!({"role":"system","content":content,"timestamp":timestamp})

@@ -38,6 +38,36 @@ pub struct ExtensionCommandOutput {
     pub entries: Vec<CustomEntry>,
 }
 
+/// Extension content included in model context, with independent display metadata.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomMessage {
+    pub custom_type: String,
+    pub content: crate::ContextContent,
+    pub display: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_json"
+    )]
+    pub details: Option<Value>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtensionCommandAction {
+    Entry { entry: CustomEntry },
+    Message { message: CustomMessage },
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExtensionCommandEffects {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ExtensionState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ExtensionCommandAction>,
+}
+
 /// Why the host is asking an extension for temporary resource paths.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -372,6 +402,29 @@ pub trait Extension: Send + Sync {
             .map(|state| ExtensionCommandOutput {
                 state: Some(state),
                 entries: Vec::new(),
+            })
+    }
+
+    /// Opt in to returning ordered entries and messages from commands.
+    fn supports_command_effects(&self) -> bool {
+        false
+    }
+
+    /// The default maps state-only and custom-entry commands to ordered effects.
+    fn command_effects(
+        &self,
+        name: &str,
+        arguments: &str,
+        previous: Option<&ExtensionState>,
+    ) -> ExtensionResult<ExtensionCommandEffects> {
+        self.command_output(name, arguments, previous)
+            .map(|output| ExtensionCommandEffects {
+                state: output.state,
+                actions: output
+                    .entries
+                    .into_iter()
+                    .map(|entry| ExtensionCommandAction::Entry { entry })
+                    .collect(),
             })
     }
 

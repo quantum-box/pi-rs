@@ -441,6 +441,13 @@ impl Cursor {
                 }
                 Some(value)
             }
+            Event::CustomMessage { message } => {
+                let mut value = json!({"type":"custom_message", "customType":message.custom_type, "content":message.content, "display":message.display});
+                if let Some(details) = &message.details {
+                    value["details"] = details.clone();
+                }
+                Some(value)
+            }
             _ => self
                 .messages
                 .raw_message(records, record)
@@ -611,6 +618,42 @@ mod tests {
         assert!(entry["id"].is_string());
         assert!(entry["parentId"].is_string());
         assert_eq!(session.current_messages().len(), before);
+    }
+
+    #[test]
+    fn native_custom_messages_preserve_rpc_metadata_and_context_edits() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_custom_message(pi_rs::CustomMessage {
+                custom_type: "hint".into(),
+                content: pi_rs::ContextContent::Text("original".into()),
+                display: false,
+                details: Some(json!({"private":true})),
+            })
+            .unwrap();
+        let target = session.head();
+        let entries = Entries::new(&session);
+        let entry = entries
+            .values
+            .iter()
+            .find(|entry| entry["type"] == "custom_message")
+            .unwrap();
+        assert_eq!(entry["customType"], "hint");
+        assert_eq!(entry["content"], "original");
+        assert_eq!(entry["display"], false);
+        assert_eq!(entry["details"]["private"], true);
+        let (messages, _) = super::super::rpc_messages::snapshot(&session);
+        assert_eq!(messages[0]["role"], "custom");
+        assert_eq!(messages[0]["content"], "original");
+        assert_eq!(messages[0]["details"]["private"], true);
+        session
+            .edit_context(target, Some(pi_rs::ContextContent::Text("edited".into())))
+            .unwrap();
+        let (messages, native) = super::super::rpc_messages::snapshot(&session);
+        assert_eq!(messages[0]["role"], "custom");
+        assert_eq!(messages[0]["content"], "edited");
+        assert_eq!(messages[0]["details"]["private"], true);
+        assert!(matches!(&native[0], pi_rs::Message::User { content } if content == "edited"));
     }
 
     #[test]

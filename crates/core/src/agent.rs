@@ -1657,10 +1657,17 @@ impl Agent<'_> {
         let states = self.migrate(session, observer)?;
         let result = hook(
             extension.as_ref(),
-            extension.command_output(command, arguments, states.get(extension_id)),
+            extension.command_effects(command, arguments, states.get(extension_id)),
         )?;
-        for entry in &result.entries {
-            crate::journal::validate_custom_entry(entry)?;
+        for action in &result.actions {
+            match action {
+                crate::ExtensionCommandAction::Entry { entry } => {
+                    crate::journal::validate_custom_entry(entry)?
+                }
+                crate::ExtensionCommandAction::Message { message } => {
+                    crate::journal::validate_custom_message(message)?
+                }
+            }
         }
         if let Some(state) = result.state {
             commit(
@@ -1671,8 +1678,14 @@ impl Agent<'_> {
                 observer,
             )?;
         }
-        for entry in result.entries {
-            commit(session, Event::CustomEntry { entry }, observer)?;
+        for action in result.actions {
+            let event = match action {
+                crate::ExtensionCommandAction::Entry { entry } => Event::CustomEntry { entry },
+                crate::ExtensionCommandAction::Message { message } => {
+                    Event::CustomMessage { message }
+                }
+            };
+            commit(session, event, observer)?;
         }
         Ok(())
     }

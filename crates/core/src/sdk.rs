@@ -707,6 +707,14 @@ impl AgentSession {
         self.emit_last();
         Ok(())
     }
+
+    /// Persist an extension message in model context without starting a turn.
+    pub fn append_custom_message(&mut self, message: crate::CustomMessage) -> Result<()> {
+        self.ensure_open()?;
+        self.session.append_custom_message(message)?;
+        self.emit_last();
+        Ok(())
+    }
     pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
         self.ensure_open()?;
         self.session.set_label(target, label)?;
@@ -1156,6 +1164,98 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CustomEntryExtension;
+    struct CustomMessageExtension;
+    impl Extension for CustomMessageExtension {
+        fn id(&self) -> &str {
+            "message-extension"
+        }
+        fn commands(&self) -> &[&str] {
+            &["context"]
+        }
+        fn supports_command_effects(&self) -> bool {
+            true
+        }
+        fn command_effects(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::ExtensionCommandEffects> {
+            Ok(crate::ExtensionCommandEffects {
+                state: None,
+                actions: vec![
+                    crate::ExtensionCommandAction::Entry {
+                        entry: crate::CustomEntry {
+                            custom_type: "before".into(),
+                            data: None,
+                        },
+                    },
+                    crate::ExtensionCommandAction::Message {
+                        message: crate::CustomMessage {
+                            custom_type: "context".into(),
+                            content: crate::ContextContent::Text("injected text".into()),
+                            display: false,
+                            details: Some(serde_json::json!({"private":"not model content"})),
+                        },
+                    },
+                ],
+            })
+        }
+    }
+
+    #[test]
+    fn extension_custom_messages_enter_context_and_follow_branch_edits() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(CustomMessageExtension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let previous = session.journal().head();
+        session
+            .extension_command("message-extension", "context", "")
+            .unwrap();
+        let records = session.journal().records();
+        assert!(matches!(
+            records[records.len() - 2].event,
+            crate::Event::CustomEntry { .. }
+        ));
+        assert!(matches!(
+            records.last().unwrap().event,
+            crate::Event::CustomMessage { .. }
+        ));
+        let target = session.journal().head();
+        let messages = session.messages().unwrap();
+        assert!(
+            matches!(messages.last(), Some(Message::User { content }) if content == "injected text")
+        );
+        assert!(
+            !serde_json::to_string(&messages)
+                .unwrap()
+                .contains("not model content")
+        );
+        session
+            .edit_context(
+                target,
+                Some(crate::ContextContent::Text("replacement".into())),
+            )
+            .unwrap();
+        assert!(
+            matches!(session.messages().unwrap().last(), Some(Message::User { content }) if content == "replacement")
+        );
+        session.checkout(previous).unwrap();
+        assert!(session.messages().unwrap().is_empty());
+        session
+            .append_custom_message(crate::CustomMessage {
+                custom_type: "sdk".into(),
+                content: crate::ContextContent::Text("sdk context".into()),
+                display: true,
+                details: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(session.messages().unwrap().last(), Some(Message::User { content }) if content == "sdk context")
+        );
+    }
     impl Extension for CustomEntryExtension {
         fn id(&self) -> &str {
             "bookmark-extension"

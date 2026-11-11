@@ -172,6 +172,11 @@ enum ProtocolRequest {
         arguments: String,
         state: Option<ExtensionState>,
     },
+    CommandEffects {
+        name: String,
+        arguments: String,
+        state: Option<ExtensionState>,
+    },
     BeforeTool {
         name: String,
         arguments: Value,
@@ -227,6 +232,8 @@ struct Description {
     host_calls: bool,
     #[serde(default)]
     command_entries: bool,
+    #[serde(default)]
+    command_effects: bool,
     #[serde(default)]
     input_hook: bool,
     #[serde(default)]
@@ -675,6 +682,33 @@ impl Extension for ExecutableExtension {
                     entries: Vec::new(),
                 }
             })
+        }
+    }
+    fn supports_command_effects(&self) -> bool {
+        self.description.command_effects
+    }
+    fn command_effects(
+        &self,
+        name: &str,
+        arguments: &str,
+        previous: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::ExtensionCommandEffects> {
+        if self.description.command_effects {
+            self.request(ProtocolRequest::CommandEffects {
+                name: name.into(),
+                arguments: arguments.into(),
+                state: previous.cloned(),
+            })
+        } else {
+            self.command_output(name, arguments, previous)
+                .map(|output| pi_rs_core::ExtensionCommandEffects {
+                    state: output.state,
+                    actions: output
+                        .entries
+                        .into_iter()
+                        .map(|entry| pi_rs_core::ExtensionCommandAction::Entry { entry })
+                        .collect(),
+                })
         }
     }
     async fn before_tool(
@@ -1427,6 +1461,7 @@ async fn dispatch_with_host(
             flags: extension.cli_flags(),
             host_calls: true,
             command_entries: extension.supports_command_entries(),
+            command_effects: extension.supports_command_effects(),
             input_hook: extension.handles_input(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
@@ -1528,6 +1563,16 @@ async fn dispatch_with_host(
                 return Err("unknown extension command".into());
             }
             encode(extension.command_output(&name, &arguments, state.as_ref()))
+        }
+        ProtocolRequest::CommandEffects {
+            name,
+            arguments,
+            state,
+        } => {
+            if !extension.command_names().contains(&name.as_str()) {
+                return Err("unknown extension command".into());
+            }
+            encode(extension.command_effects(&name, &arguments, state.as_ref()))
         }
         ProtocolRequest::BeforeTool {
             name,
@@ -1679,6 +1724,62 @@ mod tests {
         assert_eq!(result["entries"][0]["data"]["note"], "remember");
     }
 
+    #[tokio::test]
+    async fn command_effects_protocol_preserves_custom_message_metadata() {
+        struct Messages;
+        impl Extension for Messages {
+            fn id(&self) -> &str {
+                "messages"
+            }
+            fn commands(&self) -> &[&str] {
+                &["context"]
+            }
+            fn supports_command_effects(&self) -> bool {
+                true
+            }
+            fn command_effects(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::ExtensionCommandEffects> {
+                Ok(pi_rs_core::ExtensionCommandEffects {
+                    state: None,
+                    actions: vec![pi_rs_core::ExtensionCommandAction::Message {
+                        message: pi_rs_core::CustomMessage {
+                            custom_type: "notice".into(),
+                            content: pi_rs_core::ContextContent::Text("hello".into()),
+                            display: false,
+                            details: Some(serde_json::Value::Null),
+                        },
+                    }],
+                })
+            }
+        }
+        let extension: Arc<dyn Extension> = Arc::new(Messages);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["command_effects"], true);
+        let result = dispatch(
+            extension,
+            ProtocolRequest::CommandEffects {
+                name: "context".into(),
+                arguments: String::new(),
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["actions"][0]["message"]["customType"], "notice");
+        assert_eq!(result["actions"][0]["message"]["content"], "hello");
+        assert_eq!(result["actions"][0]["message"]["display"], false);
+        let decoded: pi_rs_core::ExtensionCommandEffects = serde_json::from_value(result).unwrap();
+        assert!(
+            matches!(&decoded.actions[0], pi_rs_core::ExtensionCommandAction::Message { message } if message.details == Some(serde_json::Value::Null))
+        );
+    }
+
     #[test]
     fn duplex_frames_are_bounded_and_leave_later_frames_unread() {
         let mut bytes = Vec::new();
@@ -1710,6 +1811,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!descriptor.command_entries);
+        assert!(!descriptor.command_effects);
         assert!(!descriptor.cache_warming_hook);
         assert!(!descriptor.session_lifecycle_hook);
         assert!(!descriptor.session_transition_reasons);

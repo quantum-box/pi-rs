@@ -1813,6 +1813,9 @@ fn metadata(record: &pi_rs::Record) -> Value {
         Event::CustomEntry { entry } => {
             json!({"event":"custom_entry","customType":entry.custom_type})
         }
+        Event::CustomMessage { message } => {
+            json!({"event":"custom_message","customType":message.custom_type,"display":message.display})
+        }
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),
         Event::ParentSession { .. } => json!({"event":"parent_session"}),
         Event::SessionInfo { name, cwd } => json!({"event":"session_info","name":name,"cwd":cwd}),

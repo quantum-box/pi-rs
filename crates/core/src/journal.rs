@@ -180,6 +180,11 @@ pub enum Event {
         #[serde(flatten)]
         entry: crate::CustomEntry,
     },
+    /// Extension message included in model context; display is a UI preference.
+    CustomMessage {
+        #[serde(flatten)]
+        message: crate::CustomMessage,
+    },
     ModelSelected {
         model: String,
         thinking: Option<String>,
@@ -1032,6 +1037,14 @@ impl Session {
         Ok(())
     }
 
+    /// Append a custom message without starting a model turn.
+    pub fn append_custom_message(&mut self, message: crate::CustomMessage) -> Result<()> {
+        self.ensure_settled()?;
+        validate_custom_message(&message)?;
+        self.append(Event::CustomMessage { message })?;
+        Ok(())
+    }
+
     /// Record a separately running user shell after the local agent yields.
     /// An interrupted tool can still await reconciliation. Its eventual result
     /// is projected beside its tool call, before this shell output.
@@ -1086,6 +1099,7 @@ impl Session {
                     | Event::BranchSummary { .. }
                     | Event::ContextEdited { .. }
                     | Event::BashExecution { .. }
+                    | Event::CustomMessage { .. }
                     | Event::User { .. }
                     | Event::UserWithImages { .. }
                     | Event::UserImages { .. } => Some(false),
@@ -1411,6 +1425,30 @@ pub(crate) fn validate_custom_entry(entry: &crate::CustomEntry) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_custom_message(message: &crate::CustomMessage) -> Result<()> {
+    if serde_json::to_vec(message)?.len() > 8 * 1024 * 1024 {
+        return Err(Error::Config("custom message exceeds size limit".into()));
+    }
+    if let crate::ContextContent::Blocks(blocks) = &message.content {
+        for block in blocks {
+            match block {
+                crate::ContentBlock::Text { .. } => {}
+                crate::ContentBlock::Image { data, mime_type } => crate::ImageContent {
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
+                }
+                .validate()?,
+                _ => {
+                    return Err(Error::Config(
+                        "custom messages accept only text and images".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn publish_snapshot(records: &[Record], destination: &Path) -> Result<()> {
     validated_head(records)?;
     let parent = destination
@@ -1446,6 +1484,7 @@ fn validate_context_edit(
         && !matches!(
             record.event,
             Event::User { .. }
+                | Event::CustomMessage { .. }
                 | Event::UserWithImages { .. }
                 | Event::ToolFinished { .. }
                 | Event::ToolReconciled { .. }
@@ -1909,6 +1948,7 @@ fn conversation_entries_since(
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
+            Event::CustomMessage { message } => messages.push((record.id, project_content(Message::User { content: String::new() }, &message.content))),
             Event::User { content, .. } => messages.push((
                 record.id,
                 Message::User {

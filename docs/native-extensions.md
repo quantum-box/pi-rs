@@ -36,6 +36,18 @@ and restart. An SDK host can also call `AgentSession::append_custom_entry`.
 executable extension. This currently covers command results and the SDK; it
 does not yet expose immediate `appendEntry` calls from every hook or tool.
 
+Commands can also add messages to the next model context. Implement
+`supports_command_effects` and return `ExtensionCommandEffects` from
+`command_effects`, containing ordered `Entry` and `Message` actions. A
+`CustomMessage` carries a custom type, text or image content, a `display` flag,
+and optional details. Content reaches the model regardless of `display`;
+details remain extension metadata. The terminal displays messages whose flag is
+true. SDK hosts can use `AgentSession::append_custom_message`. Executable
+extensions opt into this protocol with `command_effects` in their descriptor;
+older extensions continue to use `command_output`. Messages are currently
+added to context without starting or steering a turn, and hooks and tools do not
+yet expose Pi's immediate `sendMessage` API or custom message renderers.
+
 ## Write another extension
 
 Add the extension crate to the host's Cargo dependencies, implement
