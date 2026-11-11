@@ -765,6 +765,14 @@ fn rpc_controls_apply_while_idle_and_streaming() {
     );
     send(serde_json::json!({"type":"prompt","message":"same input"}));
     until(&|event| event["record"]["event"]["type"] == "model_requested");
+    send(serde_json::json!({"type":"set_session_name","id":"rename","name":"  Active name  "}));
+    let renamed = until(&|event| event["type"] == "session_info_changed");
+    assert_eq!(renamed["name"], "Active name");
+    assert_eq!(until(&|event| event["id"] == "rename")["success"], true);
+    send(serde_json::json!({"type":"get_state","id":"renamed-state"}));
+    let renamed_state = until(&|event| event["id"] == "renamed-state");
+    assert_eq!(renamed_state["data"]["sessionName"], "Active name");
+    assert_eq!(renamed_state["data"]["isStreaming"], true);
     send(serde_json::json!({"type":"bash","id":"shell","command":"echo parallel-shell"}));
     let shell = until(&|event| event["type"] == "response" && event["id"] == "shell");
     // Windows prevents reading a journal locked by the running agent.
@@ -774,6 +782,10 @@ fn rpc_controls_apply_while_idle_and_streaming() {
     release.send(()).unwrap();
     until(&|event| event["type"] == "agent_settled");
     let after_settlement = std::fs::read_to_string(&journal).unwrap();
+    assert_eq!(
+        Session::snapshot(&journal).unwrap().name(),
+        Some("Active name")
+    );
     send(serde_json::json!({"type":"prompt","message":"same input"}));
     until(&|event| event["type"] == "agent_settled");
     send(serde_json::json!({"type":"shutdown"}));

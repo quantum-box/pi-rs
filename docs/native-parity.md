@@ -95,10 +95,9 @@ sets `includeNative: true` to inspect the temporary journal.
 
 Each accepted RPC `set_session_name` request appends a session-info entry and
 emits `session_info_changed`, including when the normalized name is repeated.
-The core agent input channel accepts an acknowledged name update during model
-streaming. The session owner persists the change and publishes its committed
-record. The RPC worker still needs to route active rename requests through
-this channel.
+During model streaming, the RPC worker routes name updates through the core
+input channel. The session owner commits the change before the RPC
+acknowledgment, and a subsequent state query can read it during the same turn.
 
 The message snapshot preserves imported Pi roles, timestamps, and extension
 message details. Context edits replace the affected content in the snapshot.

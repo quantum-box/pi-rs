@@ -108,6 +108,11 @@ enum Request {
     ClearQueue {
         id: Option<serde_json::Value>,
     },
+    SetSessionName {
+        session: PathBuf,
+        name: String,
+        id: Option<serde_json::Value>,
+    },
     SetQueueMode {
         kind: InputKind,
         mode: QueueMode,
@@ -956,6 +961,15 @@ fn observe_snapshot(
     trace: bool,
     snapshot: &Mutex<SessionSnapshot>,
 ) {
+    let name = match &event {
+        pi_rs::Notification::Committed(record) => match &record.event {
+            pi_rs::Event::SessionInfo {
+                name: Some(name), ..
+            } => Some(name.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
     let entries = if let pi_rs::Notification::Committed(record) = &event {
         snapshot.lock().expect("session snapshot").record(record)
     } else {
@@ -964,6 +978,9 @@ fn observe_snapshot(
     observe(event, trace);
     for entry in entries {
         output(json!({"type":"entry_appended","entry":entry}));
+    }
+    if let Some(name) = name {
+        output(json!({"type":"session_info_changed","name":name}));
     }
 }
 
@@ -1106,6 +1123,7 @@ fn read_requests(
                 | Request::Followup { .. }
                 | Request::QueueInput { .. }
                 | Request::ClearQueue { .. }
+                | Request::SetSessionName { .. }
                 | Request::SetQueueMode { .. }) => {
                     if prepare_in_background {
                         if let Err(error) = queue_requests.try_send(request) {

@@ -163,6 +163,18 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
             continue;
         }
+        if request["type"] == "set_session_name" && busy(&worker) {
+            let result = session_name(&request).and_then(|name| {
+                Worker::control(&mut worker, &args, json!({
+                    "type":"set_session_name","name":name,"session":args.session,"id":request.get("id")
+                }))
+            });
+            match result {
+                Ok(()) => pending_inputs.push(request),
+                Err(error) => response(&request, Err(error))?,
+            }
+            continue;
+        }
         if !pending_inputs.is_empty() && requires_idle(request["type"].as_str().unwrap_or_default())
         {
             response(
@@ -735,10 +747,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Ok(None)
         }
         "set_session_name" => {
-            let name = request["name"]
-                .as_str()
-                .ok_or_else(|| Error::Config("name is required".into()))?;
-            let name = sessions::validate_name(name).map_err(Error::Config)?;
+            let name = session_name(request)?;
             let mut session = Session::open(&args.session)?;
             session.set_name(&name)?;
             drop(session);
@@ -990,6 +999,13 @@ fn discover_models<T: Send + 'static, F: std::future::Future<Output = Result<T>>
     })
     .join()
     .map_err(|_| Error::Config("model discovery worker stopped".into()))?
+}
+
+fn session_name(request: &Value) -> Result<String> {
+    let name = request["name"]
+        .as_str()
+        .ok_or_else(|| Error::Config("name is required".into()))?;
+    sessions::validate_name(name).map_err(Error::Config)
 }
 
 fn record_id(value: &Value) -> Result<u64> {

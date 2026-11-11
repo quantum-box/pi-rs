@@ -1,4 +1,5 @@
 //! Prepare queue submissions in order without blocking cancellation or extension UI replies.
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use pi_rs::{
@@ -67,6 +68,7 @@ impl Processor {
                 Err(error) => control_response(&command, id, Err(error)),
             },
             Request::ClearQueue { id } => self.clear(id),
+            Request::SetSessionName { session, name, id } => self.rename(session, name, id),
             Request::SetQueueMode { kind, mode, id } => self.set_mode(kind, mode, id),
             _ => unreachable!("only queue requests are routed to this task"),
         }
@@ -191,6 +193,38 @@ impl Processor {
         }
     }
 
+    fn rename(&self, session: PathBuf, name: String, id: Option<Value>) {
+        let (reply, receiver) = oneshot::channel();
+        if self
+            .inputs
+            .try_send(AgentInput::SetSessionName {
+                name: name.clone(),
+                reply,
+            })
+            .is_err()
+        {
+            control_response("set_session_name", id, Err(queue_full()));
+            return;
+        }
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = receiver
+                .await
+                .map_err(|_| channel_closed())
+                .and_then(|result| result);
+            let changed = result.is_ok();
+            control_response("set_session_name", id, result.map(|()| Value::Null));
+            if changed {
+                let _ = commands
+                    .send(Request::SessionInfoChanged {
+                        session,
+                        name: Some(name),
+                    })
+                    .await;
+            }
+        });
+    }
+
     fn set_mode(&self, kind: InputKind, mode: QueueMode, id: Option<Value>) {
         let (reply, receiver) = oneshot::channel();
         let _ = self
@@ -243,6 +277,9 @@ pub(super) fn reject(request: Request) {
             control_response(&command, id, Err(queue_full()))
         }
         Request::ClearQueue { id } => control_response("clear_queue", id, Err(queue_full())),
+        Request::SetSessionName { id, .. } => {
+            control_response("set_session_name", id, Err(queue_full()))
+        }
         Request::SetQueueMode { kind, id, .. } => {
             control_response(mode_command(kind), id, Err(queue_full()))
         }
