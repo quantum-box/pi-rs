@@ -68,6 +68,14 @@ impl SummaryUsageMetadata {
     }
 }
 
+/// Resolved system instructions and declared tools saved with an imported compaction.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CompactedSystemPrompt {
+    pub content: String,
+    pub sections: Vec<(String, Option<String>)>,
+    pub tools: Vec<crate::ToolSpec>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 // Keep the public journal event shape stable as optional provider metadata grows.
@@ -222,6 +230,8 @@ pub enum Event {
     },
     Compacted {
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<Box<CompactedSystemPrompt>>,
         retain_from: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_before: Option<u64>,
@@ -1623,14 +1633,28 @@ pub(crate) fn system_context(
     let mut tools = Vec::new();
     let mut found = false;
     for record in path {
-        let Event::SystemCheckpoint {
-            content: text,
-            sections: changes,
-            tools_added,
-            tools_removed,
-        } = &record.event
-        else {
-            continue;
+        let (text, changes, tools_added, tools_removed) = match &record.event {
+            Event::SystemCheckpoint {
+                content,
+                sections,
+                tools_added,
+                tools_removed,
+            } => (content, sections, tools_added, tools_removed.as_slice()),
+            Event::Compacted {
+                system_prompt: Some(snapshot),
+                ..
+            } => {
+                content.clear();
+                sections.clear();
+                tools.clear();
+                (
+                    &snapshot.content,
+                    &snapshot.sections,
+                    &snapshot.tools,
+                    &[][..],
+                )
+            }
+            _ => continue,
         };
         found = true;
         if !text.is_empty() {
@@ -2341,6 +2365,72 @@ mod shell_tests {
 mod system_checkpoint_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn compacted_system_prompt_replaces_earlier_deltas_on_its_branch() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let read = crate::ToolSpec {
+            name: "read".into(),
+            description: "Current read tool".into(),
+            parameters: json!({}),
+        };
+        let old = crate::ToolSpec {
+            name: "old".into(),
+            ..read.clone()
+        };
+        session
+            .append(Event::SystemCheckpoint {
+                content: "old base".into(),
+                sections: vec![("old".into(), Some("old section".into()))],
+                tools_added: vec![old.clone()],
+                tools_removed: vec![],
+            })
+            .unwrap();
+        let previous = session.head();
+        session
+            .append(Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: Some(Box::new(CompactedSystemPrompt {
+                    content: "snapshot".into(),
+                    sections: vec![("rules".into(), Some("saved".into()))],
+                    tools: vec![crate::ToolSpec {
+                        description: "Historical read tool".into(),
+                        ..read.clone()
+                    }],
+                })),
+                retain_from: Some(previous),
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        session
+            .append(Event::SystemCheckpoint {
+                content: "new instructions".into(),
+                sections: vec![("rules".into(), Some("updated".into()))],
+                tools_added: vec![],
+                tools_removed: vec![],
+            })
+            .unwrap();
+        let reopened = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            system_context(
+                &reopened.branch(),
+                "fallback",
+                vec![read.clone(), old.clone()]
+            ),
+            (
+                "snapshot\n\nnew instructions\n\nupdated".into(),
+                vec![read.clone()]
+            )
+        );
+        session.checkout(previous).unwrap();
+        assert_eq!(
+            system_context(&session.branch(), "fallback", vec![read, old.clone()]),
+            ("old base\n\nold section".into(), vec![old])
+        );
+    }
 
     #[test]
     fn system_updates_follow_branch_history_and_current_tool_permissions() {

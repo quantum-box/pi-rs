@@ -421,6 +421,15 @@ pub fn html(session: &Session) -> String {
                 }
             }
             Event::Compacted { summary, .. } | Event::BranchSummary { summary, .. } => {
+                if matches!(
+                    record.event,
+                    Event::Compacted {
+                        system_prompt: Some(_),
+                        ..
+                    }
+                ) {
+                    has_system_prompt = true;
+                }
                 let label = if matches!(record.event, Event::Compacted { .. }) {
                     "Compacted context"
                 } else {

@@ -278,6 +278,42 @@ fn content(value: &Value) -> Result<String> {
     }
     Ok(text)
 }
+fn system_prompt(message: &Value) -> Result<pi_rs::CompactedSystemPrompt> {
+    let sections = message
+        .get("sections")
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(|| Error::Session("invalid system sections".into()))?
+                .iter()
+                .map(|(name, value)| {
+                    let value = if value.is_null() {
+                        None
+                    } else {
+                        Some(
+                            value
+                                .as_str()
+                                .ok_or_else(|| Error::Session("invalid system section".into()))?
+                                .to_owned(),
+                        )
+                    };
+                    Ok((name.clone(), value))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let tools = message
+        .get("toolsAdded")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(pi_rs::CompactedSystemPrompt {
+        content: content(&message["content"])?,
+        sections,
+        tools,
+    })
+}
 fn user_content(value: &Value) -> Result<(String, Vec<pi_rs::ImageContent>)> {
     let Some(blocks) = value.as_array() else {
         return Ok((content(value)?, Vec::new()));
@@ -551,37 +587,11 @@ fn convert(
                     input_id: None,
                 }),
                 "system" => {
-                    let sections = message
-                        .get("sections")
-                        .map(|value| {
-                            value
-                                .as_object()
-                                .ok_or_else(|| Error::Session("invalid system sections".into()))?
-                                .iter()
-                                .map(|(name, value)| {
-                                    let value = if value.is_null() {
-                                        None
-                                    } else {
-                                        Some(
-                                            value
-                                                .as_str()
-                                                .ok_or_else(|| {
-                                                    Error::Session("invalid system section".into())
-                                                })?
-                                                .to_owned(),
-                                        )
-                                    };
-                                    Ok((name.clone(), value))
-                                })
-                                .collect::<Result<Vec<_>>>()
-                        })
-                        .transpose()?
-                        .unwrap_or_default();
-                    let tools_added = message
-                        .get("toolsAdded")
-                        .map(|value| serde_json::from_value(value.clone()))
-                        .transpose()?
-                        .unwrap_or_default();
+                    let pi_rs::CompactedSystemPrompt {
+                        content,
+                        sections,
+                        tools: tools_added,
+                    } = system_prompt(message)?;
                     let tools_removed = message
                         .get("toolsRemoved")
                         .map(|value| {
@@ -595,7 +605,7 @@ fn convert(
                         .transpose()?
                         .unwrap_or_default();
                     events.push(Event::SystemCheckpoint {
-                        content: content(&message["content"])?,
+                        content,
                         sections,
                         tools_added,
                         tools_removed,
@@ -660,6 +670,12 @@ fn convert(
             let usage_metadata = summary_usage_metadata(&events);
             events.push(Event::Compacted {
                 summary: required(entry, "summary")?.into(),
+                system_prompt: entry
+                    .get("systemMessage")
+                    .filter(|message| !message.is_null())
+                    .map(system_prompt)
+                    .transpose()?
+                    .map(Box::new),
                 retain_from,
                 tokens_before: entry["tokensBefore"].as_u64(),
                 states: Default::default(),
@@ -835,6 +851,39 @@ mod tests {
         assert!(session.current_messages().is_empty());
         let legacy = import_pi(vec![json!({"type":"session","version":1})]).unwrap();
         assert!(legacy.parent_session().is_none());
+    }
+
+    #[test]
+    fn imports_compaction_system_prompt_and_recognizes_later_updates() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"compaction","id":"c","parentId":"u","firstKeptEntryId":"u","summary":"summary","systemMessage":{
+                "role":"system","content":[{"type":"text","text":"saved"}],"sections":{"rules":"original"},
+                "toolsAdded":[{"name":"read","description":"Read","parameters":{"type":"object"}}]
+            }}),
+            json!({"type":"message","id":"s","parentId":"c","message":{"role":"system","content":"new"}}),
+        ]).unwrap();
+        let snapshot = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Compacted {
+                    system_prompt: Some(snapshot),
+                    ..
+                } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(snapshot.content, "saved");
+        assert_eq!(
+            snapshot.sections,
+            vec![("rules".into(), Some("original".into()))]
+        );
+        assert_eq!(snapshot.tools[0].name, "read");
+        assert!(
+            super::super::sessions::html(&session).contains("System Prompt Update: instructions")
+        );
     }
 
     #[test]

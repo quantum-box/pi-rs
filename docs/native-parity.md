@@ -185,6 +185,9 @@ Raw HTML is escaped, and Markdown images leave their alt text without loading
 external image sources.
 HTML exports show aborted and failed model requests and preserve any partial
 answer. Imported Pi assistant errors retain their original message text.
+When a Pi compaction includes a resolved system prompt, imports restore that
+snapshot before replaying later system updates and resolve its tool names
+against the current native registry.
 HTML exports fold the initial recorded system prompt and subsequent updates,
 including changed sections and available, added, or removed tools. Tool
 parameters expand to show types, required flags, and descriptions.

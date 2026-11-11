@@ -2385,6 +2385,7 @@ impl Agent<'_> {
             session,
             Event::Compacted {
                 summary: compaction.summary,
+                system_prompt: None,
                 retain_from,
                 tokens_before: Some(tokens_before),
                 states: changes,
