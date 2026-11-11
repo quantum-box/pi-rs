@@ -420,6 +420,13 @@ enum TranscriptPanel {
 }
 
 #[derive(Default)]
+struct StreamingTool {
+    name: String,
+    arguments: crate::streaming_json::StreamingJson,
+    preview: Value,
+}
+
+#[derive(Default)]
 struct View {
     regular: RegularState,
     graphics: Renderer,
@@ -447,6 +454,7 @@ struct View {
     summarizing: bool,
     hide_thinking: bool,
     streaming: String,
+    streaming_tools: std::collections::BTreeMap<u64, StreamingTool>,
     editor: Editor,
     editor_width: usize,
     editor_page: usize,
@@ -474,6 +482,32 @@ struct View {
     restoring_queue: bool,
 }
 impl View {
+    fn streaming_tool_entries(&self) -> impl Iterator<Item = Entry> + '_ {
+        self.streaming_tools.values().filter_map(|tool| {
+            if tool.name == super::operation_models::TOOL {
+                return None;
+            }
+            Some(Entry::Tool {
+                id: String::new(),
+                name: if tool.name.is_empty() {
+                    "tool".into()
+                } else {
+                    tool.name.clone()
+                },
+                arguments: if tool.preview.is_object() {
+                    tool.preview.to_string()
+                } else {
+                    "{}".into()
+                },
+                output: String::new(),
+                failed: false,
+                finished: false,
+                parts: Vec::new(),
+                numbered_diff: false,
+            })
+        })
+    }
+
     fn dialog(&self) -> Option<&crate::ui::dialog::Dialog> {
         self.local_editor
             .as_ref()
@@ -877,6 +911,7 @@ impl View {
         self.scrollbar_activity = None;
         self.flash = None;
         self.streaming.clear();
+        self.streaming_tools.clear();
         self.thinking.clear();
         self.draft_images.clear();
         self.clipboard = None;
@@ -1188,6 +1223,17 @@ impl View {
                 self.summarizing = true;
                 self.thinking.clear();
                 self.streaming.clear();
+                self.streaming_tools.clear();
+            }
+            Some("tool_call_delta") if !self.summarizing => {
+                if let Ok(delta) = serde_json::from_value::<pi_rs::ToolCallDelta>(value["toolCallDelta"].clone()) {
+                    let tool = self.streaming_tools.entry(delta.index).or_default();
+                    tool.name.push_str(&delta.name);
+                    if !delta.arguments.is_empty() {
+                        tool.preview = tool.arguments.append(&delta.arguments);
+                    }
+                    self.phase = Some("ツール呼出し準備中");
+                }
             }
             Some("reasoning_delta") if !self.summarizing => self
                 .thinking
@@ -1222,10 +1268,12 @@ impl View {
                         }
                     }
                     Some("model_requested") => {
+                        self.streaming_tools.clear();
                         self.request_started = Some(Instant::now());
                         self.phase = Some("モデル応答待ち");
                     }
                     Some("assistant") => {
+                        self.streaming_tools.clear();
                         self.streaming.clear();
                         let thinking = std::mem::take(&mut self.thinking);
                         if !thinking.is_empty() {
@@ -1303,6 +1351,7 @@ impl View {
     }
     fn settle(&mut self) {
         self.summarizing = false;
+        self.streaming_tools.clear();
         if !self.thinking.is_empty() {
             self.lines
                 .push(Entry::Thinking(std::mem::take(&mut self.thinking)));
@@ -1509,6 +1558,15 @@ impl View {
                 false,
                 true,
                 self.transcript_options(args, true),
+            ));
+        }
+        for entry in self.streaming_tool_entries() {
+            lines.extend(entry.render(
+                theme,
+                body_width,
+                self.expand_tools,
+                !self.hide_thinking,
+                output,
             ));
         }
         if let Some(picker) = &self.picker {
@@ -1826,6 +1884,9 @@ impl View {
                 true,
                 self.transcript_options(args, true),
             ));
+            for entry in self.streaming_tool_entries() {
+                active.extend(render_entry(&entry));
+            }
             if let Some(picker) = &self.picker {
                 active =
                     picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
@@ -5054,6 +5115,25 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streams_tool_arguments_without_committing_preview() {
+        let mut view = super::View::default();
+        view.receive(&serde_json::json!({"type":"tool_call_delta","toolCallDelta":{"index":0,"name":"read","arguments":"{\"path\":\"src/li"}}));
+        let entries: Vec<_> = view.streaming_tool_entries().collect();
+        assert!(
+            matches!(&entries[..], [super::Entry::Tool { name, arguments, finished: false, .. }] if name == "read" && serde_json::from_str::<serde_json::Value>(arguments).unwrap()["path"] == "src/li")
+        );
+        assert!(view.lines.is_empty());
+        view.receive(&serde_json::json!({"type":"record","record":{"event":{"type":"assistant","content":"","invocations":[{"operation_id":"op","call":{"name":"read","arguments":"{\"path\":\"src/lib.rs\"}"}}]}}}));
+        assert!(view.streaming_tools.is_empty());
+        assert!(
+            matches!(&view.lines[..], [super::Entry::Tool { id, name, .. }] if id == "op" && name == "read")
+        );
+        view.receive(&serde_json::json!({"type":"tool_call_delta","toolCallDelta":{"index":0,"name":"read","arguments":"{\"path\":\"x"}}));
+        view.settle();
+        assert!(view.streaming_tools.is_empty());
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn complete_color_replies_release_queued_query_before_marker() {

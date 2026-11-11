@@ -66,7 +66,8 @@ impl StreamingJson {
             .clone()
             .unwrap_or_else(|| Value::Object(Map::new()));
         if let Some(scalar) = &self.scalar
-            && let Some(value) = scalar_value(&scalar.text)
+            && scalar.text.len() <= 64
+            && let Some(value) = scalar_value(&scalar.text, true)
         {
             set_in(&mut root, &scalar.path, value);
         }
@@ -96,10 +97,10 @@ impl StreamingJson {
                 self.scalar = Some(scalar);
                 return;
             }
-            if let Some(value) = scalar_value(&scalar.text) {
+            if let Some(value) = scalar_value(&scalar.text, false) {
                 self.set(&scalar.path, value);
             }
-            if self.stack.is_empty() {
+            if self.stack.is_empty() && self.root.is_some() {
                 self.done = true;
                 return;
             }
@@ -109,11 +110,13 @@ impl StreamingJson {
         if c.is_whitespace() {
             return;
         }
-        match self.stack.last().map(|frame| frame.phase) {
-            Some(Phase::Key) if c == '}' => {
+        if matches!(c, '}' | ']') {
+            if !self.stack.is_empty() {
                 self.close();
-                return;
             }
+            return;
+        }
+        match self.stack.last().map(|frame| frame.phase) {
             Some(Phase::Key) if c == '"' => {
                 self.string = Some(StringToken {
                     path: None,
@@ -126,30 +129,34 @@ impl StreamingJson {
                 self.stack.last_mut().unwrap().phase = Phase::ObjectValue;
                 return;
             }
+            Some(Phase::Colon) => {
+                self.stack.last_mut().unwrap().phase = Phase::ObjectValue;
+                self.character(c);
+                return;
+            }
+            Some(Phase::Key | Phase::ArrayValue) if c == ',' => return,
             Some(Phase::ObjectComma) if c == ',' => {
                 self.stack.last_mut().unwrap().phase = Phase::Key;
                 return;
             }
-            Some(Phase::ObjectComma) if c == '}' => {
-                self.close();
+            Some(Phase::ObjectComma) if c == '"' => {
+                self.stack.last_mut().unwrap().phase = Phase::Key;
+                self.character(c);
                 return;
             }
             Some(Phase::ArrayComma) if c == ',' => {
                 self.stack.last_mut().unwrap().phase = Phase::ArrayValue;
                 return;
             }
-            Some(Phase::ArrayComma) if c == ']' => {
-                self.close();
-                return;
-            }
-            Some(Phase::ArrayValue) if c == ']' => {
-                self.close();
+            Some(Phase::ArrayComma) => {
+                self.stack.last_mut().unwrap().phase = Phase::ArrayValue;
+                self.character(c);
                 return;
             }
             Some(Phase::ObjectValue | Phase::ArrayValue) | None => {}
             _ => return,
         }
-        if !matches!(c, '{' | '[' | '"' | '-' | '0'..='9' | 't' | 'f' | 'n') {
+        if matches!(c, ':' | ',') {
             return;
         }
         if matches!(c, '{' | '[') && self.stack.len() >= MAX_DEPTH {
@@ -207,7 +214,6 @@ impl StreamingJson {
             }
             Phase::ArrayValue => {
                 path.push(Segment::Index(frame.len));
-                frame.len += 1;
                 frame.phase = Phase::ArrayComma;
             }
             _ => unreachable!("value slot"),
@@ -215,6 +221,12 @@ impl StreamingJson {
         path
     }
     fn set(&mut self, path: &[Segment], value: Value) {
+        if let (Some(frame), Some(Segment::Index(index))) = (self.stack.last_mut(), path.last())
+            && path.len() == frame.path.len() + 1
+            && *index == frame.len
+        {
+            frame.len += 1;
+        }
         if path.is_empty() {
             self.root = Some(value);
         } else if let Some(root) = &mut self.root {
@@ -259,18 +271,21 @@ fn set_in(root: &mut Value, path: &[Segment], value: Value) {
     }
 }
 
-fn scalar_value(text: &str) -> Option<Value> {
+fn scalar_value(text: &str, pending: bool) -> Option<Value> {
     for (literal, value) in [
         ("true", Value::Bool(true)),
         ("false", Value::Bool(false)),
         ("null", Value::Null),
     ] {
-        if !text.is_empty() && literal.starts_with(text) {
+        if !text.is_empty() && (text == literal || (pending && literal.starts_with(text))) {
             return Some(value);
         }
     }
     if let Ok(number) = text.parse::<Number>() {
         return Some(Value::Number(number));
+    }
+    if !pending {
+        return None;
     }
     let exponent = text.rfind(['e', 'E'])?;
     if matches!(&text[exponent + 1..], "" | "+" | "-") {
@@ -316,6 +331,16 @@ fn string_character(token: &mut StringToken, c: char) -> bool {
     }
     // Hold an incomplete Unicode escape, including a surrogate pair, until it
     // can be represented as a Unicode scalar without exposing broken UTF-8.
+    let length = token.escape.len();
+    if !(6..8).contains(&length) && !c.is_ascii_hexdigit() || (length == 6 && c != '\\') {
+        token.text.push_str(&std::mem::take(&mut token.escape));
+        return string_character(token, c);
+    }
+    if length == 7 && c != 'u' {
+        token.text.push_str(&token.escape[..6]);
+        token.escape = "\\".into();
+        return string_character(token, c);
+    }
     token.escape.push(c);
     let escape = &token.escape;
     if escape.len() == 6 {
@@ -397,5 +422,40 @@ mod tests {
             }
             assert_eq!(result, value, "{serialized}");
         }
+    }
+
+    #[test]
+    fn tolerates_missing_separators_and_discards_invalid_scalars() {
+        for (input, expected) in [
+            (r#"{"a":1 "b":2}"#, json!({"a":1,"b":2})),
+            (r#"{"a" 1, "b": 2}"#, json!({"a":1,"b":2})),
+            ("[1 2, , 3,]", json!([1, 2, 3])),
+            (r#"{"a":NaN,"b":Infinity,"e":1}"#, json!({"e":1})),
+            (r#"{"a": tru, "b": nulll, "c": falsey}"#, json!({})),
+        ] {
+            for chunk in [1, 2, 5, input.len()] {
+                let mut parser = StreamingJson::default();
+                let mut actual = Value::Null;
+                for part in input.as_bytes().chunks(chunk) {
+                    actual = parser.append(std::str::from_utf8(part).unwrap());
+                }
+                assert_eq!(actual, expected, "{input}, chunk {chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_or_invalid_unicode_does_not_swallow_following_fields() {
+        let mut parser = StreamingJson::default();
+        assert_eq!(parser.append(r#"{"text":"ab\u00"#), json!({"text":"ab"}));
+        assert_eq!(
+            parser.append(r#"","next":2}"#),
+            json!({"text":"ab\\u00", "next":2})
+        );
+        let mut parser = StreamingJson::default();
+        assert_eq!(
+            parser.append(r#"{"text":"\url{x}"}"#),
+            json!({"text":"\\url{x}"})
+        );
     }
 }

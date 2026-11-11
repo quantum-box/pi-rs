@@ -53,7 +53,9 @@ turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries. Tool-call deltas expose
 incremental argument previews, including nested objects, arrays and partial
-strings; completed calls are still validated before execution. `get_messages` returns
+strings. The fullscreen and regular terminals also show the prepared tool and
+its partial path, command or pattern while the model streams it. Completed
+calls are still validated before execution. `get_messages` returns
 Pi message roles and blocks, with a correlated partial assistant message
 during streaming. Set `includeNative: true` to include the native model
 projection in `nativeMessages`. The `steer` and `follow_up` commands
