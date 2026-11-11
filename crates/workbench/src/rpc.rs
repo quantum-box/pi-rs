@@ -165,9 +165,13 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         }
         if request["type"] == "set_session_name" && busy(&worker) {
             let result = session_name(&request).and_then(|name| {
-                Worker::control(&mut worker, &args, json!({
-                    "type":"set_session_name","name":name,"session":args.session,"id":request.get("id")
-                }))
+                Worker::control(
+                    &mut worker,
+                    &args,
+                    json!({
+                        "type":"set_session_name","name":name,"id":request.get("id")
+                    }),
+                )
             });
             match result {
                 Ok(()) => pending_inputs.push(request),

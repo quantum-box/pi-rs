@@ -1,6 +1,6 @@
 //! Prepare queue submissions in order without blocking cancellation or extension UI replies.
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pi_rs::{
     AgentInput, Error, InputEvent, InputKind, InputSource, QueueMode, QueuedInput, QueuedMessage,
@@ -19,6 +19,8 @@ pub(super) struct Processor {
     pub snapshot: Arc<Mutex<SessionSnapshot>>,
     pub resources: crate::resources::Resources,
     pub registry: Registry,
+    pub lifecycle_timeout: Duration,
+    pub trace: bool,
 }
 
 impl Processor {
@@ -68,7 +70,7 @@ impl Processor {
                 Err(error) => control_response(&command, id, Err(error)),
             },
             Request::ClearQueue { id } => self.clear(id),
-            Request::SetSessionName { session, name, id } => self.rename(session, name, id),
+            Request::SetSessionName { name, id } => self.rename(name, id),
             Request::SetQueueMode { kind, mode, id } => self.set_mode(kind, mode, id),
             _ => unreachable!("only queue requests are routed to this task"),
         }
@@ -193,7 +195,7 @@ impl Processor {
         }
     }
 
-    fn rename(&self, session: PathBuf, name: String, id: Option<Value>) {
+    fn rename(&self, name: String, id: Option<Value>) {
         let (reply, receiver) = oneshot::channel();
         if self
             .inputs
@@ -206,7 +208,10 @@ impl Processor {
             control_response("set_session_name", id, Err(queue_full()));
             return;
         }
-        let commands = self.commands.clone();
+        let registry = self.registry.clone();
+        let snapshot = self.snapshot.clone();
+        let timeout = self.lifecycle_timeout;
+        let trace = self.trace;
         tokio::spawn(async move {
             let result = receiver
                 .await
@@ -214,13 +219,22 @@ impl Processor {
                 .and_then(|result| result);
             let changed = result.is_ok();
             control_response("set_session_name", id, result.map(|()| Value::Null));
-            if changed {
-                let _ = commands
-                    .send(Request::SessionInfoChanged {
-                        session,
-                        name: Some(name),
-                    })
-                    .await;
+            if changed && registry.has_session_lifecycle_hooks() {
+                let records = snapshot.lock().expect("session snapshot").records.clone();
+                match Session::from_records(records) {
+                    Ok(session) if session.host_binding().is_none() => {
+                        pi_rs::notify_extension_lifecycle(
+                            &registry,
+                            pi_rs::LifecycleEvent::SessionInfoChanged { name: Some(name) },
+                            &session.extension_states(),
+                            timeout,
+                            &mut |event| crate::observe(event, trace),
+                        )
+                        .await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => output(json!({"type":"error","message":error.to_string()})),
+                }
             }
         });
     }

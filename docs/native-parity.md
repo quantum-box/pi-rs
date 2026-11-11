@@ -98,6 +98,8 @@ emits `session_info_changed`, including when the normalized name is repeated.
 During model streaming, the RPC worker routes name updates through the core
 input channel. The session owner commits the change before the RPC
 acknowledgment, and a subsequent state query can read it during the same turn.
+Session lifecycle extensions receive the committed name change without waiting
+for the model turn to finish.
 
 The message snapshot preserves imported Pi roles, timestamps, and extension
 message details. Context edits replace the affected content in the snapshot.

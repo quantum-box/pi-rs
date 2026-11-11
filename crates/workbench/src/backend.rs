@@ -109,7 +109,6 @@ enum Request {
         id: Option<serde_json::Value>,
     },
     SetSessionName {
-        session: PathBuf,
         name: String,
         id: Option<serde_json::Value>,
     },
@@ -151,6 +150,8 @@ struct ReaderControls {
     command_catalog: serde_json::Value,
     resources: super::resources::Resources,
     registry: pi_rs::Registry,
+    lifecycle_timeout: std::time::Duration,
+    trace: bool,
     shell: ShellRunner,
 }
 
@@ -253,6 +254,8 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             command_catalog: runtime.command_catalog(&args),
             resources: runtime.resources.clone(),
             registry: runtime.registry.clone(),
+            lifecycle_timeout: args.tool_timeout(),
+            trace: args.trace,
             shell: ShellRunner {
                 tools: Arc::new(
                     CodingTools::local(&args.workspace)?
@@ -998,6 +1001,8 @@ fn read_requests(
         command_catalog,
         resources,
         registry,
+        lifecycle_timeout,
+        trace,
         snapshot,
         shell,
     } = controls;
@@ -1010,6 +1015,8 @@ fn read_requests(
         snapshot: snapshot.clone(),
         resources,
         registry,
+        lifecycle_timeout,
+        trace,
     });
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
