@@ -1054,6 +1054,7 @@ impl CodingTool {
             ] {
                 let mut remaining = String::new();
                 stream.finish(&mut |text| remaining.push_str(&filter.filter(text)));
+                remaining.push_str(&filter.finish());
                 if !remaining.is_empty() {
                     progress(&remaining);
                     output.append(remaining.as_bytes())?;
@@ -1155,29 +1156,53 @@ struct ShellResult {
 
 #[derive(Default)]
 struct UserShellFilter {
-    parser: vte::Parser,
+    pending: String,
 }
 
 impl UserShellFilter {
     fn filter(&mut self, text: &str) -> String {
-        #[derive(Default)]
-        struct Text(String);
-        impl vte::Perform for Text {
-            fn print(&mut self, ch: char) {
-                if !matches!(ch, '\u{fff9}'..='\u{fffb}') {
-                    self.0.push(ch);
+        static PENDING: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+        let value = format!("{}{text}", self.pending);
+        self.pending.clear();
+        if value.contains(['\u{1b}', '\u{9b}']) {
+            let mut units = 0;
+            let mut window = value.len();
+            for (index, ch) in value.char_indices().rev() {
+                if units + ch.len_utf16() > 256 {
+                    break;
                 }
+                units += ch.len_utf16();
+                window = index;
             }
-            fn execute(&mut self, byte: u8) {
-                if matches!(byte, b'\n' | b'\t') {
-                    self.0.push(char::from(byte));
-                }
+            let pending = PENDING.get_or_init(|| fancy_regex::Regex::new(
+                r"(?:\x1b\](?:[^\x07\u009c\x1b]|\x1b(?!\\))*|(?:(?:\x1b\[|\u009b)[<=>]|[\x1b\u009b][\[\]()#;?]*)(?:[0-9]{1,4}(?:[;:][0-9]{0,4})*)?)$"
+            ).expect("valid ANSI suffix pattern"));
+            if let Ok(Some(found)) = pending.find(&value[window..]) {
+                let start = window + found.start();
+                self.pending.push_str(&value[start..]);
+                return sanitize_user_shell_text(&value[..start]);
             }
         }
-        let mut output = Text::default();
-        self.parser.advance(&mut output, text.as_bytes());
-        output.0
+        sanitize_user_shell_text(&value)
     }
+
+    fn finish(&mut self) -> String {
+        sanitize_user_shell_text(&std::mem::take(&mut self.pending))
+    }
+}
+
+// ANSI patterns follow Pi's ansi-regex-based implementation, MIT-licensed by Sindre Sorhus.
+fn sanitize_user_shell_text(text: &str) -> String {
+    static ANSI: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let ansi = ANSI.get_or_init(|| regex::Regex::new(
+        r"(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\u009c))|(?:(?:\x1b\[|\u009b)[<=>]|[\x1b\u009b][\[\]()#;?]*)(?:[0-9]{1,4}(?:[;:][0-9]{0,4})*)?[0-9A-PR-TZcf-nq-uy=><~]"
+    ).expect("valid ANSI pattern"));
+    ansi.replace_all(text, "")
+        .chars()
+        .filter(
+            |ch| !matches!(*ch, '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{fff9}'..='\u{fffb}'),
+        )
+        .collect()
 }
 
 #[derive(Default)]
@@ -1488,6 +1513,16 @@ mod tests {
         .map(|part| filter.filter(part))
         .collect::<String>();
         assert_eq!(output, "Ared\nok");
+    }
+
+    #[test]
+    fn user_shell_filter_flushes_incomplete_escapes_and_preserves_delete() {
+        let mut filter = UserShellFilter::default();
+        assert_eq!(filter.filter("x\u{1b}[<35;59"), "x");
+        assert_eq!(filter.finish(), "");
+        assert_eq!(filter.filter("x\u{7f}y"), "x\u{7f}y");
+        assert_eq!(filter.filter("x\u{1b}]title"), "x");
+        assert_eq!(filter.finish(), "itle");
     }
 
     #[test]
