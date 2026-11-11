@@ -250,11 +250,7 @@ impl DisplayTail {
         let mut selected = Vec::new();
         let mut bytes = 0;
         let mut partial = false;
-        let mut limit = if self.bytes > DISPLAY_BYTES as u64 {
-            Limit::Bytes
-        } else {
-            Limit::Lines
-        };
+        let mut limit = Limit::Lines;
         for line in tail.split_terminator('\n').rev().take(DISPLAY_LINES) {
             let next = line.len() + usize::from(!selected.is_empty());
             if bytes + next > DISPLAY_BYTES {
@@ -328,6 +324,24 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), input);
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn trailing_newline_at_the_byte_limit_uses_the_reference_limit_kind() {
+        let input = format!("{}\n", "x".repeat(DISPLAY_BYTES));
+        let mut accumulator = Accumulator::default();
+        accumulator.append(input.as_bytes()).unwrap();
+        let output = accumulator.finish().unwrap();
+        let truncation = &output.details.as_ref().unwrap()["truncation"];
+        assert_eq!(truncation["truncatedBy"], "lines");
+        assert_eq!(truncation["outputBytes"], DISPLAY_BYTES);
+        assert_eq!(output.display_without_notice, "x".repeat(DISPLAY_BYTES));
+        assert!(
+            output
+                .display
+                .contains("[Showing lines 1-1 of 1. Full output: ")
+        );
+        std::fs::remove_file(output.path.unwrap()).unwrap();
+    }
+
     #[test]
     fn oversized_last_line_reports_utf8_bytes_and_partial_line_metadata() {
         let text = "界".repeat(100_000);
