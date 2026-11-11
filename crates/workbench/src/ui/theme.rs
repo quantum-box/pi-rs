@@ -1,6 +1,7 @@
 //! Pi theme roles and color formats, rendered without embedded escape strings.
 use crossterm::style::Color;
-use palette::{FromColor, Okhsl, Oklab, Oklch, Srgb};
+use palette::convert::FromColorUnclamped;
+use palette::{FromColor, LinSrgb, Okhsl, Oklab, Oklch, Srgb};
 use pi_rs::{Error, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -358,41 +359,10 @@ fn resolve(
             b: number as u8,
         });
     }
-    if text.starts_with("okhsl(") || text.starts_with("oklch(") {
-        let (kind, args) = text.split_once('(').expect("color function");
-        let args = args
-            .strip_suffix(')')
-            .ok_or_else(|| Error::Config("unclosed color function".into()))?;
-        let components: Vec<_> = args
-            .split_whitespace()
-            .map(|part| {
-                let percent = part.ends_with('%');
-                let number = part
-                    .trim_end_matches('%')
-                    .parse::<f32>()
-                    .map_err(|_| Error::Config("invalid color component".into()))?;
-                if !number.is_finite() {
-                    return Err(Error::Config("color components must be finite".into()));
-                }
-                Ok(if percent { number / 100.0 } else { number })
-            })
-            .collect::<Result<_>>()?;
-        let [a, b, c] = components.as_slice() else {
-            return Err(Error::Config(
-                "color function needs three components".into(),
-            ));
-        };
-        let rgb: Srgb<f32> = if kind == "okhsl" {
-            Srgb::from_color(Okhsl::new(*a, *b, *c))
-        } else {
-            Srgb::from_color(Oklch::new(*a, *b, *c))
-        };
-        let rgb: Srgb<u8> = rgb.into_format();
-        return Ok(Color::Rgb {
-            r: rgb.red,
-            g: rgb.green,
-            b: rgb.blue,
-        });
+    if let Some((kind, _)) = text.split_once('(')
+        && (kind.eq_ignore_ascii_case("okhsl") || kind.eq_ignore_ascii_case("oklch"))
+    {
+        return parse_function_color(text, kind.eq_ignore_ascii_case("okhsl"));
     }
     if !seen.insert(text.into()) {
         return Err(Error::Config(format!("circular color variable {text:?}")));
@@ -403,6 +373,94 @@ fn resolve(
     let result = resolve(variable, variables, seen);
     seen.remove(text);
     result
+}
+
+fn parse_function_color(text: &str, is_hsl: bool) -> Result<Color> {
+    use std::sync::OnceLock;
+    static HSL: OnceLock<regex::Regex> = OnceLock::new();
+    static LCH: OnceLock<regex::Regex> = OnceLock::new();
+    let number = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?";
+    let pattern = if is_hsl { &HSL } else { &LCH };
+    let pattern = pattern.get_or_init(|| {
+        let expression = if is_hsl {
+            format!(r"(?i)^okhsl\(\s*({number})(?:deg)?\s+({number})(%)?\s+({number})(%)?\s*\)$")
+        } else {
+            format!(r"(?i)^oklch\(\s*({number})(%)?\s+({number})\s+({number})(?:deg)?\s*\)$")
+        };
+        regex::Regex::new(&expression).expect("valid color pattern")
+    });
+    let invalid = || Error::Config(format!("invalid color value: {text}"));
+    let captures = pattern.captures(text).ok_or_else(invalid)?;
+    let number = |index: usize| -> Result<f64> {
+        let value = captures[index].parse::<f64>().map_err(|_| invalid())?;
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(invalid())
+        }
+    };
+    let rgb: Srgb<f64> = if is_hsl {
+        let hue = number(1)?;
+        let saturation = number(2)?
+            / if captures.get(3).is_some() {
+                100.0
+            } else {
+                1.0
+            };
+        let lightness = number(4)?
+            / if captures.get(5).is_some() {
+                100.0
+            } else {
+                1.0
+            };
+        if !(0.0..=1.0).contains(&saturation) || !(0.0..=1.0).contains(&lightness) {
+            return Err(invalid());
+        }
+        Srgb::from_color(Okhsl::new(hue, saturation, lightness))
+    } else {
+        let lightness = number(1)?
+            / if captures.get(2).is_some() {
+                100.0
+            } else {
+                1.0
+            };
+        let chroma = number(3)?;
+        let hue = number(4)?;
+        if !(0.0..=1.0).contains(&lightness) || chroma < 0.0 {
+            return Err(invalid());
+        }
+        let at_chroma = |chroma| LinSrgb::from_color_unclamped(Oklch::new(lightness, chroma, hue));
+        let in_gamut = |rgb: LinSrgb<f64>| {
+            [rgb.red, rgb.green, rgb.blue]
+                .into_iter()
+                .all(|channel| (-1e-7..=1.0 + 1e-7).contains(&channel))
+        };
+        let direct = at_chroma(chroma);
+        let linear = if in_gamut(direct) {
+            direct
+        } else {
+            let mut linear = at_chroma(0.0);
+            let (mut low, mut high) = (0.0, chroma);
+            for _ in 0..20 {
+                let middle = (low + high) / 2.0;
+                let candidate = at_chroma(middle);
+                if in_gamut(candidate) {
+                    low = middle;
+                    linear = candidate;
+                } else {
+                    high = middle;
+                }
+            }
+            linear
+        };
+        Srgb::from_linear(linear)
+    };
+    let rgb: Srgb<u8> = rgb.into_format();
+    Ok(Color::Rgb {
+        r: rgb.red,
+        g: rgb.green,
+        b: rgb.blue,
+    })
 }
 
 #[cfg(test)]
@@ -475,6 +533,43 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn color_functions_accept_pi_syntax_and_validate_ranges() {
+        let parse = |text: &str| {
+            resolve(
+                &Value::String(text.into()),
+                &BTreeMap::new(),
+                &mut BTreeSet::new(),
+            )
+        };
+        assert_eq!(
+            parse("OKHSL(250deg 60% 55%)").unwrap(),
+            parse("okhsl(250 0.6 0.55)").unwrap()
+        );
+        assert_eq!(
+            parse("OKLCH(62% 0.1 200deg)").unwrap(),
+            parse("oklch(.62 0.1 200)").unwrap()
+        );
+        assert_eq!(
+            parse("oklch(100% 0.3 150)").unwrap(),
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255
+            }
+        );
+        for invalid in [
+            "okhsl(1 160% 55%)",
+            "okhsl(1 -0.1 0.5)",
+            "oklch(50% -0.1 0)",
+            "oklch(150% 0 0)",
+            "oklch(.5 20% 0)",
+            "okhsl(2% .5 .5)",
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+    }
+
     #[test]
     fn color_cycles_are_rejected() {
         let vars = [
