@@ -356,6 +356,7 @@ impl Cursor {
             Event::BranchSummary {
                 summary,
                 from,
+                extension_summary,
                 read_files,
                 modified_files,
                 ..
@@ -365,6 +366,17 @@ impl Cursor {
                     "type":"branch_summary","summary":summary,"fromId":wire_id(from),
                     "details":{"readFiles":read_files,"modifiedFiles":modified_files}
                 });
+                if let Some(extension) = extension_summary {
+                    entry["fromHook"] = json!(true);
+                    if let Some(details) = &extension.details {
+                        entry["details"] = details.clone();
+                    } else {
+                        entry
+                            .as_object_mut()
+                            .expect("branch entry")
+                            .remove("details");
+                    }
+                }
                 add_summary_usage(&mut entry, records, record);
                 Some(entry)
             }

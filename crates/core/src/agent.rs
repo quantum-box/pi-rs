@@ -143,6 +143,13 @@ pub enum Notification<'a> {
 
 pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
 
+/// Options for a model-generated branch summary when navigating the tree.
+#[derive(Clone, Copy, Debug)]
+pub struct BranchSummaryOptions<'a> {
+    pub instructions: Option<&'a str>,
+    pub reserve_tokens: u64,
+}
+
 impl Agent<'_> {
     /// A fresh prompt appends a user message. Resume starts from the existing branch.
     /// Follow-ups are consumed at safe boundaries, in FIFO order. The sender owns
@@ -1757,6 +1764,28 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
+        self.navigate_tree(
+            session,
+            selected,
+            Some(BranchSummaryOptions {
+                instructions,
+                reserve_tokens,
+            }),
+            cancel,
+            observer,
+        )
+        .await
+    }
+
+    /// Run extension hooks and switch the active branch, optionally with a summary.
+    pub async fn navigate_tree(
+        &self,
+        session: &mut Session,
+        selected: u64,
+        options: Option<BranchSummaryOptions<'_>>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -1775,9 +1804,164 @@ impl Agent<'_> {
             selected
         };
         session.validate_checkout(target)?;
+        let mut decision = crate::TreeDecision::default();
+        if self
+            .registry
+            .extensions
+            .iter()
+            .any(|extension| extension.handles_tree_navigation())
+        {
+            let (branch, common) = session.branch_divergence(selected);
+            let preparation = crate::TreePreparation {
+                target_id: selected,
+                old_leaf_id: from,
+                common_ancestor_id: common.map(|index| branch[index].id),
+                entries_to_summarize: branch[common.map_or(0, |index| index + 1)..]
+                    .iter()
+                    .map(|record| (*record).clone())
+                    .collect(),
+                user_wants_summary: options.is_some(),
+                custom_instructions: options
+                    .and_then(|options| options.instructions.map(str::to_owned)),
+            };
+            let states = session.extension_states();
+            let deadline =
+                tokio::time::Instant::now() + self.limits.tool_timeout.min(Duration::from_secs(10));
+            for extension in self
+                .registry
+                .extensions
+                .iter()
+                .filter(|extension| extension.handles_tree_navigation())
+            {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = tokio::time::timeout_at(deadline, extension.before_tree(&preparation, states.get(extension.id()), cancel)) => result,
+                };
+                let message = match result {
+                    Ok(Ok(Some(next))) => {
+                        if next.cancel {
+                            return Err(Error::Cancelled);
+                        }
+                        decision = next;
+                        continue;
+                    }
+                    Ok(Ok(None)) => continue,
+                    Ok(Err(error)) => error,
+                    Err(_) => "tree hook timed out".into(),
+                };
+                observer(Notification::ExtensionLifecycleError {
+                    extension: extension.id(),
+                    event: "session_before_tree",
+                    message: &message,
+                });
+            }
+        }
+        let mut from_extension = None;
+        let summary = if let Some(options) = options {
+            if let Some(summary) = decision.summary {
+                if summary.summary.trim().is_empty()
+                    || summary.summary.len() > 64 * 1024
+                    || serde_json::to_vec(&summary.details)?.len() > 256 * 1024
+                {
+                    return Err(Error::Config("invalid extension branch summary".into()));
+                }
+                from_extension = Some(true);
+                Some(Event::BranchSummary {
+                    summary: summary.summary,
+                    extension_summary: Some(crate::ExtensionTreeSummary {
+                        details: summary.details,
+                    }),
+                    from: Some(from),
+                    target: Some(target),
+                    usage: summary.usage,
+                    usage_metadata: None,
+                    read_files: Vec::new(),
+                    modified_files: Vec::new(),
+                })
+            } else {
+                let instructions = decision
+                    .custom_instructions
+                    .as_deref()
+                    .or(options.instructions);
+                let summary = self
+                    .generate_branch_summary(
+                        session,
+                        (selected, from, target),
+                        BranchSummaryOptions {
+                            instructions,
+                            ..options
+                        },
+                        decision.replace_instructions == Some(true),
+                        cancel,
+                        observer,
+                    )
+                    .await?;
+                from_extension = summary.as_ref().map(|_| false);
+                summary
+            }
+        } else {
+            None
+        };
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let summary_id = summary.as_ref().map(|_| session.records().len() as u64 + 1);
+        commit(
+            session,
+            summary.unwrap_or(Event::Checkout { target }),
+            observer,
+        )?;
+        if let Some(label) = decision.label.filter(|label| !label.is_empty()) {
+            commit(
+                session,
+                Event::Label {
+                    target: summary_id.unwrap_or(selected),
+                    label: Some(label),
+                },
+                observer,
+            )?;
+        }
+        if self
+            .registry
+            .extensions
+            .iter()
+            .any(|extension| extension.handles_tree_navigation() && extension.handles_lifecycle())
+        {
+            crate::lifecycle::notify(
+                self.registry,
+                crate::LifecycleEvent::SessionTree {
+                    new_leaf_id: session.head(),
+                    old_leaf_id: from,
+                    summary_entry: summary_id
+                        .map(|id| Box::new(session.records()[id as usize - 1].clone())),
+                    from_extension,
+                },
+                &session.extension_states(),
+                self.limits.tool_timeout,
+                observer,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn generate_branch_summary(
+        &self,
+        session: &mut Session,
+        (selected, from, target): (u64, u64, u64),
+        options: BranchSummaryOptions<'_>,
+        replace_instructions: bool,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<Option<Event>> {
+        let BranchSummaryOptions {
+            instructions,
+            reserve_tokens,
+        } = options;
         let abandoned = session.abandoned_branch(selected);
         if abandoned.messages.is_empty() {
-            return commit(session, Event::Checkout { target }, observer);
+            return Ok(None);
         }
         let mut request = ModelRequest {
             model: self.model_name.into(),
@@ -1806,8 +1990,12 @@ impl Agent<'_> {
             "Create a concise summary of the branch with sections for Goal, Constraints & Preferences, Progress (Done, In Progress, Blocked), Key Decisions, and Next Steps. Distinguish confirmed results from pending work.",
         );
         if let Some(instructions) = instructions.filter(|value| !value.trim().is_empty()) {
-            prompt.push_str("\n\nAdditional focus: ");
-            prompt.push_str(instructions);
+            if replace_instructions {
+                prompt = instructions.to_owned();
+            } else {
+                prompt.push_str("\n\nAdditional focus: ");
+                prompt.push_str(instructions);
+            }
         }
         let mut remaining = capacity
             .saturating_sub(reserve)
@@ -1872,19 +2060,16 @@ impl Agent<'_> {
                 summary.push_str(&format!("\n\n<{tag}>\n{}\n</{tag}>", files.join("\n")));
             }
         }
-        commit(
-            session,
-            Event::BranchSummary {
-                summary,
-                from: Some(from),
-                target: Some(target),
-                usage: reply.usage,
-                usage_metadata,
-                read_files,
-                modified_files,
-            },
-            observer,
-        )
+        Ok(Some(Event::BranchSummary {
+            summary,
+            extension_summary: None,
+            from: Some(from),
+            target: Some(target),
+            usage: reply.usage,
+            usage_metadata,
+            read_files,
+            modified_files,
+        }))
     }
 
     async fn reply_for_branch_summary(
@@ -2777,6 +2962,132 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
         }
     }
     ensure_settled(session.operations())
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    struct TreeHook {
+        veto: bool,
+        completed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Extension for TreeHook {
+        fn id(&self) -> &str {
+            "tree"
+        }
+
+        fn handles_tree_navigation(&self) -> bool {
+            true
+        }
+
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+
+        async fn before_tree(
+            &self,
+            preparation: &crate::TreePreparation,
+            _: Option<&crate::ExtensionState>,
+            _: &CancellationToken,
+        ) -> crate::ExtensionResult<Option<crate::TreeDecision>> {
+            assert!(preparation.user_wants_summary);
+            assert_eq!(preparation.common_ancestor_id, Some(preparation.target_id));
+            assert_eq!(preparation.entries_to_summarize.len(), 1);
+            Ok(Some(crate::TreeDecision {
+                cancel: self.veto,
+                summary: Some(crate::TreeSummary {
+                    summary: "Provided by Rust".into(),
+                    details: None,
+                    usage: None,
+                }),
+                label: Some("Saved branch".into()),
+                ..Default::default()
+            }))
+        }
+
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            assert!(matches!(
+                event,
+                crate::LifecycleEvent::SessionTree {
+                    from_extension: Some(true),
+                    summary_entry: Some(_),
+                    ..
+                }
+            ));
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct NoModel;
+
+    #[async_trait::async_trait]
+    impl Model for NoModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            panic!("a veto or supplied summary must bypass the model");
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_veto_leaves_branch_unchanged_and_supplied_summary_is_committed() {
+        for veto in [true, false] {
+            let completed = Arc::new(AtomicBool::new(false));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(TreeHook {
+                    veto,
+                    completed: completed.clone(),
+                }))
+                .unwrap();
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            let target = session.head();
+            let old_leaf = session
+                .append(Event::User {
+                    content: "Abandoned".into(),
+                    input_id: None,
+                })
+                .unwrap()
+                .id;
+            let agent = Agent {
+                model: &NoModel,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            let result = agent
+                .summarize_branch(
+                    &mut session,
+                    target,
+                    None,
+                    0,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await;
+            assert_eq!(completed.load(Ordering::SeqCst), !veto);
+            if veto {
+                assert!(matches!(result, Err(Error::Cancelled)));
+                assert_eq!(session.records().len() as u64, old_leaf);
+                assert_eq!(session.head(), old_leaf);
+            } else {
+                result.unwrap();
+                let summary = &session.records()[old_leaf as usize];
+                assert_eq!(summary.parent, Some(target));
+                assert!(
+                    matches!(&summary.event, Event::BranchSummary { summary, extension_summary: Some(_), .. } if summary == "Provided by Rust")
+                );
+                assert_eq!(session.labels()[&summary.id], "Saved branch");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

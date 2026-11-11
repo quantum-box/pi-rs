@@ -235,6 +235,8 @@ pub enum Event {
     BranchSummary {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension_summary: Option<crate::ExtensionTreeSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<u64>,
@@ -521,12 +523,8 @@ impl Session {
     }
 
     pub(crate) fn abandoned_branch(&self, target: u64) -> AbandonedBranch {
-        let retained: BTreeSet<_> = self.path(target).iter().map(|record| record.id).collect();
-        let branch = self.branch();
-        let first_abandoned = branch
-            .iter()
-            .rposition(|record| retained.contains(&record.id))
-            .map_or(0, |index| index + 1);
+        let (branch, common_ancestor) = self.branch_divergence(target);
+        let first_abandoned = common_ancestor.map_or(0, |index| index + 1);
         let mut abandoned = AbandonedBranch::default();
         let Some(first) = branch.get(first_abandoned) else {
             return abandoned;
@@ -568,6 +566,15 @@ impl Session {
             .read_files
             .retain(|path| !abandoned.modified_files.contains(path));
         abandoned
+    }
+
+    pub(crate) fn branch_divergence(&self, target: u64) -> (Vec<&Record>, Option<usize>) {
+        let retained: BTreeSet<_> = self.path(target).iter().map(|record| record.id).collect();
+        let branch = self.branch();
+        let common_ancestor = branch
+            .iter()
+            .rposition(|record| retained.contains(&record.id));
+        (branch, common_ancestor)
     }
 
     /// Current projected messages, including calls whose tools are still running.
@@ -2100,6 +2107,7 @@ mod session_metadata_tests {
         session
             .append(Event::BranchSummary {
                 summary: "decision from the old branch".into(),
+                extension_summary: None,
                 from: Some(3),
                 target: Some(2),
                 usage: Some(usage),

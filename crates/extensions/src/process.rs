@@ -10,7 +10,7 @@ use pi_rs_core::{
     CacheWarmingAction, CacheWarmingDecision, CancellationToken, Compaction, Decision, Error,
     Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState, InputAction,
     InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RequestPurpose, Result, Tool,
-    ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec,
+    ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, TreeDecision, TreePreparation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -137,6 +137,10 @@ enum ProtocolRequest {
         event: CacheWarmingDecision,
         state: Option<ExtensionState>,
     },
+    BeforeTree {
+        preparation: TreePreparation,
+        state: Option<ExtensionState>,
+    },
     BeforeRequest {
         request: ModelRequest,
         summary: bool,
@@ -206,6 +210,8 @@ struct Description {
     lifecycle_hook: bool,
     #[serde(default)]
     cache_warming_hook: bool,
+    #[serde(default)]
+    tree_navigation_hook: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
@@ -430,6 +436,21 @@ impl Extension for ExecutableExtension {
     ) -> ExtensionResult<Option<CacheWarmingAction>> {
         self.request_async(ProtocolRequest::CacheWarmingDecision {
             event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+    fn handles_tree_navigation(&self) -> bool {
+        self.description.tree_navigation_hook
+    }
+    async fn before_tree(
+        &self,
+        preparation: &TreePreparation,
+        state: Option<&ExtensionState>,
+        _cancel: &CancellationToken,
+    ) -> ExtensionResult<Option<TreeDecision>> {
+        self.request_async(ProtocolRequest::BeforeTree {
+            preparation: preparation.clone(),
             state: state.cloned(),
         })
         .await
@@ -1130,6 +1151,7 @@ async fn dispatch_with_host(
             input_hook: extension.handles_input(),
             lifecycle_hook: extension.handles_lifecycle(),
             cache_warming_hook: extension.handles_cache_warming(),
+            tree_navigation_hook: extension.handles_tree_navigation(),
             tools: extension
                 .tools()
                 .into_iter()
@@ -1164,6 +1186,11 @@ async fn dispatch_with_host(
         ProtocolRequest::CacheWarmingDecision { event, state } => encode(
             extension
                 .cache_warming_decision(&event, state.as_ref())
+                .await,
+        ),
+        ProtocolRequest::BeforeTree { preparation, state } => encode(
+            extension
+                .before_tree(&preparation, state.as_ref(), &CancellationToken::new())
                 .await,
         ),
         ProtocolRequest::BeforeRequest {

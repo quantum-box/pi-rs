@@ -324,7 +324,7 @@ struct View {
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
     local_editor: Option<(LocalEditor, crate::ui::dialog::Dialog)>,
     tree_confirmation: Option<u64>,
-    branch_summary: Option<u64>,
+    tree_navigation: Option<(u64, bool)>,
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: std::collections::BTreeMap<String, (Vec<String>, pi_rs::WidgetPlacement)>,
@@ -471,11 +471,15 @@ impl View {
         }
     }
     fn working_phase(&self) -> &'static str {
-        match (self.branch_summary.is_some(), self.phase) {
-            (true, Some("再試行待ち")) => "要約の再試行待ち",
-            (true, _) => "Summarizing branch",
-            (false, Some(phase)) => phase,
-            (false, None) if self.shell_running => "コマンド実行中",
+        match (
+            self.tree_navigation.map(|(_, summarize)| summarize),
+            self.phase,
+        ) {
+            (Some(true), Some("再試行待ち")) => "要約の再試行待ち",
+            (Some(true), _) => "Summarizing branch",
+            (Some(false), _) => "Switching branch",
+            (None, Some(phase)) => phase,
+            (None, None) if self.shell_running => "コマンド実行中",
             _ => "処理中",
         }
     }
@@ -2662,7 +2666,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 }
                 let settled = value["type"] == "agent_settled";
                 let success = value["success"] == true;
-                if view.branch_summary.is_some() {
+                if view.tree_navigation.is_some() {
                     match value["type"].as_str() {
                         Some("text_delta" | "reasoning_delta") => continue,
                         Some("error") => {
@@ -2685,7 +2689,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     active.busy = false;
                     view.dialogs.clear();
                     view.settle();
-                    if let Some(id) = view.branch_summary.take() {
+                    if let Some((id, _)) = view.tree_navigation.take() {
                         let result = if success {
                             restore_tree_position(&mut args, &mut view, id)
                         } else {
@@ -2695,7 +2699,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                         .branch_error
                                         .take()
                                         .unwrap_or_else(|| {
-                                            "Branch summary did not complete".into()
+                                            "Branch navigation did not complete".into()
                                         })));
                                 }
                             })
@@ -2718,7 +2722,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 view.settle();
                 view.cache_warming_status = None;
                 view.dialogs.clear();
-                if let Some(id) = view.branch_summary.take()
+                if let Some((id, _)) = view.tree_navigation.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
                 {
                     view.append(&error.to_string());
@@ -2928,11 +2932,12 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                         )
                                     })
                                     .map(|()| view.append("Setting saved")),
-                                LocalEditor::BranchSummary(id) => start_branch_summary(
+                                LocalEditor::BranchSummary(id) => start_tree_navigation(
                                     &args,
                                     &mut view,
                                     &mut worker,
                                     *id,
+                                    true,
                                     Some(text),
                                 ),
                                 LocalEditor::OpenRouterCode(sender) => {
@@ -3246,7 +3251,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit" | "app.message.followUp" => {
-                        if view.branch_summary.is_some() {
+                        if view.tree_navigation.is_some() {
                             continue;
                         }
                         if view.clipboard.is_some() {
@@ -4118,20 +4123,6 @@ fn confirm_tree(view: &mut View, id: u64) {
     ));
 }
 
-fn checkout_tree(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
-    let mut session = Session::open(&args.session)?;
-    let record = &session.records()[id as usize - 1];
-    let target = match record.event {
-        pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. } => {
-            record.parent.unwrap_or(1)
-        }
-        _ => id,
-    };
-    session.checkout(target)?;
-    drop(session);
-    restore_tree_position(args, view, id)
-}
-
 fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()> {
     let input = Session::open(&args.session)?
         .records()
@@ -4150,11 +4141,12 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
     Ok(())
 }
 
-fn start_branch_summary(
+fn start_tree_navigation(
     args: &Cli,
     view: &mut View,
     worker: &mut Option<Worker>,
     id: u64,
+    summarize: bool,
     instructions: Option<String>,
 ) -> Result<()> {
     let configured_reserve = &args.settings.value()["branchSummary"]["reserveTokens"];
@@ -4165,12 +4157,12 @@ fn start_branch_summary(
     start_request(
         args,
         json!({
-            "type":"branch_summary", "selected":id, "instructions":instructions, "reserve_tokens":reserve_tokens
+            "type":"branch_summary", "selected":id, "instructions":instructions, "reserve_tokens":reserve_tokens, "summarize":summarize
         }),
         worker,
     )?;
     view.branch_error = None;
-    view.branch_summary = Some(id);
+    view.tree_navigation = Some((id, summarize));
     Ok(())
 }
 
@@ -4224,13 +4216,17 @@ fn select(
             if id == Session::open(&args.session)?.head() {
                 view.append("Already at this point");
             } else if args.settings.value()["branchSummary"]["skipPrompt"] == true {
-                checkout_tree(args, view, id)?;
+                start_tree_navigation(args, view, worker, id, false, None)?;
             } else {
                 confirm_tree(view, id);
             }
         }
-        Selection::CheckoutWithoutSummary(id) => checkout_tree(args, view, id)?,
-        Selection::CheckoutWithSummary(id) => start_branch_summary(args, view, worker, id, None)?,
+        Selection::CheckoutWithoutSummary(id) => {
+            start_tree_navigation(args, view, worker, id, false, None)?
+        }
+        Selection::CheckoutWithSummary(id) => {
+            start_tree_navigation(args, view, worker, id, true, None)?
+        }
         Selection::EditBranchSummary(id) => {
             let dialog = crate::ui::dialog::Dialog::new(
                 uuid::Uuid::new_v4(),

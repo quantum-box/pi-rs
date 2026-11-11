@@ -295,6 +295,19 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    fn handles_tree_navigation(&self) -> bool {
+        false
+    }
+
+    async fn before_tree(
+        &self,
+        _preparation: &crate::TreePreparation,
+        _state: Option<&ExtensionState>,
+        _cancel: &crate::CancellationToken,
+    ) -> ExtensionResult<Option<crate::TreeDecision>> {
+        Ok(None)
+    }
+
     async fn cache_warming_decision(
         &self,
         _event: &CacheWarmingDecision,

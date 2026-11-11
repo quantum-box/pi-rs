@@ -62,6 +62,7 @@ enum Request {
         selected: u64,
         instructions: Option<String>,
         reserve_tokens: u64,
+        summarize: bool,
     },
     Steer {
         content: String,
@@ -576,12 +577,15 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     selected,
                     instructions,
                     reserve_tokens,
+                    summarize,
                 } => {
-                    Box::pin(agent.summarize_branch(
+                    Box::pin(agent.navigate_tree(
                         session,
                         selected,
-                        instructions.as_deref(),
-                        reserve_tokens,
+                        summarize.then_some(pi_rs::BranchSummaryOptions {
+                            instructions: instructions.as_deref(),
+                            reserve_tokens,
+                        }),
                         &cancel,
                         &mut observer,
                     ))

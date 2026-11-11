@@ -15,7 +15,10 @@ pub use agent::*;
 pub use context::*;
 pub use extension::*;
 pub use journal::*;
-pub use lifecycle::{LifecycleEvent, LifecycleMessage};
+pub use lifecycle::{
+    ExtensionTreeSummary, LifecycleEvent, LifecycleMessage, TreeDecision, TreePreparation,
+    TreeSummary,
+};
 pub use retry::*;
 pub use sdk::*;
 pub use statistics::{ContextUsage, SessionStats, TokenTotals};

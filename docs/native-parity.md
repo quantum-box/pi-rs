@@ -2771,3 +2771,18 @@ retain the diagnostic timestamp and transformation type, path, and reason.
 With `showCacheMissNotices` enabled, both terminal modes warn when the
 number of dropped thinking blocks increases compared to the previous
 assistant response on the active branch. Reopening restores that baseline.
+
+### Session tree extension checkpoint
+
+Embedded and executable Rust extensions can opt into tree navigation.
+The pre-navigation hook receives the selected entry, the current leaf,
+their common ancestor, the abandoned entries, and the requested summary
+options. A veto keeps the branch unchanged. The last returned decision
+can supply a summary with details and usage, override the model summary
+instructions, or label the selected entry or new summary.
+
+The terminal runs the hooks for both summarized and unsummarized
+navigation, including when the confirmation prompt is disabled. The
+post-navigation lifecycle event reports the committed leaf and summary
+origin. Extension-supplied details and origin survive journal reload,
+fork, and RPC session projection.

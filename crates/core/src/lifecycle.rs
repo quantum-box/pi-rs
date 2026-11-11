@@ -4,7 +4,43 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{ExtensionStates, Message, Notification, Observer, Registry, RunState, Session};
+use crate::{
+    ExtensionStates, Message, Notification, Observer, Record, Registry, RunState, Session, Usage,
+};
+
+/// Branch navigation as selected by the user, before any session changes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TreePreparation {
+    pub target_id: u64,
+    pub old_leaf_id: u64,
+    pub common_ancestor_id: Option<u64>,
+    pub entries_to_summarize: Vec<Record>,
+    pub user_wants_summary: bool,
+    pub custom_instructions: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TreeDecision {
+    pub cancel: bool,
+    pub summary: Option<TreeSummary>,
+    pub custom_instructions: Option<String>,
+    pub replace_instructions: Option<bool>,
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TreeSummary {
+    pub summary: String,
+    pub details: Option<serde_json::Value>,
+    pub usage: Option<Usage>,
+}
+
+/// Presence marks a branch summary supplied by an extension.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExtensionTreeSummary {
+    pub details: Option<serde_json::Value>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -31,6 +67,12 @@ pub enum LifecycleEvent {
         turn_index: u32,
         messages: Vec<LifecycleMessage>,
     },
+    SessionTree {
+        new_leaf_id: u64,
+        old_leaf_id: u64,
+        summary_entry: Option<Box<Record>>,
+        from_extension: Option<bool>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +88,7 @@ impl LifecycleEvent {
             Self::AgentEnd { .. } => "agent_end",
             Self::TurnStart { .. } => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
+            Self::SessionTree { .. } => "session_tree",
         }
     }
 }
@@ -86,11 +129,11 @@ pub(crate) async fn notify(
     observer: &mut Observer<'_>,
 ) {
     let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(10));
-    for extension in registry
-        .extensions
-        .iter()
-        .filter(|extension| extension.handles_lifecycle())
-    {
+    for extension in registry.extensions.iter().filter(|extension| {
+        extension.handles_lifecycle()
+            && (!matches!(event, LifecycleEvent::SessionTree { .. })
+                || extension.handles_tree_navigation())
+    }) {
         let error = match tokio::time::timeout_at(
             deadline,
             extension.lifecycle(&event, states.get(extension.id())),

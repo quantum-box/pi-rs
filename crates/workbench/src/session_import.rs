@@ -682,6 +682,11 @@ fn convert(
             };
             events.push(Event::BranchSummary {
                 summary: required(entry, "summary")?.into(),
+                extension_summary: (entry["fromHook"] == true).then(|| {
+                    pi_rs::ExtensionTreeSummary {
+                        details: entry.get("details").cloned(),
+                    }
+                }),
                 from: entry["fromId"]
                     .as_str()
                     .and_then(|id| branches.get(id))
