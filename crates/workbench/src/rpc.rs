@@ -535,9 +535,6 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .as_str()
                 .ok_or_else(|| Error::Config("sessionPath is required".into()))?;
             let path = args.workspace.join(path);
-            if !path.is_file() {
-                return Err(Error::Config("session file not found".into()));
-            }
             if Worker::check_session_transition(
                 Some(worker),
                 args,
@@ -554,13 +551,14 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         "fork" | "clone" if !busy(worker) => {
             let session = Session::open(&args.session)?;
             let (entry_id, position, target, text) = if name == "fork" {
-                let entry = record_id(&request["entryId"])?;
+                let invalid = || Error::Config("Invalid entry ID for forking".into());
+                let entry = record_id(&request["entryId"]).map_err(|_| invalid())?;
                 let id = super::rpc_entries::editable_record(&session, entry);
                 let record = session
                     .records()
                     .iter()
                     .find(|record| record.id == id)
-                    .ok_or_else(|| Error::Config("unknown fork entry".into()))?;
+                    .ok_or_else(invalid)?;
                 match &record.event {
                     pi_rs::Event::User { content, .. }
                     | pi_rs::Event::UserWithImages { content, .. } => {
@@ -572,9 +570,14 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                             Some(content.clone()),
                         )
                     }
-                    _ => return Err(Error::Config("fork must select a user message".into())),
+                    _ => return Err(invalid()),
                 }
             } else {
+                if !super::rpc_entries::Entries::new(&session).has_leaf() {
+                    return Err(Error::Config(
+                        "Cannot clone session: no current entry selected".into(),
+                    ));
+                }
                 (
                     session.head(),
                     pi_rs::ForkPosition::At,
@@ -604,9 +607,14 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             )?;
             drop(session);
             switch_session(args, &destination)?;
-            Ok(Some(
-                json!({"cancelled":false,"text":text,"sessionFile":args.session}),
-            ))
+            let mut data = json!({"cancelled":false});
+            if let Some(text) = text {
+                data["text"] = json!(text);
+            }
+            if request["includeNative"] == true {
+                data["sessionFile"] = json!(args.session);
+            }
+            Ok(Some(data))
         }
 
         "new_session" if !busy(worker) => {
@@ -1068,6 +1076,11 @@ fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
     }
     match result {
         Ok(Some(data)) => value["data"] = data,
+        Err(Error::Config(message))
+            if matches!(request["type"].as_str(), Some("fork" | "clone")) =>
+        {
+            value["error"] = json!(message);
+        }
         Err(error) => value["error"] = json!(error.to_string()),
         _ => {}
     }
@@ -1305,12 +1318,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(tree["tree"].as_array().unwrap().len(), 1);
-        command(
+        let forked = command(
             &json!({"type":"fork","entryId":second.to_string()}),
             &mut args,
             &mut worker,
         )
         .unwrap();
+        assert_eq!(forked, Some(json!({"text":"second","cancelled":false})));
         assert_ne!(args.session, source);
         assert_eq!(args.model, "fixture:4b");
         assert_eq!(args.thinking.as_deref(), Some("low"));
@@ -1329,6 +1343,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.session, source);
+        let cloned = command(&json!({"type":"clone"}), &mut args, &mut worker).unwrap();
+        assert_eq!(cloned, Some(json!({"cancelled":false})));
+        let clone = Session::snapshot(&args.session).unwrap();
+        assert_eq!(clone.current_messages().len(), 2);
+        let cloned = command(
+            &json!({"type":"clone","includeNative":true}),
+            &mut args,
+            &mut worker,
+        )
+        .unwrap();
+        assert_eq!(
+            cloned,
+            Some(json!({"cancelled":false,"sessionFile":args.session}))
+        );
         assert!(
             command(
                 &json!({"type":"get_entries","since":"999999"}),
@@ -1337,6 +1365,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn clone_rejects_sessions_without_a_visible_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = root.path().to_path_buf();
+        args.session = root.path().join("source.jsonl");
+        let mut session = Session::open(&args.session).unwrap();
+        session.set_working_directory(root.path()).unwrap();
+        drop(session);
+        let original = args.session.clone();
+        let error = command(&json!({"type":"clone"}), &mut args, &mut None).unwrap_err();
+        assert!(matches!(error, Error::Config(message)
+            if message == "Cannot clone session: no current entry selected"));
+        assert_eq!(args.session, original);
     }
 
     #[test]

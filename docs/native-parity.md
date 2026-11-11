@@ -64,6 +64,11 @@ empty aborted assistant messages, concatenate the selected message's text
 blocks, and trim the result. The RPC response omits `text` when the selected
 message has no text or the transcript has no eligible assistant message.
 
+`clone` requires a visible session leaf and returns `cancelled` on success.
+`fork` also returns the selected user text. Pass `includeNative: true` on
+either command to receive the new `sessionFile` in the same response. The
+path is also available via `get_state` after the transition.
+
 The message snapshot preserves imported Pi roles, timestamps, and extension
 message details. Context edits replace the affected content in the snapshot.
 Imported Gemini conversations carry signed text, thought, and function parts

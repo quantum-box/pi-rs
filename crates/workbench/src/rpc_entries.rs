@@ -29,6 +29,10 @@ pub(super) struct Entries {
 }
 
 impl Entries {
+    pub(super) fn has_leaf(&self) -> bool {
+        self.leaf.is_some()
+    }
+
     pub(super) fn new(session: &Session) -> Self {
         let mut cursor = Cursor::default();
         let values = session
