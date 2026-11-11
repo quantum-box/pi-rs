@@ -45,46 +45,31 @@ impl Resources {
         };
         let agent = crate::config::agent_dir();
         let workspace = args.workspace.canonicalize()?;
-        let mut directories = workspace
-            .ancestors()
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        directories.reverse();
-        directories.insert(0, agent.clone());
-        let mut seen = std::collections::BTreeSet::new();
-        for directory in directories.into_iter().filter(|_| !args.no_context_files) {
-            // Explicit --project continues to use the core's project-scoped loader.
-            if args.project.is_some() && directory.starts_with(&workspace) {
-                continue;
-            }
-            for filename in [
-                "AGENTS.override.md",
-                "AGENTS.md",
-                "AGENTS.MD",
-                "CLAUDE.md",
-                "CLAUDE.MD",
-            ] {
-                let path = directory.join(filename);
-                if !path.is_file() {
+        if !args.no_context_files {
+            let mut directories: Vec<_> = workspace.ancestors().collect();
+            directories.reverse();
+            let shadowed = if args.project.is_none() {
+                shadowed_context(&workspace)
+            } else {
+                None
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            for (index, directory) in std::iter::once(agent.as_path())
+                .chain(directories)
+                .enumerate()
+            {
+                // Explicit --project continues to use the core's project-scoped loader.
+                if args.project.is_some() && directory.starts_with(&workspace) {
                     continue;
                 }
-                match path
-                    .canonicalize()
-                    .map_err(Error::from)
-                    .and_then(|resolved| read_without_bom(&path).map(|text| (resolved, text)))
+                if let Some((path, resolved, text)) =
+                    context_file(directory, &mut resources.warnings)
+                    && (index == 0 || shadowed.as_ref() != Some(&path))
+                    && seen.insert(resolved)
                 {
-                    Ok((resolved, text)) => {
-                        if seen.insert(resolved) {
-                            resources
-                                .instructions
-                                .push_str(&format!("\n\n# Context {}\n{text}", path.display(),));
-                        }
-                        break;
-                    }
-                    Err(error) => resources.warnings.push(format!(
-                        "Warning: Could not read {}: {error}",
-                        path.display()
-                    )),
+                    resources
+                        .instructions
+                        .push_str(&format!("\n\n# Context {}\n{text}", path.display()));
                 }
             }
         }
@@ -437,6 +422,62 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
         .unwrap_or_default();
     Ok((metadata, normalized[end + 4..].trim().into()))
 }
+fn context_file(
+    directory: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<(PathBuf, PathBuf, String)> {
+    for filename in [
+        "AGENTS.override.md",
+        "AGENTS.md",
+        "AGENTS.MD",
+        "CLAUDE.md",
+        "CLAUDE.MD",
+    ] {
+        let path = directory.join(filename);
+        if !path.is_file() {
+            continue;
+        }
+        match path
+            .canonicalize()
+            .map_err(Error::from)
+            .and_then(|resolved| read_without_bom(&path).map(|text| (resolved, text)))
+        {
+            Ok((resolved, text)) => return Some((path, resolved, text)),
+            Err(error) => warnings.push(format!(
+                "Warning: Could not read {}: {error}",
+                path.display()
+            )),
+        }
+    }
+    None
+}
+
+fn shadowed_context(workspace: &Path) -> Option<PathBuf> {
+    let worktree = workspace
+        .ancestors()
+        .find(|directory| directory.join(".git").exists())?;
+    let git_file = worktree.join(".git");
+    if !git_file.is_file() {
+        return None;
+    }
+    let link = read(&git_file).ok()?;
+    let git_dir = worktree.join(link.trim().strip_prefix("gitdir: ")?.trim());
+    if !git_dir.join("HEAD").is_file() {
+        return None;
+    }
+    let common = read(&git_dir.join("commondir")).ok()?;
+    let common = git_dir.join(common.trim()).canonicalize().ok()?;
+    let main = common.parent()?;
+    if main == worktree
+        || !worktree.starts_with(main)
+        || main.join(".git").canonicalize().ok()? != common
+    {
+        return None;
+    }
+    let (path, _, _) = context_file(worktree, &mut Vec::new())?;
+    Some(main.join(path.file_name()?))
+}
+
 fn prompt_argument(workspace: &Path, argument: &str) -> Result<String> {
     let path = resource_path(workspace, argument);
     if path.is_file() {
@@ -584,6 +625,35 @@ mod tests {
             "A literal instruction."
         );
     }
+    #[test]
+    fn nested_worktree_shadows_only_the_matching_main_repo_context_file() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let main = root.join("main");
+        let worktree = main.join("nested");
+        let workspace = worktree.join("src");
+        let git = main.join(".git/worktrees/nested");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/nested\n").unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/fixture\n").unwrap();
+        std::fs::write(git.join("commondir"), "../..\n").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "outer fixture").unwrap();
+        std::fs::write(main.join("AGENTS.md"), "main fixture").unwrap();
+        std::fs::write(worktree.join("AGENTS.md"), "worktree fixture").unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = workspace;
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.instructions.contains("outer fixture"));
+        assert!(resources.instructions.contains("worktree fixture"));
+        assert!(!resources.instructions.contains("main fixture"));
+        std::fs::rename(worktree.join("AGENTS.md"), worktree.join("CLAUDE.md")).unwrap();
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.instructions.contains("main fixture"));
+        assert!(resources.instructions.contains("worktree fixture"));
+    }
+
     #[test]
     fn context_uses_one_readable_file_per_directory_in_pi_order() {
         use clap::Parser;

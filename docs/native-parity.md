@@ -176,6 +176,8 @@ Each directory contributes its first readable context file in Pi order
 (`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`).
 Context files are loaded from outer directories toward the workspace, and a
 UTF-8 BOM at the start of a file is removed.
+In a nested linked Git worktree, the worktree root's context file shadows
+the main repository's context file of the same name.
 
 The local CLI's coding profile can read and write absolute paths, including
 personal skill files outside the working directory. Embedded users of
