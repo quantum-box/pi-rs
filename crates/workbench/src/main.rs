@@ -1578,7 +1578,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 *prompt = prepared.text;
                 images = prepared.images;
             }
-            if let Some(expanded) = runtime.resources.expand(prompt)? {
+            if let Some(expanded) = runtime.resources.expand(prompt) {
                 *prompt = expanded;
             }
         }

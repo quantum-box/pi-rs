@@ -289,27 +289,36 @@ impl Resources {
         text.push_str(&format!("\n\n<cwd>\n{}\n</cwd>", workspace.display()));
         text
     }
-    pub fn expand(&self, input: &str) -> Result<Option<String>> {
-        let (name, arguments) = input.split_once(is_prompt_space).unwrap_or((input, ""));
-        if let Some(name) = name.strip_prefix("/skill:") {
-            let skill = self
-                .skills
-                .get(name)
-                .ok_or_else(|| Error::Config(format!("skill {name:?} not found")))?;
-            return Ok(Some(format!(
-                "Skill directory: {}\n{}\n\n{}",
-                skill.path.parent().unwrap_or(Path::new(".")).display(),
-                read(&skill.path)?,
-                arguments
-            )));
+    pub fn expand(&self, input: &str) -> Option<String> {
+        if let Some(command) = input.strip_prefix("/skill:") {
+            let (name, arguments) = command.split_once(' ').unwrap_or((command, ""));
+            if let Some(skill) = self.skills.get(name) {
+                match read_without_bom(&skill.path).and_then(|text| frontmatter(&text)) {
+                    Ok((_, body)) => {
+                        let location = skill.path.display();
+                        let directory = skill.path.parent().unwrap_or(Path::new(".")).display();
+                        let body = body.trim_matches(is_prompt_space);
+                        let mut text = format!(
+                            "<skill name=\"{name}\" location=\"{location}\">\nReferences are relative to {directory}.\n\n{body}\n</skill>"
+                        );
+                        let arguments = arguments.trim_matches(is_prompt_space);
+                        if !arguments.is_empty() {
+                            text.push_str("\n\n");
+                            text.push_str(arguments);
+                        }
+                        return Some(text);
+                    }
+                    Err(error) => {
+                        eprintln!("Could not expand skill {}: {error}", skill.path.display())
+                    }
+                }
+            }
         }
-        let Some(prompt) = name
+        let (name, arguments) = input.split_once(is_prompt_space).unwrap_or((input, ""));
+        let prompt = name
             .strip_prefix('/')
-            .and_then(|name| self.prompts.get(name))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(expand_arguments(&prompt.body, arguments)))
+            .and_then(|name| self.prompts.get(name))?;
+        Some(expand_arguments(&prompt.body, arguments))
     }
 }
 fn xml(value: &str) -> String {
@@ -870,6 +879,29 @@ mod tests {
         assert!(resources.skills.contains_key("discovered"));
         assert!(resources.prompts.contains_key("discovered"));
     }
+    #[test]
+    fn explicit_skill_expansion_sends_body_and_optional_user_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("SKILL.md");
+        std::fs::write(&path, "\u{feff}---\r\nname: fixture\r\ndescription: hidden metadata\r\n---\r\n  skill body  \r\n").unwrap();
+        let (name, skill) = parse_skill(&path).unwrap();
+        let location = skill.path.display();
+        let base = skill.path.parent().unwrap().display();
+        let block = format!(
+            "<skill name=\"fixture\" location=\"{location}\">\nReferences are relative to {base}.\n\nskill body\n</skill>"
+        );
+        let resources = Resources {
+            skills: BTreeMap::from([(name, skill)]),
+            ..Resources::default()
+        };
+        assert_eq!(resources.expand("/skill:fixture  "), Some(block.clone()));
+        assert_eq!(
+            resources.expand("/skill:fixture  do this \n"),
+            Some(format!("{block}\n\ndo this"))
+        );
+        assert_eq!(resources.expand("/skill:missing"), None);
+    }
+
     #[test]
     fn templates_preserve_quoted_arguments_defaults_and_slices() {
         assert_eq!(

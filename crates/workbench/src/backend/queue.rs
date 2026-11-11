@@ -120,7 +120,7 @@ impl Processor {
             message.input.content = prepared.text;
             message.images = prepared.images;
         }
-        if let Some(expanded) = self.resources.expand(&message.input.content)? {
+        if let Some(expanded) = self.resources.expand(&message.input.content) {
             message.input.content = expanded;
         }
         message.validate()?;

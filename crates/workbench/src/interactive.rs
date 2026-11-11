@@ -2522,7 +2522,11 @@ fn slash(
             view.restore(args)?;
         }
         _ => {
-            if let Some(expanded) = view.resources.expand(input)? {
+            if let Some(expanded) = view
+                .resources
+                .expand(input)
+                .or_else(|| input.starts_with("/skill:").then(|| input.to_owned()))
+            {
                 view.lines.push(Entry::User(expanded.clone()));
                 view.pending_request = Some(json!({"type":"prompt","content":input}));
                 return Ok(None);

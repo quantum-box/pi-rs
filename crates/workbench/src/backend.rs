@@ -568,7 +568,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     }
                     let mut content = content
                         .map(|input| {
-                            let expanded = runtime.resources.expand(&input)?;
+                            let expanded = runtime.resources.expand(&input);
                             if require_command && expanded.is_none() {
                                 return Err(Error::Config("Unknown command. Use /help.".into()));
                             }

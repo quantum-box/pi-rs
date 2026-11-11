@@ -172,6 +172,9 @@ Project configuration follows a stored trust decision, with an interactive
 trust selector and explicit `--trust` / `--no-trust` overrides. Context files
 remain readable independently of project trust. `/skills`, `/prompts`,
 `/skill:name`, prompt argument expansion and `/reload` are available.
+Explicit skill invocation sends Pi's `<skill>` block with the source location,
+relative-reference directory and body. Frontmatter is removed, and optional
+user text follows the block.
 Prompt-template arguments preserve literal backslashes and quoted empty
 values. Positional arguments, defaults and slices use Pi's placeholder
 syntax and expand only once.
