@@ -4026,6 +4026,10 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     };
     if let Some(choice) = next_model(args, choices, reverse) {
         args.change_model(choice.provider, choice.model, choice.thinking)?;
+    } else if args.model_scope.is_empty() {
+        view.append("Only one model available");
+    } else {
+        view.append("Only one model in scope");
     }
     Ok(())
 }

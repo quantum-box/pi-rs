@@ -276,17 +276,17 @@ fn canonical(model: String, ids: &[String], aliases: &[(String, String)]) -> Str
 
 pub fn next_model(args: &Cli, available: &[ScopedChoice], reverse: bool) -> Option<ScopedChoice> {
     let count = available.len();
-    if count == 0 {
+    if count <= 1 {
         return None;
     }
     let current = available
         .iter()
-        .position(|model| model.provider == args.provider && model.model == args.model);
-    let next = match (current, reverse) {
-        (Some(index), true) => (index + count - 1) % count,
-        (Some(index), false) => (index + 1) % count,
-        (None, true) => count - 1,
-        (None, false) => 0,
+        .position(|model| model.provider == args.provider && model.model == args.model)
+        .unwrap_or(0);
+    let next = if reverse {
+        (current + count - 1) % count
+    } else {
+        (current + 1) % count
     };
     Some(available[next].clone())
 }
@@ -541,6 +541,22 @@ mod tests {
     fn scope<'a>(patterns: impl IntoIterator<Item = &'a str>, available: &[String]) -> Scope {
         super::scope(patterns, available, "ollama")
     }
+    #[test]
+    fn cycling_uses_the_first_slot_as_origin_when_current_model_is_missing() {
+        use super::{Cli, Provider, ScopedChoice, next_model};
+        use clap::Parser;
+        let args = Cli::try_parse_from(["pi"]).unwrap();
+        let choices = ["first", "second", "third"].map(|model| ScopedChoice {
+            provider: Provider::Ollama,
+            model: model.into(),
+            thinking: None,
+        });
+        assert!(next_model(&args, &choices[..1], false).is_none());
+        assert!(next_model(&args, &choices[..1], true).is_none());
+        assert_eq!(next_model(&args, &choices, false).unwrap().model, "second");
+        assert_eq!(next_model(&args, &choices, true).unwrap().model, "third");
+    }
+
     #[test]
     fn preserves_model_tags_and_extracts_only_known_thinking_levels() {
         assert_eq!(split("qwen3.5:4b", &[]).unwrap().model, "qwen3.5:4b");

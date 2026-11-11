@@ -1557,6 +1557,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result["model"]["id"], "b");
+        args.model_scope.truncate(1);
+        assert_eq!(
+            command(&json!({"type":"cycle_model"}), &mut args, &mut worker).unwrap(),
+            Some(Value::Null)
+        );
+        assert_eq!(args.model, "b");
         assert_eq!(
             Session::open(&args.session).unwrap().model_selection(),
             Some(("b".into(), Some("high".into())))

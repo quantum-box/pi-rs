@@ -1902,6 +1902,10 @@ literal brackets and thinking-like tags. A partial ID selects the latest
 matching alias before dated versions. Globs can match both bare and qualified
 IDs, respect slash boundaries, and retain all matches in catalog order.
 
+Model cycling leaves the current selection intact for lists with fewer than
+two choices. If the current model is outside the list, forward and backward
+cycling start from the first slot, as in Pi.
+
 Scope diagnostics warn about unmatched patterns and invalid thinking suffixes.
 The resolver keeps valid candidates and falls back to normal model selection
 when every pattern misses. Pattern order and the first occurrence of each
