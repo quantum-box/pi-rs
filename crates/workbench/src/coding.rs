@@ -14,7 +14,7 @@ use pi_rs::{
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub use crate::shell_config::{ShellConfig, ShellContext};
+pub use crate::shell_config::{ShellConfig, ShellContext, ShellSpawnContext, ShellSpawnHook};
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ORIGINAL_IMAGE_BYTES: usize = 6 * 1024 * 1024;
@@ -143,9 +143,11 @@ impl CodingTools {
         let mut filter = UserShellFilter::default();
         let mut cancelled = false;
         let mut timed_out = false;
+        let mut operation_event = event.clone();
+        operation_event.command = self.shell.command_with_prefix(&event.command);
         let exit_code = {
             let operation = extension.execute_user_bash(
-                event,
+                &operation_event,
                 state,
                 timeout,
                 operation_cancel.clone(),
@@ -1046,14 +1048,19 @@ impl CodingTool {
     ) -> Result<ShellResult> {
         let started = std::time::Instant::now();
         let timeout = shell_timeout(args)?;
-        let crate::shell_config::Launch { mut command, input } = self.shell.launch(
+        let crate::shell_config::Launch {
+            mut command,
+            input,
+            cwd,
+        } = self.shell.launch(
             &self.root,
             matches!(self.kind, Kind::PowerShell),
             self.unrestricted,
             string(args, "command")?,
+            !sanitize_user_output,
         )?;
         command
-            .current_dir(&self.root)
+            .current_dir(cwd)
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -1572,6 +1579,132 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_shell_spawn_hook_changes_command_directory_and_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let subdir = root.path().join("nested");
+        std::fs::create_dir(&subdir).unwrap();
+        let subdir = subdir.canonicalize().unwrap();
+        let target = subdir.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let config = ShellConfig::new(None, Some("export PI_TEST_PREFIX=prefix")).with_spawn_hook(
+            Arc::new(move |mut context| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    context
+                        .command
+                        .starts_with("export PI_TEST_PREFIX=prefix\n")
+                );
+                assert_eq!(
+                    context.env.get(std::ffi::OsStr::new("PI_MODEL")).unwrap(),
+                    "model-fixture"
+                );
+                assert!(
+                    std::env::split_paths(context.env.get(std::ffi::OsStr::new("PATH")).unwrap())
+                        .any(|path| path == crate::agent_dir().join("bin"))
+                );
+                context.command.push_str("; printf '|rewritten'");
+                context.cwd = target.clone();
+                context.env.insert("PI_TEST_HOOK".into(), "hooked".into());
+                Ok(context)
+            }),
+        );
+        config.set_context(ShellContext {
+            id: uuid::Uuid::nil(),
+            path: None,
+            provider: "fixture".into(),
+            model: "model-fixture".into(),
+            reasoning_level: Some("low".into()),
+        });
+        let tool = CodingTool {
+            root: root.path().into(),
+            unrestricted: true,
+            shell: config.clone(),
+            kind: Kind::Bash,
+        };
+        let result = tool.shell(&json!({"command":"printf '%s|%s|%s|%s' \"$PI_TEST_PREFIX\" \"$PI_TEST_HOOK\" \"$PI_MODEL\" \"$PWD\""}), &pi_rs::CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            result.output.script,
+            format!("prefix|hooked|model-fixture|{}|rewritten", subdir.display())
+        );
+        let user = CodingTools::local(root.path())
+            .unwrap()
+            .with_shell_config(config);
+        let result = user
+            .execute_shell(
+                "printf '%s' \"$PI_TEST_PREFIX\"",
+                None,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output, "prefix");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_shell_can_disable_session_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let config = ShellConfig::default()
+            .with_session_environment(false)
+            .with_spawn_hook(Arc::new(|context| {
+                assert!(
+                    !context
+                        .env
+                        .contains_key(std::ffi::OsStr::new("PI_SESSION_ID"))
+                );
+                assert!(!context.env.contains_key(std::ffi::OsStr::new("PI_MODEL")));
+                Ok(context)
+            }));
+        config.set_context(ShellContext {
+            id: uuid::Uuid::nil(),
+            path: None,
+            provider: "fixture".into(),
+            model: "model-fixture".into(),
+            reasoning_level: None,
+        });
+        let tool = CodingTool {
+            root: root.path().into(),
+            unrestricted: true,
+            shell: config,
+            kind: Kind::Bash,
+        };
+        let result = tool
+            .shell(
+                &json!({"command":"printf '%s' \"${PI_MODEL-unset}\""}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output.script, "unset");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failing_shell_spawn_hook_stops_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let config = ShellConfig::default()
+            .with_spawn_hook(Arc::new(|_| Err(Error::Config("blocked by hook".into()))));
+        let tool = CodingTool {
+            root: root.path().into(),
+            unrestricted: true,
+            shell: config,
+            kind: Kind::Bash,
+        };
+        let result = tool
+            .shell(
+                &json!({"command":"touch should-not-exist"}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Config(message)) if message == "blocked by hook"));
+        assert!(!root.path().join("should-not-exist").exists());
+    }
 
     struct StreamingShell;
     #[async_trait::async_trait]

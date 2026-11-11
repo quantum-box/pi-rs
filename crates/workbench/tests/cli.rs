@@ -14,13 +14,19 @@ use serde_json::{Value, json};
 fn rpc_streaming_shell_operations_deliver_output_and_cancel() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        r#"{"shellCommandPrefix":"export PI_PREFIX_EXAMPLE=1"}"#,
+    )
+    .unwrap();
     let extension = root.path().join("stream.py");
     std::fs::write(&extension, r##"#!/usr/bin/env python3
 import json, sys, time
 if '--pi-rs-extension-bash-v1' in sys.argv:
     request = json.loads(sys.stdin.readline())
+    assert request['event']['command'].startswith('export PI_PREFIX_EXAMPLE=1\nstream ')
     print(json.dumps({'type':'output', 'data':list('日本'.encode())}), flush=True)
-    time.sleep(30 if request['event']['command'] == 'stream wait' else 0.25)
+    time.sleep(30 if request['event']['command'].endswith('stream wait') else 0.25)
     print(json.dumps({'type':'output', 'data':list(' done'.encode())}), flush=True)
     print(json.dumps({'type':'complete', 'response':{'Ok':7}}), flush=True)
 else:
@@ -68,7 +74,7 @@ else:
     let mut until = |predicate: &dyn Fn(&Value) -> bool| {
         loop {
             let event = receive
-                .recv_timeout(Duration::from_secs(15))
+                .recv_timeout(Duration::from_secs(30))
                 .unwrap_or_else(|error| {
                     let _ = child.kill();
                     panic!("RPC event timed out: {error}");
@@ -90,6 +96,22 @@ else:
     let response = until(&|event| event["type"] == "response" && event["id"] == "stream");
     assert_eq!(response["data"]["output"], "日本 done");
     assert_eq!(response["data"]["exitCode"], 7);
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"get_entries", "id":"entries", "includeNative":true})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let entries = until(&|event| event["type"] == "response" && event["id"] == "entries");
+    let entry = entries["data"]["nativeEntries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["event"]["type"] == "bash_execution")
+        .unwrap();
+    assert_eq!(entry["event"]["command"], "stream ok");
+    assert_eq!(entry["event"]["excludeFromContext"], true);
     writeln!(
         input,
         "{}",

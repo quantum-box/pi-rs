@@ -65,6 +65,14 @@ they supply a result or operations. See
 [`streaming_shell.rs`](../crates/extensions/examples/streaming_shell.rs) for
 a separately built executable example.
 
+When embedding the coding tools, `ShellConfig::with_spawn_hook` customizes the
+model-invoked shell tool's command, working directory, and environment after
+the command prefix and session variables are applied. The hook is an in-process
+Rust callback and is not applied to user `!` commands. Use
+`with_session_environment(false)` to omit the tool's Pi session metadata.
+Custom user-shell operations receive the configured command prefix at execution
+time while the event and recorded transcript retain the original user command.
+
 To observe model or thinking-level changes, implement `handles_lifecycle` and
 `handles_model_selection` and handle `LifecycleEvent::ModelSelect` and
 `LifecycleEvent::ThinkingLevelSelect`. Terminal and RPC selection commands
