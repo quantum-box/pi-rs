@@ -17,6 +17,10 @@ pub struct TreePreparation {
     pub entries_to_summarize: Vec<Record>,
     pub user_wants_summary: bool,
     pub custom_instructions: Option<String>,
+    #[serde(default)]
+    pub replace_instructions: bool,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

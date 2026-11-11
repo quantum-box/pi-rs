@@ -2786,3 +2786,13 @@ navigation, including when the confirmation prompt is disabled. The
 post-navigation lifecycle event reports the committed leaf and summary
 origin. Extension-supplied details and origin survive journal reload,
 fork, and RPC session projection.
+
+### Owned SDK tree navigation checkpoint
+
+`AgentSession::navigate_tree` runs the native tree extension hooks and
+returns the selected user's editor text and any committed summary entry.
+Callers can request a summary, replace its instructions, and attach a
+label through `TreeNavigationOptions`. The same options reach the
+pre-navigation extension hook. Branch-local input extension state and
+model selection are restored after navigation. Subscribers receive the
+committed records, and `SessionControl::abort` cancels a pending summary.

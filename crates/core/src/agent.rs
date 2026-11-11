@@ -150,6 +150,14 @@ pub struct BranchSummaryOptions<'a> {
     pub reserve_tokens: u64,
 }
 
+/// User-selected tree navigation settings, available to native extension hooks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TreeNavigationOptions<'a> {
+    pub summary: Option<BranchSummaryOptions<'a>>,
+    pub replace_instructions: bool,
+    pub label: Option<&'a str>,
+}
+
 impl Agent<'_> {
     /// A fresh prompt appends a user message. Resume starts from the existing branch.
     /// Follow-ups are consumed at safe boundaries, in FIFO order. The sender owns
@@ -1786,6 +1794,27 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
+        self.navigate_tree_with_options(
+            session,
+            selected,
+            TreeNavigationOptions {
+                summary: options,
+                ..Default::default()
+            },
+            cancel,
+            observer,
+        )
+        .await
+    }
+
+    pub async fn navigate_tree_with_options(
+        &self,
+        session: &mut Session,
+        selected: u64,
+        options: TreeNavigationOptions<'_>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -1820,9 +1849,12 @@ impl Agent<'_> {
                     .iter()
                     .map(|record| (*record).clone())
                     .collect(),
-                user_wants_summary: options.is_some(),
+                user_wants_summary: options.summary.is_some(),
                 custom_instructions: options
+                    .summary
                     .and_then(|options| options.instructions.map(str::to_owned)),
+                replace_instructions: options.replace_instructions,
+                label: options.label.map(str::to_owned),
             };
             let states = session.extension_states();
             let deadline =
@@ -1858,7 +1890,7 @@ impl Agent<'_> {
             }
         }
         let mut from_extension = None;
-        let summary = if let Some(options) = options {
+        let summary = if let Some(summary_options) = options.summary {
             if let Some(summary) = decision.summary {
                 if summary.summary.trim().is_empty()
                     || summary.summary.len() > 64 * 1024
@@ -1883,16 +1915,18 @@ impl Agent<'_> {
                 let instructions = decision
                     .custom_instructions
                     .as_deref()
-                    .or(options.instructions);
+                    .or(summary_options.instructions);
                 let summary = self
                     .generate_branch_summary(
                         session,
                         (selected, from, target),
                         BranchSummaryOptions {
                             instructions,
-                            ..options
+                            ..summary_options
                         },
-                        decision.replace_instructions == Some(true),
+                        decision
+                            .replace_instructions
+                            .unwrap_or(options.replace_instructions),
                         cancel,
                         observer,
                     )
@@ -1912,12 +1946,17 @@ impl Agent<'_> {
             summary.unwrap_or(Event::Checkout { target }),
             observer,
         )?;
-        if let Some(label) = decision.label.filter(|label| !label.is_empty()) {
+        if let Some(label) = decision
+            .label
+            .as_deref()
+            .or(options.label)
+            .filter(|label| !label.is_empty())
+        {
             commit(
                 session,
                 Event::Label {
                     target: summary_id.unwrap_or(selected),
-                    label: Some(label),
+                    label: Some(label.to_owned()),
                 },
                 observer,
             )?;

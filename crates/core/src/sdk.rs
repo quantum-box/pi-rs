@@ -39,6 +39,13 @@ pub enum SessionEvent {
     },
 }
 
+/// Result of navigating to a transcript entry through extension hooks.
+#[derive(Clone, Debug)]
+pub struct TreeNavigationResult {
+    pub editor_text: Option<String>,
+    pub summary_entry: Option<Box<Record>>,
+}
+
 #[derive(Clone)]
 pub struct SessionControl {
     input: mpsc::Sender<crate::AgentInput>,
@@ -458,6 +465,64 @@ impl AgentSession {
         }
         Ok(())
     }
+
+    /// Navigate like the terminal tree, retaining a selected user message as editor text.
+    /// Controls can abort a pending extension hook or summary request.
+    pub async fn navigate_tree(
+        &mut self,
+        selected: u64,
+        options: crate::TreeNavigationOptions<'_>,
+    ) -> Result<TreeNavigationResult> {
+        self.ensure_open()?;
+        let first_record = self.session.records().len();
+        let editor_text = self
+            .session
+            .records()
+            .iter()
+            .find(|record| record.id == selected && selected != self.session.head())
+            .and_then(|record| match &record.event {
+                crate::Event::User { content, .. }
+                | crate::Event::UserWithImages { content, .. } => Some(content.clone()),
+                _ => None,
+            });
+        let active = self.begin_run();
+        let events = self.events.as_ref().expect("open session").clone();
+        let agent = Agent {
+            model: self.model.as_ref(),
+            model_name: &self.model_name,
+            registry: &self.registry,
+            system_prompt: &self.system_prompt,
+            limits: self.limits.clone(),
+        };
+        let mut observer = |event: Notification<'_>| {
+            self.control.observe(&event);
+            emit(&events, &event);
+        };
+        let result = agent
+            .navigate_tree_with_options(
+                &mut self.session,
+                selected,
+                options,
+                &active.token,
+                &mut observer,
+            )
+            .await;
+        let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
+        result.and(final_inputs)?;
+        self.refresh_input_hooks();
+        if let Some((model, _)) = self.session.model_selection() {
+            self.model_name = model;
+        }
+        let summary_entry = self.session.records()[first_record..]
+            .iter()
+            .find(|record| matches!(record.event, crate::Event::BranchSummary { .. }))
+            .cloned()
+            .map(Box::new);
+        Ok(TreeNavigationResult {
+            editor_text,
+            summary_entry,
+        })
+    }
     pub fn set_name(&mut self, name: &str) -> Result<()> {
         self.ensure_open()?;
         self.session.set_name(name)?;
@@ -870,6 +935,153 @@ mod tests {
     use super::*;
     use crate::{ModelEvent, ModelStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TreeOptionsHook;
+    #[async_trait::async_trait]
+    impl Extension for TreeOptionsHook {
+        fn id(&self) -> &str {
+            "tree-options"
+        }
+        fn handles_tree_navigation(&self) -> bool {
+            true
+        }
+        async fn before_tree(
+            &self,
+            preparation: &crate::TreePreparation,
+            _: Option<&crate::ExtensionState>,
+            _: &CancellationToken,
+        ) -> crate::ExtensionResult<Option<crate::TreeDecision>> {
+            assert_eq!(preparation.label.as_deref(), Some("SDK summary"));
+            assert!(preparation.replace_instructions);
+            assert_eq!(
+                preparation.custom_instructions.as_deref(),
+                Some("Preserve the decision")
+            );
+            Ok(Some(crate::TreeDecision::default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_navigation_restores_input_and_branch_state_and_emits_the_summary() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .extension(Arc::new(InputExtension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        session
+            .extension_command("input-test", "prefix", "branch")
+            .unwrap();
+        session.prompt("second").await.unwrap();
+        let selected = session
+            .journal()
+            .records()
+            .iter()
+            .find_map(|record| {
+                matches!(record.event, crate::Event::User { .. }).then_some(record.id)
+            })
+            .unwrap();
+        let result = session
+            .navigate_tree(selected, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(result.editor_text.as_deref(), Some("FIRST"));
+        assert!(result.summary_entry.is_none());
+        assert!(session.messages().unwrap().is_empty());
+        session.controls().follow_up("restored").await.unwrap();
+        assert_eq!(
+            session.clear_queued_inputs().unwrap()[0].input.content,
+            "RESTORED"
+        );
+        session.prompt("new branch").await.unwrap();
+        session
+            .register_extension(Arc::new(TreeOptionsHook))
+            .unwrap();
+        let mut events = session.subscribe();
+        let result = session
+            .navigate_tree(
+                selected,
+                crate::TreeNavigationOptions {
+                    summary: Some(crate::BranchSummaryOptions {
+                        instructions: Some("Preserve the decision"),
+                        reserve_tokens: 1024,
+                    }),
+                    replace_instructions: true,
+                    label: Some("SDK summary"),
+                },
+            )
+            .await
+            .unwrap();
+        let summary = result.summary_entry.unwrap();
+        assert_eq!(
+            summary.parent,
+            session.journal().records()[selected as usize - 1].parent
+        );
+        assert!(matches!(summary.event, crate::Event::BranchSummary { .. }));
+        assert_eq!(session.journal().labels()[&summary.id], "SDK summary");
+        let observed: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(
+            observed.iter().any(
+                |event| matches!(event, SessionEvent::Record(record) if record.id == summary.id)
+            )
+        );
+        assert!(observed.iter().any(|event| matches!(event, SessionEvent::Request(request)
+            if matches!(request.messages.last(), Some(Message::User { content })
+                if content.ends_with("\n\nPreserve the decision") && !content.contains("Create a concise summary")))));
+        session.close().await.unwrap();
+        assert!(
+            session
+                .navigate_tree(selected, crate::TreeNavigationOptions::default())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_summary_can_be_aborted_through_owned_session_controls() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "echo")
+            .in_memory()
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let selected = session.journal().head();
+        session.prompt("second").await.unwrap();
+        session
+            .set_model(Arc::new(WaitingModel), "waiting")
+            .unwrap();
+        let head = session.journal().head();
+        let control = session.controls();
+        let mut events = session.subscribe();
+        let driver = async {
+            while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
+            control.abort();
+        };
+        let (result, ()) = tokio::join!(
+            session.navigate_tree(
+                selected,
+                crate::TreeNavigationOptions {
+                    summary: Some(crate::BranchSummaryOptions {
+                        instructions: None,
+                        reserve_tokens: 1024,
+                    }),
+                    ..Default::default()
+                }
+            ),
+            driver
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(
+            session
+                .journal()
+                .branch()
+                .iter()
+                .any(|record| record.id == head)
+        );
+        assert!(!session.journal().records().iter().any(|record| matches!(
+            record.event,
+            crate::Event::Checkout { .. } | crate::Event::BranchSummary { .. }
+        )));
+        session.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn idle_queue_clear_returns_messages_and_records_the_removal() {
