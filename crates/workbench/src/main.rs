@@ -1153,19 +1153,17 @@ async fn execute(mut args: Cli) -> Result<()> {
             && std::io::stdin().is_terminal()
             && std::io::stdout().is_terminal();
         let mut arguments = std::mem::take(&mut args.prompt);
-        if !interactive {
-            let mut first_message = true;
-            arguments.retain(|argument| {
-                if argument.starts_with('@') && argument.len() > 1 {
-                    return true;
-                }
-                if std::mem::take(&mut first_message) {
-                    return true;
-                }
-                follow_up_prompts.push(argument.clone());
-                false
-            });
-        }
+        let mut first_message = true;
+        arguments.retain(|argument| {
+            if argument.starts_with('@') && argument.len() > 1 {
+                return true;
+            }
+            if std::mem::take(&mut first_message) {
+                return true;
+            }
+            follow_up_prompts.push(argument.clone());
+            false
+        });
         let (mut prompt, images) = attachments::expand(
             &arguments,
             &args.workspace,
@@ -1188,7 +1186,9 @@ async fn execute(mut args: Cli) -> Result<()> {
             || !follow_up_prompts.is_empty()
         {
             if interactive {
-                args.initial_prompt = Some(prompt);
+                if !prompt.is_empty() || !args.initial_images.is_empty() {
+                    args.initial_prompt = Some(prompt);
+                }
                 args.command = Some(Command::Interactive);
             } else {
                 args.command = Some(Command::Run { prompt });
@@ -1208,7 +1208,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     );
     let command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
-        return interactive::run(args).await;
+        return interactive::run(args, follow_up_prompts).await;
     }
     if let Some(parent) = args
         .session

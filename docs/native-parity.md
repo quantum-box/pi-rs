@@ -434,11 +434,10 @@ The CLI accepts `@file` arguments for text and supported images, using the same
 image decoding and size limits as the local read tool. File text precedes the
 prompt, empty files are skipped, and UTF-8 BOMs are stripped from text files.
 Images are referenced by a single-line file tag and sent as separate image
-content. Initial prompts passed
-from a terminal now run inside the TUI and leave it available for further
-conversation. Print and JSON modes send separate positional messages as
-successive turns in the same session. Text output prints the final answer,
-and JSON emits each turn. Piped stdin is decoded as
+content. The TUI, print and JSON modes send separate positional messages as
+successive turns in the same session. Attachments belong to the first turn.
+The TUI remains available for input after the startup turns. Text output
+prints the final answer, and JSON emits each turn. Piped stdin is decoded as
 UTF-8 with replacement, trimmed, and concatenated before the attachment text
 and initial prompt, without an added separator.
 

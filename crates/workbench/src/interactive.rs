@@ -1,4 +1,5 @@
 //! Terminal presentation over the same journaled CLI used by automation.
+use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -2533,7 +2534,7 @@ fn slash(
     Ok(None)
 }
 
-pub(super) async fn run(mut args: Cli) -> Result<()> {
+pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Config(
             "interactive mode requires a terminal; use run <prompt> for automation".into(),
@@ -2588,10 +2589,17 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
         crate::ui::images::query_cell_size()?;
     }
     let mut worker: Option<Worker> = None;
-    let mut initial = args
+    let mut initial: VecDeque<_> = args
         .initial_prompt
         .take()
-        .map(|prompt| (prompt, std::mem::take(&mut args.initial_images)));
+        .map(|prompt| (prompt, std::mem::take(&mut args.initial_images)))
+        .into_iter()
+        .chain(
+            follow_up_prompts
+                .into_iter()
+                .map(|prompt| (prompt, Vec::new())),
+        )
+        .collect();
     let mut dirty = true;
     let frame_interval = Duration::from_millis(16);
     let mut last_frame = Instant::now() - frame_interval;
@@ -2599,19 +2607,6 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     loop {
-        if !args.trust_pending
-            && view.picker.is_none()
-            && let Some((prompt, images)) = initial.take()
-        {
-            view.lines.push(Entry::User(prompt.clone()));
-            view.history.push(prompt.clone());
-            start_request(
-                &args,
-                json!({"type":"prompt","content":prompt,"images":images}),
-                &mut worker,
-            )?;
-        }
-
         if last_theme_check.elapsed() >= Duration::from_millis(500) {
             match theme_watcher.poll(&mut theme) {
                 Ok(changed) => dirty |= changed,
@@ -2871,6 +2866,20 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 args.settings.terminal_progress()
                     && worker.as_ref().is_some_and(|worker| worker.busy),
             )?;
+        }
+        if !args.trust_pending
+            && view.picker.is_none()
+            && !is_busy(&worker)
+            && let Some((prompt, images)) = initial.pop_front()
+        {
+            match start_prompt(&args, &prompt, &images, &mut worker) {
+                Ok(()) => {
+                    view.lines.push(Entry::User(prompt.clone()));
+                    view.history.push(prompt);
+                }
+                Err(error) => view.append(&error.to_string()),
+            }
+            dirty = true;
         }
         if (dirty && last_frame.elapsed() >= frame_interval)
             || ((is_busy(&worker) || view.remote_task.is_some())
