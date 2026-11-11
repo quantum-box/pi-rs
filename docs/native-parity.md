@@ -102,6 +102,11 @@ Session lifecycle extensions receive the committed name change without waiting
 for the model turn to finish. A rename before the first prompt also loads and
 notifies explicitly selected and discovered native extensions.
 
+The Rust SDK's cloned session controls expose `set_session_name` during
+active operations. Subscribers receive `SessionInfoChanged` after the name
+is committed. The owned SDK method `set_name_with_hooks` delivers extension
+lifecycle notifications while idle.
+
 The message snapshot preserves imported Pi roles, timestamps, and extension
 message details. Context edits replace the affected content in the snapshot.
 Imported Gemini conversations carry signed text, thought, and function parts

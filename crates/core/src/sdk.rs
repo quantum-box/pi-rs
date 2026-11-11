@@ -191,6 +191,12 @@ impl SessionControl {
         self.queue_control(|reply| crate::AgentInput::SetQueueMode { kind, mode, reply })
             .await
     }
+    /// Save a display name during an active operation. Use the owned session while idle.
+    pub async fn set_session_name(&self, name: impl Into<String>) -> Result<()> {
+        let name = name.into();
+        self.queue_control(|reply| crate::AgentInput::SetSessionName { name, reply })
+            .await
+    }
     async fn queue_control<T>(
         &self,
         input: impl FnOnce(tokio::sync::oneshot::Sender<Result<T>>) -> crate::AgentInput,
@@ -539,11 +545,6 @@ impl AgentSession {
         self.ensure_open()?;
         self.session.set_name(name)?;
         self.emit_last();
-        if let Some(events) = &self.events {
-            let _ = events.send(SessionEvent::SessionInfoChanged {
-                name: self.session.name().map(str::to_owned),
-            });
-        }
         Ok(())
     }
 
@@ -1033,6 +1034,15 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         },
     };
     let _ = events.send(event);
+    if let Notification::Committed(record) = notification
+        && let crate::Event::SessionInfo {
+            name: Some(name), ..
+        } = &record.event
+    {
+        let _ = events.send(SessionEvent::SessionInfoChanged {
+            name: (!name.is_empty()).then(|| name.clone()),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2556,7 +2566,7 @@ mod tests {
         assert!(matches!(result, Err(Error::Cancelled)));
     }
     #[tokio::test]
-    async fn cloned_control_can_abort_a_running_session() {
+    async fn cloned_control_can_rename_and_abort_a_running_session() {
         let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")
             .in_memory()
             .unwrap();
@@ -2565,13 +2575,26 @@ mod tests {
         let abort = async move {
             while let Ok(event) = events.recv().await {
                 if matches!(event, SessionEvent::Request(_)) {
+                    assert!(control.set_session_name(" ").await.is_err());
+                    control.set_session_name("  In progress  ").await.unwrap();
+                    while let Ok(event) = events.recv().await {
+                        if let SessionEvent::SessionInfoChanged { name } = event {
+                            assert_eq!(name.as_deref(), Some("In progress"));
+                            break;
+                        }
+                    }
                     control.abort();
                     break;
                 }
             }
         };
-        let (result, ()) = tokio::join!(session.prompt("wait for abort"), abort);
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(session.prompt("wait for abort"), abort)
+        })
+        .await
+        .unwrap();
         assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(session.journal().name(), Some("In progress"));
         session.close().await.unwrap();
     }
     struct ImageModel;
