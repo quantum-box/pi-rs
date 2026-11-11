@@ -278,42 +278,6 @@ fn content(value: &Value) -> Result<String> {
     }
     Ok(text)
 }
-fn system_prompt(message: &Value) -> Result<pi_rs::CompactedSystemPrompt> {
-    let sections = message
-        .get("sections")
-        .map(|value| {
-            value
-                .as_object()
-                .ok_or_else(|| Error::Session("invalid system sections".into()))?
-                .iter()
-                .map(|(name, value)| {
-                    let value = if value.is_null() {
-                        None
-                    } else {
-                        Some(
-                            value
-                                .as_str()
-                                .ok_or_else(|| Error::Session("invalid system section".into()))?
-                                .to_owned(),
-                        )
-                    };
-                    Ok((name.clone(), value))
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let tools = message
-        .get("toolsAdded")
-        .map(|value| serde_json::from_value(value.clone()))
-        .transpose()?
-        .unwrap_or_default();
-    Ok(pi_rs::CompactedSystemPrompt {
-        content: content(&message["content"])?,
-        sections,
-        tools,
-    })
-}
 fn user_content(value: &Value) -> Result<(String, Vec<pi_rs::ImageContent>)> {
     let Some(blocks) = value.as_array() else {
         return Ok((content(value)?, Vec::new()));
@@ -591,7 +555,7 @@ fn convert(
                         content,
                         sections,
                         tools: tools_added,
-                    } = system_prompt(message)?;
+                    } = pi_rs::CompactedSystemPrompt::from_pi(message)?;
                     let tools_removed = message
                         .get("toolsRemoved")
                         .map(|value| {
@@ -673,7 +637,7 @@ fn convert(
                 system_prompt: entry
                     .get("systemMessage")
                     .filter(|message| !message.is_null())
-                    .map(system_prompt)
+                    .map(pi_rs::CompactedSystemPrompt::from_pi)
                     .transpose()?
                     .map(Box::new),
                 retain_from,
@@ -858,8 +822,8 @@ mod tests {
         let session = import_pi(vec![
             json!({"type":"session","version":3}),
             json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
-            json!({"type":"compaction","id":"c","parentId":"u","firstKeptEntryId":"u","summary":"summary","systemMessage":{
-                "role":"system","content":[{"type":"text","text":"saved"}],"sections":{"rules":"original"},
+            json!({"type":"compaction","id":"c","parentId":"u","firstKeptEntryId":"u","summary":"summary","usage":{"input":7},"systemMessage":{
+                "role":"system","content":[{"type":"text","text":"saved"},{"type":"text","text":"instructions"}],"sections":{"rules":"original"},
                 "toolsAdded":[{"name":"read","description":"Read","parameters":{"type":"object"}}]
             }}),
             json!({"type":"message","id":"s","parentId":"c","message":{"role":"system","content":"new"}}),
@@ -875,7 +839,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(snapshot.content, "saved");
+        assert_eq!(snapshot.content, "saved\ninstructions");
         assert_eq!(
             snapshot.sections,
             vec![("rules".into(), Some("original".into()))]
@@ -884,6 +848,31 @@ mod tests {
         assert!(
             super::super::sessions::html(&session).contains("System Prompt Update: instructions")
         );
+        let expected = snapshot.clone();
+        let mut legacy = session.records().to_vec();
+        let mut index = None;
+        for (position, record) in legacy.iter_mut().enumerate() {
+            if let Event::Compacted { system_prompt, .. } = &mut record.event {
+                *system_prompt = None;
+                index = Some(position);
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let journal = directory.path().join("legacy.jsonl");
+        let raw = legacy
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&journal, &raw).unwrap();
+        let reopened = Session::open(&journal).unwrap();
+        let Event::Compacted { system_prompt, .. } = &reopened.records()[index.unwrap()].event
+        else {
+            panic!("compaction should be retained");
+        };
+        assert_eq!(system_prompt.as_deref(), Some(expected.as_ref()));
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), raw);
     }
 
     #[test]

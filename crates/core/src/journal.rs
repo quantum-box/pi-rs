@@ -76,6 +76,61 @@ pub struct CompactedSystemPrompt {
     pub tools: Vec<crate::ToolSpec>,
 }
 
+impl CompactedSystemPrompt {
+    /// Decode the system prompt and tool declarations in a Pi JSONL entry.
+    pub fn from_pi(message: &serde_json::Value) -> Result<Self> {
+        let sections = message
+            .get("sections")
+            .map(|value| {
+                value
+                    .as_object()
+                    .ok_or_else(|| Error::Session("invalid system sections".into()))?
+                    .iter()
+                    .map(|(name, value)| {
+                        let value = if value.is_null() {
+                            None
+                        } else {
+                            Some(
+                                value
+                                    .as_str()
+                                    .ok_or_else(|| Error::Session("invalid system section".into()))?
+                                    .to_owned(),
+                            )
+                        };
+                        Ok((name.clone(), value))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let tools = message
+            .get("toolsAdded")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        let content = match &message["content"] {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .map(|block| {
+                    block["text"]
+                        .as_str()
+                        .ok_or_else(|| Error::Session("invalid system text block".into()))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join("\n"),
+            _ => return Err(Error::Session("invalid imported system content".into())),
+        };
+        Ok(Self {
+            content,
+            sections,
+            tools,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 // Keep the public journal event shape stable as optional provider metadata grows.
@@ -417,8 +472,9 @@ impl Session {
     }
 
     pub fn with_store(mut store: impl SessionStore + 'static) -> Result<Self> {
-        let records = store.load()?;
+        let mut records = store.load()?;
         let head = validated_head(&records)?;
+        restore_imported_compaction_prompts(&mut records);
         let mut session = Self {
             auto_compaction: crate::AutoCompactionControl::default(),
             retry: crate::RetryControl::default(),
@@ -1621,6 +1677,45 @@ pub(crate) fn ensure_settled(ops: Vec<(Invocation, OperationState)>) -> Result<(
         }
     }
     Ok(())
+}
+
+fn restore_imported_compaction_prompts(records: &mut [Record]) {
+    for index in 0..records.len() {
+        let (previous, remaining) = records.split_at_mut(index);
+        let record = &mut remaining[0];
+        let Event::Compacted { system_prompt, .. } = &mut record.event else {
+            continue;
+        };
+        if system_prompt.is_some() || record.run_id.is_some() {
+            continue;
+        }
+        let parent = |id: u64| previous.get(id.checked_sub(1)? as usize);
+        let source = record.parent.and_then(parent).and_then(|entry| {
+            if matches!(entry.event, Event::ModelFinished { .. }) {
+                entry.parent.and_then(parent)
+            } else {
+                Some(entry)
+            }
+        });
+        let Some(Record {
+            event: Event::SourceEntry { format, entry },
+            timestamp,
+            ..
+        }) = source
+        else {
+            continue;
+        };
+        if format == "pi"
+            && entry["type"] == "compaction"
+            && timestamp == &record.timestamp
+            && let Some(message) = entry
+                .get("systemMessage")
+                .filter(|message| !message.is_null())
+        {
+            // A legacy journal can contain source metadata that was never validated.
+            *system_prompt = CompactedSystemPrompt::from_pi(message).ok().map(Box::new);
+        }
+    }
 }
 
 pub(crate) fn system_context(
