@@ -517,6 +517,27 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+pub(super) fn skill_invocation(text: &str) -> Option<(&str, &str, Option<&str>)> {
+    static BLOCK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let captures = BLOCK
+        .get_or_init(|| {
+            regex::Regex::new(
+                r#"(?s)\A<skill name="([^"]+)" location="[^"]+">\n(.*?)\n</skill>(?:\n\n(.+))?\z"#,
+            )
+            .expect("Pi skill invocation block")
+        })
+        .captures(text)?;
+    let message = captures
+        .get(3)
+        .map(|text| text.as_str().trim_matches(is_prompt_space))
+        .filter(|text| !text.is_empty());
+    Some((
+        captures.get(1)?.as_str(),
+        captures.get(2)?.as_str(),
+        message,
+    ))
+}
+
 fn is_prompt_space(character: char) -> bool {
     (character.is_whitespace() && character != '\u{0085}') || character == '\u{feff}'
 }

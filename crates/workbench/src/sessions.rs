@@ -328,17 +328,10 @@ pub fn html(session: &Session) -> String {
     );
     for record in session.branch() {
         match &record.event {
-            Event::User { content, .. } => html.push_str(&format!(
-                "<article class=\"user\"><b>You</b><pre>{}</pre></article>",
-                escape(content)
-            )),
+            Event::User { content, .. } => render_user_html(&mut html, content, &[]),
             Event::UserWithImages {
                 content, images, ..
-            } => html.push_str(&format!(
-                "<article class=\"user\"><b>You</b><pre>{}</pre>{}</article>",
-                escape(content),
-                images_html(images)
-            )),
+            } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
             Event::Assistant {
                 content,
@@ -380,6 +373,27 @@ pub fn html(session: &Session) -> String {
     }
     html.push_str("</html>");
     html
+}
+
+fn render_user_html(html: &mut String, content: &str, images: &[pi_rs::ImageContent]) {
+    let text = if let Some((name, body, message)) = super::resources::skill_invocation(content) {
+        html.push_str(&format!(
+            "<details class=\"skill\"><summary>[skill] {}</summary><pre>{}</pre></details>",
+            escape(name),
+            escape(body)
+        ));
+        if message.is_none() && images.is_empty() {
+            return;
+        }
+        message.unwrap_or_default()
+    } else {
+        content
+    };
+    html.push_str(&format!(
+        "<article class=\"user\"><b>You</b><pre>{}</pre>{}</article>",
+        escape(text),
+        images_html(images)
+    ));
 }
 
 fn images_html(images: &[pi_rs::ImageContent]) -> String {
@@ -803,6 +817,24 @@ mod tests {
         import(&exported, &imported).unwrap();
         assert_eq!(Session::open(imported).unwrap().name(), session.name());
     }
+    #[test]
+    fn html_keeps_skill_body_folded_and_escapes_untrusted_text() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session.append_user_with_images(
+            "<skill name=\"demo&fixture\" location=\"/tmp/SKILL.md\">\n<script>example</script>\n</skill>\n\nvisible <request>".into(),
+            vec![pi_rs::ImageContent { data: "aW1hZ2U=".into(), mime_type: "image/png".into() }],
+            None,
+        ).unwrap();
+        let document = html(&session);
+        assert!(document.contains("<details class=\"skill\"><summary>[skill] demo&amp;fixture</summary><pre>&lt;script&gt;example&lt;/script&gt;</pre></details>"));
+        assert!(
+            document
+                .contains("<article class=\"user\"><b>You</b><pre>visible &lt;request&gt;</pre>")
+        );
+        assert!(document.contains("src=\"data:image/png;base64,aW1hZ2U=\""));
+        assert!(!document.contains("<script>"));
+    }
+
     #[test]
     fn html_embeds_user_images_with_a_data_only_image_policy() {
         let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();

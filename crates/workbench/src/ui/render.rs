@@ -225,7 +225,7 @@ pub struct TranscriptOptions {
 
 impl Entry {
     pub fn user(text: String) -> Self {
-        if skill_invocation(&text).is_some() {
+        if crate::resources::skill_invocation(&text).is_some() {
             Self::Skill {
                 text,
                 expanded: None,
@@ -252,7 +252,8 @@ impl Entry {
             }
             Self::User(text) => user_lines(text, theme, inner),
             Self::Skill { text, expanded } => {
-                let (name, body, message) = skill_invocation(text).expect("skill invocation");
+                let (name, body, message) =
+                    crate::resources::skill_invocation(text).expect("skill invocation");
 
                 let mut label = Span::new("[skill]", theme.color("customMessageLabel"));
                 label.bold = true;
@@ -626,27 +627,6 @@ fn user_lines(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
     }
     lines.push(Line::default());
     lines
-}
-
-fn skill_invocation(text: &str) -> Option<(&str, &str, Option<&str>)> {
-    static BLOCK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let captures = BLOCK
-        .get_or_init(|| {
-            regex::Regex::new(
-                r#"(?s)\A<skill name="([^"]+)" location="[^"]+">\n(.*?)\n</skill>(?:\n\n(.+))?\z"#,
-            )
-            .expect("Pi skill invocation block")
-        })
-        .captures(text)?;
-    let message = captures
-        .get(3)
-        .map(|text| text.as_str().trim())
-        .filter(|text| !text.is_empty());
-    Some((
-        captures.get(1)?.as_str(),
-        captures.get(2)?.as_str(),
-        message,
-    ))
 }
 
 #[cfg(test)]
