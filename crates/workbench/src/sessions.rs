@@ -327,6 +327,7 @@ pub fn html(session: &Session) -> String {
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\"><title>{title}</title><style>body{{max-width:960px;margin:40px auto;padding:0 20px;font:16px system-ui;background:#16181d;color:#e4e6eb}}article,details{{padding:16px;margin:12px 0;border-radius:8px;background:#252932}}.user{{background:#243448}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}}summary{{cursor:pointer}}.thinking{{color:#a5abb6}}h1{{font-size:24px}}</style><h1>{title}</h1>"
     );
     let mut imported_assistant = None;
+    let mut has_system_prompt = false;
     for record in session.branch() {
         match &record.event {
             Event::SourceEntry { format, entry } => {
@@ -340,6 +341,22 @@ pub fn html(session: &Session) -> String {
                 content, images, ..
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
+            Event::SystemCheckpoint {
+                content,
+                sections,
+                tools_added,
+                tools_removed,
+            } => {
+                render_system_html(
+                    &mut html,
+                    content,
+                    sections,
+                    tools_added,
+                    tools_removed,
+                    !has_system_prompt,
+                );
+                has_system_prompt = true;
+            }
             Event::BashExecution { execution } => render_shell_html(&mut html, execution),
             Event::Assistant {
                 content,
@@ -418,6 +435,86 @@ pub fn html(session: &Session) -> String {
     }
     html.push_str("</html>");
     html
+}
+
+fn render_system_html(
+    html: &mut String,
+    content: &str,
+    sections: &[(String, Option<String>)],
+    tools_added: &[pi_rs::ToolSpec],
+    tools_removed: &[String],
+    leading: bool,
+) {
+    let mut text = Vec::new();
+    let mut changes = Vec::new();
+    if !content.is_empty() {
+        text.push(content.to_owned());
+        changes.push("instructions".to_owned());
+    }
+    for (name, value) in sections {
+        match (leading, value) {
+            (true, Some(value)) if !value.is_empty() => text.push(value.clone()),
+            (false, Some(value)) => {
+                text.push(format!(
+                    "Updated system prompt section \"{name}\":\n\n{value}"
+                ));
+                changes.push(name.clone());
+            }
+            (false, None) => {
+                text.push(format!("Removed system prompt section \"{name}\"."));
+                changes.push(format!("-{name}"));
+            }
+            _ => {}
+        }
+    }
+    if !leading && (!tools_added.is_empty() || !tools_removed.is_empty()) {
+        let tool_changes = tools_added
+            .iter()
+            .map(|tool| format!("+{}", tool.name))
+            .chain(tools_removed.iter().map(|name| format!("-{name}")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        changes.push(format!("tools {tool_changes}"));
+    }
+    if !text.is_empty() {
+        let label = if leading {
+            "System Prompt".to_owned()
+        } else if changes.is_empty() {
+            "System Prompt Update".to_owned()
+        } else {
+            format!("System Prompt Update: {}", changes.join(", "))
+        };
+        html.push_str(&format!(
+            "<details class=\"system\"><summary>{}</summary><pre>{}</pre></details>",
+            escape(&label),
+            escape(&text.join("\n\n"))
+        ));
+    }
+    if !tools_added.is_empty() {
+        let label = if leading {
+            "Available Tools"
+        } else {
+            "Tools Added"
+        };
+        html.push_str(&format!(
+            "<details class=\"system\"><summary>{label}</summary><ul>"
+        ));
+        for tool in tools_added {
+            html.push_str(&format!(
+                "<li><b>{}</b> {}</li>",
+                escape(&tool.name),
+                escape(&tool.description)
+            ));
+        }
+        html.push_str("</ul></details>");
+    }
+    if !leading && !tools_removed.is_empty() {
+        html.push_str("<details class=\"system\"><summary>Tools Removed</summary><ul>");
+        for name in tools_removed {
+            html.push_str(&format!("<li>{}</li>", escape(name)));
+        }
+        html.push_str("</ul></details>");
+    }
 }
 
 fn render_shell_html(html: &mut String, execution: &pi_rs::BashExecution) {
@@ -943,6 +1040,48 @@ mod tests {
         assert!(document.contains("<details><summary>Show remaining output</summary><pre>&lt;script&gt;last line&lt;/script&gt;</pre></details>"));
         assert!(document.contains("(exit 7)"));
         assert!(document.contains("(cancelled)"));
+        assert!(!document.contains("<script>"));
+    }
+
+    #[test]
+    fn html_displays_initial_system_prompt_and_later_updates() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"s1","parentId":null,"message":{
+                "role":"system","content":"base","sections":{"rules":"first"},
+                "toolsAdded":[{"name":"read","description":"Read","parameters":{"type":"object"}}]
+            }}),
+            serde_json::json!({"type":"message","id":"u","parentId":"s1","message":{
+                "role":"user","content":"Question"
+            }}),
+            serde_json::json!({"type":"message","id":"s2","parentId":"u","message":{
+                "role":"system","content":"","sections":{"rules":null,"project":"<script>"},
+                "toolsAdded":[{"name":"write","description":"Write","parameters":{"type":"object"}}],
+                "toolsRemoved":[{"name":"read"}]
+            }}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(fixture.path()).unwrap();
+        let document = html(&session);
+        assert!(document.contains("<summary>System Prompt</summary><pre>base\n\nfirst</pre>"));
+        assert!(
+            document.contains("<summary>Available Tools</summary><ul><li><b>read</b> Read</li>")
+        );
+        assert!(document.contains(
+            "<summary>System Prompt Update: -rules, project, tools +write -read</summary>"
+        ));
+        assert!(document.contains("Removed system prompt section &quot;rules&quot;."));
+        assert!(
+            document
+                .contains("Updated system prompt section &quot;project&quot;:\n\n&lt;script&gt;")
+        );
+        assert!(document.contains("<summary>Tools Added</summary><ul><li><b>write</b> Write</li>"));
+        assert!(document.contains("<summary>Tools Removed</summary><ul><li>read</li>"));
+        assert!(
+            document.find("Question").unwrap() < document.find("System Prompt Update").unwrap()
+        );
         assert!(!document.contains("<script>"));
     }
 
