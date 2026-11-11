@@ -121,9 +121,9 @@ struct Cli {
     /// Fork a session file or ID into a new session for this workspace.
     #[arg(long = "fork", conflicts_with_all = ["session", "continue_session", "resume_session", "no_session"])]
     fork_session: Option<PathBuf>,
-    /// Resume a session file, or open the session selector when omitted.
-    #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["session", "continue_session", "no_session"])]
-    resume_session: Option<PathBuf>,
+    /// Open the session selector, or resume a file with --resume=PATH.
+    #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "", require_equals = true, conflicts_with_all = ["session", "continue_session", "no_session"])]
+    resume_session: Option<std::ffi::OsString>,
     /// Name the current session.
     #[arg(short = 'n', long, global = true, value_parser = sessions::validate_name)]
     name: Option<String>,
@@ -1134,12 +1134,8 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         .to_path_buf();
     if let Some(id) = &args.session_id {
         args.session = directory.join(format!("{id}.jsonl"));
-    } else if let Some(path) = args
-        .resume_session
-        .as_ref()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        args.session = sessions::resolve_reference(path, &directory)?;
+    } else if let Some(path) = args.resume_session.as_ref().filter(|path| !path.is_empty()) {
+        args.session = sessions::resolve_reference(std::path::Path::new(path), &directory)?;
         if !args.session.is_file() {
             return Err(Error::Config("session file not found".into()));
         }

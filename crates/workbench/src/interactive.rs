@@ -2715,7 +2715,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     if args
         .resume_session
         .as_ref()
-        .is_some_and(|path| path.as_os_str().is_empty())
+        .is_some_and(|path| path.is_empty())
     {
         slash("/resume", &mut args, &mut view, None)?;
     }

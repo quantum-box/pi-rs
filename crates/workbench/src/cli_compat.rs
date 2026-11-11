@@ -253,7 +253,11 @@ fn option_values(command: &Command, option: &str) -> (usize, bool) {
         })
     };
     argument.map_or((0, false), |(arg, attached)| {
-        let count = arg.get_num_args().map_or(0, |range| range.max_values());
+        let count = if arg.is_require_equals_set() {
+            0
+        } else {
+            arg.get_num_args().map_or(0, |range| range.max_values())
+        };
         (
             count.saturating_sub(usize::from(attached)),
             arg.is_allow_hyphen_values_set(),
@@ -283,6 +287,25 @@ mod tests {
         assert!(cli(&["pi", "--approve"]).trust);
         assert!(cli(&["pi", "--no-approve"]).no_trust);
         assert!(cli(&["pi", "inspect", "-na"]).no_trust);
+    }
+
+    #[test]
+    fn resume_does_not_consume_a_following_message() {
+        for flag in ["--resume", "-r"] {
+            let args = cli(&["pi", flag, "hello", "--no-mcp"]);
+            assert_eq!(
+                args.resume_session.as_deref(),
+                Some(std::ffi::OsStr::new(""))
+            );
+            assert_eq!(args.prompt, ["hello"]);
+            assert!(args.no_mcp);
+        }
+        let args = cli(&["pi", "--resume=old.jsonl", "hello"]);
+        assert_eq!(
+            args.resume_session.as_deref(),
+            Some(std::ffi::OsStr::new("old.jsonl"))
+        );
+        assert_eq!(args.prompt, ["hello"]);
     }
 
     #[test]
