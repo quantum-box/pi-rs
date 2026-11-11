@@ -172,6 +172,10 @@ Project configuration follows a stored trust decision, with an interactive
 trust selector and explicit `--trust` / `--no-trust` overrides. Context files
 remain readable independently of project trust. `/skills`, `/prompts`,
 `/skill:name`, prompt argument expansion and `/reload` are available.
+Each directory contributes its first readable context file in Pi order
+(`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`).
+Context files are loaded from outer directories toward the workspace, and a
+UTF-8 BOM at the start of a file is removed.
 
 The local CLI's coding profile can read and write absolute paths, including
 personal skill files outside the working directory. Embedded users of

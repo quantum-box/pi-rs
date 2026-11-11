@@ -57,19 +57,34 @@ impl Resources {
             if args.project.is_some() && directory.starts_with(&workspace) {
                 continue;
             }
-            let override_file = directory.join("AGENTS.override.md");
-            let paths = if override_file.is_file() {
-                vec![override_file]
-            } else {
-                vec![directory.join("AGENTS.md"), directory.join("CLAUDE.md")]
-            };
-            for path in paths {
-                if path.is_file() && seen.insert(path.canonicalize()?) {
-                    resources.instructions.push_str(&format!(
-                        "\n\n# Context {}\n{}",
-                        path.display(),
-                        read(&path)?
-                    ));
+            for filename in [
+                "AGENTS.override.md",
+                "AGENTS.md",
+                "AGENTS.MD",
+                "CLAUDE.md",
+                "CLAUDE.MD",
+            ] {
+                let path = directory.join(filename);
+                if !path.is_file() {
+                    continue;
+                }
+                match path
+                    .canonicalize()
+                    .map_err(Error::from)
+                    .and_then(|resolved| read_without_bom(&path).map(|text| (resolved, text)))
+                {
+                    Ok((resolved, text)) => {
+                        if seen.insert(resolved) {
+                            resources
+                                .instructions
+                                .push_str(&format!("\n\n# Context {}\n{text}", path.display(),));
+                        }
+                        break;
+                    }
+                    Err(error) => resources.warnings.push(format!(
+                        "Warning: Could not read {}: {error}",
+                        path.display()
+                    )),
                 }
             }
         }
@@ -147,14 +162,14 @@ impl Resources {
         } else {
             discover_prompt("SYSTEM.md")
                 .as_deref()
-                .map(read_prompt)
+                .map(read_without_bom)
                 .transpose()?
         }
         .filter(|text| !text.is_empty());
         resources.append_system = if args.append_system_prompt.is_empty() {
             discover_prompt("APPEND_SYSTEM.md")
                 .as_deref()
-                .map(read_prompt)
+                .map(read_without_bom)
                 .transpose()?
                 .unwrap_or_default()
         } else {
@@ -425,30 +440,32 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
 fn prompt_argument(workspace: &Path, argument: &str) -> Result<String> {
     let path = resource_path(workspace, argument);
     if path.is_file() {
-        read_prompt(&path)
+        read_without_bom(&path)
     } else {
         Ok(argument.into())
     }
 }
-fn read_prompt(path: &Path) -> Result<String> {
-    let mut text = read(path)?;
-    if text.starts_with('\u{feff}') {
-        text.drain(..'\u{feff}'.len_utf8());
-    }
-    Ok(text)
+fn read_without_bom(path: &Path) -> Result<String> {
+    let bytes = read_bytes(path)?;
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 fn read(path: &Path) -> Result<String> {
-    let mut text = String::new();
+    String::from_utf8(read_bytes(path)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error).into())
+}
+fn read_bytes(path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(64 * 1024 + 1)
-        .read_to_string(&mut text)?;
-    if text.len() > 64 * 1024 {
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 64 * 1024 {
         return Err(Error::Config(format!(
             "{} exceeds resource size limit",
             path.display()
         )));
     }
-    Ok(text)
+    Ok(bytes)
 }
 fn expand_arguments(body: &str, arguments: &str) -> Result<String> {
     let args = shell_words::split(arguments).map_err(|error| Error::Config(error.to_string()))?;
@@ -567,6 +584,43 @@ mod tests {
             "A literal instruction."
         );
     }
+    #[test]
+    fn context_uses_one_readable_file_per_directory_in_pi_order() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(root.join("AGENTS.MD"), "\u{feff}parent fixture").unwrap();
+        std::fs::write(project.join("AGENTS.md"), "primary fixture").unwrap();
+        std::fs::write(project.join("CLAUDE.md"), "fallback fixture").unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = project.clone();
+        let resources = Resources::load(&args).unwrap();
+        let parent = resources.instructions.find("parent fixture").unwrap();
+        let child = resources.instructions.find("primary fixture").unwrap();
+        assert!(parent < child);
+        assert!(!resources.instructions.contains("\u{feff}parent fixture"));
+        assert!(!resources.instructions.contains("fallback fixture"));
+        std::fs::write(
+            project.join("AGENTS.override.md"),
+            vec![b'x'; 64 * 1024 + 1],
+        )
+        .unwrap();
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.instructions.contains("primary fixture"));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("AGENTS.override.md"))
+        );
+        std::fs::write(project.join("AGENTS.override.md"), "override fixture").unwrap();
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.instructions.contains("override fixture"));
+        assert!(!resources.instructions.contains("primary fixture"));
+    }
+
     #[test]
     fn explicit_prompt_sources_replace_discovery_and_strip_file_boms() {
         use clap::Parser;
