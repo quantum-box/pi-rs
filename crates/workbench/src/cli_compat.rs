@@ -22,6 +22,7 @@ fn normalize(
 ) -> (Vec<OsString>, ExtensionFlags) {
     let mut input = args.into_iter().peekable();
     let mut output: Vec<_> = input.next().into_iter().collect();
+    let mut prompt = Vec::new();
     let mut flags = BTreeMap::new();
     let mut command = root;
     let mut remaining = 0;
@@ -29,6 +30,7 @@ fn normalize(
     while let Some(arg) = input.next() {
         if arg == "--" {
             output.push(arg);
+            output.append(&mut prompt);
             output.extend(input);
             break;
         }
@@ -40,13 +42,13 @@ fn normalize(
         }
         remaining = 0;
         if !option {
-            if let Some(subcommand) = command.find_subcommand(&arg) {
+            if prompt.is_empty()
+                && let Some(subcommand) = command.find_subcommand(&arg)
+            {
                 command = subcommand;
             } else if std::ptr::eq(command, root) {
-                // The first free positional starts Clap's trailing prompt.
-                output.push(arg);
-                output.extend(input);
-                break;
+                prompt.push(arg);
+                continue;
             }
             output.push(arg);
             continue;
@@ -80,7 +82,7 @@ fn normalize(
                 } else if input.peek().is_some_and(|next| {
                     !next.as_encoded_bytes().starts_with(b"-")
                         && !next.as_encoded_bytes().starts_with(b"@")
-                        && command.find_subcommand(next).is_none()
+                        && (!prompt.is_empty() || command.find_subcommand(next).is_none())
                         && next.to_str().is_some()
                 }) {
                     ExtensionFlagValue::String(
@@ -97,11 +99,25 @@ fn normalize(
             }
         }
         (remaining, hyphen_values) = option_values(command, canonical);
+        let print = matches!(canonical, "--print" | "-p");
         output.push(if canonical == value {
             arg
         } else {
             canonical.into()
         });
+        if std::ptr::eq(command, root)
+            && print
+            && input.peek().is_some_and(|next| {
+                let bytes = next.as_encoded_bytes();
+                (!bytes.starts_with(b"@") && !bytes.starts_with(b"-")) || bytes.starts_with(b"---")
+            })
+        {
+            prompt.extend(input.next());
+        }
+    }
+    if !prompt.is_empty() {
+        output.push("--".into());
+        output.extend(prompt);
     }
     (output, flags)
 }
@@ -271,7 +287,7 @@ mod tests {
 
     #[test]
     fn alias_like_values_and_prompt_tokens_remain_literal() {
-        let args = cli(&["pi", "-pt", "-nt", "-ns", "prompt", "-na"]);
+        let args = cli(&["pi", "-pt", "-nt", "-ns", "prompt", "--", "-na"]);
         assert_eq!(args.tools.as_deref(), Some("-nt"));
         assert!(!args.no_tools && !args.no_trust);
         assert!(args.no_skills && args.print);
@@ -308,6 +324,7 @@ mod tests {
                 "-ns",
                 "--print",
                 "draft",
+                "--",
                 "--leave-literal",
             ]
             .into_iter()
@@ -341,6 +358,35 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn flags_can_follow_prompt_tokens_before_the_delimiter() {
+        let (matches, flags) = parse(
+            [
+                "pi",
+                "first",
+                "-ns",
+                "second",
+                "--native-target",
+                "run",
+                "--print",
+                "---third",
+                "--",
+                "--no-tools",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .unwrap();
+        let args = super::super::Cli::from_arg_matches(&matches).unwrap();
+        assert!(args.no_skills && args.print && !args.no_tools);
+        assert_eq!(args.prompt, ["first", "second", "---third", "--no-tools"]);
+        assert_eq!(
+            flags["native-target"],
+            ExtensionFlagValue::String("run".into())
+        );
+        assert_eq!(cli(&["pi", "-p", "inspect"]).prompt, ["inspect"]);
     }
 
     #[test]
