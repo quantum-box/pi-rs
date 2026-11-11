@@ -35,19 +35,45 @@ pub(super) fn pending_request(session: &Session) -> Option<Uuid> {
     None
 }
 
-pub(super) fn count(session: &Session) -> usize {
-    let branch = session.branch();
-    let retain = branch
+fn latest_compaction<'a>(branch: &[&'a Record]) -> Option<&'a Record> {
+    branch
         .iter()
         .rev()
-        .find_map(|record| match record.event {
-            Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(record.id)),
-            _ => None,
-        })
-        .unwrap_or_default();
-    session.current_message_entries().len() + branch.iter().filter(|record| {
-        record.id >= retain && matches!(&record.event, Event::BashExecution { execution } if execution.exclude_from_context)
-    }).count()
+        .copied()
+        .find(|record| matches!(record.event, Event::Compacted { .. }))
+}
+
+fn display_only(record: &Record, compaction: Option<&Record>) -> bool {
+    match &record.event {
+        Event::SystemCheckpoint { .. } => compaction.is_none_or(|entry| record.id > entry.id),
+        Event::BashExecution { execution } if execution.exclude_from_context => {
+            let retain_from = compaction.and_then(|entry| match entry.event {
+                Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(entry.id)),
+                _ => None,
+            });
+            retain_from.is_none_or(|retain| record.id >= retain)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn count(session: &Session) -> usize {
+    let branch = session.branch();
+    let compaction = latest_compaction(&branch);
+    session.current_message_entries().len()
+        + branch
+            .iter()
+            .filter(|record| display_only(record, compaction))
+            .count()
+        + usize::from(compaction.is_some_and(|record| {
+            matches!(
+                record.event,
+                Event::Compacted {
+                    system_prompt: Some(_),
+                    ..
+                }
+            )
+        }))
 }
 
 pub(super) fn last_assistant_text(session: &Session) -> Option<String> {
@@ -75,7 +101,7 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let mut imported_entries = HashMap::new();
     let mut import = None;
     let mut edited = HashSet::new();
-    let mut retained_from = 0;
+    let compaction = latest_compaction(&branch);
     for record in &branch {
         if let Event::SourceEntry { format, entry } = &record.event {
             import = (format == "pi").then_some(entry);
@@ -87,50 +113,124 @@ pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
             }
             import = None;
         }
-        match &record.event {
-            Event::ContextEdited { target, .. } => {
-                edited.insert(*target);
-            }
-            Event::Compacted { retain_from, .. } => {
-                retained_from = retain_from.unwrap_or(record.id)
-            }
-            _ => {}
+        if let Event::ContextEdited { target, .. } = &record.event {
+            edited.insert(*target);
         }
     }
-    let mut excluded_shells = branch.into_iter().filter(|record| {
-        record.id >= retained_from && matches!(&record.event, Event::BashExecution { execution } if execution.exclude_from_context)
-    }).peekable();
+    let mut extra_messages = branch
+        .into_iter()
+        .filter(|record| display_only(record, compaction))
+        .filter_map(|record| {
+            let value = match &record.event {
+                Event::SystemCheckpoint {
+                    content,
+                    sections,
+                    tools_added,
+                    tools_removed,
+                } => imported_entries
+                    .get(&record.id)
+                    .and_then(|source| source.get("message"))
+                    .map(|message| normalize_system_message(message, record))
+                    .unwrap_or_else(|| {
+                        system_value(record, content, sections, tools_added, tools_removed)
+                    }),
+                _ => shell_message(record)?,
+            };
+            Some((record.id, value))
+        })
+        .peekable();
     let mut visible = Vec::with_capacity(entries.len());
     let mut native = Vec::with_capacity(entries.len());
     for (id, message) in entries {
         let Some(record) = session.records().get(id.saturating_sub(1) as usize) else {
             continue;
         };
-        // Keep display-only shell messages out of an assistant/tool batch.
+        // Keep display-only messages out of an assistant/tool batch.
         if !matches!(message, Message::Tool { .. })
             && !matches!(record.event, Event::Compacted { .. })
         {
-            while excluded_shells.peek().is_some_and(|shell| shell.id < id) {
-                if let Some(shell) = excluded_shells.next().and_then(shell_message) {
-                    visible.push(shell);
-                }
+            while extra_messages
+                .peek()
+                .is_some_and(|(source, _)| *source < id)
+            {
+                visible.extend(extra_messages.next().map(|(_, value)| value));
             }
         }
         let timestamp = record.timestamp_millis().unwrap_or_default();
-        let value = if let Event::Compacted { summary, .. } = &record.event {
+        let value = if let Event::Compacted {
+            summary,
+            system_prompt,
+            ..
+        } = &record.event
+        {
+            if let Some(system) = system_prompt {
+                let value = imported_entries
+                    .get(&id)
+                    .and_then(|source| source.get("systemMessage"))
+                    .map(|message| normalize_system_message(message, record))
+                    .unwrap_or_else(|| {
+                        system_value(
+                            record,
+                            &system.content,
+                            &system.sections,
+                            &system.tools,
+                            &[],
+                        )
+                    });
+                visible.push(value);
+            }
             json!({"role":"compactionSummary","summary":summary,"tokensBefore":compaction_tokens(session, record),"timestamp":timestamp})
         } else {
             projection.message(session.records(), record, &message, edited.contains(&id))
         };
         let value = imported_entries
             .get(&id)
+            .filter(|source| source["type"] != "compaction")
             .and_then(|source| imported_message(source, &value, timestamp, edited.contains(&id)))
             .unwrap_or(value);
         visible.push(value);
         native.push(message);
     }
-    visible.extend(excluded_shells.filter_map(shell_message));
+    visible.extend(extra_messages.map(|(_, value)| value));
     (visible, native)
+}
+
+fn normalize_system_message(message: &Value, record: &Record) -> Value {
+    let mut value = message.clone();
+    value["role"] = json!("system");
+    if value["content"].is_null() {
+        value["content"] = json!("");
+    }
+    if value["timestamp"].is_null() {
+        value["timestamp"] = json!(record.timestamp_millis().unwrap_or_default());
+    }
+    value
+}
+
+fn system_value(
+    record: &Record,
+    content: &str,
+    sections: &[(String, Option<String>)],
+    added: &[pi_rs::ToolSpec],
+    removed: &[String],
+) -> Value {
+    let mut value = json!({"role":"system","content":content,"timestamp":record.timestamp_millis().unwrap_or_default()});
+    if !sections.is_empty() {
+        value["sections"] = Value::Object(
+            sections
+                .iter()
+                .map(|(name, text)| (name.clone(), json!(text)))
+                .collect(),
+        );
+    }
+    if !added.is_empty() {
+        value["toolsAdded"] = json!(added);
+    }
+    if !removed.is_empty() {
+        value["toolsRemoved"] =
+            Value::Array(removed.iter().map(|name| json!({"name":name})).collect());
+    }
+    value
 }
 
 #[derive(Default)]
@@ -466,6 +566,8 @@ fn matches_imported_message(source: &Value, event: &Event) -> bool {
                     Some("user" | "custom" | "hookMessage" | "branchSummary" | "compactionSummary")
                 )
         }
+        Event::SystemCheckpoint { .. } => role == Some("system"),
+        Event::Compacted { .. } => source["type"] == "compaction",
         Event::Assistant { .. } => role == Some("assistant"),
         Event::ToolFinished { .. } | Event::ToolReconciled { .. } => role == Some("toolResult"),
         _ => false,
@@ -547,4 +649,59 @@ pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
             max_output_tokens: 0,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn rpc_projects_system_updates_and_the_active_compaction_snapshot() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"kept"}}),
+            json!({"type":"message","id":"s","parentId":"u","message":{"role":"system","content":"earlier","timestamp":7}}),
+            json!({"type":"compaction","id":"c","parentId":"s","firstKeptEntryId":"u","summary":"summary","systemMessage":{
+                "role":"system","content":[{"type":"text","text":"saved"}],"timestamp":42,
+                "toolsAdded":[{"name":"read","description":"Read","parameters":{}}]
+            }}),
+            json!({"type":"message","id":"update","parentId":"c","message":{"role":"system","content":null,"sections":{"rules":"updated"}}}),
+            json!({"type":"message","id":"next","parentId":"update","message":{"role":"user","content":"next"}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let mut session = super::super::session_import::read(fixture.path()).unwrap();
+        let (visible, native) = snapshot(&session);
+        let roles = |messages: &[Value]| {
+            messages
+                .iter()
+                .map(|value| value["role"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            roles(&visible),
+            ["system", "compactionSummary", "user", "system", "user"]
+        );
+        assert_eq!(visible[0]["content"][0]["text"], "saved");
+        assert_eq!(visible[0]["timestamp"], 42);
+        assert_eq!(visible[0]["toolsAdded"][0]["name"], "read");
+        assert_eq!(visible[3]["content"], "");
+        assert_eq!(visible[3]["sections"]["rules"], "updated");
+        assert_eq!(native.len(), 3);
+        assert_eq!(count(&session), visible.len());
+
+        let previous = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::SystemCheckpoint { .. }))
+            .unwrap()
+            .id;
+        session.checkout(previous).unwrap();
+        let (visible, _) = snapshot(&session);
+        assert_eq!(roles(&visible), ["user", "system"]);
+        assert_eq!(visible[1]["content"], "earlier");
+        assert_eq!(count(&session), visible.len());
+    }
 }

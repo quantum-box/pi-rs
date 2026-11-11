@@ -79,6 +79,9 @@ pub struct CompactedSystemPrompt {
 impl CompactedSystemPrompt {
     /// Decode the system prompt and tool declarations in a Pi JSONL entry.
     pub fn from_pi(message: &serde_json::Value) -> Result<Self> {
+        if !message.is_object() {
+            return Err(Error::Session("invalid imported system message".into()));
+        }
         let sections = message
             .get("sections")
             .map(|value| {

@@ -188,7 +188,9 @@ answer. Imported Pi assistant errors retain their original message text.
 When a Pi compaction includes a resolved system prompt, imports restore that
 snapshot before replaying later system updates and resolve its tool names
 against the current native registry. Earlier imports recover the snapshot
-from the preserved Pi entry when reopening the journal.
+from the preserved Pi entry when reopening the journal. RPC message snapshots
+include the active compaction's saved system message before the summary and
+retain later system updates in transcript order.
 HTML exports fold the initial recorded system prompt and subsequent updates,
 including changed sections and available, added, or removed tools. Tool
 parameters expand to show types, required flags, and descriptions.
