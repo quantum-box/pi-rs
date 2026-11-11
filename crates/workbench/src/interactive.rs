@@ -136,7 +136,7 @@ impl Terminal {
             crate::ui::theme::reset_terminal_background();
             execute!(
                 std::io::stdout(),
-                Print("\x1b[?2031h\x1b[?996n\x1b]11;?\x07")
+                Print("\x1b[?2031h\x1b[?996n\x1b]10;?\x07\x1b]11;?\x07")
             )?;
         }
         Ok(guard)
@@ -2968,16 +2968,19 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             #[cfg(any(unix, windows))]
             Some(
                 event @ (crate::ui::input::InputEvent::Appearance { .. }
-                | crate::ui::input::InputEvent::TerminalBackground { .. }),
+                | crate::ui::input::InputEvent::TerminalColor { .. }),
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        execute!(std::io::stdout(), Print("\x1b]11;?\x07"))?;
+                        execute!(std::io::stdout(), Print("\x1b]10;?\x07\x1b]11;?\x07"))?;
                         crate::ui::theme::set_appearance(dark)
                     }
-                    crate::ui::input::InputEvent::TerminalBackground { red, green, blue } => {
-                        crate::ui::theme::set_terminal_background(red, green, blue)
-                    }
+                    crate::ui::input::InputEvent::TerminalColor {
+                        foreground,
+                        red,
+                        green,
+                        blue,
+                    } => crate::ui::theme::set_terminal_color(foreground, red, green, blue),
                     _ => unreachable!(),
                 };
                 if changed {

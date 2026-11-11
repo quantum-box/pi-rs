@@ -22,14 +22,16 @@ impl Decoder {
                     self.escape_started = None;
                     continue;
                 }
-                let prefix = b"\x1b]11;";
-                if prefix.starts_with(&self.buffer) {
+                let foreground = b"\x1b]10;";
+                let background = b"\x1b]11;";
+                if foreground.starts_with(&self.buffer) || background.starts_with(&self.buffer) {
                     continue;
                 }
-                if self.buffer.starts_with(prefix) {
+                if self.buffer.starts_with(foreground) || self.buffer.starts_with(background) {
                     if self.buffer.last() == Some(&7) || self.buffer.ends_with(b"\x1b\\") {
-                        if let Some((red, green, blue)) = parse_background(&self.buffer) {
-                            self.events.push_back(InputEvent::TerminalBackground {
+                        if let Some((red, green, blue)) = parse_terminal_color(&self.buffer) {
+                            self.events.push_back(InputEvent::TerminalColor {
+                                foreground: self.buffer.starts_with(b"\x1b]10;"),
                                 red,
                                 green,
                                 blue,
@@ -68,7 +70,7 @@ impl Decoder {
         }
     }
     pub(super) fn flush_escape(&mut self) {
-        if self.buffer.starts_with(b"\x1b]11;")
+        if (self.buffer.starts_with(b"\x1b]10;") || self.buffer.starts_with(b"\x1b]11;"))
             && self
                 .escape_started
                 .is_some_and(|start| start.elapsed() >= std::time::Duration::from_millis(500))
@@ -117,8 +119,10 @@ impl Decoder {
     }
 }
 
-fn parse_background(buffer: &[u8]) -> Option<(u8, u8, u8)> {
-    let bytes = buffer.strip_prefix(b"\x1b]11;")?;
+fn parse_terminal_color(buffer: &[u8]) -> Option<(u8, u8, u8)> {
+    let bytes = buffer
+        .strip_prefix(b"\x1b]11;")
+        .or_else(|| buffer.strip_prefix(b"\x1b]10;"))?;
     let bytes = bytes
         .strip_suffix(b"\x07")
         .or_else(|| bytes.strip_suffix(b"\x1b\\"))?;
@@ -244,7 +248,8 @@ mod tests {
         decoder.push(b"8080\x1b\\a");
         assert_eq!(
             decoder.next(),
-            Some(InputEvent::TerminalBackground {
+            Some(InputEvent::TerminalColor {
+                foreground: false,
                 red: 255,
                 green: 0,
                 blue: 128
@@ -253,10 +258,21 @@ mod tests {
         assert!(
             matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char('a'))
         );
+        decoder.push(b"\x1b]10;rgb:ffff/eeee/dddd\x07");
+        assert_eq!(
+            decoder.next(),
+            Some(InputEvent::TerminalColor {
+                foreground: true,
+                red: 255,
+                green: 238,
+                blue: 221
+            })
+        );
         decoder.push(b"\x1b]11;#aabbcc\x07");
         assert_eq!(
             decoder.next(),
-            Some(InputEvent::TerminalBackground {
+            Some(InputEvent::TerminalColor {
+                foreground: false,
                 red: 170,
                 green: 187,
                 blue: 204

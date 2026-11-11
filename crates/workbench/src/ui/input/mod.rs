@@ -14,7 +14,8 @@ pub enum InputEvent {
         dark: bool,
     },
     #[cfg(any(unix, windows))]
-    TerminalBackground {
+    TerminalColor {
+        foreground: bool,
         red: u8,
         green: u8,
         blue: u8,

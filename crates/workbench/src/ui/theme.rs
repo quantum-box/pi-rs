@@ -1,47 +1,80 @@
 //! Pi theme roles and color formats, rendered without embedded escape strings.
 use crossterm::style::Color;
-use palette::{FromColor, Okhsl, Oklch, Srgb};
+use palette::{FromColor, Okhsl, Oklab, Oklch, Srgb};
 use pi_rs::{Error, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 static APPEARANCE: AtomicU8 = AtomicU8::new(0);
-static TERMINAL_BACKGROUND: AtomicU8 = AtomicU8::new(0);
+static TERMINAL_BACKGROUND: AtomicU32 = AtomicU32::new(0);
+static TERMINAL_FOREGROUND: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(any(unix, windows))]
 pub fn reset_terminal_background() {
     TERMINAL_BACKGROUND.store(0, Ordering::Relaxed);
+    TERMINAL_FOREGROUND.store(0, Ordering::Relaxed);
 }
 
-#[cfg(any(unix, windows))]
-pub fn set_terminal_background(red: u8, green: u8, blue: u8) -> bool {
-    let linear = |channel: u8| {
-        let value = f64::from(channel) / 255.0;
-        if value <= 0.04045 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
+fn unpack_terminal_color(value: u32) -> Option<[u8; 3]> {
+    (value & 0x1000000 != 0).then_some([(value >> 16) as u8, (value >> 8) as u8, value as u8])
+}
+
+fn terminal_is_dark(background: [u8; 3], foreground: Option<[u8; 3]>) -> bool {
+    let color = |rgb: [u8; 3]| {
+        Srgb::new(
+            rgb[0] as f64 / 255.0,
+            rgb[1] as f64 / 255.0,
+            rgb[2] as f64 / 255.0,
+        )
     };
-    let luminance = 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
-    let dark = luminance <= 0.1791287847;
-    TERMINAL_BACKGROUND.store(if dark { 1 } else { 2 }, Ordering::Relaxed);
-    APPEARANCE.swap(if dark { 1 } else { 2 }, Ordering::Relaxed) != if dark { 1 } else { 2 }
+    let linear = color(background).into_linear();
+    let luminance = 0.2126 * linear.red + 0.7152 * linear.green + 0.0722 * linear.blue;
+    let white_contrast = 1.05 / (luminance + 0.05);
+    let black_contrast = (luminance + 0.05) / 0.05;
+    if let Some(foreground) = foreground {
+        let foreground_lightness = Oklab::from_color(color(foreground).into_linear()).l;
+        let background_lightness = Oklab::from_color(linear).l;
+        if (foreground_lightness - background_lightness).abs() > 0.05 {
+            let dark = foreground_lightness > background_lightness;
+            if (if dark { white_contrast } else { black_contrast }) >= 4.5 {
+                return dark;
+            }
+        }
+    }
+    white_contrast >= black_contrast
 }
 
 #[cfg(any(unix, windows))]
-pub fn set_appearance(dark: bool) -> bool {
-    let background = TERMINAL_BACKGROUND.load(Ordering::Relaxed);
-    let value = if background != 0 {
-        background
-    } else if dark {
+pub fn set_terminal_color(foreground: bool, red: u8, green: u8, blue: u8) -> bool {
+    let value = 0x1000000 | (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue);
+    if foreground {
+        &TERMINAL_FOREGROUND
+    } else {
+        &TERMINAL_BACKGROUND
+    }
+    .store(value, Ordering::Relaxed);
+    let Some(background) = unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed))
+    else {
+        return false;
+    };
+    let foreground = unpack_terminal_color(TERMINAL_FOREGROUND.load(Ordering::Relaxed));
+    let appearance = if terminal_is_dark(background, foreground) {
         1
     } else {
         2
     };
+    APPEARANCE.swap(appearance, Ordering::Relaxed) != appearance
+}
+
+#[cfg(any(unix, windows))]
+pub fn set_appearance(dark: bool) -> bool {
+    if unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed)).is_some() {
+        return false;
+    }
+    let value = if dark { 1 } else { 2 };
     APPEARANCE.swap(value, Ordering::Relaxed) != value
 }
 
@@ -375,6 +408,14 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_appearance_uses_foreground_direction_when_readable() {
+        assert!(terminal_is_dark([117, 117, 117], Some([255, 255, 255])));
+        assert!(!terminal_is_dark([117, 117, 117], Some([0, 0, 0])));
+        assert!(!terminal_is_dark([255, 255, 255], Some([255, 255, 255])));
+        assert!(terminal_is_dark([0, 0, 0], Some([0, 0, 0])));
+    }
+
     #[test]
     fn colorfgbg_classifies_pi_terminal_palette_indexes() {
         for index in 0..=15 {
