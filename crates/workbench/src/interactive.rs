@@ -99,7 +99,7 @@ struct Terminal {
     images: Cleanup,
     progress: Option<Instant>,
     #[cfg(any(unix, windows))]
-    color_queries: std::collections::VecDeque<Instant>,
+    color_queries: std::collections::VecDeque<ColorQuery>,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -110,6 +110,12 @@ enum KeyboardProtocol {
     Probing,
     Kitty,
     Xterm,
+}
+
+#[cfg(any(unix, windows))]
+struct ColorQuery {
+    started: Instant,
+    replied: u32,
 }
 
 impl Terminal {
@@ -149,11 +155,14 @@ impl Terminal {
         while self
             .color_queries
             .front()
-            .is_some_and(|started| started.elapsed() > Duration::from_secs(2))
+            .is_some_and(|query| query.started.elapsed() > Duration::from_secs(2))
         {
             self.color_queries.pop_front();
         }
-        self.color_queries.push_back(Instant::now());
+        self.color_queries.push_back(ColorQuery {
+            started: Instant::now(),
+            replied: 0,
+        });
         let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
         for index in 0..16 {
             query.push_str(&format!("\x1b]4;{index};?\x07"));
@@ -164,8 +173,23 @@ impl Terminal {
     }
 
     #[cfg(any(unix, windows))]
-    fn accepts_color_reply(&self) -> bool {
-        self.color_queries.len() == 1
+    fn accepts_color_reply(&mut self, target: u8) -> bool {
+        while self.color_queries.len() > 1
+            && self
+                .color_queries
+                .front()
+                .is_some_and(|query| query.started.elapsed() > Duration::from_secs(2))
+        {
+            self.color_queries.pop_front();
+        }
+        let is_latest = self.color_queries.len() == 1;
+        let Some(query) = self.color_queries.front_mut() else {
+            return false;
+        };
+        let flag = 1_u32 << target;
+        let fresh = query.replied & flag == 0;
+        query.replied |= flag;
+        is_latest && fresh
     }
 
     fn update_progress(&mut self, active: bool) -> Result<()> {
@@ -3007,8 +3031,8 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 blue,
             }) => {
                 if _terminal
-                    .as_ref()
-                    .is_some_and(Terminal::accepts_color_reply)
+                    .as_mut()
+                    .is_some_and(|terminal| terminal.accepts_color_reply(index))
                     && crate::ui::theme::set_terminal_palette(index, red, green, blue)
                     && theme.name == "system"
                 {
@@ -3040,10 +3064,9 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         green,
                         blue,
                     } => {
-                        _terminal
-                            .as_ref()
-                            .is_some_and(Terminal::accepts_color_reply)
-                            && crate::ui::theme::set_terminal_color(foreground, red, green, blue)
+                        _terminal.as_mut().is_some_and(|terminal| {
+                            terminal.accepts_color_reply(if foreground { 16 } else { 17 })
+                        }) && crate::ui::theme::set_terminal_color(foreground, red, green, blue)
                     }
                     _ => unreachable!(),
                 };
