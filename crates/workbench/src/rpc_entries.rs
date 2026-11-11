@@ -1,5 +1,5 @@
 //! Pi session entries omit the native journal's execution bookkeeping.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pi_rs::{Error, Event, Record, Result, Session};
 use serde_json::{Value, json};
@@ -116,17 +116,27 @@ impl Entries {
                 }
             }
         }
+        let mut remaining: HashSet<_> = self
+            .values
+            .iter()
+            .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+            .collect();
         let mut children = HashMap::<String, Vec<Value>>::new();
         let mut roots = Vec::new();
         for entry in self.values.into_iter().rev() {
             let id = entry["id"].as_str().expect("entry has id");
-            let parent = entry["parentId"].as_str().map(str::to_owned);
+            remaining.remove(id);
+            let parent = entry["parentId"]
+                .as_str()
+                .filter(|parent| remaining.contains(*parent))
+                .map(str::to_owned);
             let mut descendants = children.remove(id).unwrap_or_default();
             descendants.reverse();
-            descendants.sort_by(|a, b| {
-                a["entry"]["timestamp"]
+            descendants.sort_by_cached_key(|node| {
+                node["entry"]["timestamp"]
                     .as_str()
-                    .cmp(&b["entry"]["timestamp"].as_str())
+                    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+                    .map(|timestamp| timestamp.timestamp_millis())
             });
             let mut node = json!({"entry":entry});
             node["children"] = Value::Array(descendants);
@@ -533,6 +543,52 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn tree_orders_children_by_instant_and_keeps_equal_times_in_append_order() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        for (id, parent, timestamp) in [
+            ("root", None, "2025-01-01T08:00:00Z"),
+            ("later", Some("root"), "2025-01-01T09:30:00Z"),
+            ("earlier", Some("root"), "2025-01-01T10:00:00+02:00"),
+            ("equal", Some("root"), "2025-01-01T08:00:00.000Z"),
+        ] {
+            let entry = json!({"type":"message","id":id,"parentId":parent,"timestamp":timestamp,
+                "message":{"role":"user","content":id}});
+            writeln!(file, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let tree = Entries::new(&session).tree();
+        let children = tree["tree"][0]["children"].as_array().unwrap();
+        let names: Vec<_> = children
+            .iter()
+            .map(|node| node["entry"]["message"]["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["earlier", "equal", "later"]);
+        assert_eq!(tree["leafId"], children[1]["entry"]["id"]);
+    }
+
+    #[test]
+    fn tree_exposes_orphan_and_self_parented_entries_as_roots() {
+        let entries = Entries {
+            values: vec![
+                json!({"id":"root","parentId":null}),
+                json!({"id":"orphan","parentId":"missing"}),
+                json!({"id":"self","parentId":"self"}),
+                json!({"id":"child","parentId":"orphan"}),
+            ],
+            leaf: Some("child".into()),
+        };
+        let tree = entries.tree();
+        let roots = tree["tree"].as_array().unwrap();
+        let ids: Vec<_> = roots
+            .iter()
+            .map(|node| node["entry"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["root", "orphan", "self"]);
+        assert_eq!(roots[1]["children"][0]["entry"]["id"], "child");
+    }
 
     #[test]
     fn imported_entries_keep_branch_parents_and_remap_references() {

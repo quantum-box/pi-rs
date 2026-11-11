@@ -59,6 +59,11 @@ leaf ID. Newly committed entries are emitted as `entry_appended` with those
 same IDs. Incremental tool arguments and additional session events remain in
 progress.
 
+`get_tree` sorts siblings by timestamp in chronological order, including
+imported timestamps with UTC offsets. Siblings with the same instant retain
+append order. Entries whose parent is missing or points to themselves appear as
+roots.
+
 `get_last_assistant_text` and `/copy` use the active transcript. Both skip
 empty aborted assistant messages, concatenate the selected message's text
 blocks, and trim the result. The RPC response omits `text` when the selected
