@@ -98,6 +98,8 @@ struct Terminal {
     alternate: bool,
     images: Cleanup,
     progress: Option<Instant>,
+    #[cfg(any(unix, windows))]
+    color_queries: std::collections::VecDeque<Instant>,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -110,24 +112,15 @@ enum KeyboardProtocol {
     Xterm,
 }
 
-#[cfg(any(unix, windows))]
-fn query_terminal_colors() -> Result<()> {
-    let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
-    for index in 0..16 {
-        query.push_str(&format!("\x1b]4;{index};?\x07"));
-    }
-    query.push_str("\x1b[c");
-    execute!(std::io::stdout(), Print(query))?;
-    Ok(())
-}
-
 impl Terminal {
     fn enter(mode: Option<TuiMode>, images: Cleanup) -> Result<Self> {
         terminal::enable_raw_mode()?;
-        let guard = Self {
+        let mut guard = Self {
             alternate: mode != Some(TuiMode::Regular),
             images,
             progress: None,
+            #[cfg(any(unix, windows))]
+            color_queries: std::collections::VecDeque::new(),
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -141,15 +134,40 @@ impl Terminal {
         }
         execute!(std::io::stdout(), EnableBracketedPaste, Hide)?;
         #[cfg(unix)]
-        execute!(std::io::stdout(), Print("\x1b[>7u\x1b[?u\x1b[c"))?;
+        execute!(std::io::stdout(), Print("\x1b[>7u\x1b[?u"))?;
         #[cfg(any(unix, windows))]
         {
             crate::ui::theme::reset_terminal_background();
             execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
-            query_terminal_colors()?;
+            guard.query_terminal_colors()?;
         }
         Ok(guard)
     }
+    #[cfg(any(unix, windows))]
+    fn query_terminal_colors(&mut self) -> Result<()> {
+        // DA1 delimits replies to successive color queries.
+        while self
+            .color_queries
+            .front()
+            .is_some_and(|started| started.elapsed() > Duration::from_secs(2))
+        {
+            self.color_queries.pop_front();
+        }
+        self.color_queries.push_back(Instant::now());
+        let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
+        for index in 0..16 {
+            query.push_str(&format!("\x1b]4;{index};?\x07"));
+        }
+        query.push_str("\x1b[c");
+        execute!(std::io::stdout(), Print(query))?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    fn accepts_color_reply(&self) -> bool {
+        self.color_queries.len() == 1
+    }
+
     fn update_progress(&mut self, active: bool) -> Result<()> {
         if active
             && self
@@ -2965,9 +2983,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 }
                 continue;
             }
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::PrimaryDeviceAttributes) => {
                 if let Some(terminal) = &mut _terminal {
+                    terminal.color_queries.pop_front();
+                    #[cfg(unix)]
                     terminal.keyboard_reply(false)?;
                 }
                 continue;
@@ -2980,14 +3000,16 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 continue;
             }
             #[cfg(any(unix, windows))]
-            #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::TerminalPalette {
                 index,
                 red,
                 green,
                 blue,
             }) => {
-                if crate::ui::theme::set_terminal_palette(index, red, green, blue)
+                if _terminal
+                    .as_ref()
+                    .is_some_and(Terminal::accepts_color_reply)
+                    && crate::ui::theme::set_terminal_palette(index, red, green, blue)
                     && theme.name == "system"
                 {
                     theme = Theme::system();
@@ -2995,14 +3017,17 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 }
                 continue;
             }
+            #[cfg(any(unix, windows))]
             Some(
                 event @ (crate::ui::input::InputEvent::Appearance { .. }
                 | crate::ui::input::InputEvent::TerminalColor { .. }),
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        crate::ui::theme::clear_terminal_palette();
-                        query_terminal_colors()?;
+                        crate::ui::theme::reset_terminal_background();
+                        if let Some(terminal) = &mut _terminal {
+                            terminal.query_terminal_colors()?;
+                        }
                         if theme.name == "system" {
                             theme = Theme::system();
                             dirty = true;
@@ -3014,7 +3039,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         red,
                         green,
                         blue,
-                    } => crate::ui::theme::set_terminal_color(foreground, red, green, blue),
+                    } => {
+                        _terminal
+                            .as_ref()
+                            .is_some_and(Terminal::accepts_color_reply)
+                            && crate::ui::theme::set_terminal_color(foreground, red, green, blue)
+                    }
                     _ => unreachable!(),
                 };
                 if changed {
