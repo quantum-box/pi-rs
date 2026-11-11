@@ -16,6 +16,19 @@ pub fn set_appearance(dark: bool) -> bool {
     APPEARANCE.swap(value, Ordering::Relaxed) != value
 }
 
+fn colorfgbg_is_dark(value: &str) -> Option<bool> {
+    let background = value
+        .rsplit(';')
+        .next()?
+        .trim_matches(|ch: char| (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}');
+    if !(1..=2).contains(&background.len()) || !background.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let index = background.parse::<u8>().ok()?;
+    (index <= 15).then_some(index <= 6 || index == 8)
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Theme {
     pub name: String,
@@ -76,10 +89,10 @@ impl Theme {
         let dark = match APPEARANCE.load(Ordering::Relaxed) {
             1 => true,
             2 => false,
-            _ => !std::env::var("COLORFGBG")
+            _ => std::env::var("COLORFGBG")
                 .ok()
-                .and_then(|v| v.rsplit(';').next()?.parse::<u8>().ok())
-                .is_some_and(|v| v == 7 || v == 15),
+                .and_then(|value| colorfgbg_is_dark(&value))
+                .unwrap_or(true),
         };
         let name = if let Some((light, dark_name)) = name.split_once('/') {
             if dark { dark_name } else { light }
@@ -333,6 +346,20 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn colorfgbg_classifies_pi_terminal_palette_indexes() {
+        for index in 0..=15 {
+            assert_eq!(
+                colorfgbg_is_dark(&format!("15; {index} ")),
+                Some(index <= 6 || index == 8)
+            );
+        }
+        for value in ["", "7;16", "7;-1", "7;007", "7;９", "7;\u{0085}7"] {
+            assert_eq!(colorfgbg_is_dark(value), None, "{value:?}");
+        }
+        assert_eq!(colorfgbg_is_dark("7;\u{feff}7\u{feff}"), Some(false));
+    }
+
     #[test]
     fn file_watch_applies_valid_changes_and_retains_last_valid_theme() {
         let directory = tempfile::tempdir().unwrap();
