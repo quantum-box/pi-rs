@@ -64,6 +64,10 @@ imported timestamps with UTC offsets. Siblings with the same instant retain
 append order. Entries whose parent is missing or points to themselves appear as
 roots.
 
+Unknown RPC commands return `Unknown command: <type>` and preserve the
+request ID when present. Malformed JSON produces a `parse` response with a
+parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
+
 `get_last_assistant_text` and `/copy` use the active transcript. Both skip
 empty aborted assistant messages, concatenate the selected message's text
 blocks, and trim the result. The RPC response omits `text` when the selected

@@ -146,13 +146,10 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(Value::Object(value)) => Value::Object(value),
-            _ => {
-                response(
-                    &json!({"type":"parse"}),
-                    Err(Error::Config("expected a JSON object".into())),
-                )?;
+        let request = match parse_request(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                response(&json!({"type":"parse"}), Err(error))?;
                 continue;
             }
         };
@@ -166,22 +163,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
             continue;
         }
-        if !pending_inputs.is_empty()
-            && matches!(
-                request["type"].as_str(),
-                Some(
-                    "new_session"
-                        | "switch_session"
-                        | "fork"
-                        | "clone"
-                        | "set_model"
-                        | "cycle_model"
-                        | "set_thinking_level"
-                        | "cycle_thinking_level"
-                        | "set_session_name"
-                        | "edit_context"
-                )
-            )
+        if !pending_inputs.is_empty() && requires_idle(request["type"].as_str().unwrap_or_default())
         {
             response(
                 &request,
@@ -487,8 +469,39 @@ fn submit_prompt(request: &Value, args: &Cli, worker: &mut Option<Worker>) -> Re
     }
 }
 
+fn parse_request(line: &str) -> Result<Value> {
+    match serde_json::from_str(line) {
+        Ok(Value::Object(request)) => Ok(Value::Object(request)),
+        Ok(_) => Err(Error::Config(
+            "Failed to parse command: expected a JSON object".into(),
+        )),
+        Err(error) => Err(Error::Config(format!("Failed to parse command: {error}"))),
+    }
+}
+
+fn requires_idle(name: &str) -> bool {
+    matches!(
+        name,
+        "new_session"
+            | "switch_session"
+            | "fork"
+            | "clone"
+            | "set_model"
+            | "cycle_model"
+            | "set_thinking_level"
+            | "cycle_thinking_level"
+            | "set_session_name"
+            | "edit_context"
+    )
+}
+
 fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Result<Option<Value>> {
     let name = request["type"].as_str().unwrap_or_default();
+    if (requires_idle(name) || name == "export_html") && busy(worker) {
+        return Err(Error::Config(format!(
+            "command {name:?} is unavailable in the current state"
+        )));
+    }
     match name {
         "abort" | "abort_bash" => Ok(None),
         name if snapshot_command(name) => {
@@ -506,7 +519,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             let (_, models) = available_models(args, true)?;
             Ok(Some(json!({"models":models})))
         }
-        "cycle_model" if !busy(worker) => {
+        "cycle_model" => {
             let (available, _) = available_models(args, false)?;
             let Some(next) = super::model_selection::next_model(args, &available, false) else {
                 return Ok(Some(Value::Null));
@@ -519,18 +532,18 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         "get_available_thinking_levels" => {
             Ok(Some(json!({"levels":super::thinking::available(args)})))
         }
-        "set_thinking_level" if !busy(worker) => {
+        "set_thinking_level" => {
             let level = request["level"]
                 .as_str()
                 .ok_or_else(|| Error::Config("invalid thinking level".into()))?;
             super::thinking::set(args, level)?;
             Ok(None)
         }
-        "cycle_thinking_level" if !busy(worker) => Ok(Some(
+        "cycle_thinking_level" => Ok(Some(
             super::thinking::cycle(args)?.map_or(Value::Null, |level| json!({"level":level})),
         )),
 
-        "switch_session" if !busy(worker) => {
+        "switch_session" => {
             let path = request["sessionPath"]
                 .as_str()
                 .ok_or_else(|| Error::Config("sessionPath is required".into()))?;
@@ -548,7 +561,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             switch_session(args, &path)?;
             Ok(Some(json!({"cancelled":false})))
         }
-        "fork" | "clone" if !busy(worker) => {
+        "fork" | "clone" => {
             let session = Session::open(&args.session)?;
             let (entry_id, position, target, text) = if name == "fork" {
                 let invalid = || Error::Config("Invalid entry ID for forking".into());
@@ -617,7 +630,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Ok(Some(data))
         }
 
-        "new_session" if !busy(worker) => {
+        "new_session" => {
             let parent = match request.get("parentSession") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(path)) => Some(path.as_str()).filter(|path| !path.is_empty()),
@@ -652,7 +665,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             args.session = destination;
             Ok(Some(json!({"cancelled":false})))
         }
-        "set_model" if !busy(worker) => {
+        "set_model" => {
             let provider = match request.get("provider") {
                 None => args.provider.clone(),
                 Some(value) => value
@@ -667,7 +680,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             args.change_model(provider, model.to_owned(), None)?;
             Ok(Some(model_value(args, &args.provider, model)))
         }
-        "edit_context" if !busy(worker) => {
+        "edit_context" => {
             let session = &mut Session::open(&args.session)?;
             let target = super::rpc_entries::editable_record(
                 session,
@@ -686,7 +699,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             session.edit_context(target, replacement)?;
             Ok(None)
         }
-        "set_session_name" if !busy(worker) => {
+        "set_session_name" => {
             let name = request["name"]
                 .as_str()
                 .ok_or_else(|| Error::Config("name is required".into()))?;
@@ -702,7 +715,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             }
             Ok(None)
         }
-        "export_html" if !busy(worker) => {
+        "export_html" => {
             let path = request["outputPath"]
                 .as_str()
                 .map(std::path::PathBuf::from)
@@ -714,9 +727,14 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Ok(Some(json!({"path":path})))
         }
 
-        _ => Err(Error::Config(format!(
-            "command {name:?} is unavailable in the current state"
-        ))),
+        _ => {
+            let command = match request.get("type") {
+                Some(Value::String(name)) => name.clone(),
+                Some(value) => value.to_string(),
+                None => "undefined".into(),
+            };
+            Err(Error::Config(format!("Unknown command: {command}")))
+        }
     }
 }
 
@@ -1070,17 +1088,16 @@ fn forward_event(
 }
 
 fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
-    let mut value = json!({"type":"response","command":request["type"],"success":result.is_ok()});
+    let mut value = json!({"type":"response","success":result.is_ok()});
+    if let Some(command) = request.get("type") {
+        value["command"] = command.clone();
+    }
     if let Some(id) = request.get("id") {
         value["id"] = id.clone();
     }
     match result {
         Ok(Some(data)) => value["data"] = data,
-        Err(Error::Config(message))
-            if matches!(request["type"].as_str(), Some("fork" | "clone")) =>
-        {
-            value["error"] = json!(message);
-        }
+        Err(Error::Config(message)) => value["error"] = json!(message),
         Err(error) => value["error"] = json!(error.to_string()),
         _ => {}
     }
