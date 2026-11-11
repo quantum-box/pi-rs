@@ -9,6 +9,11 @@ fn environment(lower: &str, upper: &str) -> Option<String> {
 }
 
 pub(super) fn configured(settings: &crate::config::Settings) -> Result<Vec<Proxy>> {
+    let (http, https, excluded) = settings_values(settings);
+    proxies(http.as_deref(), https.as_deref(), &excluded)
+}
+
+fn settings_values(settings: &crate::config::Settings) -> (Option<String>, Option<String>, String) {
     let fallback = settings
         .string("httpProxy")
         .map(str::trim)
@@ -18,10 +23,10 @@ pub(super) fn configured(settings: &crate::config::Settings) -> Result<Vec<Proxy
         .or_else(|| fallback.map(str::to_owned))
         .or_else(|| http.clone());
     let excluded = environment("no_proxy", "NO_PROXY").unwrap_or_default();
-    proxies(http.as_deref(), https.as_deref(), &excluded)
+    (http, https, excluded)
 }
 
-fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Vec<Proxy>> {
+fn parse_proxy(value: Option<&str>) -> Result<Option<Url>> {
     let parse = |value: Option<&str>| -> Result<Option<Url>> {
         value
             .filter(|value| !value.is_empty())
@@ -35,8 +40,12 @@ fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Ve
             })
             .transpose()
     };
-    let http = parse(http)?;
-    let https = parse(https)?;
+    parse(value)
+}
+
+fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Vec<Proxy>> {
+    let http = parse_proxy(http)?;
+    let https = parse_proxy(https)?;
     let excluded = excluded.to_owned();
     if http.is_none() && https.is_none() {
         return Ok(Vec::new());
@@ -51,6 +60,31 @@ fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Ve
             _ => None,
         }
     })])
+}
+
+pub(super) fn configured_mcp(
+    settings: &crate::config::Settings,
+) -> Result<pi_rs_workbench::mcp::HttpOptions> {
+    let (http, https, excluded) = settings_values(settings);
+    let http = parse_proxy(http.as_deref())?;
+    let https = parse_proxy(https.as_deref())?;
+    let mut proxies = Vec::new();
+    if http.is_some() || https.is_some() {
+        proxies.push(reqwest_mcp::Proxy::custom(move |url| {
+            if bypasses_proxy(url, &excluded) {
+                return None;
+            }
+            match url.scheme() {
+                "http" => http.clone(),
+                "https" => https.clone(),
+                _ => None,
+            }
+        }));
+    }
+    Ok(pi_rs_workbench::mcp::HttpOptions {
+        proxies,
+        idle_timeout: settings.http_idle_timeout(),
+    })
 }
 
 fn bypasses_proxy(url: &Url, excluded: &str) -> bool {

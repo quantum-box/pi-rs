@@ -290,6 +290,7 @@ struct Connection {
     config: ServerConfig,
     workspace: PathBuf,
     provider_token: Option<TokenResolver>,
+    http_options: Option<HttpOptions>,
     closed: AtomicBool,
 }
 impl Connection {
@@ -311,11 +312,12 @@ impl Connection {
             return Err(Error::Config("MCP connection is closed".into()));
         }
         if service.is_closed() || service.peer().is_transport_closed() {
-            let replacement = McpExtension::connect_with_provider_token(
+            let replacement = McpExtension::connect_with_http_options(
                 &self.name,
                 &self.config,
                 &self.workspace,
                 self.provider_token.clone(),
+                self.http_options.clone(),
             )
             .await?;
             if replacement.connection.identity() != self.identity()
@@ -342,7 +344,14 @@ impl Connection {
                 "MCP connection changed during reauthorization".into(),
             ));
         }
-        let replacement = McpExtension::connect(&self.name, &self.config, &self.workspace).await?;
+        let replacement = McpExtension::connect_with_http_options(
+            &self.name,
+            &self.config,
+            &self.workspace,
+            None,
+            self.http_options.clone(),
+        )
+        .await?;
         let identity = replacement.connection.identity();
         if self.closed.load(Ordering::SeqCst) || identity.oauth_generation != Some(generation) {
             replacement.close().await;
@@ -413,6 +422,14 @@ pub struct McpExtension {
     connection: Arc<Connection>,
     catalog: CatalogSnapshot,
 }
+
+/// HTTP transport settings supplied by an embedding host.
+#[derive(Clone)]
+pub struct HttpOptions {
+    pub proxies: Vec<reqwest_mcp::Proxy>,
+    pub idle_timeout: Option<Duration>,
+}
+
 impl McpExtension {
     pub async fn connect(name: &str, config: &ServerConfig, workspace: &Path) -> Result<Self> {
         Self::connect_with_provider_token(name, config, workspace, None).await
@@ -423,6 +440,16 @@ impl McpExtension {
         config: &ServerConfig,
         workspace: &Path,
         provider_token: Option<TokenResolver>,
+    ) -> Result<Self> {
+        Self::connect_with_http_options(name, config, workspace, provider_token, None).await
+    }
+
+    pub async fn connect_with_http_options(
+        name: &str,
+        config: &ServerConfig,
+        workspace: &Path,
+        provider_token: Option<TokenResolver>,
+        http_options: Option<HttpOptions>,
     ) -> Result<Self> {
         if name.is_empty()
             || !name
@@ -569,7 +596,16 @@ impl McpExtension {
             let client = reqwest_mcp::Client::builder()
                 .redirect(reqwest_mcp::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10));
-            let client = if provider_token.is_some() {
+            let client = if let Some(options) = &http_options {
+                let mut client = client.no_proxy();
+                for proxy in &options.proxies {
+                    client = client.proxy(proxy.clone());
+                }
+                if let Some(timeout) = options.idle_timeout {
+                    client = client.read_timeout(timeout);
+                }
+                client
+            } else if provider_token.is_some() {
                 client.no_proxy()
             } else {
                 client
@@ -661,6 +697,7 @@ impl McpExtension {
             config: config.clone(),
             workspace: workspace.to_owned(),
             provider_token,
+            http_options,
             closed: AtomicBool::new(false),
         });
         Self::discover(connection).await
@@ -1387,6 +1424,88 @@ pub async fn resolve_value(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn http_proxy_is_preserved_when_transport_reconnects() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy =
+            reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let initialized = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = initialized.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let count = count.clone();
+                tokio::spawn(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut first = String::new();
+                    if socket.read_line(&mut first).await.is_err() {
+                        return;
+                    }
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if socket.read_line(&mut line).await.is_err()
+                            || line == "\r\n"
+                            || line.is_empty()
+                        {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    if socket.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let request: Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let response = if request["method"] == "initialize" {
+                        assert!(first.starts_with("POST http://127.0.0.1:1/mcp "));
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Some(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":request["params"]["protocolVersion"],"capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}).to_string())
+                    } else {
+                        None
+                    };
+                    let response = response.unwrap_or_default();
+                    let status = if response.is_empty() {
+                        "202 Accepted"
+                    } else {
+                        "200 OK"
+                    };
+                    let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await;
+                });
+            }
+        });
+        let config: ServerConfig =
+            serde_json::from_value(json!({"url":"http://127.0.0.1:1/mcp","oauth":false})).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let extension = McpExtension::connect_with_http_options(
+            "fixture",
+            &config,
+            root.path(),
+            None,
+            Some(HttpOptions {
+                proxies: vec![proxy],
+                idle_timeout: None,
+            }),
+        )
+        .await
+        .unwrap();
+        extension
+            .connection
+            .service
+            .lock()
+            .await
+            .close()
+            .await
+            .unwrap();
+        drop(extension.connection.active_service().await.unwrap());
+        assert_eq!(initialized.load(Ordering::SeqCst), 2);
+        extension.close().await;
+        server.abort();
+    }
     #[test]
     fn exact_exposure_overrides_wildcard_selection() {
         let config: ServerConfig = serde_json::from_value(json!({"url":"http://127.0.0.1/mcp","exposure":"hidden","toolExposure":{"read*":"deferred","read_one":"direct"}})).unwrap();

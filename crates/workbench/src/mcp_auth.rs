@@ -328,7 +328,7 @@ pub async fn client(
         .as_ref()
         .and_then(|registration| registration.auth_server_metadata_url.as_deref())
     {
-        manager.set_metadata(configured_metadata(metadata_url).await?);
+        manager.set_metadata(configured_metadata_with_client(metadata_url, &client).await?);
     }
     if !manager.initialize_from_store().await.map_err(auth_error)? {
         return Err(auth_error(AuthError::AuthorizationRequired));
@@ -630,14 +630,22 @@ async fn callback_listener(
 }
 
 async fn configured_metadata(value: &str) -> Result<rmcp::transport::auth::AuthorizationMetadata> {
-    const LIMIT: usize = 128 * 1024;
-    let url = safe_http_url(value)?;
     let failure = |_| Error::Config("could not read configured MCP authorization metadata".into());
     let client = reqwest_mcp::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest_mcp::redirect::Policy::none())
         .build()
         .map_err(failure)?;
+    configured_metadata_with_client(value, &client).await
+}
+
+async fn configured_metadata_with_client(
+    value: &str,
+    client: &reqwest_mcp::Client,
+) -> Result<rmcp::transport::auth::AuthorizationMetadata> {
+    const LIMIT: usize = 128 * 1024;
+    let url = safe_http_url(value)?;
+    let failure = |_| Error::Config("could not read configured MCP authorization metadata".into());
     let mut response = client.get(url).send().await.map_err(failure)?;
     if !response.status().is_success() {
         return Err(Error::Config(
@@ -880,6 +888,49 @@ async fn authorize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn configured_metadata_uses_the_supplied_http_client() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy =
+            reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let client = reqwest_mcp::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut first = String::new();
+            socket.read_line(&mut first).await.unwrap();
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"issuer":"https://example.com","authorization_endpoint":"https://example.com/authorize","token_endpoint":"https://example.com/token","response_types_supported":["code"]}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            first
+        });
+        let metadata = configured_metadata_with_client("http://127.0.0.1:1/metadata", &client)
+            .await
+            .unwrap();
+        assert_eq!(metadata.issuer.as_deref(), Some("https://example.com"));
+        assert!(
+            server
+                .await
+                .unwrap()
+                .starts_with("GET http://127.0.0.1:1/metadata ")
+        );
+    }
 
     #[tokio::test]
     async fn scope_upgrade_preserves_prior_credentials_without_all_scopes() {

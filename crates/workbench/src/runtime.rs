@@ -347,7 +347,14 @@ impl Runtime {
                         "MCP configuration changed during sign-in".into(),
                     ));
                 }
-                pi_rs_workbench::mcp::McpExtension::connect(&name, &config, &args.workspace).await
+                pi_rs_workbench::mcp::McpExtension::connect_with_http_options(
+                    &name,
+                    &config,
+                    &args.workspace,
+                    None,
+                    Some(super::http_proxy::configured_mcp(&args.settings)?),
+                )
+                .await
             }
             .await;
             self.mcp_sign_in.pop_front();

@@ -1446,3 +1446,75 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
             .contains("refresh_token=fixture-refresh")
     );
 }
+
+#[test]
+fn mcp_provider_authenticated_connection_uses_configured_proxy() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"httpProxy":format!("http://{}", listener.local_addr().unwrap())}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(root.path().join("mcp.json"), json!({"mcpServers":{"fixture":{"url":"http://127.0.0.1:1/mcp","auth":{"provider":"anthropic"},"oauth":false}}}).to_string()).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("MCP request did not reach proxy: {error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            headers.push_str(&line.to_ascii_lowercase());
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        (first, headers)
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .env("ANTHROPIC_API_KEY", "fixture-token")
+        .env_remove("http_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("NO_PROXY")
+        .args(["mcp", "list"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let (request, headers) = server.join().unwrap();
+    assert!(
+        request.starts_with("POST http://127.0.0.1:1/mcp "),
+        "{request}"
+    );
+    assert!(
+        headers.contains("authorization: bearer fixture-token"),
+        "{headers}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-token"));
+}

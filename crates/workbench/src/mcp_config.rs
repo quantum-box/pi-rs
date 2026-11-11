@@ -237,7 +237,14 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
             }) as futures_util::future::BoxFuture<'static, Result<Option<String>>>
         }) as TokenResolver
     });
-    McpExtension::connect_with_provider_token(name, server, &args.workspace, resolver).await
+    McpExtension::connect_with_http_options(
+        name,
+        server,
+        &args.workspace,
+        resolver,
+        Some(super::http_proxy::configured_mcp(&args.settings)?),
+    )
+    .await
 }
 
 pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
