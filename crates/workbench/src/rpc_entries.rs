@@ -29,6 +29,36 @@ pub(super) struct Entries {
 }
 
 impl Entries {
+    pub(super) fn apply_message_counts(&self, stats: &mut pi_rs::SessionStats) {
+        stats.total_messages = 0;
+        stats.user_messages = 0;
+        stats.assistant_messages = 0;
+        stats.tool_results = 0;
+        stats.tool_calls = 0;
+        for entry in self
+            .values
+            .iter()
+            .filter(|entry| entry["type"] == "message")
+        {
+            stats.total_messages += 1;
+            let message = &entry["message"];
+            match message["role"].as_str() {
+                Some("user") => stats.user_messages += 1,
+                Some("toolResult") => stats.tool_results += 1,
+                Some("assistant") => {
+                    stats.assistant_messages += 1;
+                    if let Some(blocks) = message["content"].as_array() {
+                        stats.tool_calls += blocks
+                            .iter()
+                            .filter(|block| block["type"] == "toolCall")
+                            .count() as u64;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(super) fn has_leaf(&self) -> bool {
         self.leaf.is_some()
     }
@@ -543,6 +573,27 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn statistics_count_original_message_roles_after_import() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"custom_message","id":"c","parentId":"u","customType":"fixture","content":"extension context","display":true}),
+            json!({"type":"message","id":"h","parentId":"c","message":{"role":"hookMessage","content":"hook context"}}),
+            json!({"type":"message","id":"s","parentId":"h","message":{"role":"system","content":"system context"}}),
+            json!({"type":"message","id":"a","parentId":"s","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}),
+        ] {
+            writeln!(file, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let mut stats = session.statistics();
+        Entries::new(&session).apply_message_counts(&mut stats);
+        assert_eq!(stats.total_messages, 4);
+        assert_eq!(stats.user_messages, 1);
+        assert_eq!(stats.assistant_messages, 1);
+    }
 
     #[test]
     fn tree_orders_children_by_instant_and_keeps_equal_times_in_append_order() {

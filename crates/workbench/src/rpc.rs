@@ -880,6 +880,7 @@ pub(super) fn snapshot_response(
         }
         "get_session_stats" => {
             let mut native = session.statistics();
+            super::rpc_entries::Entries::new(session).apply_message_counts(&mut native);
             let operations = super::sessions::model_operation_usage(session.records());
             native.tokens.input = native.tokens.input.saturating_add(operations.input);
             native.tokens.output = native.tokens.output.saturating_add(operations.output);

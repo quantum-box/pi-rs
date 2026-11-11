@@ -1556,7 +1556,10 @@ parity.
 
 `get_session_stats` now returns user, assistant, tool-call and tool-result counts
 from the complete durable session, including alternate branches and compacted
-history. Nested tool operations do not inflate model-visible tool counts.
+history. Message counts use Pi entry types and roles, including after import.
+Hook and system messages contribute to the total without counting as user
+messages, and standalone custom entries are excluded. Nested tool operations
+do not inflate model-visible tool counts.
 Measured requests are counted once, and assistant or imported summary usage is
 used when there is no separate measured request record. Input, output,
 cache-read and cache-write totals are exposed separately without counting cached
