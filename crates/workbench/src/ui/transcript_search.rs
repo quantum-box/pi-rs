@@ -84,13 +84,14 @@ impl Search {
             &self.editor.text[offset..]
         };
         let input = super::render::wrap(
-            &[Span::new(
+            &[Span::themed(
                 input,
-                theme.color(if self.editor.text.is_empty() {
+                theme,
+                if self.editor.text.is_empty() {
                     "dim"
                 } else {
                     "text"
-                }),
+                },
             )],
             input_width,
         )
@@ -107,7 +108,7 @@ impl Search {
         middle
             .spans
             .push(Span::new(" ".repeat(input_width - used), border));
-        middle.spans.push(Span::new(result, theme.color("muted")));
+        middle.spans.push(Span::themed(result, theme, "muted"));
         middle.spans.push(Span::new("│", border));
         let controls = format!(
             " ↑ {} · ↓ {} ",
@@ -206,6 +207,7 @@ impl Search {
                 lines[segment.row].style_bytes(segment.bytes.clone(), |span| {
                     span.background = Some(theme.color("searchMatchBg"));
                     span.color = theme.color("searchMatchText");
+                    span.dim = theme.is_dim("searchMatchText");
                     span.inverse |= current;
                     span.bold |= current;
                     span.underline |= !current;

@@ -251,20 +251,21 @@ impl Dialog {
         ))
     }
     pub fn render(&self, theme: &Theme, width: usize, height: usize) -> Vec<Line> {
-        let mut lines = wrap(&[Span::new(self.heading(), theme.color("accent"))], width);
+        let mut lines = wrap(&[Span::themed(self.heading(), theme, "accent")], width);
         lines.truncate(self.heading_height(width, height));
         let available = height.saturating_sub(lines.len() + 1).max(1);
         match &self.request {
             UiRequest::Select { options, .. } => {
                 let start = self.selected.saturating_sub(available.saturating_sub(1));
                 for (index, option) in options.iter().enumerate().skip(start).take(available) {
-                    let mut line = Line::plain(
+                    let mut line = Line::themed(
                         &format!(
                             "{} {}",
                             if index == self.selected { "›" } else { " " },
                             option
                         ),
-                        theme.color("text"),
+                        theme,
+                        "text",
                     );
                     if index == self.selected {
                         line.background = Some(theme.color("selectedBg"));
@@ -274,17 +275,18 @@ impl Dialog {
             }
             UiRequest::Confirm { message, .. } => {
                 lines.extend(
-                    wrap(&[Span::new(message, theme.color("text"))], width)
+                    wrap(&[Span::themed(message, theme, "text")], width)
                         .into_iter()
                         .take(available.saturating_sub(1)),
                 );
-                lines.push(Line::plain(
+                lines.push(Line::themed(
                     if self.selected == 0 {
                         "› Yes    No"
                     } else {
                         "  Yes  › No"
                     },
-                    theme.color("text"),
+                    theme,
+                    "text",
                 ));
             }
             UiRequest::Custom { lines: body, .. } => {
@@ -294,9 +296,10 @@ impl Dialog {
                         let spans: Vec<_> = line
                             .iter()
                             .map(|span| {
-                                let mut rendered = Span::new(
+                                let mut rendered = Span::themed(
                                     &span.text,
-                                    theme.color(span.color.as_deref().unwrap_or("text")),
+                                    theme,
+                                    span.color.as_deref().unwrap_or("text"),
                                 );
                                 rendered.bold = span.bold;
                                 rendered.italic = span.italic;
@@ -317,24 +320,27 @@ impl Dialog {
                 );
             }
             UiRequest::Input { placeholder, .. } if self.editor.text.is_empty() => {
-                lines.push(Line::plain(
+                lines.push(Line::themed(
                     placeholder.as_deref().unwrap_or(""),
-                    theme.color("dim"),
+                    theme,
+                    "dim",
                 ));
             }
             UiRequest::Input { .. } | UiRequest::Editor { .. } => {
                 let content = wrap(
-                    &[Span::new(
+                    &[Span::themed(
                         self.visible(&self.editor.text).as_ref(),
-                        theme.color("text"),
+                        theme,
+                        "text",
                     )],
                     width,
                 );
                 let prefix = wrap(
-                    &[Span::new(
+                    &[Span::themed(
                         self.visible(&self.editor.text[..self.editor.cursor])
                             .as_ref(),
-                        theme.color("text"),
+                        theme,
+                        "text",
                     )],
                     width,
                 );
@@ -362,7 +368,7 @@ impl Dialog {
             }
             _ => Cow::Borrowed("Enter confirm · Esc cancel"),
         };
-        lines.push(Line::plain(&hint, theme.color("dim")));
+        lines.push(Line::themed(&hint, theme, "dim"));
         lines.truncate(height);
         lines
     }

@@ -1499,13 +1499,14 @@ impl View {
         self.graphics.clear_placements(&mut out)?;
         queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
         if header_rows != 0 {
-            Line::plain(
+            Line::themed(
                 &format!(
                     "pi v{} · {} · /help",
                     env!("CARGO_PKG_VERSION"),
                     self.session_name.as_deref().unwrap_or("new session")
                 ),
-                theme.color("accent"),
+                theme,
+                "accent",
             )
             .draw(&mut out, width)?;
         }
@@ -1540,23 +1541,24 @@ impl View {
                     ("│", "scrollbarTrack")
                 };
                 queue!(out, MoveTo((width - 1) as u16, (row + header_rows) as u16))?;
-                Line::plain(glyph, theme.color(role)).draw(&mut out, 1)?;
+                Line::themed(glyph, theme, role).draw(&mut out, 1)?;
             }
         }
         let border_row = height - prompt_height - 4 - below.len();
         queue!(out, MoveTo(0, border_row as u16))?;
-        Line::plain(
+        Line::themed(
             &format!(
                 "{}{}",
                 status,
                 "─".repeat(width.saturating_sub(UnicodeWidthStr::width(status.as_str())))
             ),
-            theme.color("border"),
+            theme,
+            "border",
         )
         .draw(&mut out, width)?;
         for (row, line) in prompt.iter().enumerate() {
             queue!(out, MoveTo(0, (border_row + 1 + row) as u16))?;
-            let mut line = Line::plain(line, theme.color("text"));
+            let mut line = Line::themed(line, theme, "text");
             if row == cursor_row && !hardware_cursor && !modal && self.search.is_none() {
                 line.mark_cursor(column);
             }
@@ -1570,10 +1572,9 @@ impl View {
             line.draw(&mut out, width)?;
         }
         queue!(out, MoveTo(0, (height - 3) as u16))?;
-        Line::plain(&"─".repeat(width), theme.color("border")).draw(&mut out, width)?;
+        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width)?;
         queue!(out, MoveTo(0, (height - 2) as u16))?;
-        Line::plain(&args.workspace.display().to_string(), theme.color("dim"))
-            .draw(&mut out, width)?;
+        Line::themed(&args.workspace.display().to_string(), theme, "dim").draw(&mut out, width)?;
         queue!(out, MoveTo(0, (height - 1) as u16))?;
         let model = format!(
             "{} · {}",
@@ -1584,9 +1585,10 @@ impl View {
         let usage = format!("↑↓ 確定 {} tokens", self.tokens);
         let usage = clip(&usage, width.saturating_sub(model_width + 1));
         let padding = width.saturating_sub(UnicodeWidthStr::width(usage.as_str()) + model_width);
-        Line::plain(
+        Line::themed(
             &format!("{usage}{}{model}", " ".repeat(padding)),
-            theme.color("dim"),
+            theme,
+            "dim",
         )
         .draw(&mut out, width)?;
         if !modal && let Some(search) = &self.search {
@@ -1795,9 +1797,10 @@ impl View {
         } else {
             queue!(out, Print("\r\n"))?;
             if (self.regular.committed == 0 || redraw) && show_startup_header(args) {
-                Line::plain(
+                Line::themed(
                     &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
-                    theme.color("accent"),
+                    theme,
+                    "accent",
                 )
                 .draw(&mut out, width)?;
                 queue!(out, Print("\r\n"))?;
@@ -1852,18 +1855,19 @@ impl View {
             String::new()
         };
         let status = format!("{status}{}{}", self.draft_status(), self.extension_status());
-        Line::plain(
+        Line::themed(
             &format!(
                 "{}{}",
                 status,
                 "─".repeat(width.saturating_sub(UnicodeWidthStr::width(status.as_str())))
             ),
-            theme.color("border"),
+            theme,
+            "border",
         )
         .draw(&mut out, width)?;
         queue!(out, Print("\r\n"))?;
         for (row, line) in prompt.iter().enumerate() {
-            let mut line = Line::plain(line, theme.color("text"));
+            let mut line = Line::themed(line, theme, "text");
             if row == cursor && !hardware_cursor && self.picker.is_none() && self.dialog().is_none()
             {
                 line.mark_cursor(column);
@@ -1876,20 +1880,21 @@ impl View {
             queue!(out, Print("\r\n"))?;
         }
         for line in [
-            Line::plain(&"─".repeat(width), theme.color("border")),
-            Line::plain(&args.workspace.display().to_string(), theme.color("dim")),
+            Line::themed(&"─".repeat(width), theme, "border"),
+            Line::themed(&args.workspace.display().to_string(), theme, "dim"),
         ] {
             line.draw(&mut out, width)?;
             queue!(out, Print("\r\n"))?;
         }
-        Line::plain(
+        Line::themed(
             &format!(
                 "↑↓ {} tokens · {} · {}",
                 self.tokens,
                 args.configured_model_name(&args.model),
                 args.thinking.as_deref().unwrap_or("default")
             ),
-            theme.color("dim"),
+            theme,
+            "dim",
         )
         .draw(&mut out, width)?;
         self.regular.cursor_row = active.len() + 1 + cursor;

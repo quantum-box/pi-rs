@@ -82,14 +82,15 @@ fn rows(text: &str) -> Vec<Row> {
 }
 fn changed_span(text: &str, row: &Row, theme: &Theme, changed: bool) -> Vec<Span> {
     if !changed {
-        return vec![Span::new(text, theme.color(row.color()))];
+        return vec![Span::themed(text, theme, row.color())];
     }
     let trimmed = text.trim_start();
-    let mut spans = vec![Span::new(
+    let mut spans = vec![Span::themed(
         &text[..text.len() - trimmed.len()],
-        theme.color(row.color()),
+        theme,
+        row.color(),
     )];
-    let mut span = Span::new(trimmed, theme.color(row.color()));
+    let mut span = Span::themed(trimmed, theme, row.color());
     span.inverse = true;
     spans.push(span);
     spans
@@ -158,8 +159,8 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
                 .is_none_or(|row| row.kind != Kind::Added);
         if paired {
             let added = &rows[index + 1];
-            let mut removed_spans = vec![Span::new(row.prefix(digits), theme.color(row.color()))];
-            let mut added_spans = vec![Span::new(added.prefix(digits), theme.color(added.color()))];
+            let mut removed_spans = vec![Span::themed(row.prefix(digits), theme, row.color())];
+            let mut added_spans = vec![Span::themed(added.prefix(digits), theme, added.color())];
             for change in TextDiff::configure()
                 .deadline(deadline)
                 .diff_words(&row.text, &added.text)
@@ -187,9 +188,10 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
             index += 2;
         } else {
             lines.extend(wrap(
-                &[Span::new(
+                &[Span::themed(
                     format!("{}{}", row.prefix(digits), row.text),
-                    theme.color(row.color()),
+                    theme,
+                    row.color(),
                 )],
                 width,
             ));

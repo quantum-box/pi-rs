@@ -22,6 +22,7 @@ pub struct Span {
     pub color: Color,
     pub background: Option<Color>,
     pub bold: bool,
+    pub dim: bool,
     pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
@@ -34,11 +35,17 @@ impl Span {
             color,
             background: None,
             bold: false,
+            dim: false,
             italic: false,
             underline: false,
             inverse: false,
             strikethrough: false,
         }
+    }
+    pub(super) fn themed(text: impl Into<String>, theme: &Theme, role: &str) -> Self {
+        let mut span = Self::new(text, theme.color(role));
+        span.dim = theme.is_dim(role);
+        span
     }
 }
 #[derive(Clone, Debug, Default)]
@@ -51,6 +58,13 @@ impl Line {
     pub fn plain(text: &str, color: Color) -> Self {
         Self {
             spans: vec![Span::new(text, color)],
+            background: None,
+            image: None,
+        }
+    }
+    pub fn themed(text: &str, theme: &Theme, role: &str) -> Self {
+        Self {
+            spans: vec![Span::themed(text, theme, role)],
             background: None,
             image: None,
         }
@@ -129,7 +143,15 @@ impl Line {
                 out,
                 SetForegroundColor(span.color),
                 SetBackgroundColor(span.background.or(self.background).unwrap_or(Color::Reset)),
+                SetAttribute(Attribute::NormalIntensity),
                 SetAttribute(if span.bold {
+                    Attribute::Bold
+                } else {
+                    Attribute::NormalIntensity
+                }),
+                SetAttribute(if span.dim {
+                    Attribute::Dim
+                } else if span.bold {
                     Attribute::Bold
                 } else {
                     Attribute::NormalIntensity
@@ -246,16 +268,16 @@ impl Entry {
         let padding = options.padding.min(width.saturating_sub(1) / 2);
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
-            Self::Notice(text) => return wrap(&[Span::new(text, theme.color("muted"))], width),
+            Self::Notice(text) => return wrap(&[Span::themed(text, theme, "muted")], width),
             Self::Warning(text) => {
-                return wrap(&[Span::new(text, theme.color("warning"))], width);
+                return wrap(&[Span::themed(text, theme, "warning")], width);
             }
             Self::User(text) => user_lines(text, theme, inner),
             Self::Skill { text, expanded } => {
                 let (name, body, message) =
                     crate::resources::skill_invocation(text).expect("skill invocation");
 
-                let mut label = Span::new("[skill]", theme.color("customMessageLabel"));
+                let mut label = Span::themed("[skill]", theme, "customMessageLabel");
                 label.bold = true;
                 let color = theme.color("customMessageText");
                 let mut lines = vec![Line::default()];
@@ -264,16 +286,20 @@ impl Entry {
                     let markdown = format!("**{name}**\n\n{body}");
                     let mut body = markdown_at_depth(&markdown, theme, inner, 0, options.mermaid);
                     for span in body.iter_mut().flat_map(|line| &mut line.spans) {
-                        if span.color == theme.color("text") {
+                        if span.color == theme.color("text") && !span.dim {
                             span.color = color;
+                            span.dim = theme.is_dim("customMessageText");
                         }
                     }
                     lines.extend(body);
                 } else {
-                    let mut title = vec![label, Span::new(format!(" {name}"), color)];
+                    let mut title = vec![
+                        label,
+                        Span::themed(format!(" {name}"), theme, "customMessageText"),
+                    ];
                     if options.expand_key.is_some() {
                         let key = super::keys::binding_hint(options.expand_key);
-                        title.push(Span::new(format!(" ({key} to expand)"), theme.color("dim")));
+                        title.push(Span::themed(format!(" ({key} to expand)"), theme, "dim"));
                     }
                     lines.extend(wrap(&title, inner));
                 }
@@ -311,7 +337,7 @@ impl Entry {
                     SummaryKind::Branch => ("[branch]", "Branch summary".into()),
                 };
                 let color = theme.color("customMessageText");
-                let mut heading = Span::new(label, theme.color("customMessageLabel"));
+                let mut heading = Span::themed(label, theme, "customMessageLabel");
                 heading.bold = true;
                 let mut lines = vec![Line::default()];
                 lines.extend(wrap(&[heading], inner));
@@ -320,21 +346,23 @@ impl Entry {
                     let markdown = format!("**{title}**\n\n{text}");
                     let mut body = markdown_at_depth(&markdown, theme, inner, 0, options.mermaid);
                     for span in body.iter_mut().flat_map(|line| &mut line.spans) {
-                        if span.color == theme.color("text") {
+                        if span.color == theme.color("text") && !span.dim {
                             span.color = color;
+                            span.dim = theme.is_dim("customMessageText");
                         }
                     }
                     lines.extend(body);
                 } else {
-                    let mut hint = vec![Span::new(title, color)];
+                    let mut hint = vec![Span::themed(title, theme, "customMessageText")];
                     if options.expand_key.is_some() {
                         hint.extend([
-                            Span::new(" (", color),
-                            Span::new(
+                            Span::themed(" (", theme, "customMessageText"),
+                            Span::themed(
                                 super::keys::binding_hint(options.expand_key),
-                                theme.color("dim"),
+                                theme,
+                                "dim",
                             ),
-                            Span::new(" to expand)", color),
+                            Span::themed(" to expand)", theme, "customMessageText"),
                         ]);
                     }
                     lines.extend(wrap(&hint, inner));
@@ -355,7 +383,7 @@ impl Entry {
                 if !show_thinking {
                     return vec![];
                 }
-                let mut span = Span::new(text, theme.color("thinkingText"));
+                let mut span = Span::themed(text, theme, "thinkingText");
                 span.italic = true;
                 let mut lines = wrap(&[span], inner);
                 lines.push(Line::default());
@@ -389,7 +417,7 @@ impl Entry {
                     })
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                let mut title = Span::new(format!("{name} {detail}"), theme.color("toolTitle"));
+                let mut title = Span::themed(format!("{name} {detail}"), theme, "toolTitle");
                 title.bold = true;
                 let mut lines = wrap(&[title], inner);
                 let output_lines: Vec<_> = output.lines().collect();
@@ -401,8 +429,7 @@ impl Entry {
                         lines.extend(super::diff::render(text, theme, inner));
                     } else {
                         for text in text.split('\n') {
-                            lines
-                                .extend(wrap(&[Span::new(text, theme.color("toolOutput"))], inner));
+                            lines.extend(wrap(&[Span::themed(text, theme, "toolOutput")], inner));
                         }
                     }
                 };
@@ -430,12 +457,13 @@ impl Entry {
                     }
                 }
                 if output_lines.len() > limit {
-                    lines.push(Line::plain(
+                    lines.push(Line::themed(
                         &format!(
                             "… {} more lines (ctrl+o to expand)",
                             output_lines.len() - limit
                         ),
-                        theme.color("dim"),
+                        theme,
+                        "dim",
                     ));
                 }
                 for line in &mut lines {
@@ -563,7 +591,7 @@ impl Table {
             widths[column] += 1;
         }
         let border = |left: &str, middle: &str, right: &str| {
-            Line::plain(
+            Line::themed(
                 &format!(
                     "{left}{}{right}",
                     widths
@@ -572,7 +600,8 @@ impl Table {
                         .collect::<Vec<_>>()
                         .join(middle)
                 ),
-                theme.color("borderMuted"),
+                theme,
+                "borderMuted",
             )
         };
         let mut lines = vec![border("┌", "┬", "┐")];
@@ -585,7 +614,7 @@ impl Table {
                 })
                 .collect();
             for line_index in 0..cells.iter().map(Vec::len).max().unwrap_or(1) {
-                let mut line = Line::plain("│", theme.color("borderMuted"));
+                let mut line = Line::themed("│", theme, "borderMuted");
                 for (column, cell) in cells.iter().enumerate() {
                     let spans = cell
                         .get(line_index)
@@ -602,11 +631,12 @@ impl Table {
                         _ => 0,
                     };
                     line.spans
-                        .push(Span::new(" ".repeat(left + 1), theme.color("text")));
+                        .push(Span::themed(" ".repeat(left + 1), theme, "text"));
                     line.spans.extend_from_slice(spans);
-                    line.spans.push(Span::new(
+                    line.spans.push(Span::themed(
                         format!("{}│", " ".repeat(padding - left + 1)),
-                        theme.color("borderMuted"),
+                        theme,
+                        "borderMuted",
                     ));
                 }
                 lines.push(line);
@@ -621,7 +651,7 @@ impl Table {
 }
 
 fn user_lines(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
-    let mut lines = wrap(&[Span::new(text, theme.color("userMessageText"))], width);
+    let mut lines = wrap(&[Span::themed(text, theme, "userMessageText")], width);
     for line in &mut lines {
         line.background = Some(theme.color("userMessageBg"));
     }
@@ -694,7 +724,7 @@ fn markdown_at_depth(
             Event::Start(Tag::Link { dest_url, .. }) => links.push(dest_url.into_string()),
             Event::End(TagEnd::Link) => {
                 if let Some(url) = links.pop() {
-                    spans.push(Span::new(format!(" ({url})"), theme.color("mdLinkUrl")));
+                    spans.push(Span::themed(format!(" ({url})"), theme, "mdLinkUrl"));
                 }
             }
             Event::Start(Tag::Strikethrough) => strikethrough += 1,
@@ -707,10 +737,8 @@ fn markdown_at_depth(
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 heading = level as usize;
                 if heading >= 3 {
-                    let mut prefix = Span::new(
-                        format!("{} ", "#".repeat(heading)),
-                        theme.color("mdHeading"),
-                    );
+                    let mut prefix =
+                        Span::themed(format!("{} ", "#".repeat(heading)), theme, "mdHeading");
                     prefix.bold = true;
                     spans.push(prefix);
                 }
@@ -744,9 +772,10 @@ fn markdown_at_depth(
                         continue;
                     }
                     lines.extend(wrap(
-                        &[Span::new(
+                        &[Span::themed(
                             format!("```{language}"),
-                            theme.color("mdCodeBlockBorder"),
+                            theme,
+                            "mdCodeBlockBorder",
                         )],
                         width,
                     ));
@@ -777,19 +806,17 @@ fn markdown_at_depth(
                             .collect::<Vec<_>>();
                         let indent = width.saturating_sub(1).min(2);
                         for mut line in wrap(&pieces, width.saturating_sub(indent)) {
-                            line.spans.insert(
-                                0,
-                                Span::new(" ".repeat(indent), theme.color("mdCodeBlock")),
-                            );
+                            line.spans
+                                .insert(0, Span::themed(" ".repeat(indent), theme, "mdCodeBlock"));
                             lines.push(line);
                         }
                     }
                     lines.extend(wrap(
-                        &[Span::new("```", theme.color("mdCodeBlockBorder"))],
+                        &[Span::themed("```", theme, "mdCodeBlockBorder")],
                         width,
                     ));
                     if let Some(warning) = warning {
-                        lines.extend(wrap(&[Span::new(warning, theme.color("warning"))], width));
+                        lines.extend(wrap(&[Span::themed(warning, theme, "warning")], width));
                     }
                     code_text.clear();
                 }
@@ -808,9 +835,10 @@ fn markdown_at_depth(
                     }
                     _ => "• ".into(),
                 };
-                let prefix = Span::new(
+                let prefix = Span::themed(
                     format!("{}{prefix}", "  ".repeat(lists.len().saturating_sub(1))),
-                    theme.color("mdListBullet"),
+                    theme,
+                    "mdListBullet",
                 );
                 item_prefixes.push(prefix.clone());
                 spans.push(prefix);
@@ -837,18 +865,19 @@ fn markdown_at_depth(
                 let quoted = if depth < 32 {
                     markdown_at_depth(&body, theme, content_width, depth + 1, mermaid)
                 } else {
-                    wrap(&[Span::new(body, theme.color("mdQuote"))], content_width)
+                    wrap(&[Span::themed(body, theme, "mdQuote")], content_width)
                 };
                 for mut line in quoted {
                     for span in &mut line.spans {
                         span.italic = true;
-                        if span.color == theme.color("text") {
+                        if span.color == theme.color("text") && !span.dim {
                             span.color = theme.color("mdQuote");
+                            span.dim = theme.is_dim("mdQuote");
                         }
                     }
                     if bordered {
                         line.spans
-                            .insert(0, Span::new("│ ", theme.color("mdQuoteBorder")));
+                            .insert(0, Span::themed("│ ", theme, "mdQuoteBorder"));
                     }
                     lines.push(line);
                 }
@@ -858,15 +887,16 @@ fn markdown_at_depth(
                 if code.is_some() {
                     code_text.push_str(&text);
                 } else {
-                    let mut span = Span::new(
+                    let mut span = Span::themed(
                         text,
-                        theme.color(if heading > 0 {
+                        theme,
+                        if heading > 0 {
                             "mdHeading"
                         } else if !links.is_empty() {
                             "mdLink"
                         } else {
                             "text"
-                        }),
+                        },
                     );
                     span.bold = bold > 0 || heading > 0;
                     span.underline = heading == 1;
@@ -876,12 +906,12 @@ fn markdown_at_depth(
                 }
             }
             Event::Code(text) => {
-                let mut span = Span::new(text, theme.color("mdCode"));
+                let mut span = Span::themed(text, theme, "mdCode");
                 span.underline = heading == 1;
                 span.bold = heading > 0;
                 spans.push(span);
             }
-            Event::SoftBreak => spans.push(Span::new(" ", theme.color("text"))),
+            Event::SoftBreak => spans.push(Span::themed(" ", theme, "text")),
             Event::End(TagEnd::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 item_prefixes.pop();
@@ -891,11 +921,12 @@ fn markdown_at_depth(
             }
             Event::Rule => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
-                lines.push(Line::plain(&"─".repeat(width.min(80)), theme.color("mdHr")));
+                lines.push(Line::themed(&"─".repeat(width.min(80)), theme, "mdHr"));
             }
-            Event::TaskListMarker(checked) => spans.push(Span::new(
+            Event::TaskListMarker(checked) => spans.push(Span::themed(
                 if checked { "☑ " } else { "☐ " },
-                theme.color("mdListBullet"),
+                theme,
+                "mdListBullet",
             )),
             _ => {}
         }
@@ -937,6 +968,33 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn system_dim_roles_survive_wrapping_and_emit_dim_attributes() {
+        let system = Theme::system();
+        let spans = [
+            Span::themed("muted text", &system, "muted"),
+            Span::themed("normal", &system, "text"),
+        ];
+        let lines = wrap(&spans, 6);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.dim && span.text.contains("muted"))
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| !span.dim && !span.text.is_empty())
+        );
+        let mut output = Vec::new();
+        lines[0].draw(&mut output, 6).unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("\x1b[2m"));
+        let custom = Theme::parse(include_str!("../../assets/themes/dark.json"), None).unwrap();
+        assert!(!Span::themed("muted", &custom, "muted").dim);
+    }
+
     #[test]
     fn skill_invocation_hides_the_body_and_keeps_user_text_visible() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

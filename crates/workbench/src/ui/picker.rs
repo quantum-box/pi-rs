@@ -806,19 +806,20 @@ impl Picker {
         } else {
             "text"
         };
-        let mut title_span = super::render::Span::new(title.clone(), theme.color(color));
+        let mut title_span = super::render::Span::themed(title.clone(), theme, color);
         title_span.bold = selected;
         let spacing = width
             .saturating_sub(2 + prefix.width() + title.width() + right.width())
             .max(1);
         Line {
             spans: vec![
-                super::render::Span::new(if selected { "› " } else { "  " }, theme.color("accent")),
-                super::render::Span::new(prefix, theme.color("dim")),
+                super::render::Span::themed(if selected { "› " } else { "  " }, theme, "accent"),
+                super::render::Span::themed(prefix, theme, "dim"),
                 title_span,
-                super::render::Span::new(
+                super::render::Span::themed(
                     format!("{}{right}", " ".repeat(spacing)),
-                    theme.color("dim"),
+                    theme,
+                    "dim",
                 ),
             ],
             background: selected.then(|| theme.color("selectedBg")),
@@ -851,17 +852,18 @@ impl Picker {
                 ),
             };
             return vec![
-                Line::plain(&title, theme.color("accent")),
-                Line::plain(&hint, theme.color("dim")),
+                Line::themed(&title, theme, "accent"),
+                Line::themed(&hint, theme, "dim"),
             ];
         }
         let filter = self
             .tree
             .as_ref()
             .map_or_else(String::new, |tree| format!(" · {}", tree.filter.name()));
-        let mut lines = vec![Line::plain(
+        let mut lines = vec![Line::themed(
             &format!("{}{filter} · {}", self.title, self.query),
-            theme.color("accent"),
+            theme,
+            "accent",
         )];
         let items = self.matches();
         let mut prefixes = vec![String::new(); items.len()];
@@ -908,7 +910,7 @@ impl Picker {
                 ));
                 continue;
             }
-            let mut line = Line::plain(
+            let mut line = Line::themed(
                 &format!(
                     "{} {}{}",
                     if index == self.selected { "›" } else { " " },
@@ -953,7 +955,8 @@ impl Picker {
                         item.label.clone()
                     }
                 ),
-                theme.color("text"),
+                theme,
+                "text",
             );
             if index == self.selected {
                 line.background = Some(theme.color("selectedBg"));
@@ -961,9 +964,10 @@ impl Picker {
             lines.push(line);
         }
         if scrolling {
-            lines.push(Line::plain(
+            lines.push(Line::themed(
                 &format!("  ({}/{})", self.selected + 1, items.len()),
-                theme.color("dim"),
+                theme,
+                "dim",
             ));
         }
         if items.is_empty() {
@@ -973,17 +977,17 @@ impl Picker {
                 } else {
                     "No matches"
                 };
-            lines.push(Line::plain(message, theme.color("dim")));
+            lines.push(Line::themed(message, theme, "dim"));
         }
         if let Some(feedback) = &self.feedback {
             let (message, role) = match feedback {
                 Ok(message) => (message, "dim"),
                 Err(message) => (message, "error"),
             };
-            lines.push(Line::plain(message, theme.color(role)));
+            lines.push(Line::themed(message, theme, role));
         }
         if self.active_session.is_some() {
-            lines.push(Line::plain(
+            lines.push(Line::themed(
                 &format!(
                     "{} · {} · Tab scope · Ctrl+N named · Ctrl+P paths",
                     if self.all_workspaces {
@@ -997,7 +1001,8 @@ impl Picker {
                         "All sessions"
                     }
                 ),
-                theme.color("dim"),
+                theme,
+                "dim",
             ));
         }
         let hint = if self.active_session.is_some() {
@@ -1061,7 +1066,7 @@ impl Picker {
                 hint("tui.select.cancel"),
             )
         };
-        lines.push(Line::plain(&hint, theme.color("dim")));
+        lines.push(Line::themed(&hint, theme, "dim"));
         lines
     }
 }

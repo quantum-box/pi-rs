@@ -107,7 +107,7 @@ pub fn render(
                         Cls::EdgeLabel => "muted",
                         Cls::Text | Cls::Empty => "text",
                     };
-                    Span::new(text, theme.color(color))
+                    Span::themed(text, theme, color)
                 })
                 .collect(),
             ..Line::default()

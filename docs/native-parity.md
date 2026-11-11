@@ -360,9 +360,8 @@ diagnostic per changed file contents. A PTY check covers live updates and
 terminal restoration. System appearance discovery queries terminal foreground and background colors
 using OSC 10 and 11 and updates light/dark theme selection as replies arrive.
 System theme accent and syntax roles use Pi's fallback ANSI palette slots.
-Neutral fallback roles retain their existing gray approximation until dim
-attributes are propagated through the terminal renderer. Palette-based system
-theme generation remains to be implemented. Custom
+Neutral fallback roles use terminal-default foreground with Pi's dim
+attribute. Palette-based system theme generation remains to be implemented. Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.
 

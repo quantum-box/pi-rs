@@ -279,6 +279,29 @@ impl Theme {
     pub fn color(&self, role: &str) -> Color {
         self.colors.get(role).copied().unwrap_or(Color::Reset)
     }
+    pub fn is_dim(&self, role: &str) -> bool {
+        self.name == "system"
+            && matches!(
+                role,
+                "customMessageText"
+                    | "muted"
+                    | "dim"
+                    | "thinkingText"
+                    | "toolOutput"
+                    | "mdLinkUrl"
+                    | "mdQuote"
+                    | "mdQuoteBorder"
+                    | "mdHr"
+                    | "mdCodeBlockBorder"
+                    | "toolDiffContext"
+                    | "syntaxComment"
+                    | "scrollbarTrack"
+                    | "scrollbarThumb"
+                    | "searchMatchText"
+                    | "borderMuted"
+                    | "thinkingOff"
+            )
+    }
     pub fn system() -> Self {
         // Pi uses the terminal's ANSI slots when no palette has been reported.
         let roles = [
@@ -316,23 +339,6 @@ impl Theme {
             colors: roles
                 .into_iter()
                 .map(|(key, index)| (key.into(), Color::AnsiValue(index)))
-                .chain(
-                    [
-                        ("borderMuted", Color::DarkGrey),
-                        ("muted", Color::Grey),
-                        ("dim", Color::DarkGrey),
-                        ("thinkingText", Color::DarkGrey),
-                        ("mdLinkUrl", Color::DarkGrey),
-                        ("mdQuote", Color::Grey),
-                        ("mdQuoteBorder", Color::DarkGrey),
-                        ("mdHr", Color::DarkGrey),
-                        ("toolOutput", Color::Grey),
-                        ("toolDiffContext", Color::Grey),
-                        ("thinkingOff", Color::DarkGrey),
-                    ]
-                    .into_iter()
-                    .map(|(key, color)| (key.into(), color)),
-                )
                 .collect(),
         }
     }
