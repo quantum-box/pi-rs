@@ -419,6 +419,7 @@ struct PendingThinking {
     provider: Option<String>,
     model: String,
     level: String,
+    previous_level: String,
 }
 
 enum RemoteEvent {
@@ -3070,6 +3071,13 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             && let Some(pending) = &view.pending_thinking
             && persist_pending_thinking(pending).is_ok()
         {
+            if pending.session == args.session && pending.previous_level != pending.level {
+                args.selection_events
+                    .push(pi_rs::LifecycleEvent::ThinkingLevelSelect {
+                        level: pending.level.clone(),
+                        previous_level: pending.previous_level.clone(),
+                    });
+            }
             view.pending_thinking = None;
         }
         if (view.picker.is_none()
@@ -3900,6 +3908,22 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                                 args.model.clone(),
                                                 state.available_levels.clone(),
                                             ));
+                                            let previous_level = view
+                                                .pending_thinking
+                                                .as_ref()
+                                                .filter(|pending| {
+                                                    pending.session == args.session
+                                                        && pending.model == args.model
+                                                        && pending.provider.as_deref()
+                                                            == args.recorded_provider()
+                                                })
+                                                .map(|pending| pending.previous_level.clone())
+                                                .unwrap_or_else(|| {
+                                                    args.thinking
+                                                        .as_deref()
+                                                        .unwrap_or("off")
+                                                        .to_owned()
+                                                });
                                             args.thinking = Some(effective.clone());
                                             view.pending_thinking = Some(PendingThinking {
                                                 session: args.session.clone(),
@@ -3908,6 +3932,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                                     .map(str::to_owned),
                                                 model: args.model.clone(),
                                                 level: effective,
+                                                previous_level,
                                             });
                                             if is_busy(&worker) {
                                                 view.flash = Some(("Thinking level applies after the current response".into(), Instant::now()));
@@ -4432,10 +4457,25 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             _ => {}
         }
     }
-    drop(worker);
+    if is_busy(&worker) {
+        drop(worker.take());
+    }
     if let Some(pending) = view.pending_thinking.take() {
         persist_pending_thinking(&pending)?;
+        if pending.session == args.session && pending.previous_level != pending.level {
+            args.selection_events
+                .push(pi_rs::LifecycleEvent::ThinkingLevelSelect {
+                    level: pending.level,
+                    previous_level: pending.previous_level,
+                });
+        }
     }
+    for event in std::mem::take(&mut args.selection_events) {
+        if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+            eprintln!("Extension selection notification: {error}");
+        }
+    }
+    drop(worker);
     if args.tui_mode == Some(TuiMode::Regular) {
         view.finish_regular()?;
     }

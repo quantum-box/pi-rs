@@ -975,10 +975,26 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
 
 #[test]
 fn settings_choose_and_clear_per_model_thinking() {
+    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let session_path = root.path().join("session.jsonl");
     std::fs::create_dir_all(&home).unwrap();
+    let extension = root.path().join("selection.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'selection', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'model_selection_hook':True}
+elif request['type'] == 'lifecycle':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'events.jsonl'), 'a') as log:
+        log.write(json.dumps(request['event']) + '\n')
+    result = None
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(
         home.join("settings.json"),
         br#"{"defaultThinkingLevel":"low"}"#,
@@ -1035,6 +1051,8 @@ fn settings_choose_and_clear_per_model_thinking() {
                 "--tui-mode",
                 "fullscreen",
             ])
+            .arg("--extension")
+            .arg(&extension)
             .env("PI_RS_HOME", &home)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -1101,6 +1119,30 @@ fn settings_choose_and_clear_per_model_thinking() {
     output_until(&mut master, |text| text.contains("Thinking: select model"));
     assert!(read_settings().get("modelThinkingLevels").is_none());
     wait_level("low");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let notifications = loop {
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(home.join("events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if entries.len() >= 2 {
+            break entries;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "selection events were not delivered: {entries:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        notifications[0],
+        serde_json::json!({"type":"thinking_level_select", "level":"high", "previousLevel":"low"})
+    );
+    assert_eq!(
+        notifications[1],
+        serde_json::json!({"type":"thinking_level_select", "level":"low", "previousLevel":"high"})
+    );
     master
         .write_all(&vec![0x7f; "ollama/fixture-model".len()])
         .unwrap();

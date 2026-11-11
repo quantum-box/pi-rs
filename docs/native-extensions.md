@@ -62,10 +62,14 @@ from within the hook.
 To observe model or thinking-level changes, implement `handles_lifecycle` and
 `handles_model_selection` and handle `LifecycleEvent::ModelSelect` and
 `LifecycleEvent::ThinkingLevelSelect`. Terminal and RPC selection commands
-deliver the new and previous values after the journal is updated. Model events
-identify whether a model was explicitly set or selected by cycling; reselecting
-the same value does not emit an event. These notifications do not yet cover
-branch restoration, the owned SDK's synchronous setter, or every settings path.
+deliver the new and previous values after the journal is updated, including
+changes to the active model's per-model thinking setting. Model events identify
+whether a model was explicitly set or selected by cycling; reselecting the same
+value does not emit an event. Owned SDK hosts can await
+`AgentSession::set_model_with_hooks` and provide model descriptors for the
+event; the existing synchronous `set_model` does not invoke asynchronous hooks.
+Pi v1.5.0 declares a `restore` source but its session restoration path does not
+emit a model selection event.
 
 An extension can also add temporary skills, prompt templates, and themes:
 

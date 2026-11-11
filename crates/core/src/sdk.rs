@@ -490,6 +490,67 @@ impl AgentSession {
         self.model_name = name;
         Ok(())
     }
+
+    /// Set the model and await selection hooks after the journal is committed.
+    /// Hosts with richer model metadata can provide a Pi-shaped descriptor; its
+    /// `id` should identify the same model as `name`.
+    pub async fn set_model_with_hooks(
+        &mut self,
+        model: Arc<dyn Model>,
+        name: impl Into<String>,
+        descriptor: serde_json::Value,
+        previous_descriptor: Option<serde_json::Value>,
+    ) -> Result<()> {
+        self.start().await?;
+        let name = name.into();
+        let previous_name = self.model_name.clone();
+        let previous_level = self
+            .session
+            .model_selection()
+            .and_then(|(_, level)| level)
+            .unwrap_or_else(|| "off".into());
+        self.set_model(model, name.clone())?;
+        if previous_level != "off" {
+            self.notify_selection_event(crate::LifecycleEvent::ThinkingLevelSelect {
+                level: "off".into(),
+                previous_level,
+            })
+            .await;
+        }
+        let descriptor_changed = previous_descriptor.as_ref().is_some_and(|previous| {
+            previous
+                .get("provider")
+                .zip(descriptor.get("provider"))
+                .is_some_and(|(left, right)| left != right)
+                || previous
+                    .get("id")
+                    .zip(descriptor.get("id"))
+                    .is_some_and(|(left, right)| left != right)
+        });
+        if previous_name != name || descriptor_changed {
+            self.notify_selection_event(crate::LifecycleEvent::ModelSelect {
+                model: descriptor,
+                previous_model: previous_descriptor,
+                source: crate::ModelSelectSource::Set,
+            })
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn notify_selection_event(&self, event: crate::LifecycleEvent) {
+        if self.registry.has_model_selection_hooks() {
+            let events = self.events.as_ref().expect("open session");
+            crate::lifecycle::notify(
+                &self.registry,
+                event,
+                &self.session.extension_states(),
+                self.limits.tool_timeout,
+                &mut |notification| emit(events, &notification),
+            )
+            .await;
+        }
+    }
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
         self.ensure_open()?;
         self.system_prompt = prompt.into();
@@ -1087,6 +1148,69 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct NameHook(Arc<Mutex<Vec<crate::LifecycleEvent>>>);
+
+    struct SelectionHook(Arc<Mutex<Vec<crate::LifecycleEvent>>>);
+    #[async_trait::async_trait]
+    impl Extension for SelectionHook {
+        fn id(&self) -> &str {
+            "selection-hook"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_model_selection(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            self.0.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_model_selection_hooks_follow_committed_changes_and_skip_unchanged_models() {
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "first")
+            .extension(Arc::new(SelectionHook(notifications.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.session.select_model("first", Some("high")).unwrap();
+        session
+            .set_model_with_hooks(
+                Arc::new(WaitingModel),
+                "second",
+                serde_json::json!({"id":"second", "provider":"fixture"}),
+                Some(serde_json::json!({"id":"first", "provider":"fixture"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.journal().model_selection(),
+            Some(("second".into(), None))
+        );
+        session
+            .set_model_with_hooks(
+                Arc::new(WaitingModel),
+                "second",
+                serde_json::json!({"id":"second"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let observed = notifications.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(
+            matches!(&observed[0], crate::LifecycleEvent::ThinkingLevelSelect { previous_level, level } if previous_level == "high" && level == "off")
+        );
+        assert!(
+            matches!(&observed[1], crate::LifecycleEvent::ModelSelect { model, previous_model: Some(previous), source: crate::ModelSelectSource::Set } if model["id"] == "second" && previous["id"] == "first")
+        );
+    }
 
     struct ForkHook(Arc<std::sync::atomic::AtomicBool>);
 
