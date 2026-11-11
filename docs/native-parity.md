@@ -68,6 +68,12 @@ Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID when present. Malformed JSON produces a `parse` response with a
 parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
 
+RPC `export_html` defaults to `pi-session-<session-basename>.html` in the
+invocation directory. An explicit output path selects the destination
+independently of its extension and can replace a previous export. The
+destination is written atomically, and the active session file is protected
+from being replaced by its own export. The export uses the native renderer.
+
 `get_last_assistant_text` and `/copy` use the active transcript. Both skip
 empty aborted assistant messages, concatenate the selected message's text
 blocks, and trim the result. The RPC response omits `text` when the selected

@@ -497,7 +497,7 @@ fn requires_idle(name: &str) -> bool {
 
 fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Result<Option<Value>> {
     let name = request["type"].as_str().unwrap_or_default();
-    if (requires_idle(name) || name == "export_html") && busy(worker) {
+    if requires_idle(name) && busy(worker) {
         return Err(Error::Config(format!(
             "command {name:?} is unavailable in the current state"
         )));
@@ -716,14 +716,39 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Ok(None)
         }
         "export_html" => {
+            if args.no_session {
+                return Err(Error::Config(
+                    "Cannot export in-memory session to HTML".into(),
+                ));
+            }
+            let session = Session::snapshot(&args.session)?;
+            if !session.records().iter().any(|record| {
+                matches!(
+                    record.event,
+                    pi_rs::Event::User { .. }
+                        | pi_rs::Event::UserWithImages { .. }
+                        | pi_rs::Event::Assistant { .. }
+                )
+            }) {
+                return Err(Error::Config(
+                    "Nothing to export yet - start a conversation first".into(),
+                ));
+            }
             let path = request["outputPath"]
                 .as_str()
-                .map(std::path::PathBuf::from)
+                .filter(|path| !path.is_empty())
+                .map(pi_rs_workbench::normalize_path)
+                .transpose()?
                 .unwrap_or_else(|| {
-                    args.workspace
-                        .join(format!("pi-session-{}.html", uuid::Uuid::new_v4()))
+                    let basename = args
+                        .session
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    let basename = basename.strip_suffix(".jsonl").unwrap_or(&basename);
+                    format!("pi-session-{basename}.html").into()
                 });
-            sessions::export(&Session::open(&args.session)?, &path)?;
+            sessions::export_rpc_html(&session, &args.session, &path)?;
             Ok(Some(json!({"path":path})))
         }
 
@@ -1115,6 +1140,37 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn rpc_html_export_uses_the_requested_format_and_protects_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.session = directory.path().join("source.jsonl");
+        let mut session = Session::open(&args.session).unwrap();
+        let output = directory.path().join("transcript.jsonl");
+        let request = json!({"type":"export_html","outputPath":output});
+        assert!(command(&request, &mut args, &mut None).is_err());
+        session
+            .append_user_with_images("fixture <text>".into(), vec![], None)
+            .unwrap();
+        drop(session);
+        std::fs::write(&output, "old").unwrap();
+        let url = reqwest::Url::from_file_path(&output).unwrap();
+        let request = json!({"type":"export_html","outputPath":url.as_str()});
+        let result = command(&request, &mut args, &mut None).unwrap();
+        assert_eq!(result, Some(json!({"path":output})));
+        let exported = std::fs::read_to_string(&output).unwrap();
+        assert!(exported.starts_with("<!doctype html>"));
+        assert!(exported.contains("fixture &lt;text&gt;"));
+        let original = std::fs::read(&args.session).unwrap();
+        let request = json!({"type":"export_html","outputPath":args.session});
+        assert!(command(&request, &mut args, &mut None).is_err());
+        assert_eq!(std::fs::read(&args.session).unwrap(), original);
+        args.no_session = true;
+        let error = command(&request, &mut args, &mut None).unwrap_err();
+        assert!(matches!(error, Error::Config(message)
+            if message == "Cannot export in-memory session to HTML"));
+    }
 
     #[test]
     fn last_assistant_text_matches_pi_transcript_rules() {

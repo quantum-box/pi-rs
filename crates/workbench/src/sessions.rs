@@ -287,6 +287,27 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn export_rpc_html(session: &Session, source: &Path, destination: &Path) -> Result<()> {
+    if let Ok(resolved) = destination.canonicalize()
+        && resolved == source.canonicalize()?
+    {
+        return Err(Error::Config(
+            "Cannot export HTML over the active session file".into(),
+        ));
+    }
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(html(session).as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(destination)
+        .map_err(|error| Error::Io(error.error))?;
+    sync_directory(parent)
+}
+
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")

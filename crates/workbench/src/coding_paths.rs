@@ -5,11 +5,20 @@ use pi_rs::{Error, Result};
 use unicode_normalization::UnicodeNormalization;
 
 pub(super) fn normalize(value: &str) -> Result<PathBuf> {
+    input(value, home().as_deref().map(Path::new))
+}
+
+/// Normalize a filesystem path without rewriting its spaces or stripping a leading `@`.
+pub fn normalize_plain(value: &str) -> Result<PathBuf> {
+    plain_input(value, home().as_deref().map(Path::new))
+}
+
+fn home() -> Option<std::ffi::OsString> {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
     #[cfg(not(windows))]
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    input(value, home.as_deref().map(Path::new))
+    home
 }
 
 fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
@@ -20,7 +29,10 @@ fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
             ch => ch,
         })
         .collect();
-    let value = value.strip_prefix('@').unwrap_or(&value);
+    plain_input(value.strip_prefix('@').unwrap_or(&value), home)
+}
+
+fn plain_input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
     #[cfg(windows)]
     let windows_value = windows_shell_path(value);
     #[cfg(windows)]
