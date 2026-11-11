@@ -102,6 +102,8 @@ struct Terminal {
     color_queries: std::collections::VecDeque<ColorQuery>,
     #[cfg(any(unix, windows))]
     color_requery: bool,
+    #[cfg(any(unix, windows))]
+    expired_color_markers: usize,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -131,6 +133,8 @@ impl Terminal {
             color_queries: std::collections::VecDeque::new(),
             #[cfg(any(unix, windows))]
             color_requery: false,
+            #[cfg(any(unix, windows))]
+            expired_color_markers: 0,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -195,6 +199,16 @@ impl Terminal {
     }
 
     #[cfg(any(unix, windows))]
+    fn receive_color_marker(&mut self) -> Result<()> {
+        if self.expired_color_markers > 0 {
+            self.expired_color_markers -= 1;
+            Ok(())
+        } else {
+            self.finish_color_query()
+        }
+    }
+
+    #[cfg(any(unix, windows))]
     fn poll_color_timeout(&mut self) -> Result<()> {
         if self.color_requery
             && self
@@ -202,6 +216,7 @@ impl Terminal {
                 .front()
                 .is_some_and(|query| query.started.elapsed() >= Duration::from_secs(2))
         {
+            self.expired_color_markers = self.expired_color_markers.saturating_add(1);
             self.finish_color_query()?;
         }
         Ok(())
@@ -3029,7 +3044,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::PrimaryDeviceAttributes) => {
                 if let Some(terminal) = &mut _terminal {
-                    terminal.finish_color_query()?;
+                    terminal.receive_color_marker()?;
                     #[cfg(unix)]
                     terminal.keyboard_reply(false)?;
                 }
@@ -4913,6 +4928,29 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn late_color_marker_does_not_complete_the_new_query() {
+        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
+            alternate: false,
+            images: Default::default(),
+            progress: None,
+            color_queries: std::collections::VecDeque::from([super::ColorQuery {
+                started: std::time::Instant::now(),
+                replied: 0,
+            }]),
+            color_requery: false,
+            expired_color_markers: 1,
+            #[cfg(unix)]
+            keyboard: super::KeyboardProtocol::Kitty,
+        });
+        terminal.receive_color_marker().unwrap();
+        assert_eq!(terminal.color_queries.len(), 1);
+        assert!(terminal.accepts_color_reply(5));
+        terminal.receive_color_marker().unwrap();
+        assert!(terminal.color_queries.is_empty());
+    }
+
     #[test]
     fn new_session_creates_its_storage_directory() {
         use clap::Parser;
