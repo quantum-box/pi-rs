@@ -325,12 +325,17 @@ impl Tool for CodingTool {
     }
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
         let result = match self.kind {
-            Kind::Read { .. } => {
+            Kind::Read { .. } | Kind::Grep | Kind::Find | Kind::List => {
                 let tool = self.clone();
                 let cancellation = context.cancellation.child_token();
                 let _guard = cancellation.clone().drop_guard();
                 let worker_token = cancellation.clone();
-                let worker = tokio::task::spawn_blocking(move || tool.read(&args, &worker_token));
+                let worker = tokio::task::spawn_blocking(move || match tool.kind {
+                    Kind::Read { .. } => tool.read(&args, &worker_token),
+                    Kind::Grep | Kind::Find => tool.search(&args, &worker_token),
+                    Kind::List => tool.list(&args, &worker_token),
+                    _ => unreachable!("only local read operations run here"),
+                });
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => Err(Error::Cancelled),
@@ -343,24 +348,11 @@ impl Tool for CodingTool {
                     .edit(&args)
                     .unwrap_or_else(|error| Outcome::Failed(edit_error_text(error)));
             }
-            Kind::Grep | Kind::Find => {
-                let tool = self.clone();
-                let cancellation = context.cancellation.child_token();
-                let _guard = cancellation.clone().drop_guard();
-                tokio::task::spawn_blocking(move || tool.search(&args, &cancellation))
-                    .await
-                    .unwrap_or_else(|error| Err(Error::Config(error.to_string())))
-            }
-            Kind::List => self.list(&args),
             Kind::Bash | Kind::PowerShell => return self.bash(&args, &context.cancellation).await,
         };
         match result {
             Ok(outcome) => outcome,
-            Err(Error::Cancelled)
-                if matches!(self.kind, Kind::Read { .. } | Kind::Grep | Kind::Find) =>
-            {
-                Outcome::Failed("Operation aborted".into())
-            }
+            Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
             Err(Error::Config(message))
                 if self.unrestricted && matches!(self.kind, Kind::Grep | Kind::List) =>
             {
@@ -637,7 +629,10 @@ impl CodingTool {
         })
     }
 
-    fn list(&self, args: &Value) -> Result<Outcome> {
+    fn list(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let path = self.path(args["path"].as_str().unwrap_or("."))?;
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
@@ -646,13 +641,22 @@ impl CodingTool {
                 path.display()
             )));
         }
-        let mut entries = std::fs::read_dir(&path)
-            .map_err(|error| Error::Config(format!("Cannot read directory: {error}")))?
-            .collect::<std::io::Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
+        let directory = std::fs::read_dir(&path)
+            .map_err(|error| Error::Config(format!("Cannot read directory: {error}")))?;
+        let mut entries = Vec::new();
+        for entry in directory {
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            entries.push(entry?);
+        }
+        entries.sort_by_cached_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
         let mut results = Vec::new();
         let mut entry_limit_reached = false;
         for entry in entries {
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             if results.len() >= limit {
                 entry_limit_reached = true;
                 break;
@@ -1315,7 +1319,7 @@ mod tests {
             tool.invoke(json!({"path":"file.txt"}), context()).await,
             Outcome::Failed(message) if message == "Operation aborted"
         ));
-        for kind in [Kind::Grep, Kind::Find] {
+        for kind in [Kind::Grep, Kind::Find, Kind::List] {
             tool.kind = kind;
             let output = tool.invoke(json!({"pattern": "match"}), context()).await;
             assert!(matches!(output, Outcome::Failed(message) if message == "Operation aborted"));
@@ -1591,17 +1595,24 @@ mod tests {
             kind: Kind::List,
         };
         assert_eq!(
-            tool.list(&json!({})).unwrap().tool_content(),
+            tool.list(&json!({}), &pi_rs::CancellationToken::new())
+                .unwrap()
+                .tool_content(),
             "(empty directory)"
         );
         std::fs::write(root.path().join("Zeta"), "").unwrap();
         std::fs::write(root.path().join("alpha"), "").unwrap();
         std::fs::create_dir(root.path().join("Beta")).unwrap();
         assert_eq!(
-            tool.list(&json!({})).unwrap().tool_content(),
+            tool.list(&json!({}), &pi_rs::CancellationToken::new())
+                .unwrap()
+                .tool_content(),
             "alpha\nBeta/\nZeta"
         );
-        let output = tool.list(&json!({"limit":1})).unwrap().tool_content();
+        let output = tool
+            .list(&json!({"limit":1}), &pi_rs::CancellationToken::new())
+            .unwrap()
+            .tool_content();
         assert!(output.starts_with("alpha\n"));
         assert!(output.contains("1 entries limit reached"));
     }
@@ -1621,7 +1632,10 @@ mod tests {
         for name in &names {
             std::fs::write(root.path().join(name), "").unwrap();
         }
-        let output = tool.list(&json!({"limit":300})).unwrap().tool_content();
+        let output = tool
+            .list(&json!({"limit":300}), &pi_rs::CancellationToken::new())
+            .unwrap()
+            .tool_content();
         let (body, notice) = output.rsplit_once("\n\n").unwrap();
         assert!(body.len() <= MAX_OUTPUT_BYTES);
         assert_eq!(body.lines().collect::<Vec<_>>(), names[..254]);
@@ -1629,9 +1643,15 @@ mod tests {
             notice,
             "[300 entries limit reached. Use limit=600 for more. 50.0KB limit reached]"
         );
-        let output = tool.list(&json!({"limit":301})).unwrap().tool_content();
+        let output = tool
+            .list(&json!({"limit":301}), &pi_rs::CancellationToken::new())
+            .unwrap()
+            .tool_content();
         assert!(output.ends_with("\n\n[50.0KB limit reached]"));
-        let output = tool.list(&json!({"limit":1})).unwrap().tool_content();
+        let output = tool
+            .list(&json!({"limit":1}), &pi_rs::CancellationToken::new())
+            .unwrap()
+            .tool_content();
         assert_eq!(
             output,
             format!(
@@ -1640,7 +1660,7 @@ mod tests {
             )
         );
         assert!(
-            tool.list(&json!({"path":names[0]}))
+            tool.list(&json!({"path":names[0]}), &pi_rs::CancellationToken::new())
                 .unwrap_err()
                 .to_string()
                 .contains("Not a directory:")
@@ -1684,7 +1704,10 @@ mod tests {
         for name in &names {
             std::fs::write(root.path().join(name), "").unwrap();
         }
-        let output = tool.list(&json!({})).unwrap().tool_content();
+        let output = tool
+            .list(&json!({}), &pi_rs::CancellationToken::new())
+            .unwrap()
+            .tool_content();
         let (body, notice) = output.rsplit_once("\n\n").unwrap();
         assert_eq!(body.len(), MAX_OUTPUT_BYTES);
         assert_eq!(body.lines().collect::<Vec<_>>(), names[..256]);

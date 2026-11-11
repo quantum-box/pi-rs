@@ -252,7 +252,8 @@ passed with the same implementation.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
-while scanning a single long line.
+while scanning a single long line. Directory listing runs off the async
+runtime and checks for cancellation during enumeration and metadata reads.
 
 `read` returns bounded PNG image content for PNG, JPEG, GIF, WebP, BMP and TIFF
 inputs. It preserves alpha, avoids upscaling and reduces large images before
