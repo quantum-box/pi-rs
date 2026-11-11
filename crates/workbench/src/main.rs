@@ -1155,10 +1155,13 @@ async fn execute(mut args: Cli) -> Result<()> {
         )?;
         args.initial_images = images;
         if !std::io::stdin().is_terminal() && !args.stdin_control {
-            let mut input = String::new();
-            std::io::stdin().read_to_string(&mut input)?;
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input)?;
+            let input = String::from_utf8_lossy(&input);
+            let input = input
+                .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
             if !input.is_empty() {
-                prompt = format!("{input}\n{prompt}");
+                prompt.insert_str(0, input);
             }
         }
         if !prompt.trim().is_empty() || !args.initial_images.is_empty() {

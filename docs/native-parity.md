@@ -436,7 +436,9 @@ prompt, empty files are skipped, and UTF-8 BOMs are stripped from text files.
 Images are referenced by a single-line file tag and sent as separate image
 content. Initial prompts passed
 from a terminal now run inside the TUI and leave it available for further
-conversation. Print and JSON modes remain one-shot.
+conversation. Print and JSON modes remain one-shot. Piped stdin is decoded as
+UTF-8 with replacement, trimmed, and concatenated before the attachment text
+and initial prompt, without an added separator.
 
 The owned SDK exposes `prompt_with_images`. Idle RPC `prompt` requests accept
 image blocks, including image-only input. Image-bearing input is committed as
