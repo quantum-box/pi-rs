@@ -3066,6 +3066,13 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 continue;
             }
             #[cfg(any(unix, windows))]
+            Some(crate::ui::input::InputEvent::TerminalColorInvalid { target }) => {
+                if let Some(terminal) = &mut _terminal {
+                    terminal.accepts_color_reply(target)?;
+                }
+                continue;
+            }
+            #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::TerminalPalette {
                 index,
                 red,

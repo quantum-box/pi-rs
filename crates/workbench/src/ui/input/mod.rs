@@ -14,6 +14,10 @@ pub enum InputEvent {
         dark: bool,
     },
     #[cfg(any(unix, windows))]
+    TerminalColorInvalid {
+        target: u8,
+    },
+    #[cfg(any(unix, windows))]
     TerminalPalette {
         index: u8,
         red: u8,
