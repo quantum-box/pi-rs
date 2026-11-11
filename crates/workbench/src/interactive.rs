@@ -157,6 +157,36 @@ impl Terminal {
         }
         Ok(guard)
     }
+
+    fn switch_mode(&mut self, alternate: bool, view: &mut View) -> Result<()> {
+        if self.alternate == alternate {
+            return Ok(());
+        }
+        if alternate {
+            view.finish_regular()?;
+            execute!(
+                std::io::stdout(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableFocusChange
+            )?;
+        } else {
+            execute!(
+                std::io::stdout(),
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            )?;
+            view.regular.layout = None;
+            view.regular.max_rows = 0;
+            view.regular.committed_rows = 0;
+        }
+        self.alternate = alternate;
+        view.graphics.reset();
+        view.mouse.clear();
+        view.scrollbar_dragging = false;
+        Ok(())
+    }
     #[cfg(any(unix, windows))]
     fn query_terminal_colors(&mut self) -> Result<()> {
         // Serialize queries so that replies remain attributable when DA1 is absent.
@@ -2944,6 +2974,13 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     loop {
+        if let Some(terminal) = &mut _terminal {
+            let alternate = args.tui_mode != Some(TuiMode::Regular);
+            if terminal.alternate != alternate {
+                terminal.switch_mode(alternate, &mut view)?;
+                dirty = true;
+            }
+        }
         if !args.trust_pending
             && worker.is_none()
             && !view.resources.extensions.is_empty()
@@ -4393,18 +4430,21 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
                 "HTTP idle timeout · {}",
                 match args.settings.http_idle_timeout_ms() {
                     0 => "disabled".to_owned(),
+                    30_000 => "30 sec".to_owned(),
+                    60_000 => "1 min".to_owned(),
+                    120_000 => "2 min".to_owned(),
+                    300_000 => "5 min".to_owned(),
                     ms => format!("{} sec", ms as f64 / 1000.0),
                 }
             ),
             selection: Selection::Setting(
                 "httpIdleTimeoutMs".into(),
                 json!(match args.settings.http_idle_timeout_ms() {
-                    0 => 30_000,
-                    1..=29_999 => 30_000,
-                    30_000..=59_999 => 60_000,
-                    60_000..=119_999 => 120_000,
-                    120_000..=299_999 => 300_000,
-                    _ => 0,
+                    30_000 => 60_000,
+                    60_000 => 120_000,
+                    120_000 => 300_000,
+                    300_000 => 0,
+                    _ => 30_000,
                 }),
             ),
         },
@@ -4533,7 +4573,91 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
     }
     let autocomplete_items = args.settings.autocomplete_max_visible();
     let skill_commands = args.settings.enable_skill_commands();
+    let quiet = &args.settings.value()["quietStartup"];
+    let quiet_label = if quiet == true {
+        "true"
+    } else if quiet == "header" {
+        "header"
+    } else {
+        "false"
+    };
+    let share = args
+        .settings
+        .string("sessionShareDestination")
+        .unwrap_or("auto");
+    let trust = args.settings.string("defaultProjectTrust").unwrap_or("ask");
+    let wheel = &args.settings.value()["fullscreenWheelScrollLines"];
+    let wheel_lines = wheel
+        .as_f64()
+        .map(|value| value.clamp(1.0, 100.0).floor() as u64);
     items.extend([
+        Item {
+            label: format!(
+                "TUI mode · {}",
+                if args.tui_mode == Some(TuiMode::Regular) {
+                    "regular"
+                } else {
+                    "fullscreen"
+                }
+            ),
+            selection: Selection::Setting(
+                "tuiMode".into(),
+                json!(if args.tui_mode == Some(TuiMode::Regular) {
+                    "fullscreen"
+                } else {
+                    "regular"
+                }),
+            ),
+        },
+        Item {
+            label: format!("Quiet startup · {quiet_label}"),
+            selection: Selection::Setting(
+                "quietStartup".into(),
+                match quiet_label {
+                    "true" => json!("header"),
+                    "header" => json!(false),
+                    _ => json!(true),
+                },
+            ),
+        },
+        Item {
+            label: format!("Session share destination · {share}"),
+            selection: Selection::Setting(
+                "sessionShareDestination".into(),
+                json!(match share {
+                    "auto" => "gist",
+                    "gist" => "radius",
+                    _ => "auto",
+                }),
+            ),
+        },
+        Item {
+            label: format!("Default project trust · {trust}"),
+            selection: Selection::Setting(
+                "defaultProjectTrust".into(),
+                json!(match trust {
+                    "ask" => "always",
+                    "always" => "never",
+                    _ => "ask",
+                }),
+            ),
+        },
+        Item {
+            label: format!(
+                "Fullscreen wheel scrolling · {}",
+                wheel_lines.map_or_else(|| "auto".into(), |n| n.to_string())
+            ),
+            selection: Selection::Setting(
+                "fullscreenWheelScrollLines".into(),
+                match wheel_lines {
+                    None => json!(1),
+                    Some(current) => [1, 2, 3, 5, 10]
+                        .into_iter()
+                        .find(|value| *value > current)
+                        .map_or_else(|| json!("auto"), |value| json!(value)),
+                },
+            ),
+        },
         Item {
             label: format!("Autocomplete max items · {autocomplete_items}"),
             selection: Selection::Setting(
@@ -4630,9 +4754,9 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             selection: Selection::Setting(
                 "markdown.mermaid".into(),
                 json!(match args.settings.mermaid_mode() {
-                    "streaming" => "final",
-                    "final" => "off",
-                    _ => "streaming",
+                    "off" => "final",
+                    "final" => "streaming",
+                    _ => "off",
                 }),
             ),
         },
@@ -4688,14 +4812,10 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         "defaultModel",
         "defaultThinkingLevel",
         "modelThinkingLevels",
-        "tuiMode",
-        "fullscreenWheelScrollLines",
         "httpProxy",
         "sessionDir",
-        "sessionShareDestination",
         "shellPath",
         "shellCommandPrefix",
-        "defaultProjectTrust",
         "defaultTools",
         "extensions",
         "skills",
@@ -4953,6 +5073,13 @@ fn select(
             match key.as_str() {
                 "expandTools" => view.set_expand_tools(value.as_bool().unwrap_or(false)),
                 "hideThinkingBlock" => view.hide_thinking = value.as_bool().unwrap_or(false),
+                "tuiMode" => {
+                    args.tui_mode = Some(if value == "regular" {
+                        TuiMode::Regular
+                    } else {
+                        TuiMode::Fullscreen
+                    })
+                }
                 _ => {}
             }
         }

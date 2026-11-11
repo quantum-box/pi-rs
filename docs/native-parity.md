@@ -44,6 +44,9 @@ or saving a JSON editor returns to the list, and Escape closes the list.
 Steering and follow-up delivery modes can be changed from this list even while
 the model is streaming; the active session and the global defaults both update.
 The list shows the session's selected mode when reopening an existing branch.
+TUI mode changes take effect immediately, including during streaming, without
+closing the settings list. Quiet startup, share destination, default project
+trust and fullscreen wheel speed can also be cycled directly in the list.
 
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |

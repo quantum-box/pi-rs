@@ -165,6 +165,22 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        master.write_all(b"TUI mode\r").unwrap();
+        let changed = if mode == "regular" {
+            "fullscreen"
+        } else {
+            "regular"
+        };
+        output_until(&mut master, |text| {
+            text.contains(&format!("TUI mode · {changed}"))
+        });
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains(&format!("TUI mode · {mode}"))
+        });
+        master
+            .write_all(b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f")
+            .unwrap();
         master.write_all(b"Edit shellPath\r").unwrap();
         output_until(&mut master, |text| text.contains("Edit shellPath as JSON"));
         master.write_all(b"\x1b").unwrap();
@@ -552,4 +568,134 @@ fn resume_selector_escape_cancels_with_redirected_stdio() {
         .read_to_string(&mut output)
         .unwrap();
     assert!(output.is_empty(), "unexpected stdout: {output}");
+}
+
+#[test]
+fn settings_switches_terminal_modes_and_restores_input() {
+    for initial in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 110,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size,
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let _process = Process(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .args([
+                    "--workspace",
+                    root.path().to_str().unwrap(),
+                    "--no-trust",
+                    "--no-mcp",
+                    "--offline",
+                    "--tui-mode",
+                    initial,
+                ])
+                .env("PI_RS_HOME", root.path().join("home"))
+                .env("TERM", "xterm-256color")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        output_until(&mut master, |text| text.contains("Enter to send"));
+        master.write_all(b"/settings\r").unwrap();
+        output_until(&mut master, |text| text.contains("Settings"));
+        master.write_all(b"TUI mode").unwrap();
+        output_until(&mut master, |text| text.contains("TUI mode"));
+        master.write_all(b"\r").unwrap();
+        let (control, changed) = if initial == "regular" {
+            ("\u{1b}[?1049h", "fullscreen")
+        } else {
+            ("\u{1b}[?1049l", "regular")
+        };
+        output_until(&mut master, |text| {
+            text.contains(control) && text.contains(&format!("TUI mode · {changed}"))
+        });
+        master.write_all(b"\r").unwrap();
+        let control = if initial == "regular" {
+            "\u{1b}[?1049l"
+        } else {
+            "\u{1b}[?1049h"
+        };
+        output_until(&mut master, |text| {
+            text.contains(control) && text.contains(&format!("TUI mode · {initial}"))
+        });
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["tuiMode"], initial);
+        master.write_all(b"\x03").unwrap();
+        output_until(&mut master, |text| text.contains("0 tokens"));
+        if initial == "regular" {
+            for (label, key, expected) in [
+                ("Quiet startup", "quietStartup", serde_json::json!(true)),
+                (
+                    "Session share destination",
+                    "sessionShareDestination",
+                    serde_json::json!("gist"),
+                ),
+                (
+                    "Default project trust",
+                    "defaultProjectTrust",
+                    serde_json::json!("always"),
+                ),
+                (
+                    "Fullscreen wheel scrolling",
+                    "fullscreenWheelScrollLines",
+                    serde_json::json!(1),
+                ),
+                (
+                    "Mermaid rendering",
+                    "markdown.mermaid",
+                    serde_json::json!("off"),
+                ),
+            ] {
+                master.write_all(b"/settings\r").unwrap();
+                output_until(&mut master, |text| text.contains("Settings"));
+                master.write_all(label.as_bytes()).unwrap();
+                output_until(&mut master, |text| text.contains(label));
+                master.write_all(b"\r").unwrap();
+                let displayed = expected
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| expected.to_string());
+                output_until(&mut master, |text| {
+                    text.contains(&format!("{label} · {displayed}"))
+                });
+                let settings: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(root.path().join("home/settings.json")).unwrap(),
+                )
+                .unwrap();
+                let actual = key.split('.').fold(&settings, |value, part| &value[part]);
+                assert_eq!(*actual, expected);
+                master.write_all(b"\x03").unwrap();
+                output_until(&mut master, |text| text.contains("0 tokens"));
+            }
+        }
+        master.write_all(b"draft survives").unwrap();
+        output_until(&mut master, |text| text.contains("draft survives"));
+    }
 }
