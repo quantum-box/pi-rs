@@ -16,6 +16,7 @@ pub(super) struct Accumulator {
     head: Vec<u8>,
     tail: Vec<u8>,
     bytes: u64,
+    raw_bytes: u64,
     display: DisplayTail,
     file: Option<tempfile::NamedTempFile>,
 }
@@ -30,13 +31,17 @@ pub(super) struct Output {
 }
 
 impl Accumulator {
+    pub fn record_raw_bytes(&mut self, count: usize) {
+        self.raw_bytes = self.raw_bytes.saturating_add(count as u64);
+    }
+
     pub fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         self.bytes += bytes.len() as u64;
         self.display.decode(bytes, false);
-        self.spill()?;
+        self.spill(true)?;
         if let Some(file) = &mut self.file {
             file.write_all(bytes)?;
         }
@@ -50,8 +55,11 @@ impl Accumulator {
         Ok(())
     }
 
-    fn spill(&mut self) -> std::io::Result<()> {
-        if self.file.is_none() && (self.bytes > DISPLAY_BYTES as u64 || self.display.is_truncated())
+    fn spill(&mut self, include_raw: bool) -> std::io::Result<()> {
+        if self.file.is_none()
+            && (self.bytes > DISPLAY_BYTES as u64
+                || (include_raw && self.raw_bytes > DISPLAY_BYTES as u64 && self.bytes > 0)
+                || self.display.is_truncated())
         {
             let mut file = tempfile::Builder::new()
                 .prefix("pi-bash-")
@@ -65,7 +73,7 @@ impl Accumulator {
 
     pub fn finish(mut self) -> std::io::Result<Output> {
         self.display.decode(&[], true);
-        self.spill()?;
+        self.spill(false)?;
         let (display, limit, lines, partial) = self.display.snapshot();
         let script_truncated = self.bytes > SCRIPT_BYTES as u64;
         let script = if script_truncated {

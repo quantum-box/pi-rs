@@ -114,8 +114,7 @@ impl CodingTools {
             truncated: result.output.details.is_some(),
             full_output_path: result
                 .output
-                .details
-                .and(result.output.path)
+                .path
                 .map(|path| path.to_string_lossy().into_owned()),
             exclude_from_context: false,
         })
@@ -1009,6 +1008,7 @@ impl CodingTool {
                     let count = count?;
                     stdout_open = count != 0;
                     if sanitize_user_output {
+                        output.record_raw_bytes(count);
                         let mut clean = String::new();
                         stdout_text.push(&stdout_chunk[..count], &mut |text| clean.push_str(&stdout_filter.filter(text)));
                         if !clean.is_empty() {
@@ -1024,6 +1024,7 @@ impl CodingTool {
                     let count = count?;
                     stderr_open = count != 0;
                     if sanitize_user_output {
+                        output.record_raw_bytes(count);
                         let mut clean = String::new();
                         stderr_text.push(&stderr_chunk[..count], &mut |text| clean.push_str(&stderr_filter.filter(text)));
                         if !clean.is_empty() {
@@ -1517,6 +1518,22 @@ mod tests {
                 .unwrap();
             assert_eq!(result.output, "red\n");
             assert_eq!(streamed, result.output);
+        }
+        if !cfg!(windows) {
+            let result = tools
+                .execute_shell(
+                    "head -c 52000 /dev/zero; printf hello",
+                    None,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.output, "hello");
+            assert!(!result.truncated);
+            let path = result.full_output_path.unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+            std::fs::remove_file(path).unwrap();
         }
         for command in ["", "  "] {
             let result = tools
