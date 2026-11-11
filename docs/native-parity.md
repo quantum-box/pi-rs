@@ -250,6 +250,8 @@ passed with the same implementation.
 
 ### Image and file-tool checkpoint
 
+Local write and edit operations support text files larger than 4 MiB.
+
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
 while scanning a single long line. Directory listing runs off the async

@@ -462,7 +462,7 @@ impl CodingTool {
 
     fn text(&self, path: &Path) -> Result<String> {
         let metadata = path.metadata()?;
-        if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+        if !metadata.is_file() || (!self.unrestricted && metadata.len() > MAX_FILE_BYTES) {
             return Err(Error::Config(
                 "expected a regular text file up to 4 MiB".into(),
             ));
@@ -558,7 +558,7 @@ impl CodingTool {
 
     fn write(&self, args: &Value) -> Result<String> {
         let content = string(args, "content")?;
-        if content.len() as u64 > MAX_FILE_BYTES {
+        if !self.unrestricted && content.len() as u64 > MAX_FILE_BYTES {
             return Err(Error::Config("content exceeds 4 MiB".into()));
         }
         let display_path = string(args, "path")?;
@@ -607,7 +607,7 @@ impl CodingTool {
         let _lock = mutation_lock(&path)?;
         let original = self.text(&path)?;
         let (output, count) = crate::text_edit::apply(&original, args)?;
-        if output.len() as u64 > MAX_FILE_BYTES {
+        if !self.unrestricted && output.len() as u64 > MAX_FILE_BYTES {
             return Err(Error::Config("edited file exceeds 4 MiB".into()));
         }
         if self.text(&path)? != original {
@@ -1604,6 +1604,30 @@ mod tests {
                 .edit(&json!({"path":"Capture d'ecran.txt", "oldText":"curly", "newText":"other"}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn local_write_and_edit_support_files_larger_than_four_mebibytes() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        };
+        let content = format!("{}\nchange me\n", "a".repeat(MAX_FILE_BYTES as usize));
+        tool.write(&json!({"path":"large.txt","content":content}))
+            .unwrap();
+        let editor = CodingTool {
+            kind: Kind::Edit,
+            ..tool
+        };
+        editor
+            .edit(&json!({"path":"large.txt","oldText":"change me","newText":"changed"}))
+            .unwrap();
+        let result = std::fs::read_to_string(root.path().join("large.txt")).unwrap();
+        assert_eq!(result.len(), content.len() - 2);
+        assert!(result.ends_with("\nchanged\n"));
     }
 
     #[test]
