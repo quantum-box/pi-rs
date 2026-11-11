@@ -109,7 +109,9 @@ fn normalize(
             && print
             && input.peek().is_some_and(|next| {
                 let bytes = next.as_encoded_bytes();
-                (!bytes.starts_with(b"@") && !bytes.starts_with(b"-")) || bytes.starts_with(b"---")
+                ((!bytes.starts_with(b"@") && !bytes.starts_with(b"-"))
+                    || bytes.starts_with(b"---"))
+                    && command.find_subcommand(next).is_none()
             })
         {
             prompt.extend(input.next());
@@ -334,6 +336,15 @@ mod tests {
                 update_extensions: true,
             }))
         ));
+    }
+
+    #[test]
+    fn print_flag_preserves_an_explicit_extension_subcommand() {
+        let args = cli(&["pi", "--print", "extension", "example", "run"]);
+        assert!(args.print);
+        assert!(
+            matches!(args.command, Some(super::super::Command::Extension { extension_id, command, .. }) if extension_id == "example" && command == "run")
+        );
     }
 
     #[test]
