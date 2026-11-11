@@ -2618,8 +2618,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             last_theme_check = Instant::now();
         }
         if let Some(name) = view.pending_session_name.take()
-            && let Some(active) = &mut worker
-            && let Err(error) = active.notify_session_name(&args, name)
+            && let Err(error) = Worker::notify_session_name(&mut worker, &args, name)
         {
             view.append(&error.to_string());
             dirty = true;

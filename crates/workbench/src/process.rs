@@ -294,21 +294,9 @@ impl Worker {
         let Some(slot) = slot else {
             return Ok(false);
         };
-        if slot.is_none() {
-            let explicit = args
-                .extensions
-                .iter()
-                .any(|extension| !super::resource_paths::named_extension(extension));
-            if !explicit
-                && super::resources::Resources::load(args)?
-                    .extensions
-                    .is_empty()
-            {
-                return Ok(false);
-            }
-            *slot = Some(Self::start(args, &["serve"])?);
-        }
-        let active = slot.as_mut().expect("session transition worker");
+        let Some(active) = Self::extension_worker(slot, args)? else {
+            return Ok(false);
+        };
         let id = json!(uuid::Uuid::new_v4());
         active.send(json!({"type":"check_session_transition","id":id,"event":event}))?;
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -331,9 +319,36 @@ impl Worker {
             active.pending_events.push(event);
         }
     }
-    pub(super) fn notify_session_name(&mut self, args: &Cli, name: Option<String>) -> Result<()> {
-        if self.session == args.session {
-            self.send(json!({"type":"session_info_changed","session":args.session,"name":name}))?;
+    fn extension_worker<'a>(
+        slot: &'a mut Option<Self>,
+        args: &Cli,
+    ) -> Result<Option<&'a mut Self>> {
+        if slot.is_none() {
+            let explicit = args
+                .extensions
+                .iter()
+                .any(|extension| !super::resource_paths::named_extension(extension));
+            if explicit
+                || !super::resources::Resources::load(args)?
+                    .extensions
+                    .is_empty()
+            {
+                *slot = Some(Self::start(args, &["serve"])?);
+            }
+        }
+        Ok(slot.as_mut())
+    }
+
+    pub(super) fn notify_session_name(
+        slot: &mut Option<Self>,
+        args: &Cli,
+        name: Option<String>,
+    ) -> Result<()> {
+        if let Some(active) = Self::extension_worker(slot, args)?
+            && active.session == args.session
+        {
+            active
+                .send(json!({"type":"session_info_changed","session":args.session,"name":name}))?;
         }
         Ok(())
     }
