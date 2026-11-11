@@ -17,6 +17,7 @@ pub(super) struct Accumulator {
     tail: Vec<u8>,
     bytes: u64,
     raw_bytes: u64,
+    preserve_bom: bool,
     display: DisplayTail,
     file: Option<tempfile::NamedTempFile>,
 }
@@ -31,6 +32,17 @@ pub(super) struct Output {
 }
 
 impl Accumulator {
+    pub fn for_user_shell() -> Self {
+        Self {
+            preserve_bom: true,
+            display: DisplayTail {
+                decoder: UTF_8.new_decoder_without_bom_handling(),
+                ..DisplayTail::default()
+            },
+            ..Self::default()
+        }
+    }
+
     pub fn record_raw_bytes(&mut self, count: usize) {
         self.raw_bytes = self.raw_bytes.saturating_add(count as u64);
     }
@@ -86,7 +98,11 @@ impl Accumulator {
             )
         } else {
             let text = String::from_utf8_lossy(&self.head);
-            text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()
+            if self.preserve_bom {
+                text.into_owned()
+            } else {
+                text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()
+            }
         };
         let path = if let Some(mut file) = self.file.take() {
             file.flush()?;

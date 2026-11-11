@@ -974,7 +974,11 @@ impl CodingTool {
             }
         };
         tokio::pin!(deadline);
-        let mut output = crate::shell_output::Accumulator::default();
+        let mut output = if sanitize_user_output {
+            crate::shell_output::Accumulator::for_user_shell()
+        } else {
+            crate::shell_output::Accumulator::default()
+        };
         let mut stdout_open = true;
         let mut stderr_open = true;
         let mut status = None;
@@ -986,7 +990,6 @@ impl CodingTool {
         let mut stdout_text = ShellStream::default();
         let mut stderr_text = ShellStream::default();
         let mut stdout_filter = UserShellFilter::default();
-        let mut stderr_filter = UserShellFilter::default();
         while status.is_none() || stdout_open || stderr_open {
             tokio::select! {
                 _ = cancellation.cancelled(), if !cancelled => {
@@ -1026,7 +1029,7 @@ impl CodingTool {
                     if sanitize_user_output {
                         output.record_raw_bytes(count);
                         let mut clean = String::new();
-                        stderr_text.push(&stderr_chunk[..count], &mut |text| clean.push_str(&stderr_filter.filter(text)));
+                        stdout_text.push(&stderr_chunk[..count], &mut |text| clean.push_str(&stdout_filter.filter(text)));
                         if !clean.is_empty() {
                             progress(&clean);
                             output.append(clean.as_bytes())?;
@@ -1048,17 +1051,12 @@ impl CodingTool {
             input_task.abort();
         }
         if sanitize_user_output {
-            for (stream, filter) in [
-                (&mut stdout_text, &mut stdout_filter),
-                (&mut stderr_text, &mut stderr_filter),
-            ] {
-                let mut remaining = String::new();
-                stream.finish(&mut |text| remaining.push_str(&filter.filter(text)));
-                remaining.push_str(&filter.finish());
-                if !remaining.is_empty() {
-                    progress(&remaining);
-                    output.append(remaining.as_bytes())?;
-                }
+            let mut remaining = String::new();
+            stdout_text.finish(&mut |text| remaining.push_str(&stdout_filter.filter(text)));
+            remaining.push_str(&stdout_filter.finish());
+            if !remaining.is_empty() {
+                progress(&remaining);
+                output.append(remaining.as_bytes())?;
             }
         } else {
             stdout_text.finish(progress);
@@ -1154,13 +1152,28 @@ struct ShellResult {
     elapsed: f64,
 }
 
-#[derive(Default)]
 struct UserShellFilter {
     pending: String,
+    at_start: bool,
+}
+
+impl Default for UserShellFilter {
+    fn default() -> Self {
+        Self {
+            pending: String::new(),
+            at_start: true,
+        }
+    }
 }
 
 impl UserShellFilter {
     fn filter(&mut self, text: &str) -> String {
+        let text = if self.at_start && !text.is_empty() {
+            self.at_start = false;
+            text.strip_prefix('\u{feff}').unwrap_or(text)
+        } else {
+            text
+        };
         static PENDING: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
         let value = format!("{}{text}", self.pending);
         self.pending.clear();
@@ -1501,6 +1514,19 @@ mod tests {
     }
 
     #[test]
+    fn user_shell_stream_removes_only_the_initial_utf8_bom() {
+        let mut stream = ShellStream::default();
+        let mut filter = UserShellFilter::default();
+        let mut text = String::new();
+        for byte in "\u{feff}first\u{feff}second".as_bytes() {
+            stream.push(&[*byte], &mut |part| text.push_str(&filter.filter(part)));
+        }
+        stream.finish(&mut |part| text.push_str(&filter.filter(part)));
+        text.push_str(&filter.finish());
+        assert_eq!(text, "first\u{feff}second");
+    }
+
+    #[test]
     fn user_shell_filter_handles_fragmented_escape_sequences() {
         let mut filter = UserShellFilter::default();
         let output = [
@@ -1569,6 +1595,25 @@ mod tests {
             let path = result.full_output_path.unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
             std::fs::remove_file(path).unwrap();
+        }
+        if !cfg!(windows) {
+            for (command, expected) in [
+                ("printf '\\357\\273\\277first'", "first"),
+                ("printf '\\000\\357\\273\\277second'", "\u{feff}second"),
+            ] {
+                let mut streamed = String::new();
+                let result = tools
+                    .execute_shell(
+                        command,
+                        None,
+                        &pi_rs::CancellationToken::new(),
+                        &mut |part| streamed.push_str(part),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(streamed, expected);
+                assert_eq!(result.output, expected);
+            }
         }
         for command in ["", "  "] {
             let result = tools
