@@ -3490,7 +3490,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 dialog.set_error(error.to_string());
                                 view.local_editor = Some((editor, dialog));
                             } else if matches!(editor, LocalEditor::Setting(_)) {
-                                let items = settings_items(&args, &view);
+                                let items = settings_items(&args, &view, worker.as_ref());
                                 if let Some(picker) = &mut view.picker {
                                     picker.refresh_settings(items);
                                 }
@@ -3585,7 +3585,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             let result =
                                 select(selection, &mut args, &mut view, &mut theme, &mut worker);
                             if settings {
-                                picker.refresh_settings(settings_items(&args, &view));
+                                picker.refresh_settings(settings_items(
+                                    &args,
+                                    &view,
+                                    worker.as_ref(),
+                                ));
                                 if let Err(error) = result {
                                     picker.show_feedback(Err(error.to_string()));
                                 }
@@ -3859,8 +3863,10 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
                         } else if input.trim() == "/settings" {
-                            view.picker =
-                                Some(Picker::new("Settings", settings_items(&args, &view)));
+                            view.picker = Some(Picker::new(
+                                "Settings",
+                                settings_items(&args, &view, worker.as_ref()),
+                            ));
                         } else if input.starts_with('!') {
                             let excluded = input.starts_with("!!");
                             let command = input[if excluded { 2 } else { 1 }..].trim();
@@ -4345,12 +4351,34 @@ fn start_tree_navigation(
     Ok(())
 }
 
-fn settings_items(args: &Cli, view: &View) -> Vec<Item> {
+fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
     let cache_mode = args.settings.string("cacheWarming").unwrap_or("streaming");
     let next_cache_mode = match cache_mode {
         "streaming" => "idle",
         "idle" => "off",
         _ => "streaming",
+    };
+    let queue_setting = |key: &str, label: &str, kind: pi_rs::InputKind| {
+        let current = worker
+            .and_then(|worker| worker.queue_mode(args, kind))
+            .or_else(|| super::process::session_queue_mode(args, kind).ok())
+            .unwrap_or_default();
+        let mode = if current == pi_rs::QueueMode::All {
+            "all"
+        } else {
+            "one-at-a-time"
+        };
+        Item {
+            label: format!("{label} · {mode}"),
+            selection: Selection::Setting(
+                key.into(),
+                json!(if mode == "all" {
+                    "one-at-a-time"
+                } else {
+                    "all"
+                }),
+            ),
+        }
     };
     let mut items = vec![
         Item {
@@ -4373,6 +4401,8 @@ fn settings_items(args: &Cli, view: &View) -> Vec<Item> {
                 }),
             ),
         },
+        queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
+        queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
         Item {
             label: format!(
                 "Tool output · {} (toggle)",
@@ -4651,8 +4681,6 @@ fn settings_items(args: &Cli, view: &View) -> Vec<Item> {
         "defaultModel",
         "defaultThinkingLevel",
         "modelThinkingLevels",
-        "steeringMode",
-        "followUpMode",
         "tuiMode",
         "fullscreenWheelScrollLines",
         "sessionDir",
@@ -4855,6 +4883,26 @@ fn select(
                     args,
                     json!({"type":"set_auto_compaction","enabled":enabled}),
                 )?;
+            } else if key == "steeringMode" || key == "followUpMode" {
+                let mode: pi_rs::QueueMode = serde_json::from_value(value.clone())?;
+                let kind = if key == "steeringMode" {
+                    pi_rs::InputKind::Steer
+                } else {
+                    pi_rs::InputKind::FollowUp
+                };
+                Worker::queue_mode_control(
+                    worker,
+                    args,
+                    json!({"type":"set_queue_mode", "kind":kind, "mode":mode}),
+                )?;
+                args.settings.set_user(&key, value.clone())?;
+                if let Some(active) = worker {
+                    if kind == pi_rs::InputKind::Steer {
+                        active.steering_mode = mode;
+                    } else {
+                        active.follow_up_mode = mode;
+                    }
+                }
             } else if let Some(member) = key.strip_prefix("terminal.") {
                 args.settings
                     .set_user_member("terminal", member, value.clone())?;

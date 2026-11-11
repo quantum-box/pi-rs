@@ -28,6 +28,9 @@ The `/settings` list remains open after a change, preserving its search and
 selected item so several values can be changed in succession. Enter activates
 the selected setting; Space also activates it when the search is empty. Closing
 or saving a JSON editor returns to the list, and Escape closes the list.
+Steering and follow-up delivery modes can be changed from this list even while
+the model is streaming; the active session and the global defaults both update.
+The list shows the session's selected mode when reopening an existing branch.
 
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |

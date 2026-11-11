@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs::File;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -40,6 +40,48 @@ fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
 fn settings_stays_open_after_changes_and_editor_cancel() {
     for mode in ["regular", "fullscreen"] {
         let root = tempfile::tempdir().unwrap();
+        let session_path = root.path().join("session.jsonl");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let (finish, finished) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut socket = loop {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut method = String::new();
+                let mut size = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if method.is_empty() {
+                        method = line.clone();
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                if method.starts_with("GET ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                let mut body = vec![0; size];
+                reader.read_exact(&mut body).unwrap();
+                break socket;
+            };
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"live-stream-marker\"},\"finish_reason\":null}]}\n\n").unwrap();
+            socket.flush().unwrap();
+            let _ = finished.recv_timeout(Duration::from_secs(30));
+            let _ = socket.write_all(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+        });
         let mut master_fd = -1;
         let mut slave_fd = -1;
         let mut size = libc::winsize {
@@ -72,9 +114,15 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
                 .args([
                     "--workspace",
                     root.path().to_str().unwrap(),
+                    "--session",
+                    session_path.to_str().unwrap(),
                     "--no-trust",
                     "--no-mcp",
                     "--offline",
+                    "--model",
+                    "test-fixture",
+                    "--endpoint",
+                    &endpoint,
                     "--tui-mode",
                     mode,
                 ])
@@ -87,6 +135,8 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
                 .unwrap(),
         );
         output_until(&mut master, |text| text.contains("Enter to send"));
+        master.write_all(b"hello\r").unwrap();
+        output_until(&mut master, |text| text.contains("live-stream-marker"));
         master.write_all(b"/settings\r").unwrap();
         output_until(&mut master, |text| text.contains("HTTP idle timeout"));
         master.write_all(b" ").unwrap();
@@ -97,6 +147,24 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         output_until(&mut master, |text| {
             text.contains("HTTP idle timeout") && text.contains("30 sec")
         });
+        master.write_all(b"\x1b[B\r").unwrap();
+        output_until(&mut master, |text| text.contains("Steering mode · all"));
+        master.write_all(b"\x1b[B\r").unwrap();
+        output_until(&mut master, |text| text.contains("Follow-up mode · all"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(session) = pi_rs::Session::snapshot(&session_path)
+                && session.queue_mode(pi_rs::InputKind::Steer) == pi_rs::QueueMode::All
+                && session.queue_mode(pi_rs::InputKind::FollowUp) == pi_rs::QueueMode::All
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "queue mode changes were not applied to the session"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         master.write_all(b"Edit shellPath\r").unwrap();
         output_until(&mut master, |text| text.contains("Edit shellPath as JSON"));
         master.write_all(b"\x1b").unwrap();
@@ -113,7 +181,11 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
                 .unwrap();
         assert_eq!(settings["httpIdleTimeoutMs"], 30_000);
+        assert_eq!(settings["steeringMode"], "all");
+        assert_eq!(settings["followUpMode"], "all");
         assert_eq!(settings["shellPath"], "");
+        finish.send(()).unwrap();
+        server.join().unwrap();
         master.write_all(b"\x1b/quit\r").unwrap();
     }
 }

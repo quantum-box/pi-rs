@@ -47,8 +47,8 @@ impl Worker {
         operation: &[&str],
         transition: Option<(SessionStartReason, Option<std::path::PathBuf>)>,
     ) -> Result<Self> {
-        let steering_mode = super::backend::configured_queue_mode(args, "steeringMode")?;
-        let follow_up_mode = super::backend::configured_queue_mode(args, "followUpMode")?;
+        let steering_mode = session_queue_mode(args, pi_rs::InputKind::Steer)?;
+        let follow_up_mode = session_queue_mode(args, pi_rs::InputKind::FollowUp)?;
         let mut command = Command::new(std::env::current_exe()?);
         command.env_remove("PI_RS_MODEL_TOKEN");
         command.env_remove(SESSION_TRANSITION_ENV);
@@ -265,6 +265,19 @@ impl Worker {
         }
         slot.as_mut().expect("queue worker").send(request)
     }
+    pub(super) fn queue_mode_control(
+        slot: &mut Option<Self>,
+        args: &Cli,
+        request: Value,
+    ) -> Result<()> {
+        if let Some(active) = slot.as_mut()
+            && (active.busy || active.bashing)
+            && active.session == args.session
+        {
+            return active.send(request);
+        }
+        Self::control(slot, args, request)
+    }
     pub(super) fn start_bash(slot: &mut Option<Self>, args: &Cli, request: Value) -> Result<()> {
         if slot.as_ref().is_some_and(|worker| worker.bashing) {
             return Err(Error::Config("a shell command is already running".into()));
@@ -275,6 +288,17 @@ impl Worker {
     }
     pub(super) fn matches(&self, args: &Cli) -> bool {
         self.persistent && self.configuration == configuration(args)
+    }
+    pub(super) fn queue_mode(
+        &self,
+        args: &Cli,
+        kind: pi_rs::InputKind,
+    ) -> Option<pi_rs::QueueMode> {
+        (self.session == args.session).then_some(if kind == pi_rs::InputKind::Steer {
+            self.steering_mode
+        } else {
+            self.follow_up_mode
+        })
     }
     pub(super) fn drain_events(&mut self) -> Vec<Value> {
         let mut events = std::mem::take(&mut self.pending_events);
@@ -407,6 +431,23 @@ impl Worker {
         Ok(())
     }
 }
+
+pub(super) fn session_queue_mode(args: &Cli, kind: pi_rs::InputKind) -> Result<pi_rs::QueueMode> {
+    if !args.no_session && !args.ephemeral_worker_session
+        && let Ok(session) = pi_rs::Session::snapshot(&args.session)
+        && session.branch().iter().any(|record| matches!(record.event, pi_rs::Event::QueueModeSelected { kind: selected, .. } if selected == kind))
+    {
+        return Ok(session.queue_mode(kind));
+    }
+    super::backend::configured_queue_mode(
+        args,
+        if kind == pi_rs::InputKind::Steer {
+            "steeringMode"
+        } else {
+            "followUpMode"
+        },
+    )
+}
 fn prepare_images(args: &Cli, request: &mut Value) -> Result<()> {
     let Some(profile) = args.model_image_resize() else {
         return Ok(());
@@ -471,5 +512,28 @@ impl Drop for Worker {
         for reader in self.readers.drain(..) {
             let _ = reader.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    #[test]
+    fn queue_mode_uses_current_branch_even_when_session_is_locked() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = root.path().join("session.jsonl");
+        let mut session = pi_rs::Session::open(&args.session).unwrap();
+        session
+            .set_queue_mode(pi_rs::InputKind::Steer, pi_rs::QueueMode::All)
+            .unwrap();
+        assert_eq!(
+            super::session_queue_mode(&args, pi_rs::InputKind::Steer).unwrap(),
+            pi_rs::QueueMode::All
+        );
+        assert_eq!(
+            super::session_queue_mode(&args, pi_rs::InputKind::FollowUp).unwrap(),
+            pi_rs::QueueMode::OneAtATime
+        );
     }
 }
