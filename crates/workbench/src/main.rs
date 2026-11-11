@@ -1152,6 +1152,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         return rpc::run(args);
     }
     let mut follow_up_prompts = Vec::new();
+    let mut skip_initial_prompt = false;
     if args.command.is_none() {
         let interactive = !args.print
             && args.mode.is_none()
@@ -1186,29 +1187,24 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 prompt.insert_str(0, input);
             }
         }
-        if !prompt.trim().is_empty()
-            || !args.initial_images.is_empty()
-            || !follow_up_prompts.is_empty()
-        {
-            if interactive {
+        if interactive {
+            if !prompt.is_empty()
+                || !args.initial_images.is_empty()
+                || !follow_up_prompts.is_empty()
+            {
                 if !prompt.is_empty() || !args.initial_images.is_empty() {
                     args.initial_prompt = Some(prompt);
                 }
                 args.command = Some(Command::Interactive);
-            } else {
-                args.command = Some(Command::Run { prompt });
-                if args.mode.is_none() {
-                    args.mode = Some(OutputMode::Text);
-                }
             }
-        } else if args.print {
-            return Err(Error::Config(
-                "print mode requires a prompt or piped input".into(),
-            ));
+        } else {
+            skip_initial_prompt = prompt.is_empty() && args.initial_images.is_empty();
+            args.command = Some(Command::Run { prompt });
+            args.mode.get_or_insert(OutputMode::Text);
         }
     }
     TEXT_OUTPUT.store(
-        args.print || args.mode == Some(OutputMode::Text),
+        args.mode == Some(OutputMode::Text) || (args.print && args.mode != Some(OutputMode::Json)),
         Ordering::Relaxed,
     );
     let command = args.command.take().unwrap_or(Command::Interactive);
@@ -1519,7 +1515,6 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     };
     let mut initial_images = args.initial_images.clone();
     let mut last_answer = None;
-    let has_follow_up = !follow_up_prompts.is_empty();
     let inputs = std::iter::once(input).chain(follow_up_prompts.into_iter().map(Some));
     for (index, mut input) in inputs.enumerate() {
         let mut images = std::mem::take(&mut initial_images);
@@ -1540,7 +1535,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             observe(event, args.trace);
         };
         if let Some(prompt) = &mut input {
-            if index == 0 && has_follow_up && prompt.is_empty() && images.is_empty() {
+            if index == 0 && skip_initial_prompt {
                 continue;
             }
             if images.is_empty() && agent.try_extension_command(&mut session, prompt, &mut observer)? {
@@ -1604,6 +1599,22 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     if let Some((answer, truncated)) = last_answer {
         output(json!({"type":"answer","content":answer}));
         *output_truncated = truncated;
+    } else if skip_initial_prompt && TEXT_OUTPUT.load(Ordering::Relaxed) {
+        let (messages, _) = rpc_messages::snapshot(&session);
+        if let Some(message) = messages.last().filter(|message| message["role"] == "assistant") {
+            let reason = message["stopReason"].as_str().unwrap_or_default();
+            if matches!(reason, "error" | "aborted") {
+                let detail = message["errorMessage"].as_str().filter(|text| !text.is_empty())
+                    .map_or_else(|| format!("Request {reason}"), str::to_owned);
+                return Err(Error::Model(detail));
+            }
+            if let Some(blocks) = message["content"].as_array() {
+                for block in blocks.iter().filter(|block| block["type"] == "text") {
+                    output(json!({"type":"answer","content":block["text"]}));
+                }
+            }
+            *output_truncated = reason == "length";
+        }
     }
     Ok(())
     }.await;
