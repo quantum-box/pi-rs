@@ -93,6 +93,9 @@ path is also available via `get_state` after the transition.
 `get_state` and `get_session_stats` omit the session file unless the request
 sets `includeNative: true` to inspect the temporary journal.
 
+Each accepted RPC `set_session_name` request appends a session-info entry and
+emits `session_info_changed`, including when the normalized name is repeated.
+
 The message snapshot preserves imported Pi roles, timestamps, and extension
 message details. Context edits replace the affected content in the snapshot.
 Imported Gemini conversations carry signed text, thought, and function parts

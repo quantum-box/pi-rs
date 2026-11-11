@@ -740,13 +740,11 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .ok_or_else(|| Error::Config("name is required".into()))?;
             let name = sessions::validate_name(name).map_err(Error::Config)?;
             let mut session = Session::open(&args.session)?;
-            if session.name() != Some(name.as_str()) {
-                session.set_name(&name)?;
-                drop(session);
-                emit(json!({"type":"session_info_changed","name":name}))?;
-                if let Some(active) = worker {
-                    active.notify_session_name(args, Some(name))?;
-                }
+            session.set_name(&name)?;
+            drop(session);
+            emit(json!({"type":"session_info_changed","name":name}))?;
+            if let Some(active) = worker {
+                active.notify_session_name(args, Some(name))?;
             }
             Ok(None)
         }
@@ -1342,6 +1340,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Session::snapshot(&path).unwrap().name(), Some("設計"));
+        let before_repeat = Session::snapshot(&path).unwrap().records().len();
+        command(
+            &json!({"type":"set_session_name", "name":"設計"}),
+            &mut args,
+            &mut worker,
+        )
+        .unwrap();
+        let snapshot = Session::snapshot(&path).unwrap();
+        assert_eq!(snapshot.records().len(), before_repeat + 1);
+        assert_eq!(snapshot.name(), Some("設計"));
     }
 
     #[test]
