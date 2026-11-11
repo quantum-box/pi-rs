@@ -122,6 +122,21 @@ impl Ollama {
         })
     }
 
+    /// Set the per-read HTTP idle timeout; `None` disables it.
+    pub fn with_http_idle_timeout(mut self, timeout: Option<Duration>) -> Result<Self> {
+        let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(10));
+        if let Some(timeout) = timeout {
+            builder = builder.read_timeout(timeout);
+        }
+        self.client = builder
+            .build()
+            .map_err(|_| Error::Config("could not build model HTTP client".into()))?;
+        Ok(self)
+    }
+
     /// Add request defaults while preserving explicitly configured headers.
     pub fn with_default_headers(mut self, headers: &HeaderMap) -> Self {
         for (name, value) in headers {
@@ -568,7 +583,7 @@ impl Model for Ollama {
         let mut poll = tokio::time::interval(Duration::from_secs(1));
         let response = loop {
             tokio::select! {
-                result = &mut response => break result.map_err(|_| Error::RetryableModel("HTTP connection failed".into()))?,
+                result = &mut response => break result.map_err(|error| Error::RetryableModel(if error.is_timeout() && !error.is_connect() { "HTTP idle timeout" } else { "HTTP connection failed" }.into()))?,
                 _ = poll.tick(), if monitor_loading => {
                     if let Some(loaded) = self.model_loaded(&requested_model).await {
                         report_progress(&self.progress, &mut last_progress, if loaded {
@@ -606,7 +621,7 @@ impl Model for Ollama {
         Ok(Box::pin(async_stream::try_stream! {
             let mut bytes = 0usize;
             let mut events = response.bytes_stream().map(move |chunk| {
-                let chunk = chunk.map_err(|_| Error::Model("broken HTTP stream".into()))?;
+                let chunk = chunk.map_err(|error| Error::RetryableModel(if error.is_timeout() && !error.is_connect() { "HTTP idle timeout" } else { "broken HTTP stream" }.into()))?;
                 bytes = bytes.saturating_add(chunk.len());
                 if bytes > 4 * 1024 * 1024 {
                     return Err(Error::Model("model stream exceeds size limit".into()));
@@ -636,7 +651,10 @@ impl Model for Ollama {
                     }
                 };
                 let Some(event) = event else { break; };
-                let event = event.map_err(|_| Error::RetryableModel("broken SSE stream".into()))?;
+                let event = event.map_err(|error| match error {
+                    eventsource_stream::EventStreamError::Transport(error) => error,
+                    _ => Error::RetryableModel("broken SSE stream".into()),
+                })?;
                 if event.data == "[DONE]" {
                     if infer_finish && !matches!(metadata.finish_reason.as_deref(), Some("length" | "content_filter")) {
                         metadata.finish_reason = Some(if calls.is_empty() { "stop" } else { "tool_calls" }.into());

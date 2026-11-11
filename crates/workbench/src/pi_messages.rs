@@ -232,6 +232,22 @@ impl PiMessages {
             })
     }
 
+    pub(super) fn with_http_idle_timeout(
+        mut self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Self> {
+        let mut builder = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(timeout) = timeout {
+            builder = builder.read_timeout(timeout);
+        }
+        self.client = builder
+            .build()
+            .map_err(|_| Error::Config("Could not initialize the Pi Messages client".into()))?;
+        Ok(self)
+    }
+
     pub(super) fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -456,7 +472,9 @@ impl Model for PiMessages {
             .send()
             .await
             .map_err(|error| {
-                if error.is_connect() || error.is_timeout() {
+                if error.is_timeout() && !error.is_connect() {
+                    Error::RetryableModel("HTTP idle timeout".into())
+                } else if error.is_connect() {
                     Error::RetryableModel("Pi Messages connection failed".into())
                 } else {
                     Error::Model("Pi Messages request failed".into())
@@ -491,7 +509,10 @@ impl Model for PiMessages {
                 }
             };
             while let Some(event) = events.next().await {
-                let event = event.map_err(|_| Error::RetryableModel("Pi Messages event stream broke".into()))?;
+                let event = event.map_err(|error| match error {
+                    eventsource_stream::EventStreamError::Transport(error) if error.is_timeout() => Error::RetryableModel("HTTP idle timeout".into()),
+                    _ => Error::RetryableModel("Pi Messages event stream broke".into()),
+                })?;
                 size = size.saturating_add(event.data.len());
                 if size > MAX_STREAM {
                     Err(Error::Model("Pi Messages stream exceeds 32 MiB".into()))?;

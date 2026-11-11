@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use pi_rs::{
     Agent, CancellationToken, Limits, MemoryStore, Notification, Registry, Session, ollama::Ollama,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[test]
 fn rpc_correlates_commands_and_rejects_unknown_commands() {
@@ -916,4 +916,192 @@ fn export_flag_replaces_html_and_preserves_source() {
     );
     assert!(!export(Some(&input)).status.success());
     assert_eq!(std::fs::read(input).unwrap(), before);
+}
+
+#[test]
+fn http_idle_timeout_resets_on_data_and_can_be_disabled() {
+    for (setting, intervals, header_delay, succeeds) in [
+        (json!(500), vec![150, 150, 150, 150, 150, 150], 0, true),
+        (json!(500), vec![900], 0, false),
+        (json!(500), vec![], 900, false),
+        (json!("disabled"), vec![900], 0, true),
+    ] {
+        let scenario = format!("{setting} {intervals:?} header={header_delay}");
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"httpIdleTimeoutMs":setting,"retry":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let mut socket = loop {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut size = 0;
+                let mut method = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if method.is_empty() {
+                        method = line.clone();
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                if method.starts_with("GET ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                let mut request = vec![0; size];
+                reader.read_exact(&mut request).unwrap();
+                break socket;
+            };
+            std::thread::sleep(Duration::from_millis(header_delay));
+            if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").is_err() { return; }
+            let send = |socket: &mut std::net::TcpStream, text: &str, finish: Option<&str>| {
+                let event = json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":finish}]});
+                write!(socket, "data: {event}\n\n").and_then(|()| socket.flush())
+            };
+            if send(&mut socket, "a", None).is_err() {
+                return;
+            }
+            for interval in intervals {
+                std::thread::sleep(Duration::from_millis(interval));
+                if send(&mut socket, "b", None).is_err() {
+                    return;
+                }
+            }
+            if send(&mut socket, "", Some("stop")).is_ok() {
+                let _ = socket.write_all(b"data: [DONE]\n\n");
+            }
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "test-fixture",
+                "--endpoint",
+                &endpoint,
+                "--model-timeout-secs",
+                "4",
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{scenario}: stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if succeeds {
+            assert!(String::from_utf8_lossy(&output.stdout).starts_with("ab"));
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("HTTP idle timeout"));
+        }
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn http_idle_timeout_applies_to_native_provider_streams() {
+    for (provider, endpoint_path) in [
+        ("anthropic", "/v1/messages"),
+        ("google", "/v1beta"),
+        ("radius", "/v1/messages"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"httpIdleTimeoutMs":300,"retry":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}{}", listener.local_addr().unwrap(), endpoint_path);
+        let server = std::thread::spawn(move || {
+            loop {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut size = 0;
+                let mut method = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if method.is_empty() {
+                        method = line.clone();
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                if method.starts_with("GET ") {
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                let mut request = vec![0; size];
+                reader.read_exact(&mut request).unwrap();
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: heartbeat\n\n");
+                let _ = socket.flush();
+                std::thread::sleep(Duration::from_millis(650));
+                break;
+            }
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--offline",
+                "--provider",
+                provider,
+                "--model",
+                "fixture-model",
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--model-timeout-secs",
+                "4",
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("HTTP idle timeout"),
+            "{provider}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
 }

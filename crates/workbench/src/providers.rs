@@ -420,6 +420,7 @@ impl Client {
         let thinking = args.provider_thinking();
         Ok(match self {
             Self::Ollama(client) => {
+                let client = client.with_http_idle_timeout(args.settings.http_idle_timeout())?;
                 let configured = args.model_profiles.model(&args.provider, &args.model);
                 let retention = args
                     .model_profiles
@@ -455,6 +456,7 @@ impl Client {
                 Self::Ollama(client.with_sampling(sampling)?)
             }
             Self::Anthropic(client) => {
+                let client = client.with_http_idle_timeout(args.settings.http_idle_timeout())?;
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
                 let (supports_long, cache_tools) = args
                     .model_profiles
@@ -488,8 +490,16 @@ impl Client {
                 }
                 Self::Anthropic(client)
             }
-            Self::Google(client) => Self::Google(client.with_thinking(thinking)),
-            Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
+            Self::Google(client) => Self::Google(
+                client
+                    .with_http_idle_timeout(args.settings.http_idle_timeout())?
+                    .with_thinking(thinking),
+            ),
+            Self::PiMessages(client) => Self::PiMessages(
+                client
+                    .with_http_idle_timeout(args.settings.http_idle_timeout())?
+                    .with_thinking(thinking),
+            ),
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));
                 Self::Deferred(client)

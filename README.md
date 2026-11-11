@@ -41,6 +41,12 @@ to start without tools. `--no-builtin-tools` retains extension tools. The
 current RPC commands are documented in
 [the parity checklist](docs/native-parity.md).
 
+The model connection has a five-minute HTTP idle timeout by default; receiving
+data resets it. Use `/settings` to change it, or set `httpIdleTimeoutMs` in
+`settings.json` to a number of milliseconds or `"disabled"`. For example,
+`{"httpIdleTimeoutMs":"disabled"}` removes the HTTP idle deadline.
+`--model-timeout-secs` separately sets a deadline for the complete operation.
+
 ## Native extensions
 
 The terminal enables notes and a TODO checklist, alongside plan mode and branch

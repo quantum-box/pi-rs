@@ -267,7 +267,8 @@ struct Cli {
     max_output_tokens: u32,
     #[arg(long, default_value_t = 8192, global = true)]
     output_budget: u32,
-    #[arg(long, default_value_t = 120, global = true)]
+    /// Bound a complete model operation in seconds.
+    #[arg(long, default_value_t = 2_147_483, global = true)]
     model_timeout_secs: u64,
     /// Bound tool calls in seconds. Unset permits long-running local operations.
     #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(0..=2_147_483))]

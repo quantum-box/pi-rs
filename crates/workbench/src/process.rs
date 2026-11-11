@@ -446,7 +446,7 @@ fn configuration(args: &Cli) -> Value {
         "no_context_files":args.no_context_files,"no_mcp":args.no_mcp,"prompt_templates":args.prompt_template,
         "coding_tools":args.coding_tools,"requests":args.max_requests,"output_tokens":args.max_output_tokens,
         "output_budget":args.output_budget,"context_window":args.context_window,
-        "model_timeout":args.model_timeout_secs,"tool_timeout":args.tool_timeout_secs
+        "model_timeout":args.model_timeout_secs,"http_idle_timeout":args.settings.http_idle_timeout_ms(),"tool_timeout":args.tool_timeout_secs
     })
 }
 

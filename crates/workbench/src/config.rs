@@ -48,6 +48,20 @@ impl Settings {
     pub fn boolean(&self, key: &str) -> Option<bool> {
         self.value.get(key)?.as_bool()
     }
+    pub fn http_idle_timeout_ms(&self) -> u64 {
+        match self.value.get("httpIdleTimeoutMs") {
+            Some(Value::String(value)) if value == "disabled" => 0,
+            Some(Value::Number(value)) => value
+                .as_f64()
+                .unwrap_or(300_000.0)
+                .clamp(0.0, 2_147_483_647.0) as u64,
+            _ => 300_000,
+        }
+    }
+    pub fn http_idle_timeout(&self) -> Option<std::time::Duration> {
+        let value = self.http_idle_timeout_ms();
+        (value > 0).then(|| std::time::Duration::from_millis(value))
+    }
     pub fn strings(&self, key: &str) -> Vec<String> {
         self.value
             .get(key)
@@ -398,6 +412,24 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_idle_timeout_has_pi_defaults_and_supports_disabling() {
+        let mut settings = super::Settings::default();
+        assert_eq!(settings.http_idle_timeout_ms(), 300_000);
+        settings.value = serde_json::json!({"httpIdleTimeoutMs": 42.9});
+        assert_eq!(settings.http_idle_timeout_ms(), 42);
+        settings.value = serde_json::json!({"httpIdleTimeoutMs": "disabled"});
+        assert!(settings.http_idle_timeout().is_none());
+        settings.value = serde_json::json!({"httpIdleTimeoutMs": 0});
+        assert!(settings.http_idle_timeout().is_none());
+        assert!(
+            super::validate_settings(
+                &serde_json::json!({"httpIdleTimeoutMs": -1}),
+                std::path::Path::new("settings.json")
+            )
+            .is_err()
+        );
+    }
     use super::*;
     use serde_json::json;
     #[test]

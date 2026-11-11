@@ -406,15 +406,17 @@ pub(super) struct Operations {
 
 impl Operations {
     pub fn new(args: &Cli) -> Result<Self> {
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(args.model_timeout_secs));
+        if let Some(timeout) = args.settings.http_idle_timeout() {
+            builder = builder.read_timeout(timeout);
+        }
         Ok(Self {
             args: args.clone(),
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(args.model_timeout_secs))
-                .build()
-                .map_err(|_| {
-                    Error::Config("could not initialize model operation HTTP client".into())
-                })?,
+            client: builder.build().map_err(|_| {
+                Error::Config("could not initialize model operation HTTP client".into())
+            })?,
         })
     }
 }

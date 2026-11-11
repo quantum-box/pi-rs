@@ -136,6 +136,21 @@ impl Anthropic {
         })
     }
 
+    /// Set the per-read HTTP idle timeout; `None` disables it.
+    pub fn with_http_idle_timeout(mut self, timeout: Option<Duration>) -> Result<Self> {
+        let mut builder = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10));
+        if let Some(timeout) = timeout {
+            builder = builder.read_timeout(timeout);
+        }
+        self.client = builder
+            .build()
+            .map_err(|_| Error::Config("could not build Anthropic HTTP client".into()))?;
+        Ok(self)
+    }
+
     /// Isolate opaque reasoning blocks when another service uses the Messages protocol.
     pub fn with_provider(mut self, provider: &str, replay_scope: impl Into<Arc<str>>) -> Self {
         self.provider = Arc::from(provider);
@@ -363,10 +378,16 @@ fn decode_model(model: &Value) -> Option<CatalogEntry> {
 }
 
 async fn send(request: reqwest::RequestBuilder) -> Result<Response> {
-    let response = request
-        .send()
-        .await
-        .map_err(|_| Error::RetryableModel("Anthropic HTTP connection failed".into()))?;
+    let response = request.send().await.map_err(|error| {
+        Error::RetryableModel(
+            if error.is_timeout() && !error.is_connect() {
+                "HTTP idle timeout"
+            } else {
+                "Anthropic HTTP connection failed"
+            }
+            .into(),
+        )
+    })?;
     let status = response.status();
     if status.is_success() {
         Ok(response)
@@ -792,7 +813,7 @@ impl Model for Anthropic {
         Ok(Box::pin(async_stream::try_stream! {
             let mut size = 0_usize;
             let mut events = response.bytes_stream().map(move |chunk| {
-                let chunk = chunk.map_err(|_| Error::RetryableModel("broken Anthropic HTTP stream".into()))?;
+                let chunk = chunk.map_err(|error| Error::RetryableModel(if error.is_timeout() && !error.is_connect() { "HTTP idle timeout" } else { "broken Anthropic HTTP stream" }.into()))?;
                 size = size.saturating_add(chunk.len());
                 if size > MAX_RESPONSE_BYTES {
                     return Err(Error::Model("Anthropic stream exceeds size limit".into()));

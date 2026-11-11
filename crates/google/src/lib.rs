@@ -96,6 +96,21 @@ impl Google {
         })
     }
 
+    /// Set the per-read HTTP idle timeout; `None` disables it.
+    pub fn with_http_idle_timeout(mut self, timeout: Option<Duration>) -> Result<Self> {
+        let mut builder = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10));
+        if let Some(timeout) = timeout {
+            builder = builder.read_timeout(timeout);
+        }
+        self.client = builder
+            .build()
+            .map_err(|_| Error::Config("could not build Google Gemini HTTP client".into()))?;
+        Ok(self)
+    }
+
     /// Bind signed Gemini parts to a named provider and its model route.
     pub fn with_provider(mut self, provider: &str, replay_scope: impl Into<Arc<str>>) -> Self {
         self.provider = Arc::from(provider);
@@ -596,7 +611,16 @@ impl Model for Google {
             .json(&body)
             .send()
             .await
-            .map_err(|_| Error::RetryableModel("Google Gemini request failed".into()))?;
+            .map_err(|error| {
+                Error::RetryableModel(
+                    if error.is_timeout() && !error.is_connect() {
+                        "HTTP idle timeout"
+                    } else {
+                        "Google Gemini request failed"
+                    }
+                    .into(),
+                )
+            })?;
         let response = check_status(response)?;
         let progress = self.progress.clone();
         let observe_reasoning = self.reasoning.clone();
@@ -616,7 +640,10 @@ impl Model for Google {
             let mut usage = None;
             let mut finish = None;
             while let Some(event) = stream.next().await {
-                let event = event.map_err(|_| Error::RetryableModel("Google Gemini stream interrupted".into()))?;
+                let event = event.map_err(|error| match error {
+                    eventsource_stream::EventStreamError::Transport(error) if error.is_timeout() => Error::RetryableModel("HTTP idle timeout".into()),
+                    _ => Error::RetryableModel("Google Gemini stream interrupted".into()),
+                })?;
                 total_bytes = total_bytes.saturating_add(event.data.len());
                 if total_bytes > MAX_RESPONSE_BYTES {
                     Err(Error::Model("Google Gemini response exceeds size limit".into()))?;

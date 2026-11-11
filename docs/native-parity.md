@@ -19,6 +19,11 @@ Invalid `--thinking` values produce a warning and leave the previous valid
 selection or configured default in place. Repeated values use the last valid
 selection, including when an invalid value follows it.
 
+`httpIdleTimeoutMs` defaults to five minutes and applies to model HTTP response
+headers and individual body reads; `0` or `"disabled"` disables this idle
+deadline. `/settings` can change it. The separate `--model-timeout-secs` bounds
+the entire model operation and defaults to 2,147,483 seconds.
+
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |

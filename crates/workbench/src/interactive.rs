@@ -3857,6 +3857,26 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             let mut items = vec![
                                 Item {
                                     label: format!(
+                                        "HTTP idle timeout · {}",
+                                        match args.settings.http_idle_timeout_ms() {
+                                            0 => "disabled".to_owned(),
+                                            ms => format!("{} sec", ms as f64 / 1000.0),
+                                        }
+                                    ),
+                                    selection: Selection::Setting(
+                                        "httpIdleTimeoutMs".into(),
+                                        json!(match args.settings.http_idle_timeout_ms() {
+                                            0 => 30_000,
+                                            1..=29_999 => 30_000,
+                                            30_000..=59_999 => 60_000,
+                                            60_000..=119_999 => 120_000,
+                                            120_000..=299_999 => 300_000,
+                                            _ => 0,
+                                        }),
+                                    ),
+                                },
+                                Item {
+                                    label: format!(
                                         "Tool output · {} (toggle)",
                                         if view.expand_tools {
                                             "expanded"
