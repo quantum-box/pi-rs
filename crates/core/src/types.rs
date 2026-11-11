@@ -92,6 +92,11 @@ pub enum AgentInput {
         mode: QueueMode,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// Persist a display name through the session owner during an active run.
+    SetSessionName {
+        name: String,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
 impl<T: Into<QueuedMessage>> From<T> for AgentInput {
     fn from(message: T) -> Self {

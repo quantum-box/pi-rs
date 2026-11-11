@@ -2858,6 +2858,19 @@ fn queue_input(
             }
             return reply_to_control(result, reply);
         }
+        AgentInput::SetSessionName { name, reply } => {
+            let name = crate::sanitize_session_name(&name);
+            if name.is_empty() {
+                let _ = reply.send(Err(Error::Config("Session name cannot be empty".into())));
+                return Ok(());
+            }
+            let count = session.records().len();
+            let result = session.set_name(&name);
+            for record in &session.records()[count..] {
+                observer(Notification::Committed(record));
+            }
+            return reply_to_control(result, reply);
+        }
     };
     queue_message(session, input, observer)
 }
@@ -3230,6 +3243,19 @@ mod queue_tests {
             }
             let (reply, result) = oneshot::channel();
             sender
+                .send(AgentInput::SetSessionName {
+                    name: "  active session  ".into(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), result)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let (reply, result) = oneshot::channel();
+            sender
                 .send(AgentInput::SetQueueMode {
                     kind: InputKind::FollowUp,
                     mode: crate::QueueMode::OneAtATime,
@@ -3271,6 +3297,7 @@ mod queue_tests {
             driver
         );
         assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(session.name(), Some("active session"));
         let receipts = session
             .records()
             .iter()
