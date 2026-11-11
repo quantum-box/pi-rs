@@ -582,6 +582,9 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             let (entry_id, position, target, text) = if name == "fork" {
                 let invalid = || Error::Config("Invalid entry ID for forking".into());
                 let entry = record_id(&request["entryId"]).map_err(|_| invalid())?;
+                if !super::rpc_entries::Entries::new(&session).is_user_message(entry) {
+                    return Err(invalid());
+                }
                 let id = super::rpc_entries::editable_record(&session, entry);
                 let record = session
                     .records()

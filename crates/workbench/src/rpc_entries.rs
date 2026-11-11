@@ -59,6 +59,13 @@ impl Entries {
         }
     }
 
+    pub(super) fn is_user_message(&self, id: u64) -> bool {
+        let id = id.to_string();
+        self.values.iter().any(|entry| {
+            entry["id"] == id && entry["type"] == "message" && entry["message"]["role"] == "user"
+        })
+    }
+
     pub(super) fn has_leaf(&self) -> bool {
         self.leaf.is_some()
     }
@@ -573,6 +580,22 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn forking_accepts_only_visible_user_message_entries() {
+        let entries = Entries {
+            values: vec![
+                json!({"id":"1","type":"custom_message","content":"text"}),
+                json!({"id":"2","type":"message","message":{"role":"user","content":[]}}),
+                json!({"id":"3","type":"message","message":{"role":"assistant","content":[]}}),
+            ],
+            leaf: Some("3".into()),
+        };
+        assert!(!entries.is_user_message(1));
+        assert!(entries.is_user_message(2));
+        assert!(!entries.is_user_message(3));
+        assert!(!entries.is_user_message(4));
+    }
 
     #[test]
     fn statistics_count_original_message_roles_after_import() {
