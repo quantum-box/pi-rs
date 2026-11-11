@@ -255,7 +255,9 @@ files follow the process umask and edits preserve existing permissions. File
 mutations run off the async runtime and check cancellation while holding the
 per-file lock, including immediately before committing the replacement.
 Lock acquisition also observes cancellation while another writer is active.
-RPC user shell commands accept empty and whitespace-only scripts.
+RPC user shell commands accept empty and whitespace-only scripts. User shell
+output strips terminal escape sequences and control characters before streaming
+and saving the transcript.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even

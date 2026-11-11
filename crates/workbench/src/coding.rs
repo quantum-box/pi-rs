@@ -95,7 +95,7 @@ impl CodingTools {
             arguments["timeout"] = json!(timeout.as_secs_f64());
         }
         let result = tool
-            .shell_stream(&arguments, cancellation, progress)
+            .shell_stream(&arguments, cancellation, progress, true)
             .await?;
         let output = if result.timed_out {
             format!(
@@ -914,7 +914,9 @@ impl CodingTool {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let result = self.shell_stream(args, cancellation, &mut |_| {}).await?;
+        let result = self
+            .shell_stream(args, cancellation, &mut |_| {}, false)
+            .await?;
         if result.timed_out {
             let status = format!(
                 "Command timed out after {} seconds",
@@ -935,6 +937,7 @@ impl CodingTool {
         args: &Value,
         cancellation: &pi_rs::CancellationToken,
         progress: &mut (dyn FnMut(&str) + Send),
+        sanitize_user_output: bool,
     ) -> Result<ShellResult> {
         let started = std::time::Instant::now();
         let timeout = shell_timeout(args)?;
@@ -983,6 +986,8 @@ impl CodingTool {
         let mut timed_out = false;
         let mut stdout_text = ShellStream::default();
         let mut stderr_text = ShellStream::default();
+        let mut stdout_filter = UserShellFilter::default();
+        let mut stderr_filter = UserShellFilter::default();
         while status.is_none() || stdout_open || stderr_open {
             tokio::select! {
                 _ = cancellation.cancelled(), if !cancelled => {
@@ -1003,14 +1008,32 @@ impl CodingTool {
                 count = stdout.read(&mut stdout_chunk), if stdout_open => {
                     let count = count?;
                     stdout_open = count != 0;
-                    output.append(&stdout_chunk[..count])?;
-                    stdout_text.push(&stdout_chunk[..count], progress);
+                    if sanitize_user_output {
+                        let mut clean = String::new();
+                        stdout_text.push(&stdout_chunk[..count], &mut |text| clean.push_str(&stdout_filter.filter(text)));
+                        if !clean.is_empty() {
+                            progress(&clean);
+                            output.append(clean.as_bytes())?;
+                        }
+                    } else {
+                        output.append(&stdout_chunk[..count])?;
+                        stdout_text.push(&stdout_chunk[..count], progress);
+                    }
                 }
                 count = stderr.read(&mut stderr_chunk), if stderr_open => {
                     let count = count?;
                     stderr_open = count != 0;
-                    output.append(&stderr_chunk[..count])?;
-                    stderr_text.push(&stderr_chunk[..count], progress);
+                    if sanitize_user_output {
+                        let mut clean = String::new();
+                        stderr_text.push(&stderr_chunk[..count], &mut |text| clean.push_str(&stderr_filter.filter(text)));
+                        if !clean.is_empty() {
+                            progress(&clean);
+                            output.append(clean.as_bytes())?;
+                        }
+                    } else {
+                        output.append(&stderr_chunk[..count])?;
+                        stderr_text.push(&stderr_chunk[..count], progress);
+                    }
                 }
                 _ = async {
                     match drain_deadline {
@@ -1023,8 +1046,22 @@ impl CodingTool {
         if let Some(input_task) = input_task {
             input_task.abort();
         }
-        stdout_text.finish(progress);
-        stderr_text.finish(progress);
+        if sanitize_user_output {
+            for (stream, filter) in [
+                (&mut stdout_text, &mut stdout_filter),
+                (&mut stderr_text, &mut stderr_filter),
+            ] {
+                let mut remaining = String::new();
+                stream.finish(&mut |text| remaining.push_str(&filter.filter(text)));
+                if !remaining.is_empty() {
+                    progress(&remaining);
+                    output.append(remaining.as_bytes())?;
+                }
+            }
+        } else {
+            stdout_text.finish(progress);
+            stderr_text.finish(progress);
+        }
         Ok(ShellResult {
             cancelled,
             timed_out,
@@ -1113,6 +1150,33 @@ struct ShellResult {
     output: crate::shell_output::Output,
     status: std::process::ExitStatus,
     elapsed: f64,
+}
+
+#[derive(Default)]
+struct UserShellFilter {
+    parser: vte::Parser,
+}
+
+impl UserShellFilter {
+    fn filter(&mut self, text: &str) -> String {
+        #[derive(Default)]
+        struct Text(String);
+        impl vte::Perform for Text {
+            fn print(&mut self, ch: char) {
+                if !matches!(ch, '\u{fff9}'..='\u{fffb}') {
+                    self.0.push(ch);
+                }
+            }
+            fn execute(&mut self, byte: u8) {
+                if matches!(byte, b'\n' | b'\t') {
+                    self.0.push(char::from(byte));
+                }
+            }
+        }
+        let mut output = Text::default();
+        self.parser.advance(&mut output, text.as_bytes());
+        output.0
+    }
 }
 
 #[derive(Default)]
@@ -1411,6 +1475,21 @@ mod tests {
     }
 
     #[test]
+    fn user_shell_filter_handles_fragmented_escape_sequences() {
+        let mut filter = UserShellFilter::default();
+        let output = [
+            "A\u{1b}[",
+            "31mred\u{1b}[0m\r\n",
+            "\u{1b}]0;title",
+            "\u{7}ok\u{0}\u{fff9}",
+        ]
+        .into_iter()
+        .map(|part| filter.filter(part))
+        .collect::<String>();
+        assert_eq!(output, "Ared\nok");
+    }
+
+    #[test]
     fn shell_updates_preserve_multibyte_boundaries() {
         let mut decoder = ShellStream::default();
         let mut text = String::new();
@@ -1425,6 +1504,20 @@ mod tests {
     async fn explicit_shell_preserves_failed_output_and_cancelled_processes() {
         let directory = tempfile::tempdir().unwrap();
         let tools = CodingTools::local(directory.path()).unwrap();
+        if !cfg!(windows) {
+            let mut streamed = String::new();
+            let result = tools
+                .execute_shell(
+                    "printf '\\033[31mred\\033[0m\\r\\n'",
+                    None,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |chunk| streamed.push_str(chunk),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.output, "red\n");
+            assert_eq!(streamed, result.output);
+        }
         for command in ["", "  "] {
             let result = tools
                 .execute_shell(command, None, &pi_rs::CancellationToken::new(), &mut |_| {})
