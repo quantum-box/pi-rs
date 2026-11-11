@@ -1142,7 +1142,13 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Config("file needs a parent".into()))?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut file = builder.tempfile_in(parent)?;
     if let Ok(metadata) = path.metadata() {
         file.as_file().set_permissions(metadata.permissions())?;
     }
@@ -1603,6 +1609,40 @@ mod tests {
             editor
                 .edit(&json!({"path":"Capture d'ecran.txt", "oldText":"curly", "newText":"other"}))
                 .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_files_follow_umask_and_existing_file_permissions_survive_editing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let reference = root.path().join("reference");
+        std::fs::write(&reference, "reference").unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        };
+        tool.write(&json!({"path":"new","content":"before"}))
+            .unwrap();
+        let target = root.path().join("new");
+        assert_eq!(
+            target.metadata().unwrap().permissions().mode() & 0o777,
+            reference.metadata().unwrap().permissions().mode() & 0o777
+        );
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let editor = CodingTool {
+            kind: Kind::Edit,
+            ..tool
+        };
+        editor
+            .edit(&json!({"path":"new","oldText":"before","newText":"after"}))
+            .unwrap();
+        assert_eq!(
+            target.metadata().unwrap().permissions().mode() & 0o777,
+            0o751
         );
     }
 
