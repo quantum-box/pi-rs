@@ -715,6 +715,25 @@ impl AgentSession {
         self.emit_last();
         Ok(())
     }
+
+    /// Send a custom message from an idle host, optionally starting a model turn.
+    ///
+    /// When `trigger_turn` is false, the message is saved for the next turn and
+    /// the model is not called. The returned answer is present only when a turn
+    /// was requested and completed successfully.
+    pub async fn send_custom_message(
+        &mut self,
+        message: crate::CustomMessage,
+        trigger_turn: bool,
+    ) -> Result<Option<String>> {
+        self.start().await?;
+        self.append_custom_message(message)?;
+        if trigger_turn {
+            self.resume().await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
     pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
         self.ensure_open()?;
         self.session.set_label(target, label)?;
@@ -1956,6 +1975,51 @@ mod tests {
                 }),
             ])))
         }
+    }
+
+    #[tokio::test]
+    async fn idle_custom_message_can_trigger_a_fresh_model_turn() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .in_memory()
+            .unwrap();
+        let message = |content: &str| crate::CustomMessage {
+            custom_type: "extension".into(),
+            content: crate::ContextContent::Text(content.into()),
+            display: false,
+            details: None,
+        };
+
+        assert_eq!(
+            session
+                .send_custom_message(message("first"), false)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(model.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            session
+                .send_custom_message(message("second"), true)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("answer 1")
+        );
+        assert_eq!(
+            session
+                .send_custom_message(message("third"), true)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("answer 2")
+        );
+        let messages = session.messages().unwrap();
+        assert!(matches!(&messages[0], Message::User { content } if content == "first"));
+        assert!(matches!(&messages[1], Message::User { content } if content == "second"));
+        assert!(matches!(&messages[3], Message::User { content } if content == "third"));
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+        session.close().await.unwrap();
     }
     struct ClosingExtension(Arc<AtomicUsize>);
     #[async_trait::async_trait]

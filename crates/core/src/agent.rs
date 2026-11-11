@@ -432,7 +432,9 @@ impl Agent<'_> {
             .iter()
             .rev()
             .find_map(|record| match &record.event {
-                Event::User { .. } | Event::UserWithImages { .. } => Some(None),
+                Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. } => {
+                    Some(None)
+                }
                 Event::Assistant {
                     content,
                     invocations,
@@ -448,7 +450,7 @@ impl Agent<'_> {
         } else if !session.branch().iter().any(|record| {
             matches!(
                 record.event,
-                Event::User { .. } | Event::UserWithImages { .. }
+                Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. }
             )
         }) {
             apply_inputs(session, true, observer)?;

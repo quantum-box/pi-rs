@@ -45,8 +45,10 @@ details remain extension metadata. The terminal displays messages whose flag is
 true. SDK hosts can use `AgentSession::append_custom_message`. Executable
 extensions opt into this protocol with `command_effects` in their descriptor;
 older extensions continue to use `command_output`. Messages are currently
-added to context without starting or steering a turn, and hooks and tools do not
-yet expose Pi's immediate `sendMessage` API or custom message renderers.
+added to context without starting or steering a turn. An idle SDK host can call
+`AgentSession::send_custom_message(message, true)` to start a model turn, or
+pass `false` to save the message without a turn. Hooks and tools do not yet
+expose Pi's immediate `sendMessage` API or custom message renderers.
 
 ## Write another extension
 
