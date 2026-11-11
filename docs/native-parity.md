@@ -185,6 +185,8 @@ Raw HTML is escaped, and Markdown images leave their alt text without loading
 external image sources.
 HTML exports show aborted and failed model requests and preserve any partial
 answer. Imported Pi assistant errors retain their original message text.
+User shell executions appear in HTML exports even when excluded from model
+context. The first ten output lines stay visible, with the rest folded.
 Prompt-template arguments preserve literal backslashes and quoted empty
 values. Positional arguments, defaults and slices use Pi's placeholder
 syntax and expand only once.

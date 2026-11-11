@@ -340,6 +340,7 @@ pub fn html(session: &Session) -> String {
                 content, images, ..
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
+            Event::BashExecution { execution } => render_shell_html(&mut html, execution),
             Event::Assistant {
                 content,
                 invocations,
@@ -417,6 +418,32 @@ pub fn html(session: &Session) -> String {
     }
     html.push_str("</html>");
     html
+}
+
+fn render_shell_html(html: &mut String, execution: &pi_rs::BashExecution) {
+    let failed = execution.cancelled || execution.exit_code.is_some_and(|code| code != 0);
+    let status = if failed { "error" } else { "success" };
+    html.push_str(&format!(
+        "<article class=\"tool-execution {status}\"><pre>$ {}</pre>",
+        escape(&execution.command)
+    ));
+    if !execution.output.is_empty() {
+        let mut lines = execution.output.splitn(11, '\n');
+        let preview = lines.by_ref().take(10).collect::<Vec<_>>().join("\n");
+        html.push_str(&format!("<pre>{}</pre>", escape(&preview)));
+        if let Some(remaining) = lines.next() {
+            html.push_str(&format!(
+                "<details><summary>Show remaining output</summary><pre>{}</pre></details>",
+                escape(remaining)
+            ));
+        }
+    }
+    if execution.cancelled {
+        render_export_failure(html, "(cancelled)");
+    } else if let Some(code) = execution.exit_code.filter(|code| *code != 0) {
+        render_export_failure(html, &format!("(exit {code})"));
+    }
+    html.push_str("</article>");
 }
 
 fn render_export_failure(html: &mut String, status: &str) {
@@ -890,6 +917,35 @@ mod tests {
         import(&exported, &imported).unwrap();
         assert_eq!(Session::open(imported).unwrap().name(), session.name());
     }
+    #[test]
+    fn html_includes_user_shell_output_and_status_even_when_excluded_from_context() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut execution = pi_rs::BashExecution {
+            command: "fixture <command>".into(),
+            output: format!(
+                "{}\n<script>last line</script>",
+                "preview\n".repeat(9) + "preview"
+            ),
+            exit_code: Some(7),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: true,
+        };
+        session.append_bash_execution(execution.clone()).unwrap();
+        execution.cancelled = true;
+        execution.exit_code = None;
+        session.append_bash_execution(execution).unwrap();
+        let document = html(&session);
+        assert!(document.contains(
+            "<article class=\"tool-execution error\"><pre>$ fixture &lt;command&gt;</pre>"
+        ));
+        assert!(document.contains("<details><summary>Show remaining output</summary><pre>&lt;script&gt;last line&lt;/script&gt;</pre></details>"));
+        assert!(document.contains("(exit 7)"));
+        assert!(document.contains("(cancelled)"));
+        assert!(!document.contains("<script>"));
+    }
+
     #[test]
     fn html_displays_imported_assistant_stop_reasons() {
         let mut fixture = tempfile::NamedTempFile::new().unwrap();
