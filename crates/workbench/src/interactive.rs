@@ -318,6 +318,12 @@ impl RemoteTask {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TranscriptPanel {
+    Summary(u64),
+    Skill(usize),
+}
+
 #[derive(Default)]
 struct View {
     regular: RegularState,
@@ -341,8 +347,8 @@ struct View {
     thinking: String,
     expand_tools: bool,
     expand_key: Option<crossterm::event::KeyEvent>,
-    summary_rows: Vec<(std::ops::Range<usize>, u64)>,
-    summary_press: Option<(u64, u16, u16)>,
+    panel_rows: Vec<(std::ops::Range<usize>, TranscriptPanel)>,
+    panel_press: Option<(TranscriptPanel, u16, u16)>,
     summarizing: bool,
     hide_thinking: bool,
     streaming: String,
@@ -655,16 +661,29 @@ impl View {
     fn set_expand_tools(&mut self, expanded: bool) {
         self.expand_tools = expanded;
         for entry in &mut self.lines {
-            if let Entry::Summary { expanded, .. } = entry {
+            if let Entry::Summary { expanded, .. } | Entry::Skill { expanded, .. } = entry {
                 *expanded = None;
             }
         }
     }
 
-    fn summary_at(&self, row: u16) -> Option<u64> {
-        self.summary_rows
+    fn panel_at(&self, row: u16) -> Option<TranscriptPanel> {
+        self.panel_rows
             .iter()
             .find_map(|(rows, id)| rows.contains(&usize::from(row)).then_some(*id))
+    }
+
+    fn panel_expansion(&mut self, panel: TranscriptPanel) -> Option<&mut Option<bool>> {
+        let entry = match panel {
+            TranscriptPanel::Summary(id) => self.lines.iter_mut().find(
+                |entry| matches!(entry, Entry::Summary { id: candidate, .. } if *candidate == id),
+            ),
+            TranscriptPanel::Skill(index) => self.lines.get_mut(index),
+        }?;
+        match entry {
+            Entry::Summary { expanded, .. } | Entry::Skill { expanded, .. } => Some(expanded),
+            _ => None,
+        }
     }
 
     fn show_summary_billing(
@@ -756,8 +775,8 @@ impl View {
         self.viewport.follow();
         self.search = None;
         self.mouse.clear();
-        self.summary_rows.clear();
-        self.summary_press = None;
+        self.panel_rows.clear();
+        self.panel_press = None;
         self.summarizing = false;
         self.scrollbar_dragging = false;
         self.scrollbar_activity = None;
@@ -805,7 +824,7 @@ impl View {
                 pi_rs::Event::User { content, .. }
                 | pi_rs::Event::UserWithImages { content, .. } => {
                     self.history.push(content.clone());
-                    self.lines.push(Entry::User(content.clone()));
+                    self.lines.push(Entry::user(content.clone()));
                     if let pi_rs::Event::UserWithImages { images, .. } = &record.event {
                         self.append(&format!("{} attached image(s)", images.len()));
                         self.add_images(images);
@@ -1268,23 +1287,26 @@ impl View {
                 self.paste_clipboard(args);
             }
             MouseEventKind::Down(MouseButton::Left) if self.search.is_none() => {
-                self.summary_press = event.modifiers.is_empty().then(|| self.summary_at(event.row))
-                    .flatten().map(|id| (id, event.column, event.row));
+                self.panel_press = event
+                    .modifiers
+                    .is_empty()
+                    .then(|| self.panel_at(event.row))
+                    .flatten()
+                    .map(|id| (id, event.column, event.row));
                 self.mouse.press(event.column, event.row, now);
             }
             MouseEventKind::Drag(MouseButton::Left) if self.search.is_none() => {
-                self.summary_press = None;
+                self.panel_press = None;
                 self.mouse.drag(event.column, event.row);
             }
             MouseEventKind::Up(MouseButton::Left) if self.search.is_none() => {
-                if let Some((id, column, row)) = self.summary_press.take()
+                let default_expanded = self.expand_tools;
+                if let Some((panel, column, row)) = self.panel_press.take()
                     && (column, row) == (event.column, event.row)
-                    && self.summary_at(row) == Some(id)
-                    && let Some(Entry::Summary { expanded, .. }) = self.lines.iter_mut().find(
-                        |entry| matches!(entry, Entry::Summary { id: candidate, .. } if *candidate == id)
-                    )
+                    && self.panel_at(row) == Some(panel)
+                    && let Some(expanded) = self.panel_expansion(panel)
                 {
-                    *expanded = Some(!expanded.unwrap_or(self.expand_tools));
+                    *expanded = Some(!expanded.unwrap_or(default_expanded));
                     self.mouse.clear();
                 } else if self.mouse.release(event.column, event.row)
                     && args.settings.boolean("fullscreenCopyOnSelect") != Some(false)
@@ -1348,9 +1370,9 @@ impl View {
         let body_height = height.saturating_sub(prompt_height + 4 + header_rows + below.len());
         let mut lines = Vec::new();
         let mut prompts = Vec::new();
-        let mut summaries = Vec::new();
-        for entry in &self.lines {
-            if matches!(entry, Entry::User(_)) {
+        let mut panels = Vec::new();
+        for (index, entry) in self.lines.iter().enumerate() {
+            if matches!(entry, Entry::User(_) | Entry::Skill { .. }) {
                 prompts.push(lines.len());
             }
             let start = lines.len();
@@ -1361,8 +1383,19 @@ impl View {
                 !self.hide_thinking,
                 output,
             ));
-            if let Entry::Summary { id, .. } = entry {
-                summaries.push((start..lines.len().saturating_sub(1), *id));
+            match entry {
+                Entry::Summary { id, .. } => panels.push((
+                    start..lines.len().saturating_sub(1),
+                    TranscriptPanel::Summary(*id),
+                )),
+                Entry::Skill { .. } => {
+                    let panel_height = lines[start..]
+                        .iter()
+                        .take_while(|line| line.background == Some(theme.color("customMessageBg")))
+                        .count();
+                    panels.push((start..start + panel_height, TranscriptPanel::Skill(index)));
+                }
+                _ => {}
             }
         }
         if !self.thinking.is_empty() {
@@ -1413,13 +1446,13 @@ impl View {
             self.viewport.top()
         };
         let end = (start + body_height).min(lines.len());
-        self.summary_rows.clear();
+        self.panel_rows.clear();
         if modal {
-            self.summary_press = None;
+            self.panel_press = None;
             self.mouse.clear();
         } else {
-            self.summary_rows
-                .extend(summaries.into_iter().filter_map(|(rows, id)| {
+            self.panel_rows
+                .extend(panels.into_iter().filter_map(|(rows, id)| {
                     let first = rows.start.max(start);
                     let last = rows.end.min(end);
                     (first < last)
@@ -2527,7 +2560,7 @@ fn slash(
                 .expand(input)
                 .or_else(|| input.starts_with("/skill:").then(|| input.to_owned()))
             {
-                view.lines.push(Entry::User(expanded.clone()));
+                view.lines.push(Entry::user(expanded.clone()));
                 view.pending_request = Some(json!({"type":"prompt","content":input}));
                 return Ok(None);
             }
@@ -2883,7 +2916,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         None
                     };
                     view.lines
-                        .push(Entry::User(display.unwrap_or_else(|| prompt.clone())));
+                        .push(Entry::user(display.unwrap_or_else(|| prompt.clone())));
                     view.history.push(prompt);
                 }
                 Err(error) => view.append(&error.to_string()),
@@ -2967,7 +3000,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 }
             }
             Event::FocusLost if args.tui_mode != Some(TuiMode::Regular) => {
-                view.summary_press = None;
+                view.panel_press = None;
                 view.mouse.focus_lost();
                 view.scrollbar_dragging = false;
                 dirty = true;
@@ -3866,7 +3899,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 Err(error) => view.append(&error.to_string()),
                             }
                         } else {
-                            view.lines.push(Entry::User(input.clone()));
+                            view.lines.push(Entry::user(input.clone()));
                             match start_prompt(&args, &input, &view.draft_images, &mut worker) {
                                 Ok(()) => view.draft_images.clear(),
                                 Err(error) => view.append(&error.to_string()),

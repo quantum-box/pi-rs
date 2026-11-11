@@ -191,6 +191,10 @@ pub enum Entry {
     Notice(String),
     Warning(String),
     User(String),
+    Skill {
+        text: String,
+        expanded: Option<bool>,
+    },
     Assistant(String),
     Thinking(String),
     Summary {
@@ -220,6 +224,17 @@ pub struct TranscriptOptions {
 }
 
 impl Entry {
+    pub fn user(text: String) -> Self {
+        if skill_invocation(&text).is_some() {
+            Self::Skill {
+                text,
+                expanded: None,
+            }
+        } else {
+            Self::User(text)
+        }
+    }
+
     pub fn render(
         &self,
         theme: &Theme,
@@ -235,44 +250,41 @@ impl Entry {
             Self::Warning(text) => {
                 return wrap(&[Span::new(text, theme.color("warning"))], width);
             }
-            Self::User(text) => {
-                if let Some((name, body, message)) = skill_invocation(text) {
-                    let mut label = Span::new("[skill]", theme.color("customMessageLabel"));
-                    label.bold = true;
-                    let color = theme.color("customMessageText");
-                    let mut lines = vec![Line::default()];
-                    if expand_tools {
-                        lines.extend(wrap(&[label], inner));
-                        let markdown = format!("**{name}**\n\n{body}");
-                        let mut body =
-                            markdown_at_depth(&markdown, theme, inner, 0, options.mermaid);
-                        for span in body.iter_mut().flat_map(|line| &mut line.spans) {
-                            if span.color == theme.color("text") {
-                                span.color = color;
-                            }
+            Self::User(text) => user_lines(text, theme, inner),
+            Self::Skill { text, expanded } => {
+                let (name, body, message) = skill_invocation(text).expect("skill invocation");
+
+                let mut label = Span::new("[skill]", theme.color("customMessageLabel"));
+                label.bold = true;
+                let color = theme.color("customMessageText");
+                let mut lines = vec![Line::default()];
+                if expanded.unwrap_or(expand_tools) {
+                    lines.extend(wrap(&[label], inner));
+                    let markdown = format!("**{name}**\n\n{body}");
+                    let mut body = markdown_at_depth(&markdown, theme, inner, 0, options.mermaid);
+                    for span in body.iter_mut().flat_map(|line| &mut line.spans) {
+                        if span.color == theme.color("text") {
+                            span.color = color;
                         }
-                        lines.extend(body);
-                    } else {
-                        let mut title = vec![label, Span::new(format!(" {name}"), color)];
-                        if options.expand_key.is_some() {
-                            let key = super::keys::binding_hint(options.expand_key);
-                            title
-                                .push(Span::new(format!(" ({key} to expand)"), theme.color("dim")));
-                        }
-                        lines.extend(wrap(&title, inner));
                     }
-                    lines.push(Line::default());
-                    for line in &mut lines {
-                        line.background = Some(theme.color("customMessageBg"));
-                    }
-                    lines.push(Line::default());
-                    if let Some(message) = message {
-                        lines.extend(user_lines(message, theme, inner));
-                    }
-                    lines
+                    lines.extend(body);
                 } else {
-                    user_lines(text, theme, inner)
+                    let mut title = vec![label, Span::new(format!(" {name}"), color)];
+                    if options.expand_key.is_some() {
+                        let key = super::keys::binding_hint(options.expand_key);
+                        title.push(Span::new(format!(" ({key} to expand)"), theme.color("dim")));
+                    }
+                    lines.extend(wrap(&title, inner));
                 }
+                lines.push(Line::default());
+                for line in &mut lines {
+                    line.background = Some(theme.color("customMessageBg"));
+                }
+                lines.push(Line::default());
+                if let Some(message) = message {
+                    lines.extend(user_lines(message, theme, inner));
+                }
+                lines
             }
             Self::Assistant(text) => {
                 let mut lines = markdown_at_depth(text, theme, inner, 0, options.mermaid);
@@ -948,7 +960,7 @@ mod tests {
     #[test]
     fn skill_invocation_hides_the_body_and_keeps_user_text_visible() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let entry = Entry::User(
+        let entry = Entry::user(
             "<skill name=\"fixture\" location=\"/tmp/SKILL.md\">\n**skill body**\n</skill>\n\nUser request".into(),
         );
         let theme = Theme::system();

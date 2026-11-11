@@ -177,6 +177,7 @@ relative-reference directory and body. Frontmatter is removed, and optional
 user text follows the block.
 The TUI displays a folded skill panel with the configured tool expansion key.
 User text remains visible below the panel, including when a session is reopened.
+In fullscreen mode, clicking a skill panel toggles that panel independently.
 Prompt-template arguments preserve literal backslashes and quoted empty
 values. Positional arguments, defaults and slices use Pi's placeholder
 syntax and expand only once.
