@@ -49,6 +49,32 @@ pre-tool decisions, post-tool state, state migrations, and compaction hooks.
 Use stable extension IDs and explicit state versions. Let the host select the
 allowed tools and register policy extensions before tools.
 
+An extension can also add temporary skills, prompt templates, and themes:
+
+```rust,ignore
+fn handles_resource_discovery(&self) -> bool { true }
+
+async fn discover_resources(
+    &self,
+    event: &pi_rs::ResourceDiscoveryEvent,
+    _state: Option<&pi_rs::ExtensionState>,
+) -> pi_rs::ExtensionResult<pi_rs::DiscoveredResources> {
+    Ok(pi_rs::DiscoveredResources {
+        skill_paths: vec!["resources/skills".into()],
+        prompt_paths: vec!["resources/prompts".into()],
+        theme_paths: vec!["resources/themes".into()],
+    })
+}
+```
+
+For an executable extension, relative paths are resolved next to the executable;
+embedded hosts can use the supplied working directory. The callback runs after
+session start and on `/reload`, with the active branch's extension state. Paths
+are temporary, remain available when automatic discovery is disabled, and do
+not override an existing resource with the same name. SDK hosts can call
+`Registry::discover_resources` and integrate the returned paths into their own
+resource loader.
+
 [The execution contract](extensions.md) describes hook ordering, cancellation,
 reconciliation, and durable state. [The standard implementations](../crates/extensions/src/lib.rs)
 and [the plan-mode extension](../crates/plan-mode/src/lib.rs) provide working

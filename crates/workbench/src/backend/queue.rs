@@ -17,7 +17,8 @@ pub(super) struct Processor {
     pub inputs: mpsc::Sender<AgentInput>,
     pub active: Arc<Mutex<ControlState>>,
     pub snapshot: Arc<Mutex<SessionSnapshot>>,
-    pub resources: crate::resources::Resources,
+    pub resources: Arc<Mutex<crate::resources::Resources>>,
+    pub resources_ready: tokio::sync::watch::Receiver<bool>,
     pub registry: Registry,
     pub lifecycle_timeout: Duration,
     pub trace: bool,
@@ -81,6 +82,13 @@ impl Processor {
         mut message: QueuedMessage,
         source: InputSource,
     ) -> Result<Option<QueuedMessage>> {
+        let mut ready = self.resources_ready.clone();
+        while !*ready.borrow_and_update() {
+            ready
+                .changed()
+                .await
+                .map_err(|_| Error::Config("resource discovery stopped".into()))?;
+        }
         if let Some(name) = message
             .input
             .content
@@ -120,7 +128,12 @@ impl Processor {
             message.input.content = prepared.text;
             message.images = prepared.images;
         }
-        if let Some(expanded) = self.resources.expand(&message.input.content) {
+        if let Some(expanded) = self
+            .resources
+            .lock()
+            .expect("resource catalog")
+            .expand(&message.input.content)
+        {
             message.input.content = expanded;
         }
         message.validate()?;

@@ -1112,7 +1112,7 @@ fn forward_event(
             }
             Ok(())
         }
-        Some("backend_ready" | "bash_execution_start") => Ok(()),
+        Some("backend_ready" | "bash_execution_start" | "resources_discovered") => Ok(()),
         Some("bash_execution_update") => {
             let mut event = event;
             event["delta"] = event["output"].clone();

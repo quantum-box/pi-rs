@@ -22,6 +22,81 @@ pub struct Runtime {
     mcp_sign_in: std::collections::VecDeque<mcp_config::PendingSignIn>,
 }
 impl Runtime {
+    pub async fn discover_resources(
+        &mut self,
+        args: &Cli,
+        session: &Session,
+        reason: pi_rs::ResourceDiscoveryReason,
+    ) -> Result<pi_rs::DiscoveredResources> {
+        if !self.registry.has_resource_discovery_hooks() {
+            return Ok(pi_rs::DiscoveredResources::default());
+        }
+        let event = pi_rs::ResourceDiscoveryEvent {
+            cwd: args
+                .workspace
+                .canonicalize()
+                .unwrap_or_else(|_| args.workspace.clone()),
+            reason,
+        };
+        let results = self
+            .registry
+            .discover_resources(
+                &event,
+                &session.extension_states(),
+                args.tool_timeout(),
+                |extension, error| eprintln!("Extension {extension} (resources_discover): {error}"),
+            )
+            .await;
+        let mut discovered = pi_rs::DiscoveredResources::default();
+        for item in results {
+            let base = item
+                .source
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .unwrap_or(&event.cwd);
+            let resolve = |path: std::path::PathBuf| {
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    base.join(path)
+                };
+                if path.exists() {
+                    Some(path)
+                } else {
+                    eprintln!(
+                        "Extension {}: resource {} was not found",
+                        item.extension_id,
+                        path.display()
+                    );
+                    None
+                }
+            };
+            discovered
+                .skill_paths
+                .extend(item.resources.skill_paths.into_iter().filter_map(&resolve));
+            discovered
+                .prompt_paths
+                .extend(item.resources.prompt_paths.into_iter().filter_map(&resolve));
+            discovered
+                .theme_paths
+                .extend(item.resources.theme_paths.into_iter().filter_map(&resolve));
+        }
+        let resources = resources::Resources::load_with_discovered(args, &discovered)?;
+        let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
+        let (selection, _, hidden) = tool_discovery(args, &servers)?;
+        self.system_prompt = select_tools(
+            &mut self.registry,
+            &selection,
+            &hidden,
+            &resources,
+            args,
+            &servers,
+        )?;
+        *self.catalog.resources.lock().expect("resource catalog") = resources.clone();
+        self.resources = resources;
+        Ok(discovered)
+    }
+
     pub fn command_catalog(&self, args: &Cli) -> serde_json::Value {
         let user_root = super::config::agent_dir();
         let user_root = user_root.canonicalize().unwrap_or(user_root);
@@ -254,7 +329,7 @@ impl Runtime {
 
 struct LiveMcpCatalog {
     args: Cli,
-    resources: resources::Resources,
+    resources: std::sync::Mutex<resources::Resources>,
     servers: std::sync::Mutex<Vec<Arc<pi_rs_workbench::mcp::McpExtension>>>,
 }
 #[async_trait::async_trait]
@@ -277,11 +352,12 @@ impl pi_rs::RegistryRefresher for LiveMcpCatalog {
         registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
             documents,
         )))?;
+        let resources = self.resources.lock().expect("resource catalog").clone();
         let system_prompt = select_tools(
             &mut registry,
             &selection,
             &hidden,
-            &self.resources,
+            &resources,
             &self.args,
             &servers,
         )?;
@@ -455,7 +531,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
         )?;
         let catalog = Arc::new(LiveMcpCatalog {
             args: args.clone(),
-            resources: local_resources.clone(),
+            resources: std::sync::Mutex::new(local_resources.clone()),
             servers: std::sync::Mutex::new(mcp_connections.clone()),
         });
         registry.set_refresher(catalog.clone());

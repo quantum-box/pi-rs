@@ -133,6 +133,10 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    DiscoverResources {
+        event: pi_rs_core::ResourceDiscoveryEvent,
+        state: Option<ExtensionState>,
+    },
     CacheWarmingDecision {
         event: CacheWarmingDecision,
         state: Option<ExtensionState>,
@@ -224,6 +228,8 @@ struct Description {
     tree_navigation_hook: bool,
     #[serde(default)]
     session_transition_hook: bool,
+    #[serde(default)]
+    resource_discovery_hook: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
@@ -426,6 +432,20 @@ impl Extension for ExecutableExtension {
     }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
+    }
+    fn handles_resource_discovery(&self) -> bool {
+        self.description.resource_discovery_hook
+    }
+    async fn discover_resources(
+        &self,
+        event: &pi_rs_core::ResourceDiscoveryEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::DiscoveredResources> {
+        self.request_async(ProtocolRequest::DiscoverResources {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
     }
     fn handles_session_lifecycle(&self) -> bool {
         self.description.session_lifecycle_hook
@@ -1211,6 +1231,7 @@ async fn dispatch_with_host(
             cache_warming_hook: extension.handles_cache_warming(),
             tree_navigation_hook: extension.handles_tree_navigation(),
             session_transition_hook: extension.handles_session_transitions(),
+            resource_discovery_hook: extension.handles_resource_discovery(),
             tools: extension
                 .tools()
                 .into_iter()
@@ -1241,6 +1262,9 @@ async fn dispatch_with_host(
         }
         ProtocolRequest::Lifecycle { event, state } => {
             encode(extension.lifecycle(&event, state.as_ref()).await)
+        }
+        ProtocolRequest::DiscoverResources { event, state } => {
+            encode(extension.discover_resources(&event, state.as_ref()).await)
         }
         ProtocolRequest::CacheWarmingDecision { event, state } => encode(
             extension
@@ -1422,6 +1446,51 @@ mod tests {
     }
 
     struct CacheDecisionExtension;
+
+    struct ResourceExtension;
+    #[async_trait::async_trait]
+    impl Extension for ResourceExtension {
+        fn id(&self) -> &str {
+            "resource-test"
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources(
+            &self,
+            event: &pi_rs_core::ResourceDiscoveryEvent,
+            state: Option<&ExtensionState>,
+        ) -> ExtensionResult<pi_rs_core::DiscoveredResources> {
+            assert_eq!(event.reason, pi_rs_core::ResourceDiscoveryReason::Reload);
+            assert_eq!(state.unwrap().data["enabled"], true);
+            Ok(pi_rs_core::DiscoveredResources {
+                skill_paths: vec!["skills".into()],
+                prompt_paths: vec!["prompts/example.md".into()],
+                theme_paths: vec!["themes".into()],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_protocol_preserves_paths_reason_and_state() {
+        let extension = Arc::new(ResourceExtension);
+        let descriptor = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(descriptor["resource_discovery_hook"], true);
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"discover_resources", "event":{"cwd":"/workspace","reason":"reload"},
+            "state":{"version":1,"data":{"enabled":true}}
+        }))
+        .unwrap();
+        let result = dispatch(extension, request).await.unwrap();
+        assert_eq!(result["skillPaths"], serde_json::json!(["skills"]));
+        assert_eq!(
+            result["promptPaths"],
+            serde_json::json!(["prompts/example.md"])
+        );
+        assert_eq!(result["themePaths"], serde_json::json!(["themes"]));
+    }
 
     #[async_trait::async_trait]
     impl Extension for CacheDecisionExtension {

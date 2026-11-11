@@ -38,6 +38,73 @@ struct Frontmatter {
     manual: bool,
 }
 impl Resources {
+    pub fn load_with_discovered(
+        args: &Cli,
+        discovered: &pi_rs::DiscoveredResources,
+    ) -> Result<Self> {
+        let mut resources = Self::load(args)?;
+        if discovered.skill_paths.is_empty()
+            && discovered.prompt_paths.is_empty()
+            && discovered.theme_paths.is_empty()
+        {
+            return Ok(resources);
+        }
+        let mut augmented = args.clone();
+        augmented.no_skills = true;
+        augmented.no_prompt_templates = true;
+        augmented.no_themes = true;
+        augmented.no_extensions = true;
+        augmented.no_context_files = true;
+        augmented.extensions.clear();
+        augmented.skill = discovered
+            .skill_paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        augmented.prompt_template = discovered.prompt_paths.clone();
+        augmented.themes = discovered.theme_paths.clone();
+        let additional = Self::load(&augmented)?;
+        for (name, skill) in additional.skills {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                resources.skills.entry(name.clone())
+            {
+                entry.insert(skill);
+            } else if resources
+                .skills
+                .get(&name)
+                .is_some_and(|existing| existing.path != skill.path)
+            {
+                resources.warnings.push(format!(
+                    "Duplicate skill {name} at {}",
+                    skill.path.display()
+                ));
+            }
+        }
+        for (name, prompt) in additional.prompts {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                resources.prompts.entry(name.clone())
+            {
+                entry.insert(prompt);
+            } else if resources
+                .prompts
+                .get(&name)
+                .is_some_and(|existing| existing.path != prompt.path)
+            {
+                resources.warnings.push(format!(
+                    "Duplicate prompt {name} at {}",
+                    prompt.path.display()
+                ));
+            }
+        }
+        for theme in additional.themes {
+            if !resources.themes.contains(&theme) {
+                resources.themes.push(theme);
+            }
+        }
+        resources.warnings.extend(additional.warnings);
+        Ok(resources)
+    }
+
     pub fn load(args: &Cli) -> Result<Self> {
         let mut resources = Self {
             packages: super::packages::resources(args)?,
@@ -618,6 +685,46 @@ fn expand_arguments(body: &str, arguments: &str) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovered_resources_remain_available_when_auto_discovery_is_disabled() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("skills/example/SKILL.md");
+        let prompt = directory.path().join("prompts/greet.md");
+        let theme = directory.path().join("themes/example.json");
+        let original = directory.path().join("existing/greet.md");
+        for path in [&skill, &prompt, &theme, &original] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(
+            &skill,
+            "---\nname: example\ndescription: Example skill\n---\nSkill instructions",
+        )
+        .unwrap();
+        std::fs::write(&prompt, "Say hello to $ARGUMENTS").unwrap();
+        std::fs::write(&original, "Existing prompt: $ARGUMENTS").unwrap();
+        std::fs::write(&theme, "{}").unwrap();
+        let mut args =
+            super::Cli::parse_from(["pi", "--no-skills", "--no-prompt-templates", "--no-themes"]);
+        args.workspace = directory.path().into();
+        let discovered = pi_rs::DiscoveredResources {
+            skill_paths: vec![skill],
+            prompt_paths: vec![prompt],
+            theme_paths: vec![theme.clone()],
+        };
+        let resources = super::Resources::load_with_discovered(&args, &discovered).unwrap();
+        assert!(resources.skills.contains_key("example"));
+        assert!(resources.expand("/greet world").unwrap().contains("world"));
+        assert!(resources.themes.contains(&theme.canonicalize().unwrap()));
+        args.prompt_template.push(original);
+        let resources = super::Resources::load_with_discovered(&args, &discovered).unwrap();
+        assert!(
+            resources
+                .expand("/greet world")
+                .unwrap()
+                .contains("Existing prompt: world")
+        );
+    }
     use super::*;
     #[test]
     fn skill_discovery_honors_declared_roots_hidden_paths_and_local_ignores() {

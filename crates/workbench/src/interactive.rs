@@ -845,7 +845,21 @@ impl View {
         )));
     }
 
-    fn receive_worker(&mut self, mut value: Value, args: &Cli) {
+    fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
+        if value["type"] == "resources_discovered" {
+            match serde_json::from_value::<pi_rs::DiscoveredResources>(value["resources"].take())
+                .map_err(Error::from)
+                .and_then(|discovered| {
+                    super::resources::Resources::load_with_discovered(args, &discovered)
+                }) {
+                Ok(resources) => {
+                    args.theme_paths = resources.themes.clone();
+                    self.resources = resources;
+                }
+                Err(error) => self.append(&format!("Resource discovery: {error}")),
+            }
+            return;
+        }
         if value["type"] == "cache_warming_status" {
             if value["session"] == json!(args.session) {
                 self.cache_warming_status = serde_json::from_value(value["status"].take()).ok();
@@ -2777,7 +2791,17 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
         &args.workspace,
         args.trusted,
         !args.no_themes,
-    )?;
+    )
+    .or_else(|error| {
+        if !super::resources::Resources::load(args)?
+            .extensions
+            .is_empty()
+        {
+            Ok(Theme::system())
+        } else {
+            Err(error)
+        }
+    })?;
     let mut view = View::default();
     slash("/resume", args, &mut view, None)?;
     let mut worker = None;
@@ -2860,13 +2884,21 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
-    let mut theme = Theme::load(
+    let mut deferred_theme_error = None;
+    let mut theme = match Theme::load(
         args.use_theme.as_deref().unwrap_or("system"),
         &args.theme_paths,
         &args.workspace,
         args.trusted,
         false,
-    )?;
+    ) {
+        Ok(theme) => theme,
+        Err(error) if !initial_resources.extensions.is_empty() => {
+            deferred_theme_error = Some(error.to_string());
+            Theme::system()
+        }
+        Err(error) => return Err(error),
+    };
     let mut view = View {
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
@@ -2891,6 +2923,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         crate::ui::images::query_cell_size()?;
     }
     let mut worker: Option<Worker> = None;
+    let mut startup_extensions: Option<Vec<PathBuf>> = None;
     let mut initial: VecDeque<_> = args
         .initial_prompt
         .take()
@@ -2909,6 +2942,18 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     loop {
+        if !args.trust_pending
+            && worker.is_none()
+            && !view.resources.extensions.is_empty()
+            && startup_extensions.as_ref() != Some(&view.resources.extensions)
+        {
+            startup_extensions = Some(view.resources.extensions.clone());
+            match Worker::start(&args, &["serve"]) {
+                Ok(active) => worker = Some(active),
+                Err(error) => view.append(&error.to_string()),
+            }
+            dirty = true;
+        }
         if last_theme_check.elapsed() >= Duration::from_millis(500) {
             match theme_watcher.poll(&mut theme) {
                 Ok(changed) => dirty |= changed,
@@ -3030,6 +3075,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     dirty = true;
                     continue;
                 }
+                if value["type"] == "backend_ready"
+                    && let Some(error) = deferred_theme_error.take()
+                {
+                    view.append(&error);
+                }
                 let settled = value["type"] == "agent_settled";
                 let success = value["success"] == true;
                 if view.tree_navigation.is_some() {
@@ -3050,7 +3100,28 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         view.request_started = None;
                     }
                 }
-                view.receive_worker(value, &args);
+                let resources_changed = value["type"] == "resources_discovered";
+                view.receive_worker(value, &mut args);
+                if resources_changed && let Some(name) = args.use_theme.as_deref() {
+                    match Theme::load(
+                        name,
+                        &args.theme_paths,
+                        &args.workspace,
+                        args.trusted,
+                        false,
+                    ) {
+                        Ok(next) => {
+                            theme = next;
+                            theme_watcher = ThemeWatcher::new(&theme);
+                            deferred_theme_error = None;
+                        }
+                        Err(error) => {
+                            if deferred_theme_error.take().is_some() {
+                                view.append(&error.to_string());
+                            }
+                        }
+                    }
+                }
                 if settled {
                     active.busy = false;
                     view.dialogs.clear();
@@ -3083,7 +3154,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     let _ = reader.join();
                 }
                 for value in finished.drain_events() {
-                    view.receive_worker(value, &args);
+                    view.receive_worker(value, &mut args);
                 }
                 view.settle();
                 view.cache_warming_status = None;

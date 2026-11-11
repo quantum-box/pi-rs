@@ -11,6 +11,40 @@ use crate::{
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
 
+/// Why the host is asking an extension for temporary resource paths.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceDiscoveryReason {
+    Startup,
+    Reload,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceDiscoveryEvent {
+    pub cwd: std::path::PathBuf,
+    pub reason: ResourceDiscoveryReason,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredResources {
+    #[serde(default)]
+    pub skill_paths: Vec<std::path::PathBuf>,
+    #[serde(default)]
+    pub prompt_paths: Vec<std::path::PathBuf>,
+    #[serde(default)]
+    pub theme_paths: Vec<std::path::PathBuf>,
+}
+
+/// A handler's resources and its source, used to resolve relative paths.
+#[derive(Clone, Debug)]
+pub struct ExtensionResources {
+    pub extension_id: String,
+    pub source: Option<std::path::PathBuf>,
+    pub resources: DiscoveredResources,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheWarmingAction {
@@ -282,6 +316,19 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to supplying temporary skills, prompt templates and themes.
+    fn handles_resource_discovery(&self) -> bool {
+        false
+    }
+
+    async fn discover_resources(
+        &self,
+        _event: &ResourceDiscoveryEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<DiscoveredResources> {
+        Ok(DiscoveredResources::default())
+    }
+
     /// Opt in to session start and shutdown events in addition to run and turn events.
     fn handles_session_lifecycle(&self) -> bool {
         false
@@ -437,6 +484,44 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub fn has_resource_discovery_hooks(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|item| item.handles_resource_discovery())
+    }
+
+    /// Discover resources in extension order. A failed handler does not stop
+    /// later extensions; the host decides how to report errors.
+    pub async fn discover_resources(
+        &self,
+        event: &ResourceDiscoveryEvent,
+        states: &ExtensionStates,
+        timeout: std::time::Duration,
+        mut on_error: impl FnMut(&str, &str),
+    ) -> Vec<ExtensionResources> {
+        let mut result = Vec::new();
+        for extension in self
+            .extensions
+            .iter()
+            .filter(|item| item.handles_resource_discovery())
+        {
+            match tokio::time::timeout(
+                timeout,
+                extension.discover_resources(event, states.get(extension.id())),
+            )
+            .await
+            {
+                Ok(Ok(resources)) => result.push(ExtensionResources {
+                    extension_id: extension.id().into(),
+                    source: extension.command_source().map(std::path::Path::to_path_buf),
+                    resources,
+                }),
+                Ok(Err(error)) => on_error(extension.id(), &error),
+                Err(_) => on_error(extension.id(), "resource discovery timed out"),
+            }
+        }
+        result
+    }
     pub fn has_session_transition_hooks(&self) -> bool {
         self.extensions
             .iter()
@@ -814,6 +899,70 @@ pub(crate) fn hook<T>(extension: &dyn Extension, result: ExtensionResult<T>) -> 
 mod replacement_tests {
     use super::*;
     use serde_json::json;
+
+    struct ResourceHook(&'static str, bool);
+    #[async_trait::async_trait]
+    impl Extension for ResourceHook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn discover_resources(
+            &self,
+            event: &ResourceDiscoveryEvent,
+            state: Option<&ExtensionState>,
+        ) -> ExtensionResult<DiscoveredResources> {
+            assert_eq!(event.reason, ResourceDiscoveryReason::Reload);
+            if self.1 {
+                return Err("fixture failure".into());
+            }
+            assert_eq!(state.unwrap().data["enabled"], true);
+            Ok(DiscoveredResources {
+                prompt_paths: vec!["relative.md".into()],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_discovery_passes_state_and_continues_after_handler_failure() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ResourceHook("broken", true)))
+            .unwrap();
+        registry
+            .register(Arc::new(ResourceHook("working", false)))
+            .unwrap();
+        let states = [(
+            "working".into(),
+            ExtensionState {
+                version: 1,
+                data: json!({"enabled": true}),
+            },
+        )]
+        .into();
+        let mut failures = Vec::new();
+        let result = registry
+            .discover_resources(
+                &ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: ResourceDiscoveryReason::Reload,
+                },
+                &states,
+                std::time::Duration::from_secs(1),
+                |id, error| failures.push((id.to_owned(), error.to_owned())),
+            )
+            .await;
+        assert_eq!(failures, [("broken".into(), "fixture failure".into())]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].extension_id, "working");
+        assert_eq!(
+            result[0].resources.prompt_paths,
+            [std::path::PathBuf::from("relative.md")]
+        );
+    }
 
     struct TestExtension(&'static str, &'static str);
     impl Extension for TestExtension {

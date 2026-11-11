@@ -147,8 +147,9 @@ struct ReaderControls {
     snapshot: Arc<Mutex<SessionSnapshot>>,
     auto_compaction: pi_rs::AutoCompactionControl,
     retry: pi_rs::RetryControl,
-    command_catalog: serde_json::Value,
-    resources: super::resources::Resources,
+    command_catalog: Arc<Mutex<serde_json::Value>>,
+    resources: Arc<Mutex<super::resources::Resources>>,
+    resources_ready: tokio::sync::watch::Receiver<bool>,
     registry: pi_rs::Registry,
     lifecycle_timeout: std::time::Duration,
     trace: bool,
@@ -241,6 +242,10 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         initial_records,
         args.mode == Some(super::OutputMode::Rpc),
     )));
+    let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
+    let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
+    let (resources_ready, ready_receiver) =
+        tokio::sync::watch::channel(!runtime.registry.has_resource_discovery_hooks());
     read_requests(
         commands,
         inputs.clone(),
@@ -251,8 +256,9 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             snapshot: snapshot.clone(),
             auto_compaction: runtime.auto_compaction.clone(),
             retry: runtime.retry.clone(),
-            command_catalog: runtime.command_catalog(&args),
-            resources: runtime.resources.clone(),
+            command_catalog: command_catalog.clone(),
+            resources: shared_resources.clone(),
+            resources_ready: ready_receiver,
             registry: runtime.registry.clone(),
             lifecycle_timeout: args.tool_timeout(),
             trace: args.trace,
@@ -285,6 +291,24 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         },
     )
     .await;
+    let session = Session::snapshot(&args.session)?;
+    let discovered = runtime
+        .discover_resources(
+            &args,
+            &session,
+            if matches!(startup_reason, SessionStartReason::Reload) {
+                pi_rs::ResourceDiscoveryReason::Reload
+            } else {
+                pi_rs::ResourceDiscoveryReason::Startup
+            },
+        )
+        .await?;
+    *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
+    *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
+    resources_ready.send_replace(true);
+    if runtime.registry.has_resource_discovery_hooks() {
+        output(json!({"type":"resources_discovered","resources":discovered}));
+    }
     output(json!({"type":"backend_ready"}));
     let mut continue_queue = false;
     let cache = super::cache_warming::Controller::default();
@@ -401,6 +425,9 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
+                if runtime.registry.has_resource_discovery_hooks() {
+                    resources_ready.send_replace(false);
+                }
                 notify_session_lifecycle(
                     &args,
                     &runtime,
@@ -429,6 +456,16 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     },
                 )
                 .await;
+                let session = Session::snapshot(&args.session)?;
+                let discovered = runtime
+                    .discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup)
+                    .await?;
+                *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
+                *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
+                resources_ready.send_replace(true);
+                if runtime.registry.has_resource_discovery_hooks() {
+                    output(json!({"type":"resources_discovered","resources":discovered}));
+                }
             }
             continue;
         }
@@ -1000,6 +1037,7 @@ fn read_requests(
         retry,
         command_catalog,
         resources,
+        resources_ready,
         registry,
         lifecycle_timeout,
         trace,
@@ -1007,13 +1045,15 @@ fn read_requests(
         shell,
     } = controls;
     let runtime = tokio::runtime::Handle::current();
-    let prepare_in_background = registry.has_input_hooks();
+    let prepare_in_background =
+        registry.has_input_hooks() || registry.has_resource_discovery_hooks();
     let processor = Arc::new(queue::Processor {
         commands: commands.clone(),
         inputs,
         active: active.clone(),
         snapshot: snapshot.clone(),
         resources,
+        resources_ready: resources_ready.clone(),
         registry,
         lifecycle_timeout,
         trace,
@@ -1059,7 +1099,20 @@ fn read_requests(
                     );
                 }
                 Request::GetCommands { id } => {
-                    control_response("get_commands", id, Ok(command_catalog.clone()));
+                    let mut ready = resources_ready.clone();
+                    let catalog = command_catalog.clone();
+                    runtime.spawn(async move {
+                        while !*ready.borrow_and_update() {
+                            if ready.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        control_response(
+                            "get_commands",
+                            id,
+                            Ok(catalog.lock().expect("command catalog").clone()),
+                        );
+                    });
                 }
                 Request::Bash {
                     command,

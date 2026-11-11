@@ -1434,7 +1434,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         }
         output(header);
     }
-    let runtime = runtime::configure(&args, false).await?;
+    let mut runtime = runtime::configure(&args, false).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
     session.set_retry_control(runtime.retry.clone());
     runtime
@@ -1447,6 +1447,9 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             },
         )
         .await;
+    runtime
+        .discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup)
+        .await?;
     let result = async {
         let registry = &runtime.registry;
         let agent = runtime.agent(&args, session.session_id());
