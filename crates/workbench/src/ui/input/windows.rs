@@ -44,7 +44,8 @@ impl Reader {
                 return Ok(Some(event));
             }
             let mut remaining = timeout.saturating_sub(started.elapsed());
-            if self.decoder.buffer == b"\x1b"
+            if (self.decoder.buffer == b"\x1b"
+                || (self.decoder.buffer.starts_with(b"\x1b]") && self.decoder.buffer.len() < 5))
                 && let Some(started) = self.decoder.escape_started
             {
                 remaining = remaining.min(escape_delay().saturating_sub(started.elapsed()));

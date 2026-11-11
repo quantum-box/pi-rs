@@ -16,6 +16,43 @@ impl Decoder {
             if self.buffer == b"\x1b" {
                 self.escape_started = Some(Instant::now());
             }
+            if self.buffer.starts_with(b"\x1b]") {
+                if self.buffer.len() > 256 {
+                    self.buffer.clear();
+                    self.escape_started = None;
+                    continue;
+                }
+                let prefix = b"\x1b]11;";
+                if prefix.starts_with(&self.buffer) {
+                    continue;
+                }
+                if self.buffer.starts_with(prefix) {
+                    if self.buffer.last() == Some(&7) || self.buffer.ends_with(b"\x1b\\") {
+                        if let Some((red, green, blue)) = parse_background(&self.buffer) {
+                            self.events.push_back(InputEvent::TerminalBackground {
+                                red,
+                                green,
+                                blue,
+                            });
+                        }
+                        self.buffer.clear();
+                        self.escape_started = None;
+                    }
+                    continue;
+                }
+                let remaining = self.buffer.split_off(2);
+                self.buffer.clear();
+                self.escape_started = None;
+                self.events
+                    .push_back(InputEvent::Event(crossterm::event::Event::Key(
+                        crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Char(']'),
+                            crossterm::event::KeyModifiers::ALT,
+                        ),
+                    )));
+                self.push(&remaining);
+                continue;
+            }
             match parse_event(&self.buffer, true) {
                 Ok(Some(event)) => {
                     self.events.push_back(event);
@@ -31,17 +68,40 @@ impl Decoder {
         }
     }
     pub(super) fn flush_escape(&mut self) {
-        if self.buffer == b"\x1b"
+        if self.buffer.starts_with(b"\x1b]11;")
             && self
                 .escape_started
-                .is_some_and(|start| start.elapsed() >= escape_delay())
+                .is_some_and(|start| start.elapsed() >= std::time::Duration::from_millis(500))
         {
+            self.buffer.clear();
+            self.escape_started = None;
+            return;
+        }
+        if self
+            .escape_started
+            .is_none_or(|start| start.elapsed() < escape_delay())
+        {
+            return;
+        }
+        if self.buffer == b"\x1b" {
             self.events
                 .push_back(InputEvent::Event(crossterm::event::Event::Key(
                     crossterm::event::KeyCode::Esc.into(),
                 )));
             self.buffer.clear();
             self.escape_started = None;
+        } else if self.buffer.starts_with(b"\x1b]") && self.buffer.len() < 5 {
+            let remaining = self.buffer.split_off(2);
+            self.buffer.clear();
+            self.escape_started = None;
+            self.events
+                .push_back(InputEvent::Event(crossterm::event::Event::Key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Char(']'),
+                        crossterm::event::KeyModifiers::ALT,
+                    ),
+                )));
+            self.push(&remaining);
         }
     }
     pub(super) fn next(&mut self) -> Option<InputEvent> {
@@ -55,6 +115,51 @@ impl Decoder {
         }
         None
     }
+}
+
+fn parse_background(buffer: &[u8]) -> Option<(u8, u8, u8)> {
+    let bytes = buffer.strip_prefix(b"\x1b]11;")?;
+    let bytes = bytes
+        .strip_suffix(b"\x07")
+        .or_else(|| bytes.strip_suffix(b"\x1b\\"))?;
+    let value = std::str::from_utf8(bytes).ok()?.trim();
+    let channels: Vec<&str> = if let Some(hex) = value.strip_prefix('#') {
+        match hex.len() {
+            6 => vec![hex.get(0..2)?, hex.get(2..4)?, hex.get(4..6)?],
+            12 => vec![hex.get(0..4)?, hex.get(4..8)?, hex.get(8..12)?],
+            _ => return None,
+        }
+    } else {
+        let prefix = value
+            .get(..5)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("rgba:"))
+            .map(|_| 5)
+            .or_else(|| {
+                value
+                    .get(..4)
+                    .filter(|prefix| prefix.eq_ignore_ascii_case("rgb:"))
+                    .map(|_| 4)
+            })
+            .unwrap_or(0);
+        let value = &value[prefix..];
+        value.split('/').take(3).collect()
+    };
+    if channels.len() != 3 {
+        return None;
+    }
+    let channel = |text: &str| {
+        if text.is_empty() || text.len() > 8 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let value = u32::from_str_radix(text, 16).ok()? as f64;
+        let maximum = (16_f64).powi(text.len() as i32) - 1.0;
+        Some((value / maximum * 255.0).round() as u8)
+    };
+    Some((
+        channel(channels[0])?,
+        channel(channels[1])?,
+        channel(channels[2])?,
+    ))
 }
 
 #[cfg(test)]
@@ -129,6 +234,47 @@ mod tests {
             matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char('b'))
         );
         assert!(decoder.next().is_none());
+    }
+
+    #[test]
+    fn background_replies_survive_fragmentation_and_alt_bracket_stays_a_key() {
+        let mut decoder = Decoder::default();
+        decoder.push(b"\x1b]11;rgb:ffff/0000/");
+        assert!(decoder.next().is_none());
+        decoder.push(b"8080\x1b\\a");
+        assert_eq!(
+            decoder.next(),
+            Some(InputEvent::TerminalBackground {
+                red: 255,
+                green: 0,
+                blue: 128
+            })
+        );
+        assert!(
+            matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char('a'))
+        );
+        decoder.push(b"\x1b]11;#aabbcc\x07");
+        assert_eq!(
+            decoder.next(),
+            Some(InputEvent::TerminalBackground {
+                red: 170,
+                green: 187,
+                blue: 204
+            })
+        );
+        decoder.push(b"\x1b]x");
+        assert!(
+            matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char(']') && key.modifiers == KeyModifiers::ALT)
+        );
+        assert!(
+            matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char('x'))
+        );
+        decoder.push(b"\x1b]");
+        decoder.escape_started = Some(Instant::now() - escape_delay());
+        decoder.flush_escape();
+        assert!(
+            matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char(']') && key.modifiers == KeyModifiers::ALT)
+        );
     }
 
     #[test]

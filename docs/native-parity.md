@@ -357,8 +357,9 @@ loading. Tests cover reader gating and custom-prompt precedence.
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
 diagnostic per changed file contents. A PTY check covers live updates and
-terminal restoration. System appearance discovery still needs terminal color
-query support.
+terminal restoration. System appearance discovery queries the terminal background using OSC 11 and
+updates light/dark theme selection when the response arrives. Foreground and
+palette-based system theme generation remain to be implemented.
 
 Markdown tables now calculate Unicode-aware column widths, preserve alignment,
 wrap cells, and use a stacked layout when a terminal cannot fit the columns.

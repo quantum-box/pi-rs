@@ -46,7 +46,10 @@ impl Reader {
         let timeout = self
             .decoder
             .escape_started
-            .filter(|_| self.decoder.buffer == b"\x1b")
+            .filter(|_| {
+                self.decoder.buffer == b"\x1b"
+                    || (self.decoder.buffer.starts_with(b"\x1b]") && self.decoder.buffer.len() < 5)
+            })
             .map_or(timeout, |start| {
                 timeout.min(escape_delay().saturating_sub(start.elapsed()))
             });

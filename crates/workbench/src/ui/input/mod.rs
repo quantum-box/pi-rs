@@ -14,6 +14,12 @@ pub enum InputEvent {
         dark: bool,
     },
     #[cfg(any(unix, windows))]
+    TerminalBackground {
+        red: u8,
+        green: u8,
+        blue: u8,
+    },
+    #[cfg(any(unix, windows))]
     CursorPosition(u16, u16),
     #[cfg(any(unix, windows))]
     KeyboardEnhancementFlags(crossterm::event::KeyboardEnhancementFlags),

@@ -9,10 +9,39 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 static APPEARANCE: AtomicU8 = AtomicU8::new(0);
+static TERMINAL_BACKGROUND: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(any(unix, windows))]
+pub fn reset_terminal_background() {
+    TERMINAL_BACKGROUND.store(0, Ordering::Relaxed);
+}
+
+#[cfg(any(unix, windows))]
+pub fn set_terminal_background(red: u8, green: u8, blue: u8) -> bool {
+    let linear = |channel: u8| {
+        let value = f64::from(channel) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
+    let dark = luminance <= 0.1791287847;
+    TERMINAL_BACKGROUND.store(if dark { 1 } else { 2 }, Ordering::Relaxed);
+    APPEARANCE.swap(if dark { 1 } else { 2 }, Ordering::Relaxed) != if dark { 1 } else { 2 }
+}
 
 #[cfg(any(unix, windows))]
 pub fn set_appearance(dark: bool) -> bool {
-    let value = if dark { 1 } else { 2 };
+    let background = TERMINAL_BACKGROUND.load(Ordering::Relaxed);
+    let value = if background != 0 {
+        background
+    } else if dark {
+        1
+    } else {
+        2
+    };
     APPEARANCE.swap(value, Ordering::Relaxed) != value
 }
 

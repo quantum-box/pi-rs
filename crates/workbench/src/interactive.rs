@@ -132,7 +132,13 @@ impl Terminal {
         #[cfg(unix)]
         execute!(std::io::stdout(), Print("\x1b[>7u\x1b[?u\x1b[c"))?;
         #[cfg(any(unix, windows))]
-        execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
+        {
+            crate::ui::theme::reset_terminal_background();
+            execute!(
+                std::io::stdout(),
+                Print("\x1b[?2031h\x1b[?996n\x1b]11;?\x07")
+            )?;
+        }
         Ok(guard)
     }
     fn update_progress(&mut self, active: bool) -> Result<()> {
@@ -2960,8 +2966,21 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 continue;
             }
             #[cfg(any(unix, windows))]
-            Some(crate::ui::input::InputEvent::Appearance { dark }) => {
-                if crate::ui::theme::set_appearance(dark) {
+            Some(
+                event @ (crate::ui::input::InputEvent::Appearance { .. }
+                | crate::ui::input::InputEvent::TerminalBackground { .. }),
+            ) => {
+                let changed = match event {
+                    crate::ui::input::InputEvent::Appearance { dark } => {
+                        execute!(std::io::stdout(), Print("\x1b]11;?\x07"))?;
+                        crate::ui::theme::set_appearance(dark)
+                    }
+                    crate::ui::input::InputEvent::TerminalBackground { red, green, blue } => {
+                        crate::ui::theme::set_terminal_background(red, green, blue)
+                    }
+                    _ => unreachable!(),
+                };
+                if changed {
                     let selection = args.use_theme.as_deref().unwrap_or("system");
                     if selection.contains('/') {
                         match Theme::load(
