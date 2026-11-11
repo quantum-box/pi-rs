@@ -77,7 +77,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -219,7 +219,7 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
                     &mut slave_fd,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size,
+                    std::ptr::addr_of_mut!(size),
                 )
             },
             0
@@ -558,7 +558,7 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -665,7 +665,7 @@ fn resume_selector_escape_cancels_with_redirected_stdio() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -750,7 +750,7 @@ fn settings_switches_terminal_modes_and_restores_input() {
                     &mut slave_fd,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size,
+                    std::ptr::addr_of_mut!(size),
                 )
             },
             0
@@ -882,7 +882,7 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -1022,7 +1022,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -1210,7 +1210,7 @@ fn thinking_model_discovery_can_be_cancelled_while_server_is_slow() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -1285,7 +1285,7 @@ fn save_default_model_persists_provider_and_extends_scope() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0

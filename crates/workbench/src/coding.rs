@@ -1414,7 +1414,10 @@ fn atomic_write(
     let parent = path
         .parent()
         .ok_or_else(|| Error::Config("file needs a parent".into()))?;
+    #[cfg(unix)]
     let mut builder = tempfile::Builder::new();
+    #[cfg(not(unix))]
+    let builder = tempfile::Builder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
