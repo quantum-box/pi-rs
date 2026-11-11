@@ -223,6 +223,51 @@ impl Settings {
         }
         Ok(())
     }
+
+    pub fn remove_user_member(&mut self, key: &str, member: &str) -> Result<()> {
+        let path = agent_dir().join("settings.json");
+        update_object(&path, |settings| {
+            if let Some(object) = settings.get_mut(key).and_then(Value::as_object_mut) {
+                object.remove(member);
+                if object.is_empty() {
+                    settings.remove(key);
+                }
+            }
+            validate_settings(&Value::Object(settings.clone()), &path)
+        })?;
+        if let Some((_, user)) = self.resource_layers.first_mut()
+            && let Some(settings) = user.as_object_mut()
+            && let Some(object) = settings.get_mut(key).and_then(Value::as_object_mut)
+        {
+            object.remove(member);
+            if object.is_empty() {
+                settings.remove(key);
+            }
+        }
+        let inherited = self
+            .resource_layers
+            .iter()
+            .skip(1)
+            .rev()
+            .find_map(|(_, layer)| layer.get(key)?.get(member).cloned());
+        if let Some(object) = self.value.get_mut(key).and_then(Value::as_object_mut) {
+            if let Some(value) = inherited {
+                object.insert(member.into(), value);
+            } else {
+                object.remove(member);
+            }
+        }
+        if self
+            .value
+            .get(key)
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+            && let Some(settings) = self.value.as_object_mut()
+        {
+            settings.remove(key);
+        }
+        Ok(())
+    }
     pub fn set_user(&mut self, key: &str, value: Value) -> Result<()> {
         let path = agent_dir().join("settings.json");
         std::fs::create_dir_all(path.parent().expect("agent directory"))?;

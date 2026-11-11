@@ -46,23 +46,38 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             "http://{}/v1/chat/completions",
             listener.local_addr().unwrap()
         );
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"models":[{"id":"test-fixture","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}}]}}}"#).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let (finish, finished) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let mut socket = loop {
-                let (mut socket, _) = listener.accept().unwrap();
+            let mut finished = Some(finished);
+            let mut streaming: Option<std::thread::JoinHandle<()>> = None;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline
+                && streaming.as_ref().is_none_or(|task| !task.is_finished())
+            {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                };
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut method = String::new();
+                if reader.read_line(&mut method).is_err() || method.is_empty() {
+                    continue;
+                }
                 let mut size = 0;
                 loop {
                     let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if method.is_empty() {
-                        method = line.clone();
-                    }
-                    if line == "\r\n" || line.is_empty() {
+                    if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
                         break;
                     }
                     if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
@@ -70,17 +85,32 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
                     }
                 }
                 if method.starts_with("GET ") {
-                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    let body = br#"{"data":[{"id":"test-fixture"}]}"#;
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(body);
                     continue;
                 }
                 let mut body = vec![0; size];
-                reader.read_exact(&mut body).unwrap();
-                break socket;
-            };
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"live-stream-marker\"},\"finish_reason\":null}]}\n\n").unwrap();
-            socket.flush().unwrap();
-            let _ = finished.recv_timeout(Duration::from_secs(30));
-            let _ = socket.write_all(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let Some(finished) = finished.take() else {
+                    continue;
+                };
+                streaming = Some(std::thread::spawn(move || {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"live-stream-marker\"},\"finish_reason\":null}]}\n\n").unwrap();
+                    socket.flush().unwrap();
+                    let _ = finished.recv_timeout(Duration::from_secs(45));
+                    let _ = socket.write_all(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+                }));
+            }
+            if let Some(task) = streaming {
+                task.join().unwrap();
+            }
         });
         let mut master_fd = -1;
         let mut slave_fd = -1;
@@ -181,6 +211,23 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         master
             .write_all(b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f")
             .unwrap();
+        let thinking_label = "Default thinking level per model";
+        master.write_all(thinking_label.as_bytes()).unwrap();
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains("Thinking: select model"));
+        master.write_all(b"ollama/test-fixture\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Thinking level · ollama/test-fixture") && text.contains("high")
+        });
+        master.write_all(b"high\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("ollama/test-fixture · high")
+        });
+        master.write_all(b"\x03").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Default thinking level per model") && text.contains("1 configured")
+        });
+        master.write_all(&vec![0x7f; thinking_label.len()]).unwrap();
         master.write_all(b"Edit shellPath\r").unwrap();
         output_until(&mut master, |text| text.contains("Edit shellPath as JSON"));
         master.write_all(b"\x1b").unwrap();
@@ -199,9 +246,31 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         assert_eq!(settings["httpIdleTimeoutMs"], 30_000);
         assert_eq!(settings["steeringMode"], "all");
         assert_eq!(settings["followUpMode"], "all");
+        assert_eq!(
+            settings["modelThinkingLevels"]["ollama/test-fixture"],
+            "high"
+        );
         assert_eq!(settings["shellPath"], "");
         finish.send(()).unwrap();
         server.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(session) = pi_rs::Session::snapshot(&session_path)
+                && session.model_selection().is_some_and(|(model, level)| {
+                    model == "test-fixture" && level.as_deref() == Some("high")
+                })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "thinking level was not saved after streaming completed: {}",
+                std::fs::read_to_string(&session_path).unwrap_or_default()
+            );
+            let mut buffer = [0; 8192];
+            let _ = master.read(&mut buffer);
+            std::thread::sleep(Duration::from_millis(20));
+        }
         master.write_all(b"\x1b/quit\r").unwrap();
     }
 }
@@ -810,4 +879,252 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
         text.contains("Theme · system/dark") && text.contains("to change")
     });
     assert_eq!(read_theme(), "system/dark");
+}
+
+#[test]
+fn settings_choose_and_clear_per_model_thinking() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let session_path = root.path().join("session.jsonl");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        br#"{"defaultThinkingLevel":"low"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+    std::fs::write(
+        root.path().join(".pi/settings.json"),
+        br#"{"modelThinkingLevels":{"ollama/fixture-model":"low"}}"#,
+    )
+    .unwrap();
+    std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"models":[{"id":"fixture-model","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}},{"id":"plain-model","reasoning":false}]}}}"#).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--session",
+                session_path.to_str().unwrap(),
+                "--trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture-model",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/settings\r").unwrap();
+    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    master
+        .write_all(b"Default thinking level per model\r")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("Thinking: select model"));
+    master.write_all(b"ollama/fixture-model\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Thinking level · ollama/fixture-model") && text.contains("high")
+    });
+    master.write_all(b"high\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("ollama/fixture-model · high")
+    });
+    let read_settings = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap()
+    };
+    assert_eq!(
+        read_settings()["modelThinkingLevels"]["ollama/fixture-model"],
+        "high"
+    );
+    let wait_level = |expected: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(session) = pi_rs::Session::snapshot(&session_path)
+                && session.model_selection().is_some_and(|(model, level)| {
+                    model == "fixture-model" && level.as_deref() == Some(expected)
+                })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "thinking level was not applied to the session"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_level("high");
+    master.write_all(b"\x03").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Default thinking level per model") && text.contains("1 configured")
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| text.contains("Thinking: select model"));
+    master.write_all(b"ollama/fixture-model").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("ollama/fixture-model · high")
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Clear override · use default")
+    });
+    master.write_all(b"Clear\r").unwrap();
+    output_until(&mut master, |text| text.contains("Thinking: select model"));
+    assert!(read_settings().get("modelThinkingLevels").is_none());
+    wait_level("low");
+    master
+        .write_all(&vec![0x7f; "ollama/fixture-model".len()])
+        .unwrap();
+    master.write_all(b"ollama/plain-model\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Thinking level · ollama/plain-model") && text.contains("off")
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("ollama/plain-model · off")
+    });
+    assert_eq!(
+        read_settings()["modelThinkingLevels"]["ollama/plain-model"],
+        "off"
+    );
+    wait_level("low");
+    master.write_all(b"\x03").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Default thinking level per model") && text.contains("2 configured")
+    });
+}
+
+#[test]
+fn thinking_model_discovery_can_be_cancelled_while_server_is_slow() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let (accepted, connected) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break Some(socket),
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => break None,
+            }
+        };
+        if let Some(socket) = socket {
+            let _ = accepted.send(());
+            let _ = gate.recv_timeout(Duration::from_secs(10));
+            drop(socket);
+        }
+    });
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/settings\r").unwrap();
+    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    master
+        .write_all(b"Default thinking level per model\r")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("Loading thinking models"));
+    connected.recv_timeout(Duration::from_secs(5)).unwrap();
+    let start = Instant::now();
+    master.write_all(b"\x03").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Default thinking level per model") && text.contains("to change")
+    });
+    assert!(start.elapsed() < Duration::from_secs(3));
+    release.send(()).unwrap();
+    server.join().unwrap();
 }

@@ -29,6 +29,8 @@ pub enum Selection {
     LogoutRadius,
     Theme(String),
     ThemeSettings(ThemeSettingsAction),
+    ThinkingModel(String),
+    ThinkingOverride(Option<String>),
     Trust(bool),
     Thinking(String),
     Setting(String, serde_json::Value),
@@ -222,6 +224,27 @@ impl Picker {
         if let Some(index) = self.matches().iter().position(|item| matches!(&item.selection, Selection::ThemeSettings(ThemeSettingsAction::Pick(value)) if value == name)) {
             self.selected = index;
         }
+    }
+
+    pub fn refresh_thinking_models(&mut self, items: Vec<Item>) {
+        let selected = match self.selected() {
+            Some(Selection::ThinkingModel(name)) => Some(name),
+            _ => None,
+        };
+        self.items = items;
+        self.selected = selected.and_then(|name| self.matches().iter().position(|item| matches!(&item.selection, Selection::ThinkingModel(model) if model == &name))).unwrap_or(0);
+    }
+
+    pub fn focus_thinking_model(&mut self, model: &str) {
+        if let Some(index) = self.matches().iter().position(
+            |item| matches!(&item.selection, Selection::ThinkingModel(name) if name == model),
+        ) {
+            self.selected = index;
+        }
+    }
+
+    pub fn focus_thinking_level(&mut self, level: Option<&str>) {
+        if let Some(index) = self.matches().iter().position(|item| matches!(&item.selection, Selection::ThinkingOverride(value) if value.as_deref() == level)) { self.selected = index; }
     }
 
     pub fn refresh_settings(&mut self, items: Vec<Item>) {
@@ -514,7 +537,10 @@ impl Picker {
                         &query,
                         label.split(" · ").next().unwrap_or(&label),
                     )
-                } else if self.active_session.is_some() || self.model_scope.is_some() {
+                } else if self.active_session.is_some()
+                    || self.model_scope.is_some()
+                    || self.title == "Thinking: select model"
+                {
                     crate::model_selection::fuzzy(&query, &label)
                 } else {
                     label.contains(&query)

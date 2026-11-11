@@ -50,6 +50,10 @@ trust and fullscreen wheel speed can also be cycled directly in the list.
 The theme submenu previews the highlighted theme, restores the original on
 cancel, and configures either a single theme or separate light/dark themes for
 automatic terminal-appearance switching.
+The per-model thinking submenu discovers models and their supported levels off
+the terminal thread, saves or clears individual overrides, and preserves other
+user and trusted-project settings. Changes for the active model update the
+session; when an agent run is in progress, they take effect after that run.
 
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |

@@ -397,11 +397,28 @@ enum ModelListIntent {
     Select,
     Cycle { reverse: bool },
     Scope,
+    ThinkingSettings,
 }
 
 struct ModelDiscovery {
     receiver: std::sync::mpsc::Receiver<Result<Vec<String>>>,
     intent: ModelListIntent,
+}
+
+struct ThinkingSettings {
+    parent: Picker,
+    models: Vec<String>,
+    model_picker: Option<Picker>,
+    selected: Option<String>,
+    levels: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    available_levels: Vec<String>,
+}
+
+struct PendingThinking {
+    session: PathBuf,
+    provider: Option<String>,
+    model: String,
+    level: String,
 }
 
 enum RemoteEvent {
@@ -487,6 +504,8 @@ struct View {
     lines: Vec<Entry>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
+    thinking_settings: Option<ThinkingSettings>,
+    pending_thinking: Option<PendingThinking>,
     session_name: Option<String>,
     resources: super::resources::Resources,
     model_list: Option<ModelDiscovery>,
@@ -3039,7 +3058,17 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         {
             worker.take();
         }
-        if view.picker.is_none()
+        if !is_busy(&worker)
+            && let Some(pending) = &view.pending_thinking
+            && persist_pending_thinking(pending).is_ok()
+        {
+            view.pending_thinking = None;
+        }
+        if (view.picker.is_none()
+            || view
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.title == "Loading thinking models"))
             && view.dialog().is_none()
             && let Some(discovery) = &view.model_list
         {
@@ -3048,9 +3077,31 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 Ok(Ok(models)) => {
                     view.model_list = None;
                     if models.is_empty() {
-                        view.append("No models available");
+                        if let Some(mut state) = view.thinking_settings.take() {
+                            state
+                                .parent
+                                .show_feedback(Err("No models available".into()));
+                            view.picker = Some(state.parent);
+                        } else {
+                            view.append("No models available");
+                        }
                     } else {
                         match intent {
+                            ModelListIntent::ThinkingSettings => {
+                                let state =
+                                    view.thinking_settings.as_mut().expect("thinking settings");
+                                state.models = models;
+                                let mut picker = Picker::new(
+                                    "Thinking: select model",
+                                    thinking_model_items(&state.models, &args),
+                                );
+                                picker.focus_thinking_model(&format!(
+                                    "{}/{}",
+                                    args.provider.id(),
+                                    args.model
+                                ));
+                                view.picker = Some(picker);
+                            }
                             ModelListIntent::Scope => {
                                 let enabled = if args.model_scope.is_empty() {
                                     models.clone()
@@ -3101,11 +3152,50 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 }
                 Ok(Err(error)) => {
                     view.model_list = None;
-                    view.append(&error.to_string());
+                    if let Some(mut state) = view.thinking_settings.take() {
+                        state.parent.show_feedback(Err(error.to_string()));
+                        view.picker = Some(state.parent);
+                    } else {
+                        view.append(&error.to_string());
+                    }
                     dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     view.model_list = None;
+                    if let Some(mut state) = view.thinking_settings.take() {
+                        state
+                            .parent
+                            .show_feedback(Err("Model discovery stopped".into()));
+                        view.picker = Some(state.parent);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if view
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.title == "Loading thinking levels")
+            && let Some(state) = &mut view.thinking_settings
+            && let Some(receiver) = &state.levels
+        {
+            match receiver.try_recv() {
+                Ok(mut levels) => {
+                    if levels.is_empty() {
+                        levels.push("off".into());
+                    }
+                    levels.dedup();
+                    state.available_levels = levels;
+                    state.levels = None;
+                    view.picker = Some(thinking_level_picker(state, &args));
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    state.levels = None;
+                    let mut picker = state.model_picker.take().expect("model picker");
+                    picker.show_feedback(Err("Thinking level discovery stopped".into()));
+                    view.picker = Some(picker);
+                    dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -3593,6 +3683,25 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             view.picker = Some(picker);
                         }
                         Input::Cancel => {
+                            if let Some(mut state) = view.thinking_settings.take() {
+                                if let Some(model_picker) = state.model_picker.take() {
+                                    state.levels = None;
+                                    state.selected = None;
+                                    view.picker = Some(model_picker);
+                                    view.thinking_settings = Some(state);
+                                } else {
+                                    if picker.title == "Loading thinking models" {
+                                        view.model_list = None;
+                                    }
+                                    state.parent.refresh_settings(settings_items(
+                                        &args,
+                                        &view,
+                                        worker.as_ref(),
+                                    ));
+                                    view.picker = Some(state.parent);
+                                }
+                                continue;
+                            }
                             if let Some(mut settings) = view.theme_settings.take() {
                                 match settings.stage {
                                     ThemeSettingsStage::Single => {
@@ -3692,6 +3801,126 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 let theme_settings = ThemeSettings::new(picker, &args, &theme);
                                 view.picker = Some(theme_settings.picker(&args));
                                 view.theme_settings = Some(theme_settings);
+                                continue;
+                            }
+                            if settings
+                                && matches!(&selection, Selection::EditSetting(name) if name == "modelThinkingLevels")
+                            {
+                                if view.model_list.is_some() {
+                                    picker.show_feedback(Err(
+                                        "Model discovery is already in progress".into(),
+                                    ));
+                                    view.picker = Some(picker);
+                                } else {
+                                    view.thinking_settings = Some(ThinkingSettings {
+                                        parent: picker,
+                                        models: Vec::new(),
+                                        model_picker: None,
+                                        selected: None,
+                                        levels: None,
+                                        available_levels: Vec::new(),
+                                    });
+                                    start_model_picker(
+                                        &args,
+                                        &mut view,
+                                        ModelListIntent::ThinkingSettings,
+                                    );
+                                    view.picker =
+                                        Some(Picker::new("Loading thinking models", Vec::new()));
+                                }
+                                continue;
+                            }
+                            if let Selection::ThinkingModel(model) = &selection {
+                                match start_thinking_levels(&args, model) {
+                                    Ok(receiver) => {
+                                        let state = view
+                                            .thinking_settings
+                                            .as_mut()
+                                            .expect("thinking settings picker");
+                                        state.selected = Some(model.clone());
+                                        state.levels = Some(receiver);
+                                        state.model_picker = Some(picker);
+                                        view.picker = Some(Picker::new(
+                                            "Loading thinking levels",
+                                            Vec::new(),
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        picker.show_feedback(Err(error.to_string()));
+                                        view.picker = Some(picker);
+                                    }
+                                }
+                                continue;
+                            }
+                            if let Selection::ThinkingOverride(level) = &selection {
+                                let mut state = view
+                                    .thinking_settings
+                                    .take()
+                                    .expect("thinking settings picker");
+                                let model =
+                                    state.selected.as_deref().expect("selected thinking model");
+                                let result = if let Some(level) = level {
+                                    args.settings.set_user_member(
+                                        "modelThinkingLevels",
+                                        model,
+                                        json!(level),
+                                    )
+                                } else {
+                                    args.settings
+                                        .remove_user_member("modelThinkingLevels", model)
+                                };
+                                match result {
+                                    Ok(()) => {
+                                        if let Some((provider, id)) =
+                                            super::model_selection::qualified_model(
+                                                model,
+                                                &args.model_profiles,
+                                            )
+                                            && provider == args.provider
+                                            && id == args.model
+                                        {
+                                            let requested = args
+                                                .settings
+                                                .thinking_for_model(provider.id(), id)
+                                                .unwrap_or("medium");
+                                            let effective = super::thinking::clamp(
+                                                requested,
+                                                &state.available_levels,
+                                            )
+                                            .to_owned();
+                                            args.thinking_profile = Some((
+                                                args.model.clone(),
+                                                state.available_levels.clone(),
+                                            ));
+                                            args.thinking = Some(effective.clone());
+                                            view.pending_thinking = Some(PendingThinking {
+                                                session: args.session.clone(),
+                                                provider: args
+                                                    .recorded_provider()
+                                                    .map(str::to_owned),
+                                                model: args.model.clone(),
+                                                level: effective,
+                                            });
+                                            if is_busy(&worker) {
+                                                view.flash = Some(("Thinking level applies after the current response".into(), Instant::now()));
+                                            }
+                                        }
+                                        let mut models =
+                                            state.model_picker.take().expect("model picker");
+                                        models.refresh_thinking_models(thinking_model_items(
+                                            &state.models,
+                                            &args,
+                                        ));
+                                        state.selected = None;
+                                        view.picker = Some(models);
+                                        view.thinking_settings = Some(state);
+                                    }
+                                    Err(error) => {
+                                        picker.show_feedback(Err(error.to_string()));
+                                        view.picker = Some(picker);
+                                        view.thinking_settings = Some(state);
+                                    }
+                                }
                                 continue;
                             }
                             if let Selection::ThemeSettings(action) = selection {
@@ -4196,6 +4425,9 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         }
     }
     drop(worker);
+    if let Some(pending) = view.pending_thinking.take() {
+        persist_pending_thinking(&pending)?;
+    }
     if args.tui_mode == Some(TuiMode::Regular) {
         view.finish_regular()?;
     }
@@ -4225,6 +4457,14 @@ fn is_busy(worker: &Option<Worker>) -> bool {
     worker
         .as_ref()
         .is_some_and(|worker| worker.busy || worker.bashing)
+}
+
+fn persist_pending_thinking(pending: &PendingThinking) -> Result<()> {
+    Session::open(&pending.session)?.select_provider_model(
+        pending.provider.as_deref(),
+        &pending.model,
+        Some(&pending.level),
+    )
 }
 
 fn start_prompt(
@@ -4404,8 +4644,12 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let catalogs = runtime.block_on(super::model_selection::catalogs(&args, false))?;
-            Ok(catalogs
+            let catalogs = match runtime.block_on(super::model_selection::catalogs(&args, false)) {
+                Ok(catalogs) => catalogs,
+                Err(_) if matches!(intent, ModelListIntent::ThinkingSettings) => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            let mut models: Vec<_> = catalogs
                 .into_iter()
                 .flat_map(|catalog| {
                     catalog
@@ -4413,7 +4657,13 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
                         .into_iter()
                         .map(move |model| format!("{}/{model}", catalog.provider.id()))
                 })
-                .collect())
+                .collect();
+            if matches!(intent, ModelListIntent::ThinkingSettings) {
+                let current = format!("{}/{}", args.provider.id(), args.model);
+                models.retain(|model| model != &current);
+                models.insert(0, current);
+            }
+            Ok(models)
         })();
         let _ = sender.send(result);
     });
@@ -4639,6 +4889,74 @@ impl ThemeSettings {
     }
 }
 
+fn thinking_model_items(models: &[String], args: &Cli) -> Vec<Item> {
+    models
+        .iter()
+        .map(|model| {
+            let override_level = args.settings.value()["modelThinkingLevels"]
+                .get(model)
+                .and_then(Value::as_str);
+            Item {
+                label: override_level
+                    .map_or_else(|| model.clone(), |level| format!("{model} · {level}")),
+                selection: Selection::ThinkingModel(model.clone()),
+            }
+        })
+        .collect()
+}
+
+fn thinking_level_picker(state: &ThinkingSettings, args: &Cli) -> Picker {
+    let model = state.selected.as_deref().expect("selected model");
+    let selected = args.settings.value()["modelThinkingLevels"]
+        .get(model)
+        .and_then(Value::as_str);
+    let mut items: Vec<_> = state
+        .available_levels
+        .iter()
+        .map(|level| Item {
+            label: format!(
+                "{} {level}",
+                if selected == Some(level.as_str()) {
+                    "✓"
+                } else {
+                    " "
+                }
+            ),
+            selection: Selection::ThinkingOverride(Some(level.clone())),
+        })
+        .collect();
+    if selected.is_some() {
+        items.push(Item {
+            label: "Clear override · use default".into(),
+            selection: Selection::ThinkingOverride(None),
+        });
+    }
+    let mut picker = Picker::new(&format!("Thinking level · {model}"), items);
+    picker.focus_thinking_level(selected);
+    picker
+}
+
+fn start_thinking_levels(
+    args: &Cli,
+    model: &str,
+) -> Result<std::sync::mpsc::Receiver<Vec<String>>> {
+    let (provider, id) = super::model_selection::qualified_model(model, &args.model_profiles)
+        .ok_or_else(|| Error::Config("Unknown model provider".into()))?;
+    let mut selected = args.clone();
+    selected.provider = provider;
+    selected.model = id.into();
+    selected.thinking_profile = None;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let levels = super::thinking::available(&mut selected)
+            .into_iter()
+            .filter(|level| super::thinking::LEVELS.contains(&level.as_str()))
+            .collect();
+        let _ = sender.send(levels);
+    });
+    Ok(receiver)
+}
+
 fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
     let cache_mode = args.settings.string("cacheWarming").unwrap_or("streaming");
     let next_cache_mode = match cache_mode {
@@ -4697,6 +5015,15 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         Item {
             label: format!("Theme · {}", args.use_theme.as_deref().unwrap_or("system")),
             selection: Selection::EditSetting("theme".into()),
+        },
+        Item {
+            label: format!(
+                "Default thinking level per model · {} configured",
+                args.settings.value()["modelThinkingLevels"]
+                    .as_object()
+                    .map_or(0, |levels| levels.len())
+            ),
+            selection: Selection::EditSetting("modelThinkingLevels".into()),
         },
         Item {
             label: format!(
@@ -5058,7 +5385,6 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
     for name in [
         "defaultModel",
         "defaultThinkingLevel",
-        "modelThinkingLevels",
         "httpProxy",
         "sessionDir",
         "shellPath",
@@ -5359,6 +5685,11 @@ fn select(
                 "theme settings require the interactive selector".into(),
             ));
         }
+        Selection::ThinkingModel(_) | Selection::ThinkingOverride(_) => {
+            return Err(Error::Config(
+                "thinking settings require the interactive selector".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -5617,6 +5948,28 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thinking_model_picker_keeps_current_model_when_discovery_fails() {
+        use clap::Parser;
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.model = "offline-fixture".into();
+        args.endpoint = "http://127.0.0.1:1/v1/chat/completions".into();
+        args.offline = true;
+        let mut view = super::View::default();
+        super::start_model_picker(&args, &mut view, super::ModelListIntent::ThinkingSettings);
+        let models = view
+            .model_list
+            .as_ref()
+            .unwrap()
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            models.first().map(String::as_str),
+            Some("ollama/offline-fixture")
+        );
+    }
     #[test]
     fn theme_settings_previews_selection_without_changing_original() {
         use clap::Parser;

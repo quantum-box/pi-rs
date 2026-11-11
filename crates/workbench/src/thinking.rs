@@ -70,7 +70,7 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     }
 }
 
-fn clamp<'a>(requested: &str, levels: &'a [String]) -> &'a str {
+pub(super) fn clamp<'a>(requested: &str, levels: &'a [String]) -> &'a str {
     if let Some(level) = levels.iter().find(|level| *level == requested) {
         return level;
     }
