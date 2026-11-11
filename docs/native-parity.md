@@ -89,6 +89,10 @@ message has no text or the transcript has no eligible assistant message.
 either command to receive the new `sessionFile` in the same response. The
 path is also available via `get_state` after the transition.
 
+`get_state` omits an unset session name. For `--no-session`,
+`get_state` and `get_session_stats` omit the session file unless the request
+sets `includeNative: true` to inspect the temporary journal.
+
 The message snapshot preserves imported Pi roles, timestamps, and extension
 message details. Context edits replace the affected content in the snapshot.
 Imported Gemini conversations carry signed text, thought, and function parts

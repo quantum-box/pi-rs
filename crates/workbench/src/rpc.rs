@@ -804,7 +804,10 @@ pub(super) fn snapshot_command(name: &str) -> bool {
 }
 
 fn state_flags(args: &Cli, worker: &Option<Worker>) -> Result<Value> {
-    let mut state = json!({"sessionFile":args.session,"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.bashing),"model":model_value(args, &args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+    let mut state = json!({"isStreaming":worker.as_ref().is_some_and(|worker| worker.busy && !worker.compacting && !worker.retrying),"isCompacting":worker.as_ref().is_some_and(|worker| worker.busy && worker.compacting),"isBashRunning":worker.as_ref().is_some_and(|worker| worker.bashing),"model":model_value(args, &args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off")});
+    if !args.no_session {
+        state["sessionFile"] = json!(args.session);
+    }
     state["autoCompactionEnabled"] = json!(args.settings.auto_compaction_enabled());
     state["steeringMode"] = json!(
         worker
@@ -839,7 +842,12 @@ pub(super) fn snapshot_response(
             state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
             state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
             state["sessionId"] = json!(session.session_id());
-            state["sessionName"] = json!(session.name());
+            if let Some(name) = session.name() {
+                state["sessionName"] = json!(name);
+            }
+            if request["includeNative"] == true && state.get("sessionFile").is_none() {
+                state["sessionFile"] = json!(path);
+            }
             state["messageCount"] = json!(super::rpc_messages::count(session));
             state["pendingMessageCount"] = json!(session.queued_inputs().len());
             if let Some(pending) = pending {
@@ -898,7 +906,9 @@ pub(super) fn snapshot_response(
             if operations.measured() {
                 stats["operationUsage"] = serde_json::to_value(operations)?;
             }
-            stats["sessionFile"] = json!(path);
+            if state.get("sessionFile").is_some() || request["includeNative"] == true {
+                stats["sessionFile"] = json!(path);
+            }
             if let Some(usage) = context_window.and_then(|window| session.context_usage(window)) {
                 stats["contextUsage"] = serde_json::to_value(usage)?;
             }

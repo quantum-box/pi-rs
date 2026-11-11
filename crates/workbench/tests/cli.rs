@@ -23,6 +23,8 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
         r#"{"id":"state","type":"get_state"}"#,
         r#"{"id":"new","type":"new_session"}"#,
         r#"{"id":"unknown","type":"unsupported"}"#,
+        r#"{"id":"stats","type":"get_session_stats"}"#,
+        r#"{"id":"native","type":"get_state","includeNative":true}"#,
         r#"{"id":"stop","type":"shutdown"}"#,
     ] {
         writeln!(stdin, "{request}").unwrap();
@@ -39,13 +41,19 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 4);
+    assert_eq!(replies.len(), 6);
     assert_eq!(replies[0]["id"], "state");
     assert_eq!(replies[0]["data"]["isStreaming"], false);
+    assert!(replies[0]["data"].get("sessionFile").is_none());
+    assert!(replies[0]["data"].get("sessionName").is_none());
     assert_eq!(replies[1]["success"], true);
     assert_eq!(replies[2]["id"], "unknown");
     assert_eq!(replies[2]["success"], false);
-    assert_eq!(replies[3]["id"], "stop");
+    assert_eq!(replies[3]["id"], "stats");
+    assert!(replies[3]["data"].get("sessionFile").is_none());
+    assert_eq!(replies[4]["id"], "native");
+    assert!(replies[4]["data"]["sessionFile"].is_string());
+    assert_eq!(replies[5]["id"], "stop");
 }
 
 #[test]
