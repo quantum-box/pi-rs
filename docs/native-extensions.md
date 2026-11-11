@@ -73,6 +73,26 @@ Rust callback and is not applied to user `!` commands. Use
 Custom user-shell operations receive the configured command prefix at execution
 time while the event and recorded transcript retain the original user command.
 
+Native extensions can call `pi_rs_extensions::exec_command` to execute a
+program directly with literal arguments, separate stdout and stderr, an optional
+working directory and timeout, cancellation, and a combined output cap. It
+returns the exit code, termination and truncation status. The helper is available
+to in-process and separately built executable extensions. It does not invoke a
+shell; request one explicitly when shell syntax is needed.
+
+```rust,ignore
+let result = pi_rs_extensions::exec_command(
+    "git",
+    &["status".into(), "--short".into()],
+    &workspace,
+    &pi_rs_extensions::ExecOptions {
+        timeout: Some(std::time::Duration::from_secs(10)),
+        cancellation: Some(cancel.clone()),
+        ..Default::default()
+    },
+).await?;
+```
+
 To observe model or thinking-level changes, implement `handles_lifecycle` and
 `handles_model_selection` and handle `LifecycleEvent::ModelSelect` and
 `LifecycleEvent::ThinkingLevelSelect`. Terminal and RPC selection commands
