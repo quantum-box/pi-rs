@@ -326,8 +326,15 @@ pub fn html(session: &Session) -> String {
     let mut html = format!(
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\"><title>{title}</title><style>body{{max-width:960px;margin:40px auto;padding:0 20px;font:16px system-ui;background:#16181d;color:#e4e6eb}}article,details{{padding:16px;margin:12px 0;border-radius:8px;background:#252932}}.user{{background:#243448}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}}summary{{cursor:pointer}}.thinking{{color:#a5abb6}}h1{{font-size:24px}}</style><h1>{title}</h1>"
     );
+    let mut imported_assistant = None;
     for record in session.branch() {
         match &record.event {
+            Event::SourceEntry { format, entry } => {
+                imported_assistant = (format == "pi"
+                    && entry["type"] == "message"
+                    && entry["message"]["role"] == "assistant")
+                    .then_some(&entry["message"]);
+            }
             Event::User { content, .. } => render_user_html(&mut html, content, &[]),
             Event::UserWithImages {
                 content, images, ..
@@ -350,13 +357,49 @@ pub fn html(session: &Session) -> String {
                         escape(&invocation.call.arguments)
                     ));
                 }
+                if let Some(message) = imported_assistant.take() {
+                    match message["stopReason"].as_str() {
+                        Some("aborted") => render_export_failure(&mut html, "Aborted"),
+                        Some("error") => render_export_failure(
+                            &mut html,
+                            &format!(
+                                "Error: {}",
+                                message["errorMessage"]
+                                    .as_str()
+                                    .filter(|text| !text.is_empty())
+                                    .unwrap_or("Unknown error")
+                            ),
+                        ),
+                        _ => {}
+                    }
+                }
             }
             Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => {
                 html.push_str(&tool_html(outcome))
             }
-            Event::ModelFinished { metadata, .. } => {
-                if let Some(reasoning) = &metadata.reasoning {
+            Event::ModelFinished {
+                metadata,
+                failure,
+                partial,
+                ..
+            } => {
+                if let Some(reasoning) = &metadata.reasoning
+                    && !reasoning.trim().is_empty()
+                {
                     html.push_str(&format!("<details class=\"thinking\"><summary>Thinking</summary><pre>{}</pre></details>", escape(reasoning)));
+                }
+                if let Some(failure) = failure {
+                    if !partial.trim().is_empty() {
+                        html.push_str("<article><b>Pi</b>");
+                        render_export_markdown(&mut html, partial);
+                        html.push_str("</article>");
+                    }
+                    let status = match failure {
+                        pi_rs::ModelFailure::Cancelled => "Aborted",
+                        pi_rs::ModelFailure::Retryable => "Error: Model request failed temporarily",
+                        pi_rs::ModelFailure::Failed => "Error: Model request failed",
+                    };
+                    render_export_failure(&mut html, status);
                 }
             }
             Event::Compacted { summary, .. } | Event::BranchSummary { summary, .. } => {
@@ -374,6 +417,13 @@ pub fn html(session: &Session) -> String {
     }
     html.push_str("</html>");
     html
+}
+
+fn render_export_failure(html: &mut String, status: &str) {
+    html.push_str(&format!(
+        "<div class=\"error-text\">{}</div>",
+        escape(status)
+    ));
 }
 
 fn render_user_html(html: &mut String, content: &str, images: &[pi_rs::ImageContent]) {
@@ -840,6 +890,28 @@ mod tests {
         import(&exported, &imported).unwrap();
         assert_eq!(Session::open(imported).unwrap().name(), session.name());
     }
+    #[test]
+    fn html_displays_imported_assistant_stop_reasons() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{
+                "role":"assistant","content":[{"type":"text","text":"**partial**"}],"stopReason":"aborted"
+            }}),
+            serde_json::json!({"type":"message","id":"b","parentId":"a","message":{
+                "role":"assistant","content":[],"stopReason":"error","errorMessage":"<script>error</script>"
+            }}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(fixture.path()).unwrap();
+        let document = html(&session);
+        assert!(document.contains("<strong>partial</strong>"));
+        assert!(document.contains("<div class=\"error-text\">Aborted</div>"));
+        assert!(document.contains("Error: &lt;script&gt;error&lt;/script&gt;"));
+        assert!(!document.contains("<script>"));
+    }
+
     #[test]
     fn html_keeps_skill_body_folded_and_escapes_untrusted_text() {
         let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();

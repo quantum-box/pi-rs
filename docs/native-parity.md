@@ -183,6 +183,8 @@ the fold. Skill content, conversation messages, and branch and compaction
 summaries render as Markdown.
 Raw HTML is escaped, and Markdown images leave their alt text without loading
 external image sources.
+HTML exports show aborted and failed model requests and preserve any partial
+answer. Imported Pi assistant errors retain their original message text.
 Prompt-template arguments preserve literal backslashes and quoted empty
 values. Positional arguments, defaults and slices use Pi's placeholder
 syntax and expand only once.
