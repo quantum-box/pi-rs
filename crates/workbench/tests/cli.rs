@@ -11,6 +11,108 @@ use serde_json::{Value, json};
 
 #[cfg(unix)]
 #[test]
+fn executable_extension_commands_persist_custom_entries_without_model_messages() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("bookmark.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'bookmark', 'dependencies':[], 'commands':['bookmark'], 'tools':[], 'command_entries':True}
+elif request['type'] == 'command_output':
+    result = {'entries':[{'customType':'bookmark', 'data':{'note':request['arguments']}}]}
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session = root.path().join("session.jsonl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut until = |predicate: &dyn Fn(&Value) -> bool| loop {
+        let event = receive
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("RPC event timed out: {error}");
+            });
+        if predicate(&event) {
+            break event;
+        }
+    };
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"bookmark", "type":"prompt", "message":"/bookmark remember this"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let response = until(&|event| event["type"] == "response" && event["id"] == "bookmark");
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["data"]["disposition"], "handled");
+    writeln!(input, "{}", json!({"id":"entries", "type":"get_entries"})).unwrap();
+    input.flush().unwrap();
+    let response = until(&|event| event["type"] == "response" && event["id"] == "entries");
+    assert!(
+        response["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["type"] == "custom"
+                && entry["customType"] == "bookmark"
+                && entry["data"]["note"] == "remember this")
+    );
+    writeln!(input, "{}", json!({"id":"messages", "type":"get_messages"})).unwrap();
+    input.flush().unwrap();
+    let response = until(&|event| event["type"] == "response" && event["id"] == "messages");
+    assert!(response["data"]["messages"].as_array().unwrap().is_empty());
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let reopened = Session::snapshot(&session).unwrap();
+    assert!(reopened.branch().iter().any(|record| matches!(&record.event, pi_rs::Event::CustomEntry { entry } if entry.custom_type == "bookmark" && entry.data.as_ref().unwrap()["note"] == "remember this")));
+    assert!(reopened.current_messages().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn rpc_streaming_shell_operations_deliver_output_and_cancel() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();

@@ -11,6 +11,33 @@ use crate::{
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
 
+/// Branch-local extension data that is not sent to the model.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomEntry {
+    pub custom_type: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_json"
+    )]
+    pub data: Option<Value>,
+}
+
+fn deserialize_present_json<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExtensionCommandOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ExtensionState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<CustomEntry>,
+}
+
 /// Why the host is asking an extension for temporary resource paths.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -327,6 +354,25 @@ pub trait Extension: Send + Sync {
         _previous: Option<&ExtensionState>,
     ) -> ExtensionResult<ExtensionState> {
         Err("extension command unavailable".into())
+    }
+
+    /// Opt in to returning branch-local custom entries from commands.
+    fn supports_command_entries(&self) -> bool {
+        false
+    }
+
+    /// The default preserves the existing state-only command contract.
+    fn command_output(
+        &self,
+        name: &str,
+        arguments: &str,
+        previous: Option<&ExtensionState>,
+    ) -> ExtensionResult<ExtensionCommandOutput> {
+        self.command(name, arguments, previous)
+            .map(|state| ExtensionCommandOutput {
+                state: Some(state),
+                entries: Vec::new(),
+            })
     }
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
@@ -1049,6 +1095,23 @@ pub(crate) fn hook<T>(extension: &dyn Extension, result: ExtensionResult<T>) -> 
 mod replacement_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn custom_entry_distinguishes_missing_data_from_json_null() {
+        let missing: CustomEntry = serde_json::from_value(json!({"customType":"x"})).unwrap();
+        let null: CustomEntry =
+            serde_json::from_value(json!({"customType":"x", "data":null})).unwrap();
+        assert!(missing.data.is_none());
+        assert_eq!(null.data, Some(Value::Null));
+        assert!(serde_json::to_value(missing).unwrap().get("data").is_none());
+        assert_eq!(serde_json::to_value(&null).unwrap()["data"], Value::Null);
+        let event = crate::Event::CustomEntry { entry: null };
+        let decoded: crate::Event =
+            serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, crate::Event::CustomEntry { entry } if entry.data == Some(Value::Null))
+        );
+    }
 
     struct BashHook(&'static str, Option<&'static str>);
 

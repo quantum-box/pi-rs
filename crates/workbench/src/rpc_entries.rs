@@ -434,6 +434,13 @@ impl Cursor {
             Event::ExtensionStates { states } => Some(json!({
                 "type":"custom","customType":"pi-rs:extension-states","data":states
             })),
+            Event::CustomEntry { entry } => {
+                let mut value = json!({"type":"custom", "customType":entry.custom_type});
+                if let Some(data) = &entry.data {
+                    value["data"] = data.clone();
+                }
+                Some(value)
+            }
             _ => self
                 .messages
                 .raw_message(records, record)
@@ -580,6 +587,31 @@ fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn native_custom_entries_are_visible_without_entering_messages() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("question".into(), Vec::new(), None)
+            .unwrap();
+        let before = session.current_messages().len();
+        session
+            .append_custom_entry(pi_rs::CustomEntry {
+                custom_type: "bookmark".into(),
+                data: Some(json!({"note":"remember"})),
+            })
+            .unwrap();
+        let entries = Entries::new(&session);
+        let entry = entries
+            .values
+            .iter()
+            .find(|entry| entry["type"] == "custom" && entry["customType"] == "bookmark")
+            .unwrap();
+        assert_eq!(entry["data"]["note"], "remember");
+        assert!(entry["id"].is_string());
+        assert!(entry["parentId"].is_string());
+        assert_eq!(session.current_messages().len(), before);
+    }
 
     #[test]
     fn forking_accepts_only_visible_user_message_entries() {

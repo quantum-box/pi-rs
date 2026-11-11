@@ -1655,17 +1655,26 @@ impl Agent<'_> {
             })
             .ok_or_else(|| Error::Config("unknown or disabled extension command".into()))?;
         let states = self.migrate(session, observer)?;
-        let state = hook(
+        let result = hook(
             extension.as_ref(),
-            extension.command(command, arguments, states.get(extension_id)),
+            extension.command_output(command, arguments, states.get(extension_id)),
         )?;
-        commit(
-            session,
-            Event::ExtensionStates {
-                states: [(extension_id.to_string(), state)].into(),
-            },
-            observer,
-        )
+        for entry in &result.entries {
+            crate::journal::validate_custom_entry(entry)?;
+        }
+        if let Some(state) = result.state {
+            commit(
+                session,
+                Event::ExtensionStates {
+                    states: [(extension_id.to_string(), state)].into(),
+                },
+                observer,
+            )?;
+        }
+        for entry in result.entries {
+            commit(session, Event::CustomEntry { entry }, observer)?;
+        }
+        Ok(())
     }
 
     /// Replace older context with a supplied summary, preserving the original journal.

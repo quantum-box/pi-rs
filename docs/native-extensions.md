@@ -26,6 +26,16 @@ state, and checking out an earlier record restores the state at that branch.
 A failed TODO update preserves the prior list. A successful update and its
 extension state are committed with the same tool-result record.
 
+Extension commands can persist branch-local custom entries without sending
+them to the model. Opt in with `supports_command_entries` and return an
+`ExtensionCommandOutput` from `command_output`; its optional `state` updates
+the extension state and its `entries` contain typed JSON data. Entries appear
+as Pi-style `custom` entries in RPC and follow the active branch across checkout
+and restart. An SDK host can also call `AgentSession::append_custom_entry`.
+[`bookmark_entry.rs`](../crates/extensions/examples/bookmark_entry.rs) shows an
+executable extension. This currently covers command results and the SDK; it
+does not yet expose immediate `appendEntry` calls from every hook or tool.
+
 ## Write another extension
 
 Add the extension crate to the host's Cargo dependencies, implement

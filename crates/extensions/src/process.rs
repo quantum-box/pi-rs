@@ -167,6 +167,11 @@ enum ProtocolRequest {
         arguments: String,
         state: Option<ExtensionState>,
     },
+    CommandOutput {
+        name: String,
+        arguments: String,
+        state: Option<ExtensionState>,
+    },
     BeforeTool {
         name: String,
         arguments: Value,
@@ -220,6 +225,8 @@ struct Description {
     tools: Vec<DescriptionTool>,
     #[serde(default)]
     host_calls: bool,
+    #[serde(default)]
+    command_entries: bool,
     #[serde(default)]
     input_hook: bool,
     #[serde(default)]
@@ -645,6 +652,30 @@ impl Extension for ExecutableExtension {
             arguments: arguments.into(),
             state: previous.cloned(),
         })
+    }
+    fn supports_command_entries(&self) -> bool {
+        self.description.command_entries
+    }
+    fn command_output(
+        &self,
+        name: &str,
+        arguments: &str,
+        previous: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::ExtensionCommandOutput> {
+        if self.description.command_entries {
+            self.request(ProtocolRequest::CommandOutput {
+                name: name.into(),
+                arguments: arguments.into(),
+                state: previous.cloned(),
+            })
+        } else {
+            self.command(name, arguments, previous).map(|state| {
+                pi_rs_core::ExtensionCommandOutput {
+                    state: Some(state),
+                    entries: Vec::new(),
+                }
+            })
+        }
     }
     async fn before_tool(
         &self,
@@ -1395,6 +1426,7 @@ async fn dispatch_with_host(
                 .collect(),
             flags: extension.cli_flags(),
             host_calls: true,
+            command_entries: extension.supports_command_entries(),
             input_hook: extension.handles_input(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
@@ -1486,6 +1518,16 @@ async fn dispatch_with_host(
                 return Err("unknown extension command".into());
             }
             encode(extension.command(&name, &arguments, state.as_ref()))
+        }
+        ProtocolRequest::CommandOutput {
+            name,
+            arguments,
+            state,
+        } => {
+            if !extension.command_names().contains(&name.as_str()) {
+                return Err("unknown extension command".into());
+            }
+            encode(extension.command_output(&name, &arguments, state.as_ref()))
         }
         ProtocolRequest::BeforeTool {
             name,
@@ -1590,6 +1632,53 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn command_output_protocol_transports_custom_entries() {
+        struct Entries;
+        impl Extension for Entries {
+            fn id(&self) -> &str {
+                "entries"
+            }
+            fn commands(&self) -> &[&str] {
+                &["bookmark"]
+            }
+            fn supports_command_entries(&self) -> bool {
+                true
+            }
+            fn command_output(
+                &self,
+                _: &str,
+                arguments: &str,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::ExtensionCommandOutput> {
+                Ok(pi_rs_core::ExtensionCommandOutput {
+                    state: None,
+                    entries: vec![pi_rs_core::CustomEntry {
+                        custom_type: "bookmark".into(),
+                        data: Some(serde_json::json!({"note":arguments})),
+                    }],
+                })
+            }
+        }
+        let extension: Arc<dyn Extension> = Arc::new(Entries);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["command_entries"], true);
+        let result = dispatch(
+            extension,
+            ProtocolRequest::CommandOutput {
+                name: "bookmark".into(),
+                arguments: "remember".into(),
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["entries"][0]["customType"], "bookmark");
+        assert_eq!(result["entries"][0]["data"]["note"], "remember");
+    }
+
     #[test]
     fn duplex_frames_are_bounded_and_leave_later_frames_unread() {
         let mut bytes = Vec::new();
@@ -1620,6 +1709,7 @@ mod tests {
             "id":"legacy", "dependencies":[], "commands":[], "tools":[]
         }))
         .unwrap();
+        assert!(!descriptor.command_entries);
         assert!(!descriptor.cache_warming_hook);
         assert!(!descriptor.session_lifecycle_hook);
         assert!(!descriptor.session_transition_reasons);

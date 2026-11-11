@@ -699,6 +699,14 @@ impl AgentSession {
         self.emit_last();
         Ok(())
     }
+
+    /// Persist extension data on the active branch without changing model context.
+    pub fn append_custom_entry(&mut self, entry: crate::CustomEntry) -> Result<()> {
+        self.ensure_open()?;
+        self.session.append_custom_entry(entry)?;
+        self.emit_last();
+        Ok(())
+    }
     pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
         self.ensure_open()?;
         self.session.set_label(target, label)?;
@@ -1146,6 +1154,84 @@ mod tests {
     use super::*;
     use crate::{ModelEvent, ModelStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CustomEntryExtension;
+    impl Extension for CustomEntryExtension {
+        fn id(&self) -> &str {
+            "bookmark-extension"
+        }
+        fn commands(&self) -> &[&str] {
+            &["bookmark"]
+        }
+        fn supports_command_entries(&self) -> bool {
+            true
+        }
+        fn command_output(
+            &self,
+            _: &str,
+            arguments: &str,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::ExtensionCommandOutput> {
+            Ok(crate::ExtensionCommandOutput {
+                state: None,
+                entries: vec![crate::CustomEntry {
+                    custom_type: "bookmark".into(),
+                    data: Some(serde_json::json!({"note":arguments})),
+                }],
+            })
+        }
+    }
+
+    #[test]
+    fn custom_entries_are_branch_local_and_do_not_enter_model_context() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(CustomEntryExtension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .session
+            .append_user_with_images("hello".into(), Vec::new(), None)
+            .unwrap();
+        let previous = session.journal().head();
+        let before = session.messages().unwrap();
+        session
+            .extension_command("bookmark-extension", "bookmark", "remember")
+            .unwrap();
+        let bookmarked = session.journal().head();
+        assert!(
+            matches!(&session.journal().records().last().unwrap().event, crate::Event::CustomEntry { entry } if entry.custom_type == "bookmark" && entry.data.as_ref().unwrap()["note"] == "remember")
+        );
+        assert_eq!(
+            serde_json::to_value(session.messages().unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        session.checkout(previous).unwrap();
+        assert!(
+            !session
+                .journal()
+                .branch()
+                .iter()
+                .any(|record| matches!(record.event, crate::Event::CustomEntry { .. }))
+        );
+        session.checkout(bookmarked).unwrap();
+        assert!(
+            session
+                .journal()
+                .branch()
+                .iter()
+                .any(|record| matches!(record.event, crate::Event::CustomEntry { .. }))
+        );
+        session
+            .append_custom_entry(crate::CustomEntry {
+                custom_type: "sdk".into(),
+                data: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(&session.journal().records().last().unwrap().event, crate::Event::CustomEntry { entry } if entry.custom_type == "sdk")
+        );
+    }
 
     struct NameHook(Arc<Mutex<Vec<crate::LifecycleEvent>>>);
 

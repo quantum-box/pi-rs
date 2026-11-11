@@ -175,6 +175,11 @@ pub enum Event {
         target: u64,
         label: Option<String>,
     },
+    /// Custom extension data on this branch, excluded from model context.
+    CustomEntry {
+        #[serde(flatten)]
+        entry: crate::CustomEntry,
+    },
     ModelSelected {
         model: String,
         thinking: Option<String>,
@@ -1019,6 +1024,14 @@ impl Session {
         self.record_bash_result(execution)
     }
 
+    /// Append extension data without adding a message to the model context.
+    pub fn append_custom_entry(&mut self, entry: crate::CustomEntry) -> Result<()> {
+        self.ensure_settled()?;
+        validate_custom_entry(&entry)?;
+        self.append(Event::CustomEntry { entry })?;
+        Ok(())
+    }
+
     /// Record a separately running user shell after the local agent yields.
     /// An interrupted tool can still await reconciliation. Its eventual result
     /// is projected beside its tool call, before this shell output.
@@ -1389,6 +1402,13 @@ impl Session {
         self.records.push(record);
         Ok(self.records.last().unwrap())
     }
+}
+
+pub(crate) fn validate_custom_entry(entry: &crate::CustomEntry) -> Result<()> {
+    if serde_json::to_vec(entry)?.len() > 8 * 1024 * 1024 {
+        return Err(Error::Config("custom entry exceeds size limit".into()));
+    }
+    Ok(())
 }
 
 fn publish_snapshot(records: &[Record], destination: &Path) -> Result<()> {
