@@ -179,6 +179,12 @@ Kitty and iTerm2 terminals display supported images inline.
 and serializes cooperating file mutations across processes. The Windows coding
 profile selects PowerShell. Windows CI exercises PowerShell output, timeout and descendant-process cleanup.
 
+`grep` and `find` run off the async executor and observe cancellation during
+directory traversal. `grep` also checks cancellation between file reads, even
+when a file produces no matches. Local `grep` and `ls` report the resolved
+absolute path when the target is missing, and `grep` clamps a zero match limit
+to one as Pi does.
+
 ### Model-selection checkpoint
 
 `/thinking`, Shift+Tab and `--thinking` select a reasoning effort. Selection is

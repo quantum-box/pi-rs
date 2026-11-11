@@ -226,6 +226,7 @@ enum Kind {
     List,
 }
 
+#[derive(Clone)]
 struct CodingTool {
     root: PathBuf,
     unrestricted: bool,
@@ -342,12 +343,27 @@ impl Tool for CodingTool {
                     .edit(&args)
                     .unwrap_or_else(|error| Outcome::Failed(edit_error_text(error)));
             }
-            Kind::Grep | Kind::Find => self.search(&args),
+            Kind::Grep | Kind::Find => {
+                let tool = self.clone();
+                let cancellation = context.cancellation.child_token();
+                let _guard = cancellation.clone().drop_guard();
+                tokio::task::spawn_blocking(move || tool.search(&args, &cancellation))
+                    .await
+                    .unwrap_or_else(|error| Err(Error::Config(error.to_string())))
+            }
             Kind::List => self.list(&args),
             Kind::Bash | Kind::PowerShell => return self.bash(&args, &context.cancellation).await,
         };
         match result {
             Ok(outcome) => outcome,
+            Err(Error::Cancelled) if matches!(self.kind, Kind::Grep | Kind::Find) => {
+                Outcome::Failed("Operation aborted".into())
+            }
+            Err(Error::Config(message))
+                if self.unrestricted && matches!(self.kind, Kind::Grep | Kind::List) =>
+            {
+                Outcome::Failed(message)
+            }
             Err(error) => Outcome::Failed(error.to_string()),
         }
     }
@@ -421,7 +437,15 @@ impl CodingTool {
         } else {
             path
         };
-        let resolved = path.canonicalize()?;
+        let resolved = path.canonicalize().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(self.kind, Kind::Grep | Kind::List)
+            {
+                Error::Config(format!("Path not found: {}", path.display()))
+            } else {
+                error.into()
+            }
+        })?;
         if !self.unrestricted && !resolved.starts_with(&self.root) {
             return Err(Error::Config("path is outside the workspace".into()));
         }
@@ -649,13 +673,17 @@ impl CodingTool {
         ))
     }
 
-    fn search(&self, args: &Value) -> Result<Outcome> {
+    fn search(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let base = self.path(args["path"].as_str().unwrap_or("."))?;
         let is_find = matches!(self.kind, Kind::Find);
         let limit = args["limit"]
             .as_u64()
             .unwrap_or(if is_find { 1000 } else { 100 })
             .min(100_000) as usize;
+        let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
         let glob = if is_find {
             let pattern = if pattern.contains('/')
@@ -711,6 +739,9 @@ impl CodingTool {
             walker.overrides(overrides);
         }
         for entry in walker.build() {
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             let entry = entry.map_err(|error| Error::Config(error.to_string()))?;
             if (is_find && entry.depth() == 0)
                 || (!is_find && !entry.file_type().is_some_and(|kind| kind.is_file()))
@@ -732,7 +763,7 @@ impl CodingTool {
                 continue;
             }
             if let Some(grep) = &mut grep {
-                if !grep.search(entry.path(), &relative.to_string_lossy())? {
+                if !grep.search(entry.path(), &relative.to_string_lossy(), cancellation)? {
                     break;
                 }
             } else {
@@ -747,6 +778,9 @@ impl CodingTool {
                     break;
                 }
             }
+        }
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
         }
         Ok(match grep {
             Some(grep) => grep.finish(),
@@ -1231,6 +1265,44 @@ impl Drop for ProcessGroup {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn local_file_queries_report_missing_paths_and_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "match\nmatch\n").unwrap();
+        let mut tool = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: cancellation.clone(),
+        };
+        let output = tool
+            .invoke(json!({"pattern": "match", "limit": 0}), context())
+            .await
+            .tool_content();
+        assert!(output.starts_with("file.txt:1: match\n"));
+        assert!(!output.contains("file.txt:2:"));
+        for kind in [Kind::Grep, Kind::List] {
+            tool.kind = kind;
+            let output = tool
+                .invoke(json!({"pattern": "match", "path": "missing"}), context())
+                .await;
+            assert!(matches!(output, Outcome::Failed(message)
+                    if message == format!("Path not found: {}", root.join("missing").display())));
+        }
+        cancellation.cancel();
+        for kind in [Kind::Grep, Kind::Find] {
+            tool.kind = kind;
+            let output = tool.invoke(json!({"pattern": "match"}), context()).await;
+            assert!(matches!(output, Outcome::Failed(message) if message == "Operation aborted"));
+        }
+    }
+
     #[test]
     fn shell_updates_preserve_multibyte_boundaries() {
         let mut decoder = ShellStream::default();
@@ -1543,7 +1615,10 @@ mod tests {
             ..tool
         };
         let output = find
-            .search(&json!({"pattern":"*", "limit":300}))
+            .search(
+                &json!({"pattern":"*", "limit":300}),
+                &pi_rs::CancellationToken::new(),
+            )
             .unwrap()
             .tool_content();
         let (body, notice) = output.rsplit_once("\n\n").unwrap();
@@ -1596,15 +1671,21 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"**/*.rs"}))
-                .unwrap()
-                .tool_content(),
+            tool.search(
+                &json!({"pattern":"**/*.rs"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "node_modules/nested/sample.rs\nsrc/sample.rs"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"**/*.rs", "path":"node_modules"}))
-                .unwrap()
-                .tool_content(),
+            tool.search(
+                &json!({"pattern":"**/*.rs", "path":"node_modules"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "nested/sample.rs"
         );
     }
@@ -1623,36 +1704,44 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"*.rs"}))
+            tool.search(&json!({"pattern":"*.rs"}), &pi_rs::CancellationToken::new())
                 .unwrap()
                 .tool_content(),
             "src/nested/Upper.RS\nsrc/sample.rs"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"*.RS"}))
+            tool.search(&json!({"pattern":"*.RS"}), &pi_rs::CancellationToken::new())
                 .unwrap()
                 .tool_content(),
             "src/nested/Upper.RS"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"src/**/*.rs"}))
-                .unwrap()
-                .tool_content(),
+            tool.search(
+                &json!({"pattern":"src/**/*.rs"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "src/nested/Upper.RS\nsrc/sample.rs"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"src"}))
+            tool.search(&json!({"pattern":"src"}), &pi_rs::CancellationToken::new())
                 .unwrap()
                 .tool_content(),
             "src/"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"*"})).unwrap().tool_content(),
+            tool.search(&json!({"pattern":"*"}), &pi_rs::CancellationToken::new())
+                .unwrap()
+                .tool_content(),
             ".hidden\nsrc/\nsrc/nested/\nsrc/nested/Upper.RS\nsrc/sample.rs"
         );
         assert!(
-            tool.search(&json!({"pattern":"*","path":".hidden"}))
-                .is_err()
+            tool.search(
+                &json!({"pattern":"*","path":".hidden"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .is_err()
         );
     }
 
@@ -1671,15 +1760,18 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"*.rs"}))
+            tool.search(&json!({"pattern":"*.rs"}), &pi_rs::CancellationToken::new())
                 .unwrap()
                 .tool_content(),
             "a.rs\nb.rs"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"*.rs","limit":1}))
-                .unwrap()
-                .tool_content(),
+            tool.search(
+                &json!({"pattern":"*.rs","limit":1}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "a.rs\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]"
         );
     }
@@ -1699,7 +1791,9 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"*"})).unwrap().tool_content(),
+            tool.search(&json!({"pattern":"*"}), &pi_rs::CancellationToken::new())
+                .unwrap()
+                .tool_content(),
             "alias\nbroken\nsrc/\nsrc/a.rs"
         );
     }
@@ -1715,9 +1809,12 @@ mod tests {
             kind: Kind::Find,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"**/*.rs"}))
-                .unwrap()
-                .tool_content(),
+            tool.search(
+                &json!({"pattern":"**/*.rs"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "main.rs"
         );
         let tool = CodingTool {
@@ -1727,9 +1824,12 @@ mod tests {
             ..tool
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"fn", "path":"main.rs"}))
-                .unwrap()
-                .tool_content(),
+            tool.search(
+                &json!({"pattern":"fn", "path":"main.rs"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "main.rs:1: fn main() {}"
         );
     }
@@ -1748,21 +1848,30 @@ mod tests {
             kind: Kind::Grep,
         };
         assert_eq!(
-            tool.search(&json!({"pattern":"needle","path":"src","glob":"!*.rs"}))
-                .unwrap()
-                .tool_content(),
+            tool.search(
+                &json!({"pattern":"needle","path":"src","glob":"!*.rs"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "b.txt:1: needle"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"needle","path":"src","glob":"/src/*.rs"}))
-                .unwrap()
-                .tool_content(),
+            tool.search(
+                &json!({"pattern":"needle","path":"src","glob":"/src/*.rs"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "a.rs:1: needle"
         );
         assert_eq!(
-            tool.search(&json!({"pattern":"needle","path":"src/a.rs","glob":"!*.rs"}))
-                .unwrap()
-                .tool_content(),
+            tool.search(
+                &json!({"pattern":"needle","path":"src/a.rs","glob":"!*.rs"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "a.rs:1: needle"
         );
     }

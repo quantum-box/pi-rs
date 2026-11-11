@@ -1,12 +1,13 @@
 //! Bounded, streaming grep with matching and context line markers.
 use std::collections::VecDeque;
+use std::io::{self, Read};
 use std::path::Path;
 
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch,
 };
-use pi_rs::{Error, Outcome, Result};
+use pi_rs::{CancellationToken, Error, Outcome, Result};
 use serde_json::{Map, Value, json};
 
 use super::tool_output::{self, Limit, MAX_BYTES, Truncation, UNLIMITED_LINES};
@@ -48,10 +49,19 @@ impl Grep {
             context,
         })
     }
-    pub fn search(&mut self, path: &Path, display: &str) -> Result<bool> {
-        self.searcher.search_path(
+    pub fn search(
+        &mut self,
+        path: &Path,
+        display: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let file = SearchInput {
+            file: std::fs::File::open(path)?,
+            cancellation,
+        };
+        let result = self.searcher.search_reader(
             &self.matcher,
-            path,
+            file,
             FileSink {
                 display,
                 output: &mut self.output,
@@ -60,7 +70,11 @@ impl Grep {
                 lines: VecDeque::new(),
                 pending: VecDeque::new(),
             },
-        )?;
+        );
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        result?;
         Ok(self.output.matches < self.output.limit)
     }
     pub fn finish(self) -> Outcome {
@@ -104,6 +118,20 @@ impl Grep {
                 .push("Some lines truncated to 500 chars. Use read tool to see full lines".into());
         }
         tool_output::finish(text, details, &notices)
+    }
+}
+
+struct SearchInput<'a> {
+    file: std::fs::File,
+    cancellation: &'a CancellationToken,
+}
+
+impl Read for SearchInput<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::other("Operation aborted"));
+        }
+        self.file.read(buffer)
     }
 }
 
@@ -250,19 +278,44 @@ impl Sink for FileSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_search_input_stops_after_cancellation() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"no matches").unwrap();
+        let cancellation = CancellationToken::new();
+        let mut input = SearchInput {
+            file: std::fs::File::open(file.path()).unwrap(),
+            cancellation: &cancellation,
+        };
+        let mut buffer = [0; 1];
+        assert_eq!(input.read(&mut buffer).unwrap(), 1);
+        cancellation.cancel();
+        assert_eq!(
+            input.read(&mut buffer).unwrap_err().to_string(),
+            "Operation aborted"
+        );
+    }
     use serde_json::json;
     #[test]
     fn overlapping_context_is_repeated_for_each_matching_line() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "before\nmatch one\nmatch two\nafter\n").unwrap();
         let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100).unwrap();
-        assert!(grep.search(file.path(), "text").unwrap());
+        assert!(
+            grep.search(file.path(), "text", &CancellationToken::new())
+                .unwrap()
+        );
         assert_eq!(
             grep.finish().tool_content(),
             "text-1- before\ntext:2: match one\ntext-3- match two\ntext-2- match one\ntext:3: match two\ntext-4- after"
         );
         let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 1).unwrap();
-        assert!(!grep.search(file.path(), "text").unwrap());
+        assert!(
+            !grep
+                .search(file.path(), "text", &CancellationToken::new())
+                .unwrap()
+        );
         assert_eq!(
             grep.finish().tool_content(),
             "text-1- before\ntext:2: match one\ntext-3- match two\n\n[1 matches limit reached. Use limit=2 for more, or refine pattern]"
@@ -278,7 +331,10 @@ mod tests {
         )
         .unwrap();
         let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100).unwrap();
-        assert!(grep.search(file.path(), "text").unwrap());
+        assert!(
+            grep.search(file.path(), "text", &CancellationToken::new())
+                .unwrap()
+        );
         assert_eq!(
             grep.finish().tool_content(),
             "text:1: match first\ntext-2- after\ntext-5- before\ntext:6: match last"
@@ -290,7 +346,10 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "before\nmatch last\n").unwrap();
         let mut grep = Grep::new(&json!({"pattern":"match", "context":1}), 100).unwrap();
-        assert!(grep.search(file.path(), "text").unwrap());
+        assert!(
+            grep.search(file.path(), "text", &CancellationToken::new())
+                .unwrap()
+        );
         assert_eq!(
             grep.finish().tool_content(),
             "text-1- before\ntext:2: match last\ntext-3- "
@@ -320,7 +379,11 @@ mod tests {
         )
         .unwrap();
         let mut grep = Grep::new(&json!({"pattern":"match"}), 111).unwrap();
-        assert!(!grep.search(file.path(), "text").unwrap());
+        assert!(
+            !grep
+                .search(file.path(), "text", &CancellationToken::new())
+                .unwrap()
+        );
         let output = grep.finish().tool_content();
         assert!(output.ends_with("[111 matches limit reached. Use limit=222 for more, or refine pattern. 50.0KB limit reached. Some lines truncated to 500 chars. Use read tool to see full lines]"));
         let body = output.split("\n\n").next().unwrap();
@@ -344,7 +407,11 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(!grep.search(file.path(), "large.txt").unwrap());
+        assert!(
+            !grep
+                .search(file.path(), "large.txt", &CancellationToken::new())
+                .unwrap()
+        );
         let output = grep.finish().tool_content();
         assert!(output.contains("large.txt-400001- before"));
         assert!(output.contains("large.txt:400002: TARGET"));
@@ -356,14 +423,18 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), format!("a.b{}\naxb\n", "界".repeat(2000))).unwrap();
         let mut grep = Grep::new(&json!({"pattern":"a.b","literal":true}), 100).unwrap();
-        assert!(grep.search(file.path(), "text").unwrap());
+        assert!(
+            grep.search(file.path(), "text", &CancellationToken::new())
+                .unwrap()
+        );
         let output = grep.finish().tool_content();
         assert!(output.starts_with("text:1: a.b"));
         assert!(output.contains("Some lines truncated"));
         assert!(!output.contains("axb"));
         assert!(output.len() < 2000);
         let mut grep = Grep::new(&json!({"pattern":"nothing"}), 100).unwrap();
-        grep.search(file.path(), "text").unwrap();
+        grep.search(file.path(), "text", &CancellationToken::new())
+            .unwrap();
         assert_eq!(grep.finish().tool_content(), "No matches found");
     }
 }
