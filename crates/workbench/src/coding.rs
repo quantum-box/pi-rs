@@ -620,7 +620,7 @@ impl CodingTool {
             }
             target = existing;
         }
-        let _lock = mutation_lock(&target)?;
+        let _lock = mutation_lock(&target, cancellation)?;
         check_mutation_cancelled(cancellation)?;
         atomic_write(&target, content.as_bytes(), cancellation)?;
         check_mutation_cancelled(cancellation)?;
@@ -639,7 +639,7 @@ impl CodingTool {
     ) -> Result<Outcome> {
         check_mutation_cancelled(cancellation)?;
         let path = self.path(string(args, "path")?)?;
-        let _lock = mutation_lock(&path)?;
+        let _lock = mutation_lock(&path, cancellation)?;
         check_mutation_cancelled(cancellation)?;
         let original = self.text(&path)?;
         let (output, count) = crate::text_edit::apply(&original, args)?;
@@ -1158,7 +1158,7 @@ fn string<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::Config(format!("{name} must be a string")))
 }
 
-fn mutation_lock(path: &Path) -> Result<std::fs::File> {
+fn mutation_lock(path: &Path, cancellation: &pi_rs::CancellationToken) -> Result<std::fs::File> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .unwrap_or_default();
@@ -1172,8 +1172,16 @@ fn mutation_lock(path: &Path) -> Result<std::fs::File> {
         .read(true)
         .write(true)
         .open(directory.join(format!("{digest:x}.lock")))?;
-    file.lock()?;
-    Ok(file)
+    loop {
+        check_mutation_cancelled(cancellation)?;
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
 }
 
 fn check_mutation_cancelled(cancellation: &pi_rs::CancellationToken) -> Result<()> {
@@ -1661,6 +1669,43 @@ mod tests {
                 .edit(&json!({"path":"Capture d'ecran.txt", "oldText":"curly", "newText":"other"}))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_mutation_stops_while_another_writer_holds_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, "before").unwrap();
+        let lock = mutation_lock(
+            &path.canonicalize().unwrap(),
+            &pi_rs::CancellationToken::new(),
+        )
+        .unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let context = ToolContext {
+            operation_id: uuid::Uuid::new_v4(),
+            cancellation: cancellation.clone(),
+        };
+        let task = tokio::spawn(async move {
+            tool.invoke(json!({"path":"file","content":"after"}), context)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!task.is_finished());
+        cancellation.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Failed(message) if message == "Operation aborted"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+        drop(lock);
     }
 
     #[tokio::test]
