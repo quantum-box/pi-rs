@@ -111,7 +111,7 @@ fn normalize(
                 let bytes = next.as_encoded_bytes();
                 ((!bytes.starts_with(b"@") && !bytes.starts_with(b"-"))
                     || bytes.starts_with(b"---"))
-                    && command.find_subcommand(next).is_none()
+                    && next != "extension"
             })
         {
             prompt.extend(input.next());
