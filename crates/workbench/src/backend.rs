@@ -200,6 +200,7 @@ impl SessionSnapshot {
 
 struct ShellRunner {
     tools: Arc<CodingTools>,
+    cwd: std::path::PathBuf,
     timeout: Option<std::time::Duration>,
     completed: mpsc::Sender<ShellCompletion>,
 }
@@ -263,6 +264,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             lifecycle_timeout: args.tool_timeout(),
             trace: args.trace,
             shell: ShellRunner {
+                cwd: args.workspace.clone(),
                 tools: Arc::new(
                     CodingTools::local(&args.workspace)?
                         .with_shell_config(runtime::shell_config(&args)),
@@ -1144,13 +1146,40 @@ fn read_requests(
                             .any(|record| matches!(record.event, pi_rs::Event::HostBound { .. }))
                     };
                     let tools = shell.tools.clone();
+                    let cwd = shell.cwd.clone();
                     let timeout = shell.timeout;
                     let completed = shell.completed.clone();
+                    let registry = processor.registry.clone();
+                    let snapshot = snapshot.clone();
+                    let mut ready = resources_ready.clone();
                     runtime.spawn(async move {
                         output(json!({"type":"bash_execution_start","executionId":id,"command":command,"excludeFromContext":exclude_from_context,"id":request_id}));
                         let result = async {
                             if !allowed {
                                 return Err(Error::Session("a managed session must execute shell commands through its host".into()));
+                            }
+                            if registry.has_user_bash_hooks() {
+                                while !*ready.borrow_and_update() {
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                                        changed = ready.changed() => if changed.is_err() {
+                                            return Err(Error::Session("extension resources are unavailable".into()));
+                                        },
+                                    }
+                                }
+                                let records = snapshot.lock().expect("session snapshot").records.clone();
+                                let states = pi_rs::Session::from_records(records)?.extension_states();
+                                let event = pi_rs::UserBashEvent { command: command.clone(), exclude_from_context, cwd };
+                                if let Some(result) = registry.user_bash(&event, &states, &cancel).await? {
+                                    if !result.output.is_empty() {
+                                        output(json!({"type":"bash_execution_update","executionId":id,"output":result.output,"id":request_id}));
+                                    }
+                                    return Ok(pi_rs::BashExecution {
+                                        command: command.clone(), output: result.output, exit_code: result.exit_code,
+                                        cancelled: result.cancelled, truncated: result.truncated,
+                                        full_output_path: result.full_output_path, exclude_from_context,
+                                    });
+                                }
                             }
                             let mut execution = tools.execute_shell(&command, timeout, &cancel, &mut |chunk| {
                                 output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));

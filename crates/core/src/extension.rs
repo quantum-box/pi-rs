@@ -247,6 +247,31 @@ pub enum InputAction {
     Handled,
 }
 
+/// A shell command entered by the user, before the host executes it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserBashEvent {
+    pub command: String,
+    pub exclude_from_context: bool,
+    pub cwd: std::path::PathBuf,
+}
+
+/// A result supplied by an extension instead of executing the command locally.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserBashResult {
+    #[serde(default)]
+    pub output: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub full_output_path: Option<String>,
+}
+
 /// Hooks run in registration order. The first denial stops pre-tool hooks.
 /// An error stops the run. A post-tool error commits the known result without state changes.
 /// Post-hooks prepare state updates and must not perform external operations.
@@ -310,6 +335,19 @@ pub trait Extension: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<InputAction> {
         Ok(InputAction::Continue)
+    }
+
+    fn handles_user_bash(&self) -> bool {
+        false
+    }
+
+    /// Return a result to replace execution, or None to pass to the next handler.
+    async fn user_bash(
+        &self,
+        _event: &UserBashEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<UserBashResult>> {
+        Ok(None)
     }
 
     fn handles_lifecycle(&self) -> bool {
@@ -602,6 +640,36 @@ impl Registry {
         self.extensions
             .iter()
             .any(|extension| extension.handles_input())
+    }
+
+    pub fn has_user_bash_hooks(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.handles_user_bash())
+    }
+
+    /// The first handler returning a result replaces the shell execution.
+    pub async fn user_bash(
+        &self,
+        event: &UserBashEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+    ) -> Result<Option<UserBashResult>> {
+        for extension in self
+            .extensions
+            .iter()
+            .filter(|extension| extension.handles_user_bash())
+        {
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = extension.user_bash(event, states.get(extension.id())) => result,
+            };
+            if let Some(result) = hook(extension.as_ref(), result)? {
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
     }
 
     /// Run opted-in extensions in registration order. A handled input is not submitted.
@@ -899,6 +967,70 @@ pub(crate) fn hook<T>(extension: &dyn Extension, result: ExtensionResult<T>) -> 
 mod replacement_tests {
     use super::*;
     use serde_json::json;
+
+    struct BashHook(&'static str, Option<&'static str>);
+    #[async_trait::async_trait]
+    impl Extension for BashHook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn handles_user_bash(&self) -> bool {
+            true
+        }
+        async fn user_bash(
+            &self,
+            event: &UserBashEvent,
+            state: Option<&ExtensionState>,
+        ) -> ExtensionResult<Option<UserBashResult>> {
+            assert_eq!(event.command, "echo hello");
+            assert!(event.exclude_from_context);
+            if self.0 == "winner" {
+                assert_eq!(state.unwrap().data["value"], 42);
+            }
+            Ok(self.1.map(|output| UserBashResult {
+                output: output.into(),
+                exit_code: Some(7),
+                ..Default::default()
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn user_bash_hooks_use_first_result_and_receive_state_and_cancellation() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(BashHook("pass", None))).unwrap();
+        registry
+            .register(Arc::new(BashHook("winner", Some("replaced"))))
+            .unwrap();
+        registry
+            .register(Arc::new(BashHook("later", Some("wrong"))))
+            .unwrap();
+        let event = UserBashEvent {
+            command: "echo hello".into(),
+            exclude_from_context: true,
+            cwd: ".".into(),
+        };
+        let states = ExtensionStates::from([(
+            "winner".into(),
+            ExtensionState {
+                version: 1,
+                data: json!({"value":42}),
+            },
+        )]);
+        let cancel = CancellationToken::new();
+        let result = registry
+            .user_bash(&event, &states, &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.output, "replaced");
+        assert_eq!(result.exit_code, Some(7));
+        cancel.cancel();
+        assert!(matches!(
+            registry.user_bash(&event, &states, &cancel).await,
+            Err(Error::Cancelled)
+        ));
+    }
 
     struct ResourceHook(&'static str, bool);
     #[async_trait::async_trait]

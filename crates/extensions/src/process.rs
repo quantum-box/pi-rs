@@ -129,6 +129,10 @@ enum ProtocolRequest {
         event: InputEvent,
         state: Option<ExtensionState>,
     },
+    UserBash {
+        event: pi_rs_core::UserBashEvent,
+        state: Option<ExtensionState>,
+    },
     Lifecycle {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
@@ -214,6 +218,8 @@ struct Description {
     host_calls: bool,
     #[serde(default)]
     input_hook: bool,
+    #[serde(default)]
+    user_bash_hook: bool,
     #[serde(default)]
     lifecycle_hook: bool,
     #[serde(default)]
@@ -425,6 +431,20 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<InputAction> {
         self.request_async(ProtocolRequest::Input {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+    fn handles_user_bash(&self) -> bool {
+        self.description.user_bash_hook
+    }
+    async fn user_bash(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<pi_rs_core::UserBashResult>> {
+        self.request_async(ProtocolRequest::UserBash {
             event: event.clone(),
             state: state.cloned(),
         })
@@ -1224,6 +1244,7 @@ async fn dispatch_with_host(
             flags: extension.cli_flags(),
             host_calls: true,
             input_hook: extension.handles_input(),
+            user_bash_hook: extension.handles_user_bash(),
             lifecycle_hook: extension.handles_lifecycle(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
@@ -1259,6 +1280,9 @@ async fn dispatch_with_host(
         }
         ProtocolRequest::Input { event, state } => {
             encode(extension.input(&event, state.as_ref()).await)
+        }
+        ProtocolRequest::UserBash { event, state } => {
+            encode(extension.user_bash(&event, state.as_ref()).await)
         }
         ProtocolRequest::Lifecycle { event, state } => {
             encode(extension.lifecycle(&event, state.as_ref()).await)
@@ -1732,5 +1756,56 @@ mod tests {
         assert!(
             matches!(&request.messages[0], pi_rs_core::Message::User { content } if content.contains("remember"))
         );
+    }
+
+    #[tokio::test]
+    async fn protocol_forwards_user_bash_and_describes_opt_in() {
+        struct ShellHook;
+        #[async_trait::async_trait]
+        impl Extension for ShellHook {
+            fn id(&self) -> &str {
+                "shell-hook"
+            }
+            fn handles_user_bash(&self) -> bool {
+                true
+            }
+            async fn user_bash(
+                &self,
+                event: &pi_rs_core::UserBashEvent,
+                state: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::UserBashResult>> {
+                assert_eq!(event.command, "echo test");
+                assert!(event.exclude_from_context);
+                assert_eq!(state.unwrap().data["value"], 42);
+                Ok(Some(pi_rs_core::UserBashResult {
+                    output: "intercepted".into(),
+                    exit_code: Some(0),
+                    ..Default::default()
+                }))
+            }
+        }
+        let extension: Arc<dyn Extension> = Arc::new(ShellHook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["user_bash_hook"], true);
+        let result = dispatch(
+            extension,
+            ProtocolRequest::UserBash {
+                event: pi_rs_core::UserBashEvent {
+                    command: "echo test".into(),
+                    exclude_from_context: true,
+                    cwd: ".".into(),
+                },
+                state: Some(ExtensionState {
+                    version: 1,
+                    data: serde_json::json!({"value":42}),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["output"], "intercepted");
+        assert_eq!(result["exitCode"], 0);
     }
 }

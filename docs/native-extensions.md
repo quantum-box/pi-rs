@@ -49,6 +49,16 @@ pre-tool decisions, post-tool state, state migrations, and compaction hooks.
 Use stable extension IDs and explicit state versions. Let the host select the
 allowed tools and register policy extensions before tools.
 
+Extensions can intercept user-entered `!` and `!!` shell commands by opting in
+with `handles_user_bash` and implementing `user_bash`. The event includes the
+command, working directory, and whether the output is excluded from model
+context. Return `None` to let the next handler or local shell run, or return
+`Some(UserBashResult)` to supply the output and exit status. The first result
+wins; errors stop execution. Cancellation also interrupts a running handler.
+The same API works for executable extensions. This currently supports result
+replacement, not Pi's custom Bash operations callbacks or streaming updates
+from within the hook.
+
 An extension can also add temporary skills, prompt templates, and themes:
 
 ```rust,ignore

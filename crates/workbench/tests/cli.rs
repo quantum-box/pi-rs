@@ -9,6 +9,100 @@ use pi_rs::{
 };
 use serde_json::{Value, json};
 
+#[cfg(unix)]
+#[test]
+fn rpc_user_bash_extension_can_replace_execution_and_pass_through() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let extension = directory.path().join("shell_extension.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id': 'shell-hook', 'dependencies': [], 'commands': [], 'tools': [], 'user_bash_hook': True}
+elif request['type'] == 'user_bash':
+    event = request['event']
+    if event['command'].startswith('touch '):
+        assert event['excludeFromContext'] and event['cwd']
+        result = {'output': 'intercepted', 'exitCode': 7}
+    else:
+        result = None
+else:
+    result = None
+print(json.dumps({'version': 1, 'response': {'Ok': result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = directory.path().join("should-not-exist");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", directory.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (events, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if events
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for (id, command, excluded, expected, exit) in [
+        (
+            "replace",
+            format!("touch {}", marker.display()),
+            true,
+            "intercepted",
+            7,
+        ),
+        ("pass", "printf passthrough".into(), false, "passthrough", 0),
+    ] {
+        writeln!(
+            input,
+            "{}",
+            json!({"type":"bash", "id":id, "command":command, "excludeFromContext":excluded})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receive.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["type"] == "response" && event["id"] == id {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["output"], expected);
+                assert_eq!(event["data"]["exitCode"], exit);
+                break;
+            }
+        }
+    }
+    assert!(!marker.exists());
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 #[test]
 fn rpc_correlates_commands_and_rejects_unknown_commands() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
