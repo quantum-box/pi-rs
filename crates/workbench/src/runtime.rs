@@ -18,9 +18,40 @@ pub struct Runtime {
     shell: ShellConfig,
     system_prompt: String,
     pub resources: resources::Resources,
+    resource_origins: ResourceOrigins,
     catalog: Arc<LiveMcpCatalog>,
     mcp_sign_in: std::collections::VecDeque<mcp_config::PendingSignIn>,
 }
+
+#[derive(Clone, Debug)]
+struct ResourceOrigin {
+    root: std::path::PathBuf,
+    source: String,
+    base_dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Default)]
+struct ResourceOrigins {
+    skills: Vec<ResourceOrigin>,
+    prompts: Vec<ResourceOrigin>,
+    themes: Vec<ResourceOrigin>,
+}
+
+impl ResourceOrigin {
+    fn source_info(path: &std::path::Path, origins: &[Self]) -> Option<serde_json::Value> {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        let origin = origins
+            .iter()
+            .find(|origin| path.starts_with(&origin.root))?;
+        let mut result =
+            json!({"path":path,"source":origin.source,"scope":"temporary","origin":"top-level"});
+        if let Some(base) = &origin.base_dir {
+            result["baseDir"] = json!(base);
+        }
+        Some(result)
+    }
+}
+
 impl Runtime {
     pub async fn discover_resources(
         &mut self,
@@ -48,12 +79,25 @@ impl Runtime {
             )
             .await;
         let mut discovered = pi_rs::DiscoveredResources::default();
+        let mut origins = ResourceOrigins::default();
         for item in results {
             let base = item
                 .source
                 .as_deref()
                 .and_then(std::path::Path::parent)
                 .unwrap_or(&event.cwd);
+            let source = item
+                .source
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| item.extension_id.clone());
+            let source = format!("extension:{source}");
+            let base_dir = item
+                .source
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf);
             let resolve = |path: std::path::PathBuf| {
                 let path = if path.is_absolute() {
                     path
@@ -71,15 +115,39 @@ impl Runtime {
                     None
                 }
             };
-            discovered
-                .skill_paths
-                .extend(item.resources.skill_paths.into_iter().filter_map(&resolve));
-            discovered
-                .prompt_paths
-                .extend(item.resources.prompt_paths.into_iter().filter_map(&resolve));
-            discovered
-                .theme_paths
-                .extend(item.resources.theme_paths.into_iter().filter_map(&resolve));
+            let add = |paths: Vec<std::path::PathBuf>,
+                       target: &mut Vec<std::path::PathBuf>,
+                       records: &mut Vec<ResourceOrigin>| {
+                for path in paths.into_iter().filter_map(&resolve) {
+                    let root = path.canonicalize().unwrap_or_else(|_| path.clone());
+                    let origin = ResourceOrigin {
+                        root: root.clone(),
+                        source: source.clone(),
+                        base_dir: base_dir.clone(),
+                    };
+                    if let Some(existing) = records.iter_mut().find(|entry| entry.root == root) {
+                        *existing = origin;
+                    } else {
+                        records.push(origin);
+                    }
+                    target.push(path);
+                }
+            };
+            add(
+                item.resources.skill_paths,
+                &mut discovered.skill_paths,
+                &mut origins.skills,
+            );
+            add(
+                item.resources.prompt_paths,
+                &mut discovered.prompt_paths,
+                &mut origins.prompts,
+            );
+            add(
+                item.resources.theme_paths,
+                &mut discovered.theme_paths,
+                &mut origins.themes,
+            );
         }
         let resources = resources::Resources::load_with_discovered(args, &discovered)?;
         let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
@@ -94,6 +162,7 @@ impl Runtime {
         )?;
         *self.catalog.resources.lock().expect("resource catalog") = resources.clone();
         self.resources = resources;
+        self.resource_origins = origins;
         Ok(discovered)
     }
 
@@ -142,7 +211,7 @@ impl Runtime {
                 "name": name,
                 "description": prompt.description,
                 "source": "prompt",
-                "sourceInfo": source_info(&prompt.path, &self.resources.packages.prompts),
+                "sourceInfo": ResourceOrigin::source_info(&prompt.path, &self.resource_origins.prompts).unwrap_or_else(|| source_info(&prompt.path, &self.resources.packages.prompts)),
             }));
         }
         for (name, skill) in &self.resources.skills {
@@ -150,7 +219,7 @@ impl Runtime {
                 "name": format!("skill:{name}"),
                 "description": skill.description,
                 "source": "skill",
-                "sourceInfo": source_info(&skill.path, &self.resources.packages.skills),
+                "sourceInfo": ResourceOrigin::source_info(&skill.path, &self.resource_origins.skills).unwrap_or_else(|| source_info(&skill.path, &self.resources.packages.skills)),
             }));
         }
         json!({"commands":commands})
@@ -547,6 +616,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             shell,
             system_prompt,
             resources: local_resources,
+            resource_origins: ResourceOrigins::default(),
             catalog,
             mcp_sign_in: discovered.sign_in.into(),
         })
@@ -693,5 +763,31 @@ impl pi_rs::Extension for LocalCommandPolicy {
         } else {
             self.0.before_tool(name, arguments, context, state).await
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_origin_tests {
+    use super::*;
+
+    #[test]
+    fn discovered_resource_origin_uses_real_path_and_extension_source() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let resource = base.join("skills/example/SKILL.md");
+        std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
+        std::fs::write(&resource, "content").unwrap();
+        let origins = vec![ResourceOrigin {
+            root: base.join("skills"),
+            source: "extension:fixture".into(),
+            base_dir: Some(base.clone()),
+        }];
+        let source = ResourceOrigin::source_info(&resource, &origins).unwrap();
+        assert_eq!(source["path"], json!(resource));
+        assert_eq!(source["source"], "extension:fixture");
+        assert_eq!(source["scope"], "temporary");
+        assert_eq!(source["origin"], "top-level");
+        assert_eq!(source["baseDir"], json!(base));
+        assert!(ResourceOrigin::source_info(&base.join("skills-other/file"), &origins).is_none());
     }
 }
