@@ -1123,7 +1123,25 @@ fn forward_event(
                 let result = if let Some(error) = event["error"].as_str() {
                     Err(Error::Config(error.into()))
                 } else {
-                    Ok(Some(event["data"].clone()))
+                    let execution = &event["data"];
+                    let mut data = json!({
+                        "output": execution["output"],
+                        "cancelled": execution["cancelled"],
+                        "truncated": execution["truncated"]
+                    });
+                    if execution["cancelled"] != true
+                        && let Some(code) =
+                            execution.get("exitCode").filter(|value| !value.is_null())
+                    {
+                        data["exitCode"] = code.clone();
+                    }
+                    if let Some(path) = execution
+                        .get("fullOutputPath")
+                        .filter(|value| !value.is_null())
+                    {
+                        data["fullOutputPath"] = path.clone();
+                    }
+                    Ok(Some(data))
                 };
                 response(&request, result)?;
             }
