@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use encoding_rs::{CoderResult, UTF_8};
-use pi_rs::{Error, Outcome, Result};
+use pi_rs::{CancellationToken, Error, Outcome, Result};
 use serde_json::json;
 
 use super::tool_output::{Limit, MAX_BYTES, MAX_LINES, Truncation, format_size};
@@ -13,6 +13,7 @@ pub(super) fn read(
     display_path: &str,
     offset: usize,
     limit: Option<usize>,
+    cancellation: &CancellationToken,
 ) -> Result<Outcome> {
     let file = std::fs::File::open(path)?;
     if !file.metadata()?.is_file() {
@@ -31,7 +32,7 @@ pub(super) fn read(
     let mut byte_limit = false;
     let mut last_newline = false;
     loop {
-        let (length, newline) = line(&mut reader, &mut buffer, &mut decoded)?;
+        let (length, newline) = line(&mut reader, &mut buffer, &mut decoded, cancellation)?;
         if length == 0 && file_lines != 0 && !last_newline {
             break;
         }
@@ -135,11 +136,15 @@ fn line(
     reader: &mut impl BufRead,
     output: &mut Vec<u8>,
     decoded: &mut [u8],
-) -> std::io::Result<(usize, bool)> {
+    cancellation: &CancellationToken,
+) -> Result<(usize, bool)> {
     output.clear();
     let mut decoder = UTF_8.new_decoder_without_bom_handling();
     let mut length = 0;
     loop {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let buffer = reader.fill_buf()?;
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let count = newline.map_or(buffer.len(), |position| position + 1);
@@ -166,7 +171,8 @@ fn line(
 mod tests {
     use super::*;
     fn read(path: &Path, name: &str, offset: usize, limit: Option<usize>) -> Result<String> {
-        super::read(path, name, offset, limit).map(|outcome| outcome.tool_content())
+        super::read(path, name, offset, limit, &CancellationToken::new())
+            .map(|outcome| outcome.tool_content())
     }
     #[test]
     fn pages_preserve_empty_lines_and_report_continuation() {
@@ -261,15 +267,59 @@ mod tests {
         let mut decoded = [0; 8];
         let expected = "\u{feff}界\u{fffd}\n";
         assert_eq!(
-            line(&mut reader, &mut output, &mut decoded).unwrap(),
+            line(
+                &mut reader,
+                &mut output,
+                &mut decoded,
+                &CancellationToken::new()
+            )
+            .unwrap(),
             (expected.len(), true)
         );
         assert_eq!(output, expected.as_bytes());
         assert_eq!(
-            line(&mut reader, &mut output, &mut decoded).unwrap(),
+            line(
+                &mut reader,
+                &mut output,
+                &mut decoded,
+                &CancellationToken::new()
+            )
+            .unwrap(),
             (3, false)
         );
         assert_eq!(output, "\u{fffd}".as_bytes());
+    }
+
+    #[test]
+    fn cancellation_interrupts_decoding_inside_a_line() {
+        struct CancelAfterRead {
+            data: &'static [u8],
+            token: CancellationToken,
+        }
+        impl std::io::Read for CancelAfterRead {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                self.data.read(output)
+            }
+        }
+        impl BufRead for CancelAfterRead {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                Ok(&self.data[..self.data.len().min(2)])
+            }
+            fn consume(&mut self, amount: usize) {
+                self.data = &self.data[amount..];
+                self.token.cancel();
+            }
+        }
+        let token = CancellationToken::new();
+        let mut reader = CancelAfterRead {
+            data: b"long line",
+            token: token.clone(),
+        };
+        assert!(matches!(
+            line(&mut reader, &mut Vec::new(), &mut [0; 8], &token),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(reader.data, b"ng line");
     }
 
     #[test]

@@ -250,6 +250,10 @@ passed with the same implementation.
 
 ### Image and file-tool checkpoint
 
+The read tool runs file I/O and image decoding off the async runtime.
+Cancellation returns promptly and stops the text scan between buffers, even
+while scanning a single long line.
+
 `read` returns bounded PNG image content for PNG, JPEG, GIF, WebP, BMP and TIFF
 inputs. It preserves alpha, avoids upscaling and reduces large images before
 serialization. The Ollama-compatible adapter forwards image tool results as

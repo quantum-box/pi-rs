@@ -154,7 +154,8 @@ impl CodingTools {
         let name = path
             .to_str()
             .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
-        if let Some(image) = tool.read_image(&json!({"path":name}))? {
+        let path = tool.path(name)?;
+        if let Some(image) = tool.read_image(&path)? {
             let blocks = image["content"].as_array().expect("image content");
             let images = blocks
                 .iter()
@@ -169,7 +170,7 @@ impl CodingTools {
                 .join("\n");
             Ok((hints, images))
         } else {
-            Ok((tool.text(&tool.path(name)?)?, Vec::new()))
+            Ok((tool.text(&path)?, Vec::new()))
         }
     }
 }
@@ -323,20 +324,19 @@ impl Tool for CodingTool {
         }
     }
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
-        if matches!(self.kind, Kind::Read { .. }) {
-            match self.read_image(&args) {
-                Ok(Some(data)) => {
-                    return Outcome::Structured {
-                        data,
-                        attachments: vec![],
-                    };
-                }
-                Ok(None) => {}
-                Err(error) => return Outcome::Failed(error.to_string()),
-            }
-        }
         let result = match self.kind {
-            Kind::Read { .. } => self.read(&args),
+            Kind::Read { .. } => {
+                let tool = self.clone();
+                let cancellation = context.cancellation.child_token();
+                let _guard = cancellation.clone().drop_guard();
+                let worker_token = cancellation.clone();
+                let worker = tokio::task::spawn_blocking(move || tool.read(&args, &worker_token));
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(Error::Cancelled),
+                    result = worker => result.unwrap_or_else(|error| Err(Error::Config(error.to_string()))),
+                }
+            }
             Kind::Write => self.write(&args).map(Outcome::Succeeded),
             Kind::Edit => {
                 return self
@@ -356,7 +356,9 @@ impl Tool for CodingTool {
         };
         match result {
             Ok(outcome) => outcome,
-            Err(Error::Cancelled) if matches!(self.kind, Kind::Grep | Kind::Find) => {
+            Err(Error::Cancelled)
+                if matches!(self.kind, Kind::Read { .. } | Kind::Grep | Kind::Find) =>
+            {
                 Outcome::Failed("Operation aborted".into())
             }
             Err(Error::Config(message))
@@ -462,12 +464,11 @@ impl CodingTool {
         Ok(std::fs::read_to_string(path)?)
     }
 
-    fn read_image(&self, args: &Value) -> Result<Option<Value>> {
-        let path = self.path(string(args, "path")?)?;
+    fn read_image(&self, path: &Path) -> Result<Option<Value>> {
         if !path.is_file() {
             return Err(Error::Config("expected a regular file".into()));
         }
-        let reader = image::ImageReader::open(&path)?.with_guessed_format()?;
+        let reader = image::ImageReader::open(path)?.with_guessed_format()?;
         let Some(format) = reader.format() else {
             return Ok(None);
         };
@@ -529,14 +530,24 @@ impl CodingTool {
         ]})))
     }
 
-    fn read(&self, args: &Value) -> Result<Outcome> {
-        let path = self.path(string(args, "path")?)?;
+    fn read(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let display_path = string(args, "path")?;
+        let path = self.path(display_path)?;
+        if let Some(data) = self.read_image(&path)? {
+            return Ok(Outcome::Structured {
+                data,
+                attachments: vec![],
+            });
+        }
         let offset = usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1))
             .unwrap_or(usize::MAX);
         let limit = args["limit"]
             .as_u64()
             .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
-        crate::text_page::read(&path, string(args, "path")?, offset, limit)
+        crate::text_page::read(&path, display_path, offset, limit, cancellation)
     }
 
     fn write(&self, args: &Value) -> Result<String> {
@@ -1296,6 +1307,14 @@ mod tests {
                     if message == format!("Path not found: {}", root.join("missing").display())));
         }
         cancellation.cancel();
+        tool.kind = Kind::Read {
+            auto_resize: true,
+            profile: None,
+        };
+        assert!(matches!(
+            tool.invoke(json!({"path":"file.txt"}), context()).await,
+            Outcome::Failed(message) if message == "Operation aborted"
+        ));
         for kind in [Kind::Grep, Kind::Find] {
             tool.kind = kind;
             let output = tool.invoke(json!({"pattern": "match"}), context()).await;
@@ -1412,10 +1431,7 @@ mod tests {
                 profile: None,
             },
         };
-        let value = tool
-            .read_image(&json!({"path":"sample.png"}))
-            .unwrap()
-            .unwrap();
+        let value = tool.read_image(&path).unwrap().unwrap();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(value["content"][1]["data"].as_str().unwrap())
             .unwrap();
@@ -1452,7 +1468,10 @@ mod tests {
             },
         };
         assert_eq!(
-            local.read(&json!({"path":skill})).unwrap().tool_content(),
+            local
+                .read(&json!({"path":skill}), &pi_rs::CancellationToken::new())
+                .unwrap()
+                .tool_content(),
             "personal skill"
         );
     }
@@ -1489,9 +1508,12 @@ mod tests {
             "Successfully wrote to src/a.txt"
         );
         assert_eq!(
-            tool.read(&json!({"path":"src/a.txt","offset":2,"limit":1}))
-                .unwrap()
-                .tool_content(),
+            tool.read(
+                &json!({"path":"src/a.txt","offset":2,"limit":1}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
             "日本語\n\n[2 more lines in file. Use offset=3 to continue.]"
         );
         assert!(
@@ -1521,16 +1543,29 @@ mod tests {
         };
         assert_eq!(
             reader
-                .read(&json!({"path":url.as_str()}))
+                .read(
+                    &json!({"path":url.as_str()}),
+                    &pi_rs::CancellationToken::new()
+                )
                 .unwrap()
                 .tool_content(),
             "hello"
         );
-        assert!(reader.read(&json!({"path":"@../escape"})).is_err());
+        assert!(
+            reader
+                .read(
+                    &json!({"path":"@../escape"}),
+                    &pi_rs::CancellationToken::new()
+                )
+                .is_err()
+        );
         std::fs::write(root.path().join("Capture d’ecran.txt"), "curly").unwrap();
         assert_eq!(
             reader
-                .read(&json!({"path":"Capture d'ecran.txt"}))
+                .read(
+                    &json!({"path":"Capture d'ecran.txt"}),
+                    &pi_rs::CancellationToken::new()
+                )
                 .unwrap()
                 .tool_content(),
             "curly"
