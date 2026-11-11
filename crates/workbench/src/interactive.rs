@@ -100,6 +100,8 @@ struct Terminal {
     progress: Option<Instant>,
     #[cfg(any(unix, windows))]
     color_queries: std::collections::VecDeque<ColorQuery>,
+    #[cfg(any(unix, windows))]
+    color_requery: bool,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -127,6 +129,8 @@ impl Terminal {
             progress: None,
             #[cfg(any(unix, windows))]
             color_queries: std::collections::VecDeque::new(),
+            #[cfg(any(unix, windows))]
+            color_requery: false,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -151,13 +155,10 @@ impl Terminal {
     }
     #[cfg(any(unix, windows))]
     fn query_terminal_colors(&mut self) -> Result<()> {
-        // DA1 delimits replies to successive color queries.
-        while self
-            .color_queries
-            .front()
-            .is_some_and(|query| query.started.elapsed() > Duration::from_secs(2))
-        {
-            self.color_queries.pop_front();
+        // Serialize queries so that replies remain attributable when DA1 is absent.
+        if !self.color_queries.is_empty() {
+            self.color_requery = true;
+            return Ok(());
         }
         self.color_queries.push_back(ColorQuery {
             started: Instant::now(),
@@ -174,15 +175,7 @@ impl Terminal {
 
     #[cfg(any(unix, windows))]
     fn accepts_color_reply(&mut self, target: u8) -> bool {
-        while self.color_queries.len() > 1
-            && self
-                .color_queries
-                .front()
-                .is_some_and(|query| query.started.elapsed() > Duration::from_secs(2))
-        {
-            self.color_queries.pop_front();
-        }
-        let is_latest = self.color_queries.len() == 1;
+        let is_latest = !self.color_requery;
         let Some(query) = self.color_queries.front_mut() else {
             return false;
         };
@@ -190,6 +183,28 @@ impl Terminal {
         let fresh = query.replied & flag == 0;
         query.replied |= flag;
         is_latest && fresh
+    }
+
+    #[cfg(any(unix, windows))]
+    fn finish_color_query(&mut self) -> Result<()> {
+        self.color_queries.pop_front();
+        if std::mem::take(&mut self.color_requery) {
+            self.query_terminal_colors()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    fn poll_color_timeout(&mut self) -> Result<()> {
+        if self.color_requery
+            && self
+                .color_queries
+                .front()
+                .is_some_and(|query| query.started.elapsed() >= Duration::from_secs(2))
+        {
+            self.finish_color_query()?;
+        }
+        Ok(())
     }
 
     fn update_progress(&mut self, active: bool) -> Result<()> {
@@ -2993,6 +3008,10 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             dirty = false;
             last_frame = Instant::now();
         }
+        #[cfg(any(unix, windows))]
+        if let Some(terminal) = &mut _terminal {
+            terminal.poll_color_timeout()?;
+        }
         let input_wait = if dirty {
             frame_interval.saturating_sub(last_frame.elapsed())
         } else {
@@ -3010,7 +3029,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::PrimaryDeviceAttributes) => {
                 if let Some(terminal) = &mut _terminal {
-                    terminal.color_queries.pop_front();
+                    terminal.finish_color_query()?;
                     #[cfg(unix)]
                     terminal.keyboard_reply(false)?;
                 }
