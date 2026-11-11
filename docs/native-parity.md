@@ -15,6 +15,9 @@ remaining acceptance work for that surface.
 prompt. The picker uses the controlling terminal, keeping standard input and
 output available to print, JSON, and RPC modes. The native `--resume=PATH`
 form opens a specific session; `--session PATH` is the Pi-compatible spelling.
+Invalid `--thinking` values produce a warning and leave the previous valid
+selection or configured default in place. Repeated values use the last valid
+selection, including when an invalid value follows it.
 
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |

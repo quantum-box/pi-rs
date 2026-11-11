@@ -57,6 +57,64 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
 }
 
 #[test]
+fn invalid_thinking_levels_warn_and_keep_the_last_valid_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("settings.json"),
+        r#"{"defaultThinkingLevel":"medium"}"#,
+    )
+    .unwrap();
+    for (arguments, expected, warnings) in [
+        (vec!["--thinking", "invalid"], "medium", 1),
+        (vec!["--thinking", "--invalid"], "medium", 1),
+        (vec!["--thinking", "low", "--thinking", "invalid"], "low", 1),
+        (
+            vec!["--thinking", "invalid", "--thinking", "high"],
+            "high",
+            1,
+        ),
+        (vec!["--thinking", "low", "--thinking", "high"], "high", 0),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .env("PI_RS_HOME", directory.path())
+            .args([
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "test-thinking-fixture",
+            ])
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(
+            b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n",
+        ).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: Value =
+            serde_json::from_slice(output.stdout.split(|byte| *byte == b'\n').next().unwrap())
+                .unwrap();
+        assert_eq!(response["data"]["thinkingLevel"], expected);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .matches("Warning: Invalid thinking level")
+                .count(),
+            warnings
+        );
+    }
+}
+
+#[test]
 fn native_notes_extension_is_saved_and_restored() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("session.jsonl");

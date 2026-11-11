@@ -169,8 +169,10 @@ struct Cli {
     /// Export a native or Pi session to HTML and exit. Output defaults beside input.
     #[arg(long = "export", num_args = 1..=2, value_names = ["INPUT", "OUTPUT"])]
     export_session: Option<Vec<PathBuf>>,
-    /// Thinking effort for models that support reasoning.
-    #[arg(long, global = true, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
+    /// Thinking effort: off, minimal, low, medium, high, xhigh, or max.
+    #[arg(long = "thinking", global = true, allow_hyphen_values = true)]
+    thinking_arguments: Vec<String>,
+    #[arg(skip)]
     thinking: Option<String>,
     /// Full provider endpoint URL. Defaults to the provider's standard endpoint.
     #[arg(
@@ -824,8 +826,17 @@ async fn run_cli() {
         });
         args.model_explicit =
             matches.value_source("model") == Some(clap::parser::ValueSource::CommandLine);
-        args.thinking_explicit =
-            matches.value_source("thinking") == Some(clap::parser::ValueSource::CommandLine);
+        for level in &args.thinking_arguments {
+            if thinking::LEVELS.contains(&level.as_str()) {
+                args.thinking = Some(level.clone());
+            } else {
+                eprintln!(
+                    "Warning: Invalid thinking level \"{level}\". Valid values: {}",
+                    thinking::LEVELS.join(", ")
+                );
+            }
+        }
+        args.thinking_explicit = args.thinking.is_some();
         if let Some(Command::Auth { command }) = args.command.as_ref() {
             if matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine) {
                 return Err(Error::Config(
