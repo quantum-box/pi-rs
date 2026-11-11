@@ -57,11 +57,14 @@ pub struct SessionControl {
     retry: crate::RetryControl,
     input_hooks: Arc<Mutex<InputHooks>>,
     input_order: Arc<tokio::sync::Mutex<()>>,
+    events: broadcast::WeakSender<SessionEvent>,
+    tool_timeout: std::time::Duration,
 }
 
 #[derive(Clone, Default)]
 struct InputHooks {
     extensions: Vec<Arc<dyn Extension>>,
+    lifecycle: Option<Registry>,
     states: crate::ExtensionStates,
 }
 
@@ -73,12 +76,19 @@ impl InputHooks {
             .filter(|extension| extension.handles_input())
             .cloned()
             .collect();
-        let states = if extensions.is_empty() {
+        let lifecycle = registry
+            .has_session_lifecycle_hooks()
+            .then(|| registry.clone());
+        let states = if extensions.is_empty() && lifecycle.is_none() {
             Default::default()
         } else {
             session.extension_states()
         };
-        Self { extensions, states }
+        Self {
+            extensions,
+            lifecycle,
+            states,
+        }
     }
 }
 
@@ -191,11 +201,32 @@ impl SessionControl {
         self.queue_control(|reply| crate::AgentInput::SetQueueMode { kind, mode, reply })
             .await
     }
-    /// Save a display name during an active operation. Use the owned session while idle.
+    /// Save a display name and notify lifecycle extensions during an active operation.
+    /// Use the owned session while idle.
     pub async fn set_session_name(&self, name: impl Into<String>) -> Result<()> {
-        let name = name.into();
-        self.queue_control(|reply| crate::AgentInput::SetSessionName { name, reply })
-            .await
+        let name = crate::sanitize_session_name(&name.into());
+        self.queue_control(|reply| crate::AgentInput::SetSessionName {
+            name: name.clone(),
+            reply,
+        })
+        .await?;
+        let hooks = self.input_hooks.lock().expect("SDK input hooks").clone();
+        if let Some(registry) = hooks.lifecycle {
+            let events = self.events.upgrade();
+            crate::lifecycle::notify(
+                &registry,
+                crate::LifecycleEvent::SessionInfoChanged { name: Some(name) },
+                &hooks.states,
+                self.tool_timeout,
+                &mut |notification| {
+                    if let Some(events) = &events {
+                        emit(events, &notification);
+                    }
+                },
+            )
+            .await;
+        }
+        Ok(())
     }
     async fn queue_control<T>(
         &self,
@@ -243,7 +274,7 @@ impl SessionControl {
         };
         if !states.is_empty() {
             let mut hooks = self.input_hooks.lock().expect("SDK input hooks");
-            if !hooks.extensions.is_empty() {
+            if !hooks.extensions.is_empty() || hooks.lifecycle.is_some() {
                 hooks.states.extend(states.clone());
             }
         }
@@ -323,6 +354,8 @@ impl SessionBuilder {
         }
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
+        let weak_events = events.downgrade();
+        let tool_timeout = self.limits.tool_timeout;
         let auto_compaction = session.auto_compaction_control();
         let retry = session.retry_control();
         let input_hooks = Arc::new(Mutex::new(InputHooks::new(&self.registry, &session)));
@@ -342,6 +375,8 @@ impl SessionBuilder {
                 retry,
                 input_hooks,
                 input_order: Arc::new(tokio::sync::Mutex::new(())),
+                events: weak_events,
+                tool_timeout,
             },
             closed: false,
             pending_start: Some((crate::SessionStartReason::Startup, None)),
@@ -2567,7 +2602,10 @@ mod tests {
     }
     #[tokio::test]
     async fn cloned_control_can_rename_and_abort_a_running_session() {
+        let names = Arc::new(Mutex::new(Vec::new()));
         let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")
+            .extension(Arc::new(NameHook(names.clone())))
+            .unwrap()
             .in_memory()
             .unwrap();
         let control = session.controls();
@@ -2577,6 +2615,11 @@ mod tests {
                 if matches!(event, SessionEvent::Request(_)) {
                     assert!(control.set_session_name(" ").await.is_err());
                     control.set_session_name("  In progress  ").await.unwrap();
+                    assert!(names.lock().unwrap().iter().any(|event| matches!(
+                        event,
+                        crate::LifecycleEvent::SessionInfoChanged { name: Some(name) }
+                            if name == "In progress"
+                    )));
                     while let Ok(event) = events.recv().await {
                         if let SessionEvent::SessionInfoChanged { name } = event {
                             assert_eq!(name.as_deref(), Some("In progress"));
