@@ -3,6 +3,7 @@
   "title": "Native Pi settings",
   "type": "object",
   "properties": {
+    "httpProxy": { "type": "string" },
     "httpIdleTimeoutMs": { "anyOf": [{ "type": "number", "minimum": 0 }, { "const": "disabled" }] },
     "fullscreenExitOutput": { "enum": ["transcript", "resume-hint"] },
     "fullscreenScrollbar": { "enum": ["auto", "always", "hidden"] },

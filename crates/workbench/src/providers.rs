@@ -418,9 +418,11 @@ impl Client {
 
     pub fn with_model_options(self, args: &super::Cli, reported: bool) -> Result<Self> {
         let thinking = args.provider_thinking();
+        let proxies = super::http_proxy::configured(&args.settings)?;
         Ok(match self {
             Self::Ollama(client) => {
-                let client = client.with_http_idle_timeout(args.settings.http_idle_timeout())?;
+                let client =
+                    client.with_http_options(args.settings.http_idle_timeout(), &proxies)?;
                 let configured = args.model_profiles.model(&args.provider, &args.model);
                 let retention = args
                     .model_profiles
@@ -456,7 +458,8 @@ impl Client {
                 Self::Ollama(client.with_sampling(sampling)?)
             }
             Self::Anthropic(client) => {
-                let client = client.with_http_idle_timeout(args.settings.http_idle_timeout())?;
+                let client =
+                    client.with_http_options(args.settings.http_idle_timeout(), &proxies)?;
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
                 let (supports_long, cache_tools) = args
                     .model_profiles
@@ -492,12 +495,12 @@ impl Client {
             }
             Self::Google(client) => Self::Google(
                 client
-                    .with_http_idle_timeout(args.settings.http_idle_timeout())?
+                    .with_http_options(args.settings.http_idle_timeout(), &proxies)?
                     .with_thinking(thinking),
             ),
             Self::PiMessages(client) => Self::PiMessages(
                 client
-                    .with_http_idle_timeout(args.settings.http_idle_timeout())?
+                    .with_http_options(args.settings.http_idle_timeout(), &proxies)?
                     .with_thinking(thinking),
             ),
             Self::Deferred(mut client) => {

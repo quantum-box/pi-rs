@@ -407,8 +407,12 @@ pub(super) struct Operations {
 impl Operations {
     pub fn new(args: &Cli) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(args.model_timeout_secs));
+        for proxy in super::http_proxy::configured(&args.settings)? {
+            builder = builder.proxy(proxy);
+        }
         if let Some(timeout) = args.settings.http_idle_timeout() {
             builder = builder.read_timeout(timeout);
         }

@@ -23,6 +23,7 @@ mod cli_compat;
 mod clipboard;
 mod config;
 mod extension_ui;
+mod http_proxy;
 mod image_policy;
 mod interactive;
 mod mcp_config;

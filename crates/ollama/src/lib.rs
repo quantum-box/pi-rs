@@ -25,6 +25,7 @@ type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
 #[derive(Clone)]
 pub struct Ollama {
     client: Client,
+    http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
     token: Option<String>,
     headers: HeaderMap,
@@ -106,6 +107,7 @@ impl Ollama {
             .map_err(|_| Error::Config("could not build model HTTP client".into()))?;
         Ok(Self {
             client,
+            http_proxies: Vec::new(),
             endpoint,
             token,
             headers: HeaderMap::new(),
@@ -123,17 +125,31 @@ impl Ollama {
     }
 
     /// Set the per-read HTTP idle timeout; `None` disables it.
-    pub fn with_http_idle_timeout(mut self, timeout: Option<Duration>) -> Result<Self> {
+    pub fn with_http_idle_timeout(self, timeout: Option<Duration>) -> Result<Self> {
+        let proxies = self.http_proxies.clone();
+        self.with_http_options(timeout, &proxies)
+    }
+
+    /// Configure the per-read deadline and explicit HTTP proxies.
+    pub fn with_http_options(
+        mut self,
+        timeout: Option<Duration>,
+        proxies: &[reqwest::Proxy],
+    ) -> Result<Self> {
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .connect_timeout(Duration::from_secs(10));
+        for proxy in proxies {
+            builder = builder.proxy(proxy.clone());
+        }
         if let Some(timeout) = timeout {
             builder = builder.read_timeout(timeout);
         }
         self.client = builder
             .build()
             .map_err(|_| Error::Config("could not build model HTTP client".into()))?;
+        self.http_proxies = proxies.to_vec();
         Ok(self)
     }
 

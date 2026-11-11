@@ -1105,3 +1105,191 @@ fn http_idle_timeout_applies_to_native_provider_streams() {
         server.join().unwrap();
     }
 }
+
+#[test]
+fn model_requests_use_configured_http_proxy_and_environment_overrides() {
+    for (provider, path, from_env) in [
+        ("ollama", "/v1/chat/completions", false),
+        ("anthropic", "/v1/messages", false),
+        ("google", "/v1beta", true),
+        ("radius", "/v1/messages", true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = format!("http://user:pass@{}", listener.local_addr().unwrap());
+        let setting = if from_env {
+            "http://127.0.0.1:1"
+        } else {
+            &proxy
+        };
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"httpProxy":setting,"retry":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            loop {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("proxy request not received: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    headers.push_str(&line.to_ascii_lowercase());
+                }
+                if first.starts_with("GET ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                return (first, headers);
+            }
+        });
+        let target = format!("http://127.0.0.1:1{path}");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .env("PI_RS_HOME", root.path())
+            .env_remove("http_proxy")
+            .env_remove("HTTP_PROXY")
+            .env_remove("https_proxy")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("no_proxy")
+            .env_remove("NO_PROXY")
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--offline",
+                "--provider",
+                provider,
+                "--model",
+                "fixture-model",
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &target,
+                "--model-timeout-secs",
+                "4",
+                "--print",
+                "hello",
+            ]);
+        if from_env {
+            command.env("http_proxy", &proxy);
+        }
+        let output = command.output().unwrap();
+        let (request, headers) = server.join().unwrap();
+        assert!(
+            request.starts_with("POST http://127.0.0.1:1/"),
+            "{provider}: {request}"
+        );
+        assert!(
+            headers.contains("proxy-authorization: basic dxnlcjpwyxnz"),
+            "{provider}: {headers}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("user:pass"));
+    }
+}
+
+#[test]
+fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"httpProxy":"http://127.0.0.1:1","retry":{"enabled":false}}).to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = listener.local_addr().unwrap();
+    let endpoint = format!("http://{target}/v1/chat/completions");
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let (mut socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("direct request not received: {error}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            if first.starts_with("GET ") {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            return first;
+        }
+    });
+    let _output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .env_remove("http_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env("no_proxy", target.to_string())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture-model",
+            "--endpoint",
+            &endpoint,
+            "--model-timeout-secs",
+            "4",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        server
+            .join()
+            .unwrap()
+            .starts_with("POST /v1/chat/completions ")
+    );
+}

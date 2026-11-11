@@ -4683,6 +4683,7 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         "modelThinkingLevels",
         "tuiMode",
         "fullscreenWheelScrollLines",
+        "httpProxy",
         "sessionDir",
         "sessionShareDestination",
         "shellPath",
@@ -4702,11 +4703,20 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         items.push(Item {
             label: format!(
                 "Edit {name} · {}",
-                args.settings
-                    .value()
-                    .get(name)
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "default".into())
+                if name == "httpProxy"
+                    && args
+                        .settings
+                        .string(name)
+                        .is_some_and(|value| !value.is_empty())
+                {
+                    "configured".into()
+                } else {
+                    args.settings
+                        .value()
+                        .get(name)
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| "default".into())
+                }
             ),
             selection: Selection::EditSetting(name.into()),
         });
@@ -4828,7 +4838,7 @@ fn select(
                         .unwrap_or_else(|| std::path::Path::new(""))
                 ),
                 "fullscreenWheelScrollLines" => json!("auto"),
-                "shellPath" | "shellCommandPrefix" => json!(""),
+                "shellPath" | "shellCommandPrefix" | "httpProxy" => json!(""),
                 "defaultProjectTrust" => json!("ask"),
                 "defaultTools" => json!(["read", "bash", "edit", "write"]),
                 "modelThinkingLevels" => json!({}),

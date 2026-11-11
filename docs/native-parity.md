@@ -24,6 +24,14 @@ headers and individual body reads; `0` or `"disabled"` disables this idle
 deadline. `/settings` can change it. The separate `--model-timeout-secs` bounds
 the entire model operation and defaults to 2,147,483 seconds.
 
+Model and codemode HTTP clients honor `httpProxy`, the HTTP(S) proxy environment
+variables, and `no_proxy`/`NO_PROXY` domain, wildcard, and port exclusions.
+Lowercase environment variables take precedence, and explicit environment
+values take precedence over the setting. Proxy URL credentials are not displayed
+in the settings list. Other network surfaces still need proxy integration;
+for plain HTTP origins reqwest uses forward-proxy requests, while upstream Pi
+uses CONNECT tunneling.
+
 The `/settings` list remains open after a change, preserving its search and
 selected item so several values can be changed in succession. Enter activates
 the selected setting; Space also activates it when the search is empty. Closing

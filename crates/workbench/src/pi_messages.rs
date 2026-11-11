@@ -232,13 +232,17 @@ impl PiMessages {
             })
     }
 
-    pub(super) fn with_http_idle_timeout(
+    pub(super) fn with_http_options(
         mut self,
         timeout: Option<std::time::Duration>,
+        proxies: &[reqwest::Proxy],
     ) -> Result<Self> {
         let mut builder = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none());
+        for proxy in proxies {
+            builder = builder.proxy(proxy.clone());
+        }
         if let Some(timeout) = timeout {
             builder = builder.read_timeout(timeout);
         }
