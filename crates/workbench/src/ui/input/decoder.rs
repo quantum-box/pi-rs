@@ -24,14 +24,33 @@ impl Decoder {
                 }
                 let foreground = b"\x1b]10;";
                 let background = b"\x1b]11;";
-                if foreground.starts_with(&self.buffer) || background.starts_with(&self.buffer) {
+                let palette = b"\x1b]4;";
+                if foreground.starts_with(&self.buffer)
+                    || background.starts_with(&self.buffer)
+                    || palette.starts_with(&self.buffer)
+                {
                     continue;
                 }
-                if self.buffer.starts_with(foreground) || self.buffer.starts_with(background) {
+                if self.buffer.starts_with(foreground)
+                    || self.buffer.starts_with(background)
+                    || self.buffer.starts_with(palette)
+                {
                     if self.buffer.last() == Some(&7) || self.buffer.ends_with(b"\x1b\\") {
-                        if let Some((red, green, blue)) = parse_terminal_color(&self.buffer) {
+                        if self.buffer.starts_with(palette) {
+                            if let Some((index, red, green, blue)) =
+                                parse_palette_color(&self.buffer)
+                            {
+                                self.events.push_back(InputEvent::TerminalPalette {
+                                    index,
+                                    red,
+                                    green,
+                                    blue,
+                                });
+                            }
+                        } else if let Some((red, green, blue)) = parse_terminal_color(&self.buffer)
+                        {
                             self.events.push_back(InputEvent::TerminalColor {
-                                foreground: self.buffer.starts_with(b"\x1b]10;"),
+                                foreground: self.buffer.starts_with(foreground),
                                 red,
                                 green,
                                 blue,
@@ -70,7 +89,9 @@ impl Decoder {
         }
     }
     pub(super) fn flush_escape(&mut self) {
-        if (self.buffer.starts_with(b"\x1b]10;") || self.buffer.starts_with(b"\x1b]11;"))
+        if (self.buffer.starts_with(b"\x1b]10;")
+            || self.buffer.starts_with(b"\x1b]11;")
+            || self.buffer.starts_with(b"\x1b]4;"))
             && self
                 .escape_started
                 .is_some_and(|start| start.elapsed() >= std::time::Duration::from_millis(500))
@@ -92,7 +113,10 @@ impl Decoder {
                 )));
             self.buffer.clear();
             self.escape_started = None;
-        } else if self.buffer.starts_with(b"\x1b]") && self.buffer.len() < 5 {
+        } else if self.buffer.starts_with(b"\x1b]")
+            && self.buffer.len() < 5
+            && !self.buffer.starts_with(b"\x1b]4;")
+        {
             let remaining = self.buffer.split_off(2);
             self.buffer.clear();
             self.escape_started = None;
@@ -123,6 +147,25 @@ fn parse_terminal_color(buffer: &[u8]) -> Option<(u8, u8, u8)> {
     let bytes = buffer
         .strip_prefix(b"\x1b]11;")
         .or_else(|| buffer.strip_prefix(b"\x1b]10;"))?;
+    parse_color_value(bytes)
+}
+
+fn parse_palette_color(buffer: &[u8]) -> Option<(u8, u8, u8, u8)> {
+    let value = buffer.strip_prefix(b"\x1b]4;")?;
+    let split = value.iter().position(|byte| *byte == b';')?;
+    let digits = &value[..split];
+    if digits.is_empty() || digits.len() > 3 || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let index: u8 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    if index >= 16 {
+        return None;
+    }
+    let (red, green, blue) = parse_color_value(&value[split + 1..])?;
+    Some((index, red, green, blue))
+}
+
+fn parse_color_value(bytes: &[u8]) -> Option<(u8, u8, u8)> {
     let bytes = bytes
         .strip_suffix(b"\x07")
         .or_else(|| bytes.strip_suffix(b"\x1b\\"))?;
@@ -290,6 +333,29 @@ mod tests {
         decoder.flush_escape();
         assert!(
             matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char(']') && key.modifiers == KeyModifiers::ALT)
+        );
+    }
+
+    #[test]
+    fn palette_replies_are_decoded_without_leaking_into_keyboard_input() {
+        let mut decoder = Decoder::default();
+        decoder.push(b"\x1b]4;1");
+        decoder.push(b"3;rgb:ffff/8080/0000\x1b\\x");
+        assert_eq!(
+            decoder.next(),
+            Some(InputEvent::TerminalPalette {
+                index: 13,
+                red: 255,
+                green: 128,
+                blue: 0
+            })
+        );
+        assert!(
+            matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char('x'))
+        );
+        decoder.push(b"\x1b]4;256;#ffffff\x07y");
+        assert!(
+            matches!(decoder.next(), Some(InputEvent::Event(Event::Key(key))) if key.code == KeyCode::Char('y'))
         );
     }
 

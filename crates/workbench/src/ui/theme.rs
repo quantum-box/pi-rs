@@ -12,11 +12,33 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 static APPEARANCE: AtomicU8 = AtomicU8::new(0);
 static TERMINAL_BACKGROUND: AtomicU32 = AtomicU32::new(0);
 static TERMINAL_FOREGROUND: AtomicU32 = AtomicU32::new(0);
+static TERMINAL_PALETTE: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
 
 #[cfg(any(unix, windows))]
 pub fn reset_terminal_background() {
     TERMINAL_BACKGROUND.store(0, Ordering::Relaxed);
     TERMINAL_FOREGROUND.store(0, Ordering::Relaxed);
+    clear_terminal_palette();
+}
+
+#[cfg(any(unix, windows))]
+pub fn clear_terminal_palette() {
+    for entry in &TERMINAL_PALETTE {
+        entry.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(any(unix, windows))]
+pub fn set_terminal_palette(index: u8, red: u8, green: u8, blue: u8) -> bool {
+    let Some(entry) = TERMINAL_PALETTE.get(index as usize) else {
+        return false;
+    };
+    let value = 0x1000000 | (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue);
+    let changed = entry.swap(value, Ordering::Relaxed) != value;
+    changed
+        && TERMINAL_PALETTE
+            .iter()
+            .all(|color| color.load(Ordering::Relaxed) != 0)
 }
 
 fn unpack_terminal_color(value: u32) -> Option<[u8; 3]> {
@@ -333,12 +355,25 @@ impl Theme {
             ("thinkingXhigh", 13),
             ("thinkingMax", 1),
         ];
+        let palette: Option<Vec<_>> = TERMINAL_PALETTE
+            .iter()
+            .map(|value| unpack_terminal_color(value.load(Ordering::Relaxed)))
+            .collect();
         Self {
             name: "system".into(),
             path: None,
             colors: roles
                 .into_iter()
-                .map(|(key, index)| (key.into(), Color::AnsiValue(index)))
+                .map(|(key, index)| {
+                    let color = palette
+                        .as_ref()
+                        .map(|palette| {
+                            let [r, g, b] = palette[index as usize];
+                            Color::Rgb { r, g, b }
+                        })
+                        .unwrap_or(Color::AnsiValue(index));
+                    (key.into(), color)
+                })
                 .collect(),
         }
     }

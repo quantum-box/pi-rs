@@ -110,6 +110,17 @@ enum KeyboardProtocol {
     Xterm,
 }
 
+#[cfg(any(unix, windows))]
+fn query_terminal_colors() -> Result<()> {
+    let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
+    for index in 0..16 {
+        query.push_str(&format!("\x1b]4;{index};?\x07"));
+    }
+    query.push_str("\x1b[c");
+    execute!(std::io::stdout(), Print(query))?;
+    Ok(())
+}
+
 impl Terminal {
     fn enter(mode: Option<TuiMode>, images: Cleanup) -> Result<Self> {
         terminal::enable_raw_mode()?;
@@ -134,10 +145,8 @@ impl Terminal {
         #[cfg(any(unix, windows))]
         {
             crate::ui::theme::reset_terminal_background();
-            execute!(
-                std::io::stdout(),
-                Print("\x1b[?2031h\x1b[?996n\x1b]10;?\x07\x1b]11;?\x07")
-            )?;
+            execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
+            query_terminal_colors()?;
         }
         Ok(guard)
     }
@@ -2971,13 +2980,33 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 continue;
             }
             #[cfg(any(unix, windows))]
+            #[cfg(any(unix, windows))]
+            Some(crate::ui::input::InputEvent::TerminalPalette {
+                index,
+                red,
+                green,
+                blue,
+            }) => {
+                if crate::ui::theme::set_terminal_palette(index, red, green, blue)
+                    && theme.name == "system"
+                {
+                    theme = Theme::system();
+                    dirty = true;
+                }
+                continue;
+            }
             Some(
                 event @ (crate::ui::input::InputEvent::Appearance { .. }
                 | crate::ui::input::InputEvent::TerminalColor { .. }),
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        execute!(std::io::stdout(), Print("\x1b]10;?\x07\x1b]11;?\x07"))?;
+                        crate::ui::theme::clear_terminal_palette();
+                        query_terminal_colors()?;
+                        if theme.name == "system" {
+                            theme = Theme::system();
+                            dirty = true;
+                        }
                         crate::ui::theme::set_appearance(dark)
                     }
                     crate::ui::input::InputEvent::TerminalColor {
