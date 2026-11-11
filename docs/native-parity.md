@@ -73,6 +73,9 @@ remain in progress.
 `get_commands` identifies discovered skills and prompt templates with their
 extension source, temporary scope, resolved file path, and executable base
 directory. Resource provenance in other surfaces remains in progress.
+Extension-provided relative paths resolve from the session working directory;
+home-relative paths and local file URLs are accepted. A missing resource is
+reported without preventing other discovered resources from loading.
 
 Completed tool arguments repair invalid string escapes and unescaped control
 characters as Pi does. Incomplete JSON and non-object values produce a tool

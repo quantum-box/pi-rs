@@ -81,11 +81,6 @@ impl Runtime {
         let mut discovered = pi_rs::DiscoveredResources::default();
         let mut origins = ResourceOrigins::default();
         for item in results {
-            let base = item
-                .source
-                .as_deref()
-                .and_then(std::path::Path::parent)
-                .unwrap_or(&event.cwd);
             let source = item
                 .source
                 .as_ref()
@@ -99,10 +94,12 @@ impl Runtime {
                 .and_then(std::path::Path::parent)
                 .map(std::path::Path::to_path_buf);
             let resolve = |path: std::path::PathBuf| {
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    base.join(path)
+                let path = match resolve_discovered_path(&path, &event.cwd) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        eprintln!("Extension {}: {error}", item.extension_id);
+                        return None;
+                    }
                 };
                 if path.exists() {
                     Some(path)
@@ -150,6 +147,11 @@ impl Runtime {
             );
         }
         let resources = resources::Resources::load_with_discovered(args, &discovered)?;
+        for warning in &resources.warnings {
+            if !self.resources.warnings.contains(warning) {
+                eprintln!("{warning}");
+            }
+        }
         let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
         let (selection, _, hidden) = tool_discovery(args, &servers)?;
         self.system_prompt = select_tools(
@@ -394,6 +396,41 @@ impl Runtime {
     pub async fn close(&self) -> Result<()> {
         self.registry.shutdown().await
     }
+}
+
+fn resolve_discovered_path(
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let Some(text) = path.to_str() else {
+        return Ok(if path.is_absolute() {
+            path.to_owned()
+        } else {
+            cwd.join(path)
+        });
+    };
+    let text = text.trim();
+    if text.starts_with("file://") {
+        return reqwest::Url::parse(text)
+            .map_err(|error| pi_rs::Error::Config(format!("invalid resource URL: {error}")))?
+            .to_file_path()
+            .map_err(|_| pi_rs::Error::Config("invalid local resource URL".into()));
+    }
+    if (text == "~" || text.starts_with("~/") || (cfg!(windows) && text.starts_with("~\\")))
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        let mut result = std::path::PathBuf::from(home);
+        if text.len() > 1 {
+            result.push(&text[2..]);
+        }
+        return Ok(result);
+    }
+    let path = std::path::Path::new(text);
+    Ok(if path.is_absolute() {
+        path.to_owned()
+    } else {
+        cwd.join(path)
+    })
 }
 
 struct LiveMcpCatalog {
@@ -769,6 +806,31 @@ impl pi_rs::Extension for LocalCommandPolicy {
 #[cfg(test)]
 mod resource_origin_tests {
     use super::*;
+
+    #[test]
+    fn extension_paths_resolve_against_workspace_with_home_and_file_urls() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        assert_eq!(
+            resolve_discovered_path(std::path::Path::new(" resources/skills "), cwd).unwrap(),
+            cwd.join("resources/skills")
+        );
+        let target = cwd.join("a b.md");
+        let url = reqwest::Url::from_file_path(&target).unwrap();
+        assert_eq!(
+            resolve_discovered_path(std::path::Path::new(url.as_str()), cwd).unwrap(),
+            target
+        );
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            assert_eq!(
+                resolve_discovered_path(std::path::Path::new("~/example"), cwd).unwrap(),
+                std::path::PathBuf::from(home).join("example")
+            );
+        }
+        assert!(
+            resolve_discovered_path(std::path::Path::new("file://invalid-host/x"), cwd).is_err()
+        );
+    }
 
     #[test]
     fn discovered_resource_origin_uses_real_path_and_extension_source() {

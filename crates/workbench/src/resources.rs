@@ -63,45 +63,81 @@ impl Resources {
             .collect();
         augmented.prompt_template = discovered.prompt_paths.clone();
         augmented.themes = discovered.theme_paths.clone();
-        let additional = Self::load(&augmented)?;
-        for (name, skill) in additional.skills {
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                resources.skills.entry(name.clone())
-            {
-                entry.insert(skill);
-            } else if resources
-                .skills
-                .get(&name)
-                .is_some_and(|existing| existing.path != skill.path)
-            {
-                resources.warnings.push(format!(
-                    "Duplicate skill {name} at {}",
-                    skill.path.display()
-                ));
+        let additions = match Self::load(&augmented) {
+            Ok(additional) => vec![additional],
+            Err(_) => {
+                // A resource can disappear or become unreadable between the
+                // extension callback and the host loading it. Keep the other
+                // extensions' resources available in that case.
+                let mut base = augmented.clone();
+                base.skill.clear();
+                base.prompt_template.clear();
+                base.themes.clear();
+                let mut loaded = Vec::new();
+                for (kind, paths) in [
+                    (0, &discovered.skill_paths),
+                    (1, &discovered.prompt_paths),
+                    (2, &discovered.theme_paths),
+                ] {
+                    for path in paths {
+                        let mut one = base.clone();
+                        match kind {
+                            0 => one.skill.push(path.to_string_lossy().into_owned()),
+                            1 => one.prompt_template.push(path.clone()),
+                            _ => one.themes.push(path.clone()),
+                        }
+                        match Self::load(&one) {
+                            Ok(additional) => loaded.push(additional),
+                            Err(error) => resources.warnings.push(format!(
+                                "Could not load discovered resource {}: {error}",
+                                path.display()
+                            )),
+                        }
+                    }
+                }
+                loaded
             }
-        }
-        for (name, prompt) in additional.prompts {
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                resources.prompts.entry(name.clone())
-            {
-                entry.insert(prompt);
-            } else if resources
-                .prompts
-                .get(&name)
-                .is_some_and(|existing| existing.path != prompt.path)
-            {
-                resources.warnings.push(format!(
-                    "Duplicate prompt {name} at {}",
-                    prompt.path.display()
-                ));
+        };
+        for additional in additions {
+            for (name, skill) in additional.skills {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    resources.skills.entry(name.clone())
+                {
+                    entry.insert(skill);
+                } else if resources
+                    .skills
+                    .get(&name)
+                    .is_some_and(|existing| existing.path != skill.path)
+                {
+                    resources.warnings.push(format!(
+                        "Duplicate skill {name} at {}",
+                        skill.path.display()
+                    ));
+                }
             }
-        }
-        for theme in additional.themes {
-            if !resources.themes.contains(&theme) {
-                resources.themes.push(theme);
+            for (name, prompt) in additional.prompts {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    resources.prompts.entry(name.clone())
+                {
+                    entry.insert(prompt);
+                } else if resources
+                    .prompts
+                    .get(&name)
+                    .is_some_and(|existing| existing.path != prompt.path)
+                {
+                    resources.warnings.push(format!(
+                        "Duplicate prompt {name} at {}",
+                        prompt.path.display()
+                    ));
+                }
             }
+            for theme in additional.themes {
+                if !resources.themes.contains(&theme) {
+                    resources.themes.push(theme);
+                }
+            }
+            resources.warnings.extend(additional.warnings);
         }
-        resources.warnings.extend(additional.warnings);
         Ok(resources)
     }
 
@@ -707,7 +743,7 @@ mod tests {
         let mut args =
             super::Cli::parse_from(["pi", "--no-skills", "--no-prompt-templates", "--no-themes"]);
         args.workspace = directory.path().into();
-        let discovered = pi_rs::DiscoveredResources {
+        let mut discovered = pi_rs::DiscoveredResources {
             skill_paths: vec![skill],
             prompt_paths: vec![prompt],
             theme_paths: vec![theme.clone()],
@@ -723,6 +759,23 @@ mod tests {
                 .expand("/greet world")
                 .unwrap()
                 .contains("Existing prompt: world")
+        );
+        let missing = directory.path().join("missing/SKILL.md");
+        discovered.skill_paths.push(missing.clone());
+        let resources = super::Resources::load_with_discovered(&args, &discovered).unwrap();
+        assert!(resources.skills.contains_key("example"));
+        assert!(
+            resources
+                .expand("/greet world")
+                .unwrap()
+                .contains("Existing prompt: world")
+        );
+        assert!(resources.themes.contains(&theme.canonicalize().unwrap()));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(&missing.display().to_string()))
         );
     }
     use super::*;

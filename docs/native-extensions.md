@@ -67,8 +67,9 @@ async fn discover_resources(
 }
 ```
 
-For an executable extension, relative paths are resolved next to the executable;
-embedded hosts can use the supplied working directory. The callback runs after
+Relative paths are resolved from the event's working directory, matching Pi;
+absolute paths, home-relative paths, and local file URLs are also supported.
+The callback runs after
 session start and on `/reload`, with the active branch's extension state. Paths
 are temporary, remain available when automatic discovery is disabled, and do
 not override an existing resource with the same name. SDK hosts can call
