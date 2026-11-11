@@ -54,6 +54,10 @@ The per-model thinking submenu discovers models and their supported levels off
 the terminal thread, saves or clears individual overrides, and preserves other
 user and trusted-project settings. Changes for the active model update the
 session; when an agent run is in progress, they take effect after that run.
+Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
+together. If a saved model falls outside a nonempty model scope, it is added to
+that scope and to a configured `enabledModels` list. Legacy qualified defaults
+without `defaultProvider` are still accepted.
 
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |

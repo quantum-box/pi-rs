@@ -1128,3 +1128,139 @@ fn thinking_model_discovery_can_be_cancelled_while_server_is_slow() {
     release.send(()).unwrap();
     server.join().unwrap();
 }
+
+#[test]
+fn save_default_model_persists_provider_and_extends_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("settings.json"), br#"{"defaultProvider":"anthropic","defaultModel":"old-model","enabledModels":["ollama/first"]}"#).unwrap();
+    std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"id":"first","reasoning":false},{"id":"second","reasoning":false}]}}}"#).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--provider",
+                "ollama",
+                "--model",
+                "first",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/settings\r").unwrap();
+    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    master.write_all(b"Save default model\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Save default model") && text.contains("to change")
+    });
+    let read_settings = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_settings()["defaultProvider"] != "ollama" {
+        assert!(Instant::now() < deadline, "default model was not saved");
+        let mut buffer = [0; 8192];
+        let _ = master.read(&mut buffer);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(read_settings()["defaultProvider"], "ollama");
+    assert_eq!(read_settings()["defaultModel"], "first");
+    master.write_all(b"\x03").unwrap();
+    output_until(&mut master, |text| text.contains("0 tokens"));
+    master.write_all(b"/model\r").unwrap();
+    output_until(&mut master, |text| text.contains("Select model"));
+    master.write_all(b"ollama/second").unwrap();
+    output_until(&mut master, |text| text.contains("ollama/second"));
+    master.write_all(b"\x13").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Default model: ollama/second")
+    });
+    let saved = read_settings();
+    assert_eq!(saved["defaultProvider"], "ollama");
+    assert_eq!(saved["defaultModel"], "second");
+    assert_eq!(
+        saved["enabledModels"],
+        serde_json::json!(["ollama/first", "ollama/second"])
+    );
+    let mut restart = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--workspace",
+            root.path().to_str().unwrap(),
+            "--no-trust",
+            "--no-session",
+            "--no-mcp",
+            "--offline",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    restart
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n",
+        )
+        .unwrap();
+    let output = restart.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let state = events.iter().find(|event| event["id"] == "state").unwrap();
+    assert_eq!(state["data"]["model"]["provider"], "ollama");
+    assert_eq!(state["data"]["model"]["id"], "second");
+}

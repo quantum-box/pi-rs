@@ -87,6 +87,8 @@ struct Cli {
     #[arg(skip)]
     model_explicit: bool,
     #[arg(skip)]
+    model_from_settings: bool,
+    #[arg(skip)]
     thinking_explicit: bool,
     #[arg(skip)]
     thinking_profile: Option<(String, Vec<String>)>,
@@ -376,9 +378,13 @@ impl Cli {
             .as_ref()
             .is_some_and(|(provider, _)| provider == &self.provider)
         {
-            let qualified = model_selection::qualified_model(&self.model, &self.model_profiles)
-                .filter(|(provider, _)| provider == &self.provider)
-                .map_or(self.model.as_str(), |(_, model)| model);
+            let qualified = if self.model_from_settings {
+                self.model.as_str()
+            } else {
+                model_selection::qualified_model(&self.model, &self.model_profiles)
+                    .filter(|(provider, _)| provider == &self.provider)
+                    .map_or(self.model.as_str(), |(_, model)| model)
+            };
             self.initial_model_endpoint = Some(
                 self.model_endpoint_for(&self.provider, Some(qualified))
                     .to_owned(),
@@ -872,13 +878,13 @@ async fn run_cli() {
                 .split_once('/')
                 .and_then(|(prefix, _)| args.model_profiles.provider(prefix))
         };
-        let configured_provider = configured_model
-            .and_then(provider_prefix)
-            .or_else(|| {
-                args.settings
-                    .string("defaultProvider")
-                    .and_then(|name| args.model_profiles.provider(name))
-            })
+        let explicit_default_provider = args
+            .settings
+            .string("defaultProvider")
+            .and_then(|name| args.model_profiles.provider(name));
+        let configured_provider = explicit_default_provider
+            .clone()
+            .or_else(|| configured_model.and_then(provider_prefix))
             .unwrap_or_default();
         args.provider = if let Some(name) = args.provider_argument.as_deref() {
             args.model_profiles
@@ -900,6 +906,7 @@ async fn run_cli() {
         if !args.model_explicit {
             if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
                 args.model = model.into();
+                args.model_from_settings = explicit_default_provider.is_some();
             } else if args.provider != Provider::Ollama {
                 args.model.clear();
             }
@@ -1032,7 +1039,10 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         .find(|catalog| catalog.provider == args.provider)
         .map_or(&[][..], |catalog| catalog.models.as_slice());
     // The hidden worker command receives an already-resolved, literal model ID.
-    if !args.model.is_empty() && !matches!(args.command, Some(Command::Serve)) {
+    if !args.model.is_empty()
+        && !args.model_from_settings
+        && !matches!(args.command, Some(Command::Serve))
+    {
         let selected = model_selection::split_with_profiles(
             &args.model,
             available,

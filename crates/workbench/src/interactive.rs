@@ -3773,7 +3773,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 .and_then(|()| {
                                     let configured =
                                         format!("{}/{}", args.provider.id(), args.model);
-                                    args.settings.set_user("defaultModel", json!(configured))?;
+                                    save_default_model(&mut args)?;
                                     view.append(&format!("Default model: {configured}"));
                                     Ok(())
                                 }),
@@ -4522,6 +4522,39 @@ fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()
     args.change_model(provider, selected.model, selected.thinking)
 }
 
+fn save_default_model(args: &mut Cli) -> Result<()> {
+    let qualified = format!("{}/{}", args.provider.id(), args.model);
+    let add_to_scope = !args.model_scope.is_empty()
+        && !args
+            .model_scope
+            .iter()
+            .any(|choice| choice.provider == args.provider && choice.model == args.model);
+    let mut values = vec![
+        ("defaultProvider".into(), json!(args.provider.id())),
+        ("defaultModel".into(), json!(args.model)),
+    ];
+    if add_to_scope {
+        let mut enabled = args.settings.strings("enabledModels");
+        if !enabled.is_empty()
+            && !enabled
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(&qualified))
+        {
+            enabled.push(qualified);
+            values.push(("enabledModels".into(), json!(enabled)));
+        }
+    }
+    args.settings.set_user_values(&values)?;
+    if add_to_scope {
+        args.model_scope.push(super::model_selection::ScopedChoice {
+            provider: args.provider.clone(),
+            model: args.model.clone(),
+            thinking: None,
+        });
+    }
+    Ok(())
+}
+
 fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     use super::model_selection::{ScopedChoice, next_model, qualified_model};
     let discovered;
@@ -5062,11 +5095,8 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
-            label: format!("Save default model · {}", args.model),
-            selection: Selection::Setting(
-                "defaultModel".into(),
-                json!(args.configured_model_name(&args.model)),
-            ),
+            label: format!("Save default model · {}/{}", args.provider.id(), args.model),
+            selection: Selection::SaveDefaultModel,
         },
         Item {
             label: format!("Cache warming · {cache_mode} (cycle)"),
@@ -5522,6 +5552,7 @@ fn select(
         Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,
         Selection::LogoutRadius => start_radius_logout(view, &args.settings)?,
         Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
+        Selection::SaveDefaultModel => save_default_model(args)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
                 "theme" => json!(args.use_theme.as_deref().unwrap_or("system")),

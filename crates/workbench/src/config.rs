@@ -14,6 +14,31 @@ pub struct Settings {
     resource_layers: Vec<(PathBuf, Value)>,
 }
 impl Settings {
+    pub fn set_user_values(&mut self, values: &[(String, Value)]) -> Result<()> {
+        let path = agent_dir().join("settings.json");
+        update_object(&path, |settings| {
+            for (key, value) in values {
+                settings.insert(key.clone(), value.clone());
+            }
+            validate_settings(&Value::Object(settings.clone()), &path)
+        })?;
+        if !self.value.is_object() {
+            self.value = Value::Object(Map::new());
+        }
+        for (key, value) in values {
+            self.value
+                .as_object_mut()
+                .expect("settings object")
+                .insert(key.clone(), value.clone());
+            if let Some((_, layer)) = self.resource_layers.first_mut() {
+                layer
+                    .as_object_mut()
+                    .expect("settings layer")
+                    .insert(key.clone(), value.clone());
+            }
+        }
+        Ok(())
+    }
     pub fn load(workspace: &Path, trusted: bool) -> Result<Self> {
         let user_path = agent_dir().join("settings.json");
         let mut value = read_object(&user_path)?;

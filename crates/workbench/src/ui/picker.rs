@@ -34,6 +34,7 @@ pub enum Selection {
     Trust(bool),
     Thinking(String),
     Setting(String, serde_json::Value),
+    SaveDefaultModel,
     EditSetting(String),
 }
 #[derive(Clone)]
@@ -254,6 +255,7 @@ impl Picker {
             .and_then(|item| match &item.selection {
                 Selection::Setting(name, _) => Some((false, name.clone())),
                 Selection::EditSetting(name) => Some((true, name.clone())),
+                Selection::SaveDefaultModel => Some((false, "__save_default_model".into())),
                 _ => None,
             });
         self.items = items;
@@ -264,6 +266,7 @@ impl Picker {
                     .position(|item| match &item.selection {
                         Selection::Setting(item_name, _) => !edit && *item_name == name,
                         Selection::EditSetting(item_name) => edit && *item_name == name,
+                        Selection::SaveDefaultModel => !edit && name == "__save_default_model",
                         _ => false,
                     })
             })

@@ -1520,3 +1520,51 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-token"));
 }
+
+#[test]
+fn default_model_and_provider_are_read_as_separate_fields() {
+    for (settings, provider, model) in [
+        (
+            json!({"defaultProvider":"ollama", "defaultModel":"anthropic/fixture"}),
+            "ollama",
+            "anthropic/fixture",
+        ),
+        (
+            json!({"defaultProvider":"anthropic", "defaultModel":"anthropic/fixture"}),
+            "anthropic",
+            "anthropic/fixture",
+        ),
+        (
+            json!({"defaultModel":"anthropic/legacy-model"}),
+            "anthropic",
+            "legacy-model",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        let mut process = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .env("ANTHROPIC_API_KEY", "fixture")
+            .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let state = events.iter().find(|event| event["id"] == "state").unwrap();
+        assert_eq!(state["data"]["model"]["provider"], provider);
+        assert_eq!(state["data"]["model"]["id"], model);
+    }
+}
