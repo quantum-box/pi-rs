@@ -31,7 +31,7 @@ pub(super) struct Stream {
 
 struct PendingTool {
     content_index: usize,
-    arguments: String,
+    arguments: super::streaming_json::StreamingJson,
 }
 
 impl Stream {
@@ -439,7 +439,7 @@ impl Stream {
             blocks.push(json!({"type":"toolCall","id":"","name":"","arguments":{}}));
             PendingTool {
                 content_index: next,
-                arguments: String::new(),
+                arguments: super::streaming_json::StreamingJson::default(),
             }
         });
         let index = pending.content_index;
@@ -462,8 +462,8 @@ impl Stream {
                 .pending_tools
                 .get_mut(&delta.index)
                 .expect("open tool call");
-            pending.arguments.push_str(&delta.arguments);
-            if let Ok(arguments @ Value::Object(_)) = serde_json::from_str(&pending.arguments) {
+            let arguments = pending.arguments.append(&delta.arguments);
+            if arguments.is_object() {
                 self.assistant["content"][index]["arguments"] = arguments;
             }
             self.update(
@@ -546,4 +546,53 @@ fn timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod streaming_tool_tests {
+    use super::*;
+
+    #[test]
+    fn tool_deltas_expose_partial_arguments_for_each_call() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let mut events = Vec::new();
+        let delta = |index, id: &str, name: &str, arguments: &str| ToolCallDelta {
+            index,
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        };
+        stream.tool_delta(delta(0, "call-a", "read", "{\"path\":\"fo"), &mut events);
+        assert_eq!(
+            stream.assistant["content"][0]["arguments"],
+            json!({"path":"fo"})
+        );
+        assert_eq!(
+            events.last().unwrap()["assistantMessageEvent"]["partial"]["content"][0]["arguments"],
+            json!({"path":"fo"})
+        );
+        stream.tool_delta(
+            delta(1, "call-b", "write", "{\"content\":\"xy"),
+            &mut events,
+        );
+        stream.tool_delta(delta(0, "", "", "o.txt\"}"), &mut events);
+        assert_eq!(
+            stream.assistant["content"][0]["arguments"],
+            json!({"path":"foo.txt"})
+        );
+        assert_eq!(
+            stream.assistant["content"][1]["arguments"],
+            json!({"content":"xy"})
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+                .count(),
+            2
+        );
+    }
 }

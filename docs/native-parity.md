@@ -51,8 +51,9 @@ that runs an extension command returns `handled`. A model turn returns
 `started` before completion. Wait for `agent_end` or `agent_settled` for that
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
-blocks, tool calls, tool results and turn boundaries. Tool-call blocks become
-available when their provider response is complete. `get_messages` returns
+blocks, tool calls, tool results and turn boundaries. Tool-call deltas expose
+incremental argument previews, including nested objects, arrays and partial
+strings; completed calls are still validated before execution. `get_messages` returns
 Pi message roles and blocks, with a correlated partial assistant message
 during streaming. Set `includeNative: true` to include the native model
 projection in `nativeMessages`. The `steer` and `follow_up` commands
@@ -64,8 +65,8 @@ Queued input is acknowledged after it is saved. The `get_entries` and
 ID. Session records used internally for run recovery are omitted from this
 view. Set `includeNative: true` for the native entries or tree and the native
 leaf ID. Newly committed entries are emitted as `entry_appended` with those
-same IDs. Incremental tool arguments and additional session events remain in
-progress.
+same IDs. Full malformed-JSON preview fidelity and additional session events
+remain in progress.
 
 `get_tree` sorts siblings by timestamp in chronological order, including
 imported timestamps with UTC offsets. Siblings with the same instant retain

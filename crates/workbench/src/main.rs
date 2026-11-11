@@ -48,6 +48,7 @@ mod rpc_messages;
 mod runtime;
 mod session_import;
 mod sessions;
+mod streaming_json;
 mod thinking;
 mod tool_selection;
 mod ui;
