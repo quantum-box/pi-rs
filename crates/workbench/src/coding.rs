@@ -342,11 +342,20 @@ impl Tool for CodingTool {
                     result = worker => result.unwrap_or_else(|error| Err(Error::Config(error.to_string()))),
                 }
             }
-            Kind::Write => self.write(&args).map(Outcome::Succeeded),
-            Kind::Edit => {
-                return self
-                    .edit(&args)
-                    .unwrap_or_else(|error| Outcome::Failed(edit_error_text(error)));
+            Kind::Write | Kind::Edit => {
+                let tool = self.clone();
+                let cancellation = context.cancellation.child_token();
+                let _guard = cancellation.clone().drop_guard();
+                tokio::task::spawn_blocking(move || {
+                    if matches!(tool.kind, Kind::Write) {
+                        tool.write_cancellable(&args, &cancellation)
+                            .map(Outcome::Succeeded)
+                    } else {
+                        tool.edit_cancellable(&args, &cancellation)
+                    }
+                })
+                .await
+                .unwrap_or_else(|error| Err(Error::Config(error.to_string())))
             }
             Kind::Bash | Kind::PowerShell => return self.bash(&args, &context.cancellation).await,
         };
@@ -357,6 +366,9 @@ impl Tool for CodingTool {
                 if self.unrestricted && matches!(self.kind, Kind::Grep | Kind::List) =>
             {
                 Outcome::Failed(message)
+            }
+            Err(error) if matches!(self.kind, Kind::Edit) => {
+                Outcome::Failed(edit_error_text(error))
             }
             Err(error) => Outcome::Failed(error.to_string()),
         }
@@ -556,7 +568,17 @@ impl CodingTool {
         crate::text_page::read(&path, display_path, offset, limit, cancellation)
     }
 
+    #[cfg(test)]
     fn write(&self, args: &Value) -> Result<String> {
+        self.write_cancellable(args, &pi_rs::CancellationToken::new())
+    }
+
+    fn write_cancellable(
+        &self,
+        args: &Value,
+        cancellation: &pi_rs::CancellationToken,
+    ) -> Result<String> {
+        check_mutation_cancelled(cancellation)?;
         let content = string(args, "content")?;
         if !self.unrestricted && content.len() as u64 > MAX_FILE_BYTES {
             return Err(Error::Config("content exceeds 4 MiB".into()));
@@ -583,6 +605,7 @@ impl CodingTool {
                 .ok_or_else(|| Error::Config("invalid parent".into()))?;
         }
         self.path(&ancestor.to_string_lossy())?;
+        check_mutation_cancelled(cancellation)?;
         std::fs::create_dir_all(parent)?;
         let parent = self.path(&parent.to_string_lossy())?;
         let mut target = parent.join(
@@ -598,13 +621,26 @@ impl CodingTool {
             target = existing;
         }
         let _lock = mutation_lock(&target)?;
-        atomic_write(&target, content.as_bytes())?;
+        check_mutation_cancelled(cancellation)?;
+        atomic_write(&target, content.as_bytes(), cancellation)?;
+        check_mutation_cancelled(cancellation)?;
         Ok(format!("Successfully wrote to {display_path}"))
     }
 
+    #[cfg(test)]
     fn edit(&self, args: &Value) -> Result<Outcome> {
+        self.edit_cancellable(args, &pi_rs::CancellationToken::new())
+    }
+
+    fn edit_cancellable(
+        &self,
+        args: &Value,
+        cancellation: &pi_rs::CancellationToken,
+    ) -> Result<Outcome> {
+        check_mutation_cancelled(cancellation)?;
         let path = self.path(string(args, "path")?)?;
         let _lock = mutation_lock(&path)?;
+        check_mutation_cancelled(cancellation)?;
         let original = self.text(&path)?;
         let (output, count) = crate::text_edit::apply(&original, args)?;
         if !self.unrestricted && output.len() as u64 > MAX_FILE_BYTES {
@@ -615,7 +651,9 @@ impl CodingTool {
                 "file changed while preparing edits; read it again".into(),
             ));
         }
-        atomic_write(&path, output.as_bytes())?;
+        check_mutation_cancelled(cancellation)?;
+        atomic_write(&path, output.as_bytes(), cancellation)?;
+        check_mutation_cancelled(cancellation)?;
         let display_path = args["path"].as_str().unwrap_or_default();
         let original = crate::text_edit::normalized_content(&original);
         let edited = crate::text_edit::normalized_content(&output);
@@ -1138,7 +1176,19 @@ fn mutation_lock(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+fn check_mutation_cancelled(cancellation: &pi_rs::CancellationToken) -> Result<()> {
+    if cancellation.is_cancelled() {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn atomic_write(
+    path: &Path,
+    content: &[u8],
+    cancellation: &pi_rs::CancellationToken,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Config("file needs a parent".into()))?;
@@ -1154,6 +1204,7 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     }
     file.write_all(content)?;
     file.as_file().sync_all()?;
+    check_mutation_cancelled(cancellation)?;
     file.persist(path).map_err(|error| Error::Io(error.error))?;
     #[cfg(unix)]
     std::fs::File::open(parent)?.sync_all()?;
@@ -1610,6 +1661,38 @@ mod tests {
                 .edit(&json!({"path":"Capture d'ecran.txt", "oldText":"curly", "newText":"other"}))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_mutations_do_not_change_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, "before").unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        for (kind, args) in [
+            (Kind::Write, json!({"path":"file","content":"after"})),
+            (
+                Kind::Edit,
+                json!({"path":"file","oldText":"before","newText":"after"}),
+            ),
+        ] {
+            tool.kind = kind;
+            let context = ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: cancellation.clone(),
+            };
+            assert!(
+                matches!(tool.invoke(args, context).await, Outcome::Failed(message) if message == "Operation aborted")
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+        }
     }
 
     #[cfg(unix)]

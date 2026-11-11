@@ -251,7 +251,9 @@ passed with the same implementation.
 ### Image and file-tool checkpoint
 
 Local write and edit operations support text files larger than 4 MiB. New
-files follow the process umask and edits preserve existing permissions.
+files follow the process umask and edits preserve existing permissions. File
+mutations run off the async runtime and check cancellation while holding the
+per-file lock, including immediately before committing the replacement.
 
 The read tool runs file I/O and image decoding off the async runtime.
 Cancellation returns promptly and stops the text scan between buffers, even
