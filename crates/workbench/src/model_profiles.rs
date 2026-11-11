@@ -536,11 +536,9 @@ impl ModelMetadata {
                 .iter()
                 .copied()
                 .filter(|level| {
-                    *level == "off"
-                        || self
-                            .thinking_level_map
-                            .get(*level)
-                            .map_or(!matches!(*level, "xhigh" | "max"), Option::is_some)
+                    self.thinking_level_map
+                        .get(*level)
+                        .map_or(!matches!(*level, "xhigh" | "max"), Option::is_some)
                 })
                 .map(str::to_owned)
                 .collect(),
@@ -1279,7 +1277,7 @@ mod tests {
     fn sampling_layers_merge_without_overriding_agent_fields() {
         let profiles = Profiles::parse(&json!({"providers":{"ollama":{
             "models":[{"id":"custom","reasoning":true,
-                "thinkingLevelMap":{"medium":null,"xhigh":"strong"},
+                "thinkingLevelMap":{"off":null,"medium":null,"xhigh":"strong"},
                 "samplingParams":{"temperature":0.7,"top_p":0.9},
                 "samplingParamsByThinkingLevel":{"xhigh":{"temperature":0.5,"top_k":20}}
             }],
@@ -1290,7 +1288,7 @@ mod tests {
         assert!(
             !levels
                 .iter()
-                .any(|level| level == "medium" || level == "max")
+                .any(|level| matches!(level.as_str(), "off" | "medium" | "max"))
         );
         assert_eq!(model.mapped_effort("xhigh"), Some(Some("strong")));
         assert_eq!(

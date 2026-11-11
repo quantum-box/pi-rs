@@ -3289,8 +3289,10 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         }
                     }
                     "app.thinking.cycle" if !is_busy(&worker) => {
-                        if let Err(error) = super::thinking::cycle(&mut args) {
-                            view.append(&error.to_string());
+                        match super::thinking::cycle(&mut args) {
+                            Ok(Some(level)) => view.append(&format!("Thinking level: {level}")),
+                            Ok(None) => view.append("Current model does not support thinking"),
+                            Err(error) => view.append(&error.to_string()),
                         }
                     }
                     "app.tools.expand" => view.set_expand_tools(!view.expand_tools),

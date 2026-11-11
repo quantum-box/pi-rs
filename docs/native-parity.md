@@ -1943,6 +1943,9 @@ Clippy pass.
 Ollama discovery reads the advertised `thinking.values` alongside capability
 flags. Boolean controls appear as `off` and `high`, and advertised names are
 available in the terminal and RPC. Models reporting only `off` skip cycling.
+An explicit null in `thinkingLevelMap` excludes that level, including
+`off` for models that require reasoning. The terminal shows the new level
+after cycling or reports that the model does not support thinking.
 Explicit selections clamp to the next supported higher standard level, then
 the nearest lower one, as in Pi. Services without level metadata use the
 standard fallback menu. The provider chooses its default when no level is
