@@ -486,12 +486,10 @@ impl Stream {
 }
 
 pub(super) fn tool_call_value(call: &ToolCall) -> Value {
-    let arguments = serde_json::from_str::<Value>(&call.arguments)
-        .ok()
-        .filter(Value::is_object);
-    let mut value = json!({"type":"toolCall","id":call.id,"name":call.name,"arguments":arguments.as_ref().cloned().unwrap_or_else(|| json!({}))});
-    if arguments.is_none() {
-        value["argumentsError"] = json!("Tool arguments are not a JSON object");
+    let arguments = pi_rs::parse_tool_arguments(&call.arguments);
+    let mut value = json!({"type":"toolCall","id":call.id,"name":call.name,"arguments":arguments.as_ref().cloned().unwrap_or_else(|_| json!({}))});
+    if let Err(error) = arguments {
+        value["argumentsError"] = json!(error);
     }
     value
 }
@@ -551,6 +549,25 @@ fn timestamp() -> u64 {
 #[cfg(test)]
 mod streaming_tool_tests {
     use super::*;
+
+    #[test]
+    fn completed_tool_call_reports_repaired_and_invalid_arguments() {
+        let call = |arguments: &str| ToolCall {
+            id: "id".into(),
+            name: "read".into(),
+            arguments: arguments.into(),
+        };
+        let repaired = tool_call_value(&call(r#"{"path":"\unknown"}"#));
+        assert_eq!(repaired["arguments"]["path"], r"\unknown");
+        assert!(repaired.get("argumentsError").is_none());
+        let raw = r#"{"path":"partial"#;
+        let invalid = tool_call_value(&call(raw));
+        assert_eq!(invalid["arguments"], json!({}));
+        assert!(invalid["argumentsError"].as_str().unwrap().ends_with(raw));
+        let empty = tool_call_value(&call(""));
+        assert_eq!(empty["arguments"], json!({}));
+        assert!(empty.get("argumentsError").is_none());
+    }
 
     #[test]
     fn tool_deltas_expose_partial_arguments_for_each_call() {

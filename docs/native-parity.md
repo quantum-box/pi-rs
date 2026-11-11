@@ -70,6 +70,11 @@ leaf ID. Newly committed entries are emitted as `entry_appended` with those
 same IDs. Full malformed-JSON preview fidelity and additional session events
 remain in progress.
 
+Completed tool arguments repair invalid string escapes and unescaped control
+characters as Pi does. Incomplete JSON and non-object values produce a tool
+error containing the received arguments. The original model response remains
+in the journal; subsequent model requests use the repaired object.
+
 `get_tree` sorts siblings by timestamp in chronological order, including
 imported timestamps with UTC offsets. Siblings with the same instant retain
 append order. Entries whose parent is missing or points to themselves appear as

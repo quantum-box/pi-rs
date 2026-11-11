@@ -170,6 +170,45 @@ fn answer(value: &str) -> Vec<ModelEvent> {
 fn ignore(_: Notification<'_>) {}
 
 #[tokio::test]
+async fn completed_tool_arguments_repair_string_escapes_and_keep_raw_journal() {
+    let raw = r#"{"id":"\url{x}"}"#;
+    let invalid = r#"{"id":"unfinished"#;
+    let model = Script::new(vec![tool_reply(&[raw, invalid]), answer("done")]);
+    let fixture = Arc::new(Fixture {
+        called: AtomicUsize::new(0),
+        hold: false,
+        effects: Mutex::default(),
+    });
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Tools(fixture.clone()))).unwrap();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("check".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.called.load(Ordering::SeqCst), 1);
+    assert!(
+        fixture
+            .effects
+            .lock()
+            .unwrap()
+            .values()
+            .any(|value| value == r"found \url{x}")
+    );
+    assert!(session.operations().iter().any(|(_, state)| matches!(state, OperationState::Finished(Outcome::Skipped(error)) if error.contains("Received arguments:") && error.ends_with(invalid))));
+    assert!(session.records().iter().any(|record| matches!(&record.event, Event::Assistant { invocations, .. } if invocations[0].call.arguments == raw)));
+    let requests = model.requests.lock().unwrap();
+    assert!(requests[1].messages.iter().any(|message| matches!(message, Message::Assistant { calls, .. } if serde_json::from_str::<Value>(&calls[0].arguments).unwrap()["id"] == r"\url{x}" && calls[1].arguments == "{}")));
+}
+
+#[tokio::test]
 async fn validation_policy_and_queued_input_keep_complete_tool_groups() {
     let dir = tempdir().unwrap();
     let mut session = Session::open(dir.path().join("session")).unwrap();

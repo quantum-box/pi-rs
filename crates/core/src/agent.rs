@@ -1327,7 +1327,8 @@ impl Agent<'_> {
             if !tool.tool.can_poll() {
                 return Err(Error::PendingOperation(operation_id));
             }
-            let arguments = serde_json::from_str(&invocation.call.arguments)?;
+            let arguments = crate::parse_tool_arguments(&invocation.call.arguments)
+                .map_err(|_| Error::PendingOperation(operation_id))?;
             let arguments = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
@@ -1378,8 +1379,14 @@ impl Agent<'_> {
                 "tool is not registered or advertised".into(),
             ));
         };
-        let Ok(args) = serde_json::from_str(&call.arguments) else {
-            return Ok(Preparation::Skipped("arguments are not valid JSON".into()));
+        let args = match crate::parse_tool_arguments(&call.arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return Ok(Preparation::Skipped(format!(
+                    "Invalid arguments for tool \"{}\": {error}",
+                    call.name
+                )));
+            }
         };
         let args = tokio::select! {
             biased;

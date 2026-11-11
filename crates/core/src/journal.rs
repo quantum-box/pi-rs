@@ -336,7 +336,7 @@ impl AbandonedBranch {
             "edit" | "write" => &mut self.modified_files,
             _ => return,
         };
-        if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments)
+        if let Ok(arguments) = crate::parse_tool_arguments(&call.arguments)
             && let Some(path) = arguments["path"].as_str().filter(|path| !path.is_empty())
         {
             files.insert(path.to_owned());
@@ -1945,9 +1945,9 @@ fn conversation_entries_since(
                             .map(|inv| {
                                 let mut call = inv.call.clone();
                                 if !serde_json::from_str::<serde_json::Value>(&call.arguments)
-                                    .is_ok_and(|value| value.is_object())
-                                {
-                                    call.arguments = "{}".into();
+                                    .is_ok_and(|value| value.is_object()) {
+                                    call.arguments = crate::parse_tool_arguments(&call.arguments)
+                                        .map_or_else(|_| "{}".into(), |value| value.to_string());
                                 }
                                 call
                             })
