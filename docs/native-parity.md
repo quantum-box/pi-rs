@@ -186,7 +186,8 @@ external image sources.
 HTML exports show aborted and failed model requests and preserve any partial
 answer. Imported Pi assistant errors retain their original message text.
 HTML exports fold the initial recorded system prompt and subsequent updates,
-including changed sections and available, added, or removed tools.
+including changed sections and available, added, or removed tools. Tool
+parameters expand to show types, required flags, and descriptions.
 User shell executions appear in HTML exports even when excluded from model
 context. The first ten output lines stay visible, with the rest folded.
 Prompt-template arguments preserve literal backslashes and quoted empty

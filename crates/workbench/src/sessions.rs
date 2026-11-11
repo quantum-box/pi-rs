@@ -500,11 +500,7 @@ fn render_system_html(
             "<details class=\"system\"><summary>{label}</summary><ul>"
         ));
         for tool in tools_added {
-            html.push_str(&format!(
-                "<li><b>{}</b> {}</li>",
-                escape(&tool.name),
-                escape(&tool.description)
-            ));
+            render_system_tool_html(html, tool);
         }
         html.push_str("</ul></details>");
     }
@@ -515,6 +511,54 @@ fn render_system_html(
         }
         html.push_str("</ul></details>");
     }
+}
+
+fn render_system_tool_html(html: &mut String, tool: &pi_rs::ToolSpec) {
+    let title = format!(
+        "<b>{}</b> {}",
+        escape(&tool.name),
+        escape(&tool.description)
+    );
+    let Some(properties) = tool.parameters["properties"]
+        .as_object()
+        .filter(|properties| !properties.is_empty())
+    else {
+        html.push_str(&format!("<li>{title}</li>"));
+        return;
+    };
+    let required = tool.parameters["required"].as_array();
+    html.push_str(&format!("<li><details><summary>{title}</summary><ul>"));
+    for (name, property) in properties {
+        let kind = match &property["type"] {
+            serde_json::Value::String(kind) if !kind.is_empty() => kind.clone(),
+            serde_json::Value::Array(kinds) => kinds
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
+            _ => "any".to_owned(),
+        };
+        let requirement = if required
+            .is_some_and(|names| names.iter().any(|entry| entry.as_str() == Some(name)))
+        {
+            "required"
+        } else {
+            "optional"
+        };
+        html.push_str(&format!(
+            "<li><code>{}</code> <code>{}</code> {requirement}",
+            escape(name),
+            escape(&kind)
+        ));
+        if let Some(description) = property["description"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+        {
+            html.push_str(&format!("<div>{}</div>", escape(description)));
+        }
+        html.push_str("</li>");
+    }
+    html.push_str("</ul></details></li>");
 }
 
 fn render_shell_html(html: &mut String, execution: &pi_rs::BashExecution) {
@@ -1050,7 +1094,7 @@ mod tests {
             serde_json::json!({"type":"session","version":3}),
             serde_json::json!({"type":"message","id":"s1","parentId":null,"message":{
                 "role":"system","content":"base","sections":{"rules":"first"},
-                "toolsAdded":[{"name":"read","description":"Read","parameters":{"type":"object"}}]
+                "toolsAdded":[{"name":"read","description":"Read","parameters":{"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"<script>path</script>"},"limit":{"type":["integer","null"]},"options":true}}}]
             }}),
             serde_json::json!({"type":"message","id":"u","parentId":"s1","message":{
                 "role":"user","content":"Question"
@@ -1066,9 +1110,9 @@ mod tests {
         let session = super::super::session_import::read(fixture.path()).unwrap();
         let document = html(&session);
         assert!(document.contains("<summary>System Prompt</summary><pre>base\n\nfirst</pre>"));
-        assert!(
-            document.contains("<summary>Available Tools</summary><ul><li><b>read</b> Read</li>")
-        );
+        assert!(document.contains(
+            "<summary>Available Tools</summary><ul><li><details><summary><b>read</b> Read</summary>"
+        ));
         assert!(document.contains(
             "<summary>System Prompt Update: -rules, project, tools +write -read</summary>"
         ));
@@ -1082,6 +1126,9 @@ mod tests {
         assert!(
             document.find("Question").unwrap() < document.find("System Prompt Update").unwrap()
         );
+        assert!(document.contains("<code>path</code> <code>string</code> required<div>&lt;script&gt;path&lt;/script&gt;</div>"));
+        assert!(document.contains("<code>limit</code> <code>integer,null</code> optional"));
+        assert!(document.contains("<code>options</code> <code>any</code> optional"));
         assert!(!document.contains("<script>"));
     }
 
