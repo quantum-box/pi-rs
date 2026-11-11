@@ -1143,11 +1143,13 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     Err(error) => panic!("proxy request not received: {error}"),
                 };
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
+                if reader.read_line(&mut first).is_err() || first.is_empty() {
+                    continue;
+                }
                 let mut headers = String::new();
                 loop {
                     let mut line = String::new();
@@ -1291,5 +1293,156 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
             .join()
             .unwrap()
             .starts_with("POST /v1/chat/completions ")
+    );
+}
+
+#[test]
+fn model_listing_uses_proxy_before_a_model_request() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"httpProxy":format!("http://{}", listener.local_addr().unwrap())}).to_string(),
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("model discovery did not reach proxy: {error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        let body = br#"{"data":[]}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        socket.write_all(body).unwrap();
+        first
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .env_remove("http_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("NO_PROXY")
+        .args([
+            "--no-mcp",
+            "--offline",
+            "--provider",
+            "ollama",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/chat/completions",
+            "--list-models",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        server
+            .join()
+            .unwrap()
+            .starts_with("GET http://127.0.0.1:1/v1/models ")
+    );
+}
+
+#[test]
+fn radius_auth_refresh_uses_proxy_from_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"httpProxy":format!("http://{}", listener.local_addr().unwrap())}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(root.path().join("auth.json"), json!({"radius":{"type":"oauth","gateway":"http://127.0.0.1:1/","access":"old-token","refresh":"fixture-refresh","expires":0}}).to_string()).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("OAuth refresh did not reach proxy: {error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let response =
+            br#"{"access_token":"new-token","refresh_token":"new-refresh","expires_in":3600}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+        socket.write_all(response).unwrap();
+        (first, body)
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .env("PI_RADIUS_GATEWAY", "http://127.0.0.1:1")
+        .env_remove("http_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("NO_PROXY")
+        .args(["--provider", "radius", "auth", "print-bearer-token"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "new-token");
+    let (request, body) = server.join().unwrap();
+    assert!(request.starts_with("POST http://127.0.0.1:1/v1/oauth/token "));
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("refresh_token=fixture-refresh")
     );
 }

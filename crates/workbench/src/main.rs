@@ -465,13 +465,14 @@ impl Cli {
                 .as_ref()
                 .is_some_and(model_auth::Credential::is_command)
         {
-            return Ok(providers::Client::deferred(
+            return providers::Client::deferred(
                 provider.clone(),
                 adapter,
                 endpoint,
                 credential,
                 settings,
-            ));
+            )
+            .with_http_settings(&self.settings);
         }
         let token = credential
             .as_ref()
@@ -481,9 +482,10 @@ impl Cli {
         let bearer = credential
             .as_ref()
             .is_some_and(model_auth::Credential::is_bearer);
-        Ok(provider
+        provider
             .connect(adapter, endpoint, token, bearer)?
-            .with_headers(headers))
+            .with_headers(headers)
+            .with_http_settings(&self.settings)
     }
 
     fn activate_provider(&mut self, provider: Provider, model: Option<&str>) -> Result<()> {
@@ -1103,7 +1105,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                         ));
                     }
                     let mut manual_input = None;
-                    let result = openrouter_auth::login(|url, sender| {
+                    let result = openrouter_auth::login(&args.settings, |url, sender| {
                         eprintln!("Continue in your browser: {url}");
                         manual_input = Some(sender);
                     })
@@ -1111,7 +1113,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                     drop(manual_input);
                     result
                 } else {
-                    let gateway = radius_auth::Gateway::configured()?;
+                    let gateway = radius_auth::Gateway::configured_with_settings(&args.settings)?;
                     let method = if *device_code {
                         radius_auth::Method::Device
                     } else {
@@ -1134,7 +1136,9 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                     &Provider::named(provider).expect("built-in OpenRouter provider"),
                 )?
             } else {
-                radius_auth::Gateway::configured()?.logout().await?
+                radius_auth::Gateway::configured_with_settings(&args.settings)?
+                    .logout()
+                    .await?
             };
             output(json!({"type":"logged_out","provider":provider,"removed":removed}));
             return Ok(());

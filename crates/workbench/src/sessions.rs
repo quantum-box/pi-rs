@@ -775,7 +775,9 @@ pub fn copy_text(text: &str) -> Result<()> {
 pub(super) enum ShareDestination {
     Radius {
         endpoint: reqwest::Url,
-        credential: RadiusCredential,
+        credential: Box<RadiusCredential>,
+        proxies: Vec<reqwest::Proxy>,
+        idle_timeout: Option<std::time::Duration>,
     },
     Gist,
 }
@@ -798,7 +800,7 @@ impl ShareDestination {
         if destination == "gist" {
             return Ok(Self::Gist);
         }
-        let gateway = super::radius_auth::Gateway::configured()?;
+        let gateway = super::radius_auth::Gateway::configured_with_settings(settings)?;
         let endpoint = match std::env::var("PI_RS_RADIUS_SHARE_URL") {
             Ok(url) => share_url(&url)?,
             Err(_) => gateway.url("/v1/artifacts"),
@@ -826,7 +828,9 @@ impl ShareDestination {
         }
         Ok(Self::Radius {
             endpoint,
-            credential,
+            credential: Box::new(credential),
+            proxies: super::http_proxy::configured(settings)?,
+            idle_timeout: settings.http_idle_timeout(),
         })
     }
 
@@ -842,11 +846,13 @@ impl ShareDestination {
             Self::Radius {
                 mut endpoint,
                 credential,
+                proxies,
+                idle_timeout,
             } => {
                 let body = super::rpc_entries::Entries::new(&session)
                     .write_share_branch(&session, workspace)?;
                 drop(session);
-                let token = match credential {
+                let token = match *credential {
                     RadiusCredential::ApiKey(key) => key,
                     RadiusCredential::OAuth(gateway) => gateway
                         .access(std::time::Duration::from_secs(300))
@@ -859,14 +865,19 @@ impl ShareDestination {
                     .query_pairs_mut()
                     .append_pair("visibility", "organization")
                     .append_pair("title", "Pi session");
-                let client = reqwest::Client::builder()
+                let mut builder = reqwest::Client::builder()
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
-                    .timeout(std::time::Duration::from_secs(120))
-                    .build()
-                    .map_err(|_| {
-                        Error::Config("Could not initialize the Radius share client".into())
-                    })?;
+                    .timeout(std::time::Duration::from_secs(120));
+                for proxy in proxies {
+                    builder = builder.proxy(proxy);
+                }
+                if let Some(timeout) = idle_timeout {
+                    builder = builder.read_timeout(timeout);
+                }
+                let client = builder.build().map_err(|_| {
+                    Error::Config("Could not initialize the Radius share client".into())
+                })?;
                 let mut response = client
                     .post(endpoint)
                     .bearer_auth(token)
@@ -971,6 +982,30 @@ async fn share_gist(file: &Path, name: &str) -> Result<SharedSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn radius_share_uses_configured_proxy() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::open(root.path().join("session.jsonl")).unwrap();
+        let (proxy, server) = super::super::http_proxy::test_proxy(
+            r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#,
+        )
+        .await;
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture-token".into())),
+            proxies: vec![proxy],
+            idle_timeout: None,
+        };
+        let shared = destination.share(session, root.path()).await.unwrap();
+        assert_eq!(shared.url, "https://example.com/shared");
+        let (request, headers, _) = server.await.unwrap();
+        assert!(request.starts_with("POST http://127.0.0.1:1/v1/artifacts?"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer fixture-token")
+        );
+    }
     #[test]
     fn session_ids_and_prefixes_resolve_without_changing_journals() {
         let root = tempfile::tempdir().unwrap();

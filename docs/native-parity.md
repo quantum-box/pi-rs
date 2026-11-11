@@ -24,7 +24,8 @@ headers and individual body reads; `0` or `"disabled"` disables this idle
 deadline. `/settings` can change it. The separate `--model-timeout-secs` bounds
 the entire model operation and defaults to 2,147,483 seconds.
 
-Model and codemode HTTP clients honor `httpProxy`, the HTTP(S) proxy environment
+Model discovery and model/codemode HTTP clients, Radius OAuth and session
+sharing, and OpenRouter OAuth honor `httpProxy`, the HTTP(S) proxy environment
 variables, and `no_proxy`/`NO_PROXY` domain, wildcard, and port exclusions.
 Lowercase environment variables take precedence, and explicit environment
 values take precedence over the setting. Proxy URL credentials are not displayed

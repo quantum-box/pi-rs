@@ -228,7 +228,8 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
                 if token.is_some() || provider != super::Provider::Radius {
                     return Ok(token);
                 }
-                let gateway = super::radius_auth::Gateway::configured()?;
+                let gateway =
+                    super::radius_auth::Gateway::configured_with_settings(&args.settings)?;
                 if gateway.model_endpoint().as_str() != endpoint {
                     return Ok(None);
                 }

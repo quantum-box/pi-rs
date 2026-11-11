@@ -249,6 +249,9 @@ impl PiMessages {
         self.client = builder
             .build()
             .map_err(|_| Error::Config("Could not initialize the Pi Messages client".into()))?;
+        if let Some(radius) = &mut self.radius {
+            radius.gateway = radius.gateway.clone().with_http_options(proxies, timeout)?;
+        }
         Ok(self)
     }
 

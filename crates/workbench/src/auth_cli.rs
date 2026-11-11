@@ -134,7 +134,7 @@ async fn resolve(
         return Ok(Some(Resolved { kind, value }));
     }
     if provider == &Provider::Radius && wanted != Some(AuthType::ApiKey) {
-        let gateway = radius_auth::Gateway::configured()?;
+        let gateway = radius_auth::Gateway::configured_with_settings(&args.settings)?;
         if gateway.model_endpoint().as_str() == endpoint {
             let access = if no_refresh {
                 gateway.cached_access()?
@@ -158,6 +158,17 @@ fn emit(line: &str) -> Result<()> {
 }
 
 pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
+    // Auth commands are dispatched before normal interactive configuration is loaded.
+    // Honor existing trust decisions without prompting in this noninteractive command.
+    let explicit = if args.no_trust {
+        Some(false)
+    } else if args.trust || args.project.is_some() {
+        Some(true)
+    } else {
+        None
+    };
+    args.trusted = super::config::project_trust(&args.workspace, explicit)?.unwrap_or(false);
+    args.settings = super::config::Settings::load(&args.workspace, args.trusted)?;
     if args.api_key.is_some() {
         return Err(Error::Config(
             "omit --api-key when resolving configured credentials".into(),

@@ -13,7 +13,12 @@ use uuid::Uuid;
 const AUTHORIZE: &str = "https://openrouter.ai/auth";
 const EXCHANGE: &str = "https://openrouter.ai/api/v1/auth/keys";
 
-pub(super) async fn login(announce: impl FnOnce(&Url, oneshot::Sender<String>)) -> Result<()> {
+pub(super) async fn login(
+    settings: &super::config::Settings,
+    announce: impl FnOnce(&Url, oneshot::Sender<String>),
+) -> Result<()> {
+    let proxies = super::http_proxy::configured(settings)?;
+    let idle_timeout = settings.http_idle_timeout();
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let callback = Url::parse(&format!(
         "http://127.0.0.1:{}/oauth/callback/{}",
@@ -46,7 +51,7 @@ pub(super) async fn login(announce: impl FnOnce(&Url, oneshot::Sender<String>)) 
     let result = async {
         let code =
             code.ok_or_else(|| Error::Config("Missing OpenRouter authorization code".into()))?;
-        let key = exchange(EXCHANGE, &code, &verifier).await?;
+        let key = exchange(EXCHANGE, &code, &verifier, &proxies, idle_timeout).await?;
         super::model_auth::save_openrouter_oauth(&key)
     }
     .await;
@@ -90,15 +95,29 @@ pub(super) fn manual_code(input: &str) -> Option<String> {
     super::model_auth::valid_key(&code).then_some(code)
 }
 
-async fn exchange(endpoint: &str, code: &str, verifier: &str) -> Result<String> {
+async fn exchange(
+    endpoint: &str,
+    code: &str,
+    verifier: &str,
+    proxies: &[reqwest::Proxy],
+    idle_timeout: Option<Duration>,
+) -> Result<String> {
     #[derive(Deserialize)]
     struct KeyResponse {
         key: String,
     }
 
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30));
+    for proxy in proxies {
+        builder = builder.proxy(proxy.clone());
+    }
+    if let Some(timeout) = idle_timeout {
+        builder = builder.read_timeout(timeout);
+    }
+    let client = builder
         .build()
         .map_err(|_| Error::Config("Could not initialize OpenRouter OAuth".into()))?;
     let failed = || Error::Config("OpenRouter key exchange failed".into());
@@ -201,11 +220,35 @@ mod tests {
             stream.write_all(body).await.unwrap();
         });
         assert_eq!(
-            exchange(&endpoint, "fixture-code", "fixture-verifier")
+            exchange(&endpoint, "fixture-code", "fixture-verifier", &[], None)
                 .await
                 .unwrap(),
             "fixture-key"
         );
         fixture.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_uses_configured_proxy() {
+        let (proxy, server) =
+            super::super::http_proxy::test_proxy(r#"{"key":"fixture-key"}"#).await;
+        assert_eq!(
+            exchange(
+                "http://127.0.0.1:1/api/v1/auth/keys",
+                "fixture-code",
+                "fixture-verifier",
+                &[proxy],
+                None
+            )
+            .await
+            .unwrap(),
+            "fixture-key"
+        );
+        let (request, _, body) = server.await.unwrap();
+        assert!(request.starts_with("POST http://127.0.0.1:1/api/v1/auth/keys "));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+            "fixture-code"
+        );
     }
 }

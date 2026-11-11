@@ -109,6 +109,43 @@ fn bypasses_proxy(url: &Url, excluded: &str) -> bool {
 }
 
 #[cfg(test)]
+pub(super) async fn test_proxy(
+    response: &'static str,
+) -> (Proxy, tokio::task::JoinHandle<(String, String, Vec<u8>)>) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let task = tokio::spawn(async move {
+        let (socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut first = String::new();
+        socket.read_line(&mut first).await.unwrap();
+        let mut headers = String::new();
+        let mut size = 0;
+        loop {
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                size = value.trim().parse().unwrap();
+            }
+            headers.push_str(&line);
+        }
+        let mut body = vec![0; size];
+        socket.read_exact(&mut body).await.unwrap();
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+        (first, headers, body)
+    });
+    (proxy, task)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

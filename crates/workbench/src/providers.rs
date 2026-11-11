@@ -206,6 +206,7 @@ pub(super) struct Deferred {
     endpoint: String,
     credential: Option<Credential>,
     headers: RequestHeaders,
+    http_settings: Option<super::config::Settings>,
     options: Option<(Box<Cli>, bool)>,
     probe_context: bool,
     observed: bool,
@@ -227,6 +228,9 @@ impl Deferred {
             .connect(self.adapter, &self.endpoint, token, bearer)?
             .with_headers(headers)
             .with_context_probes(self.probe_context);
+        if let Some(settings) = &self.http_settings {
+            client = client.with_http_settings(settings)?;
+        }
         if let Some((args, reported)) = &self.options {
             client = client.with_model_options(args, *reported)?;
         }
@@ -252,10 +256,30 @@ impl Client {
             endpoint: endpoint.into(),
             credential,
             headers,
+            http_settings: None,
             options: None,
             probe_context: true,
             observed: false,
         }))
+    }
+
+    pub fn with_http_settings(self, settings: &super::config::Settings) -> Result<Self> {
+        let proxies = super::http_proxy::configured(settings)?;
+        let timeout = settings.http_idle_timeout();
+        Ok(match self {
+            Self::Ollama(client) => Self::Ollama(client.with_http_options(timeout, &proxies)?),
+            Self::Anthropic(client) => {
+                Self::Anthropic(client.with_http_options(timeout, &proxies)?)
+            }
+            Self::Google(client) => Self::Google(client.with_http_options(timeout, &proxies)?),
+            Self::PiMessages(client) => {
+                Self::PiMessages(client.with_http_options(timeout, &proxies)?)
+            }
+            Self::Deferred(mut client) => {
+                client.http_settings = Some(settings.clone());
+                Self::Deferred(client)
+            }
+        })
     }
 
     pub async fn stream_with_headers(
@@ -418,11 +442,8 @@ impl Client {
 
     pub fn with_model_options(self, args: &super::Cli, reported: bool) -> Result<Self> {
         let thinking = args.provider_thinking();
-        let proxies = super::http_proxy::configured(&args.settings)?;
         Ok(match self {
             Self::Ollama(client) => {
-                let client =
-                    client.with_http_options(args.settings.http_idle_timeout(), &proxies)?;
                 let configured = args.model_profiles.model(&args.provider, &args.model);
                 let retention = args
                     .model_profiles
@@ -458,8 +479,6 @@ impl Client {
                 Self::Ollama(client.with_sampling(sampling)?)
             }
             Self::Anthropic(client) => {
-                let client =
-                    client.with_http_options(args.settings.http_idle_timeout(), &proxies)?;
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
                 let (supports_long, cache_tools) = args
                     .model_profiles
@@ -493,16 +512,8 @@ impl Client {
                 }
                 Self::Anthropic(client)
             }
-            Self::Google(client) => Self::Google(
-                client
-                    .with_http_options(args.settings.http_idle_timeout(), &proxies)?
-                    .with_thinking(thinking),
-            ),
-            Self::PiMessages(client) => Self::PiMessages(
-                client
-                    .with_http_options(args.settings.http_idle_timeout(), &proxies)?
-                    .with_thinking(thinking),
-            ),
+            Self::Google(client) => Self::Google(client.with_thinking(thinking)),
+            Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));
                 Self::Deferred(client)

@@ -2328,17 +2328,19 @@ fn slash(
         }
         "/login" if rest.eq_ignore_ascii_case("radius") => show_radius_methods(view),
         "/login" if rest.eq_ignore_ascii_case("radius browser") => {
-            start_radius_login(view, radius_auth::Method::Browser)?;
+            start_radius_login(view, &args.settings, radius_auth::Method::Browser)?;
         }
         "/login" if rest.eq_ignore_ascii_case("radius device-code") => {
-            start_radius_login(view, radius_auth::Method::Device)?;
+            start_radius_login(view, &args.settings, radius_auth::Method::Device)?;
         }
-        "/logout" if rest.eq_ignore_ascii_case("radius") => start_radius_logout(view)?,
+        "/logout" if rest.eq_ignore_ascii_case("radius") => {
+            start_radius_logout(view, &args.settings)?
+        }
         "/login"
             if rest.eq_ignore_ascii_case("openrouter")
                 || rest.eq_ignore_ascii_case("openrouter browser") =>
         {
-            start_openrouter_login(view)
+            start_openrouter_login(view, &args.settings)
         }
         "/login" if rest.eq_ignore_ascii_case("openrouter api-key") => edit_provider_key(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
@@ -2361,7 +2363,7 @@ fn slash(
                     })
                     .collect::<Vec<_>>();
                 if login
-                    || radius_auth::Gateway::configured()
+                    || radius_auth::Gateway::configured_with_settings(&args.settings)
                         .and_then(|gateway| gateway.has_credential())
                         .unwrap_or(false)
                 {
@@ -4147,12 +4149,13 @@ fn show_radius_methods(view: &mut View) {
     ));
 }
 
-fn start_openrouter_login(view: &mut View) {
+fn start_openrouter_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
     view.remote_task = Some(RemoteTask::start(
         "Signing in to OpenRouter",
         "OpenRouter login cancelled",
-        |sender| async move {
-            super::openrouter_auth::login(|url, manual| {
+        move |sender| async move {
+            super::openrouter_auth::login(&settings, |url, manual| {
                 let _ = sender.send(RemoteEvent::Notice(format!(
                     "Continue in your browser: {url}"
                 )));
@@ -4171,8 +4174,12 @@ fn clear_openrouter_editor(view: &mut View) {
     }
 }
 
-fn start_radius_login(view: &mut View, method: radius_auth::Method) -> Result<()> {
-    let gateway = radius_auth::Gateway::configured()?;
+fn start_radius_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: radius_auth::Method,
+) -> Result<()> {
+    let gateway = radius_auth::Gateway::configured_with_settings(settings)?;
     view.remote_task = Some(RemoteTask::start(
         "Signing in to Radius",
         "Radius login cancelled",
@@ -4188,8 +4195,8 @@ fn start_radius_login(view: &mut View, method: radius_auth::Method) -> Result<()
     Ok(())
 }
 
-fn start_radius_logout(view: &mut View) -> Result<()> {
-    let gateway = radius_auth::Gateway::configured()?;
+fn start_radius_logout(view: &mut View, settings: &crate::config::Settings) -> Result<()> {
+    let gateway = radius_auth::Gateway::configured_with_settings(settings)?;
     view.remote_task = Some(RemoteTask::start(
         "Signing out of Radius",
         "Radius logout cancelled",
@@ -4816,11 +4823,11 @@ fn select(
         }
         Selection::Completion { range, text } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
-        Selection::LoginOpenRouter => start_openrouter_login(view),
+        Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
         Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
         Selection::RadiusMethods => show_radius_methods(view),
-        Selection::LoginRadius(method) => start_radius_login(view, method)?,
-        Selection::LogoutRadius => start_radius_logout(view)?,
+        Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,
+        Selection::LogoutRadius => start_radius_logout(view, &args.settings)?,
         Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {

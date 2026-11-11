@@ -106,10 +106,41 @@ impl Gateway {
 
     pub(super) fn configured() -> Result<Self> {
         let origin = Self::configured_origin()?;
-        let client = Client::builder()
+        Self::build(origin, &[], None)
+    }
+
+    pub(super) fn configured_with_settings(settings: &super::config::Settings) -> Result<Self> {
+        Self::build(
+            Self::configured_origin()?,
+            &super::http_proxy::configured(settings)?,
+            settings.http_idle_timeout(),
+        )
+    }
+
+    pub(super) fn with_http_options(
+        self,
+        proxies: &[reqwest::Proxy],
+        idle_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        Self::build(self.origin, proxies, idle_timeout)
+    }
+
+    fn build(
+        origin: Url,
+        proxies: &[reqwest::Proxy],
+        idle_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let mut builder = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT);
+        for proxy in proxies {
+            builder = builder.proxy(proxy.clone());
+        }
+        if let Some(timeout) = idle_timeout {
+            builder = builder.read_timeout(timeout);
+        }
+        let client = builder
             .build()
             .map_err(|_| Error::Config("Could not initialize Radius OAuth client".into()))?;
         Ok(Self { origin, client })
@@ -493,4 +524,36 @@ fn status_error(status: StatusCode) -> Error {
 
 fn request_error() -> Error {
     Error::Config("Radius OAuth request failed".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn refresh_token_request_uses_configured_proxy() {
+        let (proxy, server) = super::super::http_proxy::test_proxy(
+            r#"{"access_token":"new-access","expires_in":3600}"#,
+        )
+        .await;
+        let gateway =
+            Gateway::build(Url::parse("http://127.0.0.1:1/").unwrap(), &[proxy], None).unwrap();
+        let result = gateway
+            .token(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "fixture-refresh"),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, TokenResult::Granted(Token { access_token, .. }) if access_token == "new-access")
+        );
+        let (request, _, body) = server.await.unwrap();
+        assert!(request.starts_with("POST http://127.0.0.1:1/v1/oauth/token "));
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .contains("refresh_token=fixture-refresh")
+        );
+    }
 }
