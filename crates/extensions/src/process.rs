@@ -211,6 +211,8 @@ struct Description {
     #[serde(default)]
     session_lifecycle_hook: bool,
     #[serde(default)]
+    session_transition_reasons: bool,
+    #[serde(default)]
     cache_warming_hook: bool,
     #[serde(default)]
     tree_navigation_hook: bool,
@@ -425,8 +427,29 @@ impl Extension for ExecutableExtension {
         event: &LifecycleEvent,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
+        use pi_rs_core::{SessionShutdownReason as Shutdown, SessionStartReason as Start};
+        let mut event = event.clone();
+        if !self.description.session_transition_reasons {
+            match &mut event {
+                LifecycleEvent::SessionStart { reason, .. } => {
+                    *reason = match *reason {
+                        Start::New | Start::Fork => Start::Resume,
+                        Start::Reload => Start::Startup,
+                        reason => reason,
+                    };
+                }
+                LifecycleEvent::SessionShutdown { reason, .. } => {
+                    *reason = match *reason {
+                        Shutdown::New | Shutdown::Fork => Shutdown::Resume,
+                        Shutdown::Reload => Shutdown::Quit,
+                        reason => reason,
+                    };
+                }
+                _ => {}
+            }
+        }
         self.request_async(ProtocolRequest::Lifecycle {
-            event: event.clone(),
+            event,
             state: state.cloned(),
         })
         .await
@@ -1156,6 +1179,7 @@ async fn dispatch_with_host(
             input_hook: extension.handles_input(),
             lifecycle_hook: extension.handles_lifecycle(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
+            session_transition_reasons: true,
             cache_warming_hook: extension.handles_cache_warming(),
             tree_navigation_hook: extension.handles_tree_navigation(),
             tools: extension
@@ -1359,6 +1383,7 @@ mod tests {
         .unwrap();
         assert!(!descriptor.cache_warming_hook);
         assert!(!descriptor.session_lifecycle_hook);
+        assert!(!descriptor.session_transition_reasons);
     }
 
     struct CacheDecisionExtension;

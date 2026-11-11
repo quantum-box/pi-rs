@@ -126,7 +126,10 @@ enum Request {
         state: serde_json::Value,
     },
     Cancel,
-    Shutdown,
+    Shutdown {
+        reason: Option<SessionShutdownReason>,
+        target_session_file: Option<PathBuf>,
+    },
 }
 struct ReaderControls {
     snapshot: Arc<Mutex<SessionSnapshot>>,
@@ -144,6 +147,7 @@ struct ControlState {
     queued: usize,
     pending_cancel: bool,
     shell: Option<CancellationToken>,
+    shutdown: Option<(SessionShutdownReason, Option<PathBuf>)>,
 }
 
 struct SessionSnapshot {
@@ -197,6 +201,11 @@ pub fn run(args: Cli) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
 }
 
 async fn run_worker(mut args: Cli) -> Result<()> {
+    let (startup_reason, previous_session_file) =
+        std::env::var(super::process::SESSION_TRANSITION_ENV)
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or((SessionStartReason::Startup, None));
     let mut runtime = runtime::configure(&args, true).await?;
     let ui = Arc::new(super::extension_ui::Broker::default());
     runtime.registry.set_ui(ui.clone());
@@ -248,8 +257,8 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         &args,
         &runtime,
         LifecycleEvent::SessionStart {
-            reason: SessionStartReason::Startup,
-            previous_session_file: None,
+            reason: startup_reason,
+            previous_session_file,
         },
     )
     .await;
@@ -768,12 +777,18 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     if shell_pending && let Some(shell) = shell_results.recv().await {
         save_shell(shell, &args, &snapshot, &active);
     }
+    let (reason, target_session_file) = active
+        .lock()
+        .expect("worker control")
+        .shutdown
+        .take()
+        .unwrap_or((SessionShutdownReason::Quit, None));
     notify_session_lifecycle(
         &args,
         &runtime,
         LifecycleEvent::SessionShutdown {
-            reason: SessionShutdownReason::Quit,
-            target_session_file: None,
+            reason,
+            target_session_file,
         },
     )
     .await;
@@ -1044,7 +1059,14 @@ fn read_requests(
                         state.pending_cancel = true;
                     }
                 }
-                Request::Shutdown => break,
+                Request::Shutdown {
+                    reason,
+                    target_session_file,
+                } => {
+                    active.lock().expect("worker control").shutdown =
+                        reason.map(|reason| (reason, target_session_file));
+                    break;
+                }
                 request => {
                     let counted = !matches!(
                         request,

@@ -1,12 +1,24 @@
 //! Shared subprocess transport for terminal and RPC frontends.
 use super::Cli;
-use pi_rs::{Error, Result};
+use pi_rs::{Error, Result, SessionShutdownReason, SessionStartReason};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
+
+fn shutdown_reason(reason: SessionStartReason) -> SessionShutdownReason {
+    match reason {
+        SessionStartReason::Startup => SessionShutdownReason::Quit,
+        SessionStartReason::Reload => SessionShutdownReason::Reload,
+        SessionStartReason::New => SessionShutdownReason::New,
+        SessionStartReason::Resume => SessionShutdownReason::Resume,
+        SessionStartReason::Fork => SessionShutdownReason::Fork,
+    }
+}
 
 pub(super) struct Worker {
     pub(super) compacting: bool,
@@ -17,6 +29,7 @@ pub(super) struct Worker {
     session: std::path::PathBuf,
     pub(super) busy: bool,
     persistent: bool,
+    shutdown: Option<(SessionShutdownReason, Option<std::path::PathBuf>)>,
     configuration: Value,
     pub(super) child: Child,
     stdin: Option<ChildStdin>,
@@ -25,10 +38,22 @@ pub(super) struct Worker {
 }
 impl Worker {
     pub(super) fn start(args: &Cli, operation: &[&str]) -> Result<Self> {
+        Self::start_with_transition(args, operation, None)
+    }
+
+    fn start_with_transition(
+        args: &Cli,
+        operation: &[&str],
+        transition: Option<(SessionStartReason, Option<std::path::PathBuf>)>,
+    ) -> Result<Self> {
         let steering_mode = super::backend::configured_queue_mode(args, "steeringMode")?;
         let follow_up_mode = super::backend::configured_queue_mode(args, "followUpMode")?;
         let mut command = Command::new(std::env::current_exe()?);
         command.env_remove("PI_RS_MODEL_TOKEN");
+        command.env_remove(SESSION_TRANSITION_ENV);
+        if let Some(transition) = transition {
+            command.env(SESSION_TRANSITION_ENV, serde_json::to_string(&transition)?);
+        }
         let endpoint = args.model_endpoint_for(&args.provider, Some(&args.model));
         if let Some(token) = args.model_override_token(&args.provider, endpoint) {
             command.env("PI_RS_MODEL_TOKEN", token);
@@ -189,6 +214,7 @@ impl Worker {
             session: args.session.clone(),
             busy: !persistent,
             persistent,
+            shutdown: None,
             configuration: configuration(args),
             child,
             stdin,
@@ -248,6 +274,37 @@ impl Worker {
     pub(super) fn matches(&self, args: &Cli) -> bool {
         self.persistent && self.configuration == configuration(args)
     }
+    pub(super) fn transition(
+        slot: &mut Option<Self>,
+        args: &Cli,
+        reason: SessionStartReason,
+    ) -> Result<()> {
+        let Some(active) = slot.as_mut() else {
+            return Ok(());
+        };
+        if active.session == args.session && !matches!(reason, SessionStartReason::Reload) {
+            return Ok(());
+        }
+        if active.busy || active.bashing {
+            return Err(Error::Config(
+                "wait for the current operation before changing sessions".into(),
+            ));
+        }
+        let replacing_session = active.session != args.session;
+        let previous = replacing_session.then(|| active.session.clone());
+        active.shutdown = Some((
+            shutdown_reason(reason),
+            replacing_session.then(|| args.session.clone()),
+        ));
+        drop(slot.take());
+        *slot = Some(Self::start_with_transition(
+            args,
+            &["serve"],
+            Some((reason, previous)),
+        )?);
+        Ok(())
+    }
+
     pub(super) fn request(&mut self, args: &Cli, mut request: Value) -> Result<()> {
         prepare_images(args, &mut request)?;
         if self.bashing && self.session != args.session {
@@ -319,7 +376,12 @@ fn configuration(args: &Cli) -> Value {
 impl Drop for Worker {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.send(json!({"type": if self.persistent { "shutdown" } else { "cancel" }}));
+            let message = if let Some((reason, target)) = &self.shutdown {
+                json!({"type":"shutdown","reason":reason,"target_session_file":target})
+            } else {
+                json!({"type": if self.persistent { "shutdown" } else { "cancel" }})
+            };
+            let _ = self.send(message);
             self.stdin.take();
             let deadline =
                 Instant::now() + Duration::from_secs(if self.persistent { 30 } else { 5 });

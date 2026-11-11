@@ -51,14 +51,20 @@ pub struct ExtensionTreeSummary {
 #[serde(rename_all = "snake_case")]
 pub enum SessionStartReason {
     Startup,
+    Reload,
+    New,
     Resume,
+    Fork,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionShutdownReason {
     Quit,
+    Reload,
+    New,
     Resume,
+    Fork,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

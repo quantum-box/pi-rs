@@ -386,7 +386,16 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         } else {
             None
         };
-        let result = command(&request, &mut args, &mut worker);
+        let result = command(&request, &mut args, &mut worker).and_then(|data| {
+            let reason = match request["type"].as_str() {
+                Some("new_session") => pi_rs::SessionStartReason::New,
+                Some("switch_session") => pi_rs::SessionStartReason::Resume,
+                Some("fork" | "clone") => pi_rs::SessionStartReason::Fork,
+                _ => return Ok(data),
+            };
+            Worker::transition(&mut worker, &args, reason)?;
+            Ok(data)
+        });
         if result.is_ok()
             && let Some(previous) = previous_records
             && let Ok(session) = Session::snapshot(&args.session)

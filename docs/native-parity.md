@@ -2805,6 +2805,7 @@ cleanup. This covers single-command model runs, including errors, and
 persistent workers. When a worker attaches to another journal, it
 delivers shutdown to the previous journal's extension state and start
 to the destination's state, with both journal paths available across
-the two events. Existing executable descriptors default to opting out.
-The frontend still needs to convey the specific reason for new, fork,
-and reload transitions.
+the two events. A loaded terminal runtime restarts for new sessions,
+forks, resumes, and reloads, and RPC session switches use the same
+transition path. Both runtimes receive the corresponding reason.
+Previously built extensions receive the reasons their descriptors support.

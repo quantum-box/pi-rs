@@ -2026,6 +2026,7 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
             drop(session);
             args.session = destination;
             view.restore(args)?;
+            args.session_transition = Some(pi_rs::SessionStartReason::Fork);
             if let Some(input) = input {
                 view.editor.replace(input);
             }
@@ -2200,9 +2201,15 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         }
         "/thinking" => super::thinking::set(args, rest)?,
         "/new" => {
-            args.session = session_path(&args.workspace, args.session_dir.as_deref());
-            initialize_session(args)?;
-            view.restore(args)?;
+            let mut next = args.clone();
+            next.session = session_path(&args.workspace, args.session_dir.as_deref());
+            if let Some(directory) = next.session.parent() {
+                std::fs::create_dir_all(directory)?;
+            }
+            initialize_session(&mut next)?;
+            view.restore(&next)?;
+            next.session_transition = Some(pi_rs::SessionStartReason::New);
+            *args = next;
         }
         "/resume" if rest.is_empty() => {
             let mut items = Vec::new();
@@ -2564,6 +2571,12 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 }
             }
             last_theme_check = Instant::now();
+        }
+        if let Some(reason) = args.session_transition.take()
+            && let Err(error) = Worker::transition(&mut worker, &args, reason)
+        {
+            view.append(&error.to_string());
+            dirty = true;
         }
         if worker
             .as_ref()
@@ -3725,7 +3738,6 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             view.append("Wait for the shell command to finish");
                             view.editor.replace(input);
                         } else if input.trim() == "/reload" {
-                            worker.take();
                             view.cache_warming_status = None;
                             view.dialogs.clear();
                             view.ui_status.clear();
@@ -3752,6 +3764,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 Err(error) => view.append(&error.to_string()),
                             }
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
+                            args.session_transition = Some(pi_rs::SessionStartReason::Reload);
                         } else if input.starts_with('/') {
                             match slash(&input, &mut args, &mut view) {
                                 Ok(Some(next)) => worker = Some(next),
@@ -4392,6 +4405,7 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
     next.model_explicit = false;
     next.thinking_explicit = false;
     next.session = path;
+    next.session_transition = Some(pi_rs::SessionStartReason::Resume);
     restore_workspace(&mut next)?;
     let resources = super::resources::Resources::load(&next)?;
     next.theme_paths = resources.themes.clone();
@@ -4640,6 +4654,27 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_session_creates_its_storage_directory() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.workspace = directory.path().to_owned();
+        let sessions = directory.path().join("sessions");
+        args.session_dir = Some(sessions.clone());
+        let mut view = super::View::default();
+
+        super::slash("/new", &mut args, &mut view).unwrap();
+
+        assert_eq!(args.session.parent(), Some(sessions.as_path()));
+        assert!(args.session.is_file());
+        assert!(matches!(
+            args.session_transition,
+            Some(pi_rs::SessionStartReason::New)
+        ));
+    }
+
     #[test]
     fn continue_skips_newer_sessions_from_other_workspaces_and_invalid_files() {
         let directory = tempfile::tempdir().unwrap();

@@ -65,6 +65,8 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside p
 )]
 struct Cli {
     #[arg(skip)]
+    session_transition: Option<pi_rs::SessionStartReason>,
+    #[arg(skip)]
     settings: config::Settings,
     #[arg(skip)]
     model_profiles: model_profiles::Profiles,
