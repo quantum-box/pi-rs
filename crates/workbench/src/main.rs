@@ -1146,9 +1146,28 @@ async fn execute(mut args: Cli) -> Result<()> {
         }
         return rpc::run(args);
     }
+    let mut follow_up_prompts = Vec::new();
     if args.command.is_none() {
+        let interactive = !args.print
+            && args.mode.is_none()
+            && std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal();
+        let mut arguments = std::mem::take(&mut args.prompt);
+        if !interactive {
+            let mut first_message = true;
+            arguments.retain(|argument| {
+                if argument.starts_with('@') && argument.len() > 1 {
+                    return true;
+                }
+                if std::mem::take(&mut first_message) {
+                    return true;
+                }
+                follow_up_prompts.push(argument.clone());
+                false
+            });
+        }
         let (mut prompt, images) = attachments::expand(
-            &args.prompt,
+            &arguments,
             &args.workspace,
             args.settings.resize_model_images(),
             args.model_image_resize(),
@@ -1164,12 +1183,11 @@ async fn execute(mut args: Cli) -> Result<()> {
                 prompt.insert_str(0, input);
             }
         }
-        if !prompt.trim().is_empty() || !args.initial_images.is_empty() {
-            if !args.print
-                && args.mode != Some(OutputMode::Json)
-                && std::io::stdin().is_terminal()
-                && std::io::stdout().is_terminal()
-            {
+        if !prompt.trim().is_empty()
+            || !args.initial_images.is_empty()
+            || !follow_up_prompts.is_empty()
+        {
+            if interactive {
                 args.initial_prompt = Some(prompt);
                 args.command = Some(Command::Interactive);
             } else {
@@ -1188,7 +1206,7 @@ async fn execute(mut args: Cli) -> Result<()> {
         args.print || args.mode == Some(OutputMode::Text),
         Ordering::Relaxed,
     );
-    let mut command = args.command.take().unwrap_or(Command::Interactive);
+    let command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
         return interactive::run(args).await;
     }
@@ -1391,17 +1409,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     let result = async {
         let registry = &runtime.registry;
         let agent = runtime.agent(&args, session.session_id());
-        let mut stream = (args.mode == Some(OutputMode::Json)
-            && matches!(command, Command::Run { .. } | Command::Resume))
-            .then(rpc_events::Stream::default);
-        let mut observer = |event: Notification<'_>| {
-            if let Some(stream) = &mut stream {
-                for event in stream.notify(&event, &args) {
-                    output(event);
-                }
-            }
-            observe(event, args.trace);
-        };
+        let mut observer = |event: Notification<'_>| observe(event, args.trace);
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
     tokio::spawn(async move {
@@ -1413,33 +1421,7 @@ async fn execute(mut args: Cli) -> Result<()> {
     if args.stdin_control {
         read_controls(sender, cancel.clone());
     }
-    let mut initial_images = args.initial_images.clone();
-    if let Command::Run { prompt } = &mut command {
-        if initial_images.is_empty() && agent.try_extension_command(&mut session, prompt, &mut observer)? {
-            return Ok(());
-        }
-        if registry.has_input_hooks() {
-            let event = pi_rs::InputEvent {
-                text: std::mem::take(prompt),
-                images: initial_images,
-                source: pi_rs::InputSource::Extension,
-                streaming_behavior: None,
-            };
-            let states = session.extension_states();
-            let prepared = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = registry.prepare_input(event, &states) => result?,
-            };
-            let Some(prepared) = prepared else { return Ok(()) };
-            *prompt = prepared.text;
-            initial_images = prepared.images;
-        }
-        if let Some(expanded) = runtime.resources.expand(prompt)? {
-            *prompt = expanded;
-        }
-    }
-    let mut input = match command {
+    let input = match command {
         Command::Review {
             child,
             from_record,
@@ -1530,42 +1512,87 @@ async fn execute(mut args: Cli) -> Result<()> {
         Command::Resume => None,
         _ => unreachable!(),
     };
-    let run_id = args.run_id.unwrap_or_else(Uuid::new_v4);
-    let image_record = if initial_images.is_empty() {
-        None
-    } else {
-        if session.records().iter().any(|record| record.run_id == Some(run_id) || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)) {
-            return Err(Error::DuplicateRun(run_id));
+    let mut initial_images = args.initial_images.clone();
+    let mut last_answer = None;
+    let has_follow_up = !follow_up_prompts.is_empty();
+    let inputs = std::iter::once(input).chain(follow_up_prompts.into_iter().map(Some));
+    for (index, mut input) in inputs.enumerate() {
+        let mut images = std::mem::take(&mut initial_images);
+        let mut stream = (args.mode == Some(OutputMode::Json))
+            .then(rpc_events::Stream::default);
+        let mut observer = |event: Notification<'_>| {
+            if let Some(stream) = &mut stream {
+                for event in stream.notify(&event, &args) {
+                    output(event);
+                }
+            }
+            observe(event, args.trace);
+        };
+        if let Some(prompt) = &mut input {
+            if index == 0 && has_follow_up && prompt.is_empty() && images.is_empty() {
+                continue;
+            }
+            if images.is_empty() && agent.try_extension_command(&mut session, prompt, &mut observer)? {
+                continue;
+            }
+            if registry.has_input_hooks() {
+                let event = pi_rs::InputEvent {
+                    text: std::mem::take(prompt),
+                    images,
+                    source: pi_rs::InputSource::Extension,
+                    streaming_behavior: None,
+                };
+                let states = session.extension_states();
+                let prepared = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = registry.prepare_input(event, &states) => result?,
+                };
+                let Some(prepared) = prepared else { continue };
+                *prompt = prepared.text;
+                images = prepared.images;
+            }
+            if let Some(expanded) = runtime.resources.expand(prompt)? {
+                *prompt = expanded;
+            }
         }
-        session.append_user_with_images(input.take().unwrap_or_default(), initial_images, Some(run_id))?;
-        session.records().last()
-    };
-    if args.mode == Some(OutputMode::Json) {
-        output(json!({"type":"agent_start"}));
-    }
-    if let Some(record) = image_record {
-        observer(Notification::Committed(record));
-    }
-    let answer = agent
-        .run_correlated(
-            &mut session,
-            run_id,
-            input,
-            &mut receiver,
-            &cancel,
-            &mut observer,
-        )
-        .await;
-    if let Some(stream) = &mut stream {
-        let aborted = matches!(&answer, Err(Error::Cancelled));
-        for event in stream.settle(aborted) {
-            output(event);
+        let run_id = if index == 0 { args.run_id } else { None }.unwrap_or_else(Uuid::new_v4);
+        let image_record = if images.is_empty() {
+            None
+        } else {
+            if session.records().iter().any(|record| record.run_id == Some(run_id) || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)) {
+                return Err(Error::DuplicateRun(run_id));
+            }
+            session.append_user_with_images(input.take().unwrap_or_default(), images, Some(run_id))?;
+            session.records().last()
+        };
+        if args.mode == Some(OutputMode::Json) {
+            output(json!({"type":"agent_start"}));
         }
-        output(json!({"type":"agent_end","success":answer.is_ok(),"messages":stream.messages,"willRetry":false}));
-        output(json!({"type":"agent_settled","aborted":stream.aborted()}));
+        if let Some(record) = image_record {
+            observer(Notification::Committed(record));
+        }
+        let answer = agent.run_correlated(
+            &mut session, run_id, input, &mut receiver, &cancel, &mut observer,
+        ).await;
+        if let Some(stream) = &mut stream {
+            let aborted = matches!(&answer, Err(Error::Cancelled));
+            for event in stream.settle(aborted) {
+                output(event);
+            }
+            output(json!({"type":"agent_end","success":answer.is_ok(),"messages":stream.messages,"willRetry":false}));
+            output(json!({"type":"agent_settled","aborted":stream.aborted()}));
+        }
+        let answer = answer?;
+        if TEXT_OUTPUT.load(Ordering::Relaxed) {
+            last_answer = Some(answer);
+        } else {
+            output(json!({"type":"answer","content":answer}));
+        }
     }
-    let answer = answer?;
-    output(json!({"type": "answer", "content": answer}));
+    if let Some(answer) = last_answer {
+        output(json!({"type":"answer","content":answer}));
+    }
     Ok(())
     }.await;
     runtime
