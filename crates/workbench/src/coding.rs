@@ -120,6 +120,95 @@ impl CodingTools {
         })
     }
 
+    /// Run extension-supplied shell operations through the usual user output limits.
+    pub async fn execute_shell_operations(
+        &self,
+        event: &pi_rs::UserBashEvent,
+        extension: &dyn pi_rs::Extension,
+        state: Option<&pi_rs::ExtensionState>,
+        timeout: Option<Duration>,
+        cancellation: &pi_rs::CancellationToken,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<pi_rs::BashExecution> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if !self.unrestricted && event.command.len() > 1024 * 1024 {
+            return Err(Error::Config("shell command exceeds 1048576 bytes".into()));
+        }
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let operation_cancel = cancellation.child_token();
+        let mut output = crate::shell_output::Accumulator::for_user_shell();
+        let mut text = ShellStream::default();
+        let mut filter = UserShellFilter::default();
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let exit_code = {
+            let operation = extension.execute_user_bash(
+                event,
+                state,
+                timeout,
+                operation_cancel.clone(),
+                sender,
+            );
+            tokio::pin!(operation);
+            let deadline = async {
+                match timeout {
+                    Some(timeout) => tokio::time::sleep(timeout).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(deadline);
+            let mut open = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => { cancelled = true; operation_cancel.cancel(); break None; }
+                    _ = &mut deadline => { cancelled = true; timed_out = true; operation_cancel.cancel(); break None; }
+                    chunk = receiver.recv(), if open => match chunk {
+                        Some(chunk) => append_user_shell_chunk(&mut output, &mut text, &mut filter, &chunk, progress)?,
+                        None => open = false,
+                    },
+                    result = &mut operation => {
+                        while let Ok(chunk) = receiver.try_recv() {
+                            append_user_shell_chunk(&mut output, &mut text, &mut filter, &chunk, progress)?;
+                        }
+                        break result.map_err(|message| Error::Extension { id: extension.id().into(), message })?;
+                    }
+                }
+            }
+        };
+        while let Ok(chunk) = receiver.try_recv() {
+            append_user_shell_chunk(&mut output, &mut text, &mut filter, &chunk, progress)?;
+        }
+        let mut remaining = String::new();
+        text.finish(&mut |text| remaining.push_str(&filter.filter(text)));
+        remaining.push_str(&filter.finish());
+        if !remaining.is_empty() {
+            progress(&remaining);
+            output.append(remaining.as_bytes())?;
+        }
+        let result = output.finish()?;
+        let output = if timed_out {
+            format!(
+                "{}\nCommand timed out after {} seconds",
+                result.display_without_notice,
+                timeout.expect("elapsed timeout").as_secs_f64()
+            )
+        } else {
+            result.display_without_notice
+        };
+        Ok(pi_rs::BashExecution {
+            command: event.command.clone(),
+            output,
+            exit_code,
+            cancelled,
+            truncated: result.details.is_some(),
+            full_output_path: result.path.map(|path| path.to_string_lossy().into_owned()),
+            exclude_from_context: event.exclude_from_context,
+        })
+    }
+
     /// Resolve a reader path, including Pi's filename fallbacks and this profile's scope.
     pub fn resolve_read_path(&self, path: &Path) -> Result<PathBuf> {
         CodingTool {
@@ -170,6 +259,23 @@ impl CodingTools {
             Ok((tool.text(&path)?, Vec::new()))
         }
     }
+}
+
+fn append_user_shell_chunk(
+    output: &mut crate::shell_output::Accumulator,
+    decoder: &mut ShellStream,
+    filter: &mut UserShellFilter,
+    chunk: &[u8],
+    progress: &mut (dyn FnMut(&str) + Send),
+) -> Result<()> {
+    output.record_raw_bytes(chunk.len());
+    let mut clean = String::new();
+    decoder.push(chunk, &mut |text| clean.push_str(&filter.filter(text)));
+    if !clean.is_empty() {
+        progress(&clean);
+        output.append(clean.as_bytes())?;
+    }
+    Ok(())
 }
 
 impl Extension for CodingTools {
@@ -1466,6 +1572,101 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StreamingShell;
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for StreamingShell {
+        fn id(&self) -> &str {
+            "streaming-shell"
+        }
+        async fn execute_user_bash(
+            &self,
+            event: &pi_rs::UserBashEvent,
+            _: Option<&pi_rs::ExtensionState>,
+            _: Option<Duration>,
+            cancel: pi_rs::CancellationToken,
+            output: tokio::sync::mpsc::Sender<Vec<u8>>,
+        ) -> pi_rs::ExtensionResult<Option<i32>> {
+            if event.command == "large" {
+                output
+                    .send(vec![b'x'; 60_000])
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok(Some(0));
+            }
+            for chunk in [
+                b"\x1b[31m\xe6".as_slice(),
+                b"\x97\xa5\xe6\x9c\xac\x1b[0m\r\n".as_slice(),
+            ] {
+                output
+                    .send(chunk.to_vec())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            if event.command == "wait" {
+                cancel.cancelled().await;
+            }
+            Ok(Some(7))
+        }
+    }
+
+    #[tokio::test]
+    async fn user_shell_operations_stream_sanitized_utf8_and_keep_output_on_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let tools = CodingTools::local(directory.path()).unwrap();
+        let mut event = pi_rs::UserBashEvent {
+            command: "remote".into(),
+            exclude_from_context: true,
+            cwd: directory.path().into(),
+        };
+        let mut streamed = String::new();
+        let execution = tools
+            .execute_shell_operations(
+                &event,
+                &StreamingShell,
+                None,
+                None,
+                &pi_rs::CancellationToken::new(),
+                &mut |chunk| streamed.push_str(chunk),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execution.output, "日本\n");
+        assert_eq!(streamed, execution.output);
+        assert_eq!(execution.exit_code, Some(7));
+        assert!(execution.exclude_from_context);
+        event.command = "wait".into();
+        let execution = tools
+            .execute_shell_operations(
+                &event,
+                &StreamingShell,
+                None,
+                Some(Duration::from_millis(30)),
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(execution.cancelled);
+        assert!(execution.output.starts_with("日本\n"));
+        assert!(execution.output.contains("Command timed out"));
+        event.command = "large".into();
+        let execution = tools
+            .execute_shell_operations(
+                &event,
+                &StreamingShell,
+                None,
+                None,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(execution.truncated);
+        let path = execution.full_output_path.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![b'x'; 60_000]);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn local_file_queries_report_missing_paths_and_cancellation() {

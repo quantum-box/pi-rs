@@ -133,6 +133,10 @@ enum ProtocolRequest {
         event: pi_rs_core::UserBashEvent,
         state: Option<ExtensionState>,
     },
+    UserBashOperations {
+        event: pi_rs_core::UserBashEvent,
+        state: Option<ExtensionState>,
+    },
     Lifecycle {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
@@ -220,6 +224,8 @@ struct Description {
     input_hook: bool,
     #[serde(default)]
     user_bash_hook: bool,
+    #[serde(default)]
+    user_bash_operations_hook: bool,
     #[serde(default)]
     lifecycle_hook: bool,
     #[serde(default)]
@@ -451,6 +457,42 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    fn handles_user_bash_operations(&self) -> bool {
+        self.description.user_bash_operations_hook
+    }
+    async fn user_bash_operations(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<bool> {
+        self.request_async(ProtocolRequest::UserBashOperations {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+    async fn execute_user_bash(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        timeout: Option<Duration>,
+        cancel: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> ExtensionResult<Option<i32>> {
+        let endpoint = self.endpoint.clone();
+        let request = BashStreamRequest {
+            event: event.clone(),
+            state: state.cloned(),
+            timeout_secs: timeout.map(|duration| duration.as_secs_f64()),
+        };
+        let guard = CancelOnDrop(cancel.child_token());
+        let cancelled = guard.0.clone();
+        tokio::task::spawn_blocking(move || {
+            call_bash_stream(&endpoint, request, &cancelled, output)
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
@@ -880,6 +922,108 @@ fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Exten
         .map_err(|error| format!("invalid native extension frame: {error}"))
 }
 
+#[derive(Serialize, Deserialize)]
+struct BashStreamRequest {
+    event: pi_rs_core::UserBashEvent,
+    state: Option<ExtensionState>,
+    timeout_secs: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BashStreamFrame {
+    Output {
+        data: Vec<u8>,
+    },
+    Complete {
+        response: ExtensionResult<Option<i32>>,
+    },
+}
+
+fn call_bash_stream(
+    endpoint: &Endpoint,
+    request: BashStreamRequest,
+    cancel: &CancellationToken,
+    output: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> ExtensionResult<Option<i32>> {
+    let mut child = ChildGuard::spawn(endpoint.command("--pi-rs-extension-bash-v1"))
+        .map_err(|error| error.to_string())?;
+    let mut input = child.stdin().take().expect("piped stdin");
+    let (written, writes) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = written.send(write_line(&mut input, &request));
+    });
+    let stdout = child.stdout().take().expect("piped stdout");
+    let (sender, frames) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let frame = read_line::<BashStreamFrame>(&mut reader);
+            let terminal = !matches!(frame, Ok(BashStreamFrame::Output { .. }));
+            if sender.send(frame).is_err() || terminal {
+                break;
+            }
+        }
+    });
+    loop {
+        if cancel.is_cancelled() {
+            return Err("native shell operation cancelled".into());
+        }
+        if let Ok(Err(error)) = writes.try_recv() {
+            return Err(error);
+        }
+        match frames.recv_timeout(Duration::from_millis(5)) {
+            Ok(Ok(BashStreamFrame::Output { data })) => {
+                output
+                    .blocking_send(data)
+                    .map_err(|_| "shell output consumer closed")?;
+            }
+            Ok(Ok(BashStreamFrame::Complete { response })) => return response,
+            Ok(Err(error)) => return Err(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("native shell operation output closed".into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn serve_bash_stream(extension: Arc<dyn Extension>) -> Result<()> {
+    let mut input = std::io::BufReader::new(std::io::stdin());
+    let request: BashStreamRequest = read_line(&mut input).map_err(Error::Config)?;
+    let timeout = request
+        .timeout_secs
+        .map(Duration::try_from_secs_f64)
+        .transpose()
+        .map_err(|error| Error::Config(format!("invalid shell timeout: {error}")))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let result = extension.execute_user_bash(&request.event, request.state.as_ref(), timeout, CancellationToken::new(), sender);
+        tokio::pin!(result);
+        let mut stdout = std::io::stdout().lock();
+        let mut open = true;
+        loop {
+            tokio::select! {
+                biased;
+                data = receiver.recv(), if open => match data {
+                    Some(data) => write_line(&mut stdout, &BashStreamFrame::Output { data }).map_err(Error::Config)?,
+                    None => open = false,
+                },
+                response = &mut result => {
+                    while let Ok(data) = receiver.try_recv() {
+                        write_line(&mut stdout, &BashStreamFrame::Output { data }).map_err(Error::Config)?;
+                    }
+                    write_line(&mut stdout, &BashStreamFrame::Complete { response }).map_err(Error::Config)?;
+                    return Ok(());
+                }
+            }
+        }
+    })
+}
+
 fn call_duplex(
     endpoint: &Endpoint,
     request: ProtocolRequest,
@@ -1191,6 +1335,9 @@ impl Drop for ChildGuard {
 /// Entry point for a native extension binary. Its stdout is reserved for the
 /// protocol response. Diagnostic output belongs on stderr.
 pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
+    if std::env::args().any(|argument| argument == "--pi-rs-extension-bash-v1") {
+        return serve_bash_stream(extension);
+    }
     if std::env::args().any(|argument| argument == "--pi-rs-extension-v2") {
         return serve_duplex(extension);
     }
@@ -1250,6 +1397,7 @@ async fn dispatch_with_host(
             host_calls: true,
             input_hook: extension.handles_input(),
             user_bash_hook: extension.handles_user_bash(),
+            user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
             model_selection_hook: extension.handles_model_selection(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
@@ -1289,6 +1437,9 @@ async fn dispatch_with_host(
         }
         ProtocolRequest::UserBash { event, state } => {
             encode(extension.user_bash(&event, state.as_ref()).await)
+        }
+        ProtocolRequest::UserBashOperations { event, state } => {
+            encode(extension.user_bash_operations(&event, state.as_ref()).await)
         }
         ProtocolRequest::Lifecycle { event, state } => {
             encode(extension.lifecycle(&event, state.as_ref()).await)

@@ -272,6 +272,15 @@ pub struct UserBashResult {
     pub full_output_path: Option<String>,
 }
 
+/// The first extension that handles a user command can replace its result or execution.
+pub enum UserBashReplacement {
+    Result(UserBashResult),
+    Operations {
+        extension: Arc<dyn Extension>,
+        state: Option<ExtensionState>,
+    },
+}
+
 /// Hooks run in registration order. The first denial stops pre-tool hooks.
 /// An error stops the run. A post-tool error commits the known result without state changes.
 /// Post-hooks prepare state updates and must not perform external operations.
@@ -348,6 +357,32 @@ pub trait Extension: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<UserBashResult>> {
         Ok(None)
+    }
+
+    /// Opt in to selecting a custom streaming implementation of user shell execution.
+    fn handles_user_bash_operations(&self) -> bool {
+        false
+    }
+
+    /// Return true to execute this command using `execute_user_bash`.
+    async fn user_bash_operations(
+        &self,
+        _event: &UserBashEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<bool> {
+        Ok(false)
+    }
+
+    /// Execute the command, sending combined output bytes as they become available.
+    async fn execute_user_bash(
+        &self,
+        _event: &UserBashEvent,
+        _state: Option<&ExtensionState>,
+        _timeout: Option<std::time::Duration>,
+        _cancel: CancellationToken,
+        _output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> ExtensionResult<Option<i32>> {
+        Err("user shell operations unavailable".into())
     }
 
     fn handles_lifecycle(&self) -> bool {
@@ -654,9 +689,45 @@ impl Registry {
     }
 
     pub fn has_user_bash_hooks(&self) -> bool {
-        self.extensions
-            .iter()
-            .any(|extension| extension.handles_user_bash())
+        self.extensions.iter().any(|extension| {
+            extension.handles_user_bash() || extension.handles_user_bash_operations()
+        })
+    }
+
+    /// Select the first extension that supplies a result or custom operations.
+    pub async fn prepare_user_bash(
+        &self,
+        event: &UserBashEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+    ) -> Result<Option<UserBashReplacement>> {
+        for extension in &self.extensions {
+            let state = states.get(extension.id());
+            if extension.handles_user_bash() {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = extension.user_bash(event, state) => result,
+                };
+                if let Some(result) = hook(extension.as_ref(), result)? {
+                    return Ok(Some(UserBashReplacement::Result(result)));
+                }
+            }
+            if extension.handles_user_bash_operations() {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = extension.user_bash_operations(event, state) => result,
+                };
+                if hook(extension.as_ref(), result)? {
+                    return Ok(Some(UserBashReplacement::Operations {
+                        extension: extension.clone(),
+                        state: state.cloned(),
+                    }));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The first handler returning a result replaces the shell execution.
@@ -980,6 +1051,46 @@ mod replacement_tests {
     use serde_json::json;
 
     struct BashHook(&'static str, Option<&'static str>);
+
+    struct BashOperationsHook;
+    #[async_trait::async_trait]
+    impl Extension for BashOperationsHook {
+        fn id(&self) -> &str {
+            "operations"
+        }
+        fn handles_user_bash_operations(&self) -> bool {
+            true
+        }
+        async fn user_bash_operations(
+            &self,
+            event: &UserBashEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<bool> {
+            Ok(event.command == "echo hello")
+        }
+    }
+
+    #[tokio::test]
+    async fn user_bash_operations_and_results_follow_registration_order() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(BashHook("pass", None))).unwrap();
+        registry.register(Arc::new(BashOperationsHook)).unwrap();
+        registry
+            .register(Arc::new(BashHook("later", Some("wrong"))))
+            .unwrap();
+        let event = UserBashEvent {
+            command: "echo hello".into(),
+            exclude_from_context: true,
+            cwd: ".".into(),
+        };
+        let choice = registry
+            .prepare_user_bash(&event, &ExtensionStates::new(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            matches!(choice, Some(UserBashReplacement::Operations { extension, .. }) if extension.id() == "operations")
+        );
+    }
     #[async_trait::async_trait]
     impl Extension for BashHook {
         fn id(&self) -> &str {

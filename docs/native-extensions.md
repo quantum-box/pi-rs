@@ -55,9 +55,15 @@ command, working directory, and whether the output is excluded from model
 context. Return `None` to let the next handler or local shell run, or return
 `Some(UserBashResult)` to supply the output and exit status. The first result
 wins; errors stop execution. Cancellation also interrupts a running handler.
-The same API works for executable extensions. This currently supports result
-replacement, not Pi's custom Bash operations callbacks or streaming updates
-from within the hook.
+The same API works for executable extensions. For streaming operations, opt in
+with `handles_user_bash_operations`, select commands in `user_bash_operations`,
+and implement `execute_user_bash`. Send combined output bytes over its bounded
+channel and return the exit code. The host streams sanitized UTF-8, applies the
+normal shell output limits, retains truncated output in a file, and propagates
+timeout and cancellation. Handlers are checked in registration order, whether
+they supply a result or operations. See
+[`streaming_shell.rs`](../crates/extensions/examples/streaming_shell.rs) for
+a separately built executable example.
 
 To observe model or thinking-level changes, implement `handles_lifecycle` and
 `handles_model_selection` and handle `LifecycleEvent::ModelSelect` and

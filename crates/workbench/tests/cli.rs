@@ -11,6 +11,111 @@ use serde_json::{Value, json};
 
 #[cfg(unix)]
 #[test]
+fn rpc_streaming_shell_operations_deliver_output_and_cancel() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("stream.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys, time
+if '--pi-rs-extension-bash-v1' in sys.argv:
+    request = json.loads(sys.stdin.readline())
+    print(json.dumps({'type':'output', 'data':list('日本'.encode())}), flush=True)
+    time.sleep(30 if request['event']['command'] == 'stream wait' else 0.25)
+    print(json.dumps({'type':'output', 'data':list(' done'.encode())}), flush=True)
+    print(json.dumps({'type':'complete', 'response':{'Ok':7}}), flush=True)
+else:
+    request = json.load(sys.stdin)
+    if request['type'] == 'describe':
+        result = {'id':'stream', 'dependencies':[], 'commands':[], 'tools':[], 'user_bash_operations_hook':True}
+    elif request['type'] == 'user_bash_operations':
+        result = request['event']['command'].startswith('stream')
+    else:
+        result = None
+    print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut until = |predicate: &dyn Fn(&Value) -> bool| {
+        loop {
+            let event = receive
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC event timed out: {error}");
+                });
+            if predicate(&event) {
+                break event;
+            }
+        }
+    };
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"bash", "id":"stream", "command":"stream ok", "excludeFromContext":true})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let update = until(&|event| event["type"] == "bash_execution_update");
+    assert_eq!(update["output"], "日本");
+    let response = until(&|event| event["type"] == "response" && event["id"] == "stream");
+    assert_eq!(response["data"]["output"], "日本 done");
+    assert_eq!(response["data"]["exitCode"], 7);
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"bash", "id":"cancelled", "command":"stream wait"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    until(&|event| event["type"] == "bash_execution_update");
+    writeln!(input, "{}", json!({"type":"abort_bash", "id":"abort"})).unwrap();
+    input.flush().unwrap();
+    let response = until(&|event| event["type"] == "response" && event["id"] == "cancelled");
+    assert_eq!(response["data"]["cancelled"], true);
+    assert_eq!(response["data"]["output"], "日本");
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn rpc_notifies_native_extensions_of_actual_model_and_thinking_changes() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();

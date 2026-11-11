@@ -1197,15 +1197,23 @@ fn read_requests(
                                 let records = snapshot.lock().expect("session snapshot").records.clone();
                                 let states = pi_rs::Session::from_records(records)?.extension_states();
                                 let event = pi_rs::UserBashEvent { command: command.clone(), exclude_from_context, cwd };
-                                if let Some(result) = registry.user_bash(&event, &states, &cancel).await? {
-                                    if !result.output.is_empty() {
-                                        output(json!({"type":"bash_execution_update","executionId":id,"output":result.output,"id":request_id}));
+                                match registry.prepare_user_bash(&event, &states, &cancel).await? {
+                                    Some(pi_rs::UserBashReplacement::Result(result)) => {
+                                        if !result.output.is_empty() {
+                                            output(json!({"type":"bash_execution_update","executionId":id,"output":result.output,"id":request_id}));
+                                        }
+                                        return Ok(pi_rs::BashExecution {
+                                            command: command.clone(), output: result.output, exit_code: result.exit_code,
+                                            cancelled: result.cancelled, truncated: result.truncated,
+                                            full_output_path: result.full_output_path, exclude_from_context,
+                                        });
                                     }
-                                    return Ok(pi_rs::BashExecution {
-                                        command: command.clone(), output: result.output, exit_code: result.exit_code,
-                                        cancelled: result.cancelled, truncated: result.truncated,
-                                        full_output_path: result.full_output_path, exclude_from_context,
-                                    });
+                                    Some(pi_rs::UserBashReplacement::Operations { extension, state }) => {
+                                        return tools.execute_shell_operations(&event, extension.as_ref(), state.as_ref(), timeout, &cancel, &mut |chunk| {
+                                            output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));
+                                        }).await;
+                                    }
+                                    None => {}
                                 }
                             }
                             let mut execution = tools.execute_shell(&command, timeout, &cancel, &mut |chunk| {
