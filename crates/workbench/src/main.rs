@@ -1044,6 +1044,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                     | Command::Interactive
                     | Command::Compact { .. }
                     | Command::Review { .. }
+                    | Command::Extension { .. }
             )
         );
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
@@ -1465,7 +1466,10 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     thinking::adjust(&mut args);
     args.record_model_selection(&mut session)?;
     if args.mode == Some(OutputMode::Json)
-        && matches!(command, Command::Run { .. } | Command::Resume)
+        && matches!(
+            command,
+            Command::Run { .. } | Command::Resume | Command::Extension { .. }
+        )
     {
         let mut header = rpc_entries::session_header(&session, &args.workspace);
         if let Some(parent) = session.parent_session() {
@@ -1566,11 +1570,10 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 &arguments,
                 &mut observer,
             )?;
-            if trigger {
-                let answer = agent.run_correlated(&mut session, Uuid::new_v4(), None, &mut receiver, &cancel, &mut observer).await?;
-                output(json!({"type":"answer","content":answer}));
+            if !trigger {
+                return Ok(());
             }
-            return Ok(());
+            None
         }
         Command::Compact {
             summary: Some(summary),

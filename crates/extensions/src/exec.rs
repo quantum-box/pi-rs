@@ -9,7 +9,7 @@ use tokio::io::AsyncReadExt;
 const DEFAULT_MAX_BUFFER: usize = 256 * 1024 * 1024;
 // V8's maximum string length on 64-bit platforms, used by Pi v1.5.0.
 const MAX_BUFFER: usize = (1 << 29) - 24;
-const EXIT_IDLE: Duration = Duration::from_millis(100);
+const EXIT_IDLE: Duration = Duration::from_millis(500);
 const FORCE_KILL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Default)]

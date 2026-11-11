@@ -58,6 +58,52 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     }
     server.join().unwrap();
 
+    let (endpoint, server) = model_fixture_with_finish(None, "length");
+    for mode in ["print", "json"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--endpoint",
+                &endpoint,
+                "--extension",
+            ])
+            .arg(&extension);
+        if mode == "print" {
+            command.arg("--print");
+        } else {
+            command.args(["--mode", "json"]);
+        }
+        let output = command
+            .args(["extension", "trigger", "trigger"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if mode == "print" {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Response was truncated"));
+            assert!(stdout.contains("fixture answer"));
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let events: Vec<Value> = stdout
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events[0]["type"], "session");
+            assert!(events.iter().any(|event| event["type"] == "agent_start"));
+            assert!(events.iter().any(|event| event["type"] == "agent_end"));
+        }
+    }
+    server.join().unwrap();
+
     let (endpoint, server) = model_fixture();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(root.path())
