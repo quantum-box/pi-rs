@@ -300,10 +300,10 @@ fn token_limit_preserves_partial_text_and_its_finish_reason() {
             .arg("same input")
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "Response was truncated: the model reached its output token limit.\n"
         );
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
@@ -795,7 +795,7 @@ fn rpc_controls_apply_while_idle_and_streaming() {
 }
 
 #[test]
-fn export_flag_preserves_source_and_refuses_overwrite() {
+fn export_flag_replaces_html_and_preserves_source() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("session.jsonl");
     let mut session = Session::with_store(MemoryStore::default()).unwrap();
@@ -804,24 +804,35 @@ fn export_flag_preserves_source_and_refuses_overwrite() {
         .unwrap();
     session.export_jsonl(&input).unwrap();
     let before = std::fs::read(&input).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .env("PI_RS_HOME", directory.path().join("home"))
-        .arg("--export")
-        .arg(&input)
-        .output()
-        .unwrap();
+    let export = |destination: Option<&std::path::Path>| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", directory.path().join("home"))
+            .current_dir(directory.path())
+            .arg("--export")
+            .arg(&input)
+            .args(destination)
+            .output()
+            .unwrap()
+    };
+    let output = export(None);
     assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Exported to: pi-session-session.html\n"
+    );
     assert!(
-        std::fs::read_to_string(input.with_extension("html"))
+        std::fs::read_to_string(directory.path().join("pi-session-session.html"))
             .unwrap()
             .contains("export &lt;marker&gt;")
     );
-    let again = Command::new(env!("CARGO_BIN_EXE_pi"))
-        .env("PI_RS_HOME", directory.path().join("home"))
-        .arg("--export")
-        .arg(&input)
-        .output()
-        .unwrap();
-    assert!(!again.status.success());
+    let destination = directory.path().join("transcript.jsonl");
+    std::fs::write(&destination, "old").unwrap();
+    assert!(export(Some(&destination)).status.success());
+    assert!(
+        std::fs::read_to_string(destination)
+            .unwrap()
+            .starts_with("<!doctype html>")
+    );
+    assert!(!export(Some(&input)).status.success());
     assert_eq!(std::fs::read(input).unwrap(), before);
 }

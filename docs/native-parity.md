@@ -491,9 +491,11 @@ explicit overrides, project template precedence and live theme updates.
 ### CLI export and transient credentials
 
 `--export <input> [output]` exports native or imported Pi sessions to HTML and
-exits. The default destination uses the input basename with `.html`. Existing
-destinations are preserved. HTML exports embed validated user and tool images
-as data URLs under an image-only data policy.
+exits. The default destination is `pi-session-<input-basename>.html` in the
+invocation directory. An explicit destination can use any extension and replace
+an existing output file. The source session is protected from replacement.
+HTML exports embed validated user and tool images as data URLs under an
+image-only data policy.
 
 `--api-key` overrides the model credential for the current process, including
 model discovery and persistent CLI/RPC workers. The credential remains

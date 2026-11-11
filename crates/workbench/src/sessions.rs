@@ -287,12 +287,18 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn export_rpc_html(session: &Session, source: &Path, destination: &Path) -> Result<()> {
+pub(super) fn default_html_destination(source: &Path) -> PathBuf {
+    let basename = source.file_name().unwrap_or_default().to_string_lossy();
+    let basename = basename.strip_suffix(".jsonl").unwrap_or(&basename);
+    format!("pi-session-{basename}.html").into()
+}
+
+pub(super) fn export_html(session: &Session, source: &Path, destination: &Path) -> Result<()> {
     if let Ok(resolved) = destination.canonicalize()
         && resolved == source.canonicalize()?
     {
         return Err(Error::Config(
-            "Cannot export HTML over the active session file".into(),
+            "Cannot export HTML over the source session file".into(),
         ));
     }
     let parent = destination

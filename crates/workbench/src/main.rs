@@ -1,5 +1,5 @@
 use std::io::{BufRead, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -798,6 +798,9 @@ async fn run_cli() {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
         args.extension_flags = extension_flags;
+        if let Some(paths) = &args.export_session {
+            return export_from_file(paths);
+        }
         if let Some(flag) = args.extension_flags.keys().next()
             && !matches!(
                 args.command,
@@ -927,24 +930,41 @@ async fn run_cli() {
     }
 }
 
-async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
-    if let Some(paths) = &args.export_session {
-        let input = &paths[0];
-        let output_path = paths
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| input.with_extension("html"));
-        let session = session_import::read(input)?;
-        if session.host_binding().is_some() {
-            return Err(Error::Session(
-                "managed sessions must be exported by their host".into(),
-            ));
-        }
-        sessions::export(&session, &output_path)?;
-        output(json!({"type":"exported","path":output_path}));
-        return Ok(());
+fn export_from_file(paths: &[PathBuf]) -> Result<()> {
+    let normalize = |path: &Path| {
+        path.to_str()
+            .map_or_else(|| Ok(path.to_path_buf()), pi_rs_workbench::normalize_path)
+    };
+    let input = std::path::absolute(normalize(&paths[0])?)?;
+    let output_path = paths
+        .get(1)
+        .map(PathBuf::as_path)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(normalize)
+        .transpose()?
+        .unwrap_or_else(|| sessions::default_html_destination(&input));
+    if !input.exists() {
+        return Err(Error::Config(format!(
+            "File not found: {}",
+            input.display()
+        )));
     }
+    let session = session_import::read(&input)?;
+    if session.host_binding().is_some() {
+        return Err(Error::Session(
+            "managed sessions must be exported by their host".into(),
+        ));
+    }
+    sessions::export_html(&session, &input, &output_path)?;
+    let _ = writeln!(
+        std::io::stdout().lock(),
+        "Exported to: {}",
+        output_path.display()
+    );
+    Ok(())
+}
 
+async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     let patterns: Vec<_> = if let Some(patterns) = &args.models {
         patterns.split(',').collect()
     } else if matches!(

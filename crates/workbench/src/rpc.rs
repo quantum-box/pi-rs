@@ -739,16 +739,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .filter(|path| !path.is_empty())
                 .map(pi_rs_workbench::normalize_path)
                 .transpose()?
-                .unwrap_or_else(|| {
-                    let basename = args
-                        .session
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    let basename = basename.strip_suffix(".jsonl").unwrap_or(&basename);
-                    format!("pi-session-{basename}.html").into()
-                });
-            sessions::export_rpc_html(&session, &args.session, &path)?;
+                .unwrap_or_else(|| sessions::default_html_destination(&args.session));
+            sessions::export_html(&session, &args.session, &path)?;
             Ok(Some(json!({"path":path})))
         }
 
