@@ -241,11 +241,13 @@ impl DisplayTail {
             return (self.tail.clone(), None, self.lines() as usize, false);
         }
         let mut tail = self.tail.as_str();
+        let mut skipped_partial_line = false;
         if !self.starts_at_boundary
             && let Some(index) = tail.find('\n')
             && index + 1 < tail.len()
         {
             tail = &tail[index + 1..];
+            skipped_partial_line = true;
         }
         let mut selected = Vec::new();
         let mut bytes = 0;
@@ -270,6 +272,8 @@ impl DisplayTail {
         }
         if selected.len() == DISPLAY_LINES {
             limit = Limit::Lines;
+        } else if skipped_partial_line {
+            limit = Limit::Bytes;
         }
         selected.reverse();
         (selected.join("\n"), Some(limit), selected.len(), partial)
@@ -338,6 +342,25 @@ mod tests {
             output
                 .display
                 .contains("[Showing lines 1-1 of 1. Full output: ")
+        );
+        std::fs::remove_file(output.path.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn long_discarded_line_before_short_tail_reports_byte_limit() {
+        let input = format!("{}\nlast\n", "x".repeat(300_000));
+        let mut accumulator = Accumulator::default();
+        for chunk in input.as_bytes().chunks(8192) {
+            accumulator.append(chunk).unwrap();
+        }
+        let output = accumulator.finish().unwrap();
+        let truncation = &output.details.as_ref().unwrap()["truncation"];
+        assert_eq!(truncation["truncatedBy"], "bytes");
+        assert_eq!(output.display_without_notice, "last");
+        assert!(
+            output
+                .display
+                .contains("Showing lines 2-2 of 2 (50.0KB limit)")
         );
         std::fs::remove_file(output.path.unwrap()).unwrap();
     }
