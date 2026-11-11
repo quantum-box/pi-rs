@@ -376,24 +376,50 @@ pub fn html(session: &Session) -> String {
 }
 
 fn render_user_html(html: &mut String, content: &str, images: &[pi_rs::ImageContent]) {
-    let text = if let Some((name, body, message)) = super::resources::skill_invocation(content) {
+    if let Some((name, body, message)) = super::resources::skill_invocation(content) {
         html.push_str(&format!(
-            "<details class=\"skill\"><summary>[skill] {}</summary><pre>{}</pre></details>",
-            escape(name),
-            escape(body)
+            "<details class=\"skill\"><summary>[skill] {}</summary>",
+            escape(name)
         ));
-        if message.is_none() && images.is_empty() {
-            return;
+        render_export_markdown(html, body);
+        html.push_str("</details>");
+        if message.is_some() || !images.is_empty() {
+            html.push_str("<article class=\"user\"><b>You</b>");
+            if let Some(message) = message {
+                render_export_markdown(html, message);
+            }
+            html.push_str(&images_html(images));
+            html.push_str("</article>");
         }
-        message.unwrap_or_default()
-    } else {
-        content
-    };
+        return;
+    }
     html.push_str(&format!(
         "<article class=\"user\"><b>You</b><pre>{}</pre>{}</article>",
-        escape(text),
+        escape(content),
         images_html(images)
     ));
+}
+
+fn render_export_markdown(html: &mut String, markdown: &str) {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut safe_links = Vec::new();
+    let events = Parser::new_ext(markdown, options).filter_map(|event| match event {
+        Event::Html(text) | Event::InlineHtml(text) => Some(Event::Text(text)),
+        Event::Start(Tag::Link { ref dest_url, .. }) => {
+            let safe = dest_url.starts_with('#')
+                || reqwest::Url::parse(dest_url)
+                    .is_ok_and(|url| matches!(url.scheme(), "https" | "http" | "mailto"));
+            safe_links.push(safe);
+            safe.then_some(event)
+        }
+        Event::End(TagEnd::Link) => safe_links.pop().unwrap_or(false).then_some(event),
+        Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
+        _ => Some(event),
+    });
+    pulldown_cmark::html::push_html(html, events);
 }
 
 fn images_html(images: &[pi_rs::ImageContent]) -> String {
@@ -821,16 +847,20 @@ mod tests {
     fn html_keeps_skill_body_folded_and_escapes_untrusted_text() {
         let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
         session.append_user_with_images(
-            "<skill name=\"demo&fixture\" location=\"/tmp/SKILL.md\">\n<script>example</script>\n</skill>\n\nvisible <request>".into(),
+            "<skill name=\"demo&fixture\" location=\"/tmp/SKILL.md\">\n## Steps\n\n```text\nexample\n```\n\n[unsafe](javascript:alert) [docs](https://example.test) ![remote image](https://example.test/a.png)\n\n<script>example</script>\n</skill>\n\nvisible **request** <request>".into(),
             vec![pi_rs::ImageContent { data: "aW1hZ2U=".into(), mime_type: "image/png".into() }],
             None,
         ).unwrap();
         let document = html(&session);
-        assert!(document.contains("<details class=\"skill\"><summary>[skill] demo&amp;fixture</summary><pre>&lt;script&gt;example&lt;/script&gt;</pre></details>"));
-        assert!(
-            document
-                .contains("<article class=\"user\"><b>You</b><pre>visible &lt;request&gt;</pre>")
-        );
+        assert!(document.contains(
+            "<details class=\"skill\"><summary>[skill] demo&amp;fixture</summary><h2>Steps</h2>"
+        ));
+        assert!(document.contains("<pre><code class=\"language-text\">example\n</code></pre>"));
+        assert!(document.contains("&lt;script&gt;example&lt;/script&gt;"));
+        assert!(document.contains("<article class=\"user\"><b>You</b><p>visible <strong>request</strong> &lt;request&gt;</p>"));
+        assert!(document.contains("<a href=\"https://example.test\">docs</a> remote image"));
+        assert!(!document.contains("javascript:"));
+        assert!(!document.contains("https://example.test/a.png"));
         assert!(document.contains("src=\"data:image/png;base64,aW1hZ2U=\""));
         assert!(!document.contains("<script>"));
     }
