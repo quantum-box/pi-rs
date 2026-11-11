@@ -31,6 +31,10 @@ enum Request {
         session: PathBuf,
     },
     CacheWarmingChanged,
+    SessionInfoChanged {
+        session: PathBuf,
+        name: Option<String>,
+    },
     Prompt {
         content: Option<String>,
         #[serde(default)]
@@ -325,6 +329,17 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             break;
         }
         if matches!(request, Request::CacheWarmingChanged) {
+            continue;
+        }
+        if let Request::SessionInfoChanged { session, name } = request {
+            if session == args.session {
+                notify_session_lifecycle(
+                    &args,
+                    &runtime,
+                    LifecycleEvent::SessionInfoChanged { name },
+                )
+                .await;
+            }
             continue;
         }
         if let Request::Configure {
@@ -772,6 +787,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             );
         }
     }
+    while let Ok(request) = requests.try_recv() {
+        if let Request::SessionInfoChanged { session, name } = request
+            && session == args.session
+        {
+            notify_session_lifecycle(&args, &runtime, LifecycleEvent::SessionInfoChanged { name })
+                .await;
+        }
+    }
     cancel_active(&active);
     let shell_pending = active.lock().expect("worker control").shell.is_some();
     if shell_pending && let Some(shell) = shell_results.recv().await {
@@ -1070,7 +1093,9 @@ fn read_requests(
                 request => {
                     let counted = !matches!(
                         request,
-                        Request::Configure { .. } | Request::CacheWarmingChanged
+                        Request::Configure { .. }
+                            | Request::CacheWarmingChanged
+                            | Request::SessionInfoChanged { .. }
                     );
                     if counted {
                         active.lock().expect("worker control").queued += 1;

@@ -643,7 +643,11 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             let mut session = Session::open(&args.session)?;
             if session.name() != Some(name.as_str()) {
                 session.set_name(&name)?;
+                drop(session);
                 emit(json!({"type":"session_info_changed","name":name}))?;
+                if let Some(active) = worker {
+                    active.notify_session_name(args, Some(name))?;
+                }
             }
             Ok(None)
         }

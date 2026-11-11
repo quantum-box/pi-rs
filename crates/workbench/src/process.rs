@@ -274,6 +274,12 @@ impl Worker {
     pub(super) fn matches(&self, args: &Cli) -> bool {
         self.persistent && self.configuration == configuration(args)
     }
+    pub(super) fn notify_session_name(&mut self, args: &Cli, name: Option<String>) -> Result<()> {
+        if self.session == args.session {
+            self.send(json!({"type":"session_info_changed","session":args.session,"name":name}))?;
+        }
+        Ok(())
+    }
     pub(super) fn transition(
         slot: &mut Option<Self>,
         args: &Cli,

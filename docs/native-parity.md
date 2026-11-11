@@ -2809,3 +2809,10 @@ the two events. A loaded terminal runtime restarts for new sessions,
 forks, resumes, and reloads, and RPC session switches use the same
 transition path. Both runtimes receive the corresponding reason.
 Previously built extensions receive the reasons their descriptors support.
+
+Renaming the active session in the terminal or RPC emits
+`session_info_changed` to the loaded extension runtime with the
+normalized name. The terminal resume selector uses the same notification
+when it renames the active session. Pending name notifications are
+delivered before an orderly worker shutdown. Executables built before
+this event continue to receive their supported session events.

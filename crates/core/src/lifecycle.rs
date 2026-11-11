@@ -70,6 +70,9 @@ pub enum SessionShutdownReason {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LifecycleEvent {
+    SessionInfoChanged {
+        name: Option<String>,
+    },
     SessionStart {
         reason: SessionStartReason,
         previous_session_file: Option<PathBuf>,
@@ -117,6 +120,7 @@ pub struct LifecycleMessage {
 impl LifecycleEvent {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::SessionInfoChanged { .. } => "session_info_changed",
             Self::SessionStart { .. } => "session_start",
             Self::SessionShutdown { .. } => "session_shutdown",
             Self::AgentStart { .. } => "agent_start",
@@ -167,7 +171,9 @@ pub async fn notify(
     for extension in registry.extensions.iter().filter(|extension| {
         extension.handles_lifecycle()
             && match event {
-                LifecycleEvent::SessionStart { .. } | LifecycleEvent::SessionShutdown { .. } => {
+                LifecycleEvent::SessionStart { .. }
+                | LifecycleEvent::SessionShutdown { .. }
+                | LifecycleEvent::SessionInfoChanged { .. } => {
                     extension.handles_session_lifecycle()
                 }
                 LifecycleEvent::SessionTree { .. } => extension.handles_tree_navigation(),

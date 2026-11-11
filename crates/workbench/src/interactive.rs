@@ -336,6 +336,7 @@ struct View {
     remote_task: Option<RemoteTask>,
     available_models: Vec<String>,
     pending_request: Option<Value>,
+    pending_session_name: Option<Option<String>>,
     thinking: String,
     expand_tools: bool,
     expand_key: Option<crossterm::event::KeyEvent>,
@@ -1942,7 +1943,11 @@ fn slash(input: &str, args: &mut Cli, view: &mut View) -> Result<Option<Worker>>
         "/name" => {
             let mut session = Session::open(&args.session)?;
             if !rest.is_empty() {
-                session.set_name(rest)?;
+                let name = pi_rs::sanitize_session_name(rest);
+                if session.name().unwrap_or_default() != name {
+                    session.set_name(&name)?;
+                    view.pending_session_name = Some(session.name().map(str::to_owned));
+                }
             }
             view.session_name = session.name().map(str::to_owned);
             view.append(session.name().unwrap_or("Unnamed session"));
@@ -2571,6 +2576,13 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                 }
             }
             last_theme_check = Instant::now();
+        }
+        if let Some(name) = view.pending_session_name.take()
+            && let Some(active) = &mut worker
+            && let Err(error) = active.notify_session_name(&args, name)
+        {
+            view.append(&error.to_string());
+            dirty = true;
         }
         if let Some(reason) = args.session_transition.take()
             && let Err(error) = Worker::transition(&mut worker, &args, reason)
@@ -4194,9 +4206,16 @@ fn select(
                     "managed sessions must be renamed by their host".into(),
                 ));
             }
-            session.set_name(&name)?;
+            let name = pi_rs::sanitize_session_name(&name);
+            let changed = session.name().unwrap_or_default() != name;
+            if changed {
+                session.set_name(&name)?;
+            }
             if path.canonicalize()? == args.session.canonicalize()? {
                 view.session_name = session.name().map(str::to_owned);
+                if changed {
+                    view.pending_session_name = Some(view.session_name.clone());
+                }
             }
             drop(session);
             slash("/resume", args, view)?;
