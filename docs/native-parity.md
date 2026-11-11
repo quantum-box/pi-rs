@@ -172,6 +172,9 @@ Project configuration follows a stored trust decision, with an interactive
 trust selector and explicit `--trust` / `--no-trust` overrides. Context files
 remain readable independently of project trust. `/skills`, `/prompts`,
 `/skill:name`, prompt argument expansion and `/reload` are available.
+Prompt-template arguments preserve literal backslashes and quoted empty
+values. Positional arguments, defaults and slices use Pi's placeholder
+syntax and expand only once.
 Each directory contributes its first readable context file in Pi order
 (`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`).
 Context files are loaded from outer directories toward the workspace, and a

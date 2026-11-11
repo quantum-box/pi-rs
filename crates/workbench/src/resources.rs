@@ -290,7 +290,7 @@ impl Resources {
         text
     }
     pub fn expand(&self, input: &str) -> Result<Option<String>> {
-        let (name, arguments) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+        let (name, arguments) = input.split_once(is_prompt_space).unwrap_or((input, ""));
         if let Some(name) = name.strip_prefix("/skill:") {
             let skill = self
                 .skills
@@ -309,7 +309,7 @@ impl Resources {
         else {
             return Ok(None);
         };
-        Ok(Some(expand_arguments(&prompt.body, arguments)?))
+        Ok(Some(expand_arguments(&prompt.body, arguments)))
     }
 }
 fn xml(value: &str) -> String {
@@ -508,47 +508,83 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-fn expand_arguments(body: &str, arguments: &str) -> Result<String> {
-    let args = shell_words::split(arguments).map_err(|error| Error::Config(error.to_string()))?;
-    let all = args.join(" ");
-    let expression =
-        regex::Regex::new(r"\$\{([^}]+)\}|\$ARGUMENTS\b|\$@|\$(\d+)").expect("argument expression");
-    Ok(expression
-        .replace_all(body, |captures: &regex::Captures<'_>| {
-            let token = captures.get(0).unwrap().as_str();
-            let key = captures
-                .get(1)
-                .or_else(|| captures.get(2))
-                .map(|value| value.as_str())
-                .unwrap_or(token.trim_start_matches('$'));
-            let (key, fallback) = key.split_once(":-").unwrap_or((key, ""));
-            let value = if key == "@" || key == "ARGUMENTS" {
-                all.clone()
-            } else if let Some(slice) = key.strip_prefix("@:") {
-                let (start, length) = slice.split_once(':').unwrap_or((slice, ""));
-                let start = start.parse::<usize>().unwrap_or(1).saturating_sub(1);
-                let length = length.parse::<usize>().unwrap_or(usize::MAX);
-                args.iter()
-                    .skip(start)
-                    .take(length)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" ")
+fn is_prompt_space(character: char) -> bool {
+    (character.is_whitespace() && character != '\u{0085}') || character == '\u{feff}'
+}
+
+fn parse_arguments(arguments: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut quote = None;
+    for character in arguments.chars() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
             } else {
-                key.parse::<usize>()
-                    .ok()
-                    .and_then(|index| index.checked_sub(1))
-                    .and_then(|index| args.get(index))
-                    .cloned()
-                    .unwrap_or_default()
-            };
-            if value.is_empty() {
-                fallback.into()
-            } else {
-                value
+                current.push(character);
             }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            has_token = true;
+        } else if is_prompt_space(character) {
+            if std::mem::take(&mut has_token) {
+                args.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(character);
+            has_token = true;
+        }
+    }
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
+fn expand_arguments(body: &str, arguments: &str) -> String {
+    static PLACEHOLDER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let expression = PLACEHOLDER.get_or_init(|| {
+        regex::Regex::new(r"\$\{([0-9]+|ARGUMENTS|@):-([^}]*)\}|\$\{@:([0-9]+)(?::([0-9]+))?\}|\$(ARGUMENTS|@|[0-9]+)")
+            .expect("Pi argument placeholders")
+    });
+    let args = parse_arguments(arguments);
+    let all = args.join(" ");
+    let value = |key: &str| match key {
+        "@" | "ARGUMENTS" => all.as_str(),
+        _ => key
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| args.get(index))
+            .map_or("", String::as_str),
+    };
+    expression
+        .replace_all(body, |captures: &regex::Captures<'_>| {
+            if let Some(target) = captures.get(1) {
+                let found = value(target.as_str());
+                return if found.is_empty() {
+                    captures[2].to_owned()
+                } else {
+                    found.to_owned()
+                };
+            }
+            if let Some(start) = captures.get(3) {
+                let start = start
+                    .as_str()
+                    .parse::<usize>()
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(1)
+                    .min(args.len());
+                let length = captures
+                    .get(4)
+                    .and_then(|length| length.as_str().parse::<usize>().ok())
+                    .unwrap_or(usize::MAX);
+                return args[start..start.saturating_add(length).min(args.len())].join(" ");
+            }
+            value(&captures[5]).to_owned()
         })
-        .into_owned())
+        .into_owned()
 }
 #[cfg(test)]
 mod tests {
@@ -840,9 +876,22 @@ mod tests {
             expand_arguments(
                 "$1|$2|$@|${3:-default}|${@:2:1}",
                 "\"API compatibility\" tests"
-            )
-            .unwrap(),
+            ),
             "API compatibility|tests|API compatibility tests|default|tests"
+        );
+        assert_eq!(
+            expand_arguments(
+                "$1|$2|$3|$4|$5",
+                r#"C:\work\file "" "two words" 'unfinished quote"#,
+            ),
+            r"C:\work\file||two words|unfinished quote|"
+        );
+        assert_eq!(
+            expand_arguments(
+                "$1|$ARGUMENTSsuffix|${2:-$1}|${1}|${bad:-literal}|${@:0:1}|${@:1:0}",
+                "'$@'",
+            ),
+            "$@|$@suffix|$1|${1}|${bad:-literal}|$@|"
         );
     }
     #[test]
