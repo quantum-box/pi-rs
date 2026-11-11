@@ -57,6 +57,15 @@ pub enum SessionStartReason {
     Fork,
 }
 
+/// How a model was selected by the host.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSelectSource {
+    Set,
+    Cycle,
+    Restore,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionShutdownReason {
@@ -108,6 +117,17 @@ impl BeforeSessionTransition {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LifecycleEvent {
+    ModelSelect {
+        model: serde_json::Value,
+        #[serde(rename = "previousModel")]
+        previous_model: Option<serde_json::Value>,
+        source: ModelSelectSource,
+    },
+    ThinkingLevelSelect {
+        level: String,
+        #[serde(rename = "previousLevel")]
+        previous_level: String,
+    },
     SessionInfoChanged {
         name: Option<String>,
     },
@@ -158,6 +178,8 @@ pub struct LifecycleMessage {
 impl LifecycleEvent {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::ModelSelect { .. } => "model_select",
+            Self::ThinkingLevelSelect { .. } => "thinking_level_select",
             Self::SessionInfoChanged { .. } => "session_info_changed",
             Self::SessionStart { .. } => "session_start",
             Self::SessionShutdown { .. } => "session_shutdown",
@@ -209,6 +231,9 @@ pub async fn notify(
     for extension in registry.extensions.iter().filter(|extension| {
         extension.handles_lifecycle()
             && match event {
+                LifecycleEvent::ModelSelect { .. } | LifecycleEvent::ThinkingLevelSelect { .. } => {
+                    extension.handles_model_selection()
+                }
                 LifecycleEvent::SessionStart { .. }
                 | LifecycleEvent::SessionShutdown { .. }
                 | LifecycleEvent::SessionInfoChanged { .. } => {

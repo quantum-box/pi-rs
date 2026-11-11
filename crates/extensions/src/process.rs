@@ -223,6 +223,8 @@ struct Description {
     #[serde(default)]
     lifecycle_hook: bool,
     #[serde(default)]
+    model_selection_hook: bool,
+    #[serde(default)]
     session_lifecycle_hook: bool,
     #[serde(default)]
     session_transition_reasons: bool,
@@ -452,6 +454,9 @@ impl Extension for ExecutableExtension {
     }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
+    }
+    fn handles_model_selection(&self) -> bool {
+        self.description.model_selection_hook
     }
     fn handles_resource_discovery(&self) -> bool {
         self.description.resource_discovery_hook
@@ -1246,6 +1251,7 @@ async fn dispatch_with_host(
             input_hook: extension.handles_input(),
             user_bash_hook: extension.handles_user_bash(),
             lifecycle_hook: extension.handles_lifecycle(),
+            model_selection_hook: extension.handles_model_selection(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
             session_info_hook: true,

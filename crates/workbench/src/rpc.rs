@@ -408,6 +408,11 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 json!({"type":"thinking_level_changed","level":args.thinking.as_deref().unwrap_or("off")}),
             )?;
         }
+        for event in std::mem::take(&mut args.selection_events) {
+            if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+                eprintln!("Extension selection notification: {error}");
+            }
+        }
         response(&request, result)?;
     }
     drop(worker);
@@ -535,7 +540,12 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             let Some(next) = super::model_selection::next_model(args, &available, false) else {
                 return Ok(Some(Value::Null));
             };
-            args.change_model(next.provider, next.model, next.thinking)?;
+            args.change_model(
+                next.provider,
+                next.model,
+                next.thinking,
+                pi_rs::ModelSelectSource::Cycle,
+            )?;
             Ok(Some(
                 json!({"model":model_value(args, &args.provider, &args.model),"thinkingLevel":args.thinking.as_deref().unwrap_or("off"),"isScoped":!args.model_scope.is_empty()}),
             ))
@@ -726,7 +736,12 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 })?
                 .ok_or_else(not_found)?
             };
-            args.change_model(provider, model.to_owned(), None)?;
+            args.change_model(
+                provider,
+                model.to_owned(),
+                None,
+                pi_rs::ModelSelectSource::Set,
+            )?;
             Ok(Some(value))
         }
         "edit_context" => {
@@ -925,7 +940,7 @@ pub(super) fn snapshot_response(
     }
 }
 
-fn model_value(args: &Cli, provider: &super::Provider, model: &str) -> Value {
+pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -> Value {
     let configured = args.model_profiles.model(provider, model);
     let name = configured
         .as_ref()
@@ -1610,6 +1625,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result["model"]["id"], "b");
+        assert!(
+            matches!(args.selection_events.last(), Some(pi_rs::LifecycleEvent::ModelSelect {
+            source: pi_rs::ModelSelectSource::Cycle, model, previous_model: Some(previous)
+        }) if model["id"] == "b" && previous["id"] == "a")
+        );
         args.model_scope.truncate(1);
         assert_eq!(
             command(&json!({"type":"cycle_model"}), &mut args, &mut worker).unwrap(),

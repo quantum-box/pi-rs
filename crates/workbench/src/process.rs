@@ -376,6 +376,35 @@ impl Worker {
         }
         Ok(())
     }
+    pub(super) fn notify_selection(
+        slot: &mut Option<Self>,
+        args: &Cli,
+        event: &pi_rs::LifecycleEvent,
+    ) -> Result<()> {
+        let Some(active) = Self::extension_worker(slot, args)? else {
+            return Ok(());
+        };
+        if active.session != args.session {
+            return Ok(());
+        }
+        let id = json!(uuid::Uuid::new_v4());
+        active.send(
+            json!({"type":"selection_changed", "id":id, "session":args.session, "event":event}),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let received = active
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| {
+                    Error::Config(format!("could not notify model selection: {error}"))
+                })?;
+            if received["type"] == "selection_notified" && received["id"] == id {
+                return Ok(());
+            }
+            active.pending_events.push(received);
+        }
+    }
     pub(super) fn transition(
         slot: &mut Option<Self>,
         args: &Cli,

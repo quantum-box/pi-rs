@@ -39,6 +39,11 @@ enum Request {
         session: PathBuf,
         name: Option<String>,
     },
+    SelectionChanged {
+        id: Uuid,
+        session: PathBuf,
+        event: LifecycleEvent,
+    },
     Prompt {
         content: Option<String>,
         #[serde(default)]
@@ -415,6 +420,28 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                 )
                 .await;
             }
+            continue;
+        }
+        if let Request::SelectionChanged { id, session, event } = request {
+            if session == args.session
+                && runtime.registry.has_model_selection_hooks()
+                && let Ok(session) = Session::snapshot(&args.session)
+                && session.host_binding().is_none()
+                && matches!(
+                    event,
+                    LifecycleEvent::ModelSelect { .. } | LifecycleEvent::ThinkingLevelSelect { .. }
+                )
+            {
+                pi_rs::notify_extension_lifecycle(
+                    &runtime.registry,
+                    event,
+                    &session.extension_states(),
+                    args.tool_timeout(),
+                    &mut |notification| observe(notification, args.trace),
+                )
+                .await;
+            }
+            output(json!({"type":"selection_notified","id":id}));
             continue;
         }
         if let Request::Configure {
@@ -1245,6 +1272,7 @@ fn read_requests(
                             | Request::CacheWarmingChanged
                             | Request::CheckSessionTransition { .. }
                             | Request::SessionInfoChanged { .. }
+                            | Request::SelectionChanged { .. }
                     );
                     if counted {
                         active.lock().expect("worker control").queued += 1;

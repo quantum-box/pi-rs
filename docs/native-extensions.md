@@ -59,6 +59,14 @@ The same API works for executable extensions. This currently supports result
 replacement, not Pi's custom Bash operations callbacks or streaming updates
 from within the hook.
 
+To observe model or thinking-level changes, implement `handles_lifecycle` and
+`handles_model_selection` and handle `LifecycleEvent::ModelSelect` and
+`LifecycleEvent::ThinkingLevelSelect`. Terminal and RPC selection commands
+deliver the new and previous values after the journal is updated. Model events
+identify whether a model was explicitly set or selected by cycling; reselecting
+the same value does not emit an event. These notifications do not yet cover
+branch restoration, the owned SDK's synchronous setter, or every settings path.
+
 An extension can also add temporary skills, prompt templates, and themes:
 
 ```rust,ignore

@@ -101,6 +101,8 @@ struct Cli {
     #[arg(skip)]
     model_scope: Vec<model_selection::ScopedChoice>,
     #[arg(skip)]
+    selection_events: Vec<pi_rs::LifecycleEvent>,
+    #[arg(skip)]
     trusted: bool,
     #[arg(skip)]
     trust_pending: bool,
@@ -558,7 +560,10 @@ impl Cli {
         provider: Provider,
         model: String,
         thinking: Option<String>,
+        source: pi_rs::ModelSelectSource,
     ) -> Result<()> {
+        let previous_model = rpc::model_value(self, &self.provider, &self.model);
+        let previous_level = self.thinking.as_deref().unwrap_or("off").to_owned();
         let mut selected = self.clone();
         selected.activate_provider(provider, Some(&model))?;
         selected.model = model;
@@ -570,6 +575,24 @@ impl Cli {
         }
         thinking::adjust(&mut selected);
         selected.record_model_selection(&mut Session::open(&selected.session)?)?;
+        let level = selected.thinking.as_deref().unwrap_or("off");
+        if previous_level != level {
+            selected
+                .selection_events
+                .push(pi_rs::LifecycleEvent::ThinkingLevelSelect {
+                    level: level.to_owned(),
+                    previous_level,
+                });
+        }
+        if self.provider != selected.provider || self.model != selected.model {
+            selected
+                .selection_events
+                .push(pi_rs::LifecycleEvent::ModelSelect {
+                    model: rpc::model_value(&selected, &selected.provider, &selected.model),
+                    previous_model: Some(previous_model),
+                    source,
+                });
+        }
         *self = selected;
         Ok(())
     }

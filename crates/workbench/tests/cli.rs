@@ -11,6 +11,115 @@ use serde_json::{Value, json};
 
 #[cfg(unix)]
 #[test]
+fn rpc_notifies_native_extensions_of_actual_model_and_thinking_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("models.json"),
+        json!({"providers":{"ollama":{"models":[
+            {"id":"alpha", "reasoning":true}, {"id":"beta", "reasoning":true}
+        ]}}})
+        .to_string(),
+    )
+    .unwrap();
+    let extension = directory.path().join("selection.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'selection', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'model_selection_hook':True}
+elif request['type'] == 'lifecycle':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'events.jsonl'), 'a') as log:
+        log.write(json.dumps(request['event']) + '\n')
+    result = None
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(directory.path())
+        .env("PI_RS_HOME", directory.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--model",
+            "alpha",
+            "--thinking",
+            "off",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for request in [
+        json!({"id":"think", "type":"set_thinking_level", "level":"low"}),
+        json!({"id":"same-think", "type":"set_thinking_level", "level":"low"}),
+        json!({"id":"model", "type":"set_model", "provider":"ollama", "modelId":"beta"}),
+        json!({"id":"same-model", "type":"set_model", "provider":"ollama", "modelId":"beta"}),
+    ] {
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+        loop {
+            let response = receive
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC event timed out: {error}");
+                });
+            if response["type"] == "response" && response["id"] == request["id"] {
+                assert_eq!(response["success"], true, "{response}");
+                break;
+            }
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let events: Vec<Value> = std::fs::read_to_string(directory.path().join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(
+        events[0],
+        json!({"type":"thinking_level_select", "level":"low", "previousLevel":"off"})
+    );
+    assert_eq!(events[1]["type"], "model_select");
+    assert_eq!(events[1]["previousModel"]["id"], "alpha");
+    assert_eq!(events[1]["model"]["id"], "beta");
+    assert_eq!(events[1]["source"], "set");
+}
+
+#[cfg(unix)]
+#[test]
 fn rpc_user_bash_extension_can_replace_execution_and_pass_through() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();

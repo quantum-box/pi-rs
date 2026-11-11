@@ -122,12 +122,20 @@ pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
 }
 
 fn persist(args: &mut Cli, level: &str) -> Result<()> {
+    let previous_level = args.thinking.as_deref().unwrap_or("off").to_owned();
     Session::open(&args.session)?.select_provider_model(
         args.recorded_provider(),
         &args.model,
         Some(level),
     )?;
     args.thinking = Some(level.into());
+    if previous_level != level {
+        args.selection_events
+            .push(pi_rs::LifecycleEvent::ThinkingLevelSelect {
+                level: level.into(),
+                previous_level,
+            });
+    }
     Ok(())
 }
 

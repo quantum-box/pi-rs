@@ -37,6 +37,98 @@ fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
 }
 
 #[test]
+fn thinking_command_notifies_native_extension_from_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        br#"{"providers":{"ollama":{"models":[{"id":"fixture","reasoning":true}]}}}"#,
+    )
+    .unwrap();
+    let extension = root.path().join("selection.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'selection', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'model_selection_hook':True}
+elif request['type'] == 'lifecycle':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'events.jsonl'), 'a') as log:
+        log.write(json.dumps(request['event']) + '\n')
+    result = None
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--thinking",
+                "off",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/thinking low\r").unwrap();
+    let path = home.join("events.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::metadata(&path).map_or(true, |metadata| metadata.len() == 0)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let contents = std::fs::read_to_string(path).expect("extension did not receive selection");
+    let event: serde_json::Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        event,
+        serde_json::json!({"type":"thinking_level_select", "level":"low", "previousLevel":"off"})
+    );
+}
+
+#[test]
 fn settings_stays_open_after_changes_and_editor_cancel() {
     for mode in ["regular", "fullscreen"] {
         let root = tempfile::tempdir().unwrap();

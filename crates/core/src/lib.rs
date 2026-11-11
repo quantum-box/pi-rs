@@ -18,8 +18,8 @@ pub use extension::*;
 pub use journal::*;
 pub use lifecycle::{
     BeforeSessionTransition, ExtensionTreeSummary, ForkPosition, LifecycleEvent, LifecycleMessage,
-    SessionShutdownReason, SessionStartReason, SessionSwitchReason, TreeDecision, TreePreparation,
-    TreeSummary, notify as notify_extension_lifecycle,
+    ModelSelectSource, SessionShutdownReason, SessionStartReason, SessionSwitchReason,
+    TreeDecision, TreePreparation, TreeSummary, notify as notify_extension_lifecycle,
 };
 pub use retry::*;
 pub use sdk::*;

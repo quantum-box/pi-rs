@@ -3011,6 +3011,14 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     loop {
+        if !is_busy(&worker) {
+            for event in std::mem::take(&mut args.selection_events) {
+                if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+                    view.append(&format!("Extension selection notification: {error}"));
+                    dirty = true;
+                }
+            }
+        }
         if let Some(terminal) = &mut _terminal {
             let alternate = args.tui_mode != Some(TuiMode::Regular);
             if terminal.alternate != alternate {
@@ -4519,7 +4527,12 @@ fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()
         &provider,
         &args.model_profiles,
     )?;
-    args.change_model(provider, selected.model, selected.thinking)
+    args.change_model(
+        provider,
+        selected.model,
+        selected.thinking,
+        pi_rs::ModelSelectSource::Set,
+    )
 }
 
 fn save_default_model(args: &mut Cli) -> Result<()> {
@@ -4578,7 +4591,12 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
         args.model_scope.as_slice()
     };
     if let Some(choice) = next_model(args, choices, reverse) {
-        args.change_model(choice.provider, choice.model, choice.thinking)?;
+        args.change_model(
+            choice.provider,
+            choice.model,
+            choice.thinking,
+            pi_rs::ModelSelectSource::Cycle,
+        )?;
     } else if args.model_scope.is_empty() {
         view.append("Only one model available");
     } else {

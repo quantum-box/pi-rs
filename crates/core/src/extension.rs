@@ -354,6 +354,11 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to model and thinking-level selection events.
+    fn handles_model_selection(&self) -> bool {
+        false
+    }
+
     /// Opt in to supplying temporary skills, prompt templates and themes.
     fn handles_resource_discovery(&self) -> bool {
         false
@@ -603,6 +608,12 @@ impl Registry {
         self.extensions
             .iter()
             .any(|extension| extension.handles_lifecycle() && extension.handles_session_lifecycle())
+    }
+
+    pub fn has_model_selection_hooks(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.handles_lifecycle() && extension.handles_model_selection())
     }
 
     pub fn has_cache_warming_hooks(&self) -> bool {
