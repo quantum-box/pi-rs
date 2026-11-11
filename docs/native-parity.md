@@ -11,10 +11,10 @@ The requested compatibility is equivalent functionality implemented in Rust.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
-Interactive `--resume` and `-r` open the session selector without consuming a
-following prompt. The native `--resume=PATH` form opens a specific session;
-`--session PATH` is the Pi-compatible spelling. Selector startup in print,
-JSON, and RPC modes remains to be aligned with Pi.
+`--resume` and `-r` open the session selector without consuming a following
+prompt. The picker uses the controlling terminal, keeping standard input and
+output available to print, JSON, and RPC modes. The native `--resume=PATH`
+form opens a specific session; `--session PATH` is the Pi-compatible spelling.
 
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |

@@ -190,3 +190,212 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
     assert_eq!(original.c_cflag, restored.c_cflag);
     assert_eq!(original.c_cc, restored.c_cc);
 }
+
+#[test]
+fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let mut seed = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .args([
+            "--workspace",
+            root.path().to_str().unwrap(),
+            "--session-id",
+            "target",
+            "--mode",
+            "rpc",
+            "--no-mcp",
+        ])
+        .env("PI_RS_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    seed.stdin.take().unwrap().write_all(b"{\"id\":\"name\",\"type\":\"set_session_name\",\"name\":\"Resume Fixture\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+    assert!(seed.wait_with_output().unwrap().status.success());
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 30,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let _slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut process = Process(
+        command
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--resume",
+                "--mode",
+                "rpc",
+                "--no-mcp",
+            ])
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Resume session"));
+    master.write_all(b"Resume Fixture").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Resume session") && text.contains("Resume Fixture")
+    });
+    master.write_all(b"\r").unwrap();
+    process
+        .0
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n",
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        let mut buffer = [0; 8192];
+        let _ = master.read(&mut buffer);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        process
+            .0
+            .try_wait()
+            .unwrap()
+            .is_some_and(|status| status.success())
+    );
+    let mut output = String::new();
+    process
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    let events: Vec<serde_json::Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let state = events.iter().find(|event| event["id"] == "state").unwrap();
+    assert!(
+        state["data"]["sessionFile"]
+            .as_str()
+            .unwrap()
+            .ends_with("/target.jsonl")
+    );
+}
+
+#[test]
+fn resume_selector_escape_cancels_with_redirected_stdio() {
+    let root = tempfile::tempdir().unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 30,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let _slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut process = Process(
+        command
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--resume",
+                "--print",
+                "must not run",
+                "--no-mcp",
+            ])
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Resume session"));
+    master.write_all(b"\x1b").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        let mut buffer = [0; 8192];
+        let _ = master.read(&mut buffer);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        process
+            .0
+            .try_wait()
+            .unwrap()
+            .is_some_and(|status| status.success())
+    );
+    let mut output = String::new();
+    process
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert!(output.is_empty(), "unexpected stdout: {output}");
+}

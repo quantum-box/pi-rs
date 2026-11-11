@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
 
 use super::{InputEvent, decoder::Decoder, escape_delay};
@@ -14,6 +15,9 @@ impl Reader {
     pub fn new() -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
+            // A terminal can report readiness even when a blocking read would
+            // wait for another byte; keep escape-key timeouts responsive.
+            .custom_flags(libc::O_NONBLOCK)
             .open("/dev/tty")
             .or_else(|_| {
                 let descriptor = unsafe { libc::dup(libc::STDIN_FILENO) };

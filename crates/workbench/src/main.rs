@@ -1142,6 +1142,18 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     } else if args.fork_session.is_none() {
         args.session = sessions::resolve_reference(&args.session, &directory)?;
     }
+    if args
+        .resume_session
+        .as_ref()
+        .is_some_and(|path| path.is_empty())
+    {
+        let Some(path) = interactive::select_startup_session(&mut args)? else {
+            eprintln!("No session selected");
+            return Ok(());
+        };
+        args.session = path;
+        args.resume_session = None;
+    }
     if let Some(source) = &args.fork_session {
         let source = sessions::resolve_reference(source, &directory)?;
         let source_session = session_import::read(&source)?;

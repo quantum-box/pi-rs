@@ -2671,6 +2671,110 @@ fn slash(
     Ok(None)
 }
 
+/// Run the startup session picker on the controlling terminal, leaving stdout
+/// and stdin available for print/JSON/RPC mode protocols.
+pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> {
+    #[cfg(unix)]
+    let output: Box<dyn Write> = Box::new(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/tty")
+            .map_err(|_| {
+                Error::Config("--resume requires a controlling terminal to select a session".into())
+            })?,
+    );
+    #[cfg(not(unix))]
+    let output: Box<dyn Write> = {
+        if !std::io::stderr().is_terminal() {
+            return Err(Error::Config(
+                "--resume requires a terminal to select a session".into(),
+            ));
+        }
+        Box::new(std::io::stderr())
+    };
+    struct PickerTerminal(Box<dyn Write>);
+    impl Drop for PickerTerminal {
+        fn drop(&mut self) {
+            let _ = execute!(
+                self.0,
+                ResetColor,
+                Show,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+    terminal::enable_raw_mode()?;
+    let mut screen = PickerTerminal(output);
+    execute!(screen.0, EnterAlternateScreen, EnableBracketedPaste, Hide)?;
+    let mut input = crate::ui::input::Reader::new()?;
+    let keys = Keys::load()?;
+    let mut theme = Theme::load(
+        args.use_theme.as_deref().unwrap_or("system"),
+        &args.themes,
+        &args.workspace,
+        args.trusted,
+        !args.no_themes,
+    )?;
+    let mut view = View::default();
+    slash("/resume", args, &mut view, None)?;
+    let mut worker = None;
+    let mut dirty = true;
+    loop {
+        if dirty {
+            let (width, height) = terminal::size().unwrap_or((80, 24));
+            execute!(screen.0, MoveTo(0, 0), Clear(ClearType::All))?;
+            if let Some(picker) = &view.picker {
+                for (row, line) in picker
+                    .render(&theme, width as usize, height as usize, &keys)
+                    .iter()
+                    .enumerate()
+                {
+                    if row >= height as usize {
+                        break;
+                    }
+                    queue!(screen.0, MoveTo(0, row as u16))?;
+                    line.draw(&mut screen.0, width as usize)?;
+                }
+            }
+            screen.0.flush()?;
+            dirty = false;
+        }
+        match input.next(Duration::from_millis(100))? {
+            Some(crate::ui::input::InputEvent::Event(Event::Resize(..))) => dirty = true,
+            Some(crate::ui::input::InputEvent::Event(Event::Paste(text))) => {
+                if let Some(picker) = &mut view.picker {
+                    picker.paste(&text);
+                }
+                dirty = true;
+            }
+            Some(crate::ui::input::InputEvent::Event(Event::Key(key)))
+                if key.kind != KeyEventKind::Release =>
+            {
+                dirty = true;
+                let mut picker = view.picker.take().expect("startup session picker");
+                match picker.input(key, &keys) {
+                    Input::Cancel => return Ok(None),
+                    Input::Select(Selection::Resume(path)) => return Ok(Some(path)),
+                    Input::Select(
+                        selection @ (Selection::RenameSession(..) | Selection::DeleteSession(..)),
+                    ) => {
+                        if let Err(error) =
+                            select(selection, args, &mut view, &mut theme, &mut worker)
+                        {
+                            picker.show_feedback(Err(error.to_string()));
+                            view.picker = Some(picker);
+                        }
+                    }
+                    _ => view.picker = Some(picker),
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Config(
@@ -4483,7 +4587,7 @@ fn select(
             if changed {
                 session.set_name(&name)?;
             }
-            if path.canonicalize()? == args.session.canonicalize()? {
+            if path.canonicalize().ok() == args.session.canonicalize().ok() {
                 view.session_name = session.name().map(str::to_owned);
                 if changed {
                     view.pending_session_name = Some(view.session_name.clone());
@@ -4493,7 +4597,7 @@ fn select(
             slash("/resume", args, view, None)?;
         }
         Selection::DeleteSession(path) => {
-            if path.canonicalize()? == args.session.canonicalize()? {
+            if path.canonicalize().ok() == args.session.canonicalize().ok() {
                 return Err(Error::Config("Cannot delete the active session".into()));
             }
             let session = Session::open(&path)?;
