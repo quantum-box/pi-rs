@@ -2877,7 +2877,13 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         {
             match start_prompt(&args, &prompt, &images, &mut worker) {
                 Ok(()) => {
-                    view.lines.push(Entry::User(prompt.clone()));
+                    let display = if prompt.starts_with("/skill:") {
+                        view.resources.expand(&prompt)
+                    } else {
+                        None
+                    };
+                    view.lines
+                        .push(Entry::User(display.unwrap_or_else(|| prompt.clone())));
                     view.history.push(prompt);
                 }
                 Err(error) => view.append(&error.to_string()),

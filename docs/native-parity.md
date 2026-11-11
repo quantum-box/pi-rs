@@ -175,6 +175,8 @@ remain readable independently of project trust. `/skills`, `/prompts`,
 Explicit skill invocation sends Pi's `<skill>` block with the source location,
 relative-reference directory and body. Frontmatter is removed, and optional
 user text follows the block.
+The TUI displays a folded skill panel with the configured tool expansion key.
+User text remains visible below the panel, including when a session is reopened.
 Prompt-template arguments preserve literal backslashes and quoted empty
 values. Positional arguments, defaults and slices use Pi's placeholder
 syntax and expand only once.
