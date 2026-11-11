@@ -68,6 +68,11 @@ Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID when present. Malformed JSON produces a `parse` response with a
 parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
 
+`set_model` checks the exact model ID against the selected provider's
+configured or discovered catalog before saving the selection. A missing
+provider or model reports `Model not found: <provider>/<model>`. Existing
+native clients can omit `provider` to select within the current provider.
+
 RPC `export_html` defaults to `pi-session-<session-basename>.html` in the
 invocation directory. An explicit output path selects the destination
 independently of its extension and can replace a previous export. The

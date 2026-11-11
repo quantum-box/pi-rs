@@ -666,19 +666,54 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" => {
-            let provider = match request.get("provider") {
-                None => args.provider.clone(),
-                Some(value) => value
-                    .as_str()
-                    .and_then(|name| args.model_profiles.provider(name))
-                    .ok_or_else(|| Error::Config("unsupported model provider".into()))?,
-            };
-            let model = request["modelId"]
+            let provider_id = request.get("provider").map_or(args.provider.id(), |value| {
+                value.as_str().unwrap_or("undefined")
+            });
+            let model = request["modelId"].as_str().unwrap_or("undefined");
+            let not_found = || Error::Config(format!("Model not found: {provider_id}/{model}"));
+            let provider = args
+                .model_profiles
+                .provider(provider_id)
+                .filter(|provider| provider.id() == provider_id)
+                .ok_or_else(not_found)?;
+            if request["modelId"]
                 .as_str()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| Error::Config("modelId is required".into()))?;
+                .is_none_or(|model| model.is_empty())
+            {
+                return Err(not_found());
+            }
+            let value = if args
+                .model_profiles
+                .model_ids(&provider)
+                .iter()
+                .any(|id| id == model)
+            {
+                model_value(args, &provider, model)
+            } else {
+                let current = args.clone();
+                let selected = provider.clone();
+                let candidate = model.to_owned();
+                discover_models(move || async move {
+                    let probe = current.allow_endpoint_probes(current.endpoint_for(&selected));
+                    if !probe {
+                        return Ok(None);
+                    }
+                    let catalog = super::model_selection::catalog(&current, selected, true).await?;
+                    if !catalog.models.contains(&candidate) {
+                        return Ok(None);
+                    }
+                    let details = catalog
+                        .details(std::slice::from_ref(&candidate), &current.model_profiles)
+                        .await;
+                    Ok(Some(super::model_listing::with_details(
+                        model_value(&current, &catalog.provider, &candidate),
+                        details.get(&candidate),
+                    )))
+                })?
+                .ok_or_else(not_found)?
+            };
             args.change_model(provider, model.to_owned(), None)?;
-            Ok(Some(model_value(args, &args.provider, model)))
+            Ok(Some(value))
         }
         "edit_context" => {
             let session = &mut Session::open(&args.session)?;
@@ -899,44 +934,50 @@ fn available_models(
         return Ok((args.model_scope.clone(), Vec::new()));
     }
     let args = args.clone();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
-            let mut catalogs = super::model_selection::catalogs(&args, false).await?;
-            if !include_details {
-                catalogs.sort_by_key(|catalog| {
-                    args.model_profiles
-                        .providers()
-                        .position(|provider| provider == catalog.provider)
-                        .unwrap_or(usize::MAX)
+    discover_models(move || async move {
+        let mut catalogs = super::model_selection::catalogs(&args, false).await?;
+        if !include_details {
+            catalogs.sort_by_key(|catalog| {
+                args.model_profiles
+                    .providers()
+                    .position(|provider| provider == catalog.provider)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let mut choices = Vec::new();
+        let mut rows = Vec::new();
+        for catalog in catalogs {
+            let details = if include_details {
+                catalog.details(&catalog.models, &args.model_profiles).await
+            } else {
+                Default::default()
+            };
+            for model in catalog.models {
+                if include_details {
+                    rows.push(super::model_listing::with_details(
+                        model_value(&args, &catalog.provider, &model),
+                        details.get(&model),
+                    ));
+                }
+                choices.push(ScopedChoice {
+                    provider: catalog.provider.clone(),
+                    model,
+                    thinking: None,
                 });
             }
-            let mut choices = Vec::new();
-            let mut rows = Vec::new();
-            for catalog in catalogs {
-                let details = if include_details {
-                    catalog.details(&catalog.models, &args.model_profiles).await
-                } else {
-                    Default::default()
-                };
-                for model in catalog.models {
-                    if include_details {
-                        rows.push(super::model_listing::with_details(
-                            model_value(&args, &catalog.provider, &model),
-                            details.get(&model),
-                        ));
-                    }
-                    choices.push(ScopedChoice {
-                        provider: catalog.provider.clone(),
-                        model,
-                        thinking: None,
-                    });
-                }
-            }
-            Ok((choices, rows))
-        })
+        }
+        Ok((choices, rows))
+    })
+}
+
+fn discover_models<T: Send + 'static, F: std::future::Future<Output = Result<T>>>(
+    query: impl FnOnce() -> F + Send + 'static,
+) -> Result<T> {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(query())
     })
     .join()
     .map_err(|_| Error::Config("model discovery worker stopped".into()))?
