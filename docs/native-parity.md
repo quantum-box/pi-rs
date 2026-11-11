@@ -432,7 +432,9 @@ projection when imported, including text and image replacements.
 
 The CLI accepts `@file` arguments for text and supported images, using the same
 image decoding and size limits as the local read tool. File text precedes the
-prompt, and image bytes remain separate image content. Initial prompts passed
+prompt, empty files are skipped, and UTF-8 BOMs are stripped from text files.
+Images are referenced by a single-line file tag and sent as separate image
+content. Initial prompts passed
 from a terminal now run inside the TUI and leave it available for further
 conversation. Print and JSON modes remain one-shot.
 

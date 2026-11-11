@@ -22,6 +22,10 @@ pub fn expand(
             continue;
         };
         let path = tools.resolve_read_path(Path::new(path))?;
+        let metadata = path.metadata()?;
+        if metadata.is_file() && metadata.len() == 0 {
+            continue;
+        }
         let (content, attached) = tools.read_attachment(&path)?;
         let name = path
             .to_string_lossy()
@@ -29,7 +33,13 @@ pub fn expand(
             .replace('"', "&quot;")
             .replace('<', "&lt;")
             .replace('>', "&gt;");
-        files.push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
+        if attached.is_empty() {
+            let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+            files.push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
+        } else {
+            let hints = if auto_resize { &content } else { "" };
+            files.push_str(&format!("<file name=\"{name}\">{hints}</file>\n"));
+        }
         images.extend(attached);
         if files
             .len()
@@ -48,6 +58,23 @@ pub fn expand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_files_are_skipped_and_text_attachment_boms_are_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("empty.md"), "").unwrap();
+        std::fs::write(directory.path().join("note.md"), "\u{feff}text").unwrap();
+        let (text, images) = expand(
+            &["@empty.md".into(), "@note.md".into(), "prompt".into()],
+            directory.path(),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(images.is_empty());
+        assert!(!text.contains("empty.md"));
+        assert!(text.ends_with("note.md\">\ntext\n</file>\nprompt"));
+    }
     #[test]
     fn attachments_use_reader_filename_fallbacks_and_file_urls() {
         let directory = tempfile::tempdir().unwrap();
@@ -98,7 +125,8 @@ mod tests {
             .save(&path)
             .unwrap();
         let input = ["@photo.jpg".into()];
-        let (_, original) = expand(&input, directory.path(), false, None).unwrap();
+        let (reference, original) = expand(&input, directory.path(), false, None).unwrap();
+        assert!(reference.ends_with("photo.jpg\"></file>\n"));
         assert_eq!(original[0].mime_type, "image/jpeg");
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&original[0].data)
