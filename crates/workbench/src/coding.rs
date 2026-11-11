@@ -77,10 +77,8 @@ impl CodingTools {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        if command.trim().is_empty() || command.len() > 1024 * 1024 {
-            return Err(Error::Config(
-                "shell command must contain 1–1048576 bytes".into(),
-            ));
+        if !self.unrestricted && command.len() > 1024 * 1024 {
+            return Err(Error::Config("shell command exceeds 1048576 bytes".into()));
         }
         let tool = CodingTool {
             root: self.root.clone(),
@@ -1427,6 +1425,14 @@ mod tests {
     async fn explicit_shell_preserves_failed_output_and_cancelled_processes() {
         let directory = tempfile::tempdir().unwrap();
         let tools = CodingTools::local(directory.path()).unwrap();
+        for command in ["", "  "] {
+            let result = tools
+                .execute_shell(command, None, &pi_rs::CancellationToken::new(), &mut |_| {})
+                .await
+                .unwrap();
+            assert_eq!(result.exit_code, Some(0));
+            assert!(result.output.is_empty());
+        }
         let command = if cfg!(windows) {
             "Write-Output 'failed'; exit 7"
         } else {

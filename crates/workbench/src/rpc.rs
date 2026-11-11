@@ -315,11 +315,6 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 let command = request["command"]
                     .as_str()
                     .ok_or_else(|| Error::Config("command must be a string".into()))?;
-                if command.trim().is_empty() || command.len() > 1024 * 1024 {
-                    return Err(Error::Config(
-                        "shell command must contain 1–1048576 bytes".into(),
-                    ));
-                }
                 Worker::start_bash(
                     &mut worker,
                     &args,

@@ -1098,9 +1098,6 @@ impl Session {
     }
 
     fn record_bash_result(&mut self, execution: crate::BashExecution) -> Result<()> {
-        if execution.command.trim().is_empty() {
-            return Err(Error::Config("empty shell command".into()));
-        }
         let event = Event::BashExecution { execution };
         if serde_json::to_vec(&event)?.len() > 8 * 1024 * 1024 {
             return Err(Error::Config("shell execution exceeds size limit".into()));
