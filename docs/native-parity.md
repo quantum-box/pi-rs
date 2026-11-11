@@ -333,7 +333,10 @@ configured identity.
 
 System prompt arguments accept literal text or existing files resolved from the
 workspace. Repeatable `--append-system-prompt` values preserve their order in
-both one-shot CLI and persistent RPC. Native `-e` and `-n` aliases select
+both one-shot CLI and persistent RPC. Explicit append arguments replace
+discovered `APPEND_SYSTEM.md`; an explicit base prompt likewise takes
+precedence over `SYSTEM.md`. UTF-8 BOMs are removed from prompt files.
+Native `-e` and `-n` aliases select
 extensions and session names.
 
 ### Deferred discovery checkpoint

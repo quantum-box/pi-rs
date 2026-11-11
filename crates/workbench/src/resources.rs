@@ -134,20 +134,37 @@ impl Resources {
             &explicit_themes,
             &mut resources.warnings,
         )?;
-        let mut config_directories = vec![agent.clone()];
-        if args.trusted {
-            config_directories.push(workspace.join(".pi"));
+        let project_config = workspace.join(".pi");
+        let discover_prompt = |name: &str| {
+            let project = project_config.join(name);
+            let user = agent.join(name);
+            (args.trusted && project.is_file())
+                .then_some(project)
+                .or_else(|| user.is_file().then_some(user))
+        };
+        resources.system = if let Some(argument) = &args.system_prompt {
+            Some(prompt_argument(&workspace, &argument.to_string_lossy())?)
+        } else {
+            discover_prompt("SYSTEM.md")
+                .as_deref()
+                .map(read_prompt)
+                .transpose()?
         }
-        for directory in config_directories {
-            let system = directory.join("SYSTEM.md");
-            if system.is_file() {
-                resources.system = Some(read(&system)?);
-            }
-            let append = directory.join("APPEND_SYSTEM.md");
-            if append.is_file() {
-                resources.append_system = read(&append)?;
-            }
-        }
+        .filter(|text| !text.is_empty());
+        resources.append_system = if args.append_system_prompt.is_empty() {
+            discover_prompt("APPEND_SYSTEM.md")
+                .as_deref()
+                .map(read_prompt)
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            args.append_system_prompt
+                .iter()
+                .filter(|argument| !argument.is_empty())
+                .map(|argument| prompt_argument(&workspace, argument))
+                .collect::<Result<Vec<_>>>()?
+                .join("\n\n")
+        };
         for path in skill_roots {
             match parse_skill(&path) {
                 Ok((name, skill)) => {
@@ -218,20 +235,9 @@ impl Resources {
         }
         Ok(resources)
     }
-    pub fn system_prompt(
-        &self,
-        base: &str,
-        custom: bool,
-        tools: &[pi_rs::ToolSpec],
-        workspace: &Path,
-    ) -> String {
-        let mut text = if custom {
-            base
-        } else {
-            self.system.as_deref().unwrap_or(base)
-        }
-        .to_owned();
-        if !custom && self.system.is_none() {
+    pub fn system_prompt(&self, base: &str, tools: &[pi_rs::ToolSpec], workspace: &Path) -> String {
+        let mut text = self.system.as_deref().unwrap_or(base).to_owned();
+        if self.system.is_none() {
             text.push_str("\n\n<tools>\n");
             if tools.is_empty() {
                 text.push_str("(none)\n");
@@ -416,13 +422,20 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
         .unwrap_or_default();
     Ok((metadata, normalized[end + 4..].trim().into()))
 }
-pub fn prompt_argument(workspace: &Path, argument: &str) -> Result<String> {
+fn prompt_argument(workspace: &Path, argument: &str) -> Result<String> {
     let path = resource_path(workspace, argument);
     if path.is_file() {
-        read(&path)
+        read_prompt(&path)
     } else {
         Ok(argument.into())
     }
+}
+fn read_prompt(path: &Path) -> Result<String> {
+    let mut text = read(path)?;
+    if text.starts_with('\u{feff}') {
+        text.drain(..'\u{feff}'.len_utf8());
+    }
+    Ok(text)
 }
 fn read(path: &Path) -> Result<String> {
     let mut text = String::new();
@@ -555,6 +568,34 @@ mod tests {
         );
     }
     #[test]
+    fn explicit_prompt_sources_replace_discovery_and_strip_file_boms() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        std::fs::create_dir(workspace.join(".pi")).unwrap();
+        std::fs::write(workspace.join(".pi/SYSTEM.md"), "\u{feff}discovered base").unwrap();
+        std::fs::write(
+            workspace.join(".pi/APPEND_SYSTEM.md"),
+            "\u{feff}discovered addendum",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("extra.md"), "\u{feff}second").unwrap();
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = workspace.to_path_buf();
+        args.trusted = true;
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.system.as_deref(), Some("discovered base"));
+        assert_eq!(resources.append_system, "discovered addendum");
+        std::fs::write(workspace.join(".pi/SYSTEM.md"), "x".repeat(65_537)).unwrap();
+        std::fs::write(workspace.join(".pi/APPEND_SYSTEM.md"), "x".repeat(65_537)).unwrap();
+        args.system_prompt = Some("explicit base".into());
+        args.append_system_prompt = vec!["first".into(), "".into(), "extra.md".into()];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.system.as_deref(), Some("explicit base"));
+        assert_eq!(resources.append_system, "first\n\nsecond");
+    }
+
+    #[test]
     fn prompt_uses_available_readers_and_preserves_custom_precedence() {
         let mut resources = Resources::default();
         resources.skills.insert(
@@ -565,20 +606,19 @@ mod tests {
                 automatic: true,
             },
         );
-        let no_reader = resources.system_prompt("default", false, &[], Path::new("/workspace"));
+        let no_reader = resources.system_prompt("default", &[], Path::new("/workspace"));
         assert!(!no_reader.contains("available_skills"));
         let tools = [pi_rs::ToolSpec {
             name: "read".into(),
             description: "Read a file".into(),
             parameters: serde_json::json!({}),
         }];
-        let prompt = resources.system_prompt("default", false, &tools, Path::new("/workspace"));
+        let prompt = resources.system_prompt("default", &tools, Path::new("/workspace"));
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("demo&amp;skill"));
         assert!(prompt.contains("specific &lt;task&gt;"));
-        resources.system = Some("project system".into());
-        let custom =
-            resources.system_prompt("explicit system", true, &tools, Path::new("/workspace"));
+        resources.system = Some("explicit system".into());
+        let custom = resources.system_prompt("default", &tools, Path::new("/workspace"));
         assert!(custom.starts_with("explicit system"));
         assert!(!custom.contains("project system"));
         assert!(!custom.contains("<rules>"));

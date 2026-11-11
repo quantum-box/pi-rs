@@ -255,7 +255,6 @@ impl Runtime {
 struct LiveMcpCatalog {
     args: Cli,
     resources: resources::Resources,
-    base_prompt: String,
     servers: std::sync::Mutex<Vec<Arc<pi_rs_workbench::mcp::McpExtension>>>,
 }
 #[async_trait::async_trait]
@@ -282,7 +281,7 @@ impl pi_rs::RegistryRefresher for LiveMcpCatalog {
             &mut registry,
             &selection,
             &hidden,
-            (&self.resources, &self.base_prompt),
+            &self.resources,
             &self.args,
             &servers,
         )?;
@@ -303,22 +302,10 @@ pub(super) fn shell_config(args: &Cli) -> ShellConfig {
 
 pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
     super::packages::prepare(args).await?;
-    let mut local_resources = resources::Resources::load(args)?;
-    for argument in &args.append_system_prompt {
-        local_resources.append_system.push_str("\n\n");
-        local_resources
-            .append_system
-            .push_str(&resources::prompt_argument(&args.workspace, argument)?);
-    }
+    let local_resources = resources::Resources::load(args)?;
     for warning in &local_resources.warnings {
         eprintln!("{warning}");
     }
-    let base_prompt = args
-        .system_prompt
-        .as_ref()
-        .map(|value| resources::prompt_argument(&args.workspace, &value.to_string_lossy()))
-        .transpose()?
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into());
     let discovered = mcp_config::discover(args, false, interactive_mcp).await?;
     let mcp_connections = discovered.connected;
     let result = async {
@@ -462,14 +449,13 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             &mut registry,
             &selection,
             &hidden,
-            (&local_resources, &base_prompt),
+            &local_resources,
             args,
             &mcp_connections,
         )?;
         let catalog = Arc::new(LiveMcpCatalog {
             args: args.clone(),
             resources: local_resources.clone(),
-            base_prompt: base_prompt.clone(),
             servers: std::sync::Mutex::new(mcp_connections.clone()),
         });
         registry.set_refresher(catalog.clone());
@@ -577,11 +563,10 @@ fn select_tools(
     registry: &mut Registry,
     selection: &super::tool_selection::Selection,
     hidden: &std::collections::BTreeSet<String>,
-    prompt: (&resources::Resources, &str),
+    resources: &resources::Resources,
     args: &Cli,
     mcp_connections: &[Arc<pi_rs_workbench::mcp::McpExtension>],
 ) -> Result<String> {
-    let (resources, base_prompt) = prompt;
     let only_code = args.settings.value()["codemode"]["mode"].as_str() == Some("only");
     registry.retain_tools(|tool| selection.callable(&tool.name));
     let active: Vec<_> = registry
@@ -599,12 +584,8 @@ fn select_tools(
                 && (!only_code || matches!(tool.name.as_str(), "codemode" | "tool_search"))
         })
         .collect();
-    let mut system_prompt = resources.system_prompt(
-        base_prompt,
-        args.system_prompt.is_some(),
-        &visible_tools,
-        &args.workspace,
-    );
+    let mut system_prompt =
+        resources.system_prompt(DEFAULT_SYSTEM_PROMPT, &visible_tools, &args.workspace);
     if !hidden.is_empty() {
         system_prompt.push_str("\n\n<mcp_servers>\nUse codemode searchTools() or tool_search to discover tools from these servers.\n");
         for connection in mcp_connections {
