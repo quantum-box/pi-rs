@@ -1978,6 +1978,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_ignores_user_input_removed_from_context() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.prompt("first").await.unwrap(), "answer 1");
+        let user = session
+            .session
+            .append(crate::Event::User {
+                content: "removed".into(),
+                input_id: None,
+            })
+            .unwrap()
+            .id;
+        session.edit_context(user, None).unwrap();
+        assert_eq!(session.resume().await.unwrap(), "answer 1");
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn idle_custom_message_can_trigger_a_fresh_model_turn() {
         let model = Arc::new(EchoModel(AtomicUsize::new(0)));
         let mut session = SessionBuilder::new(model.clone(), "fixture")

@@ -437,8 +437,11 @@ impl Agent<'_> {
             .iter()
             .rev()
             .find_map(|record| match &record.event {
-                Event::CustomMessage { .. } if current_entries.contains(&record.id) => Some(None),
-                Event::User { .. } | Event::UserWithImages { .. } => Some(None),
+                Event::CustomMessage { .. } | Event::User { .. } | Event::UserWithImages { .. }
+                    if current_entries.contains(&record.id) =>
+                {
+                    Some(None)
+                }
                 Event::Assistant {
                     content,
                     invocations,
@@ -454,9 +457,8 @@ impl Agent<'_> {
         } else if !session.branch().iter().any(|record| {
             matches!(
                 record.event,
-                Event::User { .. } | Event::UserWithImages { .. }
-            ) || matches!(record.event, Event::CustomMessage { .. })
-                && current_entries.contains(&record.id)
+                Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. }
+            ) && current_entries.contains(&record.id)
         }) {
             apply_inputs(session, true, observer)?;
         }
