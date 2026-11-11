@@ -1910,7 +1910,7 @@ fn slash(
     input: &str,
     args: &mut Cli,
     view: &mut View,
-    worker: Option<&mut Worker>,
+    worker: Option<&mut Option<Worker>>,
 ) -> Result<Option<Worker>> {
     let (name, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
     let rest = rest.trim();
@@ -2037,6 +2037,7 @@ fn slash(
             };
             if Worker::check_session_transition(
                 worker,
+                args,
                 pi_rs::BeforeSessionTransition::Fork { entry_id, position },
             )? {
                 view.append("Session fork cancelled");
@@ -2230,6 +2231,7 @@ fn slash(
         "/new" => {
             if Worker::check_session_transition(
                 worker,
+                args,
                 pi_rs::BeforeSessionTransition::Switch {
                     reason: pi_rs::SessionSwitchReason::New,
                     target_session_file: None,
@@ -2333,6 +2335,7 @@ fn slash(
             }
             if Worker::check_session_transition(
                 worker,
+                args,
                 pi_rs::BeforeSessionTransition::Switch {
                     reason: pi_rs::SessionSwitchReason::Resume,
                     target_session_file: Some(path.clone()),
@@ -3240,7 +3243,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             }) {
                                 let command = if action == "fork" { "/fork" } else { "/tree" };
                                 if let Err(error) =
-                                    slash(command, &mut args, &mut view, worker.as_mut())
+                                    slash(command, &mut args, &mut view, Some(&mut worker))
                                 {
                                     view.append(&error.to_string());
                                 }
@@ -3259,7 +3262,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             "app.session.fork" => "/fork",
                             _ => "/resume",
                         };
-                        if let Err(error) = slash(command, &mut args, &mut view, worker.as_mut()) {
+                        if let Err(error) = slash(command, &mut args, &mut view, Some(&mut worker))
+                        {
                             view.append(&error.to_string());
                         }
                     }
@@ -3771,7 +3775,8 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                                 view.editor.replace(input);
                             }
                         } else if input.trim() == "/session" && view.draft_images.is_empty() {
-                            if let Err(error) = slash(&input, &mut args, &mut view, worker.as_mut())
+                            if let Err(error) =
+                                slash(&input, &mut args, &mut view, Some(&mut worker))
                             {
                                 view.append(&error.to_string());
                             }
@@ -3823,7 +3828,7 @@ pub(super) async fn run(mut args: Cli) -> Result<()> {
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
                             args.session_transition = Some(pi_rs::SessionStartReason::Reload);
                         } else if input.starts_with('/') {
-                            match slash(&input, &mut args, &mut view, worker.as_mut()) {
+                            match slash(&input, &mut args, &mut view, Some(&mut worker)) {
                                 Ok(Some(next)) => worker = Some(next),
                                 Ok(None) => {
                                     if let Some(mut request) = view.pending_request.take() {
@@ -4284,7 +4289,7 @@ fn select(
                 &format!("/resume {}", path.display()),
                 args,
                 view,
-                worker.as_mut(),
+                Some(worker),
             )?;
         }
         Selection::Label(id, label) => {
@@ -4321,7 +4326,7 @@ fn select(
             view.local_editor = Some((LocalEditor::BranchSummary(id), dialog));
         }
         Selection::Fork(id) => {
-            slash(&format!("/fork {id}"), args, view, worker.as_mut())?;
+            slash(&format!("/fork {id}"), args, view, Some(worker))?;
         }
         Selection::Model(model) => {
             select_model_input(args, view, &model)?;

@@ -539,7 +539,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 return Err(Error::Config("session file not found".into()));
             }
             if Worker::check_session_transition(
-                worker.as_mut(),
+                Some(worker),
+                args,
                 pi_rs::BeforeSessionTransition::Switch {
                     reason: pi_rs::SessionSwitchReason::Resume,
                     target_session_file: Some(path.clone()),
@@ -582,7 +583,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 )
             };
             if Worker::check_session_transition(
-                worker.as_mut(),
+                Some(worker),
+                args,
                 pi_rs::BeforeSessionTransition::Fork { entry_id, position },
             )? {
                 return Ok(Some(json!({"cancelled":true})));
@@ -614,7 +616,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 Some(_) => return Err(Error::Config("parentSession must be a string".into())),
             };
             if Worker::check_session_transition(
-                worker.as_mut(),
+                Some(worker),
+                args,
                 pi_rs::BeforeSessionTransition::Switch {
                     reason: pi_rs::SessionSwitchReason::New,
                     target_session_file: None,

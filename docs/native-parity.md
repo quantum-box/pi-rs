@@ -2829,9 +2829,10 @@ session delivers its shutdown hook before releasing registry resources.
 
 ### Session transition extension hooks
 
-When a terminal or RPC worker is running, native extensions can cancel
-new sessions, resumes, and forks through `session_before_switch` and
-`session_before_fork`. A veto keeps the active journal and skips creating
+Native extensions can cancel new sessions, resumes, and forks through
+`session_before_switch` and `session_before_fork`. When native extensions
+are configured, the terminal and RPC start a worker for the first
+transition even before a model request. A veto keeps the active journal and skips creating
 the destination. Fork hooks distinguish the selected entry from the
 position immediately before it. The owned SDK exposes the same fork
 hook through `AgentSession::fork_with_hooks`.

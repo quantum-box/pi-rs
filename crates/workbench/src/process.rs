@@ -287,12 +287,28 @@ impl Worker {
     }
 
     pub(super) fn check_session_transition(
-        active: Option<&mut Self>,
+        slot: Option<&mut Option<Self>>,
+        args: &Cli,
         event: pi_rs::BeforeSessionTransition,
     ) -> Result<bool> {
-        let Some(active) = active else {
+        let Some(slot) = slot else {
             return Ok(false);
         };
+        if slot.is_none() {
+            let explicit = args
+                .extensions
+                .iter()
+                .any(|extension| !super::resource_paths::named_extension(extension));
+            if !explicit
+                && super::resources::Resources::load(args)?
+                    .extensions
+                    .is_empty()
+            {
+                return Ok(false);
+            }
+            *slot = Some(Self::start(args, &["serve"])?);
+        }
+        let active = slot.as_mut().expect("session transition worker");
         let id = json!(uuid::Uuid::new_v4());
         active.send(json!({"type":"check_session_transition","id":id,"event":event}))?;
         let deadline = Instant::now() + Duration::from_secs(15);
