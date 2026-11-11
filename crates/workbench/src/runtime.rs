@@ -2,7 +2,7 @@
 use super::{Cli, DEFAULT_SYSTEM_PROMPT, mcp_config, output, resources};
 use pi_rs::{
     Agent, CancellationToken, Extension, ExtensionUi, Limits, ProjectResources, Registry, Result,
-    UiRequest, UiResponse,
+    Session, UiRequest, UiResponse,
 };
 use pi_rs_workbench::coding::{CodingTools, ShellConfig, ShellContext};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
@@ -229,6 +229,23 @@ impl Runtime {
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
         self.provider = model_client(args, reported, true)?;
         Ok(())
+    }
+    pub async fn session_lifecycle(
+        &self,
+        args: &Cli,
+        session: &Session,
+        event: pi_rs::LifecycleEvent,
+    ) {
+        if self.registry.has_session_lifecycle_hooks() && session.host_binding().is_none() {
+            pi_rs::notify_extension_lifecycle(
+                &self.registry,
+                event,
+                &session.extension_states(),
+                args.tool_timeout(),
+                &mut |notification| super::observe(notification, args.trace),
+            )
+            .await;
+        }
     }
     pub async fn close(&self) -> Result<()> {
         self.registry.shutdown().await

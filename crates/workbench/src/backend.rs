@@ -7,8 +7,8 @@ use std::sync::{
 };
 
 use pi_rs::{
-    AgentInput, CancellationToken, Compaction, Error, InputKind, QueueMode, QueuedMessage, Result,
-    Session,
+    AgentInput, CancellationToken, Compaction, Error, InputKind, LifecycleEvent, QueueMode,
+    QueuedMessage, Result, Session, SessionShutdownReason, SessionStartReason,
 };
 use pi_rs_workbench::coding::CodingTools;
 use serde::Deserialize;
@@ -244,6 +244,15 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             cancel_active(&signal_active);
         }
     });
+    notify_session_lifecycle(
+        &args,
+        &runtime,
+        LifecycleEvent::SessionStart {
+            reason: SessionStartReason::Startup,
+            previous_session_file: None,
+        },
+    )
+    .await;
     output(json!({"type":"backend_ready"}));
     let mut continue_queue = false;
     let cache = super::cache_warming::Controller::default();
@@ -316,6 +325,19 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             session,
         } = request
         {
+            let previous_session = args.session.clone();
+            let switched = previous_session != session;
+            if switched {
+                notify_session_lifecycle(
+                    &args,
+                    &runtime,
+                    LifecycleEvent::SessionShutdown {
+                        reason: SessionShutdownReason::Resume,
+                        target_session_file: Some(session.clone()),
+                    },
+                )
+                .await;
+            }
             args.model = model;
             args.thinking = thinking;
             args.session = session;
@@ -324,6 +346,17 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                 .lock()
                 .expect("session snapshot")
                 .refresh(&Session::open(&args.session)?);
+            if switched {
+                notify_session_lifecycle(
+                    &args,
+                    &runtime,
+                    LifecycleEvent::SessionStart {
+                        reason: SessionStartReason::Resume,
+                        previous_session_file: Some(previous_session),
+                    },
+                )
+                .await;
+            }
             continue;
         }
         let request = match request {
@@ -735,7 +768,30 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     if shell_pending && let Some(shell) = shell_results.recv().await {
         save_shell(shell, &args, &snapshot, &active);
     }
+    notify_session_lifecycle(
+        &args,
+        &runtime,
+        LifecycleEvent::SessionShutdown {
+            reason: SessionShutdownReason::Quit,
+            target_session_file: None,
+        },
+    )
+    .await;
     runtime.close().await
+}
+
+async fn notify_session_lifecycle(args: &Cli, runtime: &runtime::Runtime, event: LifecycleEvent) {
+    if !runtime.registry.has_session_lifecycle_hooks() {
+        return;
+    }
+    let session = match Session::snapshot(&args.session) {
+        Ok(session) => session,
+        Err(error) => {
+            output(json!({"type":"error","message":error.to_string()}));
+            return;
+        }
+    };
+    runtime.session_lifecycle(args, &session, event).await;
 }
 
 fn cancel_active(active: &Mutex<ControlState>) {

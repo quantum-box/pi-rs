@@ -282,6 +282,11 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to session start and shutdown events in addition to run and turn events.
+    fn handles_session_lifecycle(&self) -> bool {
+        false
+    }
+
     /// Observe a run or turn boundary after the preceding journal records are committed.
     async fn lifecycle(
         &self,
@@ -419,6 +424,12 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub fn has_session_lifecycle_hooks(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.handles_lifecycle() && extension.handles_session_lifecycle())
+    }
+
     pub fn has_cache_warming_hooks(&self) -> bool {
         self.extensions
             .iter()

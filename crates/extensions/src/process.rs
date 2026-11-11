@@ -209,6 +209,8 @@ struct Description {
     #[serde(default)]
     lifecycle_hook: bool,
     #[serde(default)]
+    session_lifecycle_hook: bool,
+    #[serde(default)]
     cache_warming_hook: bool,
     #[serde(default)]
     tree_navigation_hook: bool,
@@ -414,6 +416,9 @@ impl Extension for ExecutableExtension {
     }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
+    }
+    fn handles_session_lifecycle(&self) -> bool {
+        self.description.session_lifecycle_hook
     }
     async fn lifecycle(
         &self,
@@ -1150,6 +1155,7 @@ async fn dispatch_with_host(
             host_calls: true,
             input_hook: extension.handles_input(),
             lifecycle_hook: extension.handles_lifecycle(),
+            session_lifecycle_hook: extension.handles_session_lifecycle(),
             cache_warming_hook: extension.handles_cache_warming(),
             tree_navigation_hook: extension.handles_tree_navigation(),
             tools: extension
@@ -1352,6 +1358,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!descriptor.cache_warming_hook);
+        assert!(!descriptor.session_lifecycle_hook);
     }
 
     struct CacheDecisionExtension;

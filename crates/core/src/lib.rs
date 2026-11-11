@@ -16,8 +16,9 @@ pub use context::*;
 pub use extension::*;
 pub use journal::*;
 pub use lifecycle::{
-    ExtensionTreeSummary, LifecycleEvent, LifecycleMessage, TreeDecision, TreePreparation,
-    TreeSummary,
+    ExtensionTreeSummary, LifecycleEvent, LifecycleMessage, SessionShutdownReason,
+    SessionStartReason, TreeDecision, TreePreparation, TreeSummary,
+    notify as notify_extension_lifecycle,
 };
 pub use retry::*;
 pub use sdk::*;

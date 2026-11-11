@@ -1,4 +1,5 @@
-//! Observation hooks for agent runs and completed model turns.
+//! Observation hooks for sessions, agent runs, and completed model turns.
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -46,9 +47,31 @@ pub struct ExtensionTreeSummary {
     pub details: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStartReason {
+    Startup,
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionShutdownReason {
+    Quit,
+    Resume,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LifecycleEvent {
+    SessionStart {
+        reason: SessionStartReason,
+        previous_session_file: Option<PathBuf>,
+    },
+    SessionShutdown {
+        reason: SessionShutdownReason,
+        target_session_file: Option<PathBuf>,
+    },
     AgentStart {
         session_id: Uuid,
         run_id: Uuid,
@@ -88,6 +111,8 @@ pub struct LifecycleMessage {
 impl LifecycleEvent {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::SessionStart { .. } => "session_start",
+            Self::SessionShutdown { .. } => "session_shutdown",
             Self::AgentStart { .. } => "agent_start",
             Self::AgentEnd { .. } => "agent_end",
             Self::TurnStart { .. } => "turn_start",
@@ -125,7 +150,7 @@ pub(crate) fn enabled(registry: &Registry) -> bool {
         .any(|extension| extension.handles_lifecycle())
 }
 
-pub(crate) async fn notify(
+pub async fn notify(
     registry: &Registry,
     event: LifecycleEvent,
     states: &ExtensionStates,
@@ -135,8 +160,13 @@ pub(crate) async fn notify(
     let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(10));
     for extension in registry.extensions.iter().filter(|extension| {
         extension.handles_lifecycle()
-            && (!matches!(event, LifecycleEvent::SessionTree { .. })
-                || extension.handles_tree_navigation())
+            && match event {
+                LifecycleEvent::SessionStart { .. } | LifecycleEvent::SessionShutdown { .. } => {
+                    extension.handles_session_lifecycle()
+                }
+                LifecycleEvent::SessionTree { .. } => extension.handles_tree_navigation(),
+                _ => true,
+            }
     }) {
         let error = match tokio::time::timeout_at(
             deadline,

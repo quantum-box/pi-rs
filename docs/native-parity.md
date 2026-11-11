@@ -2796,3 +2796,15 @@ label through `TreeNavigationOptions`. The same options reach the
 pre-navigation extension hook. Branch-local input extension state and
 model selection are restored after navigation. Subscribers receive the
 committed records, and `SessionControl::abort` cancels a pending summary.
+
+### Session lifecycle extension checkpoint
+
+Native extensions that opt into session lifecycle events receive
+`session_start` after runtime configuration and `session_shutdown` before
+cleanup. This covers single-command model runs, including errors, and
+persistent workers. When a worker attaches to another journal, it
+delivers shutdown to the previous journal's extension state and start
+to the destination's state, with both journal paths available across
+the two events. Existing executable descriptors default to opting out.
+The frontend still needs to convey the specific reason for new, fork,
+and reload transitions.

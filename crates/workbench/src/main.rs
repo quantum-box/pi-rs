@@ -1373,6 +1373,16 @@ async fn execute(mut args: Cli) -> Result<()> {
     let runtime = runtime::configure(&args, false).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
     session.set_retry_control(runtime.retry.clone());
+    runtime
+        .session_lifecycle(
+            &args,
+            &session,
+            pi_rs::LifecycleEvent::SessionStart {
+                reason: pi_rs::SessionStartReason::Startup,
+                previous_session_file: None,
+            },
+        )
+        .await;
     let result = async {
         let registry = &runtime.registry;
         let agent = runtime.agent(&args, session.session_id());
@@ -1553,6 +1563,16 @@ async fn execute(mut args: Cli) -> Result<()> {
     output(json!({"type": "answer", "content": answer}));
     Ok(())
     }.await;
+    runtime
+        .session_lifecycle(
+            &args,
+            &session,
+            pi_rs::LifecycleEvent::SessionShutdown {
+                reason: pi_rs::SessionShutdownReason::Quit,
+                target_session_file: None,
+            },
+        )
+        .await;
     let cleanup = runtime.close().await;
     result.and(cleanup)
 }
