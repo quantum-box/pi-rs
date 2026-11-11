@@ -59,6 +59,11 @@ leaf ID. Newly committed entries are emitted as `entry_appended` with those
 same IDs. Incremental tool arguments and additional session events remain in
 progress.
 
+`get_last_assistant_text` and `/copy` use the active transcript. Both skip
+empty aborted assistant messages, concatenate the selected message's text
+blocks, and trim the result. The RPC response omits `text` when the selected
+message has no text or the transcript has no eligible assistant message.
+
 The message snapshot preserves imported Pi roles, timestamps, and extension
 message details. Context edits replace the affected content in the snapshot.
 Imported Gemini conversations carry signed text, thought, and function parts

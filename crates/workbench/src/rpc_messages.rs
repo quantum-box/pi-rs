@@ -50,6 +50,24 @@ pub(super) fn count(session: &Session) -> usize {
     }).count()
 }
 
+pub(super) fn last_assistant_text(session: &Session) -> Option<String> {
+    let (messages, _) = snapshot(session);
+    let message = messages.iter().rev().find(|message| {
+        message["role"] == "assistant"
+            && !(message["stopReason"] == "aborted"
+                && message["content"].as_array().is_some_and(Vec::is_empty))
+    })?;
+    let blocks = message["content"].as_array()?;
+    let text: String = blocks
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    let text =
+        text.trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
 pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
     let branch = session.branch();
     let entries = session.current_message_entries();

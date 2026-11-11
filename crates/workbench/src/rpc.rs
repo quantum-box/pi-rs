@@ -787,18 +787,8 @@ pub(super) fn snapshot_response(
             Ok(result)
         }
         "get_fork_messages" => Ok(super::rpc_entries::Entries::new(session).fork_messages()),
-        "get_last_assistant_text" => {
-            let text =
-                session
-                    .current_messages()
-                    .into_iter()
-                    .rev()
-                    .find_map(|message| match message {
-                        pi_rs::Message::Assistant { content, .. } => Some(content),
-                        _ => None,
-                    });
-            Ok(json!({"text":text}))
-        }
+        "get_last_assistant_text" => Ok(super::rpc_messages::last_assistant_text(session)
+            .map_or_else(|| json!({}), |text| json!({"text":text}))),
         "get_messages" => {
             let (messages, native) = super::rpc_messages::snapshot(session);
             let mut data = json!({"messages":messages});
@@ -1095,6 +1085,57 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn last_assistant_text_matches_pi_transcript_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("upstream.jsonl");
+        let answer = json!({"type":"message","id":"a","parentId":null,"message":{
+            "role":"assistant","stopReason":"stop","content":[
+                {"type":"text","text":" \u{feff}Hello"},
+                {"type":"thinking","thinking":"private"},
+                {"type":"text","text":" world\n"}
+            ]
+        }});
+        let aborted = json!({"type":"message","id":"b","parentId":"a","message":{
+            "role":"assistant","stopReason":"aborted","content":[]
+        }});
+        let thinking_only = json!({"type":"message","id":"c","parentId":"b","message":{
+            "role":"assistant","stopReason":"aborted",
+            "content":[{"type":"thinking","thinking":"partial reasoning"}]
+        }});
+        let entries = [
+            json!({"type":"session","version":3}),
+            answer,
+            aborted,
+            thinking_only,
+        ];
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        for (length, expected) in [
+            (1, json!({})),
+            (2, json!({"text":"Hello world"})),
+            (3, json!({"text":"Hello world"})),
+            (4, json!({})),
+        ] {
+            let body = entries[..length]
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&source, body).unwrap();
+            args.session = root.path().join(format!("native-{length}.jsonl"));
+            super::super::sessions::import(&source, &args.session).unwrap();
+            assert_eq!(
+                command(
+                    &json!({"type":"get_last_assistant_text"}),
+                    &mut args,
+                    &mut None
+                )
+                .unwrap(),
+                Some(expected)
+            );
+        }
+    }
 
     #[test]
     fn compaction_stays_busy_until_its_completion_response() {

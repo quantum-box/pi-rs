@@ -388,16 +388,9 @@ fn tool_html(outcome: &pi_rs::Outcome) -> String {
 }
 
 pub fn copy_last(session: &Session) -> Result<()> {
-    let text = session
-        .branch()
-        .into_iter()
-        .rev()
-        .find_map(|record| match &record.event {
-            Event::Assistant { content, .. } if !content.is_empty() => Some(content.as_str()),
-            _ => None,
-        })
-        .ok_or_else(|| Error::Config("no assistant response to copy".into()))?;
-    copy_text(text)
+    let text = super::rpc_messages::last_assistant_text(session)
+        .ok_or_else(|| Error::Config("No agent messages to copy yet.".into()))?;
+    copy_text(&text)
 }
 
 pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
