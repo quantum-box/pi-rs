@@ -2019,6 +2019,16 @@ mod tests {
         assert!(matches!(&messages[1], Message::User { content } if content == "second"));
         assert!(matches!(&messages[3], Message::User { content } if content == "third"));
         assert_eq!(model.0.load(Ordering::SeqCst), 2);
+        assert_eq!(session.resume().await.unwrap(), "answer 2");
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+        session
+            .send_custom_message(message("removed"), false)
+            .await
+            .unwrap();
+        let removed = session.journal().head();
+        session.edit_context(removed, None).unwrap();
+        assert_eq!(session.resume().await.unwrap(), "answer 2");
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
         session.close().await.unwrap();
     }
     struct ClosingExtension(Arc<AtomicUsize>);

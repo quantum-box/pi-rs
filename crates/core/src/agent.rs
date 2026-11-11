@@ -427,14 +427,18 @@ impl Agent<'_> {
         if pending.is_none() {
             apply_inputs(session, false, observer)?;
         }
+        let current_entries: std::collections::HashSet<_> = session
+            .current_message_entries()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         if let Some(answer) = session
             .branch()
             .iter()
             .rev()
             .find_map(|record| match &record.event {
-                Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. } => {
-                    Some(None)
-                }
+                Event::CustomMessage { .. } if current_entries.contains(&record.id) => Some(None),
+                Event::User { .. } | Event::UserWithImages { .. } => Some(None),
                 Event::Assistant {
                     content,
                     invocations,
@@ -450,8 +454,9 @@ impl Agent<'_> {
         } else if !session.branch().iter().any(|record| {
             matches!(
                 record.event,
-                Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. }
-            )
+                Event::User { .. } | Event::UserWithImages { .. }
+            ) || matches!(record.event, Event::CustomMessage { .. })
+                && current_entries.contains(&record.id)
         }) {
             apply_inputs(session, true, observer)?;
         }
