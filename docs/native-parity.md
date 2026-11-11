@@ -24,6 +24,11 @@ headers and individual body reads; `0` or `"disabled"` disables this idle
 deadline. `/settings` can change it. The separate `--model-timeout-secs` bounds
 the entire model operation and defaults to 2,147,483 seconds.
 
+The `/settings` list remains open after a change, preserving its search and
+selected item so several values can be changed in succession. Enter activates
+the selected setting; Space also activates it when the search is empty. Closing
+or saving a JSON editor returns to the list, and Escape closes the list.
+
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |

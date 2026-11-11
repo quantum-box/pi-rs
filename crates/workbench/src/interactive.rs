@@ -3489,6 +3489,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             if let Err(error) = result {
                                 dialog.set_error(error.to_string());
                                 view.local_editor = Some((editor, dialog));
+                            } else if matches!(editor, LocalEditor::Setting(_)) {
+                                let items = settings_items(&args, &view);
+                                if let Some(picker) = &mut view.picker {
+                                    picker.refresh_settings(items);
+                                }
                             }
                         }
                         Some(_) => {
@@ -3576,9 +3581,16 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         }
                         Input::Select(selection) => {
                             view.tree_confirmation = None;
-                            if let Err(error) =
-                                select(selection, &mut args, &mut view, &mut theme, &mut worker)
-                            {
+                            let settings = picker.title == "Settings";
+                            let result =
+                                select(selection, &mut args, &mut view, &mut theme, &mut worker);
+                            if settings {
+                                picker.refresh_settings(settings_items(&args, &view));
+                                if let Err(error) = result {
+                                    picker.show_feedback(Err(error.to_string()));
+                                }
+                                view.picker = Some(picker);
+                            } else if let Err(error) = result {
                                 view.append(&error.to_string());
                             }
                         }
@@ -3847,394 +3859,8 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
                         } else if input.trim() == "/settings" {
-                            let cache_mode =
-                                args.settings.string("cacheWarming").unwrap_or("streaming");
-                            let next_cache_mode = match cache_mode {
-                                "streaming" => "idle",
-                                "idle" => "off",
-                                _ => "streaming",
-                            };
-                            let mut items = vec![
-                                Item {
-                                    label: format!(
-                                        "HTTP idle timeout · {}",
-                                        match args.settings.http_idle_timeout_ms() {
-                                            0 => "disabled".to_owned(),
-                                            ms => format!("{} sec", ms as f64 / 1000.0),
-                                        }
-                                    ),
-                                    selection: Selection::Setting(
-                                        "httpIdleTimeoutMs".into(),
-                                        json!(match args.settings.http_idle_timeout_ms() {
-                                            0 => 30_000,
-                                            1..=29_999 => 30_000,
-                                            30_000..=59_999 => 60_000,
-                                            60_000..=119_999 => 120_000,
-                                            120_000..=299_999 => 300_000,
-                                            _ => 0,
-                                        }),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Tool output · {} (toggle)",
-                                        if view.expand_tools {
-                                            "expanded"
-                                        } else {
-                                            "collapsed"
-                                        }
-                                    ),
-                                    selection: Selection::Setting(
-                                        "expandTools".into(),
-                                        json!(!view.expand_tools),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Thinking blocks · {} (toggle)",
-                                        if view.hide_thinking {
-                                            "hidden"
-                                        } else {
-                                            "shown"
-                                        }
-                                    ),
-                                    selection: Selection::Setting(
-                                        "hideThinkingBlock".into(),
-                                        json!(!view.hide_thinking),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Cache miss notices · {} (toggle)",
-                                        if args.settings.boolean("showCacheMissNotices")
-                                            == Some(true)
-                                        {
-                                            "on"
-                                        } else {
-                                            "off"
-                                        }
-                                    ),
-                                    selection: Selection::Setting(
-                                        "showCacheMissNotices".into(),
-                                        json!(
-                                            args.settings.boolean("showCacheMissNotices")
-                                                != Some(true)
-                                        ),
-                                    ),
-                                },
-                                Item {
-                                    label: format!("Save default model · {}", args.model),
-                                    selection: Selection::Setting(
-                                        "defaultModel".into(),
-                                        json!(args.configured_model_name(&args.model)),
-                                    ),
-                                },
-                                Item {
-                                    label: format!("Cache warming · {cache_mode} (cycle)"),
-                                    selection: Selection::Setting(
-                                        "cacheWarming".into(),
-                                        json!(next_cache_mode),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Save default thinking · {}",
-                                        args.thinking.as_deref().unwrap_or("model default")
-                                    ),
-                                    selection: Selection::Setting(
-                                        "defaultThinkingLevel".into(),
-                                        json!(args.thinking),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Auto-compaction · {} (toggle)",
-                                        if args.settings.auto_compaction_enabled() {
-                                            "on"
-                                        } else {
-                                            "off"
-                                        },
-                                    ),
-                                    selection: Selection::Setting(
-                                        "autoCompactionEnabled".into(),
-                                        json!(!args.settings.auto_compaction_enabled()),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Auto-retry · {} (toggle)",
-                                        if args.settings.retry_settings().enabled {
-                                            "on"
-                                        } else {
-                                            "off"
-                                        }
-                                    ),
-                                    selection: Selection::Setting(
-                                        "autoRetryEnabled".into(),
-                                        json!(!args.settings.retry_settings().enabled),
-                                    ),
-                                },
-                            ];
-                            let resize_images = args.settings.resize_model_images();
-                            items.push(Item {
-                                label: format!(
-                                    "Auto-resize images · {} (toggle)",
-                                    if resize_images { "on" } else { "off" }
-                                ),
-                                selection: Selection::Setting(
-                                    "images.autoResize".into(),
-                                    json!(!resize_images),
-                                ),
-                            });
-                            let block_images = args.settings.block_model_images();
-                            items.push(Item {
-                                label: format!(
-                                    "Block images · {} (toggle)",
-                                    if block_images { "on" } else { "off" }
-                                ),
-                                selection: Selection::Setting(
-                                    "images.blockImages".into(),
-                                    json!(!block_images),
-                                ),
-                            });
-                            if view.graphics.enabled() {
-                                let show_images = args.settings.show_terminal_images();
-                                let image_width = args.settings.terminal_image_width();
-                                let next_width = match image_width {
-                                    60 => 80,
-                                    80 => 120,
-                                    _ => 60,
-                                };
-                                items.extend([
-                                    Item {
-                                        label: format!(
-                                            "Show images · {} (toggle)",
-                                            if show_images { "on" } else { "off" }
-                                        ),
-                                        selection: Selection::Setting(
-                                            "terminal.showImages".into(),
-                                            json!(!show_images),
-                                        ),
-                                    },
-                                    Item {
-                                        label: format!("Image width · {image_width} cells"),
-                                        selection: Selection::Setting(
-                                            "terminal.imageWidthCells".into(),
-                                            json!(next_width),
-                                        ),
-                                    },
-                                ]);
-                            }
-                            let autocomplete_items = args.settings.autocomplete_max_visible();
-                            let skill_commands = args.settings.enable_skill_commands();
-                            items.extend([
-                                Item {
-                                    label: format!("Autocomplete max items · {autocomplete_items}"),
-                                    selection: Selection::Setting(
-                                        "autocompleteMaxVisible".into(),
-                                        json!(
-                                            [3, 5, 7, 10, 15, 20]
-                                                .into_iter()
-                                                .find(|count| *count > autocomplete_items)
-                                                .unwrap_or(3)
-                                        ),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Skill commands · {} (toggle)",
-                                        if skill_commands { "on" } else { "off" }
-                                    ),
-                                    selection: Selection::Setting(
-                                        "enableSkillCommands".into(),
-                                        json!(!skill_commands),
-                                    ),
-                                },
-                            ]);
-                            let escape =
-                                args.settings.string("doubleEscapeAction").unwrap_or("tree");
-                            let next_escape = match escape {
-                                "tree" => "fork",
-                                "fork" => "none",
-                                _ => "tree",
-                            };
-                            let tree_filter = TreeFilter::parse(
-                                args.settings.string("treeFilterMode").unwrap_or("default"),
-                            );
-                            let padding = args.settings.value()["editorPaddingX"]
-                                .as_u64()
-                                .unwrap_or(0);
-                            let exit_output = args
-                                .settings
-                                .string("fullscreenExitOutput")
-                                .unwrap_or("transcript");
-                            let scrollbar = args
-                                .settings
-                                .string("fullscreenScrollbar")
-                                .unwrap_or("auto");
-                            let copy_on_select = args
-                                .settings
-                                .boolean("fullscreenCopyOnSelect")
-                                .unwrap_or(true);
-                            items.extend([
-                                Item {
-                                    label: format!(
-                                        "Terminal progress · {} (toggle)",
-                                        if args.settings.terminal_progress() {
-                                            "on"
-                                        } else {
-                                            "off"
-                                        },
-                                    ),
-                                    selection: Selection::Setting(
-                                        "terminal.showTerminalProgress".into(),
-                                        json!(!args.settings.terminal_progress()),
-                                    ),
-                                },
-                                Item {
-                                    label: format!("Fullscreen exit output · {exit_output}"),
-                                    selection: Selection::Setting(
-                                        "fullscreenExitOutput".into(),
-                                        json!(if exit_output == "transcript" {
-                                            "resume-hint"
-                                        } else {
-                                            "transcript"
-                                        }),
-                                    ),
-                                },
-                                Item {
-                                    label: format!("Fullscreen scrollbar · {scrollbar}"),
-                                    selection: Selection::Setting(
-                                        "fullscreenScrollbar".into(),
-                                        json!(match scrollbar {
-                                            "auto" => "always",
-                                            "always" => "hidden",
-                                            _ => "auto",
-                                        }),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Fullscreen copy on select · {}",
-                                        if copy_on_select { "on" } else { "off" }
-                                    ),
-                                    selection: Selection::Setting(
-                                        "fullscreenCopyOnSelect".into(),
-                                        json!(!copy_on_select),
-                                    ),
-                                },
-                                Item {
-                                    label: format!("Editor padding · {padding}"),
-                                    selection: Selection::Setting(
-                                        "editorPaddingX".into(),
-                                        json!((padding + 1) % 4),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Mermaid rendering · {}",
-                                        args.settings.mermaid_mode()
-                                    ),
-                                    selection: Selection::Setting(
-                                        "markdown.mermaid".into(),
-                                        json!(match args.settings.mermaid_mode() {
-                                            "streaming" => "final",
-                                            "final" => "off",
-                                            _ => "streaming",
-                                        }),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Clear on shrink · {}",
-                                        if args.settings.clear_terminal_on_shrink() {
-                                            "on"
-                                        } else {
-                                            "off"
-                                        }
-                                    ),
-                                    selection: Selection::Setting(
-                                        "terminal.clearOnShrink".into(),
-                                        json!(!args.settings.clear_terminal_on_shrink()),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Hardware cursor · {}",
-                                        if args.settings.show_hardware_cursor() {
-                                            "on"
-                                        } else {
-                                            "off"
-                                        }
-                                    ),
-                                    selection: Selection::Setting(
-                                        "showHardwareCursor".into(),
-                                        json!(!args.settings.show_hardware_cursor()),
-                                    ),
-                                },
-                                Item {
-                                    label: format!(
-                                        "Output padding · {}",
-                                        args.settings.output_padding()
-                                    ),
-                                    selection: Selection::Setting(
-                                        "outputPad".into(),
-                                        json!(1 - args.settings.output_padding()),
-                                    ),
-                                },
-                                Item {
-                                    label: format!("Double-escape action · {escape}"),
-                                    selection: Selection::Setting(
-                                        "doubleEscapeAction".into(),
-                                        json!(next_escape),
-                                    ),
-                                },
-                                Item {
-                                    label: format!("Tree filter mode · {}", tree_filter.name()),
-                                    selection: Selection::Setting(
-                                        "treeFilterMode".into(),
-                                        json!(tree_filter.next().name()),
-                                    ),
-                                },
-                            ]);
-                            for name in [
-                                "theme",
-                                "defaultModel",
-                                "defaultThinkingLevel",
-                                "modelThinkingLevels",
-                                "steeringMode",
-                                "followUpMode",
-                                "tuiMode",
-                                "fullscreenWheelScrollLines",
-                                "sessionDir",
-                                "sessionShareDestination",
-                                "shellPath",
-                                "shellCommandPrefix",
-                                "defaultProjectTrust",
-                                "defaultTools",
-                                "extensions",
-                                "skills",
-                                "prompts",
-                                "themes",
-                                "packages",
-                                "codemode",
-                                "compaction",
-                                "branchSummary",
-                                "retry",
-                            ] {
-                                items.push(Item {
-                                    label: format!(
-                                        "Edit {name} · {}",
-                                        args.settings
-                                            .value()
-                                            .get(name)
-                                            .map(Value::to_string)
-                                            .unwrap_or_else(|| "default".into())
-                                    ),
-                                    selection: Selection::EditSetting(name.into()),
-                                });
-                            }
-                            view.picker = Some(Picker::new("Settings", items));
+                            view.picker =
+                                Some(Picker::new("Settings", settings_items(&args, &view)));
                         } else if input.starts_with('!') {
                             let excluded = input.starts_with("!!");
                             let command = input[if excluded { 2 } else { 1 }..].trim();
@@ -4717,6 +4343,347 @@ fn start_tree_navigation(
     view.branch_error = None;
     view.tree_navigation = Some((id, summarize));
     Ok(())
+}
+
+fn settings_items(args: &Cli, view: &View) -> Vec<Item> {
+    let cache_mode = args.settings.string("cacheWarming").unwrap_or("streaming");
+    let next_cache_mode = match cache_mode {
+        "streaming" => "idle",
+        "idle" => "off",
+        _ => "streaming",
+    };
+    let mut items = vec![
+        Item {
+            label: format!(
+                "HTTP idle timeout · {}",
+                match args.settings.http_idle_timeout_ms() {
+                    0 => "disabled".to_owned(),
+                    ms => format!("{} sec", ms as f64 / 1000.0),
+                }
+            ),
+            selection: Selection::Setting(
+                "httpIdleTimeoutMs".into(),
+                json!(match args.settings.http_idle_timeout_ms() {
+                    0 => 30_000,
+                    1..=29_999 => 30_000,
+                    30_000..=59_999 => 60_000,
+                    60_000..=119_999 => 120_000,
+                    120_000..=299_999 => 300_000,
+                    _ => 0,
+                }),
+            ),
+        },
+        Item {
+            label: format!(
+                "Tool output · {} (toggle)",
+                if view.expand_tools {
+                    "expanded"
+                } else {
+                    "collapsed"
+                }
+            ),
+            selection: Selection::Setting("expandTools".into(), json!(!view.expand_tools)),
+        },
+        Item {
+            label: format!(
+                "Thinking blocks · {} (toggle)",
+                if view.hide_thinking {
+                    "hidden"
+                } else {
+                    "shown"
+                }
+            ),
+            selection: Selection::Setting("hideThinkingBlock".into(), json!(!view.hide_thinking)),
+        },
+        Item {
+            label: format!(
+                "Cache miss notices · {} (toggle)",
+                if args.settings.boolean("showCacheMissNotices") == Some(true) {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            selection: Selection::Setting(
+                "showCacheMissNotices".into(),
+                json!(args.settings.boolean("showCacheMissNotices") != Some(true)),
+            ),
+        },
+        Item {
+            label: format!("Save default model · {}", args.model),
+            selection: Selection::Setting(
+                "defaultModel".into(),
+                json!(args.configured_model_name(&args.model)),
+            ),
+        },
+        Item {
+            label: format!("Cache warming · {cache_mode} (cycle)"),
+            selection: Selection::Setting("cacheWarming".into(), json!(next_cache_mode)),
+        },
+        Item {
+            label: format!(
+                "Save default thinking · {}",
+                args.thinking.as_deref().unwrap_or("model default")
+            ),
+            selection: Selection::Setting("defaultThinkingLevel".into(), json!(args.thinking)),
+        },
+        Item {
+            label: format!(
+                "Auto-compaction · {} (toggle)",
+                if args.settings.auto_compaction_enabled() {
+                    "on"
+                } else {
+                    "off"
+                },
+            ),
+            selection: Selection::Setting(
+                "autoCompactionEnabled".into(),
+                json!(!args.settings.auto_compaction_enabled()),
+            ),
+        },
+        Item {
+            label: format!(
+                "Auto-retry · {} (toggle)",
+                if args.settings.retry_settings().enabled {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            selection: Selection::Setting(
+                "autoRetryEnabled".into(),
+                json!(!args.settings.retry_settings().enabled),
+            ),
+        },
+    ];
+    let resize_images = args.settings.resize_model_images();
+    items.push(Item {
+        label: format!(
+            "Auto-resize images · {} (toggle)",
+            if resize_images { "on" } else { "off" }
+        ),
+        selection: Selection::Setting("images.autoResize".into(), json!(!resize_images)),
+    });
+    let block_images = args.settings.block_model_images();
+    items.push(Item {
+        label: format!(
+            "Block images · {} (toggle)",
+            if block_images { "on" } else { "off" }
+        ),
+        selection: Selection::Setting("images.blockImages".into(), json!(!block_images)),
+    });
+    if view.graphics.enabled() {
+        let show_images = args.settings.show_terminal_images();
+        let image_width = args.settings.terminal_image_width();
+        let next_width = match image_width {
+            60 => 80,
+            80 => 120,
+            _ => 60,
+        };
+        items.extend([
+            Item {
+                label: format!(
+                    "Show images · {} (toggle)",
+                    if show_images { "on" } else { "off" }
+                ),
+                selection: Selection::Setting("terminal.showImages".into(), json!(!show_images)),
+            },
+            Item {
+                label: format!("Image width · {image_width} cells"),
+                selection: Selection::Setting("terminal.imageWidthCells".into(), json!(next_width)),
+            },
+        ]);
+    }
+    let autocomplete_items = args.settings.autocomplete_max_visible();
+    let skill_commands = args.settings.enable_skill_commands();
+    items.extend([
+        Item {
+            label: format!("Autocomplete max items · {autocomplete_items}"),
+            selection: Selection::Setting(
+                "autocompleteMaxVisible".into(),
+                json!(
+                    [3, 5, 7, 10, 15, 20]
+                        .into_iter()
+                        .find(|count| *count > autocomplete_items)
+                        .unwrap_or(3)
+                ),
+            ),
+        },
+        Item {
+            label: format!(
+                "Skill commands · {} (toggle)",
+                if skill_commands { "on" } else { "off" }
+            ),
+            selection: Selection::Setting("enableSkillCommands".into(), json!(!skill_commands)),
+        },
+    ]);
+    let escape = args.settings.string("doubleEscapeAction").unwrap_or("tree");
+    let next_escape = match escape {
+        "tree" => "fork",
+        "fork" => "none",
+        _ => "tree",
+    };
+    let tree_filter =
+        TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
+    let padding = args.settings.value()["editorPaddingX"]
+        .as_u64()
+        .unwrap_or(0);
+    let exit_output = args
+        .settings
+        .string("fullscreenExitOutput")
+        .unwrap_or("transcript");
+    let scrollbar = args
+        .settings
+        .string("fullscreenScrollbar")
+        .unwrap_or("auto");
+    let copy_on_select = args
+        .settings
+        .boolean("fullscreenCopyOnSelect")
+        .unwrap_or(true);
+    items.extend([
+        Item {
+            label: format!(
+                "Terminal progress · {} (toggle)",
+                if args.settings.terminal_progress() {
+                    "on"
+                } else {
+                    "off"
+                },
+            ),
+            selection: Selection::Setting(
+                "terminal.showTerminalProgress".into(),
+                json!(!args.settings.terminal_progress()),
+            ),
+        },
+        Item {
+            label: format!("Fullscreen exit output · {exit_output}"),
+            selection: Selection::Setting(
+                "fullscreenExitOutput".into(),
+                json!(if exit_output == "transcript" {
+                    "resume-hint"
+                } else {
+                    "transcript"
+                }),
+            ),
+        },
+        Item {
+            label: format!("Fullscreen scrollbar · {scrollbar}"),
+            selection: Selection::Setting(
+                "fullscreenScrollbar".into(),
+                json!(match scrollbar {
+                    "auto" => "always",
+                    "always" => "hidden",
+                    _ => "auto",
+                }),
+            ),
+        },
+        Item {
+            label: format!(
+                "Fullscreen copy on select · {}",
+                if copy_on_select { "on" } else { "off" }
+            ),
+            selection: Selection::Setting("fullscreenCopyOnSelect".into(), json!(!copy_on_select)),
+        },
+        Item {
+            label: format!("Editor padding · {padding}"),
+            selection: Selection::Setting("editorPaddingX".into(), json!((padding + 1) % 4)),
+        },
+        Item {
+            label: format!("Mermaid rendering · {}", args.settings.mermaid_mode()),
+            selection: Selection::Setting(
+                "markdown.mermaid".into(),
+                json!(match args.settings.mermaid_mode() {
+                    "streaming" => "final",
+                    "final" => "off",
+                    _ => "streaming",
+                }),
+            ),
+        },
+        Item {
+            label: format!(
+                "Clear on shrink · {}",
+                if args.settings.clear_terminal_on_shrink() {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            selection: Selection::Setting(
+                "terminal.clearOnShrink".into(),
+                json!(!args.settings.clear_terminal_on_shrink()),
+            ),
+        },
+        Item {
+            label: format!(
+                "Hardware cursor · {}",
+                if args.settings.show_hardware_cursor() {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            selection: Selection::Setting(
+                "showHardwareCursor".into(),
+                json!(!args.settings.show_hardware_cursor()),
+            ),
+        },
+        Item {
+            label: format!("Output padding · {}", args.settings.output_padding()),
+            selection: Selection::Setting(
+                "outputPad".into(),
+                json!(1 - args.settings.output_padding()),
+            ),
+        },
+        Item {
+            label: format!("Double-escape action · {escape}"),
+            selection: Selection::Setting("doubleEscapeAction".into(), json!(next_escape)),
+        },
+        Item {
+            label: format!("Tree filter mode · {}", tree_filter.name()),
+            selection: Selection::Setting(
+                "treeFilterMode".into(),
+                json!(tree_filter.next().name()),
+            ),
+        },
+    ]);
+    for name in [
+        "theme",
+        "defaultModel",
+        "defaultThinkingLevel",
+        "modelThinkingLevels",
+        "steeringMode",
+        "followUpMode",
+        "tuiMode",
+        "fullscreenWheelScrollLines",
+        "sessionDir",
+        "sessionShareDestination",
+        "shellPath",
+        "shellCommandPrefix",
+        "defaultProjectTrust",
+        "defaultTools",
+        "extensions",
+        "skills",
+        "prompts",
+        "themes",
+        "packages",
+        "codemode",
+        "compaction",
+        "branchSummary",
+        "retry",
+    ] {
+        items.push(Item {
+            label: format!(
+                "Edit {name} · {}",
+                args.settings
+                    .value()
+                    .get(name)
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "default".into())
+            ),
+            selection: Selection::EditSetting(name.into()),
+        });
+    }
+    items
 }
 
 fn select(

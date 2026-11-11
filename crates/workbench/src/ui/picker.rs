@@ -202,6 +202,29 @@ impl Picker {
         self.selected = 0;
     }
 
+    pub fn refresh_settings(&mut self, items: Vec<Item>) {
+        let selected = self
+            .matches()
+            .get(self.selected)
+            .and_then(|item| match &item.selection {
+                Selection::Setting(name, _) => Some((false, name.clone())),
+                Selection::EditSetting(name) => Some((true, name.clone())),
+                _ => None,
+            });
+        self.items = items;
+        self.selected = selected
+            .and_then(|(edit, name)| {
+                self.matches()
+                    .iter()
+                    .position(|item| match &item.selection {
+                        Selection::Setting(item_name, _) => !edit && *item_name == name,
+                        Selection::EditSetting(item_name) => edit && *item_name == name,
+                        _ => false,
+                    })
+            })
+            .unwrap_or(0);
+    }
+
     pub fn scoped_models(provider: &str, catalog: Vec<String>, mut enabled: Vec<String>) -> Self {
         let available: std::collections::HashSet<_> = catalog.iter().collect();
         enabled.retain(|model| available.contains(model));
@@ -464,7 +487,12 @@ impl Picker {
                     return session_query.score(document).is_some();
                 }
                 let label = item.label.to_lowercase();
-                if self.active_session.is_some() || self.model_scope.is_some() {
+                if self.title == "Settings" {
+                    crate::model_selection::fuzzy(
+                        &query,
+                        label.split(" · ").next().unwrap_or(&label),
+                    )
+                } else if self.active_session.is_some() || self.model_scope.is_some() {
                     crate::model_selection::fuzzy(&query, &label)
                 } else {
                     label.contains(&query)
@@ -527,6 +555,10 @@ impl Picker {
         }
         let cancel = keys.matches("tui.select.cancel", key);
         let confirm = keys.matches("tui.select.confirm", key)
+            || (self.title == "Settings"
+                && self.query.is_empty()
+                && key.code == KeyCode::Char(' ')
+                && key.modifiers == KeyModifiers::NONE)
             || (self.completion_limit.is_some() && keys.matches("tui.input.tab", key));
         if let Some(action) = self.session_action.clone() {
             if cancel {
@@ -1048,6 +1080,14 @@ impl Picker {
                 hint("tui.select.confirm"),
                 hint("tui.select.cancel"),
             )
+        } else if self.title == "Settings" {
+            format!(
+                "Type to search · {}/{} to select · {}/Space to change · {} to close",
+                hint("tui.select.up"),
+                hint("tui.select.down"),
+                hint("tui.select.confirm"),
+                hint("tui.select.cancel"),
+            )
         } else {
             let save = self.items.first().and_then(|item| match item.selection {
                 Selection::Thinking(_) => Some("app.thinking.save"),
@@ -1232,6 +1272,21 @@ fn truncate(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_refresh_preserves_search_and_selected_setting() {
+        let item = |label: &str, value| Item {
+            label: format!("{label} · {value}"),
+            selection: Selection::Setting(label.into(), serde_json::json!(value)),
+        };
+        let mut picker = Picker::new("Settings", vec![item("HTTP timeout", 5), item("Other", 1)]);
+        picker.paste("ht to");
+        assert_eq!(picker.matches().len(), 1);
+        picker.refresh_settings(vec![item("Other", 1), item("HTTP timeout", 30)]);
+        assert!(
+            matches!(&picker.matches()[picker.selected].selection, Selection::Setting(name, value) if name == "HTTP timeout" && *value == 30)
+        );
+        assert_eq!(picker.query, "ht to");
+    }
     #[test]
     fn tree_folding_search_navigation_and_labels_preserve_record_identity() {
         let entries = [
