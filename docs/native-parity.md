@@ -4,6 +4,9 @@ The reference is Pi v1.5.0, commit
 `f9a26365568127461c47a07a37dcb42c140a3ac5`.
 The requested compatibility is equivalent functionality implemented in Rust.
 
+Markdown headings are separated from a following block by one blank line,
+without adding a trailing blank line after a final heading.
+
 [Reference CLI](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/cli.md)
 · [Reference terminal](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/usage.md)
 · [Reference extensions](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/extensions.md)
