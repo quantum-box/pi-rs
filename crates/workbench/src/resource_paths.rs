@@ -105,9 +105,6 @@ pub fn resolve(
     let mut paths = Vec::new();
     for path in explicit {
         let path = absolute(&workspace, &path.to_string_lossy());
-        if kind == Kind::Prompt && path.is_file() && !prompt_file(&path) {
-            continue;
-        }
         if kind == Kind::Prompt && path.is_dir() {
             append(&mut paths, vec![path]);
             continue;
@@ -159,11 +156,7 @@ pub fn resolve(
             if found.is_empty() && !path.exists() {
                 warnings.push(format!("Resource {} was not found", path.display()));
             }
-            configured.extend(
-                found
-                    .into_iter()
-                    .filter(|path| kind != Kind::Prompt || !path.is_file() || prompt_file(path)),
-            );
+            configured.extend(found);
         }
         if kind == Kind::Prompt {
             configured.retain(|path| {
@@ -230,16 +223,12 @@ pub fn resolve(
         &mut paths,
         packaged
             .iter()
-            .filter(|path| path.is_file() && (kind != Kind::Prompt || prompt_file(path)))
+            .filter(|path| path.is_file())
             .cloned()
             .collect(),
     );
     append(&mut paths, additional_prompts);
     Ok(paths)
-}
-fn prompt_file(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|name| name.to_string_lossy().ends_with(".md"))
 }
 // Pi's automatic prompt discovery scans only visible files in the prompt root,
 // applying ignore files from that directory. Configured paths use collect instead.

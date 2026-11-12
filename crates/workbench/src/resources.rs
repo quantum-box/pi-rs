@@ -1020,10 +1020,32 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["alias", "content"]
+            vec!["alias"]
         );
         assert_eq!(resources.prompts["alias"].body, "text target");
+        args.prompt_template = vec!["content.md".into(), "alias.txt".into()];
+        let resources = Resources::load(&args).unwrap();
         assert_eq!(resources.prompts["content"].body, "markdown target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_prompt_alias_deduplicates_before_suffix_filtering() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("content.txt"), "fixture").unwrap();
+        symlink("content.txt", root.join("alias.md")).unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--no-skills", "--no-prompt-templates"]).unwrap();
+        args.workspace = root.to_path_buf();
+        args.prompt_template = vec!["content.txt".into(), "alias.md".into()];
+        assert!(Resources::load(&args).unwrap().prompts.is_empty());
+        args.prompt_template.reverse();
+        assert_eq!(
+            Resources::load(&args).unwrap().prompts["alias"].body,
+            "fixture"
+        );
     }
 
     #[test]
