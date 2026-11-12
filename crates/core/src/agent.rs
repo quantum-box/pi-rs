@@ -605,6 +605,7 @@ impl Agent<'_> {
                                 instructions: None,
                                 output_limit: summary_limit,
                                 cancellation: cancel,
+                                reason: crate::CompactionReason::Threshold,
                             },
                             observer,
                             Some(followups),
@@ -1850,6 +1851,7 @@ impl Agent<'_> {
         ensure_settled(session.operations())?;
         let states = self.migrate(session, observer)?;
         self.commit_compaction(session, compaction, &states, None, None, observer)
+            .map(|_| ())
     }
 
     /// Commit a caller-supplied summary using configured token retention.
@@ -1880,6 +1882,7 @@ impl Agent<'_> {
             Some(retention),
             observer,
         )
+        .map(|_| ())
     }
 
     /// Request a model-generated summary in a tool-free turn, then compact atomically.
@@ -2386,6 +2389,7 @@ impl Agent<'_> {
                 instructions,
                 output_limit: limit,
                 cancellation: cancel,
+                reason: crate::CompactionReason::Manual,
             },
             observer,
             inputs,
@@ -2402,11 +2406,50 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
         inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<u32> {
+        let reason = scope.reason;
+        let result = self
+            .summarize_prefix_inner(session, states, scope, observer, inputs)
+            .await;
+        let event = match &result {
+            Ok((_, from_extension)) => crate::LifecycleEvent::SessionCompact {
+                compaction_entry: Box::new(
+                    session
+                        .records()
+                        .last()
+                        .expect("compaction was committed")
+                        .clone(),
+                ),
+                from_extension: *from_extension,
+                reason,
+                will_retry: false,
+            },
+            Err(error) => crate::LifecycleEvent::SessionCompactFailed {
+                reason,
+                error_message: (!matches!(error, Error::Cancelled)).then(|| error.to_string()),
+                aborted: matches!(error, Error::Cancelled),
+                will_retry: false,
+                from_extension: false,
+            },
+        };
+        self.observe_lifecycle(event, &session.extension_states(), None, observer)
+            .await;
+        result.map(|(spent, _)| spent)
+    }
+
+    async fn summarize_prefix_inner<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        states: &ExtensionStates,
+        scope: SummaryScope<'_>,
+        observer: &mut Observer<'_>,
+        inputs: Option<&mut mpsc::Receiver<T>>,
+    ) -> Result<(u32, bool)> {
         let SummaryScope {
             retention,
             instructions,
             output_limit: limit,
             cancellation: cancel,
+            reason: _,
         } = scope;
         if limit == 0 || self.limits.model_requests == 0 {
             return Err(Error::Budget);
@@ -2471,7 +2514,7 @@ impl Agent<'_> {
         let billing = reply
             .usage
             .map(|usage| (usage, summary_usage_metadata(session, &reply)));
-        self.commit_compaction(
+        let from_extension = self.commit_compaction(
             session,
             Compaction {
                 summary: reply.content,
@@ -2482,7 +2525,7 @@ impl Agent<'_> {
             Some(retention),
             observer,
         )?;
-        Ok(output as u32)
+        Ok((output as u32, from_extension))
     }
 
     async fn context_capacity(
@@ -2522,7 +2565,8 @@ impl Agent<'_> {
         billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
         minimum_retention: Option<RetentionPlan>,
         observer: &mut Observer<'_>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let original_summary = compaction.summary.clone();
         for extension in &self.registry.extensions {
             if let Decision::Deny(reason) = hook(
                 extension.as_ref(),
@@ -2560,6 +2604,7 @@ impl Agent<'_> {
         let (usage, usage_metadata) =
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
         let tokens_before = session.estimated_context_tokens();
+        let from_extension = original_summary != compaction.summary;
         commit(
             session,
             Event::Compacted {
@@ -2572,7 +2617,8 @@ impl Agent<'_> {
                 usage_metadata,
             },
             observer,
-        )
+        )?;
+        Ok(from_extension)
     }
 }
 
@@ -2797,6 +2843,7 @@ struct SummaryScope<'a> {
     instructions: Option<&'a str>,
     output_limit: u32,
     cancellation: &'a CancellationToken,
+    reason: crate::CompactionReason,
 }
 struct DispatchScope<'a> {
     cancellation: &'a CancellationToken,

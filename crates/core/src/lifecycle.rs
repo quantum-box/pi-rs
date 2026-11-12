@@ -83,6 +83,14 @@ pub enum SessionSwitchReason {
     Resume,
 }
 
+/// What initiated a model-generated context compaction.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionReason {
+    Manual,
+    Threshold,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkPosition {
@@ -130,6 +138,25 @@ pub enum LifecycleEvent {
     },
     SessionInfoChanged {
         name: Option<String>,
+    },
+    SessionCompact {
+        #[serde(rename = "compactionEntry")]
+        compaction_entry: Box<Record>,
+        #[serde(rename = "fromExtension")]
+        from_extension: bool,
+        reason: CompactionReason,
+        #[serde(rename = "willRetry")]
+        will_retry: bool,
+    },
+    SessionCompactFailed {
+        reason: CompactionReason,
+        #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+        aborted: bool,
+        #[serde(rename = "willRetry")]
+        will_retry: bool,
+        #[serde(rename = "fromExtension")]
+        from_extension: bool,
     },
     SessionStart {
         reason: SessionStartReason,
@@ -181,6 +208,8 @@ impl LifecycleEvent {
             Self::ModelSelect { .. } => "model_select",
             Self::ThinkingLevelSelect { .. } => "thinking_level_select",
             Self::SessionInfoChanged { .. } => "session_info_changed",
+            Self::SessionCompact { .. } => "session_compact",
+            Self::SessionCompactFailed { .. } => "session_compact_failed",
             Self::SessionStart { .. } => "session_start",
             Self::SessionShutdown { .. } => "session_shutdown",
             Self::AgentStart { .. } => "agent_start",
@@ -236,7 +265,9 @@ pub async fn notify(
                 }
                 LifecycleEvent::SessionStart { .. }
                 | LifecycleEvent::SessionShutdown { .. }
-                | LifecycleEvent::SessionInfoChanged { .. } => {
+                | LifecycleEvent::SessionInfoChanged { .. }
+                | LifecycleEvent::SessionCompact { .. }
+                | LifecycleEvent::SessionCompactFailed { .. } => {
                     extension.handles_session_lifecycle()
                 }
                 LifecycleEvent::SessionTree { .. } => extension.handles_tree_navigation(),

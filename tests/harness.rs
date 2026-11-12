@@ -19,6 +19,81 @@ struct Script {
     context_window: AtomicUsize,
 }
 
+struct CompactionObserver(Arc<Mutex<Vec<serde_json::Value>>>);
+
+#[async_trait::async_trait]
+impl Extension for CompactionObserver {
+    fn id(&self) -> &str {
+        "compaction-observer"
+    }
+    fn handles_lifecycle(&self) -> bool {
+        true
+    }
+    fn handles_session_lifecycle(&self) -> bool {
+        true
+    }
+    async fn lifecycle(
+        &self,
+        event: &LifecycleEvent,
+        _: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        if matches!(
+            event,
+            LifecycleEvent::SessionCompact { .. } | LifecycleEvent::SessionCompactFailed { .. }
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn extension_observes_committed_and_failed_manual_compaction() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(CompactionObserver(events.clone())))
+        .unwrap();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let model = Script::new(vec![answer("original"), answer("summary")]);
+    let agent = agent(&model, &registry);
+    let cancel = CancellationToken::new();
+    let (_, mut inputs) = mpsc::channel(1);
+    assert!(
+        agent
+            .summarize(&mut session, 0, &cancel, &mut ignore)
+            .await
+            .is_err()
+    );
+    agent
+        .run(
+            &mut session,
+            Some("question".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    agent
+        .summarize(&mut session, 0, &cancel, &mut ignore)
+        .await
+        .unwrap();
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["type"], "session_compact_failed");
+    assert_eq!(events[0]["reason"], "manual");
+    assert_eq!(events[0]["aborted"], false);
+    assert!(events[0]["errorMessage"].as_str().is_some());
+    assert_eq!(events[1]["type"], "session_compact");
+    assert_eq!(events[1]["reason"], "manual");
+    assert_eq!(events[1]["fromExtension"], false);
+    assert_eq!(events[1]["compactionEntry"]["event"]["summary"], "summary");
+}
+
 impl Script {
     fn new(replies: Vec<Vec<ModelEvent>>) -> Self {
         Self {

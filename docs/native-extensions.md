@@ -297,3 +297,10 @@ selected resources. When a trusted project uses this declaration for a package
 already selected by the user, its patterns apply as ordered changes to that
 user selection. For example, a project can remove one prompt with
 `"prompts": ["-prompts/example.md"]` and retain the other user-selected resources.
+
+Model-generated manual and automatic threshold compactions emit
+`session_compact` after the compacted record is committed, or
+`session_compact_failed` if summary generation or commit fails. These events
+are delivered to extensions that opt into session lifecycle notifications.
+Direct SDK compaction with a supplied summary remains synchronous and does not
+emit these asynchronous lifecycle notifications.
