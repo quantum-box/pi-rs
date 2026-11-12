@@ -3317,9 +3317,11 @@ impl ToolHost for NestedHost {
             }
         }
         futures_util::future::join_all(results.into_iter().map(|result| async move {
-            result
-                .await
-                .unwrap_or_else(|_| Outcome::Unknown("nested tool response was lost".into()))
+            tokio::select! {
+                biased;
+                result = result => result.unwrap_or_else(|_| Outcome::Unknown("nested tool response was lost".into())),
+                _ = self.cancellation.cancelled() => Outcome::Unknown("cancelled while awaiting nested tool result".into()),
+            }
         }))
         .await
     }
@@ -4122,6 +4124,42 @@ mod tree_tests {
 #[cfg(test)]
 mod nested_host_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_releases_dispatched_batch_and_preserves_ready_results() {
+        let (requests, mut incoming) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let host = NestedHost {
+            ui: None,
+            progress: None,
+            requests,
+            specs: Arc::new(vec![]),
+            parent_operation: Uuid::new_v4(),
+            cancellation: cancel.clone(),
+            depth: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let calls = vec![
+            ("first".into(), serde_json::json!({})),
+            ("second".into(), serde_json::json!({})),
+        ];
+        let call = tokio::spawn(async move { host.call_batch(calls).await });
+        let mut batch = incoming.recv().await.unwrap();
+        batch
+            .remove(0)
+            .reply
+            .send(Outcome::Succeeded("done".into()))
+            .unwrap();
+        cancel.cancel();
+        // The dispatcher still owns the other sender when cancellation occurs.
+        let outcomes = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("cancelled call remained blocked")
+            .unwrap();
+        drop(batch);
+        assert_eq!(outcomes[0], Outcome::Succeeded("done".into()));
+        assert!(matches!(outcomes[1], Outcome::Unknown(_)));
+    }
 
     #[tokio::test]
     async fn batch_retains_invalid_argument_positions_without_dispatching_them() {
