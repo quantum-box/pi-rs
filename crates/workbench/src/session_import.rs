@@ -1027,6 +1027,143 @@ mod tests {
     use pi_rs::Message;
     use serde_json::json;
 
+    #[test]
+    fn continuation_counts_empty_assistants_and_respects_omissions() {
+        use clap::Parser;
+        for reason in ["error", "aborted", "stop"] {
+            let entries = vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"model_change","id":"m","parentId":null,"provider":"ollama","modelId":"alpha"}),
+                json!({"type":"thinking_level_change","id":"t","parentId":"m","thinkingLevel":"low"}),
+                json!({"type":"message","id":"u","parentId":"t","message":{"role":"user","content":"question"}}),
+                json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","provider":"ollama","model":"alpha","stopReason":reason,"content":[]}}),
+                json!({"type":"context_edit","id":"eu","parentId":"a","targetId":"u","replacement":null}),
+            ];
+            let session = import_pi(entries.clone()).unwrap();
+            assert!(super::super::rpc_messages::snapshot(&session).0.is_empty());
+            assert!(super::super::rpc_entries::Entries::new(&session).has_session_context());
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model = "alpha".into();
+            args.model_scope
+                .push(super::super::model_selection::ScopedChoice {
+                    provider: super::super::Provider::Ollama,
+                    model: "alpha".into(),
+                    thinking: Some("high".into()),
+                });
+            args.remember_initial_selection();
+            args.restore_session_model(&session);
+            assert_eq!(args.thinking.as_deref(), Some("low"));
+
+            let mut omitted = entries.clone();
+            omitted.push(json!({"type":"context_edit","id":"ea","parentId":"eu","targetId":"a","replacement":null}));
+            let omitted = import_pi(omitted).unwrap();
+            assert!(!super::super::rpc_entries::Entries::new(&omitted).has_session_context());
+            args.restore_session_model(&omitted);
+            assert_eq!(args.thinking.as_deref(), Some("high"));
+
+            let mut replaced = entries;
+            replaced.push(json!({"type":"context_edit","id":"ea","parentId":"eu","targetId":"a","replacement":{"content":[]}}));
+            let replaced = import_pi(replaced).unwrap();
+            assert!(super::super::rpc_entries::Entries::new(&replaced).has_session_context());
+        }
+    }
+
+    #[test]
+    fn continuation_counts_unpaired_tool_result_before_repair() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","provider":"ollama","model":"m","content":[{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"r","parentId":"a","message":{"role":"toolResult","toolCallId":"call","toolName":"read","content":[{"type":"text","text":"result"}],"isError":false}}),
+            json!({"type":"context_edit","id":"e","parentId":"r","targetId":"a","replacement":null}),
+        ]).unwrap();
+        assert!(super::super::rpc_messages::snapshot(&session).0.is_empty());
+        assert!(super::super::rpc_entries::Entries::new(&session).has_session_context());
+    }
+
+    #[test]
+    fn continuation_counts_native_empty_failed_assistant() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("question".into(), Vec::new(), None)
+            .unwrap();
+        let user = session.head();
+        let mut records = session.records().to_vec();
+        let request_id = Uuid::new_v4();
+        for event in [
+            Event::ModelRequested {
+                model: "alpha".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 128,
+                request_id: Some(request_id),
+                context_head: None,
+                context_sha256: None,
+            },
+            Event::ModelFinished {
+                request_id,
+                metadata: pi_rs::ModelMetadata::default(),
+                usage: pi_rs::UsageReport::Unconfirmed,
+                failure: Some(pi_rs::ModelFailure::Failed),
+                partial: String::new(),
+                reply: None,
+            },
+            Event::Assistant {
+                content: String::new(),
+                invocations: Vec::new(),
+                usage: None,
+                request_id: Some(request_id),
+            },
+        ] {
+            let parent = records.last().unwrap().id;
+            records.push(Record {
+                id: parent + 1,
+                parent: Some(parent),
+                version: 2,
+                timestamp: None,
+                run_id: None,
+                event,
+            });
+        }
+        let mut session = Session::from_records(records).unwrap();
+        session.edit_context(user, None).unwrap();
+        assert!(super::super::rpc_messages::snapshot(&session).0.is_empty());
+        assert!(super::super::rpc_entries::Entries::new(&session).has_session_context());
+    }
+
+    #[test]
+    fn continuation_uses_active_branch_and_latest_edit() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"context_edit","id":"omit","parentId":"u","targetId":"u","replacement":null}),
+            json!({"type":"context_edit","id":"restore","parentId":"omit","targetId":"u","replacement":{"content":"restored"}}),
+            json!({"type":"custom","id":"other","parentId":"omit","customType":"metadata"}),
+        ]).unwrap();
+        assert!(!super::super::rpc_entries::Entries::new(&session).has_session_context());
+        let restored = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "restore")).unwrap().id;
+        session.checkout(restored).unwrap();
+        assert!(super::super::rpc_entries::Entries::new(&session).has_session_context());
+    }
+
+    #[test]
+    fn continuation_counts_system_and_compaction_but_not_empty_branch_summary() {
+        let system = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"s","parentId":null,"message":{"role":"system","content":""}}),
+        ]).unwrap();
+        assert!(super::super::rpc_entries::Entries::new(&system).has_session_context());
+        let compacted = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"compaction","id":"c","parentId":null,"firstKeptEntryId":"c","summary":"","tokensBefore":0}),
+        ]).unwrap();
+        assert!(super::super::rpc_entries::Entries::new(&compacted).has_session_context());
+        let summary = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"branch_summary","id":"s","parentId":null,"fromId":"unused","summary":""}),
+        ]).unwrap();
+        assert!(!super::super::rpc_entries::Entries::new(&summary).has_session_context());
+    }
+
     fn native_completion(mut session: Session, provider: &str, model: &str) -> Session {
         session.record_request_identity(provider, model).unwrap();
         let mut records = session.records().to_vec();

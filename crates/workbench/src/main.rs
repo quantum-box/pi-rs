@@ -649,7 +649,7 @@ impl Cli {
 
     fn record_automatic_model_selection(&self, session: &mut Session) -> Result<()> {
         session.record_request_identity(self.provider.id(), &self.model)?;
-        if rpc_messages::snapshot(session).0.is_empty() {
+        if !rpc_entries::Entries::new(session).has_session_context() {
             return self.record_model_selection(session);
         }
         if !self.model_explicit
@@ -806,7 +806,7 @@ impl Cli {
     fn restore_session_model(&mut self, session: &Session) {
         // Pi treats a journal with no projected messages as a new session,
         // even if it already contains model or thinking bookkeeping.
-        if rpc_messages::snapshot(session).0.is_empty() {
+        if !rpc_entries::Entries::new(session).has_session_context() {
             if !self.model_explicit
                 && let Some(initial) = &self.initial_selection
             {

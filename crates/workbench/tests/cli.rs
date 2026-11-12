@@ -2297,6 +2297,80 @@ fn scoped_thinking_applies_to_new_sessions_and_resumes_restore_branch_thinking()
 }
 
 #[test]
+fn omitted_user_with_empty_failed_assistant_is_a_resumed_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("settings.json"), json!({"defaultProvider":"ollama", "defaultModel":"alpha", "enabledModels":["ollama/alpha:high"]}).to_string()).unwrap();
+    std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha", "reasoning":true}]}}}).to_string()).unwrap();
+    for (index, reason, omit_assistant, expected) in [
+        (0, "error", false, "low"),
+        (1, "aborted", false, "low"),
+        (2, "error", true, "high"),
+    ] {
+        let source = directory.path().join(format!("source-{index}.jsonl"));
+        let native = directory.path().join(format!("native-{index}.jsonl"));
+        let mut entries = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"m","parentId":null,"provider":"ollama","modelId":"alpha"}),
+            json!({"type":"thinking_level_change","id":"t","parentId":"m","thinkingLevel":"low"}),
+            json!({"type":"message","id":"u","parentId":"t","message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","provider":"ollama","model":"alpha","stopReason":reason,"content":[]}}),
+            json!({"type":"context_edit","id":"eu","parentId":"a","targetId":"u","replacement":null}),
+        ];
+        if omit_assistant {
+            entries.push(json!({"type":"context_edit","id":"ea","parentId":"eu","targetId":"a","replacement":null}));
+        }
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = Command::new(env!("CARGO_BIN_EXE_pi-rs"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(directory.path())
+            .args(["--offline", "--no-mcp", "--no-trust", "import"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(directory.path())
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--no-trust"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state: Value =
+            serde_json::from_slice(output.stdout.split(|byte| *byte == b'\n').next().unwrap())
+                .unwrap();
+        assert_eq!(state["data"]["thinkingLevel"], expected, "{state}");
+    }
+}
+
+#[test]
 fn invalid_thinking_levels_warn_and_keep_the_last_valid_selection() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(

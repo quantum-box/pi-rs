@@ -72,6 +72,69 @@ impl Entries {
         self.leaf.is_some()
     }
 
+    /// Whether Pi's compaction-aware, un-repaired projection has messages.
+    pub(super) fn has_session_context(&self) -> bool {
+        let by_id: HashMap<_, _> = self
+            .values
+            .iter()
+            .filter_map(|entry| entry["id"].as_str().map(|id| (id, entry)))
+            .collect();
+        let mut branch = Vec::new();
+        let mut id = self.leaf.as_deref();
+        while let Some(entry) = id.and_then(|id| by_id.get(id)) {
+            branch.push(*entry);
+            id = entry["parentId"].as_str();
+        }
+        branch.reverse();
+        let context = if let Some(index) = branch
+            .iter()
+            .rposition(|entry| entry["type"] == "compaction")
+        {
+            let compacted = branch[index];
+            let mut entries = vec![compacted];
+            if let Some(first) = compacted["firstKeptEntryId"].as_str().and_then(|first| {
+                branch[..index]
+                    .iter()
+                    .position(|entry| entry["id"] == first)
+            }) {
+                entries.extend(branch[first..index].iter().copied().filter(|entry| {
+                    !(entry["type"] == "message" && entry["message"]["role"] == "system")
+                }));
+            }
+            entries.extend_from_slice(&branch[index + 1..]);
+            entries
+        } else {
+            branch
+        };
+        let edits: HashMap<_, _> = context
+            .iter()
+            .filter_map(|entry| {
+                (entry["type"] == "context_edit")
+                    .then(|| {
+                        entry["targetId"]
+                            .as_str()
+                            .map(|id| (id, entry["replacement"].is_null()))
+                    })
+                    .flatten()
+            })
+            .collect();
+        context.iter().any(|entry| {
+            let contributes = match entry["type"].as_str() {
+                Some("message" | "custom_message" | "compaction") => true,
+                Some("branch_summary") => entry["summary"]
+                    .as_str()
+                    .is_some_and(|summary| !summary.is_empty()),
+                _ => false,
+            };
+            contributes
+                && !entry["id"]
+                    .as_str()
+                    .and_then(|id| edits.get(id))
+                    .copied()
+                    .unwrap_or(false)
+        })
+    }
+
     pub(super) fn new(session: &Session) -> Self {
         let mut cursor = Cursor::default();
         let values = session
