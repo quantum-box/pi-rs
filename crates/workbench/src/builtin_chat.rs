@@ -159,6 +159,7 @@ fn moonshot() -> Value {
 
 fn xiaomi() -> Value {
     json!({"thinkingFormat":"deepseek", "supportsReasoningEffort":false,
+        "supportsStore":true,"supportsDeveloperRole":true,"maxTokensField":"max_completion_tokens",
         "requiresReasoningContentOnAssistantMessages":true})
 }
 

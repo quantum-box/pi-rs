@@ -105,6 +105,8 @@ fn xiaomi_providers_send_thinking_and_bearer_credentials() {
             assert_eq!(body["model"], "mimo-v2.6-pro");
             assert_eq!(body["thinking"]["type"], "enabled");
             assert!(body.get("reasoning_effort").is_none());
+            assert!(body["max_completion_tokens"].is_number());
+            assert!(body.get("max_tokens").is_none());
             let events = concat!(
                 "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
