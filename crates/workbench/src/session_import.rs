@@ -422,6 +422,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 event,
                 Event::User { .. }
                     | Event::CustomMessage { .. }
+                    | Event::CustomMessageDelivered { .. }
                     | Event::Assistant { .. }
                     | Event::ToolFinished { .. }
                     | Event::ToolReconciled { .. }
@@ -2465,7 +2466,8 @@ mod tests {
             .records()
             .iter()
             .filter_map(|record| match &record.event {
-                Event::CustomMessage { message } => Some(message),
+                Event::CustomMessage { message }
+                | Event::CustomMessageDelivered { message, .. } => Some(message),
                 _ => None,
             })
             .collect();

@@ -185,6 +185,15 @@ pub enum Event {
         #[serde(flatten)]
         message: crate::CustomMessage,
     },
+    /// Durable pending extension message, excluded from context until delivered.
+    CustomMessageQueued {
+        input: crate::QueuedCustomMessage,
+    },
+    /// Atomically consumes a queued message and adds it to model context.
+    CustomMessageDelivered {
+        id: Uuid,
+        message: crate::CustomMessage,
+    },
     ModelSelected {
         model: String,
         thinking: Option<String>,
@@ -1205,6 +1214,29 @@ impl Session {
         Ok(())
     }
 
+    pub fn queued_custom_messages(&self) -> Vec<(u64, crate::QueuedCustomMessage)> {
+        let branch = self.branch();
+        let mut consumed = std::collections::HashSet::new();
+        for record in &branch {
+            match &record.event {
+                Event::CustomMessageDelivered { id, .. } => {
+                    consumed.insert(*id);
+                }
+                Event::InputQueueCleared { ids } => consumed.extend(ids.iter().copied()),
+                _ => {}
+            }
+        }
+        branch
+            .into_iter()
+            .filter_map(|record| match &record.event {
+                Event::CustomMessageQueued { input } if !consumed.contains(&input.id) => {
+                    Some((record.id, input.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
         self.queued_input_records()
             .filter_map(|record| match &record.event {
@@ -1260,10 +1292,21 @@ impl Session {
     }
     pub fn clear_queued_inputs(&mut self) -> Result<Vec<crate::QueuedMessage>> {
         let pending = self.queued_inputs();
-        if !pending.is_empty() {
-            self.append(Event::InputQueueCleared {
-                ids: pending.iter().map(|input| input.input.id).collect(),
-            })?;
+        let mut ids: Vec<_> = pending.iter().map(|input| input.input.id).collect();
+        ids.extend(
+            self.queued_custom_messages()
+                .into_iter()
+                .filter_map(|(_, input)| {
+                    matches!(
+                        input.delivery,
+                        crate::CustomMessageDelivery::Steer
+                            | crate::CustomMessageDelivery::FollowUp
+                    )
+                    .then_some(input.id)
+                }),
+        );
+        if !ids.is_empty() {
+            self.append(Event::InputQueueCleared { ids })?;
         }
         Ok(pending)
     }
@@ -1370,6 +1413,7 @@ impl Session {
                     | Event::ContextEdited { .. }
                     | Event::BashExecution { .. }
                     | Event::CustomMessage { .. }
+                    | Event::CustomMessageDelivered { .. }
                     | Event::User { .. }
                     | Event::UserWithImages { .. }
                     | Event::UserImages { .. } => Some(false),
@@ -1663,7 +1707,7 @@ impl Session {
         }
         // A native message branching directly from a legacy Pi source needs a
         // distinct parent, even if its content is identical to the old message.
-        if matches!(&event, Event::CustomMessage { .. })
+        if matches!(&event, Event::CustomMessage { .. } | Event::CustomMessageDelivered { .. })
             && self.records.get(self.head.saturating_sub(1) as usize).is_some_and(|record| {
                 matches!(&record.event, Event::SourceEntry { format, entry }
                     if format == "pi" && entry["type"] == "message"
@@ -1785,6 +1829,7 @@ fn validate_context_edit(
             record.event,
             Event::User { .. }
                 | Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
                 | Event::UserWithImages { .. }
                 | Event::ToolFinished { .. }
                 | Event::ToolReconciled { .. }
@@ -2374,7 +2419,7 @@ fn conversation_entries_since_inner(
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
-            Event::CustomMessage { message } => messages.push((record.id, project_content(Message::User { content: String::new() }, &message.content))),
+            Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => messages.push((record.id, project_content(Message::User { content: String::new() }, &message.content))),
             Event::User { content, .. } => messages.push((
                 record.id,
                 Message::User {

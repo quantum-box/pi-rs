@@ -988,6 +988,7 @@ impl Agent<'_> {
                                                     tokio::select! { biased; _ = progress_cancel.cancelled() => {}, _ = crate::lifecycle::notify(&progress_registry, *event, &progress_states, progress_timeout, &mut collect) => {} }
                                                 }
                                             }
+                                            TurnProgress::Custom(input, reply) => { let _ = progress_output.send(TurnProgress::Custom(input, reply)).await; }
                                             TurnProgress::Flush(reply) => { let _ = progress_output.send(TurnProgress::Flush(reply)).await; }
                                         }
                                     }
@@ -1082,7 +1083,7 @@ impl Agent<'_> {
                         }
                     },
                 },
-                Some(message) = progress.recv() => match message { TurnProgress::Event(event) => observer(Notification::ToolProgress(&event)), TurnProgress::Flush(reply) => { let _ = reply.send(()); } },
+                Some(message) = progress.recv() => match message { TurnProgress::Event(event) => observer(Notification::ToolProgress(&event)), TurnProgress::Custom(input, reply) => { let result = queue_custom_message(session, input, observer).map_err(|error| error.to_string()); let _ = reply.send(result); }, TurnProgress::Flush(reply) => { let _ = reply.send(()); } },
                 Some(input) = receive_input(&mut inputs) => queue_input(session,input.into(),observer)?,
                 else => return Err(Error::Config("turn scheduler lost its active work".into())),
             }
@@ -1091,6 +1092,11 @@ impl Agent<'_> {
         while let Some(message) = progress.recv().await {
             match message {
                 TurnProgress::Event(event) => observer(Notification::ToolProgress(&event)),
+                TurnProgress::Custom(input, reply) => {
+                    let result = queue_custom_message(session, input, observer)
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
                 TurnProgress::Flush(reply) => {
                     let _ = reply.send(());
                 }

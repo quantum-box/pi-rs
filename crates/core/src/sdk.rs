@@ -192,6 +192,23 @@ impl SessionControl {
             .map_err(|_| Error::Config("session is closed".into()))?;
         Ok(id)
     }
+    /// Send custom context during an active operation, acknowledged after journaling.
+    pub async fn send_custom_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> Result<()> {
+        crate::journal::validate_custom_message(&message)?;
+        self.queue_control(|reply| crate::AgentInput::EnqueueCustom {
+            message: crate::QueuedCustomMessage {
+                id: Uuid::new_v4(),
+                message,
+                delivery,
+            },
+            reply,
+        })
+        .await
+    }
     /// Clear a running model operation's queue. Use the owned session method while idle.
     pub async fn clear_queued_inputs(&self) -> Result<Vec<QueuedMessage>> {
         self.queue_control(|reply| crate::AgentInput::ClearQueue { reply })
@@ -464,8 +481,9 @@ impl AgentSession {
         crate::agent::queue_inputs(&mut self.session, &mut self.input, &mut |event| {
             emit(&events, &event)
         })?;
+        let count = self.session.records().len();
         let pending = self.session.clear_queued_inputs()?;
-        if !pending.is_empty() {
+        if self.session.records().len() > count {
             self.emit_last();
         }
         Ok(pending)
@@ -734,10 +752,30 @@ impl AgentSession {
         self.start().await?;
         self.append_custom_message(message)?;
         if trigger_turn {
+            let events = self.events.as_ref().expect("open session").clone();
+            crate::agent::apply_custom_boundary(
+                &mut self.session,
+                crate::CustomMessageDelivery::NextTurn,
+                &mut |event| emit(&events, &event),
+            )?;
             self.resume().await.map(Some)
         } else {
             Ok(None)
         }
+    }
+    /// Queue custom context for the next run without starting it.
+    pub fn queue_custom_message_next_turn(&mut self, message: crate::CustomMessage) -> Result<()> {
+        self.ensure_open()?;
+        let events = self.events.as_ref().expect("open session").clone();
+        crate::agent::queue_custom_message(
+            &mut self.session,
+            crate::QueuedCustomMessage {
+                id: Uuid::new_v4(),
+                delivery: crate::CustomMessageDelivery::NextTurn,
+                message,
+            },
+            &mut |event| emit(&events, &event),
+        )
     }
     pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
         self.ensure_open()?;
@@ -2478,6 +2516,132 @@ mod tests {
         assert_eq!(job.polls.load(Ordering::SeqCst), 2);
         session.close().await.unwrap();
     }
+    struct MessageDeliveryModel(Arc<Mutex<Vec<Vec<Message>>>>);
+    #[async_trait::async_trait]
+    impl Model for MessageDeliveryModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            let mut requests = self.0.lock().unwrap();
+            requests.push(request.messages);
+            let calls = if requests.len() == 1 {
+                vec![crate::ToolCall {
+                    id: "send".into(),
+                    name: "send_messages".into(),
+                    arguments: "{}".into(),
+                }]
+            } else {
+                vec![]
+            };
+            Ok(Box::pin(futures_util::stream::iter([Ok(
+                ModelEvent::Complete { calls, usage: None },
+            )])))
+        }
+    }
+    struct MessageDeliveryTool;
+    #[async_trait::async_trait]
+    impl crate::Tool for MessageDeliveryTool {
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: "send_messages".into(),
+                description: "queue messages".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            crate::Outcome::Failed("host required".into())
+        }
+        async fn invoke_with_host(
+            &self,
+            _: serde_json::Value,
+            _: crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::Outcome {
+            for (content, delivery) in [
+                ("steer", crate::CustomMessageDelivery::Steer),
+                ("follow", crate::CustomMessageDelivery::FollowUp),
+                ("next", crate::CustomMessageDelivery::NextTurn),
+                ("after", crate::CustomMessageDelivery::AfterTurn),
+            ] {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "test".into(),
+                        content: crate::ContextContent::Text(content.into()),
+                        display: false,
+                        details: Some(serde_json::json!({"value":content})),
+                    },
+                    delivery,
+                )
+                .await
+                .unwrap();
+            }
+            crate::Outcome::Succeeded("tool result".into())
+        }
+    }
+    struct MessageDeliveryExtension;
+    impl Extension for MessageDeliveryExtension {
+        fn id(&self) -> &str {
+            "message-delivery"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(MessageDeliveryTool)]
+        }
+    }
+    #[tokio::test]
+    async fn tool_custom_messages_follow_boundaries_and_survive_restore() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session =
+            SessionBuilder::new(Arc::new(MessageDeliveryModel(requests.clone())), "fixture")
+                .extension(Arc::new(MessageDeliveryExtension))
+                .unwrap()
+                .open(&path)
+                .unwrap();
+        session.prompt("first").await.unwrap();
+        let snapshots = requests.lock().unwrap().clone();
+        assert_eq!(snapshots.len(), 3);
+        let text = |messages: &[Message]| {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::User { content } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(&snapshots[1]), ["first", "after", "steer"]);
+        assert_eq!(text(&snapshots[2]), ["first", "after", "steer", "follow"]);
+        let tool_pos = snapshots[1]
+            .iter()
+            .position(|m| matches!(m, Message::Tool { .. }))
+            .unwrap();
+        let steer_pos = snapshots[1]
+            .iter()
+            .position(|m| matches!(m, Message::User { content } if content == "steer"))
+            .unwrap();
+        assert!(tool_pos < steer_pos);
+        assert_eq!(session.journal().queued_custom_messages().len(), 1);
+        let restored = Session::from_records(session.journal().records().to_vec()).unwrap();
+        assert_eq!(
+            restored.queued_custom_messages()[0].1.delivery,
+            crate::CustomMessageDelivery::NextTurn
+        );
+        drop(session);
+        let mut session =
+            SessionBuilder::new(Arc::new(MessageDeliveryModel(requests.clone())), "fixture")
+                .extension(Arc::new(MessageDeliveryExtension))
+                .unwrap()
+                .open(&path)
+                .unwrap();
+        session.prompt("second").await.unwrap();
+        let snapshots = requests.lock().unwrap();
+        assert_eq!(
+            text(snapshots.last().unwrap()),
+            ["first", "after", "steer", "follow", "second", "next"]
+        );
+        assert!(session.journal().queued_custom_messages().is_empty());
+    }
+
     struct NestedModel;
     #[async_trait::async_trait]
     impl Model for NestedModel {
@@ -3089,6 +3253,42 @@ mod tests {
             Ok(Box::pin(futures_util::stream::pending()))
         }
     }
+    #[tokio::test]
+    async fn active_control_acknowledges_custom_message_before_abort() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let mut events = session.subscribe();
+        let queue = async move {
+            while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
+            control
+                .send_custom_message(
+                    crate::CustomMessage {
+                        custom_type: "active".into(),
+                        content: crate::ContextContent::Text("preserved".into()),
+                        display: true,
+                        details: Some(serde_json::json!({"x":1})),
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                )
+                .await
+                .unwrap();
+            control.abort();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(session.prompt("wait"), queue)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+        let restored = Session::from_records(session.journal().records().to_vec()).unwrap();
+        assert_eq!(
+            restored.queued_custom_messages()[0].1.message.details,
+            Some(serde_json::json!({"x":1}))
+        );
+    }
+
     #[tokio::test]
     async fn active_queued_hooks_receive_the_delivery_mode_before_clear() {
         let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")

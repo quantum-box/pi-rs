@@ -1179,10 +1179,16 @@ struct DuplexRequest {
     has_ui: bool,
     #[serde(default)]
     has_progress: bool,
+    #[serde(default)]
+    has_custom_messages: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DuplexFrame {
+    SendMessage {
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+    },
     Progress {
         partial_result: Value,
     },
@@ -1355,6 +1361,7 @@ fn call_duplex(
             let terminal = !matches!(
                 frame,
                 Ok(DuplexFrame::Call { .. }
+                    | DuplexFrame::SendMessage { .. }
                     | DuplexFrame::Ui { .. }
                     | DuplexFrame::Progress { .. })
             );
@@ -1370,6 +1377,7 @@ fn call_duplex(
                 tools: host.tools(),
                 has_ui: host.has_ui(),
                 has_progress: host.supports_progress(),
+                has_custom_messages: host.supports_custom_messages(),
             })
             .map_err(|error| error.to_string())?,
         )
@@ -1384,6 +1392,18 @@ fn call_duplex(
             return Err(error);
         }
         match frames.recv_timeout(Duration::from_millis(5)) {
+            Ok(Ok(DuplexFrame::SendMessage { message, delivery })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during message delivery".to_owned()),
+                        result = host.send_message(message, delivery) => result,
+                    }
+                });
+                writer
+                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
+                    .map_err(|_| "native extension input closed")?;
+            }
             Ok(Ok(DuplexFrame::Progress { partial_result })) => {
                 let response = runtime.block_on(host.report_progress(partial_result));
                 writer
@@ -1444,6 +1464,7 @@ struct RemoteHost {
     tools: Vec<ToolSpec>,
     has_ui: bool,
     has_progress: bool,
+    has_custom_messages: bool,
     io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
 }
 #[async_trait::async_trait]
@@ -1488,6 +1509,28 @@ impl ToolHost for RemoteHost {
     fn tools(&self) -> Vec<ToolSpec> {
         self.tools.clone()
     }
+    fn supports_custom_messages(&self) -> bool {
+        self.has_custom_messages
+    }
+    async fn send_message(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        if !self.has_custom_messages {
+            return Err("custom message delivery is unavailable".into());
+        }
+        let io = self.io.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            write_line(&mut io.1, &DuplexFrame::SendMessage { message, delivery })?;
+            read_line::<ExtensionResult<()>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
     async fn call(&self, name: &str, arguments: Value) -> Outcome {
         self.call_batch(vec![(name.into(), arguments)])
             .await
@@ -1520,6 +1563,7 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
         tools: request.tools,
         has_ui: request.has_ui,
         has_progress: request.has_progress,
+        has_custom_messages: request.has_custom_messages,
         io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2659,6 +2703,64 @@ else:
                 "{name}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_custom_message_host_call_preserves_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message(
+                &self,
+                message: pi_rs_core::CustomMessage,
+                delivery: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                assert_eq!(delivery, pi_rs_core::CustomMessageDelivery::FollowUp);
+                assert_eq!(message.custom_type, "notice");
+                assert!(!message.display);
+                assert_eq!(message.details, Some(serde_json::json!({"key": 3})));
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    r=json.load(sys.stdin)
+    d={'id':'message-test','dependencies':[],'commands':[],'host_calls':True,'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}]}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    r=json.loads(sys.stdin.readline())
+    assert r['has_custom_messages'] is True
+    print(json.dumps({'type':'send_message','delivery':'followUp','message':{'customType':'notice','content':'hello','display':False,'details':{'key':3}}}),flush=True)
+    assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'done'}}}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message-test");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let tool = extension.tools().pop().unwrap();
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        assert_eq!(
+            tool.invoke_with_host(serde_json::json!({}), context, None, Arc::new(Host))
+                .await,
+            Outcome::Succeeded("done".into())
+        );
     }
 
     #[tokio::test]

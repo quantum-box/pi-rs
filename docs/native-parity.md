@@ -83,7 +83,7 @@ without `defaultProvider` are still accepted.
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, Radius share presentation metadata |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint, native OpenAI Responses, Anthropic Messages, Google Gemini Generate Content, and Radius Pi Messages, named profiles for those APIs, API keys and bearer tokens, searchable built-in chat model catalog, including native OpenAI, Anthropic and Gemini catalogs and the Fireworks and OpenRouter Messages models, model declarations and overrides including model-specific APIs and endpoints, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, catalog pricing and usage estimates, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh, OpenRouter browser OAuth with manual redirect fallback, ChatGPT plan browser OAuth with token refresh and account selection | OAuth and refresh for other model providers; ChatGPT live acceptance |
-| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, user-shell result replacement and streaming operations, in-process shell spawn hooks, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and selection paths, custom entries and messages from all callbacks, turn triggering and steering for custom messages, custom message renderers, shell tool factory and remote execution APIs, resource provenance in other surfaces and general component render callbacks |
+| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, active-run custom messages from native tools, user-shell result replacement and streaming operations, in-process shell spawn hooks, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and selection paths, custom entries and messages from all callbacks, custom message renderers, shell tool factory and remote execution APIs, resource provenance in other surfaces and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
@@ -2760,6 +2760,28 @@ cancellation remains independent of input preparation.
 The SDK tests cover handled and transformed queued input, image
 attachments, fork and checkout state, delivery mode during a run and
 clearing the resulting queue.
+
+### Active-run native custom messages
+
+A native tool can call `ToolHost::send_message` with `Steer`, `FollowUp`,
+`NextTurn`, or `AfterTurn`. These correspond to Pi's default steering,
+`deliverAs: "followUp"`, `deliverAs: "nextTurn"`, and
+`triggerTurn: false`, respectively. The last mode adds context after the
+current assistant turn and its tool results without itself starting another
+model request. `SessionControl` exposes the same active-run delivery modes;
+`AgentSession::queue_custom_message_next_turn` also works while idle.
+
+Messages are journaled before the host acknowledges them. Their type, content,
+visibility and details survive reopening, and a single delivery record both
+consumes the pending item and adds it to context. Steering and follow-ups share
+FIFO order and queue modes with user input. Clearing the queue removes those
+two modes but retains next-turn messages. Executable extensions negotiate the
+host-call capability and report it unavailable with older hosts.
+
+The focused tests cover mixed user/custom queue ordering, branch-local clearing,
+tool-result ordering, all four delivery boundaries, process protocol metadata,
+and reopening a session before the next prompt. Host calls from other extension
+callbacks and custom message renderers remain outside this support.
 
 ### Rust extension lifecycle observation
 

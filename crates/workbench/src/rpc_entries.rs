@@ -552,7 +552,7 @@ impl Cursor {
                 }
                 Some(value)
             }
-            Event::CustomMessage { message } => {
+            Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
                 let mut value = json!({"type":"custom_message", "customType":message.custom_type, "content":message.content, "display":message.display});
                 if let Some(details) = &message.details {
                     value["details"] = details.clone();
@@ -612,6 +612,7 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
             Event::User { .. }
                 | Event::UserWithImages { .. }
                 | Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
                 | Event::Assistant { .. }
                 | Event::BranchSummary { .. }
                 | Event::CompactionSummaryMessage { .. }
@@ -620,7 +621,10 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
                 | Event::BashExecution { .. }
         ) | (
             Some("custom_message"),
-            Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. }
+            Event::User { .. }
+                | Event::UserWithImages { .. }
+                | Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
         ) | (
             Some("model_change" | "thinking_level_change"),
             Event::ModelSelected { .. }

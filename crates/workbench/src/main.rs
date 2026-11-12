@@ -2351,10 +2351,13 @@ fn metadata(record: &pi_rs::Record) -> Value {
         Event::BashExecution { execution } => {
             json!({"event":"bash_execution","exitCode":execution.exit_code,"cancelled":execution.cancelled,"truncated":execution.truncated})
         }
+        Event::CustomMessageQueued { input } => {
+            json!({"event":"custom_message_queued","id":input.id,"delivery":input.delivery})
+        }
         Event::CustomEntry { entry } => {
             json!({"event":"custom_entry","customType":entry.custom_type})
         }
-        Event::CustomMessage { message } => {
+        Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
             json!({"event":"custom_message","customType":message.custom_type,"display":message.display})
         }
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),

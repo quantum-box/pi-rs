@@ -431,7 +431,11 @@ impl Projection {
         edited: bool,
     ) -> Value {
         let timestamp = record.timestamp_millis().unwrap_or_default();
-        if let Event::CustomMessage { message: custom } = &record.event {
+        if let Event::CustomMessage { message: custom }
+        | Event::CustomMessageDelivered {
+            message: custom, ..
+        } = &record.event
+        {
             let content = if edited {
                 match message {
                     Message::User { content } => json!(content),
@@ -651,7 +655,7 @@ fn matches_imported_message(source: &Value, event: &Event) -> bool {
                 )
         }
         Event::SystemCheckpoint { .. } => role == Some("system"),
-        Event::CustomMessage { .. } => {
+        Event::CustomMessage { .. } | Event::CustomMessageDelivered { .. } => {
             matches!(role, Some("custom" | "hookMessage")) || source["type"] == "custom_message"
         }
         Event::Compacted { .. } => source["type"] == "compaction",

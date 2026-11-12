@@ -317,6 +317,9 @@ impl Agent<'_> {
         {
             result = Err(error);
         }
+        if ensure_settled(session.operations()).is_ok() {
+            apply_custom_boundary(session, crate::CustomMessageDelivery::AfterTurn, observer)?;
+        }
         let state = match &result {
             Ok(_) => RunState::Completed,
             Err(Error::Cancelled) => RunState::Cancelled,
@@ -430,6 +433,22 @@ impl Agent<'_> {
             }
             Err(error) => return Err(error),
         };
+        // A prior interrupted run may have left deferred messages while a tool
+        // needed reconciliation. Recovery above must finish before they appear.
+        for (queued_at, deferred) in session.queued_custom_messages() {
+            if deferred.delivery == crate::CustomMessageDelivery::AfterTurn
+                && session.records()[(queued_at - 1) as usize].run_id != Some(run_id)
+            {
+                commit(
+                    session,
+                    Event::CustomMessageDelivered {
+                        id: deferred.id,
+                        message: deferred.message,
+                    },
+                    observer,
+                )?;
+            }
+        }
         if let Some((id, content)) = input {
             commit(
                 session,
@@ -439,6 +458,37 @@ impl Agent<'_> {
                 },
                 observer,
             )?;
+        }
+        // Only messages queued before this run's initial user entry belong to it.
+        // This also covers image prompts and avoids consuming newly queued next-turn
+        // messages if a partially completed run is restored.
+        if let Some(initial_id) = session
+            .branch()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::User {
+                    input_id: Some(id), ..
+                }
+                | Event::UserWithImages {
+                    input_id: Some(id), ..
+                } if *id == run_id => Some(record.id),
+                _ => None,
+            })
+        {
+            for (queued_at, input) in session.queued_custom_messages() {
+                if queued_at < initial_id
+                    && input.delivery == crate::CustomMessageDelivery::NextTurn
+                {
+                    commit(
+                        session,
+                        Event::CustomMessageDelivered {
+                            id: input.id,
+                            message: input.message,
+                        },
+                        observer,
+                    )?;
+                }
+            }
         }
 
         let mut pending = pending_reply(session, run_id);
@@ -456,7 +506,10 @@ impl Agent<'_> {
             .iter()
             .rev()
             .find_map(|record| match &record.event {
-                Event::CustomMessage { .. } | Event::User { .. } | Event::UserWithImages { .. }
+                Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
+                | Event::User { .. }
+                | Event::UserWithImages { .. }
                     if current_entries.contains(&record.id) =>
                 {
                     Some(None)
@@ -476,7 +529,10 @@ impl Agent<'_> {
         } else if !session.branch().iter().any(|record| {
             matches!(
                 record.event,
-                Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. }
+                Event::User { .. }
+                    | Event::UserWithImages { .. }
+                    | Event::CustomMessage { .. }
+                    | Event::CustomMessageDelivered { .. }
             ) && current_entries.contains(&record.id)
         }) {
             apply_inputs(session, true, observer)?;
@@ -782,6 +838,9 @@ impl Agent<'_> {
                     )
                     .await;
             }
+            // Context-only messages must follow every tool result in the turn,
+            // but do not themselves cause another model request.
+            apply_custom_boundary(session, crate::CustomMessageDelivery::AfterTurn, observer)?;
             turn_index += 1;
 
             if let Some(update) = dispatch_update {
@@ -2603,6 +2662,10 @@ enum ProgressSink {
     Turn(mpsc::Sender<TurnProgress>),
 }
 enum TurnProgress {
+    Custom(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    ),
     Event(Box<crate::LifecycleEvent>),
     Flush(oneshot::Sender<()>),
 }
@@ -2665,6 +2728,37 @@ impl ToolHost for NestedHost {
     }
     fn tools(&self) -> Vec<ToolSpec> {
         self.specs.as_ref().clone()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        self.progress.is_some()
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let Some(progress) = &self.progress else {
+            return Err("custom message delivery is unavailable".into());
+        };
+        let (reply, result) = oneshot::channel();
+        let input = crate::QueuedCustomMessage {
+            id: Uuid::new_v4(),
+            delivery,
+            message,
+        };
+        match &progress.sender {
+            ProgressSink::Turn(sender) => tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err("custom message cancelled".into()),
+                result = sender.send(TurnProgress::Custom(input, reply)) => result.map_err(|_| "tool has finished".to_owned())?,
+            },
+        }
+        tokio::select! {
+            biased;
+            result = result => result.map_err(|_| "custom message response lost".to_owned())?,
+            _ = self.cancellation.cancelled() => Err("custom message cancelled".into()),
+        }
     }
     async fn call(&self, name: &str, arguments: serde_json::Value) -> Outcome {
         self.call_batch(vec![(name.into(), arguments)])
@@ -2897,6 +2991,9 @@ fn queue_input(
         AgentInput::Enqueue { message, reply } => {
             return reply_to_control(queue_message(session, message, observer), reply);
         }
+        AgentInput::EnqueueCustom { message, reply } => {
+            return reply_to_control(queue_custom_message(session, message, observer), reply);
+        }
         AgentInput::ClearQueue { reply } => {
             let count = session.records().len();
             let result = session.clear_queued_inputs();
@@ -2990,46 +3087,116 @@ fn queue_message(
     Ok(())
 }
 
+pub(crate) fn queue_custom_message(
+    session: &mut Session,
+    input: crate::QueuedCustomMessage,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    crate::journal::validate_custom_message(&input.message)?;
+    if session.records().iter().any(|record| {
+        matches!(&record.event,
+        Event::CustomMessageQueued { input: existing } if existing.id == input.id)
+    }) {
+        return Err(Error::Config("custom message ID already exists".into()));
+    }
+    commit(session, Event::CustomMessageQueued { input }, observer)?;
+    Ok(())
+}
+
+pub(crate) fn apply_custom_boundary(
+    session: &mut Session,
+    delivery: crate::CustomMessageDelivery,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    for (_, input) in session.queued_custom_messages() {
+        if input.delivery == delivery {
+            commit(
+                session,
+                Event::CustomMessageDelivered {
+                    id: input.id,
+                    message: input.message,
+                },
+                observer,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_inputs(
     session: &mut Session,
     include_followups: bool,
     observer: &mut Observer<'_>,
 ) -> Result<bool> {
-    let pending: Vec<_> = session
-        .queued_inputs()
-        .into_iter()
-        .filter(|message| include_followups || message.input.kind == InputKind::Steer)
-        .collect();
+    enum Pending {
+        User(QueuedMessage),
+        Custom(crate::QueuedCustomMessage),
+    }
+    let users = session.queued_inputs();
+    let customs = session.queued_custom_messages();
+    let mut pending = Vec::new();
+    for record in session.branch() {
+        match &record.event {
+            Event::InputQueued { input } => {
+                if let Some(message) = users.iter().find(|m| m.input.id == input.id) {
+                    pending.push(Pending::User(message.clone()));
+                }
+            }
+            Event::InputQueuedWithImages { input } => {
+                if let Some(message) = users.iter().find(|m| m.input.id == input.input.id) {
+                    pending.push(Pending::User(message.clone()));
+                }
+            }
+            Event::CustomMessageQueued { input } => {
+                if let Some((_, message)) = customs.iter().find(|(_, m)| m.id == input.id) {
+                    pending.push(Pending::Custom(message.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
     let mut accepted = false;
-    let steering_mode = session.queue_mode(InputKind::Steer);
-    let follow_up_mode = session.queue_mode(InputKind::FollowUp);
     let mut seen = HashSet::new();
     for message in pending {
-        let kind = message.input.kind;
-        let seen_kind = if kind == InputKind::Steer { 0 } else { 1 };
-        let mode = if kind == InputKind::Steer {
-            steering_mode
-        } else {
-            follow_up_mode
+        let kind = match &message {
+            Pending::User(message) => message.input.kind,
+            Pending::Custom(message) => match message.delivery {
+                crate::CustomMessageDelivery::Steer => InputKind::Steer,
+                crate::CustomMessageDelivery::FollowUp => InputKind::FollowUp,
+                _ => continue,
+            },
         };
-        if mode == crate::QueueMode::OneAtATime && !seen.insert(seen_kind) {
+        if !include_followups && kind == InputKind::FollowUp {
             continue;
         }
-        accepted = true;
-        message.validate()?;
-        let event = if message.images.is_empty() {
-            Event::User {
-                content: message.input.content,
-                input_id: Some(message.input.id),
-            }
-        } else {
-            Event::UserWithImages {
-                content: message.input.content,
-                input_id: Some(message.input.id),
-                images: message.images,
+        if session.queue_mode(kind) == crate::QueueMode::OneAtATime
+            && !seen.insert(kind == InputKind::Steer)
+        {
+            continue;
+        }
+        let event = match message {
+            Pending::Custom(input) => Event::CustomMessageDelivered {
+                id: input.id,
+                message: input.message,
+            },
+            Pending::User(message) => {
+                message.validate()?;
+                if message.images.is_empty() {
+                    Event::User {
+                        content: message.input.content,
+                        input_id: Some(message.input.id),
+                    }
+                } else {
+                    Event::UserWithImages {
+                        content: message.input.content,
+                        input_id: Some(message.input.id),
+                        images: message.images,
+                    }
+                }
             }
         };
         commit(session, event, observer)?;
+        accepted = true;
     }
     if accepted {
         notify_queue(session, observer);
@@ -3752,6 +3919,106 @@ mod nested_host_tests {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    fn custom(text: &str, delivery: crate::CustomMessageDelivery) -> crate::QueuedCustomMessage {
+        crate::QueuedCustomMessage {
+            id: Uuid::new_v4(),
+            delivery,
+            message: crate::CustomMessage {
+                custom_type: "fixture".into(),
+                content: crate::ContextContent::Text(text.into()),
+                display: false,
+                details: Some(serde_json::json!({"key":text})),
+            },
+        }
+    }
+
+    #[test]
+    fn custom_queue_is_durable_and_shares_fifo_and_mode_with_users() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .set_queue_mode(InputKind::Steer, crate::QueueMode::OneAtATime)
+            .unwrap();
+        let first = custom("custom first", crate::CustomMessageDelivery::Steer);
+        let first_id = first.id;
+        queue_custom_message(&mut session, first, &mut |_| {}).unwrap();
+        queue_message(
+            &mut session,
+            QueuedMessage::from(crate::QueuedInput {
+                id: Uuid::new_v4(),
+                kind: InputKind::Steer,
+                content: "user second".into(),
+            }),
+            &mut |_| {},
+        )
+        .unwrap();
+        let follow = custom("later", crate::CustomMessageDelivery::FollowUp);
+        queue_custom_message(&mut session, follow, &mut |_| {}).unwrap();
+        let mut session = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(apply_inputs(&mut session, false, &mut |_| {}).unwrap());
+        assert_eq!(session.queued_inputs().len(), 1);
+        assert_eq!(session.queued_custom_messages().len(), 1);
+        let delivered = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::CustomMessageDelivered { id, message } if *id == first_id => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            delivered.details,
+            Some(serde_json::json!({"key":"custom first"}))
+        );
+        let mut restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(restored.queued_custom_messages().len(), 1);
+        assert!(apply_inputs(&mut restored, false, &mut |_| {}).unwrap());
+        assert!(apply_inputs(&mut restored, true, &mut |_| {}).unwrap());
+        assert!(restored.queued_custom_messages().is_empty());
+        assert_eq!(restored.records().iter().filter(|r| matches!(r.event, Event::CustomMessageDelivered { id, .. } if id == first_id)).count(), 1);
+        let texts: Vec<_> = restored
+            .current_messages()
+            .into_iter()
+            .filter_map(|m| {
+                if let crate::Message::User { content } = m {
+                    Some(content)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(texts, ["custom first", "user second", "later"]);
+    }
+
+    #[test]
+    fn clearing_steering_and_followups_preserves_next_turn_and_branch_history() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        queue_custom_message(
+            &mut session,
+            custom("steer", crate::CustomMessageDelivery::Steer),
+            &mut |_| {},
+        )
+        .unwrap();
+        queue_custom_message(
+            &mut session,
+            custom("follow", crate::CustomMessageDelivery::FollowUp),
+            &mut |_| {},
+        )
+        .unwrap();
+        queue_custom_message(
+            &mut session,
+            custom("next", crate::CustomMessageDelivery::NextTurn),
+            &mut |_| {},
+        )
+        .unwrap();
+        let before_clear = session.head();
+        session.clear_queued_inputs().unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(restored.queued_custom_messages().len(), 1);
+        let old_branch =
+            Session::from_records(restored.fork_records(before_clear).unwrap()).unwrap();
+        assert_eq!(old_branch.queued_custom_messages().len(), 3);
+    }
+
     struct WaitingModel(Arc<tokio::sync::Notify>);
     #[async_trait::async_trait]
     impl Model for WaitingModel {

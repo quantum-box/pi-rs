@@ -118,6 +118,25 @@ pub struct CustomMessage {
     pub details: Option<Value>,
 }
 
+/// Delivery boundary for an extension message sent during an active run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CustomMessageDelivery {
+    #[default]
+    Steer,
+    FollowUp,
+    NextTurn,
+    /// Append after the current assistant turn without starting another turn.
+    AfterTurn,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct QueuedCustomMessage {
+    pub id: uuid::Uuid,
+    pub delivery: CustomMessageDelivery,
+    pub message: CustomMessage,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExtensionCommandAction {
@@ -253,6 +272,18 @@ pub trait ToolHost: Send + Sync {
     }
     async fn ui(&self, _request: crate::UiRequest) -> ExtensionResult<crate::UiResponse> {
         Err("interactive extension UI is unavailable".into())
+    }
+    /// Whether this host can journal custom-message delivery requests.
+    fn supports_custom_messages(&self) -> bool {
+        false
+    }
+    /// Queue custom context through the active session owner.
+    async fn send_message(
+        &self,
+        _message: CustomMessage,
+        _delivery: CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        Err("custom message delivery is unavailable".into())
     }
     async fn call(&self, name: &str, arguments: Value) -> Outcome;
     /// Submit an ordered group together so compatible reads can overlap.
