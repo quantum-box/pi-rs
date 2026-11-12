@@ -25,14 +25,15 @@ const MAX_ITEMS: usize = 100_000;
 pub struct Codemode {
     pub only: bool,
     pub inline_budget: usize,
-    pub timeout: Option<Duration>,
+    /// Maximum script duration; `Duration::MAX` means no deadline.
+    pub timeout: Duration,
 }
 impl Default for Codemode {
     fn default() -> Self {
         Self {
             only: false,
             inline_budget: 3000,
-            timeout: None,
+            timeout: Duration::MAX,
         }
     }
 }
@@ -43,7 +44,7 @@ impl Extension for Codemode {
     }
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         vec![Arc::new(ScriptTool {
-            timeout: self.timeout,
+            timeout: (self.timeout != Duration::MAX).then_some(self.timeout),
         })]
     }
     fn migrate(
@@ -1087,6 +1088,76 @@ mod tests {
                 .contains("could not be saved")
         );
         assert_eq!(value["content"][1]["type"], "image");
+    }
+
+    struct DeadlineModel;
+    #[async_trait::async_trait]
+    impl pi_rs_core::Model for DeadlineModel {
+        async fn stream(
+            &self,
+            request: ModelRequest,
+        ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+            use pi_rs_core::{Message, ModelEvent, ToolCall};
+            let events = if let Some(content) = request.messages.iter().find_map(|message| {
+                if let Message::Tool { content, .. } = message {
+                    Some(content)
+                } else {
+                    None
+                }
+            }) {
+                assert!(
+                    content.contains("error")
+                        || content.contains("timed out")
+                        || content.contains("interrupt"),
+                    "{content}"
+                );
+                vec![
+                    Ok(ModelEvent::Text("done".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ]
+            } else {
+                vec![Ok(ModelEvent::Complete {
+                    calls: vec![ToolCall {
+                        id: "deadline".into(),
+                        name: "codemode".into(),
+                        arguments: json!({"code":"while (true) {}"}).to_string(),
+                    }],
+                    usage: None,
+                })]
+            };
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn public_sdk_explicit_timeouts_interrupt_busy_scripts() {
+        for explicit_limits in [false, true] {
+            // Keep the original public struct literal and Duration field usable.
+            let extension = Codemode {
+                only: false,
+                inline_budget: 3000,
+                timeout: if explicit_limits {
+                    Duration::MAX
+                } else {
+                    Duration::from_millis(20)
+                },
+            };
+            let mut builder = pi_rs_core::SessionBuilder::new(Arc::new(DeadlineModel), "fixture")
+                .extension(Arc::new(extension))
+                .unwrap();
+            if explicit_limits {
+                builder = builder.limits(pi_rs_core::Limits {
+                    tool_timeout: Duration::from_millis(20),
+                    ..Default::default()
+                });
+            }
+            let mut session = builder.in_memory().unwrap();
+            assert_eq!(session.prompt("test").await.unwrap(), "done");
+            session.close().await.unwrap();
+        }
     }
 
     struct LargeImageModel;

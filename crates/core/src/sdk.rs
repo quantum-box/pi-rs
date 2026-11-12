@@ -303,6 +303,7 @@ pub struct SessionBuilder {
     system_prompt: String,
     registry: Registry,
     limits: Limits,
+    tool_timeout_explicit: bool,
 }
 impl SessionBuilder {
     pub fn new(model: Arc<dyn Model>, model_name: impl Into<String>) -> Self {
@@ -312,6 +313,7 @@ impl SessionBuilder {
             system_prompt: "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.".into(),
             registry: Registry::default(),
             limits: Limits::default(),
+            tool_timeout_explicit: false,
         }
     }
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -324,6 +326,7 @@ impl SessionBuilder {
     }
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self.tool_timeout_explicit = true;
         self
     }
     pub fn extension(mut self, extension: Arc<dyn Extension>) -> Result<Self> {
@@ -343,7 +346,9 @@ impl SessionBuilder {
     pub fn in_memory(self) -> Result<AgentSession> {
         self.build(Session::with_store(MemoryStore::default())?)
     }
-    pub fn build(self, session: Session) -> Result<AgentSession> {
+    pub fn build(mut self, session: Session) -> Result<AgentSession> {
+        self.registry
+            .omit_default_tool_timeout(!self.tool_timeout_explicit);
         if session.host_binding().is_some() {
             return Err(Error::Session(
                 "managed sessions must be opened through their host".into(),
@@ -355,7 +360,7 @@ impl SessionBuilder {
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let weak_events = events.downgrade();
-        let tool_timeout = self.limits.effective_tool_timeout();
+        let tool_timeout = self.limits.tool_timeout;
         let auto_compaction = session.auto_compaction_control();
         let retry = session.retry_control();
         let input_hooks = Arc::new(Mutex::new(InputHooks::new(&self.registry, &session)));
@@ -545,7 +550,7 @@ impl AgentSession {
                 &self.registry,
                 event,
                 &self.session.extension_states(),
-                self.limits.effective_tool_timeout(),
+                self.limits.tool_timeout,
                 &mut |notification| emit(events, &notification),
             )
             .await;
@@ -675,7 +680,7 @@ impl AgentSession {
                 &self.registry,
                 event,
                 &self.session.extension_states(),
-                self.limits.effective_tool_timeout(),
+                self.limits.tool_timeout,
                 &mut |notification| emit(events, &notification),
             )
             .await;
@@ -778,7 +783,7 @@ impl AgentSession {
                 .session_transition_cancelled(
                     &crate::BeforeSessionTransition::Fork { entry_id, position },
                     &self.session.extension_states(),
-                    self.limits.effective_tool_timeout(),
+                    self.limits.tool_timeout,
                     &mut |notification| emit(events, &notification),
                 )
                 .await
@@ -1214,6 +1219,25 @@ mod tests {
     use super::*;
     use crate::{ModelEvent, ModelStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn default_and_explicit_sdk_limits_preserve_public_values() {
+        let defaults = Limits::default();
+        assert_eq!(defaults.tool_timeout, std::time::Duration::from_secs(30));
+        let implicit = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .in_memory()
+            .unwrap();
+        assert!(implicit.registry.omit_default_tool_timeout);
+        let explicit = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .limits(defaults)
+            .in_memory()
+            .unwrap();
+        assert!(!explicit.registry.omit_default_tool_timeout);
+        assert_eq!(
+            explicit.limits.tool_timeout,
+            std::time::Duration::from_secs(30)
+        );
+    }
 
     struct CustomEntryExtension;
     struct CustomMessageExtension;

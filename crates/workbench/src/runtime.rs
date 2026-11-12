@@ -250,10 +250,7 @@ impl Runtime {
                 output_tokens_per_request: args.effective_max_output_tokens(),
                 output_tokens_per_run: args.output_budget,
                 model_timeout: Duration::from_secs(args.model_timeout_secs),
-                tool_timeout: args
-                    .tool_timeout_secs
-                    .map(Duration::from_secs)
-                    .unwrap_or(Limits::CLI_DEFAULT_TOOL_TIMEOUT),
+                tool_timeout: args.tool_timeout(),
                 context_window: args.effective_context_window(),
             },
         }
@@ -537,7 +534,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
                     .as_u64()
                     .unwrap_or(3000)
                     .min(100_000) as usize,
-                timeout: None,
+                timeout: Duration::MAX,
             }));
         }
         if let Some(project) = &args.project
@@ -630,6 +627,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             extensions,
             &args.disable_extension.iter().cloned().collect(),
         )?;
+        registry.omit_default_tool_timeout(args.tool_timeout_secs.is_none());
         registry.register(Arc::new(LocalCommandPolicy(CommandPolicy {
             allow_commands: args.allow_commands,
         })))?;

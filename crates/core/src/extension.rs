@@ -729,9 +729,15 @@ pub struct Registry {
     active: Option<BTreeSet<String>>,
     pub(crate) ui: Option<Arc<dyn crate::ExtensionUi>>,
     refresher: Option<Arc<dyn RegistryRefresher>>,
+    pub(crate) omit_default_tool_timeout: bool,
 }
 
 impl Registry {
+    /// Allow tools that opt out to run without the host's default timeout.
+    /// Explicitly configured host timeouts should leave this disabled.
+    pub fn omit_default_tool_timeout(&mut self, omit: bool) {
+        self.omit_default_tool_timeout = omit;
+    }
     pub fn has_resource_discovery_hooks(&self) -> bool {
         self.extensions
             .iter()
@@ -1090,6 +1096,7 @@ impl Registry {
             active: None,
             ui: self.ui.clone(),
             refresher: None,
+            omit_default_tool_timeout: self.omit_default_tool_timeout,
         })
     }
 
