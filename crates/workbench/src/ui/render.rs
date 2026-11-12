@@ -859,10 +859,11 @@ fn markdown_at_depth(
         }
         match event {
             Event::Start(Tag::Paragraph) if lists.is_empty() => {
-                if let Some(end) = previous_paragraph_end.take() {
-                    if end <= range.start && text[end..range.start].trim().is_empty() {
-                        lines.push(Line::default());
-                    }
+                if let Some(end) = previous_paragraph_end.take()
+                    && end <= range.start
+                    && text[end..range.start].trim().is_empty()
+                {
+                    lines.push(Line::default());
                 }
             }
             Event::Start(Tag::Table(alignments)) => {
