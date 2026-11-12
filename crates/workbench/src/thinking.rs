@@ -33,11 +33,13 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         }
         super::providers::Adapter::OpenAiResponses => pi_rs::openai::thinking_levels(&args.model),
         super::providers::Adapter::Anthropic
-            if matches!(args.provider.id(), "fireworks" | "openrouter")
-                && args
-                    .model_profiles
-                    .model(&args.provider, &args.model)
-                    .is_some_and(|model| model.reasoning == Some(true)) =>
+            if matches!(
+                args.provider.id(),
+                "fireworks" | "openrouter" | "vercel-ai-gateway"
+            ) && args
+                .model_profiles
+                .model(&args.provider, &args.model)
+                .is_some_and(|model| model.reasoning == Some(true)) =>
         {
             ["off", "low", "medium", "high"].map(str::to_owned).to_vec()
         }
@@ -143,6 +145,19 @@ fn persist(args: &mut Cli, level: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vercel_reasoning_model_retains_offline_thinking_level() {
+        use clap::Parser;
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&serde_json::json!({})).unwrap();
+        args.provider = args.model_profiles.provider("vercel-ai-gateway").unwrap();
+        args.model = "alibaba/qwen-3-14b".into();
+        args.thinking = Some("high".into());
+        adjust(&mut args);
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+    }
 
     #[test]
     fn clamp_prefers_supported_higher_levels_before_lower_levels() {
