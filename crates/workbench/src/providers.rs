@@ -582,7 +582,7 @@ impl Client {
                                 .unwrap_or(Some(level))
                         })
                 };
-                Self::OpenAi(client.with_thinking(thinking).with_sampling(sampling))
+                Self::OpenAi(client.with_thinking(thinking).with_sampling(sampling)?)
             }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));

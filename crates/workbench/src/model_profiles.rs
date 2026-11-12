@@ -499,16 +499,23 @@ impl ModelMetadata {
                 provider.id()
             )));
         }
-        if adapter == Adapter::ChatCompletions {
-            pi_rs::ollama::validate_sampling(&self.sampling_params)?;
+        if matches!(adapter, Adapter::ChatCompletions | Adapter::OpenAiResponses) {
+            let validate_sampling = match adapter {
+                Adapter::ChatCompletions => pi_rs::ollama::validate_sampling,
+                Adapter::OpenAiResponses => pi_rs::openai::validate_sampling,
+                _ => unreachable!(),
+            };
+            validate_sampling(&self.sampling_params)?;
             for (level, parameters) in &self.sampling_params_by_thinking_level {
                 if !super::thinking::LEVELS.contains(&level.as_str()) {
                     return Err(Error::Config(format!(
                         "unknown sampling thinking level {level:?}"
                     )));
                 }
-                pi_rs::ollama::validate_sampling(parameters)?;
+                validate_sampling(parameters)?;
             }
+        }
+        if adapter == Adapter::ChatCompletions {
             for (level, value) in &self.thinking_level_map {
                 if !super::thinking::LEVELS.contains(&level.as_str())
                     || value.as_ref().is_some_and(|value| value.trim().is_empty())
@@ -1734,6 +1741,49 @@ mod tests {
             Profiles::parse(&json!({"providers":{"ollama":{
                 "models":[{"id":"invalid","samplingParams":{"messages":[]}}]
             }}}))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn responses_sampling_rejects_managed_fields_in_definitions_and_overrides() {
+        for key in [
+            "model",
+            "input",
+            "stream",
+            "max_output_tokens",
+            "tools",
+            "reasoning",
+            "store",
+        ] {
+            for level in [false, true] {
+                let sampling = if level {
+                    json!({"samplingParamsByThinkingLevel":{"high":{(key): false}}})
+                } else {
+                    json!({"samplingParams":{(key): false}})
+                };
+                for is_override in [false, true] {
+                    let mut provider = json!({"models":[{"id":"fixture","reasoning":true}]});
+                    if is_override {
+                        provider["modelOverrides"] = json!({"fixture":sampling});
+                    } else {
+                        provider["models"][0]
+                            .as_object_mut()
+                            .unwrap()
+                            .extend(sampling.as_object().unwrap().clone());
+                    }
+                    let error = match Profiles::parse(&json!({"providers":{"openai":provider}})) {
+                        Ok(_) => panic!("accepted {key}, level={level}, override={is_override}"),
+                        Err(error) => error,
+                    };
+                    assert!(error.to_string().contains(key));
+                }
+            }
+        }
+        assert!(
+            Profiles::parse(&json!({"providers":{"openai":{"models":[{
+                "id":"fixture","samplingParamsByThinkingLevel":{"unknown":{"top_p":0.9}}
+            }]}}}))
             .is_err()
         );
     }

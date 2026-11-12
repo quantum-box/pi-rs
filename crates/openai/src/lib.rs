@@ -116,9 +116,10 @@ impl OpenAiResponses {
     }
 
     /// Set request body defaults from the selected model's sampling parameters.
-    pub fn with_sampling(mut self, sampling: BTreeMap<String, Value>) -> Self {
+    pub fn with_sampling(mut self, sampling: BTreeMap<String, Value>) -> Result<Self> {
+        validate_sampling(&sampling)?;
         self.sampling = sampling;
-        self
+        Ok(self)
     }
 
     /// Return the signed-in account's displayable models in server order.
@@ -174,6 +175,44 @@ impl OpenAiResponses {
             })
             .collect())
     }
+}
+
+/// Protect fields that control the agent's conversation, tools, and transport.
+pub fn validate_sampling(sampling: &BTreeMap<String, Value>) -> Result<()> {
+    if let Some(key) = sampling.keys().find(|key| {
+        matches!(
+            key.as_str(),
+            "model"
+                | "input"
+                | "messages"
+                | "instructions"
+                | "previous_response_id"
+                | "conversation"
+                | "prompt"
+                | "tools"
+                | "functions"
+                | "function_call"
+                | "tool_choice"
+                | "parallel_tool_calls"
+                | "max_tool_calls"
+                | "stream"
+                | "stream_options"
+                | "background"
+                | "store"
+                | "max_output_tokens"
+                | "max_tokens"
+                | "max_completion_tokens"
+                | "n"
+                | "reasoning"
+                | "reasoning_effort"
+                | "include"
+        )
+    }) {
+        return Err(Error::Config(format!(
+            "sampling parameter {key:?} is managed by the agent"
+        )));
+    }
+    Ok(())
 }
 
 /// Supported reasoning levels for known models. Unknown models use their default.
@@ -406,6 +445,56 @@ mod tests {
             }],
             max_output_tokens: 100,
         }
+    }
+
+    #[test]
+    fn sampling_rejects_responses_fields_managed_by_the_agent() {
+        let client =
+            OpenAiResponses::new_api("https://example.com/v1/responses", "token".into()).unwrap();
+        for key in [
+            "model",
+            "input",
+            "messages",
+            "instructions",
+            "previous_response_id",
+            "conversation",
+            "prompt",
+            "tools",
+            "functions",
+            "function_call",
+            "tool_choice",
+            "parallel_tool_calls",
+            "max_tool_calls",
+            "stream",
+            "stream_options",
+            "background",
+            "store",
+            "max_output_tokens",
+            "max_tokens",
+            "max_completion_tokens",
+            "n",
+            "reasoning",
+            "reasoning_effort",
+            "include",
+        ] {
+            let error = match client
+                .clone()
+                .with_sampling(BTreeMap::from([(key.into(), json!(null))]))
+            {
+                Ok(_) => panic!("accepted managed field {key}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(key));
+        }
+        assert!(
+            client
+                .with_sampling(BTreeMap::from([
+                    ("temperature".into(), json!(0.5)),
+                    ("top_p".into(), json!(0.9)),
+                    ("custom_sampling".into(), json!({"value": 1})),
+                ]))
+                .is_ok()
+        );
     }
 
     #[test]
