@@ -506,7 +506,7 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
                 | Event::BashExecution { .. }
         ) | (
             Some("custom_message"),
-            Event::User { .. } | Event::UserWithImages { .. }
+            Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. }
         ) | (
             Some("model_change" | "thinking_level_change"),
             Event::ModelSelected { .. }
@@ -515,7 +515,10 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
             | (Some("context_edit"), Event::ContextEdited { .. })
             | (Some("compaction"), Event::Compacted { .. })
             | (Some("branch_summary"), Event::BranchSummary { .. })
-            | (Some("custom"), Event::ExtensionStates { .. })
+            | (
+                Some("custom"),
+                Event::ExtensionStates { .. } | Event::CustomEntry { .. }
+            )
     )
 }
 
