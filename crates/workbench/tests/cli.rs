@@ -2645,6 +2645,164 @@ fn scoped_thinking_applies_to_new_sessions_and_resumes_restore_branch_thinking()
 }
 
 #[test]
+fn rpc_worker_preserves_imported_selection_and_cli_provenance() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"defaultProvider":"ollama","defaultModel":"physical"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1","models":[{"id":"physical","reasoning":true}]}}}).to_string()).unwrap();
+    let source = root.path().join("pi.jsonl");
+    let entries = [
+        json!({"type":"session","version":3}),
+        json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+        json!({"type":"message","id":"user","parentId":"change","message":{"role":"user","content":"question"}}),
+        json!({"type":"message","id":"assistant","parentId":"user","message":{"role":"assistant","provider":"ollama","model":"physical","content":[]}}),
+    ];
+    std::fs::write(
+        &source,
+        entries
+            .iter()
+            .map(|entry| format!("{entry}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    for (label, flags, expected) in [
+        ("implicit", vec![], vec!["virtual"]),
+        ("thinking", vec!["--thinking", "high"], vec!["virtual"]),
+        (
+            "model",
+            vec!["--model", "physical"],
+            vec!["virtual", "physical"],
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"physical","reasoning":true}]}}}).to_string()).unwrap();
+        let server = std::thread::spawn(move || {
+            loop {
+                let (mut socket, mut reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                if !first.starts_with("POST /v1/chat/completions ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                let events = concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+                break;
+            }
+        });
+        let native = root.path().join(format!("{label}.jsonl"));
+        let imported = Command::new(env!("CARGO_BIN_EXE_pi-rs"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(root.path())
+            .args(["--offline", "--no-mcp", "--no-trust", "import"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(root.path())
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--no-trust"])
+            .args(flags)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(child.stdout.take().unwrap())
+                .lines()
+                .map_while(Result::ok)
+            {
+                if send
+                    .send(serde_json::from_str::<Value>(&line).unwrap())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            child.wait_with_output().unwrap()
+        });
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"prompt","type":"prompt","message":"continue"})
+        )
+        .unwrap();
+        loop {
+            let event = receive.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["type"] == "agent_settled" {
+                assert_eq!(event["aborted"], false, "{event}");
+                break;
+            }
+        }
+        writeln!(input, "{}", json!({"id":"entries","type":"get_entries"})).unwrap();
+        let projected = loop {
+            let event = receive.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["type"] == "response" && event["id"] == "entries" {
+                break event;
+            }
+        };
+        let changes: Vec<_> = projected["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["type"] == "model_change")
+            .filter_map(|entry| entry["modelId"].as_str())
+            .collect();
+        assert_eq!(changes, expected, "{label}: {projected}");
+        if label == "thinking" {
+            assert!(
+                projected["data"]["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["type"] == "thinking_level_change"
+                        && entry["thinkingLevel"] == "high"),
+                "{projected}"
+            );
+        }
+        writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+        drop(input);
+        let output = reader.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn omitted_user_with_empty_failed_assistant_is_a_resumed_session() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");

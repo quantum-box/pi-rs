@@ -2016,6 +2016,63 @@ mod tests {
     }
 
     #[test]
+    fn explicit_endpoint_keeps_original_provider_on_workspace_switch_and_new_session() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(target.join(".pi/settings.json"), json!({"defaultProvider":"relay","defaultModel":"beta","enabledModels":["relay/beta","ollama/alpha"]}).to_string()).unwrap();
+        let path = root.path().join("target.jsonl");
+        Session::open(&path)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().to_path_buf());
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":"https://example.invalid/v1","models":[{"id":"alpha"}]},
+            "relay":{"baseUrl":"https://example.invalid/v1","api":"openai-completions","models":[{"id":"beta"}]}
+        }})).unwrap();
+        args.provider = super::super::Provider::Ollama;
+        args.model = "alpha".into();
+        args.endpoint = "https://explicit.example/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.connection_explicit = true;
+        args.initial_connection = Some((args.provider.clone(), args.endpoint.clone()));
+        args.remember_initial_selection();
+        switch_session(&mut args, &path).unwrap();
+        assert_eq!(
+            (
+                args.provider.id(),
+                args.model.as_str(),
+                args.endpoint.as_str()
+            ),
+            (
+                "ollama",
+                "alpha",
+                "https://explicit.example/v1/chat/completions"
+            )
+        );
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(
+            (
+                args.provider.id(),
+                args.model.as_str(),
+                args.endpoint.as_str()
+            ),
+            (
+                "ollama",
+                "alpha",
+                "https://explicit.example/v1/chat/completions"
+            )
+        );
+    }
+
+    #[test]
     fn workspace_provider_only_default_never_uses_previous_provider_model() {
         let root = tempfile::tempdir().unwrap();
         let launch = root.path().join("launch");

@@ -1028,11 +1028,20 @@ impl Cli {
             .provider_argument
             .as_deref()
             .and_then(|name| self.model_profiles.provider(name))
+            .or_else(|| {
+                self.endpoint_explicit
+                    .then(|| {
+                        self.initial_connection
+                            .as_ref()
+                            .map(|(provider, _)| provider.clone())
+                    })
+                    .flatten()
+            })
             .or_else(|| configured_provider.and_then(|name| self.model_profiles.provider(name)))
             .or_else(|| qualified.as_ref().map(|(provider, _)| provider.clone()))
             .unwrap_or_else(|| fallback.provider.clone());
         let configured_for_provider = configured.filter(|_| {
-            self.provider_argument.is_none()
+            (self.provider_argument.is_none() && !self.endpoint_explicit)
                 || configured_provider
                     .and_then(|name| self.model_profiles.provider(name))
                     .or_else(|| qualified.as_ref().map(|(candidate, _)| candidate.clone()))
@@ -1572,6 +1581,13 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         return packages::command(&args, command.clone()).await;
     }
     if matches!(args.command, Some(Command::Serve)) {
+        if let Ok(provenance) = std::env::var(process::SELECTION_PROVENANCE_ENV) {
+            let (model_explicit, thinking_explicit): (bool, bool) =
+                serde_json::from_str(&provenance)
+                    .map_err(|_| Error::Config("invalid worker selection provenance".into()))?;
+            args.model_explicit = model_explicit;
+            args.thinking_explicit = thinking_explicit;
+        }
         return backend::run(args).await;
     }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
