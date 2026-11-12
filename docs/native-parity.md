@@ -76,6 +76,9 @@ without `defaultProvider` are still accepted.
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+Input hooks identify command-line print and JSON prompts as `interactive`, as
+Pi does, while RPC and extension-originated submissions retain their own source.
+
 Known text-only chat models receive Pi's image-omission placeholders for user
 and tool images. Unknown model capabilities leave image handling to the
 provider, and the explicit image-blocking setting retains precedence.

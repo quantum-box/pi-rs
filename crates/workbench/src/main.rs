@@ -1694,7 +1694,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 let event = pi_rs::InputEvent {
                     text: std::mem::take(prompt),
                     images,
-                    source: pi_rs::InputSource::Extension,
+                    source: pi_rs::InputSource::Interactive,
                     streaming_behavior: None,
                 };
                 let states = session.extension_states();
