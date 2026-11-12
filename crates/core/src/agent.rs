@@ -827,6 +827,7 @@ impl Agent<'_> {
         Ok(states)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn request(
         &self,
         session: &mut Session,
