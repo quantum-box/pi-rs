@@ -505,6 +505,7 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
             Some("message"),
             Event::User { .. }
                 | Event::UserWithImages { .. }
+                | Event::CustomMessage { .. }
                 | Event::Assistant { .. }
                 | Event::ToolFinished { .. }
                 | Event::SystemCheckpoint { .. }

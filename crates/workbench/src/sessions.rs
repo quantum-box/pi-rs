@@ -341,6 +341,29 @@ pub fn html(session: &Session) -> String {
                 content, images, ..
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
+            Event::CustomMessage { message } if message.display => {
+                html.push_str(&format!("<article><b>{}</b>", escape(&message.custom_type)));
+                match &message.content {
+                    pi_rs::ContextContent::Text(text) => render_export_markdown(&mut html, text),
+                    pi_rs::ContextContent::Blocks(blocks) => {
+                        for block in blocks {
+                            match block {
+                                pi_rs::ContentBlock::Text { text } => {
+                                    render_export_markdown(&mut html, text)
+                                }
+                                pi_rs::ContentBlock::Image { data, mime_type } => {
+                                    html.push_str(&images_html(&[pi_rs::ImageContent {
+                                        data: data.clone(),
+                                        mime_type: mime_type.clone(),
+                                    }]));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                html.push_str("</article>");
+            }
             Event::SystemCheckpoint {
                 content,
                 sections,
@@ -1176,6 +1199,22 @@ mod tests {
         assert!(document.contains("<code>limit</code> <code>integer,null</code> optional"));
         assert!(document.contains("<code>options</code> <code>any</code> optional"));
         assert!(!document.contains("<script>"));
+    }
+
+    #[test]
+    fn html_respects_imported_custom_message_visibility() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"custom","customType":"private","content":"secret context","display":false}}),
+            serde_json::json!({"type":"message","id":"b","parentId":"a","message":{"role":"custom","customType":"note","content":"visible **note**","display":true}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(fixture.path()).unwrap();
+        let document = html(&session);
+        assert!(!document.contains("secret context"));
+        assert!(document.contains("visible <strong>note</strong>"));
     }
 
     #[test]
