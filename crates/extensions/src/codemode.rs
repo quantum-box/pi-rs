@@ -25,6 +25,7 @@ const MAX_ITEMS: usize = 100_000;
 pub struct Codemode {
     pub only: bool,
     pub inline_budget: usize,
+    /// Maximum script duration; `Duration::MAX` means no deadline.
     pub timeout: Duration,
 }
 impl Default for Codemode {
@@ -32,7 +33,7 @@ impl Default for Codemode {
         Self {
             only: false,
             inline_budget: 3000,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::MAX,
         }
     }
 }
@@ -43,7 +44,7 @@ impl Extension for Codemode {
     }
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         vec![Arc::new(ScriptTool {
-            timeout: self.timeout,
+            timeout: (self.timeout != Duration::MAX).then_some(self.timeout),
         })]
     }
     fn migrate(
@@ -96,10 +97,13 @@ impl Extension for Codemode {
     }
 }
 struct ScriptTool {
-    timeout: Duration,
+    timeout: Option<Duration>,
 }
 #[async_trait::async_trait]
 impl Tool for ScriptTool {
+    fn use_default_timeout(&self) -> bool {
+        false
+    }
     fn output_limit(&self) -> usize {
         8 * 1024 * 1024
     }
@@ -120,11 +124,26 @@ impl Tool for ScriptTool {
         previous: Option<&ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> ToolReply {
+        self.invoke_transaction_with_timeout(arguments, context, previous, host, None)
+            .await
+    }
+    async fn invoke_transaction_with_timeout(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        previous: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+        host_timeout: Option<Duration>,
+    ) -> ToolReply {
         let started = Instant::now();
         let Some(code) = arguments["code"].as_str() else {
             return Outcome::Failed("code must be a string".into()).into();
         };
-        let (options, source) = match options(code, self.timeout) {
+        let maximum = match (self.timeout, host_timeout) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let (options, source) = match options(code, maximum) {
             Ok(value) => value,
             Err(error) => return Outcome::Failed(error).into(),
         };
@@ -140,25 +159,64 @@ impl Tool for ScriptTool {
                 .unwrap_or(2);
             tokio::sync::Semaphore::new(maximum)
         });
-        let _permit = tokio::select! {
-            _ = context.cancellation.cancelled() => return Outcome::Failed("Script cancelled while waiting for a worker".into()).into(),
-            permit = tokio::time::timeout(options.timeout.min(Duration::from_secs(60)), workers.acquire()) => match permit {
-                Ok(Ok(permit)) => permit,
-                _ => return Outcome::Failed("Timed out waiting for a codemode worker".into()).into(),
+        let acquire = async {
+            match options.timeout {
+                Some(timeout) => tokio::time::timeout(timeout, workers.acquire())
+                    .await
+                    .map_err(|_| "Timed out waiting for a codemode worker")?,
+                None => workers.acquire().await,
             }
+            .map_err(|_| "Codemode worker pool closed")
         };
-        let Some(remaining) = options
-            .timeout
-            .checked_sub(started.elapsed())
-            .filter(|time| !time.is_zero())
-        else {
-            return Outcome::Failed("Script deadline elapsed before execution".into()).into();
+        let permit = tokio::select! {
+            _ = context.cancellation.cancelled() => return Outcome::Failed("Script cancelled while waiting for a worker".into()).into(),
+            permit = acquire => match permit {
+                Ok(permit) => permit,
+                Err(error) => return Outcome::Failed(error.into()).into(),
+            }
         };
         let store = previous
             .map(|state| state.data.clone())
             .unwrap_or_else(|| json!({}));
         let sink = Arc::new(Mutex::new(Output::default()));
-        let result = evaluate(source, store, host, context, remaining, sink.clone()).await;
+        let worker_sink = sink.clone();
+        let worker_cancel = context.cancellation.child_token();
+        // The caller may drop this future on timeout or cancellation. Keep the
+        // permit in the worker until QuickJS has actually stopped, and wake its
+        // interrupt handler even when nobody remains to await the join handle.
+        let _cancel_on_drop = worker_cancel.clone().drop_guard();
+        let worker_context = ToolContext {
+            operation_id: context.operation_id,
+            cancellation: worker_cancel,
+        };
+        let source = source.to_owned();
+        let handle = tokio::runtime::Handle::current();
+        let timeout = options.timeout;
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let remaining = match timeout {
+                Some(timeout) => {
+                    match timeout
+                        .checked_sub(started.elapsed())
+                        .filter(|time| !time.is_zero())
+                    {
+                        Some(remaining) => Some(remaining),
+                        None => return Err("Script deadline elapsed before execution".into()),
+                    }
+                }
+                None => None,
+            };
+            handle.block_on(evaluate(
+                &source,
+                store,
+                host,
+                worker_context,
+                remaining,
+                worker_sink,
+            ))
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("Codemode worker failed: {error}")));
         let (success, changed, store, error) = match result {
             Ok(result) => (result.ok, result.changed, result.store, result.error),
             Err(error) => (false, false, json!({}), Some(error)),
@@ -196,9 +254,9 @@ impl Tool for ScriptTool {
 }
 struct Options {
     max_output_tokens: usize,
-    timeout: Duration,
+    timeout: Option<Duration>,
 }
-fn options(code: &str, maximum: Duration) -> Result<(Options, &str), String> {
+fn options(code: &str, maximum: Option<Duration>) -> Result<(Options, &str), String> {
     const PREFIX: &str = "// @options:";
     const FIELDS: &str = "`max_output_tokens` and `timeout_ms`";
     if code.trim().is_empty() {
@@ -270,10 +328,10 @@ fn options(code: &str, maximum: Duration) -> Result<(Options, &str), String> {
     Ok((
         Options {
             max_output_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
-            timeout: timeout
-                .map(Duration::from_millis)
-                .unwrap_or(maximum)
-                .min(maximum),
+            timeout: match (timeout.map(Duration::from_millis), maximum) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
         },
         source,
     ))
@@ -291,19 +349,24 @@ async fn evaluate(
     store: Value,
     host: Arc<dyn ToolHost>,
     context: ToolContext,
-    timeout: Duration,
+    timeout: Option<Duration>,
     sink: Arc<Mutex<Output>>,
 ) -> Result<Completion, String> {
     let runtime = AsyncRuntime::new().map_err(|error| error.to_string())?;
     runtime.set_memory_limit(256 * 1024 * 1024).await;
     runtime.set_max_stack_size(512 * 1024).await;
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or("Invalid script deadline")?;
+    let deadline = timeout
+        .map(|timeout| {
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or("Invalid script deadline")
+        })
+        .transpose()?;
     let cancellation = context.cancellation.clone();
     runtime
         .set_interrupt_handler(Some(Box::new(move || {
-            cancellation.is_cancelled() || Instant::now() >= deadline
+            cancellation.is_cancelled()
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
         })))
         .await;
     let javascript = AsyncContext::full(&runtime)
@@ -351,8 +414,17 @@ async fn evaluate(
     });
     let result = tokio::select! {
         _ = context.cancellation.cancelled() => return Err("Script cancelled".into()),
-        result = tokio::time::timeout(timeout, operation) => result.map_err(|_| "Script timed out".to_owned())?,
-    }?;
+        result = async {
+            match timeout {
+                Some(timeout) => tokio::time::timeout(timeout, operation).await.map_err(|_| "Script timed out".to_owned())?,
+                None => operation.await,
+            }
+        } => result,
+    };
+    if context.cancellation.is_cancelled() {
+        return Err("Script cancelled".into());
+    }
+    let result = result?;
     serde_json::from_str(&result).map_err(|error| error.to_string())
 }
 fn install_globals(
@@ -798,7 +870,7 @@ mod tests {
             .unwrap()
             .block_on(
                 ScriptTool {
-                    timeout: Duration::from_secs(2),
+                    timeout: Some(Duration::from_secs(2)),
                 }
                 .invoke_transaction(
                     json!({"code":code}),
@@ -813,14 +885,14 @@ mod tests {
     }
     #[test]
     fn options_match_reference_source_validation() {
-        let maximum = Duration::from_secs(2);
+        let maximum = Some(Duration::from_secs(2));
         let (parsed, source) = options(
             "  // @options: {\"max_output_tokens\":0,\"timeout_ms\":25}\r\ntext(1)",
             maximum,
         )
         .unwrap();
         assert_eq!(parsed.max_output_tokens, 0);
-        assert_eq!(parsed.timeout, Duration::from_millis(25));
+        assert_eq!(parsed.timeout, Some(Duration::from_millis(25)));
         assert_eq!(source, "\ntext(1)");
         for invalid in [
             "",
@@ -840,6 +912,172 @@ mod tests {
             run("// @options: {\"yield\":1}\nstore('x', 1)", None).outcome,
             Outcome::Failed(_)
         ));
+    }
+    #[test]
+    fn deadlines_are_optional_and_explicit_limits_are_combined() {
+        assert_eq!(options("text(1)", None).unwrap().0.timeout, None);
+        assert_eq!(
+            options("// @options: {\"timeout_ms\":40}\ntext(1)", None)
+                .unwrap()
+                .0
+                .timeout,
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            options(
+                "// @options: {\"timeout_ms\":40}\ntext(1)",
+                Some(Duration::from_millis(20))
+            )
+            .unwrap()
+            .0
+            .timeout,
+            Some(Duration::from_millis(20))
+        );
+    }
+    #[tokio::test]
+    async fn unbounded_script_honors_cancellation() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let trigger = cancellation.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+        let reply = tokio::time::timeout(
+            Duration::from_secs(1),
+            ScriptTool { timeout: None }.invoke_transaction(
+                json!({"code":"await new Promise(() => {})"}),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation,
+                },
+                None,
+                Arc::new(Host),
+            ),
+        )
+        .await
+        .unwrap();
+        task.await.unwrap();
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message.contains("cancelled")));
+    }
+    struct StartedHost(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl ToolHost for StartedHost {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "started".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }]
+        }
+        async fn call(&self, _: &str, _: Value) -> Outcome {
+            self.0.notify_one();
+            Outcome::Succeeded("ready".into())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_cancels_unbounded_cpu_loop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (stop_watchdog, watchdog_stopped) = std::sync::mpsc::channel::<()>();
+        let watchdog_fired = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let cancellation = cancellation.clone();
+            let watchdog_fired = watchdog_fired.clone();
+            std::thread::spawn(move || {
+                if watchdog_stopped
+                    .recv_timeout(Duration::from_secs(3))
+                    .is_err()
+                {
+                    watchdog_fired.store(true, Ordering::SeqCst);
+                    cancellation.cancel();
+                }
+            })
+        };
+        let script_cancel = cancellation.clone();
+        let host = Arc::new(StartedHost(started.clone()));
+        let script = tokio::spawn(async move {
+            ScriptTool { timeout: None }.invoke_transaction(
+                json!({"code":"await tools.started({}); store('uncommitted', true); while (true) {}"}),
+                ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: script_cancel },
+                None, host,
+            ).await
+        });
+        started.notified().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation.cancel();
+        let reply = tokio::time::timeout(Duration::from_secs(1), script)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = stop_watchdog.send(());
+        watchdog.join().unwrap();
+        assert!(
+            !watchdog_fired.load(Ordering::SeqCst),
+            "current-thread executor was blocked"
+        );
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message.contains("cancelled")));
+        assert!(reply.state.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_invocation_stops_busy_worker() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let host = Arc::new(StartedHost(started.clone()));
+        let weak_host = Arc::downgrade(&host);
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let watchdog_cancel = cancellation.clone();
+        let (stop_watchdog, watchdog_stopped) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if watchdog_stopped
+                .recv_timeout(Duration::from_secs(3))
+                .is_err()
+            {
+                watchdog_cancel.cancel();
+            }
+        });
+        let script = tokio::spawn(async move {
+            ScriptTool { timeout: None }
+                .invoke_transaction(
+                    json!({"code":"await tools.started({}); while (true) {}"}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation,
+                    },
+                    None,
+                    host,
+                )
+                .await
+        });
+        started.notified().await;
+        script.abort();
+        let _ = script.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak_host.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker kept running after invocation was dropped");
+        let _ = stop_watchdog.send(());
+        watchdog.join().unwrap();
+    }
+    #[tokio::test]
+    async fn explicit_host_deadline_interrupts_busy_script() {
+        let reply = ScriptTool { timeout: None }
+            .invoke_transaction_with_timeout(
+                json!({"code":"while (true) {}"}),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: Default::default(),
+                },
+                None,
+                Arc::new(Host),
+                Some(Duration::from_millis(20)),
+            )
+            .await;
+        assert!(matches!(reply.outcome, Outcome::Failed(_)));
     }
     #[test]
     fn scripts_call_tools_and_commit_private_store_without_io_globals() {
@@ -982,6 +1220,76 @@ mod tests {
                 .contains("could not be saved")
         );
         assert_eq!(value["content"][1]["type"], "image");
+    }
+
+    struct DeadlineModel;
+    #[async_trait::async_trait]
+    impl pi_rs_core::Model for DeadlineModel {
+        async fn stream(
+            &self,
+            request: ModelRequest,
+        ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+            use pi_rs_core::{Message, ModelEvent, ToolCall};
+            let events = if let Some(content) = request.messages.iter().find_map(|message| {
+                if let Message::Tool { content, .. } = message {
+                    Some(content)
+                } else {
+                    None
+                }
+            }) {
+                assert!(
+                    content.contains("error")
+                        || content.contains("timed out")
+                        || content.contains("interrupt"),
+                    "{content}"
+                );
+                vec![
+                    Ok(ModelEvent::Text("done".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ]
+            } else {
+                vec![Ok(ModelEvent::Complete {
+                    calls: vec![ToolCall {
+                        id: "deadline".into(),
+                        name: "codemode".into(),
+                        arguments: json!({"code":"while (true) {}"}).to_string(),
+                    }],
+                    usage: None,
+                })]
+            };
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn public_sdk_explicit_timeouts_interrupt_busy_scripts() {
+        for explicit_limits in [false, true] {
+            // Keep the original public struct literal and Duration field usable.
+            let extension = Codemode {
+                only: false,
+                inline_budget: 3000,
+                timeout: if explicit_limits {
+                    Duration::MAX
+                } else {
+                    Duration::from_millis(20)
+                },
+            };
+            let mut builder = pi_rs_core::SessionBuilder::new(Arc::new(DeadlineModel), "fixture")
+                .extension(Arc::new(extension))
+                .unwrap();
+            if explicit_limits {
+                builder = builder.limits(pi_rs_core::Limits {
+                    tool_timeout: Duration::from_millis(20),
+                    ..Default::default()
+                });
+            }
+            let mut session = builder.in_memory().unwrap();
+            assert_eq!(session.prompt("test").await.unwrap(), "done");
+            session.close().await.unwrap();
+        }
     }
 
     struct LargeImageModel;
