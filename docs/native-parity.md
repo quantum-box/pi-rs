@@ -614,7 +614,10 @@ CLI fixtures verify file read/write and shell execution through scripts,
 private-store persistence across processes, and default MCP discovery and
 execution. Tests cover rollback, interruption, memory/stack limits, output
 truncation and parallel script calls through the core execution host. The
-native JSON code argument differs from Pi's provider-specific raw-code input.
+first-line `@options` parser accepts indented directives and zero output tokens,
+rejects unsupported or invalid fields and misplaced directives, and preserves
+script line numbers. The native JSON code argument differs from Pi's
+provider-specific raw-code input.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
 ### Resource selection checkpoint
