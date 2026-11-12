@@ -346,6 +346,15 @@ impl Agent<'_> {
                 observer,
             )
             .await;
+            self.observe_lifecycle(
+                crate::LifecycleEvent::AgentSettled {
+                    aborted: matches!(state, RunState::Cancelled),
+                },
+                &session.extension_states(),
+                None,
+                observer,
+            )
+            .await;
         }
         result
     }

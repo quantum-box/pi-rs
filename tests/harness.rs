@@ -21,6 +21,100 @@ struct Script {
 
 struct CompactionObserver(Arc<Mutex<Vec<serde_json::Value>>>);
 
+struct SettlementObserver(Arc<Mutex<Vec<serde_json::Value>>>);
+
+#[async_trait::async_trait]
+impl Extension for SettlementObserver {
+    fn id(&self) -> &str {
+        "settlement-observer"
+    }
+    fn handles_lifecycle(&self) -> bool {
+        true
+    }
+    async fn lifecycle(
+        &self,
+        event: &LifecycleEvent,
+        _: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        if matches!(
+            event,
+            LifecycleEvent::AgentStart { .. }
+                | LifecycleEvent::AgentEnd { .. }
+                | LifecycleEvent::AgentSettled { .. }
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn extension_observes_agent_settled_after_success_and_cancellation() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(SettlementObserver(events.clone())))
+        .unwrap();
+    let tool = Arc::new(Fixture {
+        called: AtomicUsize::new(0),
+        hold: true,
+        effects: Mutex::new(BTreeMap::new()),
+    });
+    registry.register(Arc::new(Tools(tool))).unwrap();
+    let model = Script::new(vec![answer("done"), tool_reply(&[r#"{"id":"x"}"#])]);
+    let agent = agent(&model, &registry);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let cancellation = cancel.clone();
+    let task = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancellation.cancel();
+    };
+    let (result, ()) = tokio::join!(
+        agent.run(
+            &mut session,
+            Some("cancel".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore
+        ),
+        task
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+    let events = events.lock().unwrap();
+    let types: Vec<_> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "agent_start",
+            "agent_end",
+            "agent_settled",
+            "agent_start",
+            "agent_end",
+            "agent_settled"
+        ]
+    );
+    assert_eq!(events[2]["aborted"], false);
+    assert_eq!(events[5]["aborted"], true);
+}
+
 #[async_trait::async_trait]
 impl Extension for CompactionObserver {
     fn id(&self) -> &str {
