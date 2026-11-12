@@ -2135,7 +2135,24 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         if from_env {
             command.env("http_proxy", &proxy);
         }
-        let output = command.output().unwrap();
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "{provider}: CLI timed out; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = child.wait_with_output().unwrap();
         let (request, headers) = server.join().unwrap_or_else(|_| {
             panic!(
                 "{provider}: proxy server failed; status: {}; stderr: {}",
