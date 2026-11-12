@@ -342,7 +342,17 @@ fn gemini_major(id: &str) -> Option<u32> {
     let id = id.to_ascii_lowercase();
     let version = id.strip_prefix("gemini-")?;
     let version = version.strip_prefix("live-").unwrap_or(version);
-    version.split(['.', '-']).next()?.parse().ok()
+    version
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(None, |value: Option<u32>, digit| {
+            Some(
+                value
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add((digit - b'0') as u32),
+            )
+        })
 }
 
 /// Whether the model expects call IDs in both function calls and their responses.
@@ -805,8 +815,11 @@ mod tests {
             ("gemini-2.5-flash", false),
             ("Gemini-2.5-flash", false),
             ("GeMiNi-LiVe-2.5-flash", false),
+            ("gemini-2_flash", false),
+            ("GEMINI-LIVE-2extra", false),
             ("gemini-3-pro-preview", true),
             ("GeMiNi-3-pro-preview", true),
+            ("gemini-3_flash", true),
             ("claude-sonnet-4", true),
             ("other-model", true),
         ] {
@@ -883,6 +896,32 @@ mod tests {
             assert!(!output.contains("YWJj"));
             assert!(!output.contains("ZGVm"));
         }
+    }
+
+    #[test]
+    fn gemini_major_accepts_leading_digits_before_any_suffix() {
+        for (id, expected) in [
+            ("gemini-2_flash", Some(2)),
+            ("GEMINI-LIVE-03preview", Some(3)),
+            ("gemini-12abc", Some(12)),
+            ("gemini-0000000000000000000002x", Some(2)),
+            ("gemini-9999999999999999999999x", Some(u32::MAX)),
+            ("gemini-_2", None),
+            ("gemini-live-", None),
+            ("gemini-live2", None),
+        ] {
+            assert_eq!(gemini_major(id), expected, "{id}");
+        }
+        assert_eq!(
+            model_thinking_levels("gemini-3_flash"),
+            model_thinking_levels("gemini-3-flash")
+        );
+        assert_eq!(
+            thinking_config("gemini-3_flash", Some("low"), 1024),
+            thinking_config("gemini-3-flash", Some("low"), 1024)
+        );
+        assert_eq!(model_thinking_levels("gemini-2_flash"), vec!["off"]);
+        assert_eq!(thinking_config("gemini-2_flash", Some("low"), 1024), None);
     }
 
     #[test]
