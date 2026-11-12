@@ -882,7 +882,14 @@ impl Picker {
             return Input::Continue;
         }
         if keys.matches("tui.editor.deleteCharBackward", key) {
-            self.query.pop();
+            if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
+                self.query.truncate(index);
+            }
+            self.selected = 0;
+            return Input::Continue;
+        }
+        if keys.matches("tui.editor.deleteWordBackward", key) {
+            self.query.truncate(previous_word_start(&self.query));
             self.selected = 0;
             return Input::Continue;
         }
@@ -1242,6 +1249,52 @@ impl Picker {
     }
 }
 
+fn previous_word_start(text: &str) -> usize {
+    let segmenter = icu_segmenter::WordSegmenter::new_dictionary(Default::default());
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (end, word_type) in segmenter.segment_str(text).iter_with_word_type() {
+        if end > start {
+            // ICU4X can classify Hebrew word segments as None even when
+            // Intl.Segmenter reports them as word-like.
+            let word_like =
+                word_type.is_word_like() || text[start..end].chars().any(char::is_alphanumeric);
+            segments.push((start, end, word_like));
+        }
+        start = end;
+    }
+    while segments
+        .last()
+        .is_some_and(|&(start, end, _)| text[start..end].chars().all(char::is_whitespace))
+    {
+        segments.pop();
+    }
+    let Some(&(start, end, word_like)) = segments.last() else {
+        return 0;
+    };
+    if word_like {
+        text[start..end]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`".contains(*c))
+            .map_or(start, |(i, c)| {
+                let after = start + i + c.len_utf8();
+                // A word-like segment can end in punctuation (e.g. Hebrew
+                // apostrophe). Deleting from its end would leave it stuck.
+                if after == end { start + i } else { after }
+            })
+    } else {
+        segments
+            .iter()
+            .rev()
+            .take_while(|&&(start, end, word_like)| {
+                !word_like && !text[start..end].chars().all(char::is_whitespace)
+            })
+            .last()
+            .map_or(start, |&(start, _, _)| start)
+    }
+}
+
 fn format_label_timestamp(timestamp: &str) -> String {
     use chrono::{Datelike, Local};
     let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
@@ -1403,6 +1456,84 @@ fn truncate(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_deletes_words_at_unicode_and_punctuation_boundaries() {
+        let mut picker = Picker::new("Choose", vec![]);
+        let keys = Keys::default();
+        picker.paste("alpha café-file  ");
+        let delete_word = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        picker.input(delete_word, &keys);
+        assert_eq!(picker.query, "alpha café-");
+        picker.input(delete_word, &keys);
+        assert_eq!(picker.query, "alpha café");
+        picker.input(delete_word, &keys);
+        assert_eq!(picker.query, "alpha ");
+        picker.paste("e\u{301}");
+        picker.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &keys);
+        assert_eq!(picker.query, "alpha ");
+    }
+
+    #[test]
+    fn search_deletes_dictionary_segmented_words() {
+        let keys = Keys::default();
+        let delete = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        for (query, expected, next) in [
+            ("東京大学", "東京", ""),
+            ("中华人民共和国", "中华人民", "中华"),
+            ("ภาษาไทย", "ภาษา", ""),
+        ] {
+            let mut picker = Picker::new("Choose", vec![]);
+            picker.paste(query);
+            picker.input(delete, &keys);
+            assert_eq!(picker.query, expected, "first deletion from {query}");
+            picker.input(delete, &keys);
+            assert_eq!(picker.query, next, "second deletion from {query}");
+        }
+    }
+
+    #[test]
+    fn search_word_deletion_progresses_past_hebrew_apostrophes() {
+        let keys = Keys::default();
+        let delete = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        for (query, expected) in [
+            ("אב'", vec!["אב", ""]),
+            ("אב'ג", vec!["אב'", "אב", ""]),
+            ("אב'  ", vec!["אב", ""]),
+        ] {
+            let mut picker = Picker::new("Choose", vec![]);
+            picker.paste(query);
+            for remaining in expected {
+                let previous_len = picker.query.len();
+                picker.input(delete, &keys);
+                assert_eq!(
+                    picker.query, remaining,
+                    "deleting from {query:?} at length {previous_len}"
+                );
+                assert!(picker.query.len() < previous_len);
+            }
+            picker.input(delete, &keys);
+            assert!(picker.query.is_empty());
+        }
+    }
+
+    #[test]
+    fn session_search_word_deletion_does_not_start_session_deletion() {
+        let mut picker = Picker::sessions(
+            vec![Item {
+                label: "first second".into(),
+                selection: Selection::Resume("other".into()),
+            }],
+            "active".into(),
+            Default::default(),
+        );
+        picker.paste("first second");
+        assert_eq!(picker.matches().len(), 1);
+        let keys = Keys::default();
+        picker.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT), &keys);
+        assert_eq!(picker.query, "first ");
+        assert!(picker.session_action.is_none());
+    }
 
     #[test]
     fn mouse_selects_and_activates_visible_items_and_wheel_clamps() {
