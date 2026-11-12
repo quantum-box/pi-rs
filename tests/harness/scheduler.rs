@@ -5441,3 +5441,6 @@ async fn failed_earlier_pre_tool_hook_prevents_later_read_start() {
 async fn failed_later_pre_tool_hook_prevents_earlier_group_dispatch() {
     failed_group_preparation_case(2).await;
 }
+
+#[path = "rereview.rs"]
+mod rereview;

@@ -12,6 +12,14 @@ pub(super) enum TurnPreparation {
     Skipped(String),
 }
 
+enum TurnNormalized {
+    Ready {
+        tool: Arc<RegisteredTool>,
+        args: serde_json::Value,
+    },
+    Skipped(String),
+}
+
 impl Agent<'_> {
     async fn turn_poll(
         registry: &Registry,
@@ -66,14 +74,13 @@ impl Agent<'_> {
         }
     }
 
-    pub(super) async fn turn_prepare(
+    async fn turn_normalize(
         registry: &Registry,
         tool_timeout: Duration,
         invocation: &Invocation,
         advertised: &HashSet<String>,
-        states: &ExtensionStates,
         cancel: &CancellationToken,
-    ) -> Result<TurnPreparation> {
+    ) -> Result<TurnNormalized> {
         let call = &invocation.call;
         let Some(tool) = registry
             .tools
@@ -81,34 +88,50 @@ impl Agent<'_> {
             .filter(|_| advertised.contains(&call.name))
             .cloned()
         else {
-            return Ok(TurnPreparation::Skipped(
+            return Ok(TurnNormalized::Skipped(
                 "tool is not registered or advertised".into(),
             ));
         };
         let args = match crate::parse_tool_arguments(&call.arguments) {
             Ok(arguments) => arguments,
             Err(error) => {
-                return Ok(TurnPreparation::Skipped(format!(
+                return Ok(TurnNormalized::Skipped(format!(
                     "Invalid arguments for tool \"{}\": {error}",
                     call.name
                 )));
             }
         };
-        let mut args = tokio::select! {
+        let args = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
             result = tokio::time::timeout(tool_timeout, tool.tool.prepare_arguments(args)) => match result {
                 Ok(Ok(arguments)) if arguments.to_string().len() <= 16 * 1024 * 1024 => arguments,
-                Ok(Ok(_)) => return Ok(TurnPreparation::Skipped("prepared arguments exceed size limit".into())),
-                Ok(Err(error)) => return Ok(TurnPreparation::Skipped(format!("argument preparation failed: {error}"))),
-                Err(_) => return Ok(TurnPreparation::Skipped("argument preparation timed out".into())),
+                Ok(Ok(_)) => return Ok(TurnNormalized::Skipped("prepared arguments exceed size limit".into())),
+                Ok(Err(error)) => return Ok(TurnNormalized::Skipped(format!("argument preparation failed: {error}"))),
+                Err(_) => return Ok(TurnNormalized::Skipped("argument preparation timed out".into())),
             },
         };
         if !tool.validator.is_valid(&args) {
-            return Ok(TurnPreparation::Skipped(
+            return Ok(TurnNormalized::Skipped(
                 "arguments do not match the tool's JSON Schema".into(),
             ));
         }
+        Ok(TurnNormalized::Ready { tool, args })
+    }
+
+    async fn turn_finish_preparation(
+        registry: &Registry,
+        tool_timeout: Duration,
+        invocation: &Invocation,
+        normalized: TurnNormalized,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+    ) -> Result<TurnPreparation> {
+        let (tool, mut args) = match normalized {
+            TurnNormalized::Ready { tool, args } => (tool, args),
+            TurnNormalized::Skipped(reason) => return Ok(TurnPreparation::Skipped(reason)),
+        };
+        let call = &invocation.call;
         let cancellation = cancel.child_token();
         let guard = cancellation.clone().drop_guard();
         let context = ToolContext {
@@ -131,6 +154,28 @@ impl Agent<'_> {
             },
             Decision::Deny(reason) => TurnPreparation::Skipped(reason),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) async fn turn_prepare(
+        registry: &Registry,
+        tool_timeout: Duration,
+        invocation: &Invocation,
+        advertised: &HashSet<String>,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+    ) -> Result<TurnPreparation> {
+        let normalized =
+            Self::turn_normalize(registry, tool_timeout, invocation, advertised, cancel).await?;
+        Self::turn_finish_preparation(
+            registry,
+            tool_timeout,
+            invocation,
+            normalized,
+            states,
+            cancel,
+        )
+        .await
     }
 
     async fn turn_authorize(
@@ -294,6 +339,11 @@ struct TurnLane {
     active: usize,
 }
 enum TurnEvent {
+    Normalized(
+        usize,
+        Result<TurnNormalized>,
+        Vec<(String, &'static str, String)>,
+    ),
     Prepared(
         usize,
         Result<TurnPreparation>,
@@ -322,6 +372,21 @@ enum TurnEvent {
     ),
 }
 type TurnFuture = futures_util::future::BoxFuture<'static, TurnEvent>;
+
+async fn start_turn_future(mut future: TurnFuture) -> TurnFuture {
+    match futures_util::poll!(future.as_mut()) {
+        std::task::Poll::Ready(event) => futures_util::future::ready(event).boxed(),
+        std::task::Poll::Pending => future,
+    }
+}
+
+fn turn_poll_unsettled(call: &TurnCall) -> bool {
+    call.polled
+        && matches!(
+            call.phase,
+            TurnPhase::Polling | TurnPhase::Done(..) | TurnPhase::Transforming
+        )
+}
 
 fn turn_write_barrier(
     calls: &[TurnCall],
@@ -437,6 +502,7 @@ impl Agent<'_> {
         let mut writes = HashSet::<usize>::new();
         let mut lanes = HashMap::<Option<Uuid>, TurnLane>::new();
         let mut snapshots = HashMap::<Uuid, ReplySnapshot>::new();
+        let mut nested_groups = HashMap::<usize, (Vec<usize>, bool)>::new();
         let all_tools: HashSet<String> = self.registry.tools.keys().cloned().collect();
         let specs = Arc::new(self.registry.tool_specs());
         let mut first_error = None;
@@ -486,9 +552,13 @@ impl Agent<'_> {
                 root_groups.pop_front();
             }
             let fatal = first_error.is_some();
-            if fatal && let Some(group) = root_groups.front() {
-                for &index in group {
-                    if matches!(calls[index].phase, TurnPhase::Prepared(_)) {
+            if fatal {
+                for index in 0..calls.len() {
+                    let peer_read = calls[index].parallel
+                        && error_origin.is_some_and(|origin| {
+                            turn_is_started_peer_descendant(&calls, &positions, origin, index)
+                        });
+                    if matches!(calls[index].phase, TurnPhase::Prepared(_)) && !peer_read {
                         calls[index].phase =
                             TurnPhase::NotStarted("group preparation failed".into());
                     }
@@ -515,6 +585,7 @@ impl Agent<'_> {
                     break;
                 }
             }
+            let polling = calls.iter().any(turn_poll_unsettled);
             // A lane admits at most eight consecutive reads. A write closes the
             // current lane epoch until all earlier calls have settled.
             for (lane_id, lane) in &mut lanes {
@@ -557,6 +628,9 @@ impl Agent<'_> {
                         break;
                     }
                     let parallel = calls[index].parallel;
+                    if polling && !parallel {
+                        break;
+                    }
                     if turn_write_barrier(&calls, &positions, &writes, index) {
                         break;
                     }
@@ -566,7 +640,19 @@ impl Agent<'_> {
                     if lane.active != 0 && (!lane.parallel || !parallel) {
                         break;
                     }
-                    if lane.active >= 8 {
+                    let preparing_count = lane
+                        .calls
+                        .iter()
+                        .filter(|&&item| {
+                            matches!(
+                                calls[item].phase,
+                                TurnPhase::Preparing | TurnPhase::Prepared(_)
+                            )
+                        })
+                        .count();
+                    if (lane_id.is_none() && lane.active >= 8)
+                        || (lane_id.is_some() && preparing_count >= 8)
+                    {
                         break;
                     }
                     lane.active += 1;
@@ -598,8 +684,8 @@ impl Agent<'_> {
                             let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(), event, message.to_owned())); };
                             tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify(&registry, event, &state_snapshot, model_timeout, &mut collect) => {} }
                         }
-                        let result = Self::turn_prepare(&registry, tool_timeout, &invocation, &advertised, &state_snapshot, &cancel).await;
-                        TurnEvent::Prepared(index, result, errors)
+                        let result = Self::turn_normalize(&registry, tool_timeout, &invocation, &advertised, &cancel).await;
+                        TurnEvent::Normalized(index, result, errors)
                     }.boxed());
                     if !parallel {
                         break;
@@ -608,9 +694,10 @@ impl Agent<'_> {
             }
             if !fatal
                 && let Some(group) = root_groups.front()
-                && group
-                    .iter()
-                    .all(|&index| matches!(calls[index].phase, TurnPhase::Prepared(_)))
+                && group.iter().all(|&index| {
+                    matches!(calls[index].phase, TurnPhase::Prepared(_))
+                        && (!polling || calls[index].parallel)
+                })
             {
                 for &index in group {
                     let TurnPhase::Prepared(prepared) =
@@ -621,6 +708,75 @@ impl Agent<'_> {
                     futures.push(
                         futures_util::future::ready(TurnEvent::Begin(index, prepared)).boxed(),
                     );
+                }
+            }
+            // A submitted batch is authorized together, but available read
+            // slots may be filled gradually while other reads are active.
+            let group_ids: Vec<usize> = nested_groups.keys().copied().collect();
+            for id in group_ids {
+                let (group, ready) = nested_groups.get_mut(&id).expect("nested group");
+                if !*ready
+                    && group
+                        .iter()
+                        .all(|&index| matches!(calls[index].phase, TurnPhase::Prepared(_)))
+                {
+                    *ready = true;
+                }
+                if !*ready {
+                    continue;
+                }
+                while let Some(&index) = group.first() {
+                    let peer_read = calls[index].parallel
+                        && error_origin.is_some_and(|origin| {
+                            turn_is_started_peer_descendant(&calls, &positions, origin, index)
+                        });
+                    if (fatal && !peer_read) || (polling && !calls[index].parallel) {
+                        break;
+                    }
+                    let lane = lanes.get(&calls[index].lane).expect("turn lane");
+                    if lane
+                        .calls
+                        .iter()
+                        .take_while(|&&item| item != index)
+                        .any(|&item| {
+                            matches!(
+                                calls[item].phase,
+                                TurnPhase::Queued | TurnPhase::Preparing | TurnPhase::Prepared(_)
+                            )
+                        })
+                    {
+                        break;
+                    }
+                    let running = lane
+                        .calls
+                        .iter()
+                        .filter(|&&item| {
+                            matches!(
+                                calls[item].phase,
+                                TurnPhase::Starting
+                                    | TurnPhase::Running
+                                    | TurnPhase::Done(..)
+                                    | TurnPhase::Transforming
+                                    | TurnPhase::Notifying
+                                    | TurnPhase::Polling
+                            )
+                        })
+                        .count();
+                    if running >= 8 {
+                        break;
+                    }
+                    group.remove(0);
+                    let TurnPhase::Prepared(prepared) =
+                        std::mem::replace(&mut calls[index].phase, TurnPhase::Starting)
+                    else {
+                        unreachable!()
+                    };
+                    futures.push(
+                        futures_util::future::ready(TurnEvent::Begin(index, prepared)).boxed(),
+                    );
+                }
+                if group.is_empty() {
+                    nested_groups.remove(&id);
                 }
             }
             let skipped = lanes
@@ -679,39 +835,39 @@ impl Agent<'_> {
                 let invocation = calls[index].invocation.clone();
                 let cancel = calls[index].cancellation.clone();
                 let timeout = self.limits.tool_timeout;
-                futures.push(
-                    async move {
-                        let mut errors = Vec::new();
-                        let mut collect = |event: Notification<'_>| {
-                            if let Notification::ExtensionLifecycleError {
-                                extension,
-                                event,
-                                message,
-                            } = event
-                            {
-                                errors.push((extension.to_owned(), event, message.to_owned()));
-                            }
-                        };
-                        Self::turn_transform(
-                            &registry,
-                            timeout,
-                            &invocation,
-                            &mut reply,
-                            &snapshot,
-                            &cancel,
-                            &mut collect,
-                        )
-                        .await;
-                        TurnEvent::Transformed(index, reply, duration, errors)
-                    }
-                    .boxed(),
-                );
+                let future = async move {
+                    let mut errors = Vec::new();
+                    let mut collect = |event: Notification<'_>| {
+                        if let Notification::ExtensionLifecycleError {
+                            extension,
+                            event,
+                            message,
+                        } = event
+                        {
+                            errors.push((extension.to_owned(), event, message.to_owned()));
+                        }
+                    };
+                    Self::turn_transform(
+                        &registry,
+                        timeout,
+                        &invocation,
+                        &mut reply,
+                        &snapshot,
+                        &cancel,
+                        &mut collect,
+                    )
+                    .await;
+                    TurnEvent::Transformed(index, reply, duration, errors)
+                }
+                .boxed();
+                futures.push(start_turn_future(future).await);
             }
             if lanes.values().all(|lane| lane.calls.is_empty()) {
                 break;
             }
             tokio::select! {
                 Some(batch) = incoming.recv() => {
+                    let mut group_indices = Vec::new();
                     for request in batch {
                         let operation_id = Uuid::new_v4();
                         let invocation = Invocation { operation_id, call: crate::ToolCall { id: operation_id.to_string(), name: request.name, arguments: request.arguments.to_string() } };
@@ -723,24 +879,48 @@ impl Agent<'_> {
                         snapshots.insert(invocation.operation_id, request.snapshot);
                         calls.push(TurnCall { parallel: self.registry.tools.get(&invocation.call.name).is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead), polled: false, invocation, parent, lane, cancellation: request.cancellation, depth: request.depth, call_count: request.call_count, reply: Some(request.reply), phase: TurnPhase::Queued });
                         lanes.entry(lane).or_default().calls.push_back(index);
+                        group_indices.push(index);
+                    }
+                    let mut start = 0;
+                    while start < group_indices.len() {
+                        let mut end = start + 1;
+                        if calls[group_indices[start]].parallel {
+                            while end < group_indices.len() && end - start < 8 && calls[group_indices[end]].parallel { end += 1; }
+                        }
+                        let group = group_indices[start..end].to_vec();
+                        nested_groups.insert(group[0], (group, false));
+                        start = end;
                     }
                 },
                 Some(event) = futures.next() => match event {
+                    TurnEvent::Normalized(index, normalized, errors) => {
+                        for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
+                        match normalized {
+                            Err(error) => { let reason = error.to_string(); record_turn_error(&mut first_error, &mut error_origin, index, error); calls[index].phase = TurnPhase::NotStarted(reason); }
+                            Ok(normalized) => {
+                                let registry = self.registry.clone(); let snapshot = states.clone();
+                                let invocation = calls[index].invocation.clone(); let cancel = calls[index].cancellation.clone(); let timeout = self.limits.tool_timeout;
+                                let future = async move {
+                                    let result = Self::turn_finish_preparation(&registry, timeout, &invocation, normalized, &snapshot, &cancel).await;
+                                    TurnEvent::Prepared(index, result, Vec::new())
+                                }.boxed();
+                                futures.push(start_turn_future(future).await);
+                            }
+                        }
+                    }
                     TurnEvent::Prepared(index, prepared, errors) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
                         match prepared {
                             Err(error) => { let reason = error.to_string(); record_turn_error(&mut first_error, &mut error_origin, index, error); calls[index].phase = TurnPhase::NotStarted(reason); }
-                            Ok(prepared) => {
-                                if calls[index].lane.is_none() {
-                                    calls[index].phase = TurnPhase::Prepared(prepared);
-                                } else {
-                                    calls[index].phase = TurnPhase::Starting;
-                                    futures.push(futures_util::future::ready(TurnEvent::Begin(index, prepared)).boxed());
-                                }
-                            }
+                            Ok(prepared) => { calls[index].phase = TurnPhase::Prepared(prepared); }
                         }
                     }
                     TurnEvent::Begin(index, prepared) => {
+                                if !calls[index].parallel && calls.iter().any(turn_poll_unsettled) {
+                                    calls[index].phase = TurnPhase::Prepared(prepared);
+                                    if calls[index].lane.is_some() { nested_groups.insert(index, (vec![index], true)); }
+                                    continue;
+                                }
                                 if calls[index].cancellation.is_cancelled() {
                                     record_turn_error(&mut first_error, &mut error_origin, index, Error::Cancelled);
                                     calls[index].phase = TurnPhase::NotStarted("cancelled before dispatch".into());
@@ -876,5 +1056,30 @@ impl Agent<'_> {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn first_poll_happens_before_a_foreign_commit() {
+        let state = Arc::new(AtomicUsize::new(0));
+        let observed = state.clone();
+        let (release, wait) = oneshot::channel::<()>();
+        let future = async move {
+            let at_start = observed.load(Ordering::SeqCst);
+            let _ = wait.await;
+            TurnEvent::Notified(0, Outcome::Succeeded(at_start.to_string()), Vec::new())
+        }
+        .boxed();
+        let future = start_turn_future(future).await;
+        state.store(1, Ordering::SeqCst);
+        let _ = release.send(());
+        assert!(
+            matches!(future.await, TurnEvent::Notified(_, Outcome::Succeeded(value), _) if value == "0")
+        );
     }
 }
