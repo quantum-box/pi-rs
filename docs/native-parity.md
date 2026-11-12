@@ -295,6 +295,10 @@ remaining feature rows above still need their own acceptance checks.
 
 ### Faithful terminal checkpoint
 
+Markdown lists preserve the reference spacing between items in loose lists
+with direct text paragraphs, including nested lists, while tight lists remain
+compact. Lists containing only block elements still need comparison.
+
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
 automatic detection; tmux is probed for its `hyperlinks` terminal feature.
