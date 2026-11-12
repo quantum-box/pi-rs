@@ -21,7 +21,7 @@ enum TurnNormalized {
 }
 
 impl Agent<'_> {
-    async fn turn_poll_normalize(
+    pub(super) async fn turn_poll_normalize(
         registry: &Registry,
         timeout: Duration,
         invocation: &Invocation,
@@ -47,7 +47,7 @@ impl Agent<'_> {
         Ok((tool, args))
     }
 
-    async fn turn_poll_authorize_and_run(
+    pub(super) async fn turn_poll_authorize_and_run(
         registry: &Registry,
         timeout: Duration,
         invocation: &Invocation,
@@ -86,7 +86,7 @@ impl Agent<'_> {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(timeout, authorize) => result.map_err(|_| Error::Config("pre-tool hooks timed out".into()))??,
+            result = tokio::time::timeout(timeout, authorize) => result.map_err(|_| pending())??,
         }
         tokio::select! {
             biased;

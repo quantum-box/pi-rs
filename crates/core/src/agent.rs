@@ -1191,44 +1191,23 @@ impl Agent<'_> {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let operation_id = invocation.operation_id;
-            let tool = self
-                .registry
-                .tools
-                .get(&invocation.call.name)
-                .ok_or(Error::PendingOperation(operation_id))?;
-            if !tool.tool.can_poll() {
-                return Err(Error::PendingOperation(operation_id));
-            }
-            let arguments = crate::parse_tool_arguments(&invocation.call.arguments)
-                .map_err(|_| Error::PendingOperation(operation_id))?;
-            let arguments = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.prepare_arguments(arguments)) =>
-                    result.ok().and_then(std::result::Result::ok).ok_or(Error::PendingOperation(operation_id))?,
-            };
-            if arguments.to_string().len() > 16 * 1024 * 1024
-                || !tool.validator.is_valid(&arguments)
-            {
-                return Err(Error::PendingOperation(operation_id));
-            }
-            let context = ToolContext {
-                operation_id,
-                cancellation: cancel.child_token(),
-            };
-            if self
-                .authorize(&invocation.call.name, &arguments, &context, states)
-                .await?
-                != Decision::Allow
-            {
-                return Err(Error::PendingOperation(operation_id));
-            }
-            let outcome = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.poll(&reference, context)) => result.ok().flatten().ok_or(Error::PendingOperation(operation_id))?,
-            };
+            let prepared = Self::turn_poll_normalize(
+                self.registry,
+                self.limits.tool_timeout,
+                &invocation,
+                cancel,
+            )
+            .await?;
+            let outcome = Self::turn_poll_authorize_and_run(
+                self.registry,
+                self.limits.tool_timeout,
+                &invocation,
+                &reference,
+                prepared,
+                states,
+                cancel,
+            )
+            .await?;
             let mut reply = outcome.into();
             self.transform_tool_result(&invocation, &mut reply, states, cancel, observer)
                 .await;
@@ -1390,27 +1369,6 @@ impl Agent<'_> {
             }
         }
         Ok(changes)
-    }
-
-    async fn authorize(
-        &self,
-        name: &str,
-        args: &serde_json::Value,
-        context: &ToolContext,
-        states: &ExtensionStates,
-    ) -> Result<Decision> {
-        for extension in &self.registry.extensions {
-            let decision = hook(
-                extension.as_ref(),
-                extension
-                    .before_tool(name, args, context, states.get(extension.id()))
-                    .await,
-            )?;
-            if decision != Decision::Allow {
-                return Ok(decision);
-            }
-        }
-        Ok(Decision::Allow)
     }
 
     /// Execute a discovered slash command before treating input as model text.
