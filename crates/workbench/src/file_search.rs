@@ -278,12 +278,11 @@ fn read_context_line(
         let mut input = &buf[..count];
         loop {
             let (status, consumed, written, _) = decoder.decode_to_utf8(input, &mut decoded, last);
-            if decoded[..written].contains(&0) {
-                binary = true;
-                break;
-            }
+            let visible = &decoded[..written];
+            let nul = visible.iter().position(|&byte| byte == 0);
             if units.len() < 501 {
-                let text = std::str::from_utf8(&decoded[..written]).expect("decoded UTF-8");
+                let text =
+                    std::str::from_utf8(&visible[..nul.unwrap_or(written)]).expect("decoded UTF-8");
                 for ch in text.chars().filter(|&ch| ch != '\r' && ch != '\n') {
                     let mut encoded = [0u16; 2];
                     for &unit in ch.encode_utf16(&mut encoded).iter() {
@@ -295,6 +294,10 @@ fn read_context_line(
                         break;
                     }
                 }
+            }
+            if nul.is_some() {
+                binary = true;
+                break;
             }
             if status == CoderResult::InputEmpty {
                 break;
@@ -394,9 +397,9 @@ fn render_context(
         }
         let (line, has_bytes, newline, binary) =
             read_context_line(&mut reader, number, encoding, cancellation)?;
-        // Search treats decoded NUL as binary. Discard its entire line and
-        // everything after it, even if the match limit stopped search early.
-        if binary {
+        // Retain a reported match before NUL, but do not add an unrelated
+        // binary line or any subsequent lines to the context.
+        if binary && matches.binary_search(&number).is_err() {
             break;
         }
         if !has_bytes && number > 1 && !previous_newline {
@@ -409,7 +412,7 @@ fn render_context(
         prefix.long = prefix.long.saturating_add(u64::from(line.truncated));
         number = number.saturating_add(1);
         previous_newline = newline;
-        if !has_bytes {
+        if !has_bytes || binary {
             break;
         }
     }
@@ -444,11 +447,8 @@ fn render_context(
             let number = block.start + index;
             let (line, _, _, binary) =
                 read_context_line(&mut reader, number, encoding, cancellation)?;
-            if binary {
-                break;
-            }
             output.render(display, &line, number == center);
-            if output.prefix_full {
+            if binary || output.prefix_full {
                 break;
             }
         }
@@ -743,6 +743,79 @@ mod tests {
                 );
             }
             other => panic!("expected byte truncation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_keeps_a_searcher_reported_match_before_nul() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for text in [
+            "needle\0tail\n".to_owned(),
+            format!("needle{}\0tail\n", "x".repeat(9000)),
+        ] {
+            for bytes in [
+                text.as_bytes().to_vec(),
+                utf16_bytes(&text, true),
+                utf16_bytes(&text, false),
+            ] {
+                std::fs::write(file.path(), bytes).unwrap();
+                let mut output = Output {
+                    matches: 1,
+                    limit: 100,
+                    ..Output::default()
+                };
+                render_context(
+                    file.path(),
+                    "f",
+                    &[1],
+                    2,
+                    &mut output,
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+                let expected = if text.len() > 100 {
+                    format!("f:1: needle{}... [truncated]", "x".repeat(494))
+                } else {
+                    "f:1: needle".to_owned()
+                };
+                assert_eq!(output.lines, [expected.clone()]);
+                assert_eq!(output.total_lines, 1);
+                assert_eq!(output.total_bytes, expected.len() as u64);
+                assert_eq!(output.long_lines, text.len() > 100);
+            }
+        }
+    }
+
+    #[test]
+    fn reported_binary_boundary_match_is_counted_in_overlapping_blocks() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let text = "first match\nsecond match\0untrusted\nafter\n";
+        for bytes in [
+            text.as_bytes().to_vec(),
+            utf16_bytes(text, true),
+            utf16_bytes(text, false),
+        ] {
+            std::fs::write(file.path(), bytes).unwrap();
+            let mut output = Output {
+                matches: 2,
+                limit: 100,
+                ..Output::default()
+            };
+            render_context(
+                file.path(),
+                "f",
+                &[1, 2],
+                2,
+                &mut output,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            let expected =
+                "f:1: first match\nf-2- second match\nf-1- first match\nf:2: second match";
+            assert_eq!(output.lines.join("\n"), expected);
+            assert_eq!(output.total_lines, 4);
+            assert_eq!(output.total_bytes, expected.len() as u64);
+            assert!(!output.long_lines);
         }
     }
 
