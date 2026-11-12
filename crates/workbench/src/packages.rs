@@ -956,10 +956,18 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
         plain
             .iter()
             .flat_map(|pattern| {
+                let pattern = pattern.replace('\\', "/");
                 if pattern.contains(['*', '?', '[', '{']) {
-                    expand_prompt_glob(root, pattern)
+                    let mut matches = expand_prompt_glob(root, &pattern);
+                    if !pattern.trim_start_matches("./").contains('/') {
+                        let mut legacy = legacy_prompt_candidates(root, None);
+                        legacy.retain(|path| resource_matches(path, root, &pattern, false, true));
+                        legacy.sort();
+                        matches.extend(legacy);
+                    }
+                    matches
                 } else {
-                    vec![root.join(pattern)]
+                    vec![root.join(&pattern)]
                 }
             })
             .collect()
@@ -992,7 +1000,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     }
     // Exact force-includes may select a file outside the plain source entries.
     for path in overrides.iter().filter_map(|p| p.strip_prefix('+')) {
-        let path = root.join(path);
+        let path = root.join(path.replace('\\', "/"));
         paths.extend(legacy_prompt_candidates(root, Some(&path)));
     }
     if !overrides.is_empty() {
@@ -1073,6 +1081,10 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         .build()
         .flatten()
         .filter(|entry| {
+            // A directory symlink discovered by a wildcard is not a traversal root.
+            if entry.file_type().is_some_and(|kind| kind.is_symlink()) && entry.path().is_dir() {
+                return false;
+            }
             entry.path().strip_prefix(root).is_ok_and(|path| {
                 path.components()
                     .all(|c| !c.as_os_str().to_string_lossy().starts_with('.'))
@@ -1533,6 +1545,59 @@ mod tests {
         assert_eq!(
             discover("./prompts/[ab]/*.md"),
             vec![root.join("prompts/a/nested.md")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_legacy_basename_and_backslash_patterns_are_bounded() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(root.join("prompts/nested")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for file in [
+            "root.md",
+            "prompts/nested/review.md",
+            "prompts/nested/.hidden.md",
+            "prompts/nested/ignored.md",
+        ] {
+            std::fs::write(root.join(file), "fixture").unwrap();
+        }
+        std::fs::write(root.join(".ignore"), "ignored.md\n").unwrap();
+        std::fs::write(outside.join("external.md"), "outside").unwrap();
+        symlink(&outside, root.join("prompts/link")).unwrap();
+        symlink("/", root.join("unrelated.md")).unwrap();
+        let discover = |patterns| {
+            collect_package_resources(&root, &json!({"prompts": patterns}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        let mut basename = discover(json!(["*.md"]));
+        basename.sort();
+        assert_eq!(
+            basename,
+            vec![
+                root.join("prompts/nested/.hidden.md"),
+                root.join("prompts/nested/review.md"),
+                root.join("root.md")
+            ]
+        );
+        assert_eq!(
+            discover(json!([r"prompts\nested\*.md"])),
+            vec![
+                root.join("prompts/nested/ignored.md"),
+                root.join("prompts/nested/review.md")
+            ]
+        );
+        assert_eq!(
+            discover(json!([r"prompts\nested\review.md"])),
+            vec![root.join("prompts/nested/review.md")]
+        );
+        assert_eq!(
+            discover(json!(["root.md", r"+prompts\nested\review.md"])),
+            vec![root.join("root.md"), root.join("prompts/nested/review.md")]
         );
     }
 
