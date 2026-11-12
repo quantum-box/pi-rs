@@ -1777,6 +1777,8 @@ duplicating the converted journal records. Codemode store entries also continue
 to restore their branch-local state.
 Legacy `custom` and `hookMessage` message records likewise retain their display
 metadata and enter model context without being rendered as user prompts.
+Imported message-form branch summaries use Pi's summary context framing while
+retaining their original RPC representation and branch reference.
 
 Imported failed or aborted assistant messages retain their original transcript
 and failure status. Incomplete tool calls in those messages are not executed,
