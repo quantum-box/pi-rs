@@ -1165,6 +1165,11 @@ impl Agent<'_> {
         let observe_tools = self.registry.extensions.iter().any(|extension| {
             extension.handles_lifecycle() && extension.handles_tool_execution_lifecycle()
         });
+        let observe_progress = self.registry.extensions.iter().any(|extension| {
+            extension.handles_lifecycle()
+                && extension.handles_tool_execution_lifecycle()
+                && extension.handles_tool_execution_updates()
+        });
         let parallel = |inv: &Invocation| {
             self.registry
                 .tools
@@ -1267,7 +1272,7 @@ impl Agent<'_> {
                             depth: scope.depth,
                             call_count: scope.call_count.clone(),
                             ui: self.registry.ui.clone(),
-                            progress: observe_tools.then(|| ProgressReporter {
+                            progress: observe_progress.then(|| ProgressReporter {
                                 sender: updates.clone(),
                                 tool_call_id: invocation.call.id.clone(),
                                 tool_name: invocation.call.name.clone(),

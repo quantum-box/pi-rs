@@ -340,9 +340,12 @@ pub async fn notify(
                 }
                 LifecycleEvent::SessionTree { .. } => extension.handles_tree_navigation(),
                 LifecycleEvent::ToolExecutionStart { .. }
-                | LifecycleEvent::ToolExecutionUpdate { .. }
                 | LifecycleEvent::ToolExecutionEnd { .. } => {
                     extension.handles_tool_execution_lifecycle()
+                }
+                LifecycleEvent::ToolExecutionUpdate { .. } => {
+                    extension.handles_tool_execution_lifecycle()
+                        && extension.handles_tool_execution_updates()
                 }
                 _ => true,
             }

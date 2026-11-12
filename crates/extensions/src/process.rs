@@ -261,6 +261,8 @@ struct Description {
     #[serde(default)]
     tool_execution_lifecycle_hook: bool,
     #[serde(default)]
+    tool_execution_update_hook: bool,
+    #[serde(default)]
     model_selection_hook: bool,
     #[serde(default)]
     session_lifecycle_hook: bool,
@@ -538,6 +540,9 @@ impl Extension for ExecutableExtension {
     }
     fn handles_tool_execution_lifecycle(&self) -> bool {
         self.description.tool_execution_lifecycle_hook
+    }
+    fn handles_tool_execution_updates(&self) -> bool {
+        self.description.tool_execution_update_hook
     }
     fn handles_model_selection(&self) -> bool {
         self.description.model_selection_hook
@@ -1688,6 +1693,7 @@ async fn dispatch_with_host(
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
             tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
+            tool_execution_update_hook: extension.handles_tool_execution_updates(),
             model_selection_hook: extension.handles_model_selection(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
@@ -2033,6 +2039,9 @@ mod tests {
             fn handles_tool_execution_lifecycle(&self) -> bool {
                 true
             }
+            fn handles_tool_execution_updates(&self) -> bool {
+                true
+            }
             async fn lifecycle(
                 &self,
                 event: &LifecycleEvent,
@@ -2049,6 +2058,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(description["tool_execution_lifecycle_hook"], true);
+        assert_eq!(description["tool_execution_update_hook"], true);
         let request = ProtocolRequest::Lifecycle {
             event: LifecycleEvent::ToolExecutionStart {
                 tool_call_id: "call".into(),

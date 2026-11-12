@@ -508,6 +508,11 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in separately to tool execution update events.
+    fn handles_tool_execution_updates(&self) -> bool {
+        false
+    }
+
     /// Opt in to model and thinking-level selection events.
     fn handles_model_selection(&self) -> bool {
         false

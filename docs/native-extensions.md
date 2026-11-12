@@ -321,6 +321,9 @@ update and is not journaled. The v2 executable protocol negotiates support;
 new executables work with old hosts, where progress is ignored. Parallel calls
 currently emit end notifications in journal order after the batch settles;
 completion-order notifications and progress from built-in tools remain open.
+Observers opt into updates separately with `handles_tool_execution_updates`
+(`tool_execution_update_hook` for executable extensions), so older observers
+continue to receive only event types they understand.
 
 Executable extensions built with the current SDK advertise
 `pi_lifecycle_fields` and receive Pi's camelCase lifecycle and tree fields,

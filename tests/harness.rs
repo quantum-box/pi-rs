@@ -424,6 +424,9 @@ async fn sibling_progress_is_delivered_while_nested_tool_runs() {
         fn handles_tool_execution_lifecycle(&self) -> bool {
             true
         }
+        fn handles_tool_execution_updates(&self) -> bool {
+            true
+        }
         async fn lifecycle(
             &self,
             event: &LifecycleEvent,
@@ -545,6 +548,9 @@ async fn extensions_receive_tool_progress_before_tool_completion() {
         fn handles_tool_execution_lifecycle(&self) -> bool {
             true
         }
+        fn handles_tool_execution_updates(&self) -> bool {
+            true
+        }
         async fn lifecycle(
             &self,
             event: &LifecycleEvent,
@@ -560,8 +566,36 @@ async fn extensions_receive_tool_progress_before_tool_completion() {
             Ok(())
         }
     }
+    struct LegacyObserver(Arc<Mutex<Vec<Value>>>);
+    #[async_trait::async_trait]
+    impl Extension for LegacyObserver {
+        fn id(&self) -> &str {
+            "legacy-observer"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &LifecycleEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+            Ok(())
+        }
+    }
     let events = Arc::new(Mutex::new(Vec::new()));
+    let legacy_events = Arc::new(Mutex::new(Vec::new()));
     let mut registry = Registry::default();
+    registry
+        .register(Arc::new(LegacyObserver(legacy_events.clone())))
+        .unwrap();
     registry
         .register(Arc::new(ProgressExtension {
             tool: Arc::new(ProgressTool(Arc::new(tokio::sync::Notify::new()))),
@@ -601,6 +635,17 @@ async fn extensions_receive_tool_progress_before_tool_completion() {
     );
     assert_eq!(tool_events[2]["type"], "tool_execution_end");
     assert_eq!(tool_events[2]["isError"], false);
+    let legacy = legacy_events.lock().unwrap();
+    assert!(
+        !legacy
+            .iter()
+            .any(|event| event["type"] == "tool_execution_update")
+    );
+    assert!(
+        legacy
+            .iter()
+            .any(|event| event["type"] == "tool_execution_end")
+    );
 }
 
 #[tokio::test]
