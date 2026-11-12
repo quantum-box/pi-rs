@@ -2198,7 +2198,8 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
     listener.set_nonblocking(true).unwrap();
     let target = listener.local_addr().unwrap();
     let endpoint = format!("http://{target}/v1/chat/completions");
-    let server = std::thread::spawn(move || {
+    let (server_tx, server_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         loop {
             let (mut socket, mut reader, first) =
                 accept_proxy_request(listener.try_clone().unwrap());
@@ -2222,10 +2223,12 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
                     b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .unwrap();
-            return first;
+            let _ = server_tx.send(first);
+            return;
         }
     });
-    let _output = Command::new(env!("CARGO_BIN_EXE_pi"))
+    let stderr = tempfile::NamedTempFile::new().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", root.path())
         .env_remove("http_proxy")
         .env_remove("HTTP_PROXY")
@@ -2245,13 +2248,33 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
             "--print",
             "hello",
         ])
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr.reopen().unwrap()))
+        .spawn()
         .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if child.try_wait().unwrap().is_none() {
+        let _ = child.kill();
+        panic!(
+            "CLI timed out; stderr: {}",
+            String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
+        );
+    }
+    let status = child.wait().unwrap();
+    let request = server_rx
+        .recv_timeout(Duration::from_secs(75))
+        .unwrap_or_else(|error| {
+            panic!(
+                "direct server did not finish ({error}); status: {status}; stderr: {}",
+                String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
+            )
+        });
     assert!(
-        server
-            .join()
-            .unwrap()
-            .starts_with("POST /v1/chat/completions ")
+        request.starts_with("POST /v1/chat/completions "),
+        "{request}"
     );
 }
 
