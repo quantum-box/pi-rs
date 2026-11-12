@@ -618,8 +618,15 @@ impl ModelMetadata {
 }
 
 static BUILTIN_MODELS: LazyLock<BTreeMap<String, Vec<ConfiguredModel>>> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("../assets/builtin-chat-models.json"))
-        .expect("bundled Pi chat models")
+    let mut models: BTreeMap<String, Vec<ConfiguredModel>> =
+        serde_json::from_str(include_str!("../assets/builtin-chat-models.json"))
+            .expect("bundled Pi chat models");
+    models.insert(
+        "amazon-bedrock".into(),
+        serde_json::from_str(include_str!("../assets/bedrock-models.json"))
+            .expect("bundled Pi Bedrock models"),
+    );
+    models
 });
 
 impl Profiles {
@@ -1250,6 +1257,35 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+
+    #[test]
+    fn bedrock_application_profile_retains_configured_model_name() {
+        let id = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opaque";
+        let profiles = Profiles::parse(
+            &json!({"providers":{"amazon-bedrock":{"models":[{"id":id,"name":"Claude Sonnet"}]}}}),
+        )
+        .unwrap();
+        let provider = profiles.provider("amazon-bedrock").unwrap();
+        assert_eq!(
+            profiles.model(&provider, id).unwrap().name.as_deref(),
+            Some("Claude Sonnet")
+        );
+    }
+
+    #[test]
+    fn bedrock_catalog_exposes_pi_models_and_metadata_offline() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        let provider = profiles.provider("amazon-bedrock").unwrap();
+        assert_eq!(provider.adapter(), Adapter::Bedrock);
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .contains(&"amazon.nova-lite-v1:0".to_owned())
+        );
+        let model = profiles.model(&provider, "amazon.nova-lite-v1:0").unwrap();
+        assert_eq!(model.context_window, Some(300_000));
+        assert_eq!(model.max_tokens, Some(10_000));
+    }
 
     #[test]
     fn vercel_gateway_catalog_and_endpoint() {
