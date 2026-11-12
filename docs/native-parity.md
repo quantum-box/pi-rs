@@ -130,6 +130,9 @@ roots.
 Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID when present. Malformed JSON produces a `parse` response with a
 parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
+Model-list discovery runs independently of the RPC input loop, so a slow model
+endpoint does not block cancellation or other commands. Concurrent discovery
+requests are bounded and retain their individual response IDs.
 
 `set_model` checks the exact model ID against the selected provider's
 configured or discovered catalog before saving the selection. A missing
