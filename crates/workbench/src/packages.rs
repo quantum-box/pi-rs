@@ -958,14 +958,14 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
             .flat_map(|pattern| {
                 let pattern = pattern.replace('\\', "/");
                 if pattern.contains(['*', '?', '[', '{']) {
-                    let mut matches = expand_prompt_glob(root, &pattern);
                     if !pattern.trim_start_matches("./").contains('/') {
                         let mut legacy = legacy_prompt_candidates(root, None);
                         legacy.retain(|path| resource_matches(path, root, &pattern, false, true));
                         legacy.sort();
-                        matches.extend(legacy);
+                        legacy
+                    } else {
+                        expand_prompt_glob(root, &pattern)
                     }
-                    matches
                 } else {
                     vec![root.join(&pattern)]
                 }
@@ -1081,10 +1081,6 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         .build()
         .flatten()
         .filter(|entry| {
-            // A directory symlink discovered by a wildcard is not a traversal root.
-            if entry.file_type().is_some_and(|kind| kind.is_symlink()) && entry.path().is_dir() {
-                return false;
-            }
             entry.path().strip_prefix(root).is_ok_and(|path| {
                 path.components()
                     .all(|c| !c.as_os_str().to_string_lossy().starts_with('.'))
@@ -1599,6 +1595,45 @@ mod tests {
             discover(json!(["root.md", r"+prompts\nested\review.md"])),
             vec![root.join("root.md"), root.join("prompts/nested/review.md")]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_basename_glob_uses_only_unignored_files() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("archive.md")).unwrap();
+        std::fs::write(root.join("archive.md/inside.md"), "inside").unwrap();
+        symlink("/", root.join("archive.md/escape")).unwrap();
+        std::fs::write(root.join("private.md"), "private").unwrap();
+        std::fs::write(root.join("visible.md"), "visible").unwrap();
+        std::fs::write(root.join(".ignore"), "private.md\n").unwrap();
+        let prompts = collect_package_resources(root, &json!({"prompts": ["*.md"]}), Vec::new())
+            .unwrap()
+            .prompts;
+        assert_eq!(
+            prompts,
+            vec![root.join("archive.md/inside.md"), root.join("visible.md")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_path_glob_collects_selected_symlink_directory() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("review.md"), "fixture").unwrap();
+        symlink(&external, root.join("prompts/linked")).unwrap();
+        let prompts =
+            collect_package_resources(&root, &json!({"prompts": ["prompts/*"]}), Vec::new())
+                .unwrap()
+                .prompts;
+        assert_eq!(prompts, vec![root.join("prompts/linked/review.md")]);
     }
 
     #[cfg(unix)]
