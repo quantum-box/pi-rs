@@ -193,6 +193,8 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
     }
     let mut branches = BTreeMap::<String, Branch>::new();
     let mut previous = None;
+    let mut legacy_ids: Vec<String> = Vec::new();
+    let entry_count = entries.len();
     for (index, entry) in entries.into_iter().enumerate().skip(1) {
         importer.timestamp = entry["timestamp"].as_str().map(str::to_owned);
         let id = if version == 1 {
@@ -224,7 +226,36 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
                 .ok_or_else(|| Error::Session(format!("missing imported parent {parent}")))?,
             None => root.clone(),
         };
-        let events = convert(&entry, &mut branch, &branches)?;
+        // Pi v1 stored compaction boundaries as indices into the full file,
+        // including the session header. Later formats use entry IDs instead.
+        let mut converted_entry = None;
+        if version == 1
+            && entry["type"] == "compaction"
+            && let Some(kept_index) = entry["firstKeptEntryIndex"]
+                .as_u64()
+                .and_then(|i| usize::try_from(i).ok())
+        {
+            // The current entry already has an ID in Pi's migration. A later
+            // v1 entry has not been assigned one yet, so no earlier message
+            // is retained when it is selected as the boundary.
+            let target = if kept_index == index || (kept_index > index && kept_index < entry_count)
+            {
+                Some(&id)
+            } else {
+                kept_index.checked_sub(1).and_then(|i| legacy_ids.get(i))
+            };
+            if let Some(target) = target {
+                let mut migrated = entry.clone();
+                migrated["id"] = Value::String(id.clone());
+                migrated["firstKeptEntryId"] = Value::String(target.clone());
+                converted_entry = Some(migrated);
+            }
+        }
+        let events = convert(
+            converted_entry.as_ref().unwrap_or(&entry),
+            &mut branch,
+            &branches,
+        )?;
         importer.append(
             &mut branch,
             Event::SourceEntry {
@@ -249,6 +280,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             }
         }
         branches.insert(id.clone(), branch);
+        legacy_ids.push(id.clone());
         previous = Some(id);
     }
     Session::from_records(importer.records)
@@ -831,6 +863,71 @@ mod tests {
     use super::*;
     use pi_rs::Message;
     use serde_json::json;
+    #[test]
+    fn imports_v1_compaction_index_and_preserves_original_entry() {
+        let compaction = json!({"type":"compaction","firstKeptEntryIndex":2,"summary":"earlier"});
+        let session = import_pi(vec![
+            json!({"type":"session","version":1}),
+            json!({"type":"message","message":{"role":"user","content":"discarded"}}),
+            json!({"type":"message","message":{"role":"user","content":"retained"}}),
+            compaction.clone(),
+            json!({"type":"message","message":{"role":"user","content":"after"}}),
+        ])
+        .unwrap();
+        let messages = session.current_messages();
+        assert_eq!(
+            messages,
+            vec![
+                Message::User {
+                    content: "Prior conversation summary:\nearlier".into(),
+                },
+                Message::User {
+                    content: "retained".into()
+                },
+                Message::User {
+                    content: "after".into()
+                },
+            ]
+        );
+        assert!(session.records().iter().any(|record| matches!(
+            &record.event, Event::SourceEntry { entry, .. } if entry == &compaction
+        )));
+        let fork = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+        assert_eq!(fork.current_messages(), messages);
+    }
+
+    #[test]
+    fn v1_compaction_at_current_or_future_index_keeps_no_earlier_messages() {
+        for kept_index in [2, 3] {
+            let compaction =
+                json!({"type":"compaction","firstKeptEntryIndex":kept_index,"summary":"earlier"});
+            let session = import_pi(vec![
+                json!({"type":"session","version":1}),
+                json!({"type":"message","message":{"role":"user","content":"discarded"}}),
+                compaction.clone(),
+                json!({"type":"message","message":{"role":"user","content":"after"}}),
+            ])
+            .unwrap();
+            assert_eq!(
+                session.current_messages(),
+                vec![
+                    Message::User {
+                        content: "Prior conversation summary:\nearlier".into()
+                    },
+                    Message::User {
+                        content: "after".into()
+                    },
+                ]
+            );
+            assert!(session.records().iter().any(|record| matches!(
+                &record.event, Event::SourceEntry { entry, .. } if entry == &compaction
+            )));
+            let fork =
+                Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+            assert_eq!(fork.current_messages(), session.current_messages());
+        }
+    }
+
     #[test]
     fn imported_session_uuid_survives_export_and_fork_gets_a_new_id() {
         let id = Uuid::new_v4();
