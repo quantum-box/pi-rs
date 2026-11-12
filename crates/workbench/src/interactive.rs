@@ -491,6 +491,8 @@ struct StreamingTool {
     preview: Value,
 }
 
+type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
+
 #[derive(Default)]
 struct View {
     regular: RegularState,
@@ -519,7 +521,7 @@ struct View {
     expand_key: Option<crossterm::event::KeyEvent>,
     panel_rows: Vec<(std::ops::Range<usize>, TranscriptPanel)>,
     panel_press: Option<(TranscriptPanel, u16, u16)>,
-    link_rows: Vec<(u16, Vec<(std::ops::Range<usize>, String)>)>,
+    link_rows: Vec<LinkRow>,
     link_press: Option<(String, u16, u16)>,
     summarizing: bool,
     hide_thinking: bool,
