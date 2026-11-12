@@ -3310,6 +3310,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let frame_interval = Duration::from_millis(16);
     let mut last_frame = Instant::now() - frame_interval;
     let mut last_idle_interrupt: Option<Instant> = None;
+    let mut last_clear: Option<Instant> = None;
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     loop {
@@ -4575,17 +4576,8 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
                     "app.clear" => {
-                        if let Some(active) = worker.as_mut().filter(|active| active.busy) {
-                            let _ = active.send(json!({"type":"cancel"}));
-                        } else if view.editor.text.is_empty()
-                            && view.draft_images.is_empty()
-                            && view.clipboard.is_none()
-                        {
+                        if clear_editor_or_exit(&mut view, &mut last_clear, Instant::now()) {
                             break;
-                        } else {
-                            view.editor.take();
-                            view.draft_images.clear();
-                            view.clipboard = None;
                         }
                     }
                     "app.exit" => break,
@@ -6466,8 +6458,70 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+// Pi treats Ctrl+C as a timed pair, independent of agent activity and editor contents.
+fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: Instant) -> bool {
+    if last_clear
+        .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_millis(500))
+    {
+        return true;
+    }
+    view.editor.take();
+    view.draft_images.clear();
+    view.clipboard = None;
+    *last_clear = Some(now);
+    false
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clear_requires_two_presses_within_500_ms_even_when_empty() {
+        let mut view = super::View::default();
+        let mut last = None;
+        let now = std::time::Instant::now();
+        assert!(!super::clear_editor_or_exit(&mut view, &mut last, now));
+        assert!(super::clear_editor_or_exit(
+            &mut view,
+            &mut last,
+            now + std::time::Duration::from_millis(499)
+        ));
+        assert!(!super::clear_editor_or_exit(
+            &mut view,
+            &mut last,
+            now + std::time::Duration::from_millis(500)
+        ));
+        assert!(super::clear_editor_or_exit(
+            &mut view,
+            &mut last,
+            now + std::time::Duration::from_millis(999)
+        ));
+    }
+
+    #[test]
+    fn clear_removes_draft_before_a_second_press() {
+        let mut view = super::View::default();
+        view.editor.insert("unsent draft");
+        view.draft_images.push(pi_rs::ImageContent {
+            data: "aGVsbG8=".into(),
+            mime_type: "image/png".into(),
+        });
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        view.clipboard = Some(receiver);
+        let mut last = None;
+        let now = std::time::Instant::now();
+        assert!(!super::clear_editor_or_exit(&mut view, &mut last, now));
+        assert!(view.editor.text.is_empty());
+        assert!(view.draft_images.is_empty());
+        assert!(view.clipboard.is_none());
+        view.editor.insert("new draft");
+        assert!(super::clear_editor_or_exit(
+            &mut view,
+            &mut last,
+            now + std::time::Duration::from_millis(1)
+        ));
+        assert_eq!(view.editor.text, "new draft");
+    }
+
     #[test]
     fn link_clicks_use_visible_cells_and_require_the_original_target() {
         let mut view = super::View::default();
