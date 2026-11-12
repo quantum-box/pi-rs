@@ -43,8 +43,20 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         {
             ["off", "low", "medium", "high"].map(str::to_owned).to_vec()
         }
-        super::providers::Adapter::Anthropic | super::providers::Adapter::Bedrock => {
-            vec!["off".into()]
+        super::providers::Adapter::Anthropic => vec!["off".into()],
+        super::providers::Adapter::Bedrock => {
+            let metadata = args.model_profiles.model(&args.provider, &args.model);
+            if metadata
+                .as_ref()
+                .is_some_and(|model| model.reasoning == Some(false))
+            {
+                vec!["off".into()]
+            } else {
+                pi_rs::bedrock::thinking_levels(
+                    &args.model,
+                    metadata.as_ref().and_then(|model| model.name.as_deref()),
+                )
+            }
         }
         super::providers::Adapter::Google => pi_rs::google::model_thinking_levels(&args.model),
     };
@@ -159,6 +171,24 @@ mod tests {
         args.thinking = Some("high".into());
         adjust(&mut args);
         assert_eq!(args.thinking.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn bedrock_thinking_levels_follow_offline_model_capabilities() {
+        use clap::Parser;
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&serde_json::json!({})).unwrap();
+        args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
+        args.model = "anthropic.claude-sonnet-4-5-20250929-v1:0".into();
+        args.thinking = Some("high".into());
+        adjust(&mut args);
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        assert!(available(&mut args).contains(&"medium".into()));
+        args.model = "global.anthropic.claude-opus-4-8".into();
+        assert!(available(&mut args).contains(&"xhigh".into()));
+        args.model = "amazon.nova-lite-v1:0".into();
+        assert_eq!(available(&mut args), vec!["off".to_owned()]);
     }
 
     #[test]

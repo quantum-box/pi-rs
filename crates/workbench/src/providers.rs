@@ -383,6 +383,13 @@ impl Client {
             Self::Bedrock(_) if !defaults.is_empty() => Err(Error::Config(
                 "custom Bedrock headers are not supported".into(),
             )),
+            Self::Bedrock(client) if cache_disabled => {
+                client
+                    .clone()
+                    .with_cache_retention(CacheRetention::None)
+                    .stream(request)
+                    .await
+            }
             Self::Deferred(client) => {
                 if client.observed {
                     super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
@@ -639,16 +646,21 @@ impl Client {
                 Self::OpenAi(client)
             }
             Self::Bedrock(client) => {
-                let name = args
-                    .model_profiles
-                    .model(&args.provider, &args.model)
-                    .and_then(|model| model.name);
-                let client = client.with_model_name(&args.model, name.as_deref());
-                Self::Bedrock(if thinking.is_some_and(|level| level != "off") {
-                    client.unsupported("Bedrock thinking controls are not supported")
-                } else {
-                    client
-                })
+                let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let mapped = thinking.and_then(|level| {
+                    metadata
+                        .as_ref()
+                        .and_then(|model| model.mapped_effort(level))
+                });
+                let level = if mapped == Some(None) { None } else { thinking };
+                let client = client
+                    .with_model_name(
+                        &args.model,
+                        metadata.as_ref().and_then(|model| model.name.as_deref()),
+                    )
+                    .with_cache_retention(cache_retention(true))
+                    .with_reasoning(level, mapped.flatten())?;
+                Self::Bedrock(client)
             }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));

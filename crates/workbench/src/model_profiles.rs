@@ -534,7 +534,10 @@ impl ModelMetadata {
         }
         if !matches!(
             adapter,
-            Adapter::ChatCompletions | Adapter::Anthropic | Adapter::OpenAiResponses
+            Adapter::ChatCompletions
+                | Adapter::Anthropic
+                | Adapter::OpenAiResponses
+                | Adapter::Bedrock
         ) || self.thinking_level_map.is_empty()
         {
             return None;
