@@ -22,6 +22,8 @@ fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStrea
             Ok((socket, _)) => {
                 let sender = sender.clone();
                 std::thread::spawn(move || {
+                    // Accepted sockets can inherit O_NONBLOCK on macOS.
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
@@ -2166,27 +2168,9 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
     let target = listener.local_addr().unwrap();
     let endpoint = format!("http://{target}/v1/chat/completions");
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
         loop {
-            let (mut socket, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(error) => panic!("direct request not received: {error}"),
-            };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut first = String::new();
-            if reader.read_line(&mut first).is_err() || first.is_empty() {
-                continue;
-            }
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
