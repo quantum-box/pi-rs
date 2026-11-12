@@ -47,7 +47,7 @@ pulldown-cmark = "0.13"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 shell-words = "1"
 similar = "2.7"
-pi-rs = { path = "../..", features = ["anthropic", "google", "openai"] }
+pi-rs = { path = "../..", features = ["anthropic", "google", "openai", "bedrock"] }
 pi-rs-extensions = { path = "../extensions" }
 pi-rs-fixture-tools = { path = "../fixture-tools", optional = true }
 pi-rs-plan-mode = { path = "../plan-mode" }
