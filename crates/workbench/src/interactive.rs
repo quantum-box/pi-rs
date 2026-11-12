@@ -3288,7 +3288,11 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     }
 }
 
-pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result<()> {
+pub(super) async fn run(
+    mut args: Cli,
+    follow_up_prompts: Vec<String>,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Config(
             "interactive mode requires a terminal; use run <prompt> for automation".into(),
@@ -3307,7 +3311,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     {
         std::fs::create_dir_all(parent)?;
     }
-    prepare_initial_session(&mut args)?;
+    args = prepare_initial_session_async(args).await?;
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
@@ -3347,6 +3351,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let mut keys = Keys::load()?;
     let mut _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
     let mut input = crate::ui::input::Reader::new()?;
+    super::startup_ready(&mut ready);
     if view.graphics.enabled() {
         crate::ui::images::query_cell_size()?;
     }
@@ -4837,7 +4842,10 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             view.widgets.clear();
                             args.settings =
                                 crate::config::Settings::load(&args.workspace, args.trusted)?;
-                            args.model_keys = super::model_auth::Keys::load()?;
+                            match super::model_auth::Keys::load_async().await {
+                                Ok(keys) => args.model_keys = keys,
+                                Err(error) => view.append(&format!("Auth reload: {error}")),
+                            }
                             args.reload_model_profiles()?;
                             super::packages::prepare(&args).await?;
                             view.resources = super::resources::Resources::load(&args)?;
@@ -6425,6 +6433,48 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
     Ok(())
 }
 
+async fn prepare_initial_session_async(args: Cli) -> Result<Cli> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut args = args;
+        let result = restore_workspace(&mut args).map(|()| args);
+        let _ = sender.send(result);
+    });
+    let mut args = receiver
+        .await
+        .map_err(|_| Error::Config("workspace discovery stopped".into()))??;
+    initialize_session(&mut args)?;
+    Ok(args)
+}
+
+pub(super) fn restore_workspace_cancellable(
+    args: &mut Cli,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next = args.clone();
+    std::thread::spawn(move || {
+        let result = restore_workspace(&mut next).map(|()| next);
+        let _ = sender.send(result);
+    });
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(result) => {
+                *args = result?;
+                return Ok(());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Config("workspace discovery stopped".into()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn prepare_initial_session(args: &mut Cli) -> Result<()> {
     restore_workspace(args)?;
     initialize_session(args)

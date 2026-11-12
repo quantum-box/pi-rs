@@ -156,6 +156,10 @@ impl Gateway {
 
     fn credential(&self) -> Result<Option<Credential>> {
         let value = super::config::read_object(&auth_path())?;
+        self.credential_from_value(&value)
+    }
+
+    fn credential_from_value(&self, value: &Value) -> Result<Option<Credential>> {
         let Some(entry) = value.get("radius").filter(|entry| entry["type"] == "oauth") else {
             return Ok(None);
         };
@@ -215,35 +219,70 @@ impl Gateway {
         &self,
         min_validity: Duration,
     ) -> Result<Option<(String, String)>> {
-        let Some(credential) = self.credential()? else {
+        self.access_with_login_at(auth_path(), min_validity).await
+    }
+
+    async fn access_with_login_at(
+        &self,
+        path: PathBuf,
+        min_validity: Duration,
+    ) -> Result<Option<(String, String)>> {
+        let value = super::config::read_auth_object(&path).await?;
+        let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
         };
         let min_validity = u64::try_from(min_validity.as_millis()).unwrap_or(u64::MAX);
         if credential.expires > now().saturating_add(min_validity) {
             return Ok(Some(credential.access()));
         }
-        let _guard = auth_lock().await?;
-        let Some(credential) = self.credential()? else {
+        let radius_guard = auth_lock_at(path.parent().expect("auth parent")).await?;
+        let guard = super::auth_lock::acquire_async(&path).await?;
+        let value = super::config::read_object_unlocked(&path)?;
+        let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
         };
+        guard.check()?;
         if credential.expires > now().saturating_add(min_validity) {
             return Ok(Some(credential.access()));
         }
-        let result = self
-            .token(&[
+        let gateway = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _radius_guard = radius_guard;
+            let _barrier = super::process::refresh_barrier()?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| Error::Config("Could not start Radius refresh runtime".into()))?;
+            let previous = serde_json::to_value(&credential)?;
+            let result = runtime.block_on(gateway.token(&[
                 ("grant_type", "refresh_token"),
                 ("client_id", CLIENT_ID),
                 ("refresh_token", &credential.refresh),
-            ])
-            .await?;
-        let TokenResult::Granted(token) = result else {
-            return Err(Error::Config(
-                "Radius OAuth refresh did not return a token".into(),
-            ));
-        };
-        let refreshed = self.credential_from_token(token, Some(credential))?;
-        save(&refreshed)?;
-        Ok(Some(refreshed.access()))
+            ]))?;
+            let TokenResult::Granted(token) = result else {
+                return Err(Error::Config(
+                    "Radius OAuth refresh did not return a token".into(),
+                ));
+            };
+            let refreshed = gateway.credential_from_token(token, Some(credential))?;
+            super::config::update_object_locked(&path, Some(&guard), |data| {
+                let unchanged = data.get("radius").is_some_and(|current| {
+                    ["type", "gateway", "access", "refresh", "expires"]
+                        .iter()
+                        .all(|key| current[*key] == previous[*key])
+                });
+                if !unchanged {
+                    return Err(Error::Config(
+                        "Radius credentials changed during refresh".into(),
+                    ));
+                }
+                data.insert("radius".into(), serde_json::to_value(&refreshed)?);
+                Ok(())
+            })?;
+            Ok(Some(refreshed.access()))
+        })
+        .await
+        .map_err(|_| Error::Config("Radius refresh task failed".into()))?
     }
 
     async fn login_browser(&self, announce: impl Fn(Notice)) -> Result<()> {
@@ -474,8 +513,11 @@ fn auth_path() -> PathBuf {
 }
 
 async fn auth_lock() -> Result<std::fs::File> {
-    let directory = super::config::agent_dir();
-    std::fs::create_dir_all(&directory)?;
+    auth_lock_at(&super::config::agent_dir()).await
+}
+
+async fn auth_lock_at(directory: &std::path::Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(directory)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -555,5 +597,62 @@ mod tests {
                 .unwrap()
                 .contains("refresh_token=fixture-refresh")
         );
+    }
+    #[tokio::test]
+    async fn rotating_refresh_holds_shared_store_lock_until_persisted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0},"other":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut data = [0; 4096];
+            assert!(stream.read(&mut data).await.unwrap() > 0);
+            started_tx.send(()).unwrap();
+            reply_rx.await.unwrap();
+            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let refresh = tokio::spawn({
+            let path = path.clone();
+            async move { gateway.access_with_login_at(path, Duration::ZERO).await }
+        });
+        started_rx.await.unwrap();
+        let mut contender = tokio::spawn({
+            let path = path.clone();
+            async move { super::super::auth_lock::acquire_async(&path).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut contender)
+                .await
+                .is_err()
+        );
+        // Cancellation must not drop the rotating exchange or the shared lock.
+        refresh.abort();
+        reply_tx.send(()).unwrap();
+        server.await.unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(3), contender)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let stored = super::super::config::read_object_unlocked(&path).unwrap();
+        assert_eq!(stored["radius"]["refresh"], "rotated");
+        assert_eq!(stored["other"]["key"], "keep");
+        drop(guard);
     }
 }

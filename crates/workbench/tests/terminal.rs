@@ -1794,3 +1794,150 @@ fn exit_during_shell_restores_terminal_and_drains_late_key_release() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[test]
+fn reload_waits_for_auth_lock_without_closing_terminal() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    let lock = home.join("auth.json.lock");
+    std::fs::create_dir(&lock).unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        process.0.try_wait().unwrap().is_none(),
+        "terminal exited while auth store was locked"
+    );
+    std::fs::remove_dir(lock).unwrap();
+    output_until(&mut master, |text| text.contains("Reloaded settings"));
+    master.write_all(b"reload-still-responsive").unwrap();
+    output_until(&mut master, |text| text.contains("reload-still-responsive"));
+    assert!(process.0.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn sigint_cancels_interactive_startup_model_discovery() {
+    use std::net::TcpListener;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut bytes = [0; 4096];
+        assert!(socket.read(&mut bytes).unwrap() > 0);
+        started_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let _master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env_remove("HTTP_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--provider",
+                "ollama",
+                "--endpoint",
+                &endpoint,
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    started_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as i32, libc::SIGINT) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = process.0.try_wait().unwrap();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    assert_eq!(status.and_then(|status| status.code()), Some(130));
+}

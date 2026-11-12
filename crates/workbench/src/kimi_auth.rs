@@ -321,17 +321,7 @@ async fn access_at(
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
-        let barrier = std::env::var_os(super::process::REFRESH_BARRIER_ENV)
-            .map(|path| {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(path)
-            })
-            .transpose()?;
-        if let Some(file) = &barrier {
-            file.lock()?;
-        }
+        let _barrier = super::process::refresh_barrier()?;
         let previous = serde_json::to_value(&value)?;
         let value = runtime.block_on(service.refresh(&value.refresh))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
@@ -516,7 +506,7 @@ mod tests {
         started.await.unwrap();
         let second = tokio::spawn(access_at(path.clone(), service, None, false));
         let writer_path = path.clone();
-        let writer = tokio::task::spawn_blocking(move || {
+        let writer = std::thread::spawn(move || {
             super::super::config::update_object(&writer_path, |data| {
                 data.insert(
                     "kimi-coding".into(),
@@ -530,7 +520,7 @@ mod tests {
         reply.send(()).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), "new");
         server.await.unwrap();
-        writer.await.unwrap().unwrap();
+        writer.join().unwrap().unwrap();
         // The second caller either observes the rotated credential or the API key.
         let result = second.await.unwrap();
         assert!(result.is_err() || result.unwrap() == "new");

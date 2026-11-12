@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 
 use super::{Cli, interactive, process::Worker, sessions};
 
-pub(super) fn run(mut args: Cli) -> Result<()> {
+pub(super) fn run(
+    mut args: Cli,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     if args.command.is_some() || !args.prompt.is_empty() {
         return Err(Error::Config("RPC accepts prompts through stdin".into()));
     }
@@ -34,7 +37,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         session.set_name(name)?;
     }
     drop(session);
-    interactive::restore_workspace(&mut args)?;
+    interactive::restore_workspace_cancellable(&mut args, &cancelled)?;
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -54,6 +57,9 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut deferred = std::collections::VecDeque::<Value>::new();
     let mut stream = super::rpc_events::Stream::default();
     'run: loop {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
         // Drain accepted input before committing a completed transition. This
         // gives abort/shutdown priority over prompts queued while it was pending.
         if transition.is_some() {

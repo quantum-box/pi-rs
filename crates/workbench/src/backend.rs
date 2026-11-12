@@ -216,12 +216,18 @@ struct ShellCompletion {
     result: Result<pi_rs::BashExecution>,
 }
 
-pub fn run(args: Cli) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
+pub fn run(
+    args: Cli,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
     // Keep the long-lived worker's future out of the frontend stack frame.
-    Box::pin(run_worker(args))
+    Box::pin(run_worker(args, ready))
 }
 
-async fn run_worker(mut args: Cli) -> Result<()> {
+async fn run_worker(
+    mut args: Cli,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let (startup_reason, previous_session_file) =
         std::env::var(super::process::SESSION_TRANSITION_ENV)
             .ok()
@@ -282,13 +288,13 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     let signal_active = active.clone();
     let signal_stopping = stopping.clone();
     let signal_notify = stop_notify.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_stopping.store(true, Ordering::SeqCst);
-            signal_notify.notify_one();
-            cancel_active(&signal_active);
-        }
-    });
+    super::install_ctrl_c(move || {
+        signal_stopping.store(true, Ordering::SeqCst);
+        signal_notify.notify_one();
+        cancel_active(&signal_active);
+    })
+    .await;
+    super::startup_ready(&mut ready);
     notify_session_lifecycle(
         &args,
         &runtime,

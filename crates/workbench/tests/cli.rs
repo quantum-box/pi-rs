@@ -4864,3 +4864,145 @@ fn sigint_cancels_package_install_waiting_for_package_lock() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_managed_model_discovery() {
+    for mode in [vec!["--mode", "rpc"], vec!["--models", "ollama/*", "serve"]] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).unwrap() > 0);
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .env_remove("HTTP_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .args(["--no-mcp", "--provider", "ollama", "--endpoint", &endpoint])
+            .args(&mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        let _ = release_tx.send(());
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        server.join().unwrap();
+        assert!(status.is_some(), "model discovery ignored SIGINT");
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_open_rpc_and_piped_stdin() {
+    for args in [vec!["--mode", "rpc"], vec!["--print"]] {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args(["--no-mcp", "--offline", "--model", "fixture"])
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(status.is_some(), "{args:?} ignored SIGINT");
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn radius_refresh_survives_sigint_and_persists_rotated_token() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let gateway = format!("http://{}/", listener.local_addr().unwrap());
+    let auth = root.path().join("auth.json");
+    std::fs::write(&auth, json!({"radius":{"type":"oauth","gateway":gateway,"access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut buffer = [0; 4096];
+        assert!(socket.read(&mut buffer).unwrap() > 0);
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .env("PI_RADIUS_GATEWAY", &gateway)
+        .args(["--provider", "radius", "auth", "print-bearer-token"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(child.try_wait().unwrap().is_none());
+    release_tx.send(()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stored: Value = serde_json::from_slice(&std::fs::read(auth).unwrap()).unwrap();
+    assert_eq!(stored["radius"]["refresh"], "rotated");
+}

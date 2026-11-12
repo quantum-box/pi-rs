@@ -1242,6 +1242,34 @@ enum Control {
     Cancel,
 }
 
+// Return only after Tokio has polled and registered the signal listener.
+async fn install_ctrl_c(callback: impl FnOnce() + Send + 'static) {
+    use std::future::Future;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut signal = Box::pin(tokio::signal::ctrl_c());
+        let mut ready = Some(ready_tx);
+        let result = std::future::poll_fn(|context| {
+            let result = signal.as_mut().poll(context);
+            if let Some(sender) = ready.take() {
+                let _ = sender.send(());
+            }
+            result
+        })
+        .await;
+        if result.is_ok() {
+            callback();
+        }
+    });
+    let _ = ready_rx.await;
+}
+
+fn startup_ready(ready: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(sender) = ready.take() {
+        let _ = sender.send(());
+    }
+}
+
 fn main() {
     #[cfg(windows)]
     let code = {
@@ -1256,9 +1284,12 @@ fn main() {
     };
     #[cfg(not(windows))]
     let code = run_cli();
-    if code != 0 {
-        std::process::exit(code);
-    }
+    // Detached discovery threads may still be finishing. Wait for any token
+    // rotation and prevent another one from starting before process exit.
+    let _refreshes = process::stop_new_refreshes();
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code);
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -1420,17 +1451,21 @@ async fn run_cli() -> i32 {
         if matches.value_source("session") != Some(clap::parser::ValueSource::CommandLine) {
             args.session = interactive::session_path(&args.workspace, args.session_dir.as_deref());
         }
-        // Session and terminal modes have their own signal/terminal handling.
-        // Route the early listener to all other commands, including model listing.
         let managed = args.list_models.is_none() && matches!(&args.command,
             None | Some(Command::Interactive | Command::Serve | Command::Run { .. } | Command::Resume | Command::Compact { .. } | Command::Review { .. })
         );
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx)));
         if managed {
-            if signal_rx.try_recv().is_ok() { return Err(Error::Cancelled); }
-            Box::pin(execute(args, &mut output_truncated)).await
+            tokio::select! {
+                biased;
+                _ = &mut signal_rx => Err(Error::Cancelled),
+                result = &mut execution => result,
+                _ = ready_rx => execution.await,
+            }
         } else {
             tokio::select! {
-                result = Box::pin(execute(args, &mut output_truncated)) => result,
+                result = &mut execution => result,
                 _ = &mut signal_rx => Err(Error::Cancelled),
             }
         }
@@ -1485,7 +1520,31 @@ fn export_from_file(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
+async fn read_piped_stdin() -> Result<Vec<u8>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = std::io::stdin().read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    receiver
+        .await
+        .map_err(|_| Error::Config("stdin reader stopped".into()))?
+        .map_err(Error::Io)
+}
+
+struct RpcCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for RpcCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn execute(
+    mut args: Cli,
+    output_truncated: &mut bool,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let pi_style_invocation = args.command.is_none();
     let patterns: Vec<_> = if let Some(patterns) = &args.models {
         patterns.split(',').collect()
@@ -1623,7 +1682,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             args.model_explicit = model_explicit;
             args.thinking_explicit = thinking_explicit;
         }
-        return backend::run(args).await;
+        return backend::run(args, ready).await;
     }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
         return mcp_config::command(&args, command.clone()).await;
@@ -1769,7 +1828,11 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 "RPC mode accepts images in prompt requests, not @file arguments".into(),
             ));
         }
-        return rpc::run(args);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _guard = RpcCancellation(cancelled.clone());
+        return tokio::task::spawn_blocking(move || rpc::run(args, cancelled))
+            .await
+            .map_err(|_| Error::Config("RPC worker stopped".into()))?;
     }
     let mut follow_up_prompts = Vec::new();
     let mut skip_initial_prompt = false;
@@ -1798,8 +1861,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         )?;
         args.initial_images = images;
         if !std::io::stdin().is_terminal() && !args.stdin_control {
-            let mut input = Vec::new();
-            std::io::stdin().read_to_end(&mut input)?;
+            let input = read_piped_stdin().await?;
             let input = String::from_utf8_lossy(&input);
             let input = input
                 .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
@@ -1829,7 +1891,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     );
     let mut command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
-        return interactive::run(args, follow_up_prompts).await;
+        return interactive::run(args, follow_up_prompts, ready).await;
     }
     if let Some(parent) = args
         .session
@@ -2065,11 +2127,8 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         let mut observer = |event: Notification<'_>| observe(event, args.trace);
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal.cancel();
-        }
-    });
+    install_ctrl_c(move || signal.cancel()).await;
+    startup_ready(&mut ready);
     let (sender, mut receiver) = mpsc::channel(32);
     if args.stdin_control {
         read_controls(sender, cancel.clone());

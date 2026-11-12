@@ -13,6 +13,38 @@ pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
 
+static IN_FLIGHT_REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(super) struct RefreshBarrier {
+    _process: std::sync::MutexGuard<'static, ()>,
+    _worker: Option<std::fs::File>,
+}
+
+pub(super) fn stop_new_refreshes() -> std::sync::MutexGuard<'static, ()> {
+    IN_FLIGHT_REFRESH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub(super) fn refresh_barrier() -> Result<RefreshBarrier> {
+    let process = stop_new_refreshes();
+    let worker = std::env::var_os(REFRESH_BARRIER_ENV)
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+        })
+        .transpose()?;
+    if let Some(file) = &worker {
+        file.lock()?;
+    }
+    Ok(RefreshBarrier {
+        _process: process,
+        _worker: worker,
+    })
+}
+
 fn shutdown_reason(reason: SessionStartReason) -> SessionShutdownReason {
     match reason {
         SessionStartReason::Startup => SessionShutdownReason::Quit,
@@ -577,6 +609,22 @@ fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: I
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[test]
+    fn process_shutdown_waits_for_detached_refresh() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let active = super::refresh_barrier().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _shutdown = super::stop_new_refreshes();
+            sender.send(()).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(150)).is_err());
+        drop(active);
+        receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        waiter.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn worker_teardown_waits_for_refresh_barrier_after_grace() {
