@@ -338,9 +338,11 @@ impl Keys {
             ),
         ];
         let mut lines = vec!["Keyboard Shortcuts".to_owned()];
+        let mut included = std::collections::BTreeSet::new();
         for (heading, actions) in sections {
             lines.push(format!("\n{heading}"));
             for (action, description) in *actions {
+                included.insert(*action);
                 let keys = self.bindings.get(*action).map_or_else(
                     || "—".to_owned(),
                     |keys| {
@@ -355,6 +357,25 @@ impl Keys {
                     },
                 );
                 lines.push(format!("{keys}  {description}"));
+            }
+        }
+        let other: Vec<_> = self
+            .bindings
+            .iter()
+            .filter(|(name, _)| !included.contains(name.as_str()))
+            .collect();
+        if !other.is_empty() {
+            lines.push("\nOther bindings".into());
+            for (name, keys) in other {
+                let keys = if keys.is_empty() {
+                    "—".to_owned()
+                } else {
+                    keys.iter()
+                        .map(|key| binding_hint(Some(*key)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                lines.push(format!("{keys}  {name}"));
             }
         }
         lines.join("\n")
@@ -470,6 +491,7 @@ mod tests {
         assert!(text.contains("Alt+M, Ctrl+L  Open model selector"));
         assert!(text.contains("—  Copy selection or last assistant message"));
         assert!(text.contains("Shift+Enter, Ctrl+J  New line"));
+        assert!(text.contains("Ctrl+T  app.tree.filter.noTools"));
         assert!(!text.contains("KeyEvent"));
     }
 }
