@@ -1139,7 +1139,7 @@ impl Agent<'_> {
                         tool_name: invocation.call.name.clone(),
                         result: outcome,
                         is_error: true,
-                        duration_ms: 0,
+                        duration_ms: None,
                         parent_tool_call_id: None,
                     },
                     states,
