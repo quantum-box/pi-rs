@@ -341,3 +341,99 @@ async fn service_errors_include_safe_diagnostics_and_classify_stream_validation(
         server.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn tool_free_summary_keeps_history_as_text_without_tool_config() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut data = Vec::new();
+        let mut buf = [0; 8192];
+        let (end, len) = loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buf[..n]);
+            if let Some(pos) = data.windows(4).position(|x| x == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&data[..pos]);
+                let len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                break (pos + 4, len);
+            }
+        };
+        while data.len() < end + len {
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buf[..n]);
+        }
+        let body: serde_json::Value = serde_json::from_slice(&data[end..end + len]).unwrap();
+        assert!(body.get("toolConfig").is_none());
+        let messages = body["messages"].as_array().unwrap();
+        assert!(
+            messages
+                .iter()
+                .flat_map(|m| m["content"].as_array().unwrap())
+                .all(|b| b.get("text").is_some())
+        );
+        let wire = body.to_string();
+        assert!(wire.contains("Historical tool call"));
+        assert!(wire.contains("Historical tool result"));
+        assert!(wire.contains("disk full"));
+        assert!(!wire.contains("toolUse"));
+        assert!(!wire.contains("toolResult"));
+        let frames = [event("messageStop", json!({"stopReason":"end_turn"}))].concat();
+        socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n",frames.len()).as_bytes()).await.unwrap();
+        socket.write_all(&frames).await.unwrap();
+    });
+    let conf = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version_latest()
+        .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+        .credentials_provider(aws_credential_types::Credentials::new(
+            "test", "secret", None, None, "test",
+        ))
+        .endpoint_url(format!("http://{address}"))
+        .build();
+    let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(conf));
+    let request = ModelRequest {
+        model: "test-model".into(),
+        tools: vec![],
+        max_output_tokens: 128,
+        messages: vec![
+            Message::User {
+                content: "start".into(),
+            },
+            Message::Assistant {
+                content: String::new(),
+                calls: vec![pi_rs_core::ToolCall {
+                    id: "id".into(),
+                    name: "shell".into(),
+                    arguments: "{bad json".into(),
+                }],
+                replay: None,
+            },
+            Message::Tool {
+                call_id: "id".into(),
+                content: "disk full".into(),
+                is_error: true,
+                is_structured: Some(false),
+            },
+            Message::User {
+                content: "Summarize".into(),
+            },
+        ],
+    };
+    let events = model
+        .stream(request)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(events.iter().all(Result::is_ok));
+    server.await.unwrap();
+}

@@ -151,6 +151,7 @@ impl Model for Bedrock {
         if request.max_output_tokens == 0 || request.model.contains(":prompt/") {
             return Err(Error::Config("Bedrock requires a positive max output token limit and does not support managed prompt ARNs".into()));
         }
+        let tool_free = request.tools.is_empty();
         let mut ids = ToolIds::default();
         let mut system = Vec::new();
         let mut messages: Vec<types::Message> = Vec::new();
@@ -175,6 +176,10 @@ impl Model for Bedrock {
                         blocks.push(ContentBlock::Text(content));
                     }
                     for call in calls {
+                        if tool_free {
+                            blocks.push(ContentBlock::Text(format!("Historical tool call: {}", serde_json::json!({"id":call.id,"name":call.name,"arguments":call.arguments}))));
+                            continue;
+                        }
                         let input: Value =
                             serde_json::from_str(&call.arguments).map_err(build_error)?;
                         blocks.push(ContentBlock::ToolUse(
@@ -193,21 +198,30 @@ impl Model for Bedrock {
                     content,
                     is_error,
                     ..
-                } => (
-                    ConversationRole::User,
-                    vec![ContentBlock::ToolResult(
-                        types::ToolResultBlock::builder()
-                            .tool_use_id(ids.get(&call_id))
-                            .content(types::ToolResultContentBlock::Text(required_text(content)))
-                            .status(if is_error {
-                                types::ToolResultStatus::Error
-                            } else {
-                                types::ToolResultStatus::Success
-                            })
-                            .build()
-                            .map_err(build_error)?,
-                    )],
-                ),
+                } => {
+                    let block = if tool_free {
+                        ContentBlock::Text(format!(
+                            "Historical tool result: {}",
+                            serde_json::json!({"id":call_id,"content":content,"isError":is_error})
+                        ))
+                    } else {
+                        ContentBlock::ToolResult(
+                            types::ToolResultBlock::builder()
+                                .tool_use_id(ids.get(&call_id))
+                                .content(types::ToolResultContentBlock::Text(required_text(
+                                    content,
+                                )))
+                                .status(if is_error {
+                                    types::ToolResultStatus::Error
+                                } else {
+                                    types::ToolResultStatus::Success
+                                })
+                                .build()
+                                .map_err(build_error)?,
+                        )
+                    };
+                    (ConversationRole::User, vec![block])
+                }
             };
             if blocks.is_empty() {
                 continue;
