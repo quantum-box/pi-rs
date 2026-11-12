@@ -536,7 +536,9 @@ fn tool_value(outcome: Outcome) -> Value {
         Outcome::Succeeded(value) | Outcome::SucceededWithDetails { output: value, .. } => {
             json!({"ok":true,"value":value})
         }
-        Outcome::Structured { data, .. } => json!({"ok":true,"value":data}),
+        Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } => {
+            json!({"ok":true,"value":data})
+        }
         outcome => json!({"ok":false,"error":outcome.tool_content()}),
     }
 }

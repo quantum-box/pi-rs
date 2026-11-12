@@ -2036,7 +2036,13 @@ fn outcome_status(outcome: &Outcome) -> &'static str {
         Outcome::Unknown(_) => "unknown",
         Outcome::Pending { .. } => "pending",
         Outcome::Truncated { .. } => "truncated",
-        Outcome::Structured { .. } => "succeeded",
+        Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } => {
+            if data["isError"] == true {
+                "failed"
+            } else {
+                "succeeded"
+            }
+        }
     }
 }
 

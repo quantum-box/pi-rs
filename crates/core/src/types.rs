@@ -672,6 +672,12 @@ pub enum Outcome {
         data: Value,
         attachments: Vec<AttachmentRef>,
     },
+    /// Structured output with metadata retained outside model-facing content.
+    StructuredWithDetails {
+        data: Value,
+        attachments: Vec<AttachmentRef>,
+        details: Value,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -692,9 +698,10 @@ impl Outcome {
             Self::Truncated { original_bytes } => format!(
                 "Tool succeeded. Output omitted ({original_bytes} bytes exceeded the limit)."
             ),
-            Self::Structured { data, attachments } => {
-                serde_json::json!({ "data": data, "attachments": attachments }).to_string()
-            }
+            Self::Structured { data, attachments }
+            | Self::StructuredWithDetails {
+                data, attachments, ..
+            } => serde_json::json!({ "data": data, "attachments": attachments }).to_string(),
         }
     }
 }

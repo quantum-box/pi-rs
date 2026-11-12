@@ -1431,7 +1431,7 @@ impl Agent<'_> {
                     let is_error = matches!(
                         &result,
                         Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-                    ) || matches!(&result, Outcome::Structured { data, .. } if data["isError"] == true);
+                    ) || matches!(&result, Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } if data["isError"] == true);
                     self.observe_lifecycle(
                         crate::LifecycleEvent::ToolExecutionEnd {
                             tool_call_id: invocation.call.id.clone(),
@@ -1787,6 +1787,16 @@ impl Agent<'_> {
             }
             outcome @ Outcome::Structured { .. } => {
                 let size = outcome.tool_content().len();
+                if size > max_output_bytes {
+                    Outcome::Truncated {
+                        original_bytes: size,
+                    }
+                } else {
+                    outcome
+                }
+            }
+            outcome @ Outcome::StructuredWithDetails { .. } => {
+                let size = serde_json::to_vec(&outcome)?.len();
                 if size > max_output_bytes {
                     Outcome::Truncated {
                         original_bytes: size,
