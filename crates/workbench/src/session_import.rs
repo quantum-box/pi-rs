@@ -1218,6 +1218,81 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_selecting_physical_response_overrides_virtual_selection_in_share() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+            json!({"type":"message","id":"assistant","parentId":"change","message":{"role":"assistant","provider":"anthropic","model":"physical","content":[]}}),
+        ]).unwrap();
+        assert!(
+            matches!(branch_selection(&session, |_, _| Some(true)), BranchSelection::Selected { model, .. } if model == "virtual")
+        );
+        session
+            .select_provider_model(Some("anthropic"), "physical", None)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        let entries: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .rev()
+                .find(|entry| entry["type"] == "model_change")
+                .unwrap()["modelId"],
+            "physical"
+        );
+        let path = directory.path().join("share.jsonl");
+        std::fs::write(&path, bytes).unwrap();
+        let reopened = read(&path).unwrap();
+        assert!(
+            matches!(branch_selection(&reopened, |_, _| Some(true)), BranchSelection::Selected { provider, model, .. } if provider == "anthropic" && model == "physical")
+        );
+    }
+
+    #[test]
+    fn restoration_requires_known_model_and_uses_default_thinking_for_unset_branch() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".pi")).unwrap();
+        std::fs::write(
+            directory.path().join(".pi/settings.json"),
+            r#"{"defaultThinkingLevel":"low"}"#,
+        )
+        .unwrap();
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.settings = super::super::config::Settings::load(directory.path(), true).unwrap();
+        args.model = "initial".into();
+        args.remember_initial_selection();
+        args.discovered_models
+            .push(("ollama".into(), "known".into()));
+        for (model, expected) in [("not-in-offline-catalog", "initial"), ("known", "known")] {
+            args.model = "previous-branch".into();
+            args.thinking = Some("high".into());
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","provider":"ollama","model":model,"content":[]}}),
+            ]).unwrap();
+            args.restore_session_model(&session);
+            assert_eq!(args.model, expected);
+            assert_eq!(args.thinking.as_deref(), Some("low"));
+        }
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","provider":"anthropic","model":"nonexistent-model-id","content":[]}}),
+        ]).unwrap();
+        args.model = "previous-branch".into();
+        args.restore_session_model(&session);
+        assert_eq!(args.model, "initial");
+        assert_eq!(args.thinking.as_deref(), Some("low"));
+    }
+
+    #[test]
     fn incomplete_prior_model_change_does_not_hide_complete_response() {
         let session = import_pi(vec![
             json!({"type":"session","version":3}),
@@ -1251,6 +1326,7 @@ mod tests {
             args.initial_connection =
                 Some((super::super::Provider::Google, "invalid endpoint".into()));
             args.endpoint_explicit = true;
+            args.discovered_models.push(("google".into(), "b".into()));
             args.restore_session_model(&session);
             assert_eq!(args.provider.id(), "ollama");
             assert_eq!(args.model, "initial");

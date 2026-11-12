@@ -70,6 +70,8 @@ struct Cli {
     #[arg(skip)]
     initial_selection: Option<InitialSelection>,
     #[arg(skip)]
+    discovered_models: Vec<(String, String)>,
+    #[arg(skip)]
     session_transition: Option<pi_rs::SessionStartReason>,
     #[arg(skip)]
     settings: config::Settings,
@@ -305,7 +307,6 @@ struct InitialSelection {
     provider: Provider,
     endpoint: String,
     model: String,
-    thinking: Option<String>,
 }
 
 impl Cli {
@@ -667,6 +668,15 @@ impl Cli {
             return false;
         }
         if !in_scope && !self.model_explicit {
+            if !self.thinking_explicit
+                && let Some(thinking) = self
+                    .model_scope
+                    .iter()
+                    .find(|choice| choice.provider == self.provider && choice.model == self.model)
+                    .and_then(|choice| choice.thinking.clone())
+            {
+                self.thinking = Some(thinking);
+            }
             return false;
         }
         if !self.model_explicit && in_scope {
@@ -690,6 +700,14 @@ impl Cli {
     }
 
     fn restore_initial_selection(&mut self, thinking: Option<String>) {
+        let thinking = thinking.or_else(|| {
+            Some(
+                self.settings
+                    .string("defaultThinkingLevel")
+                    .unwrap_or("medium")
+                    .to_owned(),
+            )
+        });
         if let Some(initial) = &self.initial_selection {
             if !self.model_explicit {
                 self.provider = initial.provider.clone();
@@ -698,9 +716,9 @@ impl Cli {
                 self.thinking_profile = None;
             }
             if !self.thinking_explicit {
-                self.thinking = thinking.or_else(|| initial.thinking.clone());
+                self.thinking = thinking;
             }
-        } else if !self.thinking_explicit && thinking.is_some() {
+        } else if !self.thinking_explicit {
             self.thinking = thinking;
         }
     }
@@ -711,10 +729,39 @@ impl Cli {
         thinking: Option<String>,
         provider: Option<&str>,
     ) {
-        if !self.restore_model_selection(model, thinking.clone(), provider) {
+        let known = self
+            .model_profiles
+            .provider(provider.unwrap_or("ollama"))
+            .is_some_and(|provider| {
+                self.model_profiles
+                    .model_ids(&provider)
+                    .iter()
+                    .any(|id| id == &model)
+                    || self
+                        .discovered_models
+                        .iter()
+                        .any(|(p, id)| p == provider.id() && id == &model)
+                    || self
+                        .model_scope
+                        .iter()
+                        .any(|choice| choice.provider == provider && choice.model == model)
+                    || self.initial_selection.as_ref().is_some_and(|initial| {
+                        initial.provider == provider && initial.model == model
+                    })
+            });
+        // Unknown dynamic models may exist, but cannot be verified by this
+        // synchronous, potentially offline restoration path.
+        if !known || !self.restore_model_selection(model, thinking.clone(), provider) {
             self.restore_initial_selection(thinking);
-        } else if !self.thinking_explicit && thinking.is_some() {
-            self.thinking = thinking;
+        } else if !self.thinking_explicit {
+            self.thinking = thinking.or_else(|| {
+                Some(
+                    self.settings
+                        .string("defaultThinkingLevel")
+                        .unwrap_or("medium")
+                        .to_owned(),
+                )
+            });
         }
     }
 
@@ -745,7 +792,6 @@ impl Cli {
             provider: self.provider.clone(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
-            thinking: self.thinking.clone(),
         });
     }
 }
@@ -1151,6 +1197,15 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         .iter()
         .find(|catalog| catalog.provider == args.provider)
         .map_or(&[][..], |catalog| catalog.models.as_slice());
+    args.discovered_models = catalogs
+        .iter()
+        .flat_map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .map(|model| (catalog.provider.id().to_owned(), model.clone()))
+        })
+        .collect();
     // The hidden worker command receives an already-resolved, literal model ID.
     if !args.model.is_empty()
         && !args.model_from_settings

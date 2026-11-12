@@ -6273,7 +6273,6 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = Session::open(&args.session)?;
-    args.restore_session_model(&session);
     if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
         if !path.is_dir() {
@@ -6296,6 +6295,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
     args.settings = crate::config::Settings::load(&args.workspace, args.trusted)?;
+    args.restore_session_model(&session);
     drop(session);
     super::thinking::adjust(args);
     Ok(())
@@ -6539,6 +6539,10 @@ mod tests {
         args.session_dir = Some(directory.path().into());
         args.session = session_path;
         args.model = "initial".into();
+        args.discovered_models = vec![
+            ("ollama".into(), "model-a".into()),
+            ("ollama".into(), "model-b".into()),
+        ];
         args.no_trust = true;
         args.remember_initial_selection();
         let mut view = super::View::default();

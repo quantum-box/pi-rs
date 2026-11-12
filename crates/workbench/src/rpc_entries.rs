@@ -352,16 +352,11 @@ impl Cursor {
                     };
                     Some(selection(model, provider.as_deref(), thinking.as_deref()))
                 });
-                let model_changed = if let Some(id) = parent.response_model {
-                    let Event::SourceEntry { entry, .. } = &records[id as usize - 1].event else {
-                        unreachable!()
-                    };
-                    let message = &entry["message"];
-                    message["provider"].as_str() != Some(current.0)
-                        || message["model"].as_str() != Some(current.1)
-                } else {
-                    previous.is_none_or(|old| (old.0, old.1) != (current.0, current.1))
-                };
+                // A response may have been routed by a virtual selection. An
+                // explicit native selection must override that selection even
+                // when it names the same physical model as the response.
+                let model_changed = parent.response_model.is_some()
+                    || previous.is_none_or(|old| (old.0, old.1) != (current.0, current.1));
                 let thinking_changed = previous.is_none_or(|old| old.2 != current.2);
                 let model_entry =
                     || json!({"type":"model_change","provider":current.0,"modelId":current.1});
