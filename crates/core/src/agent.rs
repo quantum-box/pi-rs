@@ -1191,7 +1191,9 @@ impl Agent<'_> {
             };
             let mut first_error = None;
             // All started outcomes are recorded even if one parallel member failed.
-            for (invocation, outcome) in group.iter().zip(outcomes) {
+            for (invocation, mut outcome) in group.iter().zip(outcomes) {
+                self.transform_tool_result(invocation, &mut outcome, states, cancel, observer)
+                    .await;
                 if let Err(error) = self.finish_tool(session, invocation, outcome, states, observer)
                     && (first_error.is_none()
                         || (matches!(first_error, Some(Error::PendingOperation(_)))
@@ -1365,7 +1367,10 @@ impl Agent<'_> {
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
                 result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.poll(&reference, context)) => result.ok().flatten().ok_or(Error::PendingOperation(operation_id))?,
             };
-            self.finish_tool(session, &invocation, outcome.into(), states, observer)?;
+            let mut reply = outcome.into();
+            self.transform_tool_result(&invocation, &mut reply, states, cancel, observer)
+                .await;
+            self.finish_tool(session, &invocation, reply, states, observer)?;
         }
         Ok(())
     }
@@ -1434,6 +1439,60 @@ impl Agent<'_> {
             },
             Decision::Deny(reason) => Preparation::Skipped(reason),
         })
+    }
+
+    async fn transform_tool_result(
+        &self,
+        invocation: &Invocation,
+        reply: &mut ToolReply,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) {
+        if matches!(
+            reply.outcome,
+            Outcome::Skipped(_) | Outcome::Unknown(_) | Outcome::Pending { .. }
+        ) {
+            return;
+        }
+        for extension in self
+            .registry
+            .extensions
+            .iter()
+            .filter(|item| item.handles_tool_result())
+        {
+            let context = ToolContext {
+                operation_id: invocation.operation_id,
+                cancellation: cancel.child_token(),
+            };
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                result = tokio::time::timeout(self.limits.tool_timeout, extension.tool_result(
+                    &invocation.call, &reply.outcome, &context, states.get(extension.id()),
+                )) => result,
+            };
+            let error = match result {
+                Ok(Ok(Some(outcome)))
+                    if !matches!(
+                        outcome,
+                        Outcome::Skipped(_) | Outcome::Unknown(_) | Outcome::Pending { .. }
+                    ) =>
+                {
+                    reply.outcome = outcome;
+                    continue;
+                }
+                Ok(Ok(None)) => continue,
+                Ok(Ok(Some(_))) => "invalid replacement outcome".to_owned(),
+                Ok(Err(error)) => error,
+                Err(_) => "tool result hook timed out".to_owned(),
+            };
+            observer(Notification::ExtensionLifecycleError {
+                extension: extension.id(),
+                event: "tool_result",
+                message: &error,
+            });
+        }
     }
 
     fn finish_tool(
@@ -3189,6 +3248,78 @@ mod tree_tests {
         async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
             panic!("a veto or supplied summary must bypass the model");
         }
+    }
+
+    struct ResultHook(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::Extension for ResultHook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn handles_tool_result(&self) -> bool {
+            true
+        }
+        async fn tool_result(
+            &self,
+            call: &crate::ToolCall,
+            outcome: &Outcome,
+            _context: &crate::ToolContext,
+            _state: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Option<Outcome>> {
+            assert_eq!(call.name, "fixture");
+            let Outcome::Succeeded(text) = outcome else {
+                panic!("unexpected result")
+            };
+            Ok(Some(Outcome::Succeeded(format!("{text}:{}", self.0))))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_hooks_chain_and_skip_unexecuted_operations() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ResultHook("first"))).unwrap();
+        registry.register(Arc::new(ResultHook("second"))).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut reply = ToolReply::from(Outcome::Succeeded("result".into()));
+        agent
+            .transform_tool_result(
+                &invocation,
+                &mut reply,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(
+            reply.outcome,
+            Outcome::Succeeded("result:first:second".into())
+        );
+        let mut skipped = ToolReply::from(Outcome::Skipped("denied".into()));
+        agent
+            .transform_tool_result(
+                &invocation,
+                &mut skipped,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(skipped.outcome, Outcome::Skipped("denied".into()));
     }
 
     #[tokio::test]

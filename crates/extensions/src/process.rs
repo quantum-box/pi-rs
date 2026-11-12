@@ -204,6 +204,12 @@ enum ProtocolRequest {
         outcome: Outcome,
         state: Option<ExtensionState>,
     },
+    ToolResult {
+        call: pi_rs_core::ToolCall,
+        outcome: Outcome,
+        operation_id: String,
+        state: Option<ExtensionState>,
+    },
     BeforeCompaction {
         summary: String,
         keep_turns: usize,
@@ -236,6 +242,8 @@ struct Description {
     command_effects: bool,
     #[serde(default)]
     input_hook: bool,
+    #[serde(default)]
+    tool_result_hook: bool,
     #[serde(default)]
     user_bash_hook: bool,
     #[serde(default)]
@@ -732,6 +740,29 @@ impl Extension for ExecutableExtension {
                 .await
                 .map_err(|error| error.to_string())??;
         Ok(result.into())
+    }
+    fn handles_tool_result(&self) -> bool {
+        self.description.tool_result_hook
+    }
+    async fn tool_result(
+        &self,
+        call_data: &pi_rs_core::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<Outcome>> {
+        let request = ProtocolRequest::ToolResult {
+            call: call_data.clone(),
+            outcome: outcome.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+            .await
+            .map_err(|error| error.to_string())?
     }
     fn after_tool(
         &self,
@@ -1463,6 +1494,7 @@ async fn dispatch_with_host(
             command_entries: extension.supports_command_entries(),
             command_effects: extension.supports_command_effects(),
             input_hook: extension.handles_input(),
+            tool_result_hook: extension.handles_tool_result(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
@@ -1634,6 +1666,16 @@ async fn dispatch_with_host(
             outcome,
             state,
         } => encode(extension.after_tool(&name, &outcome, state.as_ref())),
+        ProtocolRequest::ToolResult {
+            call,
+            outcome,
+            operation_id,
+            state,
+        } => encode(
+            extension
+                .tool_result(&call, &outcome, &context(&operation_id)?, state.as_ref())
+                .await,
+        ),
         ProtocolRequest::BeforeCompaction {
             summary,
             keep_turns,
@@ -1676,6 +1718,55 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tool_result_hook_is_advertised_and_dispatched() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "result"
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result(
+                &self,
+                call: &pi_rs_core::ToolCall,
+                outcome: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Outcome>> {
+                assert_eq!(call.name, "fixture");
+                assert_eq!(outcome, &Outcome::Succeeded("original".into()));
+                Ok(Some(Outcome::Succeeded("changed".into())))
+            }
+        }
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["tool_result_hook"], true);
+        let result = dispatch(
+            extension,
+            ProtocolRequest::ToolResult {
+                call: pi_rs_core::ToolCall {
+                    id: "call".into(),
+                    name: "fixture".into(),
+                    arguments: "{}".into(),
+                },
+                outcome: Outcome::Succeeded("original".into()),
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Option<Outcome>>(result).unwrap(),
+            Some(Outcome::Succeeded("changed".into()))
+        );
+    }
 
     #[tokio::test]
     async fn command_output_protocol_transports_custom_entries() {

@@ -2987,6 +2987,16 @@ With `showCacheMissNotices` enabled, both terminal modes warn when the
 number of dropped thinking blocks increases compared to the previous
 assistant response on the active branch. Reopening restores that baseline.
 
+### Tool-result extension hooks
+
+Native in-process and executable extensions can opt in to a `tool_result`
+hook. After a tool returns a final result, hooks run in extension order and
+can replace the outcome before it is committed and included in model context.
+Later hooks see the preceding replacement. Unexecuted, unresolved, and pending
+operations are never transformed, preserving recovery and reconciliation.
+Hook failures are reported and leave the latest known outcome intact. Esc and
+the tool timeout bound hook execution. Output limits still apply to replacements.
+
 ### Session tree extension checkpoint
 
 Embedded and executable Rust extensions can opt into tree navigation.
