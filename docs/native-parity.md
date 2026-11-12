@@ -4,12 +4,20 @@ The reference is Pi v1.5.0, commit
 `f9a26365568127461c47a07a37dcb42c140a3ac5`.
 The requested compatibility is equivalent functionality implemented in Rust.
 
+Markdown headings are separated from a following block by one blank line,
+without adding a trailing blank line after a final heading.
+
 [Reference CLI](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/cli.md)
 · [Reference terminal](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/usage.md)
 · [Reference extensions](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/docs/extensions.md)
 
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
+
+Endpointless API keys in Pi's `auth.json` are accepted for custom providers
+declared in `models.json`. The saved key takes precedence over the profile key
+and is used only for endpoints declared by that profile; keys with an explicit
+endpoint remain bound to that endpoint.
 
 `--resume` and `-r` open the session selector without consuming a following
 prompt. The picker uses the controlling terminal, keeping standard input and
@@ -1741,6 +1749,14 @@ second fixture verifies 256 entries ending exactly at the byte boundary. This
 covers listing limits; complete locale collation, structured tool details and
 other local-tool output/error parity remain open.
 
+### Shell partial-line notice checkpoint
+
+For a byte-truncated final shell line, the displayed line size follows Pi's
+streaming accumulator: a trailing newline resets the current-line byte count
+to zero, while an unterminated line retains its UTF-8 byte count. The retained
+tail and truncation metadata are unchanged. A regression covers both cases
+with chunked multibyte output; other local-tool parity gaps remain open.
+
 ### Grep context and line-limit checkpoint
 
 Grep now emits a separate context block for each match, including repeated lines
@@ -3291,3 +3307,12 @@ again.
 RPC and JSON modes forward transient `tool_execution_update` events, including
 the tool arguments, partial result, and parent call ID when present. Updates
 are delivered during execution even when no extension subscribes to progress.
+
+### Legacy session compaction import
+
+Pi v1 session imports translate `firstKeptEntryIndex` compaction boundaries
+using the original JSONL entry order, including the header. The original entry
+is retained for inspection, while the imported context and forks retain the
+correct post-compaction messages. A boundary at the compaction itself, or at a
+later unassigned v1 entry, retains no earlier messages. Other legacy session variants remain subject
+to the session import limitations above.

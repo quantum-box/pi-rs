@@ -11,6 +11,30 @@ use crate::{
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
 
+/// Partial update to a successful text result. Omitted fields retain their values.
+#[derive(Clone, Debug, Default)]
+pub struct ToolResultPatch {
+    pub output: Option<String>,
+    pub details: Option<Value>,
+}
+
+impl ToolResultPatch {
+    pub fn apply(self, outcome: &Outcome) -> ExtensionResult<Outcome> {
+        let (output, details) = match outcome {
+            Outcome::Succeeded(output) => (output.clone(), None),
+            Outcome::SucceededWithDetails { output, details } => {
+                (output.clone(), Some(details.clone()))
+            }
+            _ => return Err("text result patch requires a successful text outcome".into()),
+        };
+        let output = self.output.unwrap_or(output);
+        Ok(match self.details.or(details) {
+            Some(details) => Outcome::SucceededWithDetails { output, details },
+            None => Outcome::Succeeded(output),
+        })
+    }
+}
+
 /// Branch-local extension data that is not sent to the model.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -683,6 +707,36 @@ pub trait Extension: Send + Sync {
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<Outcome>> {
         Ok(None)
+    }
+
+    /// Patch successful text results while preserving fields omitted by the handler.
+    async fn tool_result_patch(
+        &self,
+        _call: &crate::ToolCall,
+        _outcome: &Outcome,
+        _context: &ToolContext,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<ToolResultPatch>> {
+        Ok(None)
+    }
+
+    /// Dispatch legacy replacement and partial result hooks in order.
+    async fn tool_result_update(
+        &self,
+        call: &crate::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<Outcome>> {
+        let replacement = self.tool_result(call, outcome, context, state).await?;
+        let current = replacement.as_ref().unwrap_or(outcome);
+        match self
+            .tool_result_patch(call, current, context, state)
+            .await?
+        {
+            Some(patch) => patch.apply(current).map(Some),
+            None => Ok(replacement),
+        }
     }
 
     fn after_tool(

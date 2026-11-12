@@ -874,6 +874,7 @@ fn markdown_at_depth(
     let mut table: Option<Table> = None;
     let mut links = Vec::new();
     let mut previous_paragraph_end = None;
+    let mut last_heading_separator = None;
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         if quote_skip > 0 {
             match event {
@@ -936,6 +937,7 @@ fn markdown_at_depth(
             Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
             Event::Start(Tag::Heading { level, .. }) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                previous_paragraph_end = None;
                 heading = level as usize;
                 if heading >= 3 {
                     let mut prefix =
@@ -947,6 +949,10 @@ fn markdown_at_depth(
             Event::End(TagEnd::Heading(_)) => {
                 heading = 0;
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                if lists.is_empty() {
+                    last_heading_separator = Some(lines.len());
+                    lines.push(Line::default());
+                }
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
@@ -1198,6 +1204,10 @@ fn markdown_at_depth(
         }
     }
     flush(&mut spans, &mut lines, width, item_prefixes.last());
+    // Source after a heading can consist solely of non-rendered link definitions.
+    if last_heading_separator == lines.len().checked_sub(1) && last_heading_separator.is_some() {
+        lines.pop();
+    }
     lines
 }
 fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Option<&Span>) {
@@ -1234,6 +1244,41 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markdown_separates_headings_from_following_blocks() {
+        for (source, expected) in [
+            ("# Hello\nworld", vec!["Hello", "", "world"]),
+            ("# Hello\n\nworld", vec!["Hello", "", "world"]),
+            ("# Hello\n## Next", vec!["Hello", "", "Next"]),
+            ("# Hello\n\n", vec!["Hello"]),
+        ] {
+            let rendered: Vec<String> = markdown(source, &Theme::system(), 80)
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            assert_eq!(rendered, expected, "{source:?}");
+        }
+    }
+    #[test]
+    fn markdown_heading_ignores_nonrendered_reference_definitions() {
+        for (source, expected) in [
+            ("# Hello\n\n[ref]: https://example.com", vec!["Hello"]),
+            (
+                "# Hello\n\n[ref]: https://example.com\n\nworld",
+                vec!["Hello", "", "world"],
+            ),
+            (
+                "# First\n\n## Last\n\n[ref]: https://example.com",
+                vec!["First", "", "Last"],
+            ),
+        ] {
+            let rendered: Vec<String> = markdown(source, &Theme::system(), 80)
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            assert_eq!(rendered, expected, "{source:?}");
+        }
+    }
     #[test]
     fn markdown_keeps_blank_lines_between_paragraphs() {
         let theme = Theme::system();

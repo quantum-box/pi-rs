@@ -195,7 +195,6 @@ struct DisplayTail {
     bytes: u64,
     newlines: u64,
     current_line: u64,
-    last_complete_line: u64,
 }
 
 impl Default for DisplayTail {
@@ -207,7 +206,6 @@ impl Default for DisplayTail {
             bytes: 0,
             newlines: 0,
             current_line: 0,
-            last_complete_line: 0,
         }
     }
 }
@@ -221,9 +219,8 @@ impl DisplayTail {
             let text = std::str::from_utf8(&buffer[..written]).expect("UTF-8 decoder output");
             self.bytes += written as u64;
             for chunk in text.split_inclusive('\n') {
-                if let Some(line) = chunk.strip_suffix('\n') {
+                if chunk.ends_with('\n') {
                     self.newlines += 1;
-                    self.last_complete_line = self.current_line + line.len() as u64;
                     self.current_line = 0;
                 } else {
                     self.current_line += chunk.len() as u64;
@@ -250,11 +247,7 @@ impl DisplayTail {
     }
 
     fn last_line_bytes(&self) -> u64 {
-        if self.current_line == 0 {
-            self.last_complete_line
-        } else {
-            self.current_line
-        }
+        self.current_line
     }
 
     fn is_truncated(&self) -> bool {
@@ -404,28 +397,28 @@ mod tests {
     }
 
     #[test]
-    fn oversized_last_line_reports_utf8_bytes_and_partial_line_metadata() {
+    fn oversized_last_line_reports_reference_size_with_and_without_newline() {
         let text = "界".repeat(100_000);
-        let mut accumulator = Accumulator::default();
-        for chunk in text.as_bytes().chunks(313) {
-            accumulator.append(chunk).unwrap();
+        for (suffix, expected_size) in [("", "293.0KB"), ("\n", "0B")] {
+            let mut accumulator = Accumulator::default();
+            for chunk in text.as_bytes().chunks(313) {
+                accumulator.append(chunk).unwrap();
+            }
+            accumulator.append(suffix.as_bytes()).unwrap();
+            let output = accumulator.finish().unwrap();
+            let details = output.details.unwrap();
+            let truncation = &details["truncation"];
+            assert_eq!(truncation["truncatedBy"], "bytes");
+            assert_eq!(truncation["lastLinePartial"], true);
+            assert_eq!(truncation["totalLines"], 1);
+            assert_eq!(truncation["totalBytes"], 300000 + suffix.len());
+            assert_eq!(truncation["outputBytes"], 51198);
+            assert!(output.display.contains(&format!(
+                "Showing last 50.0KB of line 1 (line is {expected_size})"
+            )));
+            assert!(!output.display.contains('�'));
+            std::fs::remove_file(output.path.unwrap()).unwrap();
         }
-        accumulator.append(b"\n").unwrap();
-        let output = accumulator.finish().unwrap();
-        let details = output.details.unwrap();
-        let truncation = &details["truncation"];
-        assert_eq!(truncation["truncatedBy"], "bytes");
-        assert_eq!(truncation["lastLinePartial"], true);
-        assert_eq!(truncation["totalLines"], 1);
-        assert_eq!(truncation["totalBytes"], 300001);
-        assert_eq!(truncation["outputBytes"], 51198);
-        assert!(
-            output
-                .display
-                .contains("Showing last 50.0KB of line 1 (line is 293.0KB)")
-        );
-        assert!(!output.display.contains('�'));
-        std::fs::remove_file(output.path.unwrap()).unwrap();
     }
 
     #[test]
