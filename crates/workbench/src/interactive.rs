@@ -550,6 +550,23 @@ struct View {
     restoring_queue: bool,
 }
 impl View {
+    fn invalidate_model_catalog(&mut self) {
+        self.available_models.clear();
+        self.model_list = None;
+        if self.thinking_settings.take().is_some()
+            || self.picker.as_ref().is_some_and(|picker| {
+                matches!(
+                    picker.title.as_str(),
+                    "Select model"
+                        | "Model Configuration"
+                        | "Loading thinking models"
+                        | "Thinking: select model"
+                )
+            })
+        {
+            self.picker = None;
+        }
+    }
     fn streaming_tool_entries(&self) -> impl Iterator<Item = Entry> + '_ {
         self.streaming_tools.values().filter_map(|tool| {
             if tool.name == super::operation_models::TOOL {
@@ -3542,6 +3559,8 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     dirty = true;
                 }
                 Ok(RemoteEvent::RefreshModelKeys) => {
+                    view.invalidate_model_catalog();
+                    args.thinking_profile = None;
                     match super::model_auth::Keys::load() {
                         Ok(keys) => args.model_keys = keys,
                         Err(error) => view.append(&error.to_string()),
@@ -6283,6 +6302,24 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credential_change_discards_cached_and_inflight_model_lists() {
+        let mut view = super::View::default();
+        view.available_models
+            .push("openai-chatgpt/account-a-model".into());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        view.model_list = Some(super::ModelDiscovery {
+            receiver,
+            intent: super::ModelListIntent::Select,
+        });
+        view.picker = Some(super::Picker::new("Select model", vec![]));
+        view.invalidate_model_catalog();
+        assert!(view.available_models.is_empty());
+        assert!(view.model_list.is_none());
+        assert!(view.picker.is_none());
+        assert!(sender.send(Ok(vec!["stale".into()])).is_err());
+    }
+
     #[test]
     fn debug_log_includes_rendered_transcript_and_session_messages() {
         use clap::Parser;
