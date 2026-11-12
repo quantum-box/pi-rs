@@ -53,7 +53,47 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut transition: Option<(Value, mpsc::Receiver<Result<Cli>>)> = None;
     let mut deferred = std::collections::VecDeque::<Value>::new();
     let mut stream = super::rpc_events::Stream::default();
-    loop {
+    'run: loop {
+        // Drain accepted input before committing a completed transition. This
+        // gives abort/shutdown priority over prompts queued while it was pending.
+        if transition.is_some() {
+            while let Ok(line) = receiver.try_recv() {
+                let request = match parse_request(&line?) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        response(&json!({"type":"parse"}), Err(error))?;
+                        continue;
+                    }
+                };
+                if matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
+                    let (pending, _) = transition.take().expect("pending transition");
+                    response(&pending, Ok(Some(json!({"cancelled":true}))))?;
+                    for queued in deferred.drain(..) {
+                        response(
+                            &queued,
+                            Err(Error::Config("session transition cancelled".into())),
+                        )?;
+                    }
+                    if request["type"] == "shutdown" {
+                        drop(worker.take());
+                        response(&request, Ok(None))?;
+                        break 'run;
+                    }
+                    response(&request, Ok(None))?;
+                    continue 'run;
+                }
+                if deferred.len() >= 256 {
+                    response(
+                        &request,
+                        Err(Error::Config(
+                            "too many commands waiting for session transition".into(),
+                        )),
+                    )?;
+                } else {
+                    deferred.push_back(request);
+                }
+            }
+        }
         if let Some((_, receiver)) = &transition {
             let result = match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -64,9 +104,12 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             };
             if let Some(result) = result {
                 let (request, _) = transition.take().expect("pending transition");
-                let result = result.and_then(|next| {
+                let result = result.and_then(|mut next| {
                     let previous_thinking = args.thinking.clone();
                     let reason = if request["type"] == "new_session" { pi_rs::SessionStartReason::New } else { pi_rs::SessionStartReason::Resume };
+                    if request["type"] == "new_session" {
+                        finish_new_session(&mut next, request["parentSession"].as_str().filter(|path| !path.is_empty()))?;
+                    }
                     Worker::transition(&mut worker, &next, reason)?;
                     args = next;
                     if previous_thinking.as_deref().unwrap_or("off") != args.thinking.as_deref().unwrap_or("off") {
@@ -210,12 +253,24 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 }
             }
         };
-        if transition.is_some()
-            && !matches!(
-                request["type"].as_str(),
-                Some("get_available_models" | "get_available_thinking_levels")
-            )
-        {
+        if transition.is_some() && matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
+            let (pending, _) = transition.take().expect("pending transition");
+            response(&pending, Ok(Some(json!({"cancelled":true}))))?;
+            for queued in deferred.drain(..) {
+                response(
+                    &queued,
+                    Err(Error::Config("session transition cancelled".into())),
+                )?;
+            }
+            if request["type"] == "shutdown" {
+                drop(worker.take());
+                response(&request, Ok(None))?;
+                break;
+            }
+            response(&request, Ok(None))?;
+            continue;
+        }
+        if transition.is_some() {
             if deferred.len() >= 256 {
                 response(
                     &request,
@@ -265,7 +320,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         ),
                     )
                 };
-                let parent = match request.get("parentSession") {
+                match request.get("parentSession") {
                     None | Some(Value::Null) => None,
                     Some(Value::String(path)) => Some(path.clone()).filter(|path| !path.is_empty()),
                     Some(_) if is_new => {
@@ -293,7 +348,7 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     let result = if let Some(path) = path {
                         switch_session(&mut next, &path)
                     } else {
-                        prepare_new_session(&mut next, parent.as_deref())
+                        prepare_new_session_draft(&mut next)
                     }
                     .map(|()| next);
                     let _ = sender.send(result);
@@ -1174,29 +1229,37 @@ fn record_id(value: &Value) -> Result<u64> {
 }
 
 fn prepare_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
-    let destination = if args.no_session {
+    let mut next = args.clone();
+    prepare_new_session_draft(&mut next)?;
+    finish_new_session(&mut next, parent)?;
+    *args = next;
+    Ok(())
+}
+
+fn prepare_new_session_draft(args: &mut Cli) -> Result<()> {
+    args.refresh_workspace_selection();
+    args.session = if args.no_session {
         args.session
             .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
     } else {
         interactive::session_path(&args.workspace, args.session_dir.as_deref())
     };
-    if let Some(directory) = destination.parent() {
+    Ok(())
+}
+
+fn finish_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
+    if let Some(directory) = args.session.parent() {
         std::fs::create_dir_all(directory)?;
     }
-    let mut next = args.clone();
-    next.refresh_workspace_selection();
-    next.session = destination;
-    let mut session = Session::open(&next.session)?;
-    session.set_working_directory(&next.workspace)?;
-    super::backend::initialize_queue_modes(&mut session, &next)?;
+    let mut session = Session::open(&args.session)?;
+    session.set_working_directory(&args.workspace)?;
+    super::backend::initialize_queue_modes(&mut session, args)?;
     if let Some(parent) = parent {
         session.set_parent_session(parent)?;
     }
-    next.restore_session_model(&session);
-    super::thinking::adjust(&mut next);
-    next.record_automatic_model_selection(&mut session)?;
-    drop(session);
-    *args = next;
+    args.restore_session_model(&session);
+    super::thinking::adjust(args);
+    args.record_automatic_model_selection(&mut session)?;
     Ok(())
 }
 

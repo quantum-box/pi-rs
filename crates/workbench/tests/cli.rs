@@ -2055,7 +2055,6 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
         r#"{"id":"unknown","type":"unsupported"}"#,
         r#"{"id":"stats","type":"get_session_stats"}"#,
         r#"{"id":"native","type":"get_state","includeNative":true}"#,
-        r#"{"id":"stop","type":"shutdown"}"#,
     ] {
         writeln!(stdin, "{request}").unwrap();
     }
@@ -2071,7 +2070,7 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 6);
+    assert_eq!(replies.len(), 5);
     assert_eq!(replies[0]["id"], "state");
     assert_eq!(replies[0]["data"]["isStreaming"], false);
     assert!(replies[0]["data"].get("sessionFile").is_none());
@@ -2083,7 +2082,6 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
     assert!(replies[3]["data"].get("sessionFile").is_none());
     assert_eq!(replies[4]["id"], "native");
     assert!(replies[4]["data"]["sessionFile"].is_string());
-    assert_eq!(replies[5]["id"], "stop");
 }
 
 #[test]
@@ -2191,7 +2189,7 @@ fn rpc_model_discovery_does_not_block_other_commands() {
 }
 
 #[test]
-fn rpc_workspace_switch_keeps_independent_queries_responsive_and_orders_session_commands() {
+fn rpc_workspace_switch_defers_thinking_levels_and_orders_session_commands() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let launch = root.path().join("launch");
@@ -2203,7 +2201,7 @@ fn rpc_workspace_switch_keeps_independent_queries_responsive_and_orders_session_
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
     std::fs::write(
         home.join("models.json"),
-        json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"alpha"}]}}}).to_string(),
+        json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"alpha","reasoning":false},{"id":"dynamic","reasoning":true}]}}}).to_string(),
     )
     .unwrap();
     std::fs::write(
@@ -2286,18 +2284,15 @@ fn rpc_workspace_switch_keeps_independent_queries_responsive_and_orders_session_
         json!({"id":"levels","type":"get_available_thinking_levels"})
     )
     .unwrap();
-    let event = receive
-        .recv_timeout(Duration::from_secs(2))
-        .expect("independent query blocked during switch");
-    assert_eq!(event["id"], "levels", "{event}");
     assert!(receive.recv_timeout(Duration::from_millis(150)).is_err());
     writeln!(input, "{}", json!({"id":"new","type":"new_session"})).unwrap();
     writeln!(input, "{}", json!({"id":"state2","type":"get_state"})).unwrap();
     release.send(()).unwrap();
     let mut replies = Vec::new();
-    while replies.len() < 4 {
+    while replies.len() < 5 {
         let event = receive.recv_timeout(Duration::from_secs(10)).unwrap();
-        if ["switch", "state", "new", "state2"].contains(&event["id"].as_str().unwrap_or_default())
+        if ["switch", "state", "levels", "new", "state2"]
+            .contains(&event["id"].as_str().unwrap_or_default())
         {
             replies.push(event);
         }
@@ -2306,10 +2301,12 @@ fn rpc_workspace_switch_keeps_independent_queries_responsive_and_orders_session_
     assert_eq!(replies[0]["success"], true);
     assert_eq!(replies[1]["id"], "state");
     assert_eq!(replies[1]["data"]["model"]["id"], "dynamic");
-    assert_eq!(replies[2]["id"], "new");
-    assert_eq!(replies[2]["success"], true);
-    assert_eq!(replies[3]["id"], "state2");
-    assert_eq!(replies[3]["data"]["model"]["id"], "dynamic");
+    assert_eq!(replies[2]["id"], "levels");
+    assert!(replies[2]["data"]["levels"].as_array().unwrap().len() > 1);
+    assert_eq!(replies[3]["id"], "new");
+    assert_eq!(replies[3]["success"], true);
+    assert_eq!(replies[4]["id"], "state2");
+    assert_eq!(replies[4]["data"]["model"]["id"], "dynamic");
     writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
     drop(input);
     let output = reader.join().unwrap();
@@ -2319,6 +2316,131 @@ fn rpc_workspace_switch_keeps_independent_queries_responsive_and_orders_session_
         String::from_utf8_lossy(&output.stderr)
     );
     server.join().unwrap();
+}
+
+#[test]
+fn rpc_abort_and_shutdown_cancel_pending_switch_and_queued_prompt() {
+    for control in ["abort", "shutdown"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(launch.join(".pi")).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"alpha","reasoning":false}]}}}).to_string()).unwrap();
+        std::fs::write(
+            launch.join(".pi/settings.json"),
+            json!({"defaultProvider":"ollama","defaultModel":"alpha"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"enabledModels":["ollama/dynamic"]}).to_string(),
+        )
+        .unwrap();
+        let path = root.path().join("target.jsonl");
+        Session::open(&path)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, _) = accept_proxy_request(listener);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            accepted.send(()).unwrap();
+            let _ = gate.recv_timeout(Duration::from_secs(10));
+            let body = br#"{"data":[{"id":"dynamic"}]}"#;
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(body);
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .arg("--workspace")
+            .arg(&launch)
+            .arg("--session")
+            .arg(root.path().join("launch.jsonl"))
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--approve"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(child.stdout.take().unwrap())
+                .lines()
+                .map_while(Result::ok)
+            {
+                if send
+                    .send(serde_json::from_str::<Value>(&line).unwrap())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            child.wait_with_output().unwrap()
+        });
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"switch","type":"switch_session","sessionPath":path})
+        )
+        .unwrap();
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"prompt","type":"prompt","message":"must not run"})
+        )
+        .unwrap();
+        writeln!(input, "{}", json!({"id":"control","type":control})).unwrap();
+        let mut replies = Vec::new();
+        while replies.len() < 3 {
+            let event = receive
+                .recv_timeout(Duration::from_secs(3))
+                .expect("control blocked by discovery");
+            if event.get("id").is_some() {
+                replies.push(event);
+            }
+        }
+        assert_eq!(replies[0]["id"], "switch");
+        assert_eq!(replies[0]["data"]["cancelled"], true);
+        assert_eq!(replies[1]["id"], "prompt");
+        assert_eq!(replies[1]["success"], false);
+        assert_eq!(replies[2]["id"], "control");
+        assert_eq!(replies[2]["success"], true);
+        if control == "abort" {
+            writeln!(input, "{}", json!({"id":"state","type":"get_state"})).unwrap();
+            let state = receive.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(state["id"], "state");
+            assert_eq!(state["data"]["model"]["id"], "alpha");
+            writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+        }
+        drop(input);
+        let _ = release.send(());
+        let output = reader.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
 }
 
 #[test]
@@ -2368,7 +2490,6 @@ fn rpc_new_session_recreates_cli_and_workspace_defaults() {
         requests.push(json!({"id":"thinking","type":"set_thinking_level","level":if explicit { "high" } else { "low" }}));
         requests.push(json!({"id":"new","type":"new_session"}));
         requests.push(json!({"id":"state","type":"get_state"}));
-        requests.push(json!({"type":"shutdown"}));
         child
             .stdin
             .take()

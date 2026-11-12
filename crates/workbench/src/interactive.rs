@@ -2834,10 +2834,6 @@ fn slash(
                     let result = (|| {
                         next.refresh_workspace_selection();
                         next.session = session_path(&next.workspace, next.session_dir.as_deref());
-                        if let Some(directory) = next.session.parent() {
-                            std::fs::create_dir_all(directory)?;
-                        }
-                        initialize_session(&mut next)?;
                         next.session_transition = Some(pi_rs::SessionStartReason::New);
                         Ok(next)
                     })();
@@ -6308,6 +6304,15 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
 fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
     let resources = super::resources::Resources::load(&next)?;
     next.theme_paths = resources.themes.clone();
+    if matches!(
+        next.session_transition,
+        Some(pi_rs::SessionStartReason::New)
+    ) {
+        if let Some(directory) = next.session.parent() {
+            std::fs::create_dir_all(directory)?;
+        }
+        initialize_session(&mut next)?;
+    }
     view.restore(&next)?;
     view.resources = resources;
     *args = next;
@@ -6569,6 +6574,70 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancelled_new_session_does_not_create_a_journal_after_discovery() {
+        use clap::Parser;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("work");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        std::fs::write(
+            workspace.join(".pi/settings.json"),
+            r#"{"enabledModels":["ollama/dynamic"]}"#,
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 2048];
+            let _ = socket.read(&mut buf).unwrap();
+            accepted.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            let body = r#"{"data":[{"id":"dynamic"}]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = workspace.clone();
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().join("sessions"));
+        args.trust = true;
+        args.settings = super::super::config::Settings::load(&workspace, true).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"ollama":{"baseUrl":endpoint,"models":[{"id":"alpha"}]}}})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        args.selection_discovery_pending = true;
+        let mut view = super::View {
+            async_transitions: true,
+            ..Default::default()
+        };
+        super::slash("/new", &mut args, &mut view, None).unwrap();
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        let cancelled = view.pending_transition.take().unwrap();
+        release.send(()).unwrap();
+        let prepared = cancelled
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(!prepared.session.exists());
+        assert!(!root.path().join("sessions").exists());
+        assert_eq!(args.session, root.path().join("current.jsonl"));
+        server.join().unwrap();
+    }
+
     #[test]
     fn interactive_workspace_switch_prepares_in_background_before_applying_scope() {
         use clap::Parser;
