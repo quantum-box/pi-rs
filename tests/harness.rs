@@ -170,6 +170,62 @@ fn answer(value: &str) -> Vec<ModelEvent> {
 fn ignore(_: Notification<'_>) {}
 
 #[tokio::test]
+async fn result_hooks_transform_executed_tools_before_model_and_journal() {
+    struct Hook;
+    #[async_trait::async_trait]
+    impl Extension for Hook {
+        fn id(&self) -> &str {
+            "result-hook"
+        }
+        fn handles_tool_result(&self) -> bool {
+            true
+        }
+        async fn tool_result(
+            &self,
+            _: &ToolCall,
+            outcome: &Outcome,
+            _: &ToolContext,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<Option<Outcome>> {
+            assert_eq!(outcome, &Outcome::Succeeded("found 42".into()));
+            Ok(Some(Outcome::Succeeded("redacted".into())))
+        }
+    }
+    let model = Script::new(vec![
+        tool_reply(&[r#"{"id":"denied"}"#, r#"{"id":"42"}"#]),
+        answer("done"),
+    ]);
+    let fixture = Arc::new(Fixture {
+        called: AtomicUsize::new(0),
+        hold: false,
+        effects: Mutex::default(),
+    });
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Policy)).unwrap();
+    registry.register(Arc::new(Tools(fixture.clone()))).unwrap();
+    registry.register(Arc::new(Hook)).unwrap();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("check".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.called.load(Ordering::SeqCst), 1);
+    assert!(session.operations().iter().any(|(_, state)| matches!(state, OperationState::Finished(Outcome::Succeeded(text)) if text == "redacted")));
+    assert!(
+        model.requests.lock().unwrap()[1].messages.iter().any(
+            |message| matches!(message, Message::Tool { content, .. } if content == "redacted")
+        )
+    );
+}
+
+#[tokio::test]
 async fn completed_tool_arguments_repair_string_escapes_and_keep_raw_journal() {
     let raw = r#"{"id":"\url{x}"}"#;
     let invalid = r#"{"id":"unfinished"#;

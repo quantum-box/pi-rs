@@ -606,6 +606,22 @@ pub trait Extension: Send + Sync {
         Ok(Decision::Allow)
     }
 
+    /// Opt in to transforming completed tool results before they enter the journal.
+    fn handles_tool_result(&self) -> bool {
+        false
+    }
+
+    /// Return a replacement outcome. Later extensions receive the latest result.
+    async fn tool_result(
+        &self,
+        _call: &crate::ToolCall,
+        _outcome: &Outcome,
+        _context: &ToolContext,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<Outcome>> {
+        Ok(None)
+    }
+
     fn after_tool(
         &self,
         _name: &str,
