@@ -186,7 +186,7 @@ fn payload(request: &ModelRequest) -> Value {
             }
         }
     }
-    let mut body = json!({"model":request.model, "input":input, "store":false, "stream":true});
+    let mut body = json!({"model":request.model, "input":input, "store":false, "stream":true, "max_output_tokens":request.max_output_tokens});
     if !request.tools.is_empty() {
         let tools: Vec<_> = request.tools.iter().map(|tool| json!({"type":"function", "name":tool.name, "description":tool.description, "parameters":tool.parameters, "strict":false})).collect();
         body["tools"] = json!([{"type":"namespace", "name":NAMESPACE, "description":"Local tools", "tools":tools}]);
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(body["input"][0]["role"], "developer");
         assert_eq!(body["tools"][0]["type"], "namespace");
         assert_eq!(body["tools"][0]["tools"][0]["name"], "read");
-        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["max_output_tokens"], 100);
         assert!(OpenAiResponses::new("http://example.com/responses", "token".into()).is_err());
     }
 
