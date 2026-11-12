@@ -851,47 +851,6 @@ impl View {
     }
 
     fn observe_thinking_drop(&mut self, event: &pi_rs::Event) -> Option<usize> {
-        let mut mouse_activate = false;
-        let event = match event {
-            Event::Mouse(mouse)
-                if args.tui_mode != Some(TuiMode::Regular)
-                    && view.dialog().is_none()
-                    && view.picker.is_some() =>
-            {
-                let mut picker = view.picker.take().expect("picker checked above");
-                let header_rows = usize::from(show_startup_header(&args));
-                let action = if usize::from(mouse.column) < view.fullscreen_width
-                    && let Some(row) = usize::from(mouse.row).checked_sub(header_rows)
-                {
-                    picker.mouse(mouse.kind, row)
-                } else {
-                    picker.clear_mouse_press();
-                    MouseInput::Ignored
-                };
-                if matches!(action, MouseInput::Changed)
-                    && let Some(settings) = &view.theme_settings
-                {
-                    match settings.preview(&picker, &args) {
-                        Ok(next) => theme = next,
-                        Err(error) => picker.show_feedback(Err(error.to_string())),
-                    }
-                }
-                view.picker = Some(picker);
-                match action {
-                    MouseInput::Activate => {
-                        mouse_activate = true;
-                        Event::Key(KeyEvent::new(KeyCode::F(255), KeyModifiers::NONE))
-                    }
-                    MouseInput::Changed => {
-                        last_idle_interrupt = None;
-                        dirty = true;
-                        continue;
-                    }
-                    MouseInput::Ignored => continue,
-                }
-            }
-            event => event,
-        };
         match event {
             pi_rs::Event::ModelFinished {
                 request_id,
@@ -3895,6 +3854,47 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 continue;
             }
             _ => continue,
+        };
+        let mut mouse_activate = false;
+        let event = match event {
+            Event::Mouse(mouse)
+                if args.tui_mode != Some(TuiMode::Regular)
+                    && view.dialog().is_none()
+                    && view.picker.is_some() =>
+            {
+                let mut picker = view.picker.take().expect("picker checked above");
+                let header_rows = usize::from(show_startup_header(&args));
+                let action = if usize::from(mouse.column) < view.fullscreen_width
+                    && let Some(row) = usize::from(mouse.row).checked_sub(header_rows)
+                {
+                    picker.mouse(mouse.kind, row)
+                } else {
+                    picker.clear_mouse_press();
+                    MouseInput::Ignored
+                };
+                if matches!(action, MouseInput::Changed)
+                    && let Some(settings) = &view.theme_settings
+                {
+                    match settings.preview(&picker, &args) {
+                        Ok(next) => theme = next,
+                        Err(error) => picker.show_feedback(Err(error.to_string())),
+                    }
+                }
+                view.picker = Some(picker);
+                match action {
+                    MouseInput::Activate => {
+                        mouse_activate = true;
+                        Event::Key(KeyEvent::new(KeyCode::F(255), KeyModifiers::NONE))
+                    }
+                    MouseInput::Changed => {
+                        last_idle_interrupt = None;
+                        dirty = true;
+                        continue;
+                    }
+                    MouseInput::Ignored => continue,
+                }
+            }
+            event => event,
         };
         match event {
             Event::Resize(..) => {
