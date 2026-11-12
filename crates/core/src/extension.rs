@@ -56,8 +56,16 @@ pub struct CustomMessage {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExtensionCommandAction {
-    Entry { entry: CustomEntry },
-    Message { message: CustomMessage },
+    Entry {
+        entry: CustomEntry,
+    },
+    Message {
+        message: CustomMessage,
+    },
+    /// Add a message and ask the host to start a model turn.
+    TriggerMessage {
+        message: CustomMessage,
+    },
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]

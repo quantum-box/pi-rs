@@ -1588,6 +1588,8 @@ fn validated_head(records: &[Record]) -> Result<u64> {
 
 struct FileStore {
     file: File,
+    #[cfg(windows)]
+    lock_file: File,
     #[cfg(unix)]
     parent: std::path::PathBuf,
 }
@@ -1602,10 +1604,28 @@ impl FileStore {
             options.mode(0o600);
         }
         let file = options.open(path)?;
+        #[cfg(windows)]
+        let lock_file = {
+            let mut lock_path = path.as_os_str().to_os_string();
+            lock_path.push(".lock");
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_path)?
+        };
+        #[cfg(windows)]
+        lock_file
+            .try_lock()
+            .map_err(|err| Error::Session(format!("cannot lock journal: {err}")))?;
+        #[cfg(not(windows))]
         file.try_lock()
             .map_err(|err| Error::Session(format!("cannot lock journal: {err}")))?;
         Ok(Self {
             file,
+            #[cfg(windows)]
+            lock_file,
             #[cfg(unix)]
             parent: path
                 .parent()
@@ -1620,6 +1640,9 @@ impl Drop for FileStore {
     fn drop(&mut self) {
         // Release the lock even when a concurrently spawned child still holds a
         // duplicate file descriptor until its exec completes.
+        #[cfg(windows)]
+        let _ = self.lock_file.unlock();
+        #[cfg(not(windows))]
         let _ = self.file.unlock();
     }
 }

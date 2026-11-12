@@ -468,7 +468,8 @@ impl Cli {
         let settings = self
             .model_profiles
             .header_settings(provider, endpoint, model);
-        if settings.has_command()
+        if model.is_some_and(str::is_empty)
+            || settings.has_command()
             || credential
                 .as_ref()
                 .is_some_and(model_auth::Credential::is_command)
@@ -1286,7 +1287,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         args.mode == Some(OutputMode::Text) || (args.print && args.mode != Some(OutputMode::Json)),
         Ordering::Relaxed,
     );
-    let command = args.command.take().unwrap_or(Command::Interactive);
+    let mut command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
         return interactive::run(args, follow_up_prompts).await;
     }
@@ -1462,10 +1463,15 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     if let Some((model, thinking)) = session.model_selection() {
         args.restore_model_selection(model, thinking, session.model_provider());
     }
-    thinking::adjust(&mut args);
-    args.record_model_selection(&mut session)?;
+    if !args.model.is_empty() {
+        thinking::adjust(&mut args);
+        args.record_model_selection(&mut session)?;
+    }
     if args.mode == Some(OutputMode::Json)
-        && matches!(command, Command::Run { .. } | Command::Resume)
+        && matches!(
+            command,
+            Command::Run { .. } | Command::Resume | Command::Extension { .. }
+        )
     {
         let mut header = rpc_entries::session_header(&session, &args.workspace);
         if let Some(parent) = session.parent_session() {
@@ -1490,6 +1496,32 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         .discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup)
         .await?;
     let result = async {
+        if let Command::Extension { extension_id, command: extension_command, arguments } = &command {
+            if let Some(run_id) = args.run_id
+                && session.records().iter().any(|record| record.run_id == Some(run_id))
+            {
+                return Err(Error::DuplicateRun(run_id));
+            }
+            let trigger = runtime.agent(&args, session.session_id()).extension_command_with_trigger(
+                &mut session, extension_id, extension_command, arguments,
+                &mut |event| observe(event, args.trace),
+            )?;
+            if !trigger { return Ok(()); }
+            if args.model.is_empty() {
+                let catalog = model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes()).await?;
+                args.model = catalog.models.first().cloned().ok_or_else(|| Error::Config("no model is available for the selected provider; pass --model".into()))?;
+                args.bind_initial_model_endpoint();
+                if !args.thinking_explicit { args.apply_model_thinking_defaults(); }
+                thinking::adjust(&mut args);
+                args.record_model_selection(&mut session)?;
+                runtime.close().await?;
+                runtime = runtime::configure(&args, false).await?;
+                session.set_auto_compaction_control(runtime.auto_compaction.clone());
+                session.set_retry_control(runtime.retry.clone());
+                runtime.discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup).await?;
+            }
+            command = Command::Resume;
+        }
         let registry = &runtime.registry;
         let agent = runtime.agent(&args, session.session_id());
         let mut observer = |event: Notification<'_>| observe(event, args.trace);
@@ -1554,19 +1586,6 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             );
             return Ok(());
         }
-        Command::Extension {
-            extension_id,
-            command,
-            arguments,
-        } => {
-            return agent.extension_command(
-                &mut session,
-                &extension_id,
-                &command,
-                &arguments,
-                &mut observer,
-            );
-        }
         Command::Compact {
             summary: Some(summary),
             keep_turns,
@@ -1620,9 +1639,16 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             if index == 0 && skip_initial_prompt {
                 continue;
             }
-            if images.is_empty() && agent.try_extension_command(&mut session, prompt, &mut observer)? {
-                continue;
+            if index == 0 && prompt.starts_with('/')
+                && let Some(run_id) = args.run_id
+                && session.records().iter().any(|record| record.run_id == Some(run_id))
+            {
+                return Err(Error::DuplicateRun(run_id));
             }
+            if images.is_empty() && let Some(trigger) = agent.try_extension_command_with_trigger(&mut session, prompt, &mut observer)? {
+                if !trigger { continue; }
+                input = None;
+            } else {
             if registry.has_input_hooks() {
                 let event = pi_rs::InputEvent {
                     text: std::mem::take(prompt),
@@ -1642,6 +1668,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             }
             if let Some(expanded) = runtime.resources.expand(prompt) {
                 *prompt = expanded;
+            }
             }
         }
         let run_id = if index == 0 { args.run_id } else { None }.unwrap_or_else(Uuid::new_v4);

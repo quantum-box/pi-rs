@@ -418,8 +418,15 @@ fn resolve_discovered_path(
     };
     let text = text.trim();
     if text.starts_with("file://") {
-        return reqwest::Url::parse(text)
-            .map_err(|error| pi_rs::Error::Config(format!("invalid resource URL: {error}")))?
+        let url = reqwest::Url::parse(text)
+            .map_err(|error| pi_rs::Error::Config(format!("invalid resource URL: {error}")))?;
+        if url
+            .host_str()
+            .is_some_and(|host| !host.is_empty() && host != "localhost")
+        {
+            return Err(pi_rs::Error::Config("invalid local resource URL".into()));
+        }
+        return url
             .to_file_path()
             .map_err(|_| pi_rs::Error::Config("invalid local resource URL".into()));
     }

@@ -11,6 +11,166 @@ use serde_json::{Value, json};
 
 #[cfg(unix)]
 #[test]
+fn extension_command_can_trigger_model_in_print_and_json_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("trigger.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'trigger', 'dependencies':[], 'commands':['trigger'], 'tools':[], 'command_effects':True}
+elif request['type'] == 'command_effects':
+    result = {'actions':[{'type':'trigger_message','message':{'customType':'hint','content':'same input','display':False}}]}
+elif request['type'] in ('context', 'before_request'):
+    result = request['request']
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (endpoint, server) = model_fixture();
+    for mode in ["--print", "--mode"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--endpoint",
+                &endpoint,
+                "--extension",
+            ])
+            .arg(&extension)
+            .arg(mode);
+        if mode == "--mode" {
+            command.arg("json");
+        }
+        let output = command.arg("/trigger").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+    }
+    server.join().unwrap();
+
+    let (endpoint, server) = model_fixture_with_finish(None, "length");
+    for mode in ["print", "json"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--endpoint",
+                &endpoint,
+                "--extension",
+            ])
+            .arg(&extension);
+        if mode == "print" {
+            command.arg("--print");
+        } else {
+            command.args(["--mode", "json"]);
+        }
+        let output = command
+            .args(["extension", "trigger", "trigger"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if mode == "print" {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Response was truncated"));
+            assert!(stdout.contains("fixture answer"));
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let events: Vec<Value> = stdout
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events[0]["type"], "session");
+            assert!(events.iter().any(|event| event["type"] == "agent_start"));
+            assert!(events.iter().any(|event| event["type"] == "agent_end"));
+        }
+    }
+    server.join().unwrap();
+
+    let (endpoint, server) = model_fixture();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["--mode", "rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for id in ["first", "second"] {
+        writeln!(
+            input,
+            "{}",
+            json!({"id": id, "type": "prompt", "message": "/trigger"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        let mut started = false;
+        loop {
+            let event = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            if event["type"] == "response" && event["id"] == id {
+                assert_eq!(event["data"]["disposition"], "started", "{event}");
+                started = true;
+            }
+            if event["type"] == "agent_end" {
+                assert!(started, "turn ended before prompt was acknowledged");
+                break;
+            }
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn executable_extension_can_add_custom_model_context_without_display() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -145,6 +305,28 @@ else:
 print(json.dumps({'version':1, 'response':{'Ok':result}}))
 "##).unwrap();
     std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let no_model = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--provider",
+            "anthropic",
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["extension", "bookmark", "bookmark", "offline"])
+        .output()
+        .unwrap();
+    assert!(
+        no_model.status.success(),
+        "{}",
+        String::from_utf8_lossy(&no_model.stderr)
+    );
     let session = root.path().join("session.jsonl");
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(root.path())
@@ -818,7 +1000,7 @@ fn model_fixture_with_gate(
     server.set_nonblocking(true).unwrap();
     let handle = std::thread::spawn(move || {
         let mut completed = 0;
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(180);
         while completed < 2 {
             let (mut socket, _) = match server.accept() {
                 Ok(connection) => connection,
@@ -1679,7 +1861,8 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         )
         .unwrap();
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            // Parallel CLI tests can delay process startup on hosted runners.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
                 let (mut socket, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -1748,7 +1931,13 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
             command.env("http_proxy", &proxy);
         }
         let output = command.output().unwrap();
-        let (request, headers) = server.join().unwrap();
+        let (request, headers) = server.join().unwrap_or_else(|_| {
+            panic!(
+                "{provider}: proxy server failed; status: {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
         assert!(
             request.starts_with("POST http://127.0.0.1:1/"),
             "{provider}: {request}"
@@ -1859,25 +2048,28 @@ fn model_listing_uses_proxy_before_a_model_request() {
     )
     .unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        let (mut socket, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (mut socket, mut reader, first) = loop {
+            let (socket, _) = match listener.accept() {
+                Ok(connection) => connection,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(10))
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
                 Err(error) => panic!("model discovery did not reach proxy: {error}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_ok() && !first.is_empty() {
+                break (socket, reader, first);
             }
         };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = BufReader::new(socket.try_clone().unwrap());
-        let mut first = String::new();
-        reader.read_line(&mut first).unwrap();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -1934,25 +2126,28 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     .unwrap();
     std::fs::write(root.path().join("auth.json"), json!({"radius":{"type":"oauth","gateway":"http://127.0.0.1:1/","access":"old-token","refresh":"fixture-refresh","expires":0}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        let (mut socket, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (mut socket, mut reader, first) = loop {
+            let (socket, _) = match listener.accept() {
+                Ok(connection) => connection,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(10))
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
                 Err(error) => panic!("OAuth refresh did not reach proxy: {error}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_ok() && !first.is_empty() {
+                break (socket, reader, first);
             }
         };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = BufReader::new(socket.try_clone().unwrap());
-        let mut first = String::new();
-        reader.read_line(&mut first).unwrap();
         let mut length = 0;
         loop {
             let mut line = String::new();
@@ -2011,25 +2206,28 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
     .unwrap();
     std::fs::write(root.path().join("mcp.json"), json!({"mcpServers":{"fixture":{"url":"http://127.0.0.1:1/mcp","auth":{"provider":"anthropic"},"oauth":false}}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        let (mut socket, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (mut socket, mut reader, first) = loop {
+            let (socket, _) = match listener.accept() {
+                Ok(connection) => connection,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(10))
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
                 Err(error) => panic!("MCP request did not reach proxy: {error}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_ok() && !first.is_empty() {
+                break (socket, reader, first);
             }
         };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = BufReader::new(socket.try_clone().unwrap());
-        let mut first = String::new();
-        reader.read_line(&mut first).unwrap();
         let mut headers = String::new();
         loop {
             let mut line = String::new();

@@ -44,7 +44,7 @@ fn thinking_command_notifies_native_extension_from_terminal() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("models.json"),
-        br#"{"providers":{"ollama":{"models":[{"id":"fixture","reasoning":true}]}}}"#,
+        br#"{"providers":{"ollama":{"models":[{"id":"fixture","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}}]}}}"#,
     )
     .unwrap();
     let extension = root.path().join("selection.py");
@@ -77,7 +77,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -115,12 +115,25 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     master.write_all(b"/thinking low\r").unwrap();
     let path = home.join("events.jsonl");
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut terminal_output = Vec::new();
+    let mut buffer = [0; 8192];
     while std::fs::metadata(&path).map_or(true, |metadata| metadata.len() == 0)
         && Instant::now() < deadline
     {
+        match master.read(&mut buffer) {
+            Ok(count) => terminal_output.extend_from_slice(&buffer[..count]),
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+            Err(error) => panic!("terminal read failed: {error}"),
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let contents = std::fs::read_to_string(path).expect("extension did not receive selection");
+    let contents = std::fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "extension did not receive selection: {error}; terminal output: {}",
+            String::from_utf8_lossy(&terminal_output)
+        )
+    });
     let event: serde_json::Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
     assert_eq!(
         event,
@@ -219,7 +232,7 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
                     &mut slave_fd,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size,
+                    std::ptr::addr_of_mut!(size),
                 )
             },
             0
@@ -558,7 +571,7 @@ fn rpc_resume_uses_controlling_terminal_without_corrupting_protocol() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -665,7 +678,7 @@ fn resume_selector_escape_cancels_with_redirected_stdio() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -750,7 +763,7 @@ fn settings_switches_terminal_modes_and_restores_input() {
                     &mut slave_fd,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size,
+                    std::ptr::addr_of_mut!(size),
                 )
             },
             0
@@ -882,7 +895,7 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -1022,7 +1035,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -1121,6 +1134,10 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     wait_level("low");
     let deadline = Instant::now() + Duration::from_secs(10);
     let notifications = loop {
+        // Keep draining the PTY while waiting: fullscreen redraws can fill its
+        // output buffer and block the UI before it dispatches the notification.
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
         let entries: Vec<serde_json::Value> = std::fs::read_to_string(home.join("events.jsonl"))
             .unwrap_or_default()
             .lines()
@@ -1210,7 +1227,7 @@ fn thinking_model_discovery_can_be_cancelled_while_server_is_slow() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -1285,7 +1302,7 @@ fn save_default_model_persists_provider_and_extends_scope() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0

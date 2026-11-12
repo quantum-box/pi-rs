@@ -1645,6 +1645,35 @@ impl Agent<'_> {
         Ok(true)
     }
 
+    /// Dispatch a slash command, returning its optional turn request.
+    pub fn try_extension_command_with_trigger(
+        &self,
+        session: &mut Session,
+        input: &str,
+        observer: &mut Observer<'_>,
+    ) -> Result<Option<bool>> {
+        let (name, arguments) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+        let Some(name) = name.strip_prefix('/') else {
+            return Ok(None);
+        };
+        let Some(command) = self
+            .registry
+            .registered_commands()
+            .into_iter()
+            .find(|command| command.invocation_name == name)
+        else {
+            return Ok(None);
+        };
+        self.extension_command_with_trigger(
+            session,
+            &command.extension_id,
+            &command.name,
+            arguments.trim_start(),
+            observer,
+        )
+        .map(Some)
+    }
+
     /// Run a host-only extension command against this branch's durable state.
     pub fn extension_command(
         &self,
@@ -1654,6 +1683,31 @@ impl Agent<'_> {
         arguments: &str,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
+        self.extension_command_inner(session, extension_id, command, arguments, observer, false)?;
+        Ok(())
+    }
+
+    /// Execute a command and return whether its effects request a model turn.
+    pub fn extension_command_with_trigger(
+        &self,
+        session: &mut Session,
+        extension_id: &str,
+        command: &str,
+        arguments: &str,
+        observer: &mut Observer<'_>,
+    ) -> Result<bool> {
+        self.extension_command_inner(session, extension_id, command, arguments, observer, true)
+    }
+
+    fn extension_command_inner(
+        &self,
+        session: &mut Session,
+        extension_id: &str,
+        command: &str,
+        arguments: &str,
+        observer: &mut Observer<'_>,
+        allow_trigger: bool,
+    ) -> Result<bool> {
         ensure_settled(session.operations())?;
         let extension = self
             .registry
@@ -1668,15 +1722,25 @@ impl Agent<'_> {
             extension.as_ref(),
             extension.command_effects(command, arguments, states.get(extension_id)),
         )?;
+        let mut trigger = false;
         for action in &result.actions {
             match action {
                 crate::ExtensionCommandAction::Entry { entry } => {
                     crate::journal::validate_custom_entry(entry)?
                 }
-                crate::ExtensionCommandAction::Message { message } => {
+                crate::ExtensionCommandAction::Message { message }
+                | crate::ExtensionCommandAction::TriggerMessage { message } => {
                     crate::journal::validate_custom_message(message)?
                 }
             }
+            if matches!(action, crate::ExtensionCommandAction::TriggerMessage { .. }) {
+                trigger = true;
+            }
+        }
+        if trigger && !allow_trigger {
+            return Err(Error::Config(
+                "extension command requires a host that supports triggering a model turn".into(),
+            ));
         }
         if let Some(state) = result.state {
             commit(
@@ -1690,13 +1754,14 @@ impl Agent<'_> {
         for action in result.actions {
             let event = match action {
                 crate::ExtensionCommandAction::Entry { entry } => Event::CustomEntry { entry },
-                crate::ExtensionCommandAction::Message { message } => {
+                crate::ExtensionCommandAction::Message { message }
+                | crate::ExtensionCommandAction::TriggerMessage { message } => {
                     Event::CustomMessage { message }
                 }
             };
             commit(session, event, observer)?;
         }
-        Ok(())
+        Ok(trigger)
     }
 
     /// Replace older context with a supplied summary, preserving the original journal.
