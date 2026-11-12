@@ -1720,6 +1720,31 @@ mod tests {
         args.refresh_workspace_selection();
         args.thinking = Some("low".into());
         args.remember_initial_selection();
+        let mut thinking_override = args.clone();
+        thinking_override.thinking_explicit = true;
+        thinking_override.remember_initial_selection();
+        switch_session(&mut thinking_override, &target_session).unwrap();
+        assert_eq!(
+            (
+                thinking_override.model.as_str(),
+                thinking_override.thinking.as_deref()
+            ),
+            ("beta", Some("low"))
+        );
+        thinking_override.thinking = Some("high".into());
+        command(
+            &json!({"type":"new_session"}),
+            &mut thinking_override,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                thinking_override.model.as_str(),
+                thinking_override.thinking.as_deref()
+            ),
+            ("beta", Some("low"))
+        );
         switch_session(&mut args, &target_session).unwrap();
         assert_eq!(
             (args.model.as_str(), args.thinking.as_deref()),
