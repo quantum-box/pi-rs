@@ -170,6 +170,83 @@ fn answer(value: &str) -> Vec<ModelEvent> {
 fn ignore(_: Notification<'_>) {}
 
 #[tokio::test]
+async fn context_with_system_runs_after_context_hooks_in_registration_order() {
+    struct Hook(&'static str);
+    #[async_trait::async_trait]
+    impl Extension for Hook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        async fn before_request(
+            &self,
+            request: &mut ModelRequest,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            request.messages.push(Message::User {
+                content: format!("context-{}", self.0),
+            });
+            Ok(())
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut Vec<Message>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            assert!(matches!(messages.first(), Some(Message::System { .. })));
+            assert!(messages.iter().any(
+                |message| matches!(message, Message::User { content } if content == "context-b")
+            ));
+            messages.push(Message::User {
+                content: format!("system-{}", self.0),
+            });
+            Ok(())
+        }
+    }
+    let model = Script::new(vec![answer("done")]);
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Hook("a"))).unwrap();
+    registry.register(Arc::new(Hook("b"))).unwrap();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let requests = model.requests.lock().unwrap();
+    let contents: Vec<_> = requests[0]
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        contents,
+        ["hello", "context-a", "context-b", "system-a", "system-b"]
+    );
+    assert_eq!(
+        session
+            .conversation_at(session.head())
+            .unwrap()
+            .iter()
+            .filter(|message| matches!(message, Message::User { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn result_hooks_transform_executed_tools_before_model_and_journal() {
     struct Hook;
     #[async_trait::async_trait]

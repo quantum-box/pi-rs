@@ -162,6 +162,10 @@ enum ProtocolRequest {
         summary: bool,
         state: Option<ExtensionState>,
     },
+    ContextWithSystem {
+        messages: Vec<Message>,
+        state: Option<ExtensionState>,
+    },
     Command {
         name: String,
         arguments: String,
@@ -266,6 +270,8 @@ struct Description {
     session_transition_hook: bool,
     #[serde(default)]
     resource_discovery_hook: bool,
+    #[serde(default)]
+    context_with_system_hook: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
@@ -654,6 +660,34 @@ impl Extension for ExecutableExtension {
         let mut updated = self.request_async(message).await?;
         restore_provider_replay(request, &mut updated);
         *request = updated;
+        Ok(())
+    }
+    fn handles_context_with_system(&self) -> bool {
+        self.description.context_with_system_hook
+    }
+    async fn context_with_system(
+        &self,
+        messages: &mut Vec<Message>,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        let original = ModelRequest {
+            model: String::new(),
+            messages: messages.clone(),
+            tools: Vec::new(),
+            max_output_tokens: 0,
+        };
+        let updated = self
+            .request_async(ProtocolRequest::ContextWithSystem {
+                messages: extension_context(&original).messages,
+                state: state.cloned(),
+            })
+            .await?;
+        let mut updated = ModelRequest {
+            messages: updated,
+            ..original.clone()
+        };
+        restore_provider_replay(&original, &mut updated);
+        *messages = updated.messages;
         Ok(())
     }
     fn command(
@@ -1506,6 +1540,7 @@ async fn dispatch_with_host(
             tree_navigation_hook: extension.handles_tree_navigation(),
             session_transition_hook: extension.handles_session_transitions(),
             resource_discovery_hook: extension.handles_resource_discovery(),
+            context_with_system_hook: extension.handles_context_with_system(),
             tools: extension
                 .tools()
                 .into_iter()
@@ -1575,6 +1610,15 @@ async fn dispatch_with_host(
                 .before_request(&mut request, purpose, state.as_ref())
                 .await?;
             encode(Ok(request))
+        }
+        ProtocolRequest::ContextWithSystem {
+            mut messages,
+            state,
+        } => {
+            extension
+                .context_with_system(&mut messages, state.as_ref())
+                .await?;
+            encode(Ok(messages))
         }
         ProtocolRequest::Command {
             name,
@@ -2165,6 +2209,60 @@ mod tests {
                 ))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn protocol_context_with_system_passes_messages_and_state() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "hook"
+            }
+            fn handles_context_with_system(&self) -> bool {
+                true
+            }
+            async fn context_with_system(
+                &self,
+                messages: &mut Vec<Message>,
+                state: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert_eq!(state.unwrap().data["value"], "saved");
+                assert!(matches!(messages.first(), Some(Message::System { .. })));
+                messages.push(Message::User {
+                    content: "added".into(),
+                });
+                Ok(())
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let descriptor: Description = serde_json::from_value(
+            runtime
+                .block_on(dispatch(extension.clone(), ProtocolRequest::Describe))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(descriptor.context_with_system_hook);
+        let result = runtime
+            .block_on(dispatch(
+                extension,
+                ProtocolRequest::ContextWithSystem {
+                    messages: vec![Message::System {
+                        content: "prompt".into(),
+                    }],
+                    state: Some(ExtensionState {
+                        version: 1,
+                        data: serde_json::json!({"value":"saved"}),
+                    }),
+                },
+            ))
+            .unwrap();
+        let messages: Vec<Message> = serde_json::from_value(result).unwrap();
+        assert!(matches!(&messages[1], Message::User { content } if content == "added"));
     }
 
     #[test]
