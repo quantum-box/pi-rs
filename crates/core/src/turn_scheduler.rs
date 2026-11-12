@@ -21,22 +21,19 @@ enum TurnNormalized {
 }
 
 impl Agent<'_> {
-    async fn turn_poll(
+    async fn turn_poll_normalize(
         registry: &Registry,
         timeout: Duration,
         invocation: &Invocation,
-        reference: &str,
-        states: &ExtensionStates,
         cancel: &CancellationToken,
-    ) -> Result<Outcome> {
+    ) -> Result<(Arc<RegisteredTool>, serde_json::Value)> {
         let pending = || Error::PendingOperation(invocation.operation_id);
         let tool = registry
             .tools
             .get(&invocation.call.name)
+            .filter(|tool| tool.tool.can_poll())
+            .cloned()
             .ok_or_else(pending)?;
-        if !tool.tool.can_poll() {
-            return Err(pending());
-        }
         let args =
             crate::parse_tool_arguments(&invocation.call.arguments).map_err(|_| pending())?;
         let args = tokio::select! {
@@ -47,25 +44,49 @@ impl Agent<'_> {
         if args.to_string().len() > 16 * 1024 * 1024 || !tool.validator.is_valid(&args) {
             return Err(pending());
         }
+        Ok((tool, args))
+    }
+
+    async fn turn_poll_authorize_and_run(
+        registry: &Registry,
+        timeout: Duration,
+        invocation: &Invocation,
+        reference: &str,
+        prepared: (Arc<RegisteredTool>, serde_json::Value),
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+    ) -> Result<Outcome> {
+        let (tool, args) = prepared;
+        let pending = || Error::PendingOperation(invocation.operation_id);
+        let cancellation = cancel.child_token();
+        let _guard = cancellation.clone().drop_guard();
         let context = ToolContext {
             operation_id: invocation.operation_id,
-            cancellation: cancel.child_token(),
+            cancellation,
         };
-        for extension in &registry.extensions {
-            let decision = hook(
-                extension.as_ref(),
-                extension
-                    .before_tool(
-                        &invocation.call.name,
-                        &args,
-                        &context,
-                        states.get(extension.id()),
-                    )
-                    .await,
-            )?;
-            if decision != Decision::Allow {
-                return Err(pending());
+        let authorize = async {
+            for extension in &registry.extensions {
+                let decision = hook(
+                    extension.as_ref(),
+                    extension
+                        .before_tool(
+                            &invocation.call.name,
+                            &args,
+                            &context,
+                            states.get(extension.id()),
+                        )
+                        .await,
+                )?;
+                if decision != Decision::Allow {
+                    return Err(pending());
+                }
             }
+            Ok(())
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            result = tokio::time::timeout(timeout, authorize) => result.map_err(|_| Error::Config("pre-tool hooks timed out".into()))??,
         }
         tokio::select! {
             biased;
@@ -363,6 +384,13 @@ enum TurnEvent {
         Vec<(String, &'static str, String)>,
     ),
     Notified(usize, Outcome, Vec<(String, &'static str, String)>),
+    PollPrepared(
+        usize,
+        Result<(Arc<RegisteredTool>, serde_json::Value)>,
+        String,
+        Option<u64>,
+        Vec<(String, &'static str, String)>,
+    ),
     Polled(
         usize,
         Result<Outcome>,
@@ -989,16 +1017,17 @@ impl Agent<'_> {
                             let pending_outcome = outcome.clone();
                             calls[index].phase = TurnPhase::Polling;
                             calls[index].polled = true;
-                            futures.push(async move {
+                            let future = async move {
                                 let mut errors = Vec::new();
                                 if observe_tools {
                                     let event = crate::LifecycleEvent::ToolExecutionEnd { tool_call_id: invocation.call.id.clone(), tool_name: invocation.call.name.clone(), result: pending_outcome, is_error: false, duration_ms: duration, parent_tool_call_id: parent };
                                     let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(), event, message.to_owned())); };
-                                    crate::lifecycle::notify(&registry, event, &snapshot, model_timeout, &mut collect).await;
+                                    tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify(&registry, event, &snapshot, model_timeout, &mut collect) => {} }
                                 }
-                                let result = Self::turn_poll(&registry, timeout, &invocation, &reference, &snapshot, &cancel).await;
-                                TurnEvent::Polled(index, result, reference, duration, errors)
-                            }.boxed());
+                                let result = Self::turn_poll_normalize(&registry, timeout, &invocation, &cancel).await;
+                                TurnEvent::PollPrepared(index, result, reference, duration, errors)
+                            }.boxed();
+                            futures.push(start_turn_future(future).await);
                             continue;
                         }
                         if let Err(error) = finished { record_turn_error(&mut first_error, &mut error_origin, index, error); }
@@ -1025,6 +1054,21 @@ impl Agent<'_> {
                         writes.remove(&index);
                         let lane = lanes.get_mut(&calls[index].lane).expect("turn lane");
                         assert_eq!(lane.calls.pop_front(), Some(index)); lane.active -= 1;
+                    }
+                    TurnEvent::PollPrepared(index, result, reference, duration, errors) => {
+                        for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension,event,message }); }
+                        match result {
+                            Ok((tool, args)) => {
+                                let registry = self.registry.clone(); let snapshot = states.clone();
+                                let invocation = calls[index].invocation.clone(); let cancel = calls[index].cancellation.clone(); let timeout = self.limits.tool_timeout;
+                                let future = async move {
+                                    let result = Self::turn_poll_authorize_and_run(&registry, timeout, &invocation, &reference, (tool, args), &snapshot, &cancel).await;
+                                    TurnEvent::Polled(index, result, reference, duration, Vec::new())
+                                }.boxed();
+                                futures.push(start_turn_future(future).await);
+                            }
+                            Err(error) => { futures.push(futures_util::future::ready(TurnEvent::Polled(index, Err(error), reference, duration, Vec::new())).boxed()); }
+                        }
                     }
                     TurnEvent::Polled(index, result, reference, duration, errors) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension,event,message }); }
