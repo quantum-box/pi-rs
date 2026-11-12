@@ -125,20 +125,21 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
             let requested = source
                 .map(|source| normalize(&source, &args.workspace))
                 .transpose()?;
-            let declarations = declarations(args)?;
+            let sources = configured_update_sources(args)?;
             if let Some(source) = &requested
-                && !declarations.iter().any(|declaration| {
-                    source_identity(&declaration.source) == source_identity(source)
-                })
+                && !sources
+                    .iter()
+                    .any(|entry| source_identity(entry) == source_identity(source))
             {
                 return Err(Error::Config("package is not configured".into()));
             }
-            for declaration in declarations {
-                if requested.as_ref().is_none_or(|requested| {
-                    source_identity(requested) == source_identity(&declaration.source)
-                }) {
-                    install(&declaration.source, args.offline).await?;
-                    output(json!({"type":"package_updated","source":declaration.source}));
+            for source in sources {
+                if requested
+                    .as_ref()
+                    .is_none_or(|requested| source_identity(requested) == source_identity(&source))
+                {
+                    install(&source, args.offline).await?;
+                    output(json!({"type":"package_updated","source":source}));
                 }
             }
         }
@@ -381,6 +382,44 @@ pub(crate) fn resource_matches(
 
 fn source_field(value: &Value) -> Option<&str> {
     value.as_str().or_else(|| value.get("source")?.as_str())
+}
+
+// Updates reconcile each configured revision, including a user declaration
+// shadowed by a project declaration. Transient CLI packages are not persisted
+// and are refreshed by prepare instead.
+fn configured_update_sources(args: &Cli) -> Result<Vec<String>> {
+    let mut files = vec![(
+        config::agent_dir().join("settings.json"),
+        config::agent_dir(),
+    )];
+    if args.trusted {
+        files.push((
+            args.workspace.join(".pi/settings.json"),
+            args.workspace.join(".pi"),
+        ));
+    }
+    update_sources(&files)
+}
+
+fn update_sources(files: &[(PathBuf, PathBuf)]) -> Result<Vec<String>> {
+    let mut sources = Vec::new();
+    for (file, base) in files {
+        let document = config::read_object(file)?;
+        if let Some(packages) = document.get("packages") {
+            for value in packages
+                .as_array()
+                .ok_or_else(|| Error::Config("packages must be an array".into()))?
+            {
+                let source = source_field(value)
+                    .ok_or_else(|| Error::Config("package needs a source".into()))?;
+                let source = normalize(source, base)?;
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+        }
+    }
+    Ok(sources)
 }
 fn declarations(args: &Cli) -> Result<Vec<Declaration>> {
     let mut result = BTreeMap::new();
@@ -1078,6 +1117,29 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn update_reconciles_shadowed_revisions_without_transient_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("user.json");
+        let project = root.path().join("project.json");
+        std::fs::write(
+            &user,
+            json!({"packages":["git:https://example.com/team/pkg.git#v1", "cargo:other@1"]})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(&project, json!({"packages":[{"source":"git:https://example.com/team/pkg.git#v2"}, "cargo:other@1"]}).to_string()).unwrap();
+        let files = vec![(user, root.path().into()), (project, root.path().into())];
+        let sources = update_sources(&files).unwrap();
+        assert_eq!(sources.len(), 3);
+        let package = sources
+            .iter()
+            .filter(|source| source_identity(source) == "git:example.com/team/pkg")
+            .collect::<Vec<_>>();
+        assert_eq!(package.len(), 2);
+        assert!(package.iter().any(|source| source.ends_with("#v1")));
+        assert!(package.iter().any(|source| source.ends_with("#v2")));
+    }
     #[test]
     fn package_sources_normalize_file_urls_and_git_transports() {
         let root = tempfile::tempdir().unwrap();
