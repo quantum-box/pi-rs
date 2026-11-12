@@ -1,6 +1,6 @@
 //! Searchable keyboard selectors for session and model navigation.
 use super::{keys::Keys, render::Line, theme::Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -131,6 +131,8 @@ pub struct Picker {
     query: String,
     selected: usize,
     page_size: std::cell::Cell<usize>,
+    mouse_layout: std::cell::Cell<(usize, usize, usize)>,
+    mouse_pressed: Option<usize>,
     completion_limit: Option<usize>,
     active_session: Option<PathBuf>,
     session_action: Option<SessionAction>,
@@ -170,6 +172,11 @@ pub enum Input {
     CopyTreeRecord(u64),
     UpdateModelScope { save: bool },
 }
+pub enum MouseInput {
+    Ignored,
+    Changed,
+    Activate,
+}
 impl Picker {
     pub fn new(title: &str, items: Vec<Item>) -> Self {
         Self {
@@ -178,6 +185,8 @@ impl Picker {
             query: String::new(),
             selected: 0,
             page_size: std::cell::Cell::new(10),
+            mouse_layout: std::cell::Cell::new((0, 0, 0)),
+            mouse_pressed: None,
             completion_limit: None,
             active_session: None,
             session_action: None,
@@ -217,6 +226,55 @@ impl Picker {
         self.query
             .extend(text.chars().filter(|character| !character.is_control()));
         self.selected = 0;
+    }
+
+    /// Handle pointer input in the rendered selector body, with row zero at its title.
+    pub fn mouse(&mut self, kind: MouseEventKind, row: usize) -> MouseInput {
+        let (start, visible, height) = self.mouse_layout.get();
+        if self.session_action.is_some() || row >= height {
+            self.mouse_pressed = None;
+            return MouseInput::Ignored;
+        }
+        match kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.mouse_pressed = None;
+                let count = self.matches().len();
+                if kind == MouseEventKind::ScrollUp {
+                    self.selected = self.selected.saturating_sub(1);
+                } else {
+                    self.selected = (self.selected + 1).min(count.saturating_sub(1));
+                }
+                MouseInput::Changed
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if row > 0 && row <= visible && start + row - 1 < self.matches().len() =>
+            {
+                self.selected = start + row - 1;
+                self.mouse_pressed = Some(self.selected);
+                MouseInput::Changed
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.mouse_pressed = None;
+                MouseInput::Changed
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(index) = self
+                    .mouse_pressed
+                    .take()
+                    .filter(|index| *index < self.matches().len())
+                {
+                    self.selected = index;
+                    MouseInput::Activate
+                } else {
+                    MouseInput::Ignored
+                }
+            }
+            _ => MouseInput::Ignored,
+        }
+    }
+
+    pub fn clear_mouse_press(&mut self) {
+        self.mouse_pressed = None;
     }
 
     pub fn selected(&self) -> Option<Selection> {
@@ -333,7 +391,7 @@ impl Picker {
             .unwrap_or_else(|| self.selected.min(matches.len().saturating_sub(1)));
     }
 
-    fn model_scope_input(&mut self, key: KeyEvent, keys: &Keys) -> Option<Input> {
+    fn model_scope_input(&mut self, key: KeyEvent, keys: &Keys, activate: bool) -> Option<Input> {
         if keys.matches("tui.select.cancel", key)
             && key.code == KeyCode::Char('c')
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -346,7 +404,7 @@ impl Picker {
         if keys.matches("app.models.save", key) {
             return Some(Input::UpdateModelScope { save: true });
         }
-        let toggle = keys.matches("tui.select.confirm", key);
+        let toggle = activate || keys.matches("tui.select.confirm", key);
         let enable = keys.matches("app.models.enableAll", key);
         let clear = keys.matches("app.models.clearAll", key);
         let provider = keys.matches("app.models.toggleProvider", key);
@@ -602,14 +660,27 @@ impl Picker {
         Some(super::session_threads::layout(&paths, &parents))
     }
     pub fn input(&mut self, key: KeyEvent, keys: &Keys) -> Input {
+        self.input_inner(key, keys, false)
+    }
+
+    pub fn activate_mouse_selection(&mut self, keys: &Keys) -> Input {
+        self.input_inner(
+            KeyEvent::new(KeyCode::F(255), KeyModifiers::NONE),
+            keys,
+            true,
+        )
+    }
+
+    fn input_inner(&mut self, key: KeyEvent, keys: &Keys, activate: bool) -> Input {
         self.feedback = None;
         if self.model_scope.is_some()
-            && let Some(input) = self.model_scope_input(key, keys)
+            && let Some(input) = self.model_scope_input(key, keys, activate)
         {
             return input;
         }
         let cancel = keys.matches("tui.select.cancel", key);
-        let confirm = keys.matches("tui.select.confirm", key)
+        let confirm = activate
+            || keys.matches("tui.select.confirm", key)
             || (self.title == "Settings"
                 && self.query.is_empty()
                 && key.code == KeyCode::Char(' ')
@@ -984,6 +1055,11 @@ impl Picker {
         } else {
             self.selected.saturating_sub(available - 1)
         };
+        self.mouse_layout.set((
+            start,
+            items.len().saturating_sub(start).min(available),
+            height,
+        ));
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
             if let Selection::Resume(path) = &item.selection
                 && self.session_documents.contains_key(path)
@@ -1327,6 +1403,69 @@ fn truncate(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_selects_and_activates_visible_items_and_wheel_clamps() {
+        let items = (0..8)
+            .map(|id| Item {
+                label: format!("item {id}"),
+                selection: Selection::Checkout(id),
+            })
+            .collect();
+        let mut picker = Picker::new("Choose", items);
+        let keys = Keys::default();
+        picker.render(&Theme::system(), 80, 7, &keys);
+        assert!(matches!(
+            picker.mouse(MouseEventKind::Down(MouseButton::Left), 3),
+            MouseInput::Changed
+        ));
+        assert_eq!(picker.selected, 2);
+        assert!(matches!(
+            picker.mouse(MouseEventKind::Up(MouseButton::Left), 3),
+            MouseInput::Activate
+        ));
+        assert!(matches!(
+            picker.activate_mouse_selection(&keys),
+            Input::Select(Selection::Checkout(2))
+        ));
+        assert!(matches!(
+            picker.mouse(MouseEventKind::ScrollUp, 0),
+            MouseInput::Changed
+        ));
+        assert_eq!(picker.selected, 1);
+        picker.mouse(MouseEventKind::ScrollUp, 0);
+        picker.mouse(MouseEventKind::ScrollUp, 0);
+        assert_eq!(picker.selected, 0);
+        picker.mouse(MouseEventKind::Down(MouseButton::Left), 1);
+        picker.mouse(MouseEventKind::Drag(MouseButton::Left), 2);
+        assert!(matches!(
+            picker.mouse(MouseEventKind::Up(MouseButton::Left), 2),
+            MouseInput::Ignored
+        ));
+        assert!(matches!(
+            picker.mouse(MouseEventKind::Down(MouseButton::Left), 6),
+            MouseInput::Ignored
+        ));
+    }
+
+    #[test]
+    fn mouse_activation_toggles_scoped_models() {
+        let mut picker =
+            Picker::scoped_models("ollama", vec!["alpha".into()], vec!["alpha".into()]);
+        let keys = Keys::default();
+        picker.render(&Theme::system(), 80, 8, &keys);
+        picker.mouse(MouseEventKind::Down(MouseButton::Left), 1);
+        assert!(matches!(
+            picker.mouse(MouseEventKind::Up(MouseButton::Left), 1),
+            MouseInput::Activate
+        ));
+        assert!(matches!(
+            picker.activate_mouse_selection(&keys),
+            Input::UpdateModelScope { save: false }
+        ));
+        assert!(picker.model_scope().unwrap().1.is_empty());
+    }
+
     #[test]
     fn settings_refresh_preserves_search_and_selected_setting() {
         let item = |label: &str, value| Item {
