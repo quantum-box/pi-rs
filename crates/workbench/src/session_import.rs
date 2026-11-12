@@ -509,6 +509,21 @@ fn convert(
             match required(message, "role")? {
                 "user" => push_user(&mut events, &message["content"])?,
                 "assistant" => {
+                    // Pi derives the session's model from the latest assistant
+                    // message as well as explicit model_change entries.
+                    if let Some(model) = message["model"].as_str().filter(|model| !model.is_empty())
+                    {
+                        let provider = message["provider"].as_str().map(str::to_owned);
+                        if branch.model != model || branch.provider != provider {
+                            branch.model = model.to_owned();
+                            branch.provider = provider;
+                            events.push(Event::ModelSelected {
+                                model: branch.model.clone(),
+                                thinking: branch.thinking.clone(),
+                                provider: branch.provider.clone(),
+                            });
+                        }
+                    }
                     let failure = match message["stopReason"].as_str() {
                         Some("error") => Some(pi_rs::ModelFailure::Failed),
                         Some("aborted") => Some(pi_rs::ModelFailure::Cancelled),
@@ -874,6 +889,47 @@ mod tests {
     use super::*;
     use pi_rs::Message;
     use serde_json::json;
+    #[test]
+    fn assistant_model_selection_follows_branches_and_survives_export() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"think","parentId":null,"thinkingLevel":"high"}),
+            json!({"type":"message","id":"first","parentId":"think","message":{"role":"assistant","provider":"first-provider","model":"first-model","content":[{"type":"text","text":"first"}]}}),
+            json!({"type":"model_change","id":"change","parentId":"first","provider":"explicit","modelId":"explicit-model"}),
+            json!({"type":"message","id":"second","parentId":"change","message":{"role":"assistant","provider":"second-provider","model":"second-model","content":[{"type":"text","text":"second"}]}}),
+            json!({"type":"message","id":"other","parentId":"first","message":{"role":"user","content":"other branch"}}),
+        ]).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("first-model".into(), Some("high".into())))
+        );
+        assert_eq!(session.model_provider(), Some("first-provider"));
+        let second = session.records().iter().find(|record| matches!(&record.event, Event::Assistant { content, .. } if content == "second")).unwrap().id;
+        session.checkout(second).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("second-model".into(), Some("high".into())))
+        );
+        assert_eq!(session.model_provider(), Some("second-provider"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("export.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        assert_eq!(reopened.model_selection(), session.model_selection());
+        assert_eq!(reopened.model_provider(), session.model_provider());
+    }
+
+    #[test]
+    fn assistant_without_model_does_not_erase_explicit_selection() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"p","modelId":"m"}),
+            json!({"type":"message","id":"assistant","parentId":"change","message":{"role":"assistant","content":[]}}),
+        ]).unwrap();
+        assert_eq!(session.model_selection(), Some(("m".into(), None)));
+        assert_eq!(session.model_provider(), Some("p"));
+    }
     #[test]
     fn imports_v1_compaction_index_and_preserves_original_entry() {
         let compaction = json!({"type":"compaction","firstKeptEntryIndex":2,"summary":"earlier"});
