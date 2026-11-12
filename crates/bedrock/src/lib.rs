@@ -7,12 +7,13 @@ use aws_sdk_bedrockruntime::{
     },
 };
 use aws_smithy_types::{Document, Number};
+use aws_types::request_id::RequestId;
 use pi_rs_core::{
     Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result, ToolCall,
     ToolCallDelta, Usage,
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A client configured with the AWS SDK's region and refreshing credential provider chain.
 #[derive(Clone)]
@@ -40,6 +41,82 @@ impl Bedrock {
         self.unsupported = Some(reason.into());
         self
     }
+}
+#[derive(Default)]
+struct ToolIds {
+    mapped: BTreeMap<String, String>,
+    used: BTreeSet<String>,
+}
+impl ToolIds {
+    fn get(&mut self, original: &str) -> String {
+        if let Some(id) = self.mapped.get(original) {
+            return id.clone();
+        }
+        let base: String = original
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect();
+        let base = if base.is_empty() {
+            "_".to_owned()
+        } else {
+            base
+        };
+        let mut candidate = base.clone();
+        let mut suffix = 2_u64;
+        while self.used.contains(&candidate) {
+            let tail = format!("_{suffix}");
+            candidate = format!("{}{}", &base[..base.len().min(64 - tail.len())], tail);
+            suffix += 1;
+        }
+        self.used.insert(candidate.clone());
+        self.mapped.insert(original.to_owned(), candidate.clone());
+        candidate
+    }
+}
+fn required_text(text: String) -> String {
+    if text.trim().is_empty() {
+        "<empty>".into()
+    } else {
+        text
+    }
+}
+fn diagnostic(
+    meta: &aws_smithy_types::error::metadata::ErrorMetadata,
+    fallback_id: Option<&str>,
+) -> String {
+    let clean = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_control())
+            .take(512)
+            .collect::<String>()
+    };
+    let mut parts = vec!["Bedrock error".to_owned()];
+    if let Some(code) = meta.code().filter(|s| {
+        !s.is_empty()
+            && s.len() <= 128
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.#".contains(&b))
+    }) {
+        parts.push(code.into());
+    }
+    if let Some(message) = meta.message().map(clean).filter(|s| !s.trim().is_empty()) {
+        parts.push(message);
+    }
+    if let Some(id) = meta.request_id().or(fallback_id).filter(|s| {
+        s.len() <= 128
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    }) {
+        parts.push(format!("request id: {id}"));
+    }
+    parts.join(": ")
 }
 fn doc(v: Value) -> Document {
     match v {
@@ -74,6 +151,7 @@ impl Model for Bedrock {
         if request.max_output_tokens == 0 || request.model.contains(":prompt/") {
             return Err(Error::Config("Bedrock requires a positive max output token limit and does not support managed prompt ARNs".into()));
         }
+        let mut ids = ToolIds::default();
         let mut system = Vec::new();
         let mut messages: Vec<types::Message> = Vec::new();
         for message in request.messages {
@@ -82,9 +160,10 @@ impl Model for Bedrock {
                     system.push(types::SystemContentBlock::Text(content));
                     continue;
                 }
-                Message::User { content } => {
-                    (ConversationRole::User, vec![ContentBlock::Text(content)])
-                }
+                Message::User { content } => (
+                    ConversationRole::User,
+                    vec![ContentBlock::Text(required_text(content))],
+                ),
                 Message::UserWithImages { .. } => {
                     return Err(Error::Config(
                         "Bedrock image input is not supported yet".into(),
@@ -92,7 +171,7 @@ impl Model for Bedrock {
                 }
                 Message::Assistant { content, calls, .. } => {
                     let mut blocks = Vec::new();
-                    if !content.is_empty() {
+                    if !content.trim().is_empty() {
                         blocks.push(ContentBlock::Text(content));
                     }
                     for call in calls {
@@ -100,7 +179,7 @@ impl Model for Bedrock {
                             serde_json::from_str(&call.arguments).map_err(build_error)?;
                         blocks.push(ContentBlock::ToolUse(
                             types::ToolUseBlock::builder()
-                                .tool_use_id(call.id)
+                                .tool_use_id(ids.get(&call.id))
                                 .name(call.name)
                                 .input(doc(input))
                                 .build()
@@ -118,8 +197,8 @@ impl Model for Bedrock {
                     ConversationRole::User,
                     vec![ContentBlock::ToolResult(
                         types::ToolResultBlock::builder()
-                            .tool_use_id(call_id)
-                            .content(types::ToolResultContentBlock::Text(content))
+                            .tool_use_id(ids.get(&call_id))
+                            .content(types::ToolResultContentBlock::Text(required_text(content)))
                             .status(if is_error {
                                 types::ToolResultStatus::Error
                             } else {
@@ -186,27 +265,42 @@ impl Model for Bedrock {
             );
         }
         let mut response = command.send().await.map_err(|e| {
-            let retryable = e.as_service_error().is_some_and(|e| {
-                e.is_throttling_exception()
-                    || e.is_model_timeout_exception()
-                    || e.is_service_unavailable_exception()
-                    || e.is_internal_server_exception()
-            }) || matches!(
+            if let Some(service) = e.as_service_error() {
+                let message = diagnostic(service.meta(), service.request_id());
+                if service.is_throttling_exception()
+                    || service.is_model_timeout_exception()
+                    || service.is_service_unavailable_exception()
+                    || service.is_internal_server_exception()
+                {
+                    Error::RetryableModel(message)
+                } else {
+                    Error::Model(message)
+                }
+            } else if matches!(
                 &e,
                 aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_)
                     | aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(_)
-            );
-            if retryable {
-                Error::RetryableModel(format!("Bedrock request failed: {e}"))
+            ) {
+                Error::RetryableModel("Bedrock transport failed".into())
             } else {
-                Error::Model(format!("Bedrock request failed: {e}"))
+                Error::Model("Bedrock request failed".into())
             }
         })?;
+        let request_id = response.request_id().map(str::to_owned);
         Ok(Box::pin(async_stream::try_stream! {
             let mut calls: BTreeMap<i32, ToolCall> = BTreeMap::new();
             let mut usage=None; let mut stop=None; let mut cache_read=None; let mut cache_write=None; let mut received=0usize;
             let mut open_tools = std::collections::BTreeSet::new();
-            while let Some(event)=response.stream.recv().await.map_err(|e| Error::RetryableModel(format!("Bedrock stream failed: {e}")))? {
+            while let Some(event)=response.stream.recv().await.map_err(|e| {
+                if let Some(service) = e.as_service_error() {
+                    let mut message=diagnostic(service.meta(), request_id.as_deref());
+                    if service.meta().code().is_none() {
+                        let code = if service.is_validation_exception() { Some("ValidationException") } else if service.is_throttling_exception() { Some("ThrottlingException") } else if service.is_service_unavailable_exception() { Some("ServiceUnavailableException") } else if service.is_internal_server_exception() { Some("InternalServerException") } else if service.is_model_stream_error_exception() { Some("ModelStreamErrorException") } else { None };
+                        if let Some(code) = code { message.insert_str(0, &format!("{code}: ")); }
+                    }
+                    if service.is_throttling_exception() || service.is_service_unavailable_exception() || service.is_internal_server_exception() || service.is_model_stream_error_exception() { Error::RetryableModel(message) } else { Error::Model(message) }
+                } else { Error::RetryableModel("Bedrock stream transport failed".into()) }
+            })? {
                 match event {
                     ConverseStreamOutput::ContentBlockStart(event) => if let Some(ContentBlockStart::ToolUse(tool))=event.start {
                         let index=event.content_block_index;
@@ -236,5 +330,22 @@ impl Model for Bedrock {
             yield ModelEvent::Metadata(ModelMetadata {finish_reason:Some(finish_reason.into()), cached_input_tokens:cache_read, cache_creation_input_tokens:cache_write, provider_api:Some(pi_rs_core::ModelApi::BedrockConverseStream), ..Default::default()});
             yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn diagnostic_strips_control_characters_and_rejects_unsafe_ids() {
+        let meta = aws_smithy_types::error::metadata::ErrorMetadata::builder()
+            .code("ValidationException")
+            .message("bad\u{1b}[31m input\nnext")
+            .build();
+        let text = diagnostic(&meta, Some("unsafe\nrequest-id"));
+        assert_eq!(
+            text,
+            "Bedrock error: ValidationException: bad[31m inputnext"
+        );
     }
 }

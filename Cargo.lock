@@ -2769,6 +2769,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-smithy-eventstream",
  "aws-smithy-types",
+ "aws-types",
  "bytes",
  "futures-util",
  "pi-rs-core",

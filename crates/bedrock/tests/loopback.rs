@@ -75,7 +75,21 @@ async fn converse_stream_sends_signed_request_and_collects_tool_and_usage() {
             body["messages"][2]["content"][0]["toolResult"]["status"],
             "error"
         );
-        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "<empty>");
+        let calls = &body["messages"][1]["content"];
+        let id0 = calls[0]["toolUse"]["toolUseId"].as_str().unwrap();
+        let id1 = calls[1]["toolUse"]["toolUseId"].as_str().unwrap();
+        assert_ne!(id0, id1);
+        assert!(id0.len() <= 64 && id1.len() <= 64);
+        assert!(
+            id0.bytes()
+                .chain(id1.bytes())
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        );
+        let results = &body["messages"][2]["content"];
+        assert_eq!(results[0]["toolResult"]["toolUseId"], id0);
+        assert_eq!(results[1]["toolResult"]["toolUseId"], id1);
+        assert_eq!(results[0]["toolResult"]["content"][0]["text"], "<empty>");
         assert_eq!(
             body["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]["minimum"],
             -1
@@ -119,21 +133,34 @@ async fn converse_stream_sends_signed_request_and_collects_tool_and_usage() {
                 content: "system".into(),
             },
             Message::User {
-                content: "hello".into(),
+                content: "  ".into(),
             },
             Message::Assistant {
-                content: String::new(),
-                calls: vec![pi_rs_core::ToolCall {
-                    id: "prev".into(),
-                    name: "lookup".into(),
-                    arguments: "{\"q\":\"x\"}".into(),
-                }],
+                content: "  ".into(),
+                calls: vec![
+                    pi_rs_core::ToolCall {
+                        id: format!("{}!", "a".repeat(70)),
+                        name: "lookup".into(),
+                        arguments: "{\"q\":\"x\"}".into(),
+                    },
+                    pi_rs_core::ToolCall {
+                        id: format!("{}?", "a".repeat(70)),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
                 replay: None,
             },
             Message::Tool {
-                call_id: "prev".into(),
-                content: "failed".into(),
+                call_id: format!("{}!", "a".repeat(70)),
+                content: "  ".into(),
                 is_error: true,
+                is_structured: Some(false),
+            },
+            Message::Tool {
+                call_id: format!("{}?", "a".repeat(70)),
+                content: "done".into(),
+                is_error: false,
                 is_structured: Some(false),
             },
         ],
@@ -191,9 +218,39 @@ async fn truncated_tool_block_never_completes() {
     let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(conf));
     let request = ModelRequest {
         model: "test-model".into(),
-        messages: vec![Message::User {
-            content: "hello".into(),
-        }],
+        messages: vec![
+            Message::User {
+                content: "  ".into(),
+            },
+            Message::Assistant {
+                content: " ".into(),
+                calls: vec![
+                    pi_rs_core::ToolCall {
+                        id: format!("{}!", "a".repeat(70)),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                    pi_rs_core::ToolCall {
+                        id: format!("{}?", "a".repeat(70)),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                replay: None,
+            },
+            Message::Tool {
+                call_id: format!("{}!", "a".repeat(70)),
+                content: " ".into(),
+                is_error: false,
+                is_structured: Some(false),
+            },
+            Message::Tool {
+                call_id: format!("{}?", "a".repeat(70)),
+                content: "done".into(),
+                is_error: false,
+                is_structured: Some(false),
+            },
+        ],
         tools: vec![],
         max_output_tokens: 128,
     };
@@ -210,4 +267,77 @@ async fn truncated_tool_block_never_completes() {
             .any(|e| matches!(e, Ok(ModelEvent::Complete { .. })))
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn service_errors_include_safe_diagnostics_and_classify_stream_validation() {
+    for streaming in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 8192];
+            let _ = socket.read(&mut buffer).await.unwrap();
+            if streaming {
+                let frame = Frame::new(bytes::Bytes::from_static(br#"{"message":"bad input"}"#))
+                    .add_header(Header::new(
+                        ":message-type",
+                        HeaderValue::String("exception".into()),
+                    ))
+                    .add_header(Header::new(
+                        ":exception-type",
+                        HeaderValue::String("validationException".into()),
+                    ))
+                    .add_header(Header::new(
+                        ":content-type",
+                        HeaderValue::String("application/json".into()),
+                    ));
+                let mut bytes = Vec::new();
+                write_message_to(&frame, &mut bytes).unwrap();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nx-amzn-requestid: stream-request\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n",bytes.len()).as_bytes()).await.unwrap();
+                socket.write_all(&bytes).await.unwrap();
+            } else {
+                let body = br#"{"message":"bad input"}"#;
+                socket.write_all(format!("HTTP/1.1 400 Bad Request\r\nx-amzn-requestid: request-123\r\nx-amzn-errortype: ValidationException\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+        });
+        let config = aws_sdk_bedrockruntime::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "test", "secret", None, None, "test",
+            ))
+            .endpoint_url(format!("http://{address}"))
+            .build();
+        let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config));
+        let request = ModelRequest {
+            model: "test-model".into(),
+            messages: vec![Message::User {
+                content: "hi".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let error = match model.stream(request).await {
+            Ok(mut stream) => stream.next().await.unwrap().unwrap_err(),
+            Err(error) => error,
+        };
+        assert!(matches!(error, pi_rs_core::Error::Model(_)), "{error:?}");
+        let message = error.to_string();
+        assert!(
+            message.contains("ValidationException") || message.contains("validationException"),
+            "{message}"
+        );
+        assert!(message.contains("bad input"), "{message}");
+        assert!(
+            message.contains(if streaming {
+                "stream-request"
+            } else {
+                "request-123"
+            }),
+            "{message}"
+        );
+        server.await.unwrap();
+    }
 }
