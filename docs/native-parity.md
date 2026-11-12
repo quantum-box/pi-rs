@@ -3262,5 +3262,6 @@ again.
 Pi v1 session imports translate `firstKeptEntryIndex` compaction boundaries
 using the original JSONL entry order, including the header. The original entry
 is retained for inspection, while the imported context and forks retain the
-correct post-compaction messages. Other legacy session variants remain subject
+correct post-compaction messages. A boundary at the compaction itself, or at a
+later unassigned v1 entry, retains no earlier messages. Other legacy session variants remain subject
 to the session import limitations above.
