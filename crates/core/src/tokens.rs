@@ -84,6 +84,9 @@ pub(crate) fn estimate_source_tokens(
         Some(Event::BashExecution { execution }) => text_chars(&execution.command)
             .saturating_add(text_chars(&execution.output))
             .div_ceil(4),
+        Some(
+            Event::BranchSummary { summary, .. } | Event::CompactionSummaryMessage { summary, .. },
+        ) => text_chars(summary).div_ceil(4),
         Some(Event::Assistant { request_id, .. }) => {
             let branch = session.branch();
             let replacement = branch.iter().rev().find_map(|record| match &record.event {
@@ -121,6 +124,44 @@ pub(crate) fn estimate_source_tokens(
         }
         _ => estimate_message_tokens(message),
     }
+}
+
+/// A trailing Pi system message retains its original blocks for estimation.
+pub(crate) fn estimate_system_delta(session: &crate::Session, record: &crate::Record) -> u64 {
+    if let Event::SystemCheckpoint {
+        sections,
+        tools_added,
+        ..
+    } = &record.event
+        && let Some(parent) = record
+            .parent
+            .and_then(|id| session.records().get(id.saturating_sub(1) as usize))
+        && let Event::SourceEntry { format, entry } = &parent.event
+        && format == "pi"
+        && entry["type"] == "message"
+        && entry["message"]["role"] == "system"
+        && let Some(blocks) = entry["message"]["content"].as_array()
+    {
+        let mut chars = blocks.iter().fold(0_u64, |chars, block| {
+            chars.saturating_add(match block["type"].as_str() {
+                Some("text") => block["text"].as_str().map(text_chars).unwrap_or(0),
+                Some("image") => ESTIMATED_IMAGE_CHARS,
+                _ => 0,
+            })
+        });
+        for (_, value) in sections {
+            if let Some(value) = value {
+                chars = chars.saturating_add(text_chars(value));
+            }
+        }
+        if !tools_added.is_empty() {
+            chars = chars.saturating_add(text_chars(
+                &serde_json::to_string(tools_added).unwrap_or_default(),
+            ));
+        }
+        return chars.div_ceil(4);
+    }
+    estimate_system_tokens(&[record])
 }
 
 pub(crate) fn estimate_system_tokens(branch: &[&crate::Record]) -> u64 {

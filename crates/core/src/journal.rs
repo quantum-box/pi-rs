@@ -757,7 +757,7 @@ impl Session {
                     record.id > *source && matches!(record.event, Event::SystemCheckpoint { .. })
                 })
                 .fold(trailing_tokens, |tokens, record| {
-                    tokens.saturating_add(crate::tokens::estimate_system_tokens(&[*record]))
+                    tokens.saturating_add(crate::tokens::estimate_system_delta(self, record))
                 });
             return crate::ContextUsageEstimate {
                 tokens: usage_tokens.saturating_add(trailing_tokens),
@@ -2140,6 +2140,14 @@ fn conversation_entries_since_inner(
     retain_from: u64,
     repair: bool,
 ) -> Vec<(u64, Message)> {
+    let invocations: BTreeMap<_, _> = path
+        .iter()
+        .flat_map(|record| match &record.event {
+            Event::Assistant { invocations, .. } => invocations.as_slice(),
+            _ => &[],
+        })
+        .map(|invocation| (invocation.operation_id, &invocation.call.id))
+        .collect();
     let results: BTreeMap<_, _> = operations
         .into_iter()
         .filter_map(|(inv, state)| match state {
@@ -2252,7 +2260,7 @@ fn conversation_entries_since_inner(
                             .collect(),
                     },
                 ));
-                for inv in invocations {
+                for inv in invocations.iter().filter(|_| repair) {
                     if let Some(outcome) = results.get(&inv.operation_id) {
                         messages.push((
                             *result_sources.get(&inv.operation_id).unwrap_or(&record.id),
@@ -2264,6 +2272,15 @@ fn conversation_entries_since_inner(
                             },
                         ));
                     }
+                }
+            }
+            Event::ToolFinished { operation_id, .. } | Event::ToolReconciled { operation_id, .. } if !repair => {
+                if result_sources.get(operation_id) == Some(&record.id)
+                    && let (Some(call_id), Some(outcome)) = (invocations.get(operation_id), results.get(operation_id)) {
+                    messages.push((record.id, Message::Tool {
+                        call_id: (*call_id).clone(), content: outcome.tool_content(),
+                        is_error: outcome.is_error(), is_structured: Some(outcome.is_structured()),
+                    }));
                 }
             }
             _ => {}

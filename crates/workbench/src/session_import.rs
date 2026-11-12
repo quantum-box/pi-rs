@@ -1068,6 +1068,72 @@ mod tests {
     }
 
     #[test]
+    fn retained_tool_result_is_estimated_without_its_compacted_assistant() {
+        let mut entries = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","stopReason":"toolUse","content":[{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"t","parentId":"a","message":{"role":"toolResult","toolCallId":"call","content":[{"type":"text","text":"12345678"}],"isError":false}}),
+            json!({"type":"compaction","id":"c","parentId":"t","firstKeptEntryId":"t","summary":"sum","tokensBefore":100}),
+        ];
+        let session = import_pi(entries.clone()).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 3);
+        entries.push(json!({"type":"context_edit","id":"e","parentId":"c","targetId":"t","replacement":{"content":"abcd"}}));
+        assert_eq!(
+            import_pi(entries).unwrap().context_usage_estimate().tokens,
+            2
+        );
+    }
+
+    #[test]
+    fn imported_summary_messages_count_raw_summary_in_fresh_and_trailing_estimates() {
+        let base = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"b","parentId":null,"message":{"role":"branchSummary","summary":"abcd"}}),
+            json!({"type":"message","id":"c","parentId":"b","message":{"role":"compactionSummary","summary":"12345678","tokensBefore":100}}),
+        ];
+        assert_eq!(
+            import_pi(base.clone())
+                .unwrap()
+                .context_usage_estimate()
+                .tokens,
+            3
+        );
+        let mut trailing = vec![
+            base[0].clone(),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stopReason":"stop","usage":{"totalTokens":100}}}),
+        ];
+        let mut b = base[1].clone();
+        b["parentId"] = json!("a");
+        trailing.push(b);
+        trailing.push(base[2].clone());
+        assert_eq!(
+            import_pi(trailing).unwrap().context_usage_estimate().tokens,
+            103
+        );
+    }
+
+    #[test]
+    fn imported_system_images_are_counted_in_trailing_system_delta() {
+        let system = json!({"type":"message","id":"s","parentId":"a","message":{"role":"system","content":[{"type":"text","text":"ab"},{"type":"image","data":"AA==","mimeType":"image/png"},{"type":"text","text":"cd"}]}});
+        let mut fresh_system = system.clone();
+        fresh_system["parentId"] = serde_json::Value::Null;
+        // Pi's fallback resolves current system content to text first.
+        assert_eq!(
+            import_pi(vec![json!({"type":"session","version":3}), fresh_system])
+                .unwrap()
+                .context_usage_estimate()
+                .tokens,
+            2
+        );
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stopReason":"stop","usage":{"totalTokens":100}}}),
+            system,
+        ]).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 1301);
+    }
+
+    #[test]
     fn continuation_counts_empty_assistants_and_respects_omissions() {
         use clap::Parser;
         for reason in ["error", "aborted", "stop"] {
