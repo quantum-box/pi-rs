@@ -1901,16 +1901,6 @@ fn project_message_entries(
     messages
 }
 
-pub(crate) fn conversation(
-    path: &[&Record],
-    operations: Vec<(Invocation, OperationState)>,
-) -> Vec<Message> {
-    conversation_entries(path, operations)
-        .into_iter()
-        .map(|(_, message)| message)
-        .collect()
-}
-
 pub(crate) fn conversation_entries(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,

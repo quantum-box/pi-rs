@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::extension::{RegisteredTool, hook};
-use crate::journal::{conversation, conversation_entries, ensure_settled};
+use crate::journal::{conversation_entries, ensure_settled};
 use crate::{
     AgentInput, CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind,
     Invocation, Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest,
@@ -838,7 +838,7 @@ impl Agent<'_> {
         if let Some(boundary) = before {
             let mut keep_group = false;
             messages.extend(
-                conversation_entries(&branch, session.operations())
+                model_conversation_entries(&branch, session.operations())
                     .into_iter()
                     .filter_map(|(source, message)| {
                         if !matches!(message, Message::Tool { .. }) {
@@ -848,7 +848,11 @@ impl Agent<'_> {
                     }),
             );
         } else {
-            messages.extend(conversation(history, session.operations()));
+            messages.extend(
+                model_conversation_entries(history, session.operations())
+                    .into_iter()
+                    .map(|(_, message)| message),
+            );
         }
         if messages.len() == 1 {
             return Err(Error::Session("there is no conversation to resume".into()));
@@ -2560,6 +2564,37 @@ impl Agent<'_> {
     }
 }
 
+fn model_conversation_entries(
+    path: &[&Record],
+    operations: Vec<(Invocation, OperationState)>,
+) -> Vec<(u64, Message)> {
+    let failed: HashSet<_> = path
+        .iter()
+        .filter_map(|record| match record.event {
+            Event::ModelFinished {
+                request_id,
+                failure: Some(_),
+                ..
+            } => Some(request_id),
+            _ => None,
+        })
+        .collect();
+    let excluded: HashSet<_> = path
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::Assistant {
+                request_id: Some(id),
+                ..
+            } if failed.contains(id) => Some(record.id),
+            _ => None,
+        })
+        .collect();
+    conversation_entries(path, operations)
+        .into_iter()
+        .filter(|(source, _)| !excluded.contains(source))
+        .collect()
+}
+
 fn has_summary_prefix(session: &Session, boundary: Option<u64>) -> bool {
     conversation_entries(&session.branch(), session.operations())
         .iter()
@@ -3183,6 +3218,41 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+
+    #[test]
+    fn failed_assistant_is_retained_in_history_but_not_model_context() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "question".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata::default(),
+                usage: crate::UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Failed),
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "partial".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        assert_eq!(session.current_message_entries().len(), 2);
+        let messages = model_conversation_entries(&session.branch(), session.operations());
+        assert!(
+            matches!(messages.as_slice(), [(_, Message::User { content })] if content == "question")
+        );
+    }
 
     struct TreeHook {
         veto: bool,
