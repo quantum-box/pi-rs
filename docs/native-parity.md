@@ -3256,3 +3256,11 @@ host reports a non-fatal extension error for that handler. Later handlers and
 the provider still receive its transformed context, matching Pi v1.5.0. A
 handler that restores and then removes the leading system message is reported
 again.
+
+### Legacy session compaction import
+
+Pi v1 session imports translate `firstKeptEntryIndex` compaction boundaries
+using the original JSONL entry order, including the header. The original entry
+is retained for inspection, while the imported context and forks retain the
+correct post-compaction messages. Other legacy session variants remain subject
+to the session import limitations above.
