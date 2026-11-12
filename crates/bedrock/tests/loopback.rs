@@ -66,7 +66,7 @@ async fn converse_stream_sends_signed_request_and_collects_tool_and_usage() {
         let body: serde_json::Value =
             serde_json::from_slice(&data[header_end..header_end + length]).unwrap();
         assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
-        assert_eq!(body["system"][0]["text"], "system");
+        assert_eq!(body["system"], json!([{"text":"system"}]));
         assert_eq!(
             body["messages"][1]["content"][0]["toolUse"]["input"]["q"],
             "x"
@@ -134,7 +134,13 @@ async fn converse_stream_sends_signed_request_and_collects_tool_and_usage() {
         model: "test-model".into(),
         messages: vec![
             Message::System {
+                content: " \n".into(),
+            },
+            Message::System {
                 content: "system".into(),
+            },
+            Message::System {
+                content: "\t".into(),
             },
             Message::User {
                 content: "  ".into(),
@@ -432,7 +438,23 @@ async fn tool_free_summary_keeps_history_as_text_without_tool_config() {
         let wire = body.to_string();
         assert!(wire.contains("Historical tool call"));
         assert!(wire.contains("Historical tool result"));
-        assert!(wire.contains("disk full"));
+        let result = messages
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+            .find_map(|b| {
+                b["text"]
+                    .as_str()
+                    .filter(|text| text.starts_with("Historical tool result"))
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            format!(
+                "Historical tool result (id; error):\n{}",
+                "quote \" and slash \\ and newline\n".repeat(1000)
+            )
+        );
+        assert!(wire.contains("quote"));
         assert!(!wire.contains("toolUse"));
         assert!(!wire.contains("toolResult"));
         let frames = [event("messageStop", json!({"stopReason":"end_turn"}))].concat();
@@ -467,7 +489,7 @@ async fn tool_free_summary_keeps_history_as_text_without_tool_config() {
             },
             Message::Tool {
                 call_id: "id".into(),
-                content: "disk full".into(),
+                content: "quote \" and slash \\ and newline\n".repeat(1000),
                 is_error: true,
                 is_structured: Some(false),
             },
@@ -484,4 +506,80 @@ async fn tool_free_summary_keeps_history_as_text_without_tool_config() {
         .await;
     assert!(events.iter().all(Result::is_ok));
     server.await.unwrap();
+}
+
+#[derive(Debug)]
+struct MissingCredentials;
+impl aws_credential_types::provider::ProvideCredentials for MissingCredentials {
+    fn provide_credentials<'a>(
+        &'a self,
+    ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        aws_credential_types::provider::future::ProvideCredentials::ready(Err(
+            aws_credential_types::provider::error::CredentialsError::not_loaded(
+                "sensitive-test-detail",
+            ),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn missing_region_and_credentials_are_actionable_but_connection_failures_retry() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let request = || ModelRequest {
+        model: "test-model".into(),
+        messages: vec![Message::User {
+            content: "hello".into(),
+        }],
+        tools: vec![],
+        max_output_tokens: 128,
+    };
+    let base = || {
+        aws_sdk_bedrockruntime::Config::builder()
+            .behavior_version_latest()
+            .endpoint_url(format!("http://{address}"))
+            .retry_config(aws_sdk_bedrockruntime::config::retry::RetryConfig::disabled())
+    };
+    let credentials =
+        || aws_credential_types::Credentials::new("test", "secret", None, None, "test");
+    let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(
+        base().credentials_provider(credentials()).build(),
+    ));
+    let error = match model.stream(request()).await {
+        Err(e) => e,
+        Ok(_) => panic!("missing region accepted"),
+    };
+    assert!(matches!(error, pi_rs_core::Error::Config(_)));
+    assert!(error.to_string().contains("AWS_REGION"));
+    let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(
+        base()
+            .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+            .credentials_provider(MissingCredentials)
+            .build(),
+    ));
+    let error = match model.stream(request()).await {
+        Err(e) => e,
+        Ok(_) => panic!("missing credentials accepted"),
+    };
+    assert!(matches!(error, pi_rs_core::Error::Config(_)), "{error:?}");
+    assert!(error.to_string().contains("AWS_PROFILE"));
+    assert!(!error.to_string().contains("sensitive-test-detail"));
+    let model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(
+        base()
+            .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+            .credentials_provider(credentials())
+            .build(),
+    ));
+    let error = match model.stream(request()).await {
+        Err(e) => e,
+        Ok(_) => panic!("closed port accepted"),
+    };
+    assert!(
+        matches!(error, pi_rs_core::Error::RetryableModel(_)),
+        "{error:?}"
+    );
 }

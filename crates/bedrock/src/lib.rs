@@ -158,7 +158,9 @@ impl Model for Bedrock {
         for message in request.messages {
             let (role, blocks) = match message {
                 Message::System { content } => {
-                    system.push(types::SystemContentBlock::Text(content));
+                    if !content.trim().is_empty() {
+                        system.push(types::SystemContentBlock::Text(content));
+                    }
                     continue;
                 }
                 Message::User { content } => (
@@ -177,7 +179,10 @@ impl Model for Bedrock {
                     }
                     for call in calls {
                         if tool_free {
-                            blocks.push(ContentBlock::Text(format!("Historical tool call: {}", serde_json::json!({"id":call.id,"name":call.name,"arguments":call.arguments}))));
+                            blocks.push(ContentBlock::Text(format!(
+                                "Historical tool call ({}; {}):\n{}",
+                                call.id, call.name, call.arguments
+                            )));
                             continue;
                         }
                         let input = pi_rs_core::parse_tool_arguments(&call.arguments)
@@ -201,8 +206,10 @@ impl Model for Bedrock {
                 } => {
                     let block = if tool_free {
                         ContentBlock::Text(format!(
-                            "Historical tool result: {}",
-                            serde_json::json!({"id":call_id,"content":content,"isError":is_error})
+                            "Historical tool result ({}; {}):\n{}",
+                            call_id,
+                            if is_error { "error" } else { "success" },
+                            content
                         ))
                     } else {
                         ContentBlock::ToolResult(
@@ -260,6 +267,9 @@ impl Model for Bedrock {
                 Client::new(&aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await)
             })
             .await;
+        if client.config().region().is_none() {
+            return Err(Error::Config("Bedrock requires an AWS region; set AWS_REGION or configure a region in the selected AWS profile".into()));
+        }
         let mut command = client
             .converse_stream()
             .model_id(request.model)
@@ -290,14 +300,13 @@ impl Model for Bedrock {
                 } else {
                     Error::Model(message)
                 }
-            } else if matches!(
-                &e,
-                aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_)
-                    | aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(_)
-            ) {
-                Error::RetryableModel("Bedrock transport failed".into())
             } else {
-                Error::Model("Bedrock request failed".into())
+                match &e {
+                    aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => Error::RetryableModel("Bedrock transport timed out".into()),
+                    aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(failure) if failure.is_io() || failure.is_timeout() => Error::RetryableModel("Bedrock transport failed".into()),
+                    aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(_) | aws_sdk_bedrockruntime::error::SdkError::ConstructionFailure(_) => Error::Config("Bedrock could not resolve AWS credentials or configure the request; check AWS_PROFILE, credentials, and region".into()),
+                    _ => Error::Model("Bedrock request failed".into()),
+                }
             }
         })?;
         let request_id = response.request_id().map(str::to_owned);
