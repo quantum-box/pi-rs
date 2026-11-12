@@ -967,7 +967,14 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
                         expand_prompt_glob(root, &pattern)
                     }
                 } else {
-                    vec![root.join(&pattern)]
+                    let mut sources = vec![root.join(&pattern)];
+                    if pattern.ends_with(".md") && !pattern.trim_start_matches("./").contains('/') {
+                        let mut legacy = legacy_prompt_candidates(root, None, true);
+                        legacy.retain(|path| resource_matches(path, root, &pattern, false, true));
+                        legacy.sort();
+                        sources.extend(legacy);
+                    }
+                    sources
                 }
             })
             .collect()
@@ -1601,6 +1608,32 @@ mod tests {
             discover(json!(["root.md", r"+prompts\nested\review.md"])),
             vec![root.join("root.md"), root.join("prompts/nested/review.md")]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_literal_basename_matches_nested_legacy_candidates() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("prompts")).unwrap();
+        std::fs::create_dir(root.join("private")).unwrap();
+        std::fs::write(root.join("review.md"), "root").unwrap();
+        std::fs::write(root.join("prompts/review.md"), "nested").unwrap();
+        std::fs::write(root.join("private/review.md"), "ignored").unwrap();
+        std::fs::write(root.join(".ignore"), "private/\n").unwrap();
+        symlink("/", root.join("escape")).unwrap();
+        let discover = || {
+            collect_package_resources(root, &json!({"prompts": ["review.md"]}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        assert_eq!(
+            discover(),
+            vec![root.join("review.md"), root.join("prompts/review.md")]
+        );
+        std::fs::remove_file(root.join("review.md")).unwrap();
+        assert_eq!(discover(), vec![root.join("prompts/review.md")]);
     }
 
     #[cfg(unix)]
