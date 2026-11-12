@@ -1237,6 +1237,27 @@ impl Session {
             .collect()
     }
 
+    /// Find a callback-triggered run that has not started or was interrupted.
+    pub(crate) fn pending_custom_trigger(&self) -> Option<Uuid> {
+        let branch = self.branch();
+        branch.iter().find_map(|record| {
+            let Event::CustomMessageQueued { input } = &record.event else {
+                return None;
+            };
+            if input.delivery != crate::CustomMessageDelivery::TriggerTurn {
+                return None;
+            }
+            let last_state = branch.iter().rev().find_map(|entry| match entry.event {
+                Event::Run { state, .. } if entry.run_id == Some(input.id) => Some(state),
+                _ => None,
+            });
+            match last_state {
+                None | Some(RunState::Running) => Some(input.id),
+                _ => None,
+            }
+        })
+    }
+
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
         self.queued_input_records()
             .filter_map(|record| match &record.event {

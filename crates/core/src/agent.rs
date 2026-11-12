@@ -224,10 +224,20 @@ impl Agent<'_> {
             }
         }
         session.set_run_id(Some(run_id));
-        let result = self
+        let mut result = self
             .run_turns(session, run_id, input, followups, cancel, observer)
             .await;
         session.set_run_id(None);
+        while result.is_ok() && !cancel.is_cancelled() {
+            let Some(trigger_id) = session.pending_custom_trigger() else {
+                break;
+            };
+            session.set_run_id(Some(trigger_id));
+            result = self
+                .run_turns(session, trigger_id, None, followups, cancel, observer)
+                .await;
+            session.set_run_id(None);
+        }
         result
     }
 
@@ -416,7 +426,10 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
     ) -> Result<()> {
         let (sender, mut incoming) = mpsc::channel(32);
-        let host = Arc::new(LifecycleMessageHost { sender });
+        let host = Arc::new(LifecycleMessageHost {
+            sender,
+            idle: false,
+        });
         let mut errors = Vec::new();
         let mut collect = |event: Notification<'_>| {
             if let Notification::ExtensionLifecycleError {
@@ -498,6 +511,44 @@ impl Agent<'_> {
             }
             Err(error) => return Err(error),
         };
+        // The trigger UUID is its run ID, so a restart resumes the same run.
+        if let Some((_, message)) =
+            session
+                .queued_custom_messages()
+                .into_iter()
+                .find(|(_, message)| {
+                    message.id == run_id
+                        && message.delivery == crate::CustomMessageDelivery::TriggerTurn
+                })
+        {
+            commit(
+                session,
+                Event::CustomMessageDelivered {
+                    id: message.id,
+                    message: message.message,
+                },
+                observer,
+            )?;
+        }
+        let trigger_started = session
+            .branch()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Run {
+                    state: RunState::Running,
+                    ..
+                } if record.run_id == Some(run_id) => Some(record.id),
+                _ => None,
+            });
+        if session.branch().iter().any(|record| matches!(&record.event, Event::CustomMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
+            && let Some(started_at) = trigger_started
+        {
+            for (queued_at, pending) in session.queued_custom_messages() {
+                if pending.delivery == crate::CustomMessageDelivery::NextTurn && queued_at < started_at {
+                    commit(session, Event::CustomMessageDelivered { id: pending.id, message: pending.message }, observer)?;
+                }
+            }
+        }
         // A prior interrupted run may have left deferred messages while a tool
         // needed reconciliation. Recovery above must finish before they appear.
         for (queued_at, deferred) in session.queued_custom_messages() {
@@ -1034,7 +1085,10 @@ impl Agent<'_> {
         };
         for extension in &self.registry.extensions {
             let (sender, mut incoming) = mpsc::channel(32);
-            let host = Arc::new(LifecycleMessageHost { sender });
+            let host = Arc::new(LifecycleMessageHost {
+                sender,
+                idle: false,
+            });
             let result = {
                 let future = tokio::time::timeout(
                     self.limits.model_timeout,
@@ -1069,7 +1123,10 @@ impl Agent<'_> {
             let had_leading_system =
                 matches!(request.messages.first(), Some(Message::System { .. }));
             let (sender, mut incoming) = mpsc::channel(32);
-            let host = Arc::new(LifecycleMessageHost { sender });
+            let host = Arc::new(LifecycleMessageHost {
+                sender,
+                idle: false,
+            });
             let result = {
                 let future = tokio::time::timeout(
                     self.limits.model_timeout,
@@ -1380,24 +1437,76 @@ impl Agent<'_> {
                 cancel,
             )
             .await?;
-            let outcome = Self::turn_poll_authorize_and_run(
-                self.registry,
-                self.limits.tool_timeout,
-                &invocation,
-                &reference,
-                prepared,
-                states,
-                cancel,
-            )
-            .await?;
-            let mut reply = outcome.into();
-            self.transform_tool_result(&invocation, &mut reply, states, cancel, observer)
-                .await;
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host = Arc::new(LifecycleMessageHost {
+                sender,
+                idle: false,
+            });
+            let mut errors = Vec::new();
+            let mut collect = |event: Notification<'_>| {
+                if let Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                } = event
+                {
+                    errors.push((extension.to_owned(), event, message.to_owned()));
+                }
+            };
+            let reply = {
+                let future = async {
+                    let outcome = Self::turn_poll_authorize_and_run(
+                        self.registry,
+                        self.limits.tool_timeout,
+                        &invocation,
+                        &reference,
+                        prepared,
+                        states,
+                        cancel,
+                        Some(host.clone()),
+                    )
+                    .await?;
+                    let mut reply = outcome.into();
+                    Self::turn_transform(
+                        self.registry,
+                        self.limits.tool_timeout,
+                        &invocation,
+                        &mut reply,
+                        states,
+                        cancel,
+                        &mut collect,
+                        Some(host),
+                    )
+                    .await;
+                    Ok::<_, Error>(reply)
+                };
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((input, response)) = incoming.recv() => {
+                            match queue_custom_message(session, input, observer) {
+                                Ok(()) => { let _ = response.send(Ok(())); },
+                                Err(error) => { let _ = response.send(Err(error.to_string())); return Err(error); }
+                            }
+                        }
+                        result = &mut future => break result?,
+                    }
+                }
+            };
+            for (extension, event, message) in &errors {
+                observer(Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                });
+            }
             self.finish_tool(session, &invocation, reply, states, observer, replies)?;
         }
         Ok(())
     }
 
+    #[cfg(test)]
     async fn transform_tool_result(
         &self,
         invocation: &Invocation,
@@ -2766,6 +2875,7 @@ fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> 
         })
 }
 pub(crate) struct LifecycleMessageHost {
+    pub(crate) idle: bool,
     pub(crate) sender: mpsc::Sender<(
         crate::QueuedCustomMessage,
         oneshot::Sender<std::result::Result<(), String>>,
@@ -2788,6 +2898,11 @@ impl ToolHost for LifecycleMessageHost {
         delivery: crate::CustomMessageDelivery,
     ) -> crate::ExtensionResult<()> {
         crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let delivery = if !self.idle && delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
         let (reply, result) = oneshot::channel();
         self.sender
             .send((
@@ -2903,6 +3018,11 @@ impl ToolHost for NestedHost {
         delivery: crate::CustomMessageDelivery,
     ) -> crate::ExtensionResult<()> {
         crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let delivery = if delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
         let Some(progress) = &self.progress else {
             return Err("custom message delivery is unavailable".into());
         };
@@ -3156,7 +3276,10 @@ fn queue_input(
         AgentInput::Enqueue { message, reply } => {
             return reply_to_control(queue_message(session, message, observer), reply);
         }
-        AgentInput::EnqueueCustom { message, reply } => {
+        AgentInput::EnqueueCustom { mut message, reply } => {
+            if message.delivery == crate::CustomMessageDelivery::TriggerTurn {
+                message.delivery = crate::CustomMessageDelivery::Steer;
+            }
             return reply_to_control(queue_custom_message(session, message, observer), reply);
         }
         AgentInput::ClearQueue { reply } => {

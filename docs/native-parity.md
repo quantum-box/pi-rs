@@ -2764,9 +2764,10 @@ clearing the resulting queue.
 ### Active-run native custom messages
 
 A native tool or supported extension callback can call `ToolHost::send_message`
-with `Steer`, `FollowUp`, `NextTurn`, or `AfterTurn`. These correspond to Pi's default steering,
-`deliverAs: "followUp"`, `deliverAs: "nextTurn"`, and
-`triggerTurn: false`, respectively. The last mode adds context after the
+with `Steer`, `FollowUp`, `NextTurn`, `TriggerTurn`, or `AfterTurn`. These
+correspond to Pi's default steering, `deliverAs: "followUp"`,
+`deliverAs: "nextTurn"`, `triggerTurn: true`, and `triggerTurn: false`,
+respectively. `TriggerTurn` queues steering during an active run. The last mode adds context after the
 current assistant turn and its tool results without itself starting another
 model request. `SessionControl` exposes the same active-run delivery modes;
 `AgentSession::queue_custom_message_next_turn` also works while idle.
@@ -2785,17 +2786,25 @@ and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
 `agent_settled`; and SDK-owned session and model-selection notifications,
-including active control rename notifications. Idle callbacks append messages without starting a model turn, except `NextTurn`, which is queued.
+including active control rename notifications. Idle callbacks append messages
+without starting a model turn, except `NextTurn`, which is queued, and
+`TriggerTurn`, which starts a separate run. A trigger's queued message UUID is
+also its run ID. Reopening a session resumes an interrupted triggered run with
+that same ID and does not redeliver its message or repeat a recorded answer.
 Reentrant sends are serviced by the journal owner while the callback waits.
 Separately built extensions negotiate the individual callback capabilities.
 
 Focused tests cover queue and tool-result ordering, callback reentrancy,
 initial and streaming input, provider-request delivery, session start and
 settled boundaries, process protocol metadata, and reopening before the next
-prompt. The host API does not yet express an idle `triggerTurn: true` request
-from these callbacks. Host calls also remain unavailable in legacy before-tool-only
-policy hooks, non-scheduler tool-result recovery, user-bash, resource discovery,
-compaction, tree, and session-transition hooks.
+prompt. Tests also cover multiple triggers, idle and active delivery, and
+restarts before run creation, before and after message delivery, and after the
+answer was recorded. Host-aware `before_tool` policies can opt in with
+`handles_before_tool_host`; separately built extensions negotiate this support.
+Host calls also remain unavailable in idle `SessionControl` input hooks,
+user-bash, resource discovery, compaction, tree, and session-transition hooks.
+A trigger requested by a session shutdown callback remains queued for the next
+session start because the closing session cannot start another run.
 Command effects retain their existing return-value mechanism; custom message
 renderers are unsupported.
 

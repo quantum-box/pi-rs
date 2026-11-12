@@ -81,6 +81,11 @@ impl crate::ToolHost for InputMessageHost {
         delivery: crate::CustomMessageDelivery,
     ) -> crate::ExtensionResult<()> {
         crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let delivery = if delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.input
             .send(crate::AgentInput::EnqueueCustom {
@@ -606,6 +611,7 @@ impl AgentSession {
             })
             .await?;
         }
+        let _ = self.drain_idle_triggers().await?;
         Ok(())
     }
 
@@ -724,6 +730,7 @@ impl AgentSession {
             name: self.session.name().map(str::to_owned),
         })
         .await?;
+        let _ = self.drain_idle_triggers().await?;
         Ok(())
     }
 
@@ -737,7 +744,46 @@ impl AgentSession {
             })
             .await?;
         }
+        let _ = self.drain_idle_triggers().await?;
         Ok(())
+    }
+
+    async fn drain_idle_triggers(&mut self) -> Result<Option<String>> {
+        let Some(trigger_id) = self.session.pending_custom_trigger() else {
+            return Ok(None);
+        };
+        let active = self.begin_run();
+        let events = self.events.as_ref().expect("open session").clone();
+        let mut observe = |event: Notification<'_>| {
+            self.control.observe(&event);
+            emit(&events, &event);
+        };
+        let agent = Agent {
+            model: self.model.as_ref(),
+            model_name: &self.model_name,
+            registry: &self.registry,
+            system_prompt: &self.system_prompt,
+            limits: self.limits.clone(),
+        };
+        let _ = events.send(SessionEvent::RunStarted { run_id: trigger_id });
+        let result = agent
+            .run_correlated(
+                &mut self.session,
+                trigger_id,
+                None,
+                &mut self.input,
+                &active.token,
+                &mut observe,
+            )
+            .await;
+        let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observe);
+        let _ = events.send(SessionEvent::RunEnded {
+            run_id: trigger_id,
+            succeeded: result.is_ok() && final_inputs.is_ok(),
+        });
+        let answer = result?;
+        final_inputs?;
+        Ok(Some(answer))
     }
 
     async fn notify_session_event(&mut self, event: crate::LifecycleEvent) -> Result<()> {
@@ -800,16 +846,20 @@ impl AgentSession {
         trigger_turn: bool,
     ) -> Result<Option<String>> {
         self.start().await?;
-        self.append_custom_message(message)?;
         if trigger_turn {
             let events = self.events.as_ref().expect("open session").clone();
-            crate::agent::apply_custom_boundary(
+            crate::agent::queue_custom_message(
                 &mut self.session,
-                crate::CustomMessageDelivery::NextTurn,
+                crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    message,
+                },
                 &mut |event| emit(&events, &event),
             )?;
-            self.resume().await.map(Some)
+            self.drain_idle_triggers().await
         } else {
+            self.append_custom_message(message)?;
             Ok(None)
         }
     }
@@ -985,7 +1035,7 @@ impl AgentSession {
                 };
                 let states = self.session.extension_states();
                 let (sender, mut incoming) = mpsc::channel(32);
-                let host = Arc::new(crate::agent::LifecycleMessageHost { sender });
+                let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
                 let prepared = {
                     let future = self.registry.prepare_input_with_host(event, &states, host);
                     tokio::pin!(future);
@@ -993,7 +1043,7 @@ impl AgentSession {
                         tokio::select! {
                             biased;
                             Some((input, reply)) = incoming.recv() => {
-                                let result = if input.delivery == crate::CustomMessageDelivery::NextTurn {
+                                let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
                                     crate::agent::queue_custom_message(&mut self.session, input, &mut observe)
                                 } else {
                                     self.session.append_custom_message(input.message).map(|()| {
@@ -1007,6 +1057,9 @@ impl AgentSession {
                         }
                     }
                 };
+                if let Some(trigger_id) = self.session.pending_custom_trigger() {
+                    agent.run_correlated(&mut self.session, trigger_id, None, &mut self.input, &active.token, &mut observe).await?;
+                }
                 let Some(prepared) = prepared else {
                     return Ok(String::new());
                 };
@@ -2553,6 +2606,56 @@ mod tests {
             vec![self.0.clone()]
         }
     }
+    struct PendingMessageHook;
+    #[async_trait::async_trait]
+    impl Extension for PendingMessageHook {
+        fn id(&self) -> &str {
+            "pending-messages"
+        }
+        fn handles_tool_result(&self) -> bool {
+            true
+        }
+        async fn before_tool_with_host(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+            _: &crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::Decision> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "poll".into(),
+                    content: crate::ContextContent::Text("before poll".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            Ok(crate::Decision::Allow)
+        }
+        async fn tool_result_update_with_host(
+            &self,
+            _: &crate::ToolCall,
+            _: &crate::Outcome,
+            _: &crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::Outcome>> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "poll".into(),
+                    content: crate::ContextContent::Text("after poll".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
     #[tokio::test]
     async fn pending_job_survives_cancel_and_reopen_without_redispatch() {
         let job = Arc::new(PollingJob {
@@ -2579,9 +2682,30 @@ mod tests {
         let mut session = SessionBuilder::new(Arc::new(TaskModel), "task")
             .extension(Arc::new(JobExtension(job.clone())))
             .unwrap()
+            .extension(Arc::new(PendingMessageHook))
+            .unwrap()
             .open(path)
             .unwrap();
-        assert_eq!(session.resume().await.unwrap(), "done");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), session.resume())
+                .await
+                .unwrap()
+                .unwrap(),
+            "done"
+        );
+        let texts: Vec<_> = session
+            .messages()
+            .unwrap()
+            .into_iter()
+            .filter_map(|m| {
+                if let Message::User { content } = m {
+                    Some(content)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(texts, ["start job", "before poll", "after poll"]);
         assert_eq!(job.dispatched.load(Ordering::SeqCst), 1);
         assert_eq!(job.polls.load(Ordering::SeqCst), 2);
         session.close().await.unwrap();
@@ -2759,7 +2883,7 @@ mod tests {
                     display: false,
                     details: None,
                 },
-                crate::CustomMessageDelivery::Steer,
+                crate::CustomMessageDelivery::TriggerTurn,
             )
             .await?;
             Ok(crate::Decision::Allow)
@@ -2829,12 +2953,44 @@ mod tests {
             .await
         }
     }
+    struct BeforePolicyMessage;
+    #[async_trait::async_trait]
+    impl Extension for BeforePolicyMessage {
+        fn id(&self) -> &str {
+            "before-policy-message"
+        }
+        fn handles_before_tool_host(&self) -> bool {
+            true
+        }
+        async fn before_tool_with_host(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+            _: &crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::Decision> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "policy".into(),
+                    content: crate::ContextContent::Text("policy".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            Ok(crate::Decision::Allow)
+        }
+    }
     #[tokio::test]
     async fn lifecycle_host_calls_are_reentrant_and_ordered_at_turn_boundaries() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let mut session =
             SessionBuilder::new(Arc::new(MessageDeliveryModel(requests.clone())), "fixture")
                 .extension(Arc::new(LifecycleMessageExtension))
+                .unwrap()
+                .extension(Arc::new(BeforePolicyMessage))
                 .unwrap()
                 .in_memory()
                 .unwrap();
@@ -2862,6 +3018,7 @@ mod tests {
                 "turn end",
                 "tool start",
                 "tool call",
+                "policy",
                 "tool result",
                 "tool end"
             ]
@@ -3161,6 +3318,288 @@ mod tests {
             .collect();
         assert_eq!(texts, ["session start", "first", "second", "after settled"]);
         assert_eq!(model.0.load(Ordering::SeqCst), 2);
+    }
+
+    struct TriggerFromLifecycle {
+        settled: bool,
+        fired: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for TriggerFromLifecycle {
+        fn id(&self) -> &str {
+            "trigger-lifecycle"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            let matching = if self.settled {
+                matches!(event, crate::LifecycleEvent::AgentSettled { .. })
+            } else {
+                matches!(event, crate::LifecycleEvent::SessionStart { .. })
+            };
+            if matching && !self.fired.swap(true, Ordering::SeqCst) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "trigger".into(),
+                        content: crate::ContextContent::Text("triggered".into()),
+                        display: false,
+                        details: Some(serde_json::json!({"test":true})),
+                    },
+                    crate::CustomMessageDelivery::TriggerTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn idle_session_and_settled_callbacks_start_a_durable_triggered_run() {
+        for settled in [false, true] {
+            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .extension(Arc::new(TriggerFromLifecycle {
+                    settled,
+                    fired: std::sync::atomic::AtomicBool::new(false),
+                }))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(model.0.load(Ordering::SeqCst), 2);
+            let records = session.journal().records();
+            let id = records
+                .iter()
+                .find_map(|record| match &record.event {
+                    crate::Event::CustomMessageQueued { input }
+                        if input.delivery == crate::CustomMessageDelivery::TriggerTurn =>
+                    {
+                        Some(input.id)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(records.iter().filter(|record| matches!(record.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
+            assert!(records.iter().any(|record| record.run_id == Some(id)
+                && matches!(
+                    record.event,
+                    crate::Event::Run {
+                        state: crate::RunState::Completed,
+                        ..
+                    }
+                )));
+            assert!(session.journal().pending_custom_trigger().is_none());
+        }
+    }
+    #[tokio::test]
+    async fn interrupted_trigger_handoff_resumes_same_run_without_duplicate_delivery() {
+        for phase in 0..4 {
+            let id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "trigger".into(),
+                content: crate::ContextContent::Text("recover".into()),
+                display: false,
+                details: None,
+            };
+            let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+            crate::agent::queue_custom_message(
+                &mut journal,
+                crate::QueuedCustomMessage {
+                    id,
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    message: message.clone(),
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+            if phase >= 1 {
+                journal.set_run_id(Some(id));
+                journal
+                    .append(crate::Event::Run {
+                        state: crate::RunState::Running,
+                        initial: None,
+                    })
+                    .unwrap();
+                if phase >= 2 {
+                    journal
+                        .append(crate::Event::CustomMessageDelivered { id, message })
+                        .unwrap();
+                }
+                if phase == 3 {
+                    journal
+                        .append(crate::Event::Assistant {
+                            content: "already answered".into(),
+                            invocations: vec![],
+                            usage: None,
+                            request_id: None,
+                        })
+                        .unwrap();
+                }
+                journal.set_run_id(None);
+            }
+            let restored = Session::from_records(journal.records().to_vec()).unwrap();
+            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .build(restored)
+                .unwrap();
+            session.start().await.unwrap();
+            session.start().await.unwrap();
+            assert_eq!(
+                model.0.load(Ordering::SeqCst),
+                usize::from(phase != 3),
+                "phase {phase}"
+            );
+            assert_eq!(session.journal().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
+            assert!(session.journal().pending_custom_trigger().is_none());
+        }
+    }
+
+    struct MultiTriggerStart;
+    #[async_trait::async_trait]
+    impl Extension for MultiTriggerStart {
+        fn id(&self) -> &str {
+            "multi-trigger"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                for text in ["one", "two"] {
+                    host.send_message(
+                        crate::CustomMessage {
+                            custom_type: "trigger".into(),
+                            content: crate::ContextContent::Text(text.into()),
+                            display: false,
+                            details: None,
+                        },
+                        crate::CustomMessageDelivery::TriggerTurn,
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn multiple_idle_triggers_start_distinct_ordered_runs() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(MultiTriggerStart))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.start().await.unwrap();
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+        let branch = session.journal().branch();
+        let deliveries: Vec<_> = branch
+            .iter()
+            .filter_map(|r| match &r.event {
+                crate::Event::CustomMessageDelivered { id, message } => {
+                    Some((*id, &message.content))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries[0].1, &crate::ContextContent::Text("one".into()));
+        assert_eq!(deliveries[1].1, &crate::ContextContent::Text("two".into()));
+        assert_ne!(deliveries[0].0, deliveries[1].0);
+        let first_done = branch
+            .iter()
+            .position(|r| {
+                r.run_id == Some(deliveries[0].0)
+                    && matches!(
+                        r.event,
+                        crate::Event::Run {
+                            state: crate::RunState::Completed,
+                            ..
+                        }
+                    )
+            })
+            .unwrap();
+        let second_delivery = branch.iter().position(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id, .. } if id == deliveries[1].0)).unwrap();
+        assert!(first_done < second_delivery);
+    }
+
+    struct TriggerInputHook;
+    #[async_trait::async_trait]
+    impl Extension for TriggerInputHook {
+        fn id(&self) -> &str {
+            "trigger-input"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            _: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            for (text, delivery) in [
+                ("next", crate::CustomMessageDelivery::NextTurn),
+                ("trigger", crate::CustomMessageDelivery::TriggerTurn),
+            ] {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "input".into(),
+                        content: crate::ContextContent::Text(text.into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery,
+                )
+                .await?;
+            }
+            Ok(crate::InputAction::Continue)
+        }
+    }
+    #[tokio::test]
+    async fn idle_input_trigger_runs_before_prompt_with_pending_next_turn_context() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(TriggerInputHook))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("user"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+        let texts: Vec<_> = session
+            .messages()
+            .unwrap()
+            .into_iter()
+            .filter_map(|m| {
+                if let Message::User { content } = m {
+                    Some(content)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(texts, ["trigger", "next", "user"]);
     }
 
     struct NestedModel;

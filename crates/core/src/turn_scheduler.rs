@@ -47,6 +47,7 @@ impl Agent<'_> {
         Ok((tool, args))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn turn_poll_authorize_and_run(
         registry: &Registry,
         timeout: Duration,
@@ -55,6 +56,7 @@ impl Agent<'_> {
         prepared: (Arc<RegisteredTool>, serde_json::Value),
         states: &ExtensionStates,
         cancel: &CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
     ) -> Result<Outcome> {
         let (tool, args) = prepared;
         let pending = || Error::PendingOperation(invocation.operation_id);
@@ -68,14 +70,29 @@ impl Agent<'_> {
             for extension in &registry.extensions {
                 let decision = hook(
                     extension.as_ref(),
-                    extension
-                        .before_tool(
-                            &invocation.call.name,
-                            &args,
-                            &context,
-                            states.get(extension.id()),
-                        )
-                        .await,
+                    match &host {
+                        Some(host) => {
+                            extension
+                                .before_tool_with_host(
+                                    &invocation.call.name,
+                                    &args,
+                                    &context,
+                                    states.get(extension.id()),
+                                    host.clone(),
+                                )
+                                .await
+                        }
+                        None => {
+                            extension
+                                .before_tool(
+                                    &invocation.call.name,
+                                    &args,
+                                    &context,
+                                    states.get(extension.id()),
+                                )
+                                .await
+                        }
+                    },
                 )?;
                 if decision != Decision::Allow {
                     return Err(pending());
@@ -550,6 +567,7 @@ impl Agent<'_> {
         let (lifecycle_sender, mut lifecycle_messages) = mpsc::channel(32);
         let lifecycle_host = Arc::new(LifecycleMessageHost {
             sender: lifecycle_sender,
+            idle: false,
         });
         let mut futures = FuturesUnordered::<TurnFuture>::new();
         let mut calls = Vec::<TurnCall>::new();
@@ -1096,8 +1114,9 @@ impl Agent<'_> {
                             Ok((tool, args)) => {
                                 let registry = self.registry.clone(); let snapshot = states.clone();
                                 let invocation = calls[index].invocation.clone(); let cancel = calls[index].cancellation.clone(); let timeout = self.limits.tool_timeout;
+                                let hook_host = lifecycle_host.clone();
                                 let future = async move {
-                                    let result = Self::turn_poll_authorize_and_run(&registry, timeout, &invocation, &reference, (tool, args), &snapshot, &cancel).await;
+                                    let result = Self::turn_poll_authorize_and_run(&registry, timeout, &invocation, &reference, (tool, args), &snapshot, &cancel, Some(hook_host)).await;
                                     TurnEvent::Polled(index, result, reference, duration, Vec::new())
                                 }.boxed();
                                 futures.push(start_turn_future(future).await);

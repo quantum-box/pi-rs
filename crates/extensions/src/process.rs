@@ -323,6 +323,8 @@ struct Description {
     #[serde(default)]
     tool_hook_host_calls: bool,
     #[serde(default)]
+    before_tool_host_calls: bool,
+    #[serde(default)]
     request_hook_host_calls: bool,
     #[serde(default)]
     input_hook_host_calls: bool,
@@ -1005,6 +1007,34 @@ impl Extension for ExecutableExtension {
                 .map_err(|error| error.to_string())??;
         Ok(result.into())
     }
+    async fn before_tool_with_host(
+        &self,
+        name: &str,
+        arguments: &Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.before_tool_host_calls {
+            return self.before_tool(name, arguments, context, state).await;
+        }
+        let request = ProtocolRequest::BeforeTool {
+            name: name.into(),
+            arguments: arguments.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let result: DecisionValue = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok(result.into())
+    }
     fn handles_tool_call(&self) -> bool {
         self.description.tool_call_hook
     }
@@ -1042,7 +1072,12 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<Decision> {
-        if !self.description.tool_hook_host_calls || !self.description.tool_call_hook {
+        if !self.description.tool_call_hook {
+            return self
+                .before_tool_with_host(name, arguments, context, state, host)
+                .await;
+        }
+        if !self.description.tool_hook_host_calls {
             return self.tool_call(name, arguments, context, state).await;
         }
         let request = ProtocolRequest::ToolCall {
@@ -2098,6 +2133,7 @@ async fn dispatch_with_host(
             lifecycle_hook: extension.handles_lifecycle(),
             lifecycle_host_calls: true,
             tool_hook_host_calls: true,
+            before_tool_host_calls: true,
             request_hook_host_calls: true,
             input_hook_host_calls: true,
             context_hook_host_calls: true,
@@ -2275,12 +2311,16 @@ async fn dispatch_with_host(
             state,
         } => {
             let context = context(&operation_id)?;
-            encode(
+            let decision = if host.supports_custom_messages() {
+                extension
+                    .before_tool_with_host(&name, &arguments, &context, state.as_ref(), host)
+                    .await
+            } else {
                 extension
                     .before_tool(&name, &arguments, &context, state.as_ref())
                     .await
-                    .map(DecisionValue::from),
-            )
+            };
+            encode(decision.map(DecisionValue::from))
         }
         ProtocolRequest::Invoke {
             name,
@@ -3020,7 +3060,7 @@ else:
                 delivery: pi_rs_core::CustomMessageDelivery,
             ) -> ExtensionResult<()> {
                 assert_eq!(message.custom_type, "from-hook");
-                assert_eq!(delivery, pi_rs_core::CustomMessageDelivery::Steer);
+                assert_eq!(delivery, pi_rs_core::CustomMessageDelivery::TriggerTurn);
                 Ok(())
             }
         }
@@ -3033,7 +3073,7 @@ if '--pi-rs-extension-v1' in sys.argv:
 else:
     r=json.loads(sys.stdin.readline())
     assert r['request']['type']=='lifecycle' and r['has_custom_messages'] is True
-    print(json.dumps({'type':'send_message','delivery':'steer','message':{'customType':'from-hook','content':'hello','display':False}}),flush=True)
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','message':{'customType':'from-hook','content':'hello','display':False}}),flush=True)
     assert json.loads(sys.stdin.readline()) == {'Ok':None}
     print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
 "##;
@@ -3081,7 +3121,7 @@ else:
 import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     json.load(sys.stdin)
-    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'tool_hook_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
@@ -3091,6 +3131,7 @@ else:
     if kind=='input': result={'action':'continue'}
     elif kind=='before_request': result=r['request']
     elif kind=='context_with_system': result=r['messages']
+    elif kind=='before_tool': result={'allow':True,'reason':None}
     elif kind=='tool_call': result=[r['arguments'],{'allow':True,'reason':None}]
     elif kind=='tool_result': result=None
     else: raise AssertionError(kind)
@@ -3138,6 +3179,13 @@ else:
         let mut args = serde_json::json!({});
         assert_eq!(
             extension
+                .before_tool_with_host("tool", &args, &context, None, host.clone())
+                .await
+                .unwrap(),
+            Decision::Allow
+        );
+        assert_eq!(
+            extension
                 .tool_call_with_host("tool", &mut args, &context, None, host.clone())
                 .await
                 .unwrap(),
@@ -3161,7 +3209,7 @@ else:
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 6);
     }
 
     #[tokio::test]

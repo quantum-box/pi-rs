@@ -126,6 +126,8 @@ pub enum CustomMessageDelivery {
     Steer,
     FollowUp,
     NextTurn,
+    /// Start a new turn when idle; while active, deliver as steering.
+    TriggerTurn,
     /// Append after the current assistant turn without starting another turn.
     AfterTurn,
 }
@@ -788,6 +790,22 @@ pub trait Extension: Send + Sync {
         Ok(Decision::Allow)
     }
 
+    /// Opt in to host-aware legacy policy dispatch instead of `tool_call`.
+    fn handles_before_tool_host(&self) -> bool {
+        false
+    }
+
+    async fn before_tool_with_host(
+        &self,
+        name: &str,
+        args: &Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        self.before_tool(name, args, context, state).await
+    }
+
     /// Opt in to modifying validated tool arguments before execution.
     fn handles_tool_call(&self) -> bool {
         false
@@ -810,9 +828,14 @@ pub trait Extension: Send + Sync {
         args: &mut Value,
         context: &ToolContext,
         state: Option<&ExtensionState>,
-        _host: Arc<dyn ToolHost>,
+        host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<Decision> {
-        self.tool_call(name, args, context, state).await
+        if self.handles_before_tool_host() {
+            self.before_tool_with_host(name, args, context, state, host)
+                .await
+        } else {
+            self.tool_call(name, args, context, state).await
+        }
     }
 
     /// Opt in to transforming completed tool results before they enter the journal.
