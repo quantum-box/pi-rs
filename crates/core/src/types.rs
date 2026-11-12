@@ -399,6 +399,7 @@ impl CacheRetention {
 #[serde(rename_all = "kebab-case")]
 pub enum ModelApi {
     OpenaiCompletions,
+    OpenaiResponses,
     AnthropicMessages,
     GoogleGenerativeAi,
     PiMessages,
@@ -408,6 +409,7 @@ impl ModelApi {
     pub fn named(name: &str) -> Option<Self> {
         match name {
             "openai-completions" => Some(Self::OpenaiCompletions),
+            "openai-responses" => Some(Self::OpenaiResponses),
             "anthropic-messages" => Some(Self::AnthropicMessages),
             "google-generative-ai" => Some(Self::GoogleGenerativeAi),
             "pi-messages" => Some(Self::PiMessages),
@@ -418,6 +420,7 @@ impl ModelApi {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenaiCompletions => "openai-completions",
+            Self::OpenaiResponses => "openai-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGenerativeAi => "google-generative-ai",
             Self::PiMessages => "pi-messages",

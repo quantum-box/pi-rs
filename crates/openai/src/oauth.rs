@@ -46,7 +46,93 @@ pub struct Credential {
     pub scopes: Vec<String>,
 }
 
+impl Credential {
+    pub async fn revoke(&self, client: &Client) -> Result<()> {
+        let response = client
+            .post("https://auth.openai.com/api/accounts/oauth/revoke")
+            .form(&[
+                ("token", self.refresh_token.as_str()),
+                ("token_type_hint", "refresh_token"),
+                ("client_id", self.client_id.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|_| failed("session revocation failed"))?;
+        if !response.status().is_success() {
+            return Err(failed("session revocation was not confirmed"));
+        }
+        Ok(())
+    }
+    /// Replace a rotating refresh token. The caller must serialize refreshes
+    /// across processes and atomically persist the returned credential.
+    pub async fn refresh(&self, client: &Client) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Refreshed {
+            access_token: String,
+            refresh_token: String,
+            expires_in: u64,
+            token_type: String,
+            scope: Option<String>,
+        }
+        let mut response = client
+            .post(TOKEN)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", self.client_id.as_str()),
+                ("refresh_token", self.refresh_token.as_str()),
+                ("resource", RESOURCE),
+            ])
+            .send()
+            .await
+            .map_err(|_| failed("token refresh failed"))?;
+        if !response.status().is_success() {
+            return Err(failed("token refresh was rejected"));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| failed("token response failed"))?
+        {
+            if bytes.len() + chunk.len() > 64 * 1024 {
+                return Err(failed("token response too large"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let refreshed: Refreshed =
+            serde_json::from_slice(&bytes).map_err(|_| failed("invalid token response"))?;
+        if refreshed.access_token.is_empty()
+            || refreshed.refresh_token.is_empty()
+            || refreshed.expires_in == 0
+            || !refreshed.token_type.eq_ignore_ascii_case("bearer")
+        {
+            return Err(failed("invalid token response"));
+        }
+        let scopes: Vec<String> = refreshed
+            .scope
+            .as_deref()
+            .map(|scope| scope.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_else(|| self.scopes.clone());
+        if !scopes.iter().any(|scope| scope == PLAN_SCOPE) {
+            return Err(failed("ChatGPT plan permission was not granted"));
+        }
+        let expires_at = now()?
+            .checked_add(refreshed.expires_in)
+            .ok_or_else(|| failed("invalid token expiry"))?;
+        Ok(Self {
+            access_token: refreshed.access_token,
+            refresh_token: refreshed.refresh_token,
+            expires_at,
+            scopes,
+            ..self.clone()
+        })
+    }
+}
+
 impl Authorization {
+    pub fn state(&self) -> &str {
+        &self.state
+    }
     pub fn new(callback: Url, host_id: String, client_id: Option<String>) -> Result<Self> {
         if callback.scheme() != "http"
             || callback.host_str() != Some("127.0.0.1")
@@ -336,8 +422,15 @@ fn validate_id_token(
             .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(client_id)));
     if claims["iss"] != ISSUER
         || !audience
+        || claims["aud"]
+            .as_array()
+            .is_some_and(|values| values.len() > 1)
+            && claims["azp"] != client_id
         || claims["nonce"] != nonce
         || claims["exp"].as_u64().is_none_or(|exp| exp <= now)
+        || claims["iat"]
+            .as_u64()
+            .is_none_or(|iat| iat > now.saturating_add(60))
         || claims["nbf"].as_u64().is_some_and(|nbf| nbf > now)
     {
         return Err(invalid());
@@ -353,9 +446,24 @@ fn validate_id_token(
 
 /// Build a redirect-disabled HTTP client for exchanging and verifying credentials.
 pub fn http_client() -> Result<Client> {
-    Client::builder()
+    http_client_with_options(&[], None)
+}
+
+pub fn http_client_with_options(
+    proxies: &[reqwest::Proxy],
+    idle_timeout: Option<std::time::Duration>,
+) -> Result<Client> {
+    let mut builder = Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30));
+    if let Some(timeout) = idle_timeout {
+        builder = builder.read_timeout(timeout);
+    }
+    for proxy in proxies {
+        builder = builder.proxy(proxy.clone());
+    }
+    builder
         .build()
         .map_err(|_| failed("could not initialize HTTP client"))
 }
@@ -431,8 +539,7 @@ mod tests {
             .unwrap();
             format!("{msg}.{}", URL_SAFE_NO_PAD.encode(sig))
         };
-        let claims =
-            serde_json::json!({"iss":ISSUER,"aud":"client","nonce":"nonce","sub":"user","exp":200});
+        let claims = serde_json::json!({"iss":ISSUER,"aud":"client","nonce":"nonce","sub":"user","exp":200,"iat":90});
         let valid = sign(claims.clone());
         assert_eq!(
             validate_id_token(&valid, &keys, "client", "nonce", 100)
@@ -453,5 +560,29 @@ mod tests {
             parts[2]
         );
         assert!(validate_id_token(&tampered, &keys, "client", "nonce", 100).is_err());
+    }
+
+    #[test]
+    fn token_exchange_requires_the_plan_scope() {
+        let token = || TokenResponse {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            id_token: "id".into(),
+            expires_in: 3600,
+            scope: "openid profile email".into(),
+            token_type: "Bearer".into(),
+        };
+        let identity = || Identity {
+            subject: "user".into(),
+            email: None,
+        };
+        assert!(
+            token()
+                .into_credential("client".into(), identity())
+                .is_err()
+        );
+        let mut granted = token();
+        granted.scope.push_str(" chatgpt.tokens.use.direct");
+        assert!(granted.into_credential("client".into(), identity()).is_ok());
     }
 }

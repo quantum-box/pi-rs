@@ -2543,6 +2543,12 @@ fn slash(
         "/logout" if rest.eq_ignore_ascii_case("radius") => {
             start_radius_logout(view, &args.settings)?
         }
+        "/login" if rest.eq_ignore_ascii_case("openai-chatgpt") => {
+            start_chatgpt_login(view, &args.settings)
+        }
+        "/logout" if rest.eq_ignore_ascii_case("openai-chatgpt") => {
+            start_chatgpt_logout(view, &args.settings)
+        }
         "/login"
             if rest.eq_ignore_ascii_case("openrouter")
                 || rest.eq_ignore_ascii_case("openrouter browser") =>
@@ -2559,6 +2565,7 @@ fn slash(
                 let mut items = args
                     .model_profiles
                     .providers()
+                    .filter(|provider| provider.id() != "openai-chatgpt")
                     .filter(|provider| login || args.model_keys.has(provider))
                     .map(|provider| Item {
                         label: provider.id().into(),
@@ -2589,6 +2596,23 @@ fn slash(
                         Item {
                             label: "openrouter · OAuth".into(),
                             selection: Selection::LoginOpenRouter,
+                        },
+                    );
+                }
+                if login
+                    || args
+                        .model_keys
+                        .has(&super::Provider::named("openai-chatgpt").expect("ChatGPT provider"))
+                {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-chatgpt · Continue with ChatGPT".into(),
+                            selection: if login {
+                                Selection::LoginChatGpt
+                            } else {
+                                Selection::LogoutChatGpt
+                            },
                         },
                     );
                 }
@@ -4826,6 +4850,46 @@ fn start_openrouter_login(view: &mut View, settings: &crate::config::Settings) {
     ));
 }
 
+fn start_chatgpt_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    view.remote_task = Some(RemoteTask::start(
+        "Signing in with ChatGPT",
+        "ChatGPT sign-in cancelled",
+        move |sender| async move {
+            super::chatgpt_auth::login(&settings, |url| {
+                let _ = sender.send(RemoteEvent::Notice(format!(
+                    "Continue with ChatGPT in your browser: {url}"
+                )));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in with ChatGPT".into()])
+        },
+    ));
+}
+
+fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    view.remote_task = Some(RemoteTask::start(
+        "Signing out of ChatGPT",
+        "ChatGPT sign-out cancelled",
+        move |sender| async move {
+            let result = super::chatgpt_auth::logout(&settings).await;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            result.map(|removed| {
+                vec![
+                    if removed {
+                        "Signed out of ChatGPT"
+                    } else {
+                        "No saved ChatGPT session"
+                    }
+                    .into(),
+                ]
+            })
+        },
+    ));
+}
+
 fn clear_openrouter_editor(view: &mut View) {
     if matches!(view.local_editor, Some((LocalEditor::OpenRouterCode(_), _))) {
         view.local_editor = None;
@@ -5751,6 +5815,8 @@ fn select(
         Selection::Completion { range, text } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
+        Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings),
+        Selection::LogoutChatGpt => start_chatgpt_logout(view, &args.settings),
         Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
         Selection::RadiusMethods => show_radius_methods(view),
         Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,

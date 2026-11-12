@@ -822,6 +822,9 @@ impl Profiles {
     pub fn providers(&self) -> impl Iterator<Item = Provider> + '_ {
         Provider::ALL
             .into_iter()
+            .chain(std::iter::once(
+                Provider::named("openai-chatgpt").expect("ChatGPT provider"),
+            ))
             .chain(
                 builtin_chat::PROVIDERS
                     .iter()
@@ -1105,6 +1108,7 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
 
     let suffix = match adapter {
         Adapter::ChatCompletions => "/chat/completions",
+        Adapter::OpenAiResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
         Adapter::Google => {
             if url.path() == "/" {

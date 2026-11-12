@@ -23,6 +23,8 @@ pub enum Selection {
     },
     LoginProvider(super::super::Provider),
     LoginOpenRouter,
+    LoginChatGpt,
+    LogoutChatGpt,
     LogoutProvider(super::super::Provider),
     RadiusMethods,
     LoginRadius(crate::radius_auth::Method),

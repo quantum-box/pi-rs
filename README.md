@@ -47,6 +47,18 @@ data resets it. Use `/settings` to change it, or set `httpIdleTimeoutMs` in
 `{"httpIdleTimeoutMs":"disabled"}` removes the HTTP idle deadline.
 `--model-timeout-secs` separately sets a deadline for the complete operation.
 
+To use eligible ChatGPT plan usage, sign in with your ChatGPT account and
+authorize plan usage in the browser:
+
+```sh
+pi login openai-chatgpt
+pi --provider openai-chatgpt
+```
+
+Inside the terminal, `/login openai-chatgpt` starts the same flow, and
+`/logout openai-chatgpt` signs out. Available models and usage depend on the
+account and workspace. Manage app usage in [ChatGPT Settings](https://chatgpt.com/settings/usage).
+
 ## Native extensions
 
 The terminal enables notes and a TODO checklist, alongside plan mode and branch

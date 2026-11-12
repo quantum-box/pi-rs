@@ -19,6 +19,7 @@ mod backend;
 mod builtin_chat;
 mod cache_stats;
 mod cache_warming;
+mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
 mod config;
@@ -472,7 +473,7 @@ impl Cli {
             || settings.has_command()
             || credential
                 .as_ref()
-                .is_some_and(model_auth::Credential::is_command)
+                .is_some_and(model_auth::Credential::requires_resolution)
         {
             return providers::Client::deferred(
                 provider.clone(),
@@ -703,14 +704,14 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt"])]
         provider: String,
     },
     Run {
@@ -1132,7 +1133,15 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             device_code,
         }) => {
             let login = async {
-                if provider == "openrouter" {
+                if provider == "openai-chatgpt" {
+                    if *device_code {
+                        return Err(Error::Config("ChatGPT uses browser authorization".into()));
+                    }
+                    chatgpt_auth::login(&args.settings, |url| {
+                        eprintln!("Continue with ChatGPT in your browser: {url}")
+                    })
+                    .await
+                } else if provider == "openrouter" {
                     if *device_code {
                         return Err(Error::Config(
                             "OpenRouter uses browser authorization".into(),
@@ -1165,7 +1174,9 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             return Ok(());
         }
         Some(Command::Logout { provider }) => {
-            let removed = if provider == "openrouter" {
+            let removed = if provider == "openai-chatgpt" {
+                chatgpt_auth::logout(&args.settings).await?
+            } else if provider == "openrouter" {
                 model_auth::remove(
                     &Provider::named(provider).expect("built-in OpenRouter provider"),
                 )?

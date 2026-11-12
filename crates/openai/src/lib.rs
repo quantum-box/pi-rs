@@ -22,13 +22,33 @@ pub struct OpenAiResponses {
     client: Client,
     endpoint: Url,
     token: String,
+    thinking: Option<String>,
 }
 
 impl OpenAiResponses {
+    pub fn with_http_options(
+        mut self,
+        timeout: Option<std::time::Duration>,
+        proxies: &[reqwest::Proxy],
+    ) -> Result<Self> {
+        let mut builder = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(timeout) = timeout {
+            builder = builder.read_timeout(timeout);
+        }
+        for proxy in proxies {
+            builder = builder.proxy(proxy.clone());
+        }
+        self.client = builder
+            .build()
+            .map_err(|_| Error::Config("could not initialize OpenAI client".into()))?;
+        Ok(self)
+    }
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
         let endpoint = Url::parse(endpoint)
             .map_err(|_| Error::Config("invalid OpenAI Responses endpoint".into()))?;
-        let secure = endpoint.scheme() == "https"
+        let secure = endpoint.as_str() == DEFAULT_ENDPOINT
             || (endpoint.scheme() == "http"
                 && matches!(
                     endpoint.host_str(),
@@ -41,7 +61,7 @@ impl OpenAiResponses {
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
         {
-            return Err(Error::Config("OpenAI Responses requires HTTPS or loopback HTTP without credentials, query, or fragment".into()));
+            return Err(Error::Config("ChatGPT plan requests require the official OpenAI Responses endpoint or loopback HTTP".into()));
         }
         if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
             return Err(Error::Config("invalid OpenAI bearer token".into()));
@@ -55,7 +75,58 @@ impl OpenAiResponses {
             client,
             endpoint,
             token,
+            thinking: None,
         })
+    }
+
+    pub fn with_thinking(mut self, level: Option<&str>) -> Self {
+        self.thinking = level.map(|level| if level == "off" { "none" } else { level }.to_owned());
+        self
+    }
+
+    /// Return the signed-in account's displayable models in server order.
+    pub async fn models(&self) -> Result<Vec<String>> {
+        let mut endpoint = self.endpoint.clone();
+        endpoint.set_path("/v1/models");
+        let mut response = self
+            .client
+            .get(endpoint)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| Error::RetryableModel("OpenAI model listing failed".into()))?;
+        if !response.status().is_success() {
+            return Err(Error::Model(format!(
+                "OpenAI model listing failed ({})",
+                response.status()
+            )));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| Error::RetryableModel("OpenAI model listing interrupted".into()))?
+        {
+            if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
+                return Err(Error::Model("OpenAI model listing too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::Model("invalid OpenAI model listing".into()))?;
+        let models = body["models"]
+            .as_array()
+            .ok_or_else(|| Error::Model("invalid OpenAI model listing".into()))?;
+        Ok(models
+            .iter()
+            .filter(|entry| entry["visibility"] == "list")
+            .filter_map(|entry| {
+                entry["slug"]
+                    .as_str()
+                    .filter(|slug| !slug.is_empty())
+                    .map(str::to_owned)
+            })
+            .collect())
     }
 }
 
@@ -107,26 +178,56 @@ fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::Model(format!("invalid OpenAI event field {name}")))
 }
 
+fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Error {
+    match code {
+        Some("subscription_sharing_usage_limit_exceeded") => Error::Model(
+            "ChatGPT plan usage limit reached; see https://chatgpt.com/settings/usage".into(),
+        ),
+        Some("subscription_sharing_user_not_eligible") => {
+            Error::Model("ChatGPT plan usage is unavailable for this account or workspace".into())
+        }
+        Some("subscription_sharing_usage_unavailable") => {
+            Error::RetryableModel("ChatGPT plan usage is temporarily unavailable".into())
+        }
+        _ if status.is_some_and(|status| status.is_server_error()) => {
+            Error::RetryableModel("OpenAI service temporarily unavailable".into())
+        }
+        _ => Error::Model(status.map_or_else(
+            || "OpenAI response did not complete".into(),
+            |status| format!("OpenAI request failed ({status})"),
+        )),
+    }
+}
+
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         let model = request.model.clone();
-        let response = self
+        let mut body = payload(&request);
+        if let Some(thinking) = &self.thinking {
+            body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
+        let mut response = self
             .client
             .post(self.endpoint.clone())
             .bearer_auth(&self.token)
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&payload(&request))
+            .json(&body)
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
         if !response.status().is_success() {
             let status = response.status();
-            return Err(if status.is_server_error() {
-                Error::RetryableModel(format!("OpenAI request failed ({status})"))
-            } else {
-                Error::Model(format!("OpenAI request failed ({status})"))
-            });
+            let mut bytes = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                if bytes.len() + chunk.len() > 64 * 1024 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            return Err(response_error(body["error"]["code"].as_str(), Some(status)));
         }
         if !response
             .headers()
@@ -175,11 +276,11 @@ impl Model for OpenAiResponses {
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:"openai-chatgpt".into(), model:model.clone() };
-                        yield ModelEvent::Metadata(ModelMetadata { resolved_model:Some(identity.clone()), finish_reason:Some("stop".into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:Some(Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
+                        yield ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), resolved_model:Some(identity.clone()), finish_reason:Some("stop".into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:Some(Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
                         yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
                         return;
                     }
-                    "response.failed" | "response.incomplete" | "error" => Err(Error::Model("OpenAI response did not complete".into()))?,
+                    "response.failed" | "response.incomplete" | "error" => Err(response_error(event["response"]["error"]["code"].as_str().or_else(|| event["error"]["code"].as_str()), None))?,
                     _ => {}
                 }
             }
@@ -310,5 +411,30 @@ mod tests {
             matches!(events.last(), Some(ModelEvent::Complete { calls, .. }) if calls.len()==1 && calls[0].name=="read")
         );
         server.await.unwrap();
+    }
+
+    #[test]
+    fn usage_errors_do_not_trigger_generic_retries() {
+        assert!(matches!(
+            response_error(
+                Some("subscription_sharing_usage_limit_exceeded"),
+                Some(reqwest::StatusCode::TOO_MANY_REQUESTS)
+            ),
+            Error::Model(_)
+        ));
+        assert!(matches!(
+            response_error(
+                Some("subscription_sharing_usage_unavailable"),
+                Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+            ),
+            Error::RetryableModel(_)
+        ));
+        assert!(matches!(
+            response_error(
+                Some("subscription_sharing_user_not_eligible"),
+                Some(reqwest::StatusCode::FORBIDDEN)
+            ),
+            Error::Model(_)
+        ));
     }
 }
