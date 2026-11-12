@@ -489,7 +489,16 @@ impl Cli {
         let credential = self.model_credential_for(provider, endpoint);
         let settings = self
             .model_profiles
-            .header_settings(provider, endpoint, model);
+            .header_settings(provider, endpoint, model)
+            .with_environment(
+                self.model_override_token(provider, endpoint)
+                    .is_none()
+                    .then(|| {
+                        self.model_keys
+                            .environment(provider, endpoint, &self.model_profiles)
+                    })
+                    .flatten(),
+            );
         if model.is_some_and(str::is_empty)
             || settings.has_command()
             || credential

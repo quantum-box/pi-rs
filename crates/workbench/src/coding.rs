@@ -864,7 +864,17 @@ impl CodingTool {
         cancellation: &pi_rs::CancellationToken,
     ) -> Result<Outcome> {
         check_mutation_cancelled(cancellation)?;
-        let path = self.path(string(args, "path")?)?;
+        let display_path = string(args, "path")?;
+        let path = self.path(display_path).map_err(|error| match error {
+            Error::Io(ref cause)
+                if self.unrestricted && cause.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Error::Config(format!(
+                    "Could not edit file: {display_path}. Error code: ENOENT."
+                ))
+            }
+            error => error,
+        })?;
         let _lock = mutation_lock(&path, cancellation)?;
         check_mutation_cancelled(cancellation)?;
         let original = self.text(&path)?;
@@ -2641,6 +2651,30 @@ mod tests {
                 .edit(&json!({"path":"Capture d'ecran.txt", "oldText":"curly", "newText":"other"}))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn local_edit_reports_missing_target_with_original_path() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        for path in ["missing.txt", "missing/child.txt", "@absent.txt"] {
+            let context = ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: pi_rs::CancellationToken::new(),
+            };
+            let outcome = tool
+                .invoke(json!({"path":path,"oldText":"a","newText":"b"}), context)
+                .await;
+            assert!(
+                matches!(outcome, Outcome::Failed(message) if message == format!("Could not edit file: {path}. Error code: ENOENT."))
+            );
+        }
+        assert!(!root.path().join("missing").exists());
     }
 
     #[tokio::test]

@@ -3579,3 +3579,6 @@ async fn cancelled_nested_batch_preserves_already_journaled_result() {
     assert_eq!(outcomes[0], Outcome::Succeeded("first finished".into()));
     assert!(matches!(outcomes[1], Outcome::Unknown(_)));
 }
+
+#[path = "harness/scheduler.rs"]
+mod scheduler;
