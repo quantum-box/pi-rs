@@ -552,13 +552,23 @@ fn wire_request(
                 }
                 push_content(&mut contents, "model", parts, false);
             }
-            Message::Tool { call_id, content } => {
+            Message::Tool {
+                call_id,
+                content,
+                is_structured,
+                ..
+            } => {
                 let Some((name, id)) = calls.get(call_id.as_str()) else {
                     return Err(Error::Model(
                         "Google tool result has no preceding call".into(),
                     ));
                 };
-                let (text, images) = extract_tool_images(content.clone());
+                let (text, images) =
+                    if pi_rs_core::tool_content_is_structured(content, *is_structured) {
+                        extract_tool_images(content.clone())
+                    } else {
+                        (content.clone(), Vec::new())
+                    };
                 let mut response = json!({"name":name,"response":{"output":text}});
                 if let Some(id) = id {
                     response["id"] = json!(id);
@@ -804,6 +814,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plain_json_tool_output_is_not_extracted_as_an_image() {
+        let text = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        let mut request = ModelRequest {
+            model: "gemini-3-pro-preview".into(),
+            messages: vec![
+                Message::Assistant {
+                    content: String::new(),
+                    calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    }],
+                    replay: None,
+                },
+                Message::Tool {
+                    call_id: "call".into(),
+                    content: text.into(),
+                    is_error: false,
+                    is_structured: Some(false),
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 32,
+        };
+        let body = wire_request(&request, None, "google").unwrap();
+        let response = &body["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(response["response"]["output"], text);
+        assert!(response.get("parts").is_none());
+        request.messages[1] =
+            serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
+        let body = wire_request(&request, None, "google").unwrap();
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["data"],
+            "aW1hZ2U="
+        );
+    }
+
+    #[test]
     fn tool_images_follow_model_multimodal_response_support() {
         let image_result = json!({"data":{"content":[
             {"type":"text","text":"picture"},
@@ -839,10 +887,14 @@ mod tests {
                         replay: None,
                     },
                     Message::Tool {
+                        is_structured: Some(true),
+                        is_error: false,
                         call_id: "a".into(),
                         content: image_result.clone(),
                     },
                     Message::Tool {
+                        is_structured: Some(false),
+                        is_error: false,
                         call_id: "b".into(),
                         content: "second result".into(),
                     },
@@ -1067,6 +1119,8 @@ mod tests {
                     })),
                 },
                 Message::Tool {
+                    is_structured: Some(false),
+                    is_error: false,
                     call_id: "logical-call".into(),
                     content: "tool output".into(),
                 },

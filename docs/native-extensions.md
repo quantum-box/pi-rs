@@ -77,12 +77,24 @@ pre-tool decisions, post-tool state, state migrations, and compaction hooks.
 Use stable extension IDs and explicit state versions. Let the host select the
 allowed tools and register policy extensions before tools.
 
-For successful text results, opt in with `handles_tool_result` and implement
-`tool_result_patch` to change output or details independently. Omitted fields
-retain their previous values, and handlers see earlier handlers' changes. This
-also works for executable extensions and preserves the existing full-outcome
-`tool_result` hook. Patches to other outcome types are reported as hook errors;
-use the full-outcome hook for those results.
+For successful or failed text results, opt in with `handles_tool_result` and
+implement `tool_result_patch` to change output or details. Implement
+`tool_result_patch_v2` to also change `is_error` independently. Omitted fields
+retain their previous values, and handlers see earlier handlers' changes.
+Patched output is passed verbatim to the model, while details stay outside model
+context. This works for executable extensions. Existing patch hooks continue to
+work; older executables receive a lossy legacy projection of patched failures,
+which cannot represent failure details. The same projection applies to nested
+host-call responses sent to older executables; current executables receive the
+full result. Tool messages carry `is_error` independently of their text; older
+context-hook executables retain the original status by tool-call ID and retain
+structured provenance when content is unchanged. Their rewritten content has
+unknown provenance and follows legacy structured-envelope detection. Tool
+message `is_structured` marks known structured or plain results. Older serialized
+messages without the flag also use legacy detection, so images remain subject
+to normal filtering and extraction. Patches to
+non-text outcomes are reported as hook errors; use the full-outcome hook for
+those results.
 
 Extensions can intercept user-entered `!` and `!!` shell commands by opting in
 with `handles_user_bash` and implementing `user_bash`. The event includes the

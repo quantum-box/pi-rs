@@ -32,8 +32,16 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
                     .saturating_add(text_chars(&arguments))
             })
         }
-        Message::Tool { content, .. } => {
-            let (content, images) = extract_tool_images(content.clone());
+        Message::Tool {
+            content,
+            is_structured,
+            ..
+        } => {
+            let (content, images) = if crate::tool_content_is_structured(content, *is_structured) {
+                extract_tool_images(content.clone())
+            } else {
+                (content.clone(), Vec::new())
+            };
             text_chars(&content)
                 .saturating_add((images.len() as u64).saturating_mul(ESTIMATED_IMAGE_CHARS))
         }
@@ -112,6 +120,8 @@ mod tests {
     #[test]
     fn structured_tool_images_have_a_fixed_cost_and_preserve_original_data() {
         let result = |data: &str| Message::Tool {
+            is_structured: Some(true),
+            is_error: false,
             call_id: "lookup".into(),
             content: serde_json::json!({"data":{"content":[
                 {"type":"text","text":"image"},
@@ -129,6 +139,24 @@ mod tests {
         assert!(
             matches!(long, Message::Tool { content, .. } if content.contains(&"A".repeat(5000)))
         );
+    }
+
+    #[test]
+    fn plain_json_tool_output_is_counted_as_text() {
+        let content = serde_json::json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(5000)}]}}).to_string();
+        let plain = Message::Tool {
+            call_id: "id".into(),
+            content: content.clone(),
+            is_error: false,
+            is_structured: Some(false),
+        };
+        let structured = Message::Tool {
+            call_id: "id".into(),
+            content,
+            is_error: false,
+            is_structured: Some(true),
+        };
+        assert!(estimate_message_tokens(&plain) > estimate_message_tokens(&structured));
     }
 
     #[test]

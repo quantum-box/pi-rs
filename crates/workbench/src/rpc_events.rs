@@ -309,7 +309,11 @@ impl Stream {
             } => {
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
-                    let result = tool_result_value(&outcome.tool_content(), Some(&outcome));
+                    let result = tool_result_value(
+                        &outcome.tool_content(),
+                        Some(&outcome),
+                        Some(outcome.is_structured()),
+                    );
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
@@ -498,14 +502,19 @@ pub(super) fn tool_call_value(call: &ToolCall) -> Value {
 }
 
 pub(super) fn tool_failed(outcome: &Outcome) -> bool {
-    matches!(
-        outcome,
-        Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-    ) || matches!(outcome, Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } if data["isError"] == true)
+    outcome.is_error()
 }
 
-pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value {
-    let (text, images) = pi_rs::extract_tool_images(text.to_owned());
+pub(super) fn tool_result_value(
+    text: &str,
+    outcome: Option<&Outcome>,
+    is_structured: Option<bool>,
+) -> Value {
+    let (text, images) = if pi_rs::tool_content_is_structured(text, is_structured) {
+        pi_rs::extract_tool_images(text.to_owned())
+    } else {
+        (text.to_owned(), Vec::new())
+    };
     let mut content = vec![json!({"type":"text","text":text})];
     content.extend(
         images
@@ -517,6 +526,13 @@ pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value 
         Outcome::SucceededWithDetails { details, .. }
         | Outcome::StructuredWithDetails { details, .. },
     ) = outcome
+    {
+        result["details"] = details.clone();
+    }
+    if let Some(Outcome::TextResult {
+        details: Some(details),
+        ..
+    }) = outcome
     {
         result["details"] = details.clone();
     }
@@ -557,6 +573,44 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn patched_result_projects_verbatim_content_details_and_error() {
+        let result = Outcome::TextResult {
+            output: "exact".into(),
+            details: Some(json!({"code": 42})),
+            is_error: true,
+        };
+        assert!(tool_failed(&result));
+        assert_eq!(
+            tool_result_value(
+                &result.tool_content(),
+                Some(&result),
+                Some(result.is_structured())
+            ),
+            json!({"content":[{"type":"text","text":"exact"}], "details":{"code":42}})
+        );
+        let success = Outcome::TextResult {
+            output: "recovered".into(),
+            details: None,
+            is_error: false,
+        };
+        assert!(!tool_failed(&success));
+    }
+
+    #[test]
+    fn plain_json_result_is_verbatim_in_rpc() {
+        let text = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        let outcome = Outcome::TextResult {
+            output: text.into(),
+            details: None,
+            is_error: true,
+        };
+        assert_eq!(
+            tool_result_value(text, Some(&outcome), Some(outcome.is_structured())),
+            json!({"content":[{"type":"text","text":text}]})
+        );
+    }
 
     #[test]
     fn tool_progress_is_forwarded_as_pi_event_in_json_mode() {

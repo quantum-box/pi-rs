@@ -5450,3 +5450,134 @@ mod poll_review;
 
 #[path = "poll_status.rs"]
 mod poll_status;
+
+#[tokio::test]
+async fn scheduler_preserves_patched_error_status_for_nested_and_parent_results() {
+    struct Parent;
+    struct Child;
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let child = host.call("child", json!({})).await;
+            assert!(child.is_error());
+            assert_eq!(child.tool_content(), "child failed");
+            Outcome::Failed("parent failure".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Child {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "child".into(),
+                description: "child".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            Outcome::Succeeded("child output".into())
+        }
+    }
+    struct Hooks(Arc<Mutex<Vec<(String, bool, Outcome)>>>);
+    #[async_trait::async_trait]
+    impl Extension for Hooks {
+        fn id(&self) -> &str {
+            "patched-scheduler"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(Parent), Arc::new(Child)]
+        }
+        fn handles_tool_result(&self) -> bool {
+            true
+        }
+        async fn tool_result_patch_v2(
+            &self,
+            call: &ToolCall,
+            _: &Outcome,
+            _: &ToolContext,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<Option<ToolResultPatchV2>> {
+            Ok(Some(ToolResultPatchV2 {
+                output: Some(
+                    if call.name == "child" {
+                        "child failed"
+                    } else {
+                        "parent recovered"
+                    }
+                    .into(),
+                ),
+                details: Some(json!({"tool":call.name})),
+                is_error: Some(call.name == "child"),
+            }))
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &LifecycleEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            if let LifecycleEvent::ToolExecutionEnd {
+                tool_name,
+                result,
+                is_error,
+                ..
+            } = event
+            {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((tool_name.clone(), *is_error, result.clone()));
+            }
+            Ok(())
+        }
+    }
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Hooks(events.clone()))).unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("test".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|(name, is_error, result)| name == "child"
+        && *is_error
+        && result.tool_content() == "child failed"));
+    assert!(
+        events
+            .iter()
+            .any(|(name, is_error, result)| name == "lookup"
+                && !*is_error
+                && result.tool_content() == "parent recovered")
+    );
+    let requests = model.requests.lock().unwrap();
+    assert!(requests[1].messages.iter().any(|message| matches!(message, Message::Tool { content, is_error: false, .. } if content == "parent recovered")));
+}

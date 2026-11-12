@@ -532,12 +532,17 @@ fn install_globals(
     Ok(())
 }
 fn tool_value(outcome: Outcome) -> Value {
-    if matches!(&outcome, Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } if data["isError"] == true)
-    {
+    if outcome.is_error() {
         return json!({"ok":false,"error":outcome.tool_content()});
     }
     match outcome {
-        Outcome::Succeeded(value) | Outcome::SucceededWithDetails { output: value, .. } => {
+        Outcome::Succeeded(value)
+        | Outcome::SucceededWithDetails { output: value, .. }
+        | Outcome::TextResult {
+            output: value,
+            is_error: false,
+            ..
+        } => {
             json!({"ok":true,"value":value})
         }
         Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } => {
@@ -934,6 +939,48 @@ mod tests {
             assert!(!error.contains("private metadata"));
         }
     }
+    #[tokio::test]
+    async fn patched_text_results_reach_scripts_with_independent_status() {
+        struct PatchedHost;
+        #[async_trait::async_trait]
+        impl ToolHost for PatchedHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                ["recovered", "failed"]
+                    .into_iter()
+                    .map(|name| ToolSpec {
+                        name: name.into(),
+                        description: "patched".into(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                Outcome::TextResult {
+                    output: if name == "recovered" {
+                        "exact success"
+                    } else {
+                        "exact failure"
+                    }
+                    .into(),
+                    details: Some(json!({"secret":"private"})),
+                    is_error: name == "failed",
+                }
+            }
+        }
+        let reply = ScriptTool { timeout: Some(Duration::from_secs(2)) }.invoke_transaction(
+            json!({"code":"text(await tools.recovered({})); try { await tools.failed({}); } catch (e) { text(e.message); }"}),
+            ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: Default::default() }, None, Arc::new(PatchedHost)).await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("script should succeed")
+        };
+        assert_eq!(data["isError"], false);
+        let output = data["content"].to_string();
+        assert!(output.contains("exact success"));
+        assert!(output.contains("exact failure"));
+        assert!(!output.contains("Tool failed:"));
+        assert!(!output.contains("private"));
+    }
+
     struct Host;
     #[async_trait::async_trait]
     impl ToolHost for Host {

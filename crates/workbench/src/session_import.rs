@@ -783,7 +783,11 @@ fn convert(
                             }
                         }
                     } else if message["isError"] == true {
-                        Outcome::Failed(text)
+                        Outcome::TextResult {
+                            output: text,
+                            details: message.get("details").cloned(),
+                            is_error: true,
+                        }
                     } else if let Some(details) =
                         message.get("details").filter(|details| !details.is_null())
                     {
@@ -1984,8 +1988,11 @@ mod tests {
                 matches!(outcome, Outcome::StructuredWithDetails { data, details: stored, .. } if data["content"] == blocks && stored == &details)
             );
             assert_eq!(super::super::rpc_events::tool_failed(outcome), is_error);
-            let rpc =
-                super::super::rpc_events::tool_result_value(&outcome.tool_content(), Some(outcome));
+            let rpc = super::super::rpc_events::tool_result_value(
+                &outcome.tool_content(),
+                Some(outcome),
+                Some(outcome.is_structured()),
+            );
             assert_eq!(rpc["details"], details);
             assert_eq!(rpc["content"][1]["data"], "aW1hZ2U=");
             assert!(reopened.current_messages().iter().any(|message| matches!(message,

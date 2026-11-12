@@ -38,6 +38,7 @@ struct Endpoint {
     path: PathBuf,
     flags: Option<Arc<str>>,
     pi_lifecycle_fields: bool,
+    text_result_v2: bool,
 }
 
 impl Endpoint {
@@ -111,6 +112,46 @@ fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) 
                 .then(|| original.messages.iter().find_map(matching))
                 .flatten()
         });
+    }
+}
+
+// Older executable hooks discard unknown tool-message fields. Retain provenance
+// only for unchanged content; rewrites have unknown legacy provenance.
+fn restore_legacy_tool_metadata(
+    original: &ModelRequest,
+    updated: &mut ModelRequest,
+    restore_status: bool,
+    restore_structure: bool,
+) {
+    for message in &mut updated.messages {
+        if let Message::Tool {
+            call_id,
+            content,
+            is_error,
+            is_structured,
+            ..
+        } = message
+            && let Some(Message::Tool {
+                content: previous_content,
+                is_error: previous_error,
+                is_structured: previous_structure,
+                ..
+            }) = original
+                .messages
+                .iter()
+                .find(|item| matches!(item, Message::Tool { call_id: id, .. } if id == call_id))
+        {
+            if restore_status {
+                *is_error = *previous_error;
+            }
+            if restore_structure {
+                *is_structured = if content == previous_content {
+                    *previous_structure
+                } else {
+                    None
+                };
+            }
+        }
     }
 }
 
@@ -223,6 +264,8 @@ enum ProtocolRequest {
         outcome: Outcome,
         operation_id: String,
         state: Option<ExtensionState>,
+        #[serde(default)]
+        text_result_v2: bool,
     },
     BeforeCompaction {
         summary: String,
@@ -258,6 +301,15 @@ struct Description {
     input_hook: bool,
     #[serde(default)]
     tool_result_hook: bool,
+    #[serde(default)]
+    text_result_v2: bool,
+    #[serde(default)]
+    tool_message_error: bool,
+    #[serde(default)]
+    tool_message_structured: bool,
+    /// This executable distinguishes explicit false from missing provenance.
+    #[serde(default)]
+    tool_message_provenance_v2: bool,
     #[serde(default)]
     tool_call_hook: bool,
     #[serde(default)]
@@ -352,6 +404,7 @@ impl ExecutableExtension {
             path: executable,
             flags: None,
             pi_lifecycle_fields: false,
+            text_result_v2: false,
         };
         let description =
             call(&endpoint, ProtocolRequest::Describe, None).map_err(Error::Config)?;
@@ -360,6 +413,7 @@ impl ExecutableExtension {
             description,
         };
         extension.endpoint.pi_lifecycle_fields = extension.description.pi_lifecycle_fields;
+        extension.endpoint.text_result_v2 = extension.description.text_result_v2;
         extension.apply_flags(&mut BTreeMap::new())?;
         Ok(extension)
     }
@@ -670,6 +724,12 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })?;
         restore_provider_replay(request, &mut updated);
+        restore_legacy_tool_metadata(
+            request,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
         *request = updated;
         Ok(())
     }
@@ -686,6 +746,12 @@ impl Extension for ExecutableExtension {
         };
         let mut updated = self.request_async(message).await?;
         restore_provider_replay(request, &mut updated);
+        restore_legacy_tool_metadata(
+            request,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
         *request = updated;
         Ok(())
     }
@@ -714,6 +780,12 @@ impl Extension for ExecutableExtension {
             ..original.clone()
         };
         restore_provider_replay(&original, &mut updated);
+        restore_legacy_tool_metadata(
+            &original,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
         *messages = updated.messages;
         Ok(())
     }
@@ -841,19 +913,54 @@ impl Extension for ExecutableExtension {
         context: &ToolContext,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<Outcome>> {
+        let legacy = !self.endpoint.text_result_v2;
+        let sent = if legacy {
+            outcome.legacy_text_result()
+        } else {
+            outcome.clone()
+        };
         let request = ProtocolRequest::ToolResult {
             call: call_data.clone(),
-            outcome: outcome.clone(),
+            outcome: sent.clone(),
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
+            text_result_v2: !legacy,
         };
         let path = self.endpoint.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
         let cancelled = guard.0.clone();
-        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
-            .await
-            .map_err(|error| error.to_string())?
+        let updated: Option<Outcome> =
+            tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+                .await
+                .map_err(|error| error.to_string())??;
+        // An older executable cannot represent patched failure metadata. Preserve
+        // it when the old hook makes no change, or changes only the text.
+        if legacy
+            && let Outcome::TextResult {
+                output, details, ..
+            } = outcome
+        {
+            return Ok(updated.map(|result| {
+                if result == sent {
+                    return outcome.clone();
+                }
+                match result {
+                    Outcome::Failed(text) => Outcome::TextResult {
+                        output: if text == *output {
+                            output.clone()
+                        } else {
+                            text
+                        },
+                        details: details.clone(),
+                        is_error: true,
+                    },
+                    other => other,
+                }
+            }));
+        }
+        Ok(updated)
     }
+
     fn after_tool(
         &self,
         name: &str,
@@ -862,7 +969,11 @@ impl Extension for ExecutableExtension {
     ) -> ExtensionResult<Option<ExtensionState>> {
         self.request(ProtocolRequest::AfterTool {
             name: name.into(),
-            outcome: outcome.clone(),
+            outcome: if self.endpoint.text_result_v2 {
+                outcome.clone()
+            } else {
+                outcome.legacy_text_result()
+            },
             state: state.cloned(),
         })
     }
@@ -1290,6 +1401,14 @@ fn call_duplex(
                         results = host.call_batch(calls) => Ok(results),
                     }
                 })?;
+                let results: Vec<_> = if endpoint.text_result_v2 {
+                    results
+                } else {
+                    results
+                        .into_iter()
+                        .map(|result| result.legacy_text_result())
+                        .collect()
+                };
                 writer
                     .send(serde_json::to_value(results).map_err(|error| error.to_string())?)
                     .map_err(|_| "native extension input closed")?;
@@ -1502,8 +1621,18 @@ fn call<T: serde::de::DeserializeOwned>(
     request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
-    let bytes = serde_json::to_vec(&wire_request(&request, endpoint.pi_lifecycle_fields)?)
-        .map_err(|error| error.to_string())?;
+    let mut wire = wire_request(&request, endpoint.pi_lifecycle_fields)?;
+    if !endpoint.text_result_v2
+        && wire["type"] == "lifecycle"
+        && wire["event"]["type"] == "tool_execution_end"
+    {
+        let result = &mut wire["event"]["result"];
+        if let Ok(outcome) = serde_json::from_value::<Outcome>(result.clone()) {
+            *result = serde_json::to_value(outcome.legacy_text_result())
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let bytes = serde_json::to_vec(&wire).map_err(|error| error.to_string())?;
     if bytes.len() as u64 > MAX_REQUEST {
         return Err("extension request exceeds 64 MiB".into());
     }
@@ -1726,6 +1855,10 @@ async fn dispatch_with_host(
             command_effects: extension.supports_command_effects(),
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
+            text_result_v2: true,
+            tool_message_error: true,
+            tool_message_structured: true,
+            tool_message_provenance_v2: true,
             tool_call_hook: extension.handles_tool_call(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
@@ -1928,10 +2061,18 @@ async fn dispatch_with_host(
             outcome,
             operation_id,
             state,
+            text_result_v2,
         } => encode(
             extension
                 .tool_result_update(&call, &outcome, &context(&operation_id)?, state.as_ref())
-                .await,
+                .await
+                .map(|result| {
+                    if text_result_v2 {
+                        result
+                    } else {
+                        result.map(|outcome| outcome.legacy_text_result())
+                    }
+                }),
         ),
         ProtocolRequest::BeforeCompaction {
             summary,
@@ -1975,6 +2116,39 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_tool_messages_decode_without_status_and_omit_false_on_wire() {
+        let legacy = serde_json::json!({"role":"tool","call_id":"call","content":"text"});
+        let message: Message = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            &message,
+            Message::Tool {
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &message,
+            Message::Tool {
+                is_structured: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(message).unwrap(), legacy);
+        let explicit = Message::Tool {
+            call_id: "call".into(),
+            content: "text".into(),
+            is_error: false,
+            is_structured: Some(false),
+        };
+        let encoded = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(encoded["is_structured"], false);
+        assert_eq!(
+            serde_json::from_value::<Message>(encoded).unwrap(),
+            explicit
+        );
+    }
 
     #[test]
     fn lifecycle_wire_naming_is_negotiated_without_duplicate_fields() {
@@ -2203,6 +2377,7 @@ mod tests {
                 outcome: Outcome::Succeeded("original".into()),
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
+                text_result_v2: true,
             },
         )
         .await
@@ -2251,6 +2426,7 @@ mod tests {
                 },
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
+                text_result_v2: true,
             },
         )
         .await
@@ -2261,6 +2437,315 @@ mod tests {
                 output: "changed".into(),
                 details: serde_json::json!({"retained": true})
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_result_patch_is_dispatched() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "patch"
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatch>> {
+                Ok(Some(pi_rs_core::ToolResultPatch {
+                    output: Some("changed".into()),
+                    details: None,
+                }))
+            }
+        }
+        let result = dispatch(
+            Arc::new(Hook),
+            ProtocolRequest::ToolResult {
+                call: pi_rs_core::ToolCall {
+                    id: "call".into(),
+                    name: "fixture".into(),
+                    arguments: "{}".into(),
+                },
+                outcome: Outcome::Failed("original".into()),
+                operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                state: None,
+                text_result_v2: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Option<Outcome>>(result).unwrap(),
+            Some(Outcome::TextResult {
+                output: "changed".into(),
+                details: None,
+                is_error: true
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_context_hooks_distinguish_unchanged_and_rewritten_provenance() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'tool_message_error':name!='legacy','tool_message_structured':name in ('prior','modern'),'tool_message_provenance_v2':name=='modern'}
+else:
+    value=r.get('messages') if r['type']=='context_with_system' else r['request']
+    messages=value if isinstance(value,list) else value['messages']
+    for m in messages:
+        if m['role']=='tool':
+            if name=='legacy': m.pop('is_error',None)
+            if name!='modern': m.pop('is_structured',None)
+            if m['call_id']=='to_text':
+                m['content']='replacement text'
+                if name=='modern': m['is_structured']=False
+            if m['call_id']=='to_structured':
+                m['content']='{"data":{"content":[{"type":"image","mimeType":"image/png","data":"YWJj"}]}}'
+                if name=='modern': m['is_structured']=True
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["legacy", "intermediate", "prior", "modern"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let extension = ExecutableExtension::load(path).unwrap();
+            let item = |id: &str, content: &str, is_structured| Message::Tool {
+                call_id: id.into(),
+                content: content.into(),
+                is_error: true,
+                is_structured: Some(is_structured),
+            };
+            let original = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![
+                    item("unchanged_structured", "structured", true),
+                    item("unchanged_plain", "plain", false),
+                    item("to_text", "old structured", true),
+                    item("to_structured", "old plain", false),
+                ],
+                tools: vec![],
+                max_output_tokens: 10,
+            };
+            let check = |messages: &[Message]| {
+                assert!(matches!(
+                    &messages[0],
+                    Message::Tool {
+                        is_error: true,
+                        is_structured: Some(true),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &messages[1],
+                    Message::Tool {
+                        is_error: true,
+                        is_structured: Some(false),
+                        ..
+                    }
+                ));
+                for (index, expected) in [(2, false), (3, true)] {
+                    let Message::Tool {
+                        content,
+                        is_error,
+                        is_structured,
+                        ..
+                    } = &messages[index]
+                    else {
+                        panic!("tool message missing")
+                    };
+                    assert!(*is_error);
+                    assert_eq!(
+                        *is_structured,
+                        if name == "modern" {
+                            Some(expected)
+                        } else {
+                            None
+                        }
+                    );
+                    assert_eq!(
+                        pi_rs_core::tool_content_is_structured(content, *is_structured),
+                        expected
+                    );
+                }
+            };
+            let mut request = original.clone();
+            extension.context(&mut request, None).unwrap();
+            check(&request.messages);
+            let mut request = original.clone();
+            extension
+                .before_request(&mut request, RequestPurpose::Turn, None)
+                .await
+                .unwrap();
+            check(&request.messages);
+            let mut messages = original.messages;
+            extension
+                .context_with_system(&mut messages, None)
+                .await
+                .unwrap();
+            check(&messages);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nested_host_results_negotiate_outcome_variants_across_processes() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                Outcome::TextResult {
+                    output: format!("{name} output"),
+                    details: Some(serde_json::json!({"id": name})),
+                    is_error: name == "failure",
+                }
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys, os
+name=os.path.basename(sys.argv[0])
+if '--pi-rs-extension-v1' in sys.argv:
+    r=json.load(sys.stdin)
+    assert r['type']=='describe'
+    d={'id':name, 'dependencies':[], 'commands':[], 'host_calls':True, 'text_result_v2':name=='modern', 'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}]}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    request=json.loads(sys.stdin.readline())
+    assert request['request']['type']=='invoke'
+    print(json.dumps({'type':'call','calls':[['success',{}],['failure',{}]]}),flush=True)
+    results=json.loads(sys.stdin.readline())
+    if name=='modern':
+        assert results[0]['status']=='text_result' and results[0]['detail']['is_error'] is False
+        assert results[1]['status']=='text_result' and results[1]['detail']['is_error'] is True
+        assert results[1]['detail']['details']=={'id':'failure'}
+    else:
+        assert results[0]=={'status':'succeeded_with_details','detail':{'output':'success output','details':{'id':'success'}}}
+        assert results[1]=={'status':'failed','detail':'failure output'}
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'nested calls complete'}}}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["legacy", "modern"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let extension = ExecutableExtension::load(path).unwrap();
+            assert_eq!(extension.endpoint.text_result_v2, name == "modern");
+            let tool = extension.tools().pop().unwrap();
+            let context = ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: CancellationToken::new(),
+            };
+            let result = tool
+                .invoke_with_host(serde_json::json!({}), context, None, Arc::new(Host))
+                .await;
+            assert_eq!(
+                result,
+                Outcome::Succeeded("nested calls complete".into()),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn older_host_receives_legacy_result_from_new_extension() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "hook"
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatchV2>> {
+                Ok(Some(pi_rs_core::ToolResultPatchV2 {
+                    output: Some("fixed".into()),
+                    details: Some(serde_json::json!({"code": 42})),
+                    is_error: Some(true),
+                }))
+            }
+        }
+        let raw = serde_json::json!({"type":"tool_result", "call":{"id":"id", "name":"tool", "arguments":"{}"}, "outcome":{"status":"failed","detail":"bad"}, "operation_id":"00000000-0000-4000-8000-000000000001", "state":null});
+        let request = serde_json::from_value(raw).unwrap();
+        let response = dispatch(Arc::new(Hook), request).await.unwrap();
+        assert_eq!(
+            serde_json::from_value::<Option<Outcome>>(response).unwrap(),
+            Some(Outcome::Failed("fixed".into()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_result_patch_chain_and_legacy_negotiation() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json, sys, os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':name!='legacy'}
+elif r['type']=='tool_result':
+    o=r['outcome']
+    if name=='first':
+        assert o['status']=='failed' and r['text_result_v2']
+        value={'status':'text_result','detail':{'output':'exact','details':{'code':42},'is_error':True}}
+    elif name=='second':
+        assert o['detail']=={'output':'legacy changed','details':{'code':42},'is_error':True}
+        value={'status':'text_result','detail':{'output':'legacy changed','details':{'code':42},'is_error':False}}
+    else:
+        assert o['status']=='failed' and o['detail']=='exact'
+        value={'status':'failed','detail':'legacy changed'}
+else:
+    raise RuntimeError(r['type'])
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let mut extensions = Vec::new();
+        for name in ["first", "legacy", "second"] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            extensions.push(ExecutableExtension::load(path).unwrap());
+        }
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let mut outcome = Outcome::Failed("original".into());
+        for ext in extensions {
+            outcome = ext
+                .tool_result_update(&call, &outcome, &context, None)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(outcome.tool_content(), "legacy changed");
+        assert!(!outcome.is_error());
+        assert!(
+            matches!(outcome, Outcome::TextResult { details: Some(details), .. } if details["code"] == 42)
         );
     }
 

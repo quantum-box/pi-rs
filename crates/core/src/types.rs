@@ -168,6 +168,16 @@ impl ImageContent {
     }
 }
 
+/// Resolve provenance for tool messages written before the structured flag existed.
+/// Unknown legacy messages retain the historical structured-envelope detection.
+pub fn tool_content_is_structured(content: &str, is_structured: Option<bool>) -> bool {
+    is_structured.unwrap_or_else(|| {
+        serde_json::from_str::<Value>(content)
+            .ok()
+            .is_some_and(|value| value["data"]["content"].is_array())
+    })
+}
+
 /// Separate supported images from native structured tool output for provider encoding.
 pub fn extract_tool_images(mut content: String) -> (String, Vec<ImageContent>) {
     let mut images = Vec::new();
@@ -256,6 +266,12 @@ pub enum Message {
     Tool {
         call_id: String,
         content: String,
+        /// Whether the tool result represents an error; absent in older messages.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
+        /// None denotes an older message whose provenance was not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_structured: Option<bool>,
     },
 }
 
@@ -658,6 +674,13 @@ pub enum Outcome {
         details: Value,
     },
     Failed(String),
+    /// A patched text result with independent model content, metadata and error status.
+    TextResult {
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        is_error: bool,
+    },
     Skipped(String),
     /// An effect may have occurred. Only an authoritative reconciliation can clear this state.
     Unknown(String),
@@ -688,10 +711,53 @@ pub struct AttachmentRef {
 }
 
 impl Outcome {
+    pub fn is_error(&self) -> bool {
+        match self {
+            Self::Failed(_) | Self::Skipped(_) | Self::Unknown(_) => true,
+            Self::TextResult { is_error, .. } => *is_error,
+            Self::Structured { data, .. } | Self::StructuredWithDetails { data, .. } => {
+                data["isError"] == true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this outcome contains structured tool data.
+    pub fn is_structured(&self) -> bool {
+        matches!(
+            self,
+            Self::Structured { .. } | Self::StructuredWithDetails { .. }
+        )
+    }
+
+    /// Lossy projection for older native executable protocols.
+    pub fn legacy_text_result(&self) -> Self {
+        match self {
+            Self::TextResult {
+                output,
+                details,
+                is_error: false,
+            } => match details {
+                Some(details) => Self::SucceededWithDetails {
+                    output: output.clone(),
+                    details: details.clone(),
+                },
+                None => Self::Succeeded(output.clone()),
+            },
+            Self::TextResult {
+                output,
+                is_error: true,
+                ..
+            } => Self::Failed(output.clone()),
+            _ => self.clone(),
+        }
+    }
+
     pub fn tool_content(&self) -> String {
         match self {
             Self::Succeeded(output) | Self::SucceededWithDetails { output, .. } => output.clone(),
             Self::Failed(reason) => format!("Tool failed: {reason}"),
+            Self::TextResult { output, .. } => output.clone(),
             Self::Skipped(reason) => format!("Tool did not start: {reason}"),
             Self::Unknown(reason) => format!("Tool outcome unknown: {reason}"),
             Self::Pending { .. } => "Tool operation is still pending".into(),
