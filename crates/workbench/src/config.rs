@@ -12,6 +12,9 @@ pub fn agent_dir() -> PathBuf {
 pub struct Settings {
     value: Value,
     resource_layers: Vec<(PathBuf, Value)>,
+    // Live controls override merged settings only for this running session.
+    live_auto_retry: Option<bool>,
+    live_auto_compaction: Option<bool>,
 }
 impl Settings {
     pub fn set_user_values(&mut self, values: &[(String, Value)]) -> Result<()> {
@@ -70,6 +73,7 @@ impl Settings {
         Ok(Self {
             value,
             resource_layers,
+            ..Self::default()
         })
     }
     pub fn string(&self, key: &str) -> Option<&str> {
@@ -148,7 +152,9 @@ impl Settings {
                 .unwrap_or(default)
         };
         pi_rs::RetrySettings {
-            enabled: value["enabled"].as_bool().unwrap_or(defaults.enabled),
+            enabled: self
+                .live_auto_retry
+                .unwrap_or_else(|| value["enabled"].as_bool().unwrap_or(defaults.enabled)),
             max_retries: number("maxRetries", u64::from(defaults.max_retries))
                 .min(u64::from(u32::MAX)) as u32,
             base_delay_ms: number("baseDelayMs", defaults.base_delay_ms),
@@ -156,12 +162,16 @@ impl Settings {
         }
     }
     pub fn set_auto_retry_enabled(&mut self, enabled: bool) -> Result<()> {
-        self.set_user_member("retry", "enabled", Value::Bool(enabled))
+        self.set_user_member("retry", "enabled", Value::Bool(enabled))?;
+        self.live_auto_retry = Some(enabled);
+        Ok(())
     }
     pub fn auto_compaction_enabled(&self) -> bool {
-        self.value["compaction"]["enabled"]
-            .as_bool()
-            .unwrap_or(true)
+        self.live_auto_compaction.unwrap_or_else(|| {
+            self.value["compaction"]["enabled"]
+                .as_bool()
+                .unwrap_or(true)
+        })
     }
     pub fn compaction_tokens(&self, provider: &str, model: &str) -> pi_rs::CompactionTokens {
         let compaction = &self.value["compaction"];
@@ -184,7 +194,9 @@ impl Settings {
         }
     }
     pub fn set_auto_compaction_enabled(&mut self, enabled: bool) -> Result<()> {
-        self.set_user_member("compaction", "enabled", Value::Bool(enabled))
+        self.set_user_member("compaction", "enabled", Value::Bool(enabled))?;
+        self.live_auto_compaction = Some(enabled);
+        Ok(())
     }
     pub fn autocomplete_max_visible(&self) -> usize {
         self.value["autocompleteMaxVisible"]
@@ -536,6 +548,7 @@ mod tests {
                 (dir.path().to_owned(), user),
                 (dir.path().join("project"), project),
             ],
+            ..Settings::default()
         };
 
         settings
@@ -594,6 +607,7 @@ mod tests {
         args.settings = Settings {
             value: settings.clone(),
             resource_layers: vec![],
+            ..Settings::default()
         };
         let selection = super::super::tool_selection::Selection::new(&args).unwrap();
         assert!(selection.includes("read"));
@@ -656,6 +670,7 @@ mod tests {
                     json!({"prompts":["templates", "!**/skip.md"], "extensions":["+builtin:mcp"]}),
                 ),
             ],
+            ..Settings::default()
         };
         let mut warnings = Vec::new();
         let paths = resource_paths::resolve(&args, Kind::Prompt, &[], &[], &mut warnings).unwrap();
@@ -725,6 +740,7 @@ mod tests {
         args.settings = Settings {
             value: json!({}),
             resource_layers: vec![(user.clone(), json!({})), (project.clone(), json!({}))],
+            ..Settings::default()
         };
         let mut warnings = Vec::new();
         let paths = resource_paths::resolve(&args, Kind::Prompt, &[], &[], &mut warnings).unwrap();
@@ -770,6 +786,7 @@ mod tests {
                 (dir.path().join("agent"), json!({})),
                 (project.clone(), json!({})),
             ],
+            ..Settings::default()
         };
         let resources = super::super::resources::Resources::load(&args).unwrap();
         assert_eq!(
@@ -838,6 +855,7 @@ mod tests {
                     json!({"prompts": ["custom", "-custom/visible.md"]}),
                 ),
             ],
+            ..Settings::default()
         };
         let mut warnings = Vec::new();
         let paths = resource_paths::resolve(&args, Kind::Prompt, &[], &[], &mut warnings).unwrap();
@@ -879,6 +897,7 @@ mod tests {
                 (dir.path().join("agent"), json!({})),
                 (project, json!({"prompts": ["custom", "-custom/audit.md"]})),
             ],
+            ..Settings::default()
         };
         let resources = super::super::resources::Resources::load(&args).unwrap();
         assert_eq!(
@@ -923,6 +942,7 @@ mod tests {
         args.settings = Settings {
             value: json!({}),
             resource_layers: vec![(dir.path().join("agent"), json!({})), (project, json!({}))],
+            ..Settings::default()
         };
         let resources = super::super::resources::Resources::load(&args).unwrap();
         assert!(resources.prompts.contains_key("audit"));
@@ -954,6 +974,7 @@ mod tests {
         args.settings = Settings {
             value: json!({}),
             resource_layers: vec![(dir.path().join("agent"), json!({})), (project, json!({}))],
+            ..Settings::default()
         };
         args.prompt_template = vec![extra.join("review.md"), extra.join("audit.md")];
         let resources = super::super::resources::Resources::load(&args).unwrap();

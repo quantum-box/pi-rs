@@ -1587,6 +1587,141 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
 }
 
 #[test]
+fn rpc_live_toggles_override_project_settings_for_the_session() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        r#"{"compaction":{"enabled":false},"retry":{"enabled":false}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".pi/settings.json"),
+        r#"{"compaction":{"enabled":true},"retry":{"enabled":true}}"#,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture",
+            "--no-session",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut request = |id: &str, kind: &str, enabled: Option<bool>| -> Value {
+        let mut command = json!({"id":id, "type":kind});
+        if let Some(enabled) = enabled {
+            command["enabled"] = json!(enabled);
+        }
+        writeln!(input, "{command}").unwrap();
+        input.flush().unwrap();
+        loop {
+            let reply = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+            if reply["id"] == id && reply["type"] == "response" {
+                assert_eq!(reply["success"], true, "{reply}");
+                break reply;
+            }
+        }
+    };
+    assert_eq!(
+        request("initial", "get_state", None)["data"]["autoCompactionEnabled"],
+        true
+    );
+    for enabled in [false, true, false] {
+        request("compact", "set_auto_compaction", Some(enabled));
+        assert_eq!(
+            request("state", "get_state", None)["data"]["autoCompactionEnabled"],
+            enabled
+        );
+        request("retry", "set_auto_retry", Some(enabled));
+        assert_eq!(
+            request("after-retry", "get_state", None)["data"]["autoCompactionEnabled"],
+            enabled
+        );
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["compaction"]["enabled"], enabled);
+        assert_eq!(saved["retry"]["enabled"], enabled);
+    }
+    request("stop", "shutdown", None);
+    drop(request);
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // A new session resolves the still-unchanged trusted project settings.
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture",
+            "--no-session",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut fresh = output;
+    fresh
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n",
+        )
+        .unwrap();
+    let result = fresh.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let state = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["id"] == "state")
+        .unwrap();
+    assert_eq!(state["data"]["autoCompactionEnabled"], true);
+}
+
+#[test]
 fn rpc_correlates_commands_and_rejects_unknown_commands() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .args(["--mode", "rpc", "--no-session"])
