@@ -1850,14 +1850,58 @@ fn print_and_json_modes_accept_positional_prompts() {
                     .iter()
                     .any(|event| event["type"] == "agent_end" && event["success"] == true)
             );
-            assert!(
-                records
-                    .iter()
-                    .any(|record| record["type"] == "answer"
-                        && record["content"] == "fixture answer")
-            );
+            assert!(!records.iter().any(|record| record["type"] == "answer"));
         }
     }
+    server.join().unwrap();
+}
+
+#[test]
+fn json_print_mode_emits_only_agent_events_for_multiple_prompts() {
+    let root = tempfile::tempdir().unwrap();
+    let (endpoint, server) = model_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--mode",
+            "json",
+            "same input",
+            "second",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events[0]["type"], "session");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_settled")
+            .count(),
+        2
+    );
+    assert!(!events.iter().any(|event| event["type"] == "answer"));
     server.join().unwrap();
 }
 
