@@ -586,6 +586,73 @@ mod tests {
     }
 
     #[test]
+    fn replacement_tool_calls_follow_repair_without_losing_thinking() {
+        use crate::ContentBlock;
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let operation_id = uuid::Uuid::new_v4();
+        session
+            .append(Event::Assistant {
+                content: "original".into(),
+                request_id: None,
+                usage: None,
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "keep".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            })
+            .unwrap();
+        let assistant = session.head();
+        session
+            .append(Event::ToolFinished {
+                operation_id,
+                outcome: crate::Outcome::Succeeded("yes".into()),
+                states: Default::default(),
+            })
+            .unwrap();
+        let keep = ContentBlock::ToolCall {
+            id: "keep".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        };
+        let unmatched = ContentBlock::ToolCall {
+            id: "missing".into(),
+            name: "large".into(),
+            arguments: serde_json::json!({"data":"x".repeat(4000)}),
+        };
+        let thinking = ContentBlock::Thinking {
+            thinking: "abcd".into(),
+        };
+        session
+            .edit_context(
+                assistant,
+                Some(ContextContent::Blocks(vec![
+                    ContentBlock::Text { text: "ok".into() },
+                    thinking.clone(),
+                    keep,
+                    unmatched.clone(),
+                ])),
+            )
+            .unwrap();
+        let messages = session.current_messages();
+        assert!(
+            matches!(&messages[0], crate::Message::Assistant { calls, .. } if calls.len() == 1 && calls[0].id == "keep")
+        );
+        assert_eq!(session.context_usage_estimate().tokens, 4);
+        session
+            .edit_context(
+                assistant,
+                Some(ContextContent::Blocks(vec![thinking, unmatched])),
+            )
+            .unwrap();
+        assert!(session.current_messages().is_empty());
+        assert_eq!(session.context_usage_estimate().tokens, 1);
+    }
+
+    #[test]
     fn removing_a_native_system_tool_invalidates_old_usage() {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
         session

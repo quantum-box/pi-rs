@@ -2245,6 +2245,17 @@ fn conversation_entries_since_inner(
     retain_from: u64,
     repair: bool,
 ) -> Vec<(u64, Message)> {
+    let repair_operations = if !repair {
+        let assistants: BTreeSet<_> = path
+            .iter()
+            .filter_map(|record| {
+                matches!(record.event, Event::Assistant { .. }).then_some(record.id)
+            })
+            .collect();
+        path.iter().any(|record| matches!(&record.event, Event::ContextEdited { target, replacement: Some(_), .. } if assistants.contains(target))).then(|| operations.clone())
+    } else {
+        None
+    };
     let invocations: BTreeMap<_, _> = path
         .iter()
         .flat_map(|record| match &record.event {
@@ -2290,6 +2301,40 @@ fn conversation_entries_since_inner(
             _ => None,
         })
         .collect();
+    // Replacement blocks may introduce calls with no corresponding result.
+    // Compare those calls with the actual repaired model projection, while
+    // keeping an otherwise empty assistant for its thinking and usage.
+    let replacement_calls: BTreeMap<u64, BTreeSet<String>> = if !repair {
+        let mut allowed: BTreeMap<_, BTreeSet<String>> = path
+            .iter()
+            .filter_map(|record| {
+                (matches!(record.event, Event::Assistant { .. })
+                    && matches!(edits.get(&record.id), Some(Some(_))))
+                .then_some((record.id, BTreeSet::new()))
+            })
+            .collect();
+        if !allowed.is_empty() {
+            for (source, message) in conversation_entries_since_inner(
+                path,
+                repair_operations.expect("unrepaired projection"),
+                retain_from,
+                true,
+            ) {
+                if let (
+                    Some(calls),
+                    Message::Assistant {
+                        calls: repaired, ..
+                    },
+                ) = (allowed.get_mut(&source), message)
+                {
+                    calls.extend(repaired.into_iter().map(|call| call.id));
+                }
+            }
+        }
+        allowed
+    } else {
+        BTreeMap::new()
+    };
     // An explicit edit to an assistant can remove its tool calls. Keep
     // independently retained results, but exclude results orphaned by that edit.
     let removed_tool_sources: BTreeSet<_> = if repair {
@@ -2441,6 +2486,15 @@ fn conversation_entries_since_inner(
             {
                 let count = calls.len();
                 calls.retain(|call| !omitted.contains(&call.id));
+                if calls.len() != count {
+                    *replay = None;
+                }
+            }
+            if let (Some(allowed), Message::Assistant { calls, replay, .. }) =
+                (replacement_calls.get(&source), &mut message)
+            {
+                let count = calls.len();
+                calls.retain(|call| allowed.contains(&call.id));
                 if calls.len() != count {
                     *replay = None;
                 }
