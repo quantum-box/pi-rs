@@ -1741,6 +1741,14 @@ second fixture verifies 256 entries ending exactly at the byte boundary. This
 covers listing limits; complete locale collation, structured tool details and
 other local-tool output/error parity remain open.
 
+### Shell partial-line notice checkpoint
+
+For a byte-truncated final shell line, the displayed line size follows Pi's
+streaming accumulator: a trailing newline resets the current-line byte count
+to zero, while an unterminated line retains its UTF-8 byte count. The retained
+tail and truncation metadata are unchanged. A regression covers both cases
+with chunked multibyte output; other local-tool parity gaps remain open.
+
 ### Grep context and line-limit checkpoint
 
 Grep now emits a separate context block for each match, including repeated lines
