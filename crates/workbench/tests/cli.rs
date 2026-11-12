@@ -76,7 +76,7 @@ fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
             "baseUrl":base,
             "models":[{"id":"fixture-model","reasoning":true,
                 "thinkingLevelMap":{"high":"strong"},
-                "samplingParams":{"temperature":0.7,"top_p":0.9,"top_k":10},
+                "samplingParams":{"temperature":0.7,"top_p":0.9,"top_k":10,"parallel_tool_calls":false,"max_tool_calls":3},
                 "samplingParamsByThinkingLevel":{"high":{"temperature":0.5,"top_k":40}}}],
             "modelOverrides":{"fixture-model":{"samplingParamsByThinkingLevel":{"high":{"temperature":0.2}}}}
         }}}).to_string()).unwrap();
@@ -100,6 +100,8 @@ fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
             assert_eq!(body["temperature"], temperature);
             assert_eq!(body["top_p"], 0.9);
             assert_eq!(body["top_k"], top_k);
+            assert_eq!(body["parallel_tool_calls"], false);
+            assert_eq!(body["max_tool_calls"], 3);
             if level == "high" {
                 assert_eq!(body["reasoning"]["effort"], "strong");
             }
@@ -135,6 +137,68 @@ fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
         );
         server.join().unwrap();
     }
+}
+
+#[test]
+fn unrelated_provider_loads_legacy_responses_sampling_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{
+            "openai":{"models":[{"id":"legacy","samplingParams":{"stream":false}}]},
+            "ollama":{"models":[{"id":"local"}]}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-mcp",
+            "--offline",
+            "--provider",
+            "ollama",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/chat/completions",
+            "--list-models",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("local"));
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "openai",
+            "--model",
+            "legacy",
+            "--api-key",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/responses",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        error.contains("openai/legacy") && error.contains("stream"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -193,8 +193,6 @@ pub fn validate_sampling(sampling: &BTreeMap<String, Value>) -> Result<()> {
                 | "functions"
                 | "function_call"
                 | "tool_choice"
-                | "parallel_tool_calls"
-                | "max_tool_calls"
                 | "stream"
                 | "stream_options"
                 | "background"
@@ -463,8 +461,6 @@ mod tests {
             "functions",
             "function_call",
             "tool_choice",
-            "parallel_tool_calls",
-            "max_tool_calls",
             "stream",
             "stream_options",
             "background",
@@ -492,6 +488,8 @@ mod tests {
                     ("temperature".into(), json!(0.5)),
                     ("top_p".into(), json!(0.9)),
                     ("custom_sampling".into(), json!({"value": 1})),
+                    ("parallel_tool_calls".into(), json!(false)),
+                    ("max_tool_calls".into(), json!(3)),
                 ]))
                 .is_ok()
         );

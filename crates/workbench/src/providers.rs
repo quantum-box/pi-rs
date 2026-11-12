@@ -582,7 +582,17 @@ impl Client {
                                 .unwrap_or(Some(level))
                         })
                 };
-                Self::OpenAi(client.with_thinking(thinking).with_sampling(sampling)?)
+                let client = client
+                    .with_thinking(thinking)
+                    .with_sampling(sampling)
+                    .map_err(|error| {
+                        pi_rs::Error::Config(format!(
+                            "invalid sampling for {}/{}: {error}",
+                            args.provider.id(),
+                            args.model
+                        ))
+                    })?;
+                Self::OpenAi(client)
             }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));

@@ -499,23 +499,16 @@ impl ModelMetadata {
                 provider.id()
             )));
         }
-        if matches!(adapter, Adapter::ChatCompletions | Adapter::OpenAiResponses) {
-            let validate_sampling = match adapter {
-                Adapter::ChatCompletions => pi_rs::ollama::validate_sampling,
-                Adapter::OpenAiResponses => pi_rs::openai::validate_sampling,
-                _ => unreachable!(),
-            };
-            validate_sampling(&self.sampling_params)?;
+        if adapter == Adapter::ChatCompletions {
+            pi_rs::ollama::validate_sampling(&self.sampling_params)?;
             for (level, parameters) in &self.sampling_params_by_thinking_level {
                 if !super::thinking::LEVELS.contains(&level.as_str()) {
                     return Err(Error::Config(format!(
                         "unknown sampling thinking level {level:?}"
                     )));
                 }
-                validate_sampling(parameters)?;
+                pi_rs::ollama::validate_sampling(parameters)?;
             }
-        }
-        if adapter == Adapter::ChatCompletions {
             for (level, value) in &self.thinking_level_map {
                 if !super::thinking::LEVELS.contains(&level.as_str())
                     || value.as_ref().is_some_and(|value| value.trim().is_empty())
@@ -1746,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_sampling_rejects_managed_fields_in_definitions_and_overrides() {
+    fn responses_sampling_is_checked_only_for_the_selected_model_and_level() {
         for key in [
             "model",
             "input",
@@ -1756,13 +1749,13 @@ mod tests {
             "reasoning",
             "store",
         ] {
-            for level in [false, true] {
-                let sampling = if level {
-                    json!({"samplingParamsByThinkingLevel":{"high":{(key): false}}})
-                } else {
-                    json!({"samplingParams":{(key): false}})
-                };
+            for level_specific in [false, true] {
                 for is_override in [false, true] {
+                    let sampling = if level_specific {
+                        json!({"samplingParamsByThinkingLevel":{"high":{(key): false}}})
+                    } else {
+                        json!({"samplingParams":{(key): false}})
+                    };
                     let mut provider = json!({"models":[{"id":"fixture","reasoning":true}]});
                     if is_override {
                         provider["modelOverrides"] = json!({"fixture":sampling});
@@ -1772,20 +1765,58 @@ mod tests {
                             .unwrap()
                             .extend(sampling.as_object().unwrap().clone());
                     }
-                    let error = match Profiles::parse(&json!({"providers":{"openai":provider}})) {
-                        Ok(_) => panic!("accepted {key}, level={level}, override={is_override}"),
+                    let profiles = Profiles::parse(&json!({"providers":{
+                        "openai":provider,
+                        "ollama":{"models":[{"id":"local"}]}
+                    }}))
+                    .unwrap();
+                    let mut args = super::super::Cli::parse_from([
+                        "pi",
+                        "--provider",
+                        "openai",
+                        "--model",
+                        "fixture",
+                        "--thinking",
+                        "high",
+                    ]);
+                    args.model_profiles = profiles;
+                    args.provider = args.model_profiles.provider("openai").unwrap();
+                    args.thinking = Some("high".into());
+                    let client = super::super::providers::Client::OpenAi(
+                        pi_rs::openai::OpenAiResponses::new_api(
+                            "https://example.com/v1/responses",
+                            "token".into(),
+                        )
+                        .unwrap(),
+                    );
+                    let error = match client.clone().with_model_options(&args, false) {
+                        Ok(_) => {
+                            panic!("accepted {key}, level={level_specific}, override={is_override}")
+                        }
                         Err(error) => error,
                     };
-                    assert!(error.to_string().contains(key));
+                    let message = error.to_string();
+                    assert!(
+                        message.contains(key) && message.contains("openai/fixture"),
+                        "{message}"
+                    );
+                    if level_specific {
+                        args.thinking = Some("off".into());
+                        assert!(client.with_model_options(&args, false).is_ok());
+                    }
+                    args.provider = Provider::Ollama;
+                    args.model = "local".into();
+                    let local = super::super::providers::Client::Ollama(
+                        pi_rs::ollama::Ollama::new(
+                            "http://127.0.0.1:11434/v1/chat/completions",
+                            None,
+                        )
+                        .unwrap(),
+                    );
+                    assert!(local.with_model_options(&args, false).is_ok());
                 }
             }
         }
-        assert!(
-            Profiles::parse(&json!({"providers":{"openai":{"models":[{
-                "id":"fixture","samplingParamsByThinkingLevel":{"unknown":{"top_p":0.9}}
-            }]}}}))
-            .is_err()
-        );
     }
 
     #[test]
