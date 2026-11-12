@@ -797,6 +797,7 @@ mod tests {
                 project.clone(),
                 json!({"prompts": ["content.txt", "alias.md"]}),
             )],
+            ..Settings::default()
         };
         assert!(
             super::super::resources::Resources::load(&args)
