@@ -956,12 +956,11 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
         plain
             .iter()
             .flat_map(|pattern| {
-                let sources = if pattern.contains(['*', '?', '[', '{']) {
+                if pattern.contains(['*', '?', '[', '{']) {
                     expand_prompt_glob(root, pattern)
                 } else {
                     vec![root.join(pattern)]
-                };
-                sources
+                }
             })
             .collect()
     };
