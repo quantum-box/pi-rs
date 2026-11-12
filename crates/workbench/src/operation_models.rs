@@ -216,6 +216,12 @@ impl Catalogue {
                         Error::Config(format!("operation provider {name} requires baseUrl"))
                     })?;
                 let (base, endpoint) = endpoints(base, api.route())?;
+                let key_endpoint = provider["baseUrl"]
+                    .as_str()
+                    .or_else(|| official_base(&name))
+                    .map(|base| endpoints(base, api.route()))
+                    .transpose()?
+                    .map(|(_, endpoint)| endpoint);
                 let inherited: BTreeMap<String, String> = if provider["headers"].is_null() {
                     BTreeMap::new()
                 } else {
@@ -244,13 +250,16 @@ impl Catalogue {
                     .compat
                     .send_image_opt_in_header
                     .or(inherited.send_image_opt_in_header);
+                let api_key = (key_endpoint.as_ref() == Some(&endpoint))
+                    .then(|| provider["apiKey"].as_str().map(str::to_owned))
+                    .flatten();
                 result.push(Entry {
                     provider: name.clone(),
                     model: configured,
                     api,
                     base,
                     endpoint,
-                    api_key: provider["apiKey"].as_str().map(str::to_owned),
+                    api_key,
                 });
             }
         }
@@ -372,8 +381,14 @@ impl Entry {
         {
             return Some(key.clone());
         }
-        if let Some(key) = self.api_key.as_deref().filter(|key| !key.is_empty()) {
-            return Credential::configured(key);
+        if let Some(key) = self.api_key.as_deref() {
+            return Some(match Credential::configured(key) {
+                Some(Credential::Literal(value)) if super::model_auth::valid_key(&value) => {
+                    Credential::Literal(value)
+                }
+                Some(credential @ Credential::Command(_)) => credential,
+                _ => Credential::Invalid,
+            });
         }
         {
             let key = match (self.provider.as_str(), official) {
@@ -727,8 +742,8 @@ impl Operations {
 mod tests {
     use super::*;
 
-    #[test]
-    fn operation_credentials_prefer_stored_then_configured_then_environment() {
+    #[tokio::test]
+    async fn operation_credentials_prefer_stored_then_configured_then_environment() {
         for (provider, variable) in [
             ("typesafe", "TYPESAFE_API_KEY"),
             ("openrouter", "OPENROUTER_API_KEY"),
@@ -770,7 +785,76 @@ mod tests {
             assert!(no_config.credential_with_env(&empty, env).is_none());
             let mut invalid = entry.clone();
             invalid.api_key = Some("${PI_RS_MISSING_OPERATION_KEY_TEST_8E43B}".into());
-            assert!(invalid.credential_with_env(&empty, env).is_none());
+            assert!(
+                invalid
+                    .credential_with_env(&empty, env)
+                    .unwrap()
+                    .resolve()
+                    .await
+                    .is_err()
+            );
+            invalid.api_key = Some(String::new());
+            assert!(
+                invalid
+                    .credential_with_env(&empty, env)
+                    .unwrap()
+                    .resolve()
+                    .await
+                    .is_err()
+            );
+            for key in ["", "${PI_RS_MISSING_OPERATION_KEY_TEST_8E43B}"] {
+                let saved = Keys::parse(&json!({provider: {"type":"api_key", "key":key}}));
+                assert!(
+                    entry
+                        .credential_with_env(&saved, env)
+                        .unwrap()
+                        .resolve()
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_key_is_bound_to_provider_endpoint_not_model_override() {
+        for (base, override_base) in [
+            ("https://api.typesafe.ai/v1", "https://proxy.example/v1"),
+            ("https://proxy.example/v1", "https://api.typesafe.ai/v1"),
+        ] {
+            let config = json!({"typesafe": {
+                "baseUrl": base, "apiKey": "provider-key",
+                "models": [
+                    {"type":"classifier", "id":"same", "api":"typesafe-system-one"},
+                    {"type":"classifier", "id":"override", "api":"typesafe-system-one", "baseUrl":override_base}
+                ]
+            }});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let find = |id| {
+                catalogue
+                    .0
+                    .iter()
+                    .find(|entry| entry.provider == "typesafe" && entry.model.id == id)
+                    .unwrap()
+            };
+            assert_eq!(find("same").api_key.as_deref(), Some("provider-key"));
+            assert!(find("override").api_key.is_none());
+            let keys = Keys::parse(&json!({}));
+            let env = |name: &str| (name == "TYPESAFE_API_KEY").then(|| "ambient-key".to_owned());
+            assert_eq!(
+                find("same")
+                    .credential_with_env(&keys, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("provider-key")
+            );
+            assert_eq!(
+                find("override")
+                    .credential_with_env(&keys, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                (override_base == "https://api.typesafe.ai/v1").then_some("ambient-key")
+            );
         }
     }
 

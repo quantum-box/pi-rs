@@ -14,6 +14,7 @@ pub(super) enum Credential {
     Bearer(String),
     Command(String),
     StoredCommand(String),
+    Invalid,
     ChatGpt,
 }
 
@@ -36,7 +37,7 @@ impl Credential {
     pub fn literal(&self) -> Option<&str> {
         match self {
             Self::Literal(value) | Self::Bearer(value) => Some(value),
-            Self::Command(_) | Self::StoredCommand(_) | Self::ChatGpt => None,
+            Self::Command(_) | Self::StoredCommand(_) | Self::Invalid | Self::ChatGpt => None,
         }
     }
 
@@ -49,12 +50,13 @@ impl Credential {
     }
 
     pub fn requires_resolution(&self) -> bool {
-        self.is_command() || matches!(self, Self::ChatGpt)
+        self.is_command() || matches!(self, Self::ChatGpt | Self::Invalid)
     }
 
     pub async fn resolve(&self) -> Result<String> {
         let value = match self {
             Self::Literal(value) | Self::Bearer(value) => return Ok(value.clone()),
+            Self::Invalid => return Err(Error::Config("Invalid model credential".into())),
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
@@ -127,18 +129,24 @@ impl Keys {
                     if entry["type"] != "api_key" {
                         return None;
                     }
-                    let value = entry["key"].as_str()?;
-                    if entry["literal"] == true {
-                        valid_key(value).then(|| Credential::Literal(value.into()))?
-                    } else {
-                        match Credential::configured(value)? {
-                            Credential::Command(command) => Credential::StoredCommand(command),
-                            Credential::Literal(value) if valid_key(&value) => {
+                    entry["key"].as_str().map_or(Credential::Invalid, |value| {
+                        if entry["literal"] == true {
+                            return if valid_key(value) {
+                                Credential::Literal(value.into())
+                            } else {
+                                Credential::Invalid
+                            };
+                        }
+                        match Credential::configured(value) {
+                            Some(Credential::Command(command)) => {
+                                Credential::StoredCommand(command)
+                            }
+                            Some(Credential::Literal(value)) if valid_key(&value) => {
                                 Credential::Literal(value)
                             }
-                            _ => return None,
+                            _ => Credential::Invalid,
                         }
-                    }
+                    })
                 };
                 let endpoint = match entry.get("endpoint") {
                     None => Provider::named(name)
