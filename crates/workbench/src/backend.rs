@@ -526,7 +526,10 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         continue_queue = false;
         let resume_queued = matches!(
             &request,
-            Request::Prompt { .. } | Request::Compact { .. } | Request::Review { .. }
+            Request::Prompt { .. }
+                | Request::Compact { .. }
+                | Request::Review { .. }
+                | Request::Extension { .. }
         );
         let compact_response = match &request {
             Request::Compact { rpc: true, id, .. } => Some(id.clone()),
