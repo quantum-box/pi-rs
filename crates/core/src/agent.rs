@@ -1245,26 +1245,40 @@ impl Agent<'_> {
             {
                 self.transform_tool_result(invocation, &mut outcome, states, cancel, observer)
                     .await;
-                let result = outcome.outcome.clone();
-                let is_error = matches!(
-                    &result,
-                    Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-                ) || matches!(&result, Outcome::Structured { data, .. } if data["isError"] == true);
                 let finished = self.finish_tool(session, invocation, outcome, states, observer);
-                self.observe_lifecycle(
-                    crate::LifecycleEvent::ToolExecutionEnd {
-                        tool_call_id: invocation.call.id.clone(),
-                        tool_name: invocation.call.name.clone(),
-                        result,
-                        is_error,
-                        duration_ms: duration,
-                        parent_tool_call_id: parent,
-                    },
-                    states,
-                    None,
-                    observer,
-                )
-                .await;
+                if let Some(result) =
+                    session
+                        .records()
+                        .iter()
+                        .rev()
+                        .find_map(|record| match &record.event {
+                            Event::ToolFinished {
+                                operation_id,
+                                outcome,
+                                ..
+                            } if *operation_id == invocation.operation_id => Some(outcome.clone()),
+                            _ => None,
+                        })
+                {
+                    let is_error = matches!(
+                        &result,
+                        Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
+                    ) || matches!(&result, Outcome::Structured { data, .. } if data["isError"] == true);
+                    self.observe_lifecycle(
+                        crate::LifecycleEvent::ToolExecutionEnd {
+                            tool_call_id: invocation.call.id.clone(),
+                            tool_name: invocation.call.name.clone(),
+                            result,
+                            is_error,
+                            duration_ms: duration,
+                            parent_tool_call_id: parent,
+                        },
+                        states,
+                        None,
+                        observer,
+                    )
+                    .await;
+                }
                 if let Err(error) = finished
                     && (first_error.is_none()
                         || (matches!(first_error, Some(Error::PendingOperation(_)))

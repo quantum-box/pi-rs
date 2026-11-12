@@ -417,6 +417,83 @@ async fn extension_observes_tool_start_and_transformed_end_including_denials() {
 }
 
 #[tokio::test]
+async fn tool_execution_end_observes_the_journaled_size_limited_outcome() {
+    struct Hook(Arc<Mutex<Vec<Value>>>);
+    #[async_trait::async_trait]
+    impl Extension for Hook {
+        fn id(&self) -> &str {
+            "bounded-observer"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &LifecycleEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            if matches!(event, LifecycleEvent::ToolExecutionEnd { .. }) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            }
+            Ok(())
+        }
+    }
+    struct LargeTool;
+    #[async_trait::async_trait]
+    impl Tool for LargeTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "large".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn output_limit(&self) -> usize {
+            8
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            Outcome::Succeeded("excessive output".into())
+        }
+    }
+    struct ToolExtension;
+    impl Extension for ToolExtension {
+        fn id(&self) -> &str {
+            "large-tool"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(LargeTool)]
+        }
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Hook(observed.clone()))).unwrap();
+    registry.register(Arc::new(ToolExtension)).unwrap();
+    let model = Script::new(vec![tool_reply(&[r#"{}"#]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0]["result"]["status"], "truncated");
+    assert_eq!(observed[0]["result"]["detail"]["original_bytes"], 16);
+}
+
+#[tokio::test]
 async fn context_with_system_runs_after_context_hooks_in_registration_order() {
     struct Hook(&'static str);
     #[async_trait::async_trait]
