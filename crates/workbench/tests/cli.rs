@@ -305,6 +305,28 @@ else:
 print(json.dumps({'version':1, 'response':{'Ok':result}}))
 "##).unwrap();
     std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let no_model = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--provider",
+            "anthropic",
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["extension", "bookmark", "bookmark", "offline"])
+        .output()
+        .unwrap();
+    assert!(
+        no_model.status.success(),
+        "{}",
+        String::from_utf8_lossy(&no_model.stderr)
+    );
     let session = root.path().join("session.jsonl");
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(root.path())

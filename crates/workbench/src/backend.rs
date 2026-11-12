@@ -697,6 +697,15 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                         &arguments,
                         &mut observer,
                     )? {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(Error::Cancelled),
+                            result = async {
+                                runtime.authorize_pending_mcp(&args, ui.as_ref(), &cancel).await?;
+                                runtime.refresh_mcp(&args).await
+                            } => result?,
+                        }
+                        let agent = runtime.agent(&args, session.session_id());
                         let answer = Box::pin(agent.run_correlated(
                             session,
                             Uuid::new_v4(),
