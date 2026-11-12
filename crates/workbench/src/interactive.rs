@@ -1923,6 +1923,112 @@ impl View {
         }
     }
 
+    fn debug_log(&self, args: &Cli, theme: &Theme, width: usize, height: usize) -> Result<String> {
+        let width = width.max(1);
+        let options = self.transcript_options(args, false);
+        let mut lines: Vec<Line> = self
+            .lines
+            .iter()
+            .flat_map(|entry| {
+                entry.render(
+                    theme,
+                    width,
+                    self.expand_tools,
+                    !self.hide_thinking,
+                    options,
+                )
+            })
+            .collect();
+        if !self.thinking.is_empty() {
+            lines.extend(Entry::Thinking(self.thinking.clone()).render(
+                theme,
+                width,
+                false,
+                !self.hide_thinking,
+                self.transcript_options(args, true),
+            ));
+        }
+        if !self.streaming.is_empty() {
+            lines.extend(Entry::Assistant(self.streaming.clone()).render(
+                theme,
+                width,
+                false,
+                true,
+                self.transcript_options(args, true),
+            ));
+        }
+        for entry in self.streaming_tool_entries() {
+            lines.extend(entry.render(
+                theme,
+                width,
+                self.expand_tools,
+                !self.hide_thinking,
+                options,
+            ));
+        }
+        lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
+        for row in wrap(&self.editor.text, width) {
+            lines.push(Line::themed(&row, theme, "text"));
+        }
+        lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor));
+        lines.push(Line::themed(
+            &args.workspace.display().to_string(),
+            theme,
+            "dim",
+        ));
+        lines.push(Line::themed(
+            &format!(
+                "{} · {}",
+                args.configured_model_name(&args.model),
+                args.thinking.as_deref().unwrap_or("default")
+            ),
+            theme,
+            "dim",
+        ));
+        let session = Session::snapshot(&args.session)?;
+        let (messages, _) = super::rpc_messages::snapshot(&session);
+        let mut output = format!(
+            "Debug output at {}\nTerminal: {}x{}\nTotal lines: {}\n\n=== All rendered lines with visible widths ===\n",
+            chrono::Utc::now().to_rfc3339(),
+            width,
+            height,
+            lines.len()
+        );
+        for (index, line) in lines.iter().enumerate() {
+            let mut rendered = Vec::new();
+            line.draw(&mut rendered, width)?;
+            let rendered = String::from_utf8_lossy(&rendered);
+            output.push_str(&format!(
+                "[{index}] (w={width}) {}\n",
+                serde_json::to_string(&*rendered)?
+            ));
+        }
+        output.push_str("\n=== Agent messages (JSONL) ===\n");
+        for message in messages {
+            output.push_str(&serde_json::to_string(&message)?);
+            output.push('\n');
+        }
+        Ok(output)
+    }
+
+    fn write_debug_log(&self, args: &Cli, theme: &Theme) -> Result<PathBuf> {
+        let (width, height) = terminal::size()?;
+        let content = self.debug_log(args, theme, usize::from(width), usize::from(height))?;
+        let directory = crate::config::agent_dir();
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("pi-debug.log");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        file.write_all(content.as_bytes())?;
+        Ok(path)
+    }
+
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
         self.graphics.reset();
         let output = self.transcript_options(args, false);
@@ -2214,7 +2320,7 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. Ctrl+Shift+F finds transcript text. Ctrl+Up/Down jumps between prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. Ctrl+Shift+F finds transcript text. Ctrl+Up/Down jumps between prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(
     input: &str,
@@ -4340,6 +4446,13 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             }
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
+                        } else if input.trim() == "/debug" {
+                            match view.write_debug_log(&args, &theme) {
+                                Ok(path) => {
+                                    view.append(&format!("Debug log written\n{}", path.display()))
+                                }
+                                Err(error) => view.append(&format!("Debug log: {error}")),
+                            }
                         } else if input.trim() == "/settings" {
                             view.picker = Some(Picker::new(
                                 "Settings",
@@ -5951,6 +6064,7 @@ fn complete_input(args: &Cli, view: &mut View) {
             "/review",
             "/theme",
             "/settings",
+            "/debug",
             "/reload",
         ]
         .into_iter()
@@ -6070,6 +6184,31 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_log_includes_rendered_transcript_and_session_messages() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = directory.path().join("session.jsonl");
+        let mut session = pi_rs::Session::open(&args.session).unwrap();
+        session
+            .append_user_with_images("question".into(), Vec::new(), None)
+            .unwrap();
+        drop(session);
+        let mut view = super::View::default();
+        view.lines.push(super::Entry::user("question".into()));
+        view.streaming = "answer in progress".into();
+        let output = view
+            .debug_log(&args, &super::Theme::system(), 80, 24)
+            .unwrap();
+        assert!(output.contains("Terminal: 80x24"));
+        assert!(output.contains("=== All rendered lines with visible widths ==="));
+        assert!(output.contains("answer in progress"));
+        assert!(output.contains("=== Agent messages (JSONL) ==="));
+        assert!(output.contains("\"role\":\"user\""));
+        assert!(output.contains("question"));
+    }
+
     #[test]
     fn custom_message_display_flag_controls_terminal_visibility() {
         let mut view = super::View::default();
