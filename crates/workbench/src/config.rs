@@ -494,6 +494,17 @@ pub fn read_object(path: &Path) -> Result<Value> {
     }
 }
 
+pub(super) async fn read_auth_object(path: &Path) -> Result<Value> {
+    match super::auth_lock::acquire_async(path).await {
+        Ok(guard) => {
+            let value = read_object_unlocked(path)?;
+            guard.check()?;
+            Ok(value)
+        }
+        Err(error) => read_readonly_auth(path, error),
+    }
+}
+
 fn same_auth_metadata(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     if a.len() != b.len() || a.modified().ok() != b.modified().ok() {
         return false;
@@ -512,24 +523,11 @@ fn same_auth_metadata(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     }
 }
 
-// Readers unable to create the shared lock can use a stable snapshot only when
-// the directory is read-only. Any observed lock or concurrent change fails closed.
+// If lock creation is denied, use checked snapshots. Any observed lock or
+// concurrent change fails closed; do not infer access from Unix mode bits.
 pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
     let denied = matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(libc::EROFS));
     if !denied {
-        return Err(error);
-    }
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let metadata = std::fs::metadata(parent)?;
-    #[cfg(unix)]
-    let readonly = {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o222 == 0
-            || matches!(&error, Error::Io(e) if e.raw_os_error() == Some(libc::EROFS))
-    };
-    #[cfg(not(unix))]
-    let readonly = metadata.permissions().readonly();
-    if !readonly {
         return Err(error);
     }
     let mut lock = path.as_os_str().to_os_string();
@@ -678,6 +676,34 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn auth_read_waits_asynchronously_until_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"provider":{"type":"api_key","key":"fixture"}}"#).unwrap();
+        let guard = super::super::auth_lock::acquire(&path).unwrap();
+        let reader_path = path.clone();
+        let reader = tokio::spawn(async move { super::read_auth_object(&reader_path).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!reader.is_finished());
+        drop(guard);
+        assert_eq!(reader.await.unwrap().unwrap()["provider"]["key"], "fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_lock_allows_checked_snapshot_with_owner_writable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"provider":{"type":"api_key","key":"fixture"}}"#).unwrap();
+        let denied = pi_rs::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            super::read_readonly_auth(&path, denied).unwrap()["provider"]["key"],
+            "fixture"
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn readonly_auth_snapshot_rejects_active_pi_lock() {

@@ -189,8 +189,12 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
         .or_else(|| args.model_explicit.then_some(args.model.as_str()))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| Error::Config("auth requires --provider or --model".into()))?;
-    let configuration = super::model_profiles::Profiles::load()
-        .and_then(|profiles| Ok((profiles, super::model_auth::Keys::load()?)));
+    let configuration = match super::model_profiles::Profiles::load() {
+        Ok(profiles) => super::model_auth::Keys::load_async()
+            .await
+            .map(|keys| (profiles, keys)),
+        Err(error) => Err(error),
+    };
     match configuration {
         Ok((profiles, keys)) => {
             args.model_profiles = profiles;

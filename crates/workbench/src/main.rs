@@ -1352,7 +1352,10 @@ async fn run_cli() -> i32 {
         args.trust_pending = decision.is_none();
         args.settings = config::Settings::load(&args.workspace, args.trusted)?;
         args.model_profiles = model_profiles::Profiles::load()?;
-        args.model_keys = model_auth::Keys::load()?;
+        args.model_keys = tokio::select! {
+            result = model_auth::Keys::load_async() => result?,
+            _ = &mut signal_rx => return Err(Error::Cancelled),
+        };
         let configured_model = args.settings.string("defaultModel");
         let provider_prefix = |model: &str| {
             model
@@ -1417,13 +1420,19 @@ async fn run_cli() -> i32 {
         if matches.value_source("session") != Some(clap::parser::ValueSource::CommandLine) {
             args.session = interactive::session_path(&args.workspace, args.session_dir.as_deref());
         }
-        if matches!(&args.command, Some(Command::Login { .. })) {
+        // Session and terminal modes have their own signal/terminal handling.
+        // Route the early listener to all other commands, including model listing.
+        let managed = args.list_models.is_none() && matches!(&args.command,
+            None | Some(Command::Interactive | Command::Serve | Command::Run { .. } | Command::Resume | Command::Compact { .. } | Command::Review { .. })
+        );
+        if managed {
+            if signal_rx.try_recv().is_ok() { return Err(Error::Cancelled); }
+            Box::pin(execute(args, &mut output_truncated)).await
+        } else {
             tokio::select! {
                 result = Box::pin(execute(args, &mut output_truncated)) => result,
                 _ = &mut signal_rx => Err(Error::Cancelled),
             }
-        } else {
-            Box::pin(execute(args, &mut output_truncated)).await
         }
     }
     .await;

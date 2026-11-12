@@ -114,6 +114,11 @@ fn try_lock(path: &Path) -> Result<Option<Guard>> {
     }
 }
 pub(super) fn acquire(path: &Path) -> Result<Guard> {
+    // Synchronous UI and credential paths must never sleep on a Tokio worker.
+    // Async callers that need to wait use acquire_async instead.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return try_lock(path)?.ok_or_else(busy);
+    }
     let deadline = std::time::Instant::now() + WAIT;
     loop {
         if let Some(guard) = try_lock(path)? {
@@ -154,6 +159,23 @@ mod tests {
         assert!(first.check().is_err());
         drop(first);
         assert!(lock.exists());
+    }
+
+    #[tokio::test]
+    async fn synchronous_runtime_access_fails_fast_and_async_wait_can_be_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let held = acquire(&path).unwrap();
+        let started = std::time::Instant::now();
+        assert!(acquire(&path).is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), acquire_async(&path))
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert!(acquire_async(&path).await.is_ok());
     }
 
     // Optional local interoperability check against Pi's pinned npm dependency.

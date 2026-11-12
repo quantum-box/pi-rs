@@ -122,6 +122,11 @@ impl Keys {
         Self::load_path(&config::agent_dir().join("auth.json"))
     }
 
+    pub async fn load_async() -> Result<Self> {
+        let value = config::read_auth_object(&config::agent_dir().join("auth.json")).await?;
+        Ok(Self::parse(&value))
+    }
+
     pub(super) fn load_path(path: &std::path::Path) -> Result<Self> {
         let value = config::read_object(path)?;
         Ok(Self::parse(&value))

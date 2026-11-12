@@ -4629,19 +4629,216 @@ fn auth_check_reads_readonly_store_and_environment_keys() {
 
 #[cfg(unix)]
 #[test]
-fn cancelled_chatgpt_login_does_not_wait_for_held_refresh_lock() {
+fn cancelled_chatgpt_login_and_logout_do_not_wait_for_held_refresh_lock() {
+    for action in ["login", "logout"] {
+        let root = tempfile::tempdir().unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.path().join("chatgpt-refresh.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([action, "openai-chatgpt"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        lock.unlock().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            status.is_some(),
+            "{action} did not cancel while the lock was held"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_waiting_for_auth_json_lock() {
+    for arguments in [
+        vec!["--provider", "kimi-coding", "auth", "check"],
+        vec!["login", "openai-chatgpt"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let lock = root.path().join("auth.json.lock");
+        std::fs::create_dir(&lock).unwrap();
+        std::fs::write(root.path().join("auth.json"), "{}").unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args(arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(status.is_some(), "auth lock wait ignored SIGINT");
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(lock.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_running_package_install() {
+    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let marker = root.path().join("git-started");
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        "#!/bin/sh\nprintf ready > \"$PI_TEST_GIT_STARTED\"\nexec /bin/sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("PATH", path)
+        .env("PI_TEST_GIT_STARTED", &marker)
+        .args(["install", "git:https://example.invalid/pkg.git"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "package did not start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(status.is_some(), "package ignored SIGINT");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_check_reads_root_owned_0755_directory_when_unprivileged() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(home.join("auth.json"), json!({"kimi-coding":{"type":"oauth","access":"cached","refresh":"refresh","expires":9_000_000_000_000_u64}}).to_string()).unwrap();
+    let binary = root.path().join("pi-test");
+    std::fs::copy(env!("CARGO_BIN_EXE_pi"), &binary).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(&binary)
+        .uid(65534)
+        .gid(65534)
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--provider",
+            "kimi-coding",
+            "auth",
+            "check",
+            "--json",
+            "--no-refresh",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["status"],
+        "ready"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_package_install_waiting_for_package_lock() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let source = "git:https://example.invalid/pkg.git";
+    let directory = root
+        .path()
+        .join("packages")
+        .join(format!("{:x}", Sha256::digest(source.as_bytes())));
+    std::fs::create_dir_all(&directory).unwrap();
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(root.path().join("chatgpt-refresh.lock"))
+        .open(directory.join("install.lock"))
         .unwrap();
     lock.lock().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
         .env("PI_RS_HOME", root.path())
-        .args(["login", "openai-chatgpt"])
+        .args(["install", source])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -4659,10 +4856,7 @@ fn cancelled_chatgpt_login_does_not_wait_for_held_refresh_lock() {
         let _ = child.kill();
     }
     let output = child.wait_with_output().unwrap();
-    assert!(
-        status.is_some(),
-        "login did not cancel while the lock was held"
-    );
+    assert!(status.is_some(), "package lock wait ignored SIGINT");
     assert_eq!(
         output.status.code(),
         Some(130),
