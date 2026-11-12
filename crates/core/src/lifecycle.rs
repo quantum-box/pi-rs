@@ -192,6 +192,28 @@ pub enum LifecycleEvent {
         turn_index: u32,
         messages: Vec<LifecycleMessage>,
     },
+    ToolExecutionStart {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        args: serde_json::Value,
+        #[serde(rename = "parentToolCallId", skip_serializing_if = "Option::is_none")]
+        parent_tool_call_id: Option<String>,
+    },
+    ToolExecutionEnd {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        result: crate::Outcome,
+        #[serde(rename = "isError")]
+        is_error: bool,
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(rename = "parentToolCallId", skip_serializing_if = "Option::is_none")]
+        parent_tool_call_id: Option<String>,
+    },
     SessionTree {
         new_leaf_id: u64,
         old_leaf_id: u64,
@@ -221,6 +243,8 @@ impl LifecycleEvent {
             Self::AgentSettled { .. } => "agent_settled",
             Self::TurnStart { .. } => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
+            Self::ToolExecutionStart { .. } => "tool_execution_start",
+            Self::ToolExecutionEnd { .. } => "tool_execution_end",
             Self::SessionTree { .. } => "session_tree",
         }
     }
@@ -276,6 +300,10 @@ pub async fn notify(
                     extension.handles_session_lifecycle()
                 }
                 LifecycleEvent::SessionTree { .. } => extension.handles_tree_navigation(),
+                LifecycleEvent::ToolExecutionStart { .. }
+                | LifecycleEvent::ToolExecutionEnd { .. } => {
+                    extension.handles_tool_execution_lifecycle()
+                }
                 _ => true,
             }
     }) {

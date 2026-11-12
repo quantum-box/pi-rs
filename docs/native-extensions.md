@@ -308,3 +308,12 @@ Model-generated manual and automatic threshold compactions emit
 are delivered to extensions that opt into session lifecycle notifications.
 Direct SDK compaction with a supplied summary remains synchronous and does not
 emit these asynchronous lifecycle notifications.
+
+Extensions may also opt into `tool_execution_start` and `tool_execution_end`
+with both `handles_lifecycle` and `handles_tool_execution_lifecycle`. Events
+include the tool call ID, name and arguments or the final native outcome;
+end events indicate errors and include execution duration when the tool ran.
+Nested tool calls include their parent tool-call ID. Executable extensions
+advertise this capability with `tool_execution_lifecycle_hook`.
+Parallel calls currently emit end notifications in journal order after the
+batch settles; streaming updates and completion-order notifications remain open.
