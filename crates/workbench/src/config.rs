@@ -456,6 +456,18 @@ fn merge(base: &mut Value, overlay: Value) {
     if let (Value::Object(base), Value::Object(overlay)) = (base, overlay) {
         for (key, value) in overlay {
             if let Some(prior) = base.get_mut(&key) {
+                if key == "defaultTools"
+                    && let (Some(base_tools), Some(project_tools)) =
+                        (prior.as_array_mut(), value.as_array())
+                    && project_tools.iter().all(|entry| {
+                        entry
+                            .as_str()
+                            .is_some_and(|entry| entry.starts_with(['+', '-']))
+                    })
+                {
+                    base_tools.extend(project_tools.iter().cloned());
+                    continue;
+                }
                 if prior.is_object() && value.is_object() {
                     merge(prior, value);
                     continue;
@@ -482,6 +494,36 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_tools_project_modifiers_extend_user_selection() {
+        use super::*;
+        use serde_json::json;
+        let mut settings = json!({"defaultTools": ["read", "bash", "+codemode"]});
+        merge(
+            &mut settings,
+            json!({"defaultTools": ["-codemode", "+grep"]}),
+        );
+        assert_eq!(
+            settings["defaultTools"],
+            json!(["read", "bash", "+codemode", "-codemode", "+grep"])
+        );
+        use clap::Parser;
+        let mut args = super::super::Cli::try_parse_from(["pi"]).unwrap();
+        args.settings = Settings {
+            value: settings.clone(),
+            resource_layers: vec![],
+        };
+        let selection = super::super::tool_selection::Selection::new(&args).unwrap();
+        assert!(selection.includes("read"));
+        assert!(selection.includes("bash"));
+        assert!(selection.includes("grep"));
+        assert!(!selection.includes("codemode"));
+        assert!(!selection.includes("write"));
+        merge(&mut settings, json!({"defaultTools": ["write"]}));
+        assert_eq!(settings["defaultTools"], json!(["write"]));
+        merge(&mut settings, json!({"defaultTools": []}));
+        assert_eq!(settings["defaultTools"], json!(["write"]));
+    }
     #[test]
     fn http_idle_timeout_has_pi_defaults_and_supports_disabling() {
         let mut settings = super::Settings::default();
