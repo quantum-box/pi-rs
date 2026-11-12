@@ -142,6 +142,32 @@ fn build_error(e: impl std::fmt::Display) -> Error {
     Error::Config(format!("invalid Bedrock request: {e}"))
 }
 
+fn request_error(
+    e: aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
+    >,
+) -> Error {
+    if let Some(service) = e.as_service_error() {
+        let message = diagnostic(service.meta(), service.request_id());
+        if service.is_throttling_exception()
+            || service.is_model_timeout_exception()
+            || service.is_service_unavailable_exception()
+            || service.is_internal_server_exception()
+        {
+            Error::RetryableModel(message)
+        } else {
+            Error::Model(message)
+        }
+    } else {
+        match &e {
+                    aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => Error::RetryableModel("Bedrock transport timed out".into()),
+                    aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(failure) if failure.is_io() || failure.is_timeout() || matches!(failure.as_other(), Some(aws_smithy_types::retry::ErrorKind::TransientError | aws_smithy_types::retry::ErrorKind::ThrottlingError | aws_smithy_types::retry::ErrorKind::ServerError)) => Error::RetryableModel("Bedrock transport failed".into()),
+                    aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(_) | aws_sdk_bedrockruntime::error::SdkError::ConstructionFailure(_) => Error::Config("Bedrock could not resolve AWS credentials or configure the request; check AWS_PROFILE, credentials, and region".into()),
+                    _ => Error::Model("Bedrock request failed".into()),
+                }
+    }
+}
+
 #[async_trait::async_trait]
 impl Model for Bedrock {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
@@ -288,27 +314,7 @@ impl Model for Bedrock {
                     .map_err(build_error)?,
             );
         }
-        let mut response = command.send().await.map_err(|e| {
-            if let Some(service) = e.as_service_error() {
-                let message = diagnostic(service.meta(), service.request_id());
-                if service.is_throttling_exception()
-                    || service.is_model_timeout_exception()
-                    || service.is_service_unavailable_exception()
-                    || service.is_internal_server_exception()
-                {
-                    Error::RetryableModel(message)
-                } else {
-                    Error::Model(message)
-                }
-            } else {
-                match &e {
-                    aws_sdk_bedrockruntime::error::SdkError::TimeoutError(_) => Error::RetryableModel("Bedrock transport timed out".into()),
-                    aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(failure) if failure.is_io() || failure.is_timeout() => Error::RetryableModel("Bedrock transport failed".into()),
-                    aws_sdk_bedrockruntime::error::SdkError::DispatchFailure(_) | aws_sdk_bedrockruntime::error::SdkError::ConstructionFailure(_) => Error::Config("Bedrock could not resolve AWS credentials or configure the request; check AWS_PROFILE, credentials, and region".into()),
-                    _ => Error::Model("Bedrock request failed".into()),
-                }
-            }
-        })?;
+        let mut response = command.send().await.map_err(request_error)?;
         let request_id = response.request_id().map(str::to_owned);
         Ok(Box::pin(async_stream::try_stream! {
             let mut calls: BTreeMap<i32, ToolCall> = BTreeMap::new();
@@ -359,6 +365,33 @@ impl Model for Bedrock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dispatch_retry_classification_respects_smithy_transient_kind() {
+        use aws_sdk_bedrockruntime::error::{ConnectorError, SdkError};
+        use aws_smithy_types::retry::ErrorKind;
+        let error = |kind| {
+            SdkError::dispatch_failure(ConnectorError::other(
+                Box::new(std::io::Error::other("incomplete HTTP response")),
+                kind,
+            ))
+        };
+        for kind in [
+            ErrorKind::TransientError,
+            ErrorKind::ThrottlingError,
+            ErrorKind::ServerError,
+        ] {
+            assert!(matches!(
+                request_error(error(Some(kind))),
+                Error::RetryableModel(_)
+            ));
+        }
+        assert!(matches!(request_error(error(None)), Error::Config(_)));
+        assert!(matches!(
+            request_error(error(Some(ErrorKind::ClientError))),
+            Error::Config(_)
+        ));
+    }
+
     #[test]
     fn diagnostic_strips_control_characters_and_rejects_unsafe_ids() {
         let meta = aws_smithy_types::error::metadata::ErrorMetadata::builder()
