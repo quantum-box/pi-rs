@@ -889,32 +889,7 @@ impl Picker {
             return Input::Continue;
         }
         if keys.matches("tui.editor.deleteWordBackward", key) {
-            let end = self.query.trim_end_matches(char::is_whitespace).len();
-            let before = &self.query[..end];
-            let start =
-                before
-                    .split_word_bound_indices()
-                    .next_back()
-                    .map_or(0, |(index, segment)| {
-                        if segment.chars().any(char::is_alphanumeric) {
-                            segment
-                                .char_indices()
-                                .rev()
-                                .find(|(_, c)| "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`".contains(*c))
-                                .map_or(index, |(i, c)| index + i + c.len_utf8())
-                        } else {
-                            before
-                                .split_word_bound_indices()
-                                .rev()
-                                .take_while(|(_, part)| {
-                                    !part.chars().any(char::is_alphanumeric)
-                                        && !part.chars().all(char::is_whitespace)
-                                })
-                                .last()
-                                .map_or(index, |(i, _)| i)
-                        }
-                    });
-            self.query.truncate(start);
+            self.query.truncate(previous_word_start(&self.query));
             self.selected = 0;
             return Input::Continue;
         }
@@ -1274,6 +1249,43 @@ impl Picker {
     }
 }
 
+fn previous_word_start(text: &str) -> usize {
+    let segmenter = icu_segmenter::WordSegmenter::new_dictionary(Default::default());
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (end, word_type) in segmenter.segment_str(text).iter_with_word_type() {
+        if end > start {
+            segments.push((start, end, word_type.is_word_like()));
+        }
+        start = end;
+    }
+    while segments
+        .last()
+        .is_some_and(|&(start, end, _)| text[start..end].chars().all(char::is_whitespace))
+    {
+        segments.pop();
+    }
+    let Some(&(start, end, word_like)) = segments.last() else {
+        return 0;
+    };
+    if word_like {
+        text[start..end]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`".contains(*c))
+            .map_or(start, |(i, c)| start + i + c.len_utf8())
+    } else {
+        segments
+            .iter()
+            .rev()
+            .take_while(|&&(start, end, word_like)| {
+                !word_like && !text[start..end].chars().all(char::is_whitespace)
+            })
+            .last()
+            .map_or(start, |&(start, _, _)| start)
+    }
+}
+
 fn format_label_timestamp(timestamp: &str) -> String {
     use chrono::{Datelike, Local};
     let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
@@ -1451,6 +1463,24 @@ mod tests {
         picker.paste("e\u{301}");
         picker.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &keys);
         assert_eq!(picker.query, "alpha ");
+    }
+
+    #[test]
+    fn search_deletes_dictionary_segmented_words() {
+        let keys = Keys::default();
+        let delete = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        for (query, expected, next) in [
+            ("東京大学", "東京", ""),
+            ("中华人民共和国", "中华人民", "中华"),
+            ("ภาษาไทย", "ภาษา", ""),
+        ] {
+            let mut picker = Picker::new("Choose", vec![]);
+            picker.paste(query);
+            picker.input(delete, &keys);
+            assert_eq!(picker.query, expected, "first deletion from {query}");
+            picker.input(delete, &keys);
+            assert_eq!(picker.query, next, "second deletion from {query}");
+        }
     }
 
     #[test]

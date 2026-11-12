@@ -37,6 +37,7 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 icu_collator = "2.4"
 icu_locale_core = "2.4"
+icu_segmenter = { version = "2.4", default-features = false, features = ["compiled_data"] }
 ignore = "0.4"
 libc = "0.2"
 jsonschema = { version = "0.33", default-features = false }
