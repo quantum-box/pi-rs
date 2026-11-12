@@ -77,6 +77,10 @@ async fn converse_stream_sends_signed_request_and_collects_tool_and_usage() {
         );
         assert_eq!(body["messages"][0]["content"][0]["text"], "<empty>");
         let calls = &body["messages"][1]["content"];
+        assert_eq!(calls[2]["toolUse"]["input"], json!({}));
+        assert_eq!(calls[3]["toolUse"]["input"], json!({"path":r"C:\work"}));
+        assert_eq!(calls[4]["toolUse"]["input"], json!({}));
+        assert_eq!(calls[5]["toolUse"]["input"], json!({}));
         let id0 = calls[0]["toolUse"]["toolUseId"].as_str().unwrap();
         let id1 = calls[1]["toolUse"]["toolUseId"].as_str().unwrap();
         assert_ne!(id0, id1);
@@ -148,6 +152,26 @@ async fn converse_stream_sends_signed_request_and_collects_tool_and_usage() {
                         name: "lookup".into(),
                         arguments: "{}".into(),
                     },
+                    pi_rs_core::ToolCall {
+                        id: "empty".into(),
+                        name: "lookup".into(),
+                        arguments: "  ".into(),
+                    },
+                    pi_rs_core::ToolCall {
+                        id: "repair".into(),
+                        name: "lookup".into(),
+                        arguments: r#"{"path":"C:\work"}"#.into(),
+                    },
+                    pi_rs_core::ToolCall {
+                        id: "invalid".into(),
+                        name: "lookup".into(),
+                        arguments: "{broken".into(),
+                    },
+                    pi_rs_core::ToolCall {
+                        id: "array".into(),
+                        name: "lookup".into(),
+                        arguments: "[1]".into(),
+                    },
                 ],
                 replay: None,
             },
@@ -161,6 +185,30 @@ async fn converse_stream_sends_signed_request_and_collects_tool_and_usage() {
                 call_id: format!("{}?", "a".repeat(70)),
                 content: "done".into(),
                 is_error: false,
+                is_structured: Some(false),
+            },
+            Message::Tool {
+                call_id: "empty".into(),
+                content: "empty result".into(),
+                is_error: true,
+                is_structured: Some(false),
+            },
+            Message::Tool {
+                call_id: "repair".into(),
+                content: "repaired result".into(),
+                is_error: false,
+                is_structured: Some(false),
+            },
+            Message::Tool {
+                call_id: "invalid".into(),
+                content: "invalid result".into(),
+                is_error: true,
+                is_structured: Some(false),
+            },
+            Message::Tool {
+                call_id: "array".into(),
+                content: "array result".into(),
+                is_error: true,
                 is_structured: Some(false),
             },
         ],

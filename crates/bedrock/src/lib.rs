@@ -180,8 +180,8 @@ impl Model for Bedrock {
                             blocks.push(ContentBlock::Text(format!("Historical tool call: {}", serde_json::json!({"id":call.id,"name":call.name,"arguments":call.arguments}))));
                             continue;
                         }
-                        let input: Value =
-                            serde_json::from_str(&call.arguments).map_err(build_error)?;
+                        let input = pi_rs_core::parse_tool_arguments(&call.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({}));
                         blocks.push(ContentBlock::ToolUse(
                             types::ToolUseBlock::builder()
                                 .tool_use_id(ids.get(&call.id))
