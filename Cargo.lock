@@ -2134,6 +2134,7 @@ dependencies = [
  "pi-rs-core",
  "pi-rs-google",
  "pi-rs-ollama",
+ "pi-rs-openai",
  "pi-rs-review",
  "serde_json",
  "tempfile",
@@ -2251,6 +2252,25 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+]
+
+[[package]]
+name = "pi-rs-openai"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "eventsource-stream",
+ "futures-util",
+ "pi-rs-core",
+ "reqwest 0.12.28",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

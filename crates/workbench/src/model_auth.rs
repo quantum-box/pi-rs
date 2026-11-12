@@ -14,6 +14,7 @@ pub(super) enum Credential {
     Bearer(String),
     Command(String),
     StoredCommand(String),
+    ChatGpt,
 }
 
 type CommandResult = std::result::Result<String, &'static str>;
@@ -35,21 +36,29 @@ impl Credential {
     pub fn literal(&self) -> Option<&str> {
         match self {
             Self::Literal(value) | Self::Bearer(value) => Some(value),
-            Self::Command(_) | Self::StoredCommand(_) => None,
+            Self::Command(_) | Self::StoredCommand(_) | Self::ChatGpt => None,
         }
     }
 
     pub fn is_bearer(&self) -> bool {
-        matches!(self, Self::Bearer(_))
+        matches!(self, Self::Bearer(_) | Self::ChatGpt)
     }
 
     pub fn is_command(&self) -> bool {
-        self.literal().is_none()
+        matches!(self, Self::Command(_) | Self::StoredCommand(_))
+    }
+
+    pub fn requires_resolution(&self) -> bool {
+        self.is_command() || matches!(self, Self::ChatGpt)
     }
 
     pub async fn resolve(&self) -> Result<String> {
         let value = match self {
             Self::Literal(value) | Self::Bearer(value) => return Ok(value.clone()),
+            Self::ChatGpt => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::chatgpt_auth::access(&settings).await;
+            }
             Self::Command(command) => resolve_command(command).await,
             Self::StoredCommand(command) => {
                 let cell = STORED_COMMANDS
@@ -101,8 +110,17 @@ impl Keys {
             .into_iter()
             .flatten()
             .filter_map(|(name, entry)| {
-                let oauth = name.eq_ignore_ascii_case("openrouter") && entry["type"] == "oauth";
-                let key = if oauth {
+                let chatgpt =
+                    name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
+                let oauth = (name.eq_ignore_ascii_case("openrouter") || chatgpt)
+                    && entry["type"] == "oauth";
+                let key = if chatgpt {
+                    serde_json::from_value::<pi_rs::openai::oauth::Credential>(
+                        entry["credential"].clone(),
+                    )
+                    .ok()?;
+                    Credential::ChatGpt
+                } else if oauth {
                     let access = entry["access"].as_str()?;
                     valid_key(access).then(|| Credential::Literal(access.into()))?
                 } else {
@@ -131,6 +149,7 @@ impl Keys {
                     Some(value) => value.as_str()?,
                 };
                 if oauth
+                    && !chatgpt
                     && super::builtin_chat::find("openrouter")
                         .is_none_or(|builtin| builtin.endpoint() != endpoint)
                 {
@@ -253,6 +272,30 @@ pub(super) fn valid_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chatgpt_oauth_credentials_are_bound_to_the_official_endpoint() {
+        let credential = pi_rs::openai::oauth::Credential {
+            client_id: "client".into(),
+            subject: "subject".into(),
+            email: None,
+            id_token: "id".into(),
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: 100,
+            scopes: vec!["chatgpt.tokens.use.direct".into()],
+        };
+        let keys = Keys::parse(&json!({"openai-chatgpt":{"type":"oauth","credential":credential}}));
+        let provider = Provider::named("openai-chatgpt").unwrap();
+        assert!(matches!(
+            keys.credential(&provider, pi_rs::openai::DEFAULT_ENDPOINT),
+            Some(Credential::ChatGpt)
+        ));
+        assert!(
+            keys.credential(&provider, "http://127.0.0.1:1234/v1/responses")
+                .is_none()
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

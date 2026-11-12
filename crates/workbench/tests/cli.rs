@@ -12,9 +12,16 @@ use serde_json::{Value, json};
 // Some hosted runners open idle connections to local listeners. Read each
 // connection independently so one idle peer cannot block the real request.
 fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStream>, String) {
+    // Windows duplicates may not retain the original listener’s nonblocking mode.
+    // Without this, accept can block after a reader has received the request.
+    listener.set_nonblocking(true).unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        assert!(
+            Instant::now() < deadline,
+            "proxy request not received before deadline"
+        );
         if let Ok(request) = receiver.try_recv() {
             return request;
         }
@@ -22,6 +29,8 @@ fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStrea
             Ok((socket, _)) => {
                 let sender = sender.clone();
                 std::thread::spawn(move || {
+                    // Accepted sockets can inherit O_NONBLOCK on macOS.
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
@@ -40,6 +49,103 @@ fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStrea
             Err(error) => panic!("proxy request not received: {error}"),
         }
     }
+}
+
+#[test]
+fn chatgpt_plan_provider_streams_through_the_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(first.starts_with("POST /v1/responses "), "{first}");
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut body = vec![0; length.unwrap()];
+        reader.read_exact(&mut body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], "fixture-model");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        let events = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fixture answer\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",events.len()).unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "openai-chatgpt",
+            "--model",
+            "fixture-model",
+            "--api-key",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+    server.join().unwrap();
+}
+
+#[test]
+fn chatgpt_account_switch_preserves_separate_saved_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let credential = |id: &str| json!({"client_id":id,"subject":format!("user-{id}"),"email":null,"id_token":"id","access_token":format!("access-{id}"),"refresh_token":format!("refresh-{id}"),"expires_at":4_000_000_000u64,"scopes":["chatgpt.tokens.use.direct"]});
+    std::fs::write(root.path().join("chatgpt-registrations.json"),json!({"active":"one","accounts":[{"client_id":"one","subject":"user-one","email":null},{"client_id":"two","subject":"user-two","email":null}]}).to_string()).unwrap();
+    std::fs::write(
+        root.path().join("chatgpt-sessions.json"),
+        json!({"one":credential("one"),"two":credential("two")}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("auth.json"),
+        json!({"openai-chatgpt":{"type":"oauth","credential":credential("one")}}).to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["login", "openai-chatgpt", "--account", "two"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("access-two"));
+    let auth: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["openai-chatgpt"]["credential"]["client_id"], "two");
+    let store: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("chatgpt-sessions.json")).unwrap())
+            .unwrap();
+    assert_eq!(store["one"]["client_id"], "one");
+    assert_eq!(store["two"]["client_id"], "two");
 }
 
 #[cfg(unix)]
@@ -1985,29 +2091,16 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
             json!({"httpProxy":setting,"retry":{"enabled":false}}).to_string(),
         )
         .unwrap();
-        let server = std::thread::spawn(move || {
-            // Parallel CLI tests can delay process startup on hosted runners.
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (server_tx, server_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
             loop {
-                let (mut socket, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("proxy request not received: {error}"),
-                };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                let mut reader = BufReader::new(socket.try_clone().unwrap());
-                let mut first = String::new();
-                if reader.read_line(&mut first).is_err() || first.is_empty() {
-                    continue;
-                }
+                assert!(
+                    Instant::now() < deadline,
+                    "proxy did not receive a model request"
+                );
+                let (mut socket, mut reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
                 let mut headers = String::new();
                 loop {
                     let mut line = String::new();
@@ -2022,7 +2115,8 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     continue;
                 }
                 socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-                return (first, headers);
+                let _ = server_tx.send((first, headers));
+                return;
             }
         });
         let target = format!("http://127.0.0.1:1{path}");
@@ -2048,21 +2142,41 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                 "--endpoint",
                 &target,
                 "--model-timeout-secs",
-                "4",
+                "20",
                 "--print",
                 "hello",
             ]);
         if from_env {
             command.env("http_proxy", &proxy);
         }
-        let output = command.output().unwrap();
-        let (request, headers) = server.join().unwrap_or_else(|_| {
+        let stderr = tempfile::NamedTempFile::new().unwrap();
+        let mut child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr.reopen().unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
             panic!(
-                "{provider}: proxy server failed; status: {}; stderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            )
-        });
+                "{provider}: CLI timed out; stderr: {}",
+                String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
+            );
+        }
+        let status = child.wait().unwrap();
+        let stderr = std::fs::read(stderr.path()).unwrap();
+        let (request, headers) = server_rx
+            .recv_timeout(Duration::from_secs(75))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{provider}: proxy server did not finish ({error}); status: {}; stderr: {}",
+                    status,
+                    String::from_utf8_lossy(&stderr)
+                )
+            });
         assert!(
             request.starts_with("POST http://127.0.0.1:1/"),
             "{provider}: {request}"
@@ -2071,7 +2185,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
             headers.contains("proxy-authorization: basic dxnlcjpwyxnz"),
             "{provider}: {headers}"
         );
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("user:pass"));
+        assert!(!String::from_utf8_lossy(&stderr).contains("user:pass"));
     }
 }
 
@@ -2087,28 +2201,11 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
     listener.set_nonblocking(true).unwrap();
     let target = listener.local_addr().unwrap();
     let endpoint = format!("http://{target}/v1/chat/completions");
-    let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let (server_tx, server_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         loop {
-            let (mut socket, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(error) => panic!("direct request not received: {error}"),
-            };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut first = String::new();
-            if reader.read_line(&mut first).is_err() || first.is_empty() {
-                continue;
-            }
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -2129,10 +2226,12 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
                     b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .unwrap();
-            return first;
+            let _ = server_tx.send(first);
+            return;
         }
     });
-    let _output = Command::new(env!("CARGO_BIN_EXE_pi"))
+    let stderr = tempfile::NamedTempFile::new().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", root.path())
         .env_remove("http_proxy")
         .env_remove("HTTP_PROXY")
@@ -2152,13 +2251,33 @@ fn no_proxy_bypasses_configured_proxy_for_matching_endpoint_and_port() {
             "--print",
             "hello",
         ])
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr.reopen().unwrap()))
+        .spawn()
         .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if child.try_wait().unwrap().is_none() {
+        let _ = child.kill();
+        panic!(
+            "CLI timed out; stderr: {}",
+            String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
+        );
+    }
+    let status = child.wait().unwrap();
+    let request = server_rx
+        .recv_timeout(Duration::from_secs(75))
+        .unwrap_or_else(|error| {
+            panic!(
+                "direct server did not finish ({error}); status: {status}; stderr: {}",
+                String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
+            )
+        });
     assert!(
-        server
-            .join()
-            .unwrap()
-            .starts_with("POST /v1/chat/completions ")
+        request.starts_with("POST /v1/chat/completions "),
+        "{request}"
     );
 }
 

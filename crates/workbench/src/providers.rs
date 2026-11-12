@@ -28,6 +28,7 @@ pub(super) enum Provider {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Adapter {
     ChatCompletions,
+    OpenAiResponses,
     Anthropic,
     Google,
     PiMessages,
@@ -37,6 +38,7 @@ impl Adapter {
     pub fn named(api: &str) -> Option<Self> {
         match api {
             "openai-completions" => Some(Self::ChatCompletions),
+            "openai-responses" => Some(Self::OpenAiResponses),
             "anthropic-messages" => Some(Self::Anthropic),
             "google-generative-ai" => Some(Self::Google),
             "pi-messages" => Some(Self::PiMessages),
@@ -47,6 +49,7 @@ impl Adapter {
     pub fn api(self) -> &'static str {
         match self {
             Self::ChatCompletions => "openai-completions",
+            Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic-messages",
             Self::Google => "google-generative-ai",
             Self::PiMessages => "pi-messages",
@@ -90,6 +93,12 @@ impl Provider {
     }
 
     pub fn named(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("openai-chatgpt") {
+            return Some(Self::Custom {
+                id: Arc::from("openai-chatgpt"),
+                adapter: Adapter::OpenAiResponses,
+            });
+        }
         Self::ALL
             .into_iter()
             .find(|provider| name.eq_ignore_ascii_case(provider.id()))
@@ -103,6 +112,9 @@ impl Provider {
             Self::Google => pi_rs::google::DEFAULT_ENDPOINT,
             Self::Radius => super::radius_auth::DEFAULT_MODEL_ENDPOINT,
             Self::Custom { id, .. } => {
+                if id.as_ref() == "openai-chatgpt" {
+                    return pi_rs::openai::DEFAULT_ENDPOINT;
+                }
                 super::builtin_chat::find(id).map_or("", |builtin| builtin.endpoint())
             }
         }
@@ -135,6 +147,10 @@ impl Provider {
             })
         };
         match adapter {
+            Adapter::OpenAiResponses => Ok(Client::OpenAi(pi_rs::openai::OpenAiResponses::new(
+                endpoint,
+                token.ok_or_else(missing_key)?,
+            )?)),
             Adapter::ChatCompletions => {
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
@@ -196,6 +212,7 @@ pub(super) enum Client {
     Anthropic(Anthropic),
     Google(Google),
     PiMessages(PiMessages),
+    OpenAi(pi_rs::openai::OpenAiResponses),
     Deferred(Box<Deferred>),
 }
 
@@ -215,6 +232,10 @@ pub(super) struct Deferred {
 impl Deferred {
     async fn resolve(&self) -> Result<Client> {
         let token = match &self.credential {
+            Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
+                super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
+                    .await?,
+            ),
             Some(credential) => Some(credential.resolve().await?),
             None => None,
         };
@@ -275,6 +296,7 @@ impl Client {
             Self::PiMessages(client) => {
                 Self::PiMessages(client.with_http_options(timeout, &proxies)?)
             }
+            Self::OpenAi(client) => Self::OpenAi(client.with_http_options(timeout, &proxies)?),
             Self::Deferred(mut client) => {
                 client.http_settings = Some(settings.clone());
                 Self::Deferred(client)
@@ -344,6 +366,7 @@ impl Client {
             Self::Anthropic(client) => Self::Anthropic(client.with_headers(headers)),
             Self::Google(client) => Self::Google(client.with_headers(headers)),
             Self::PiMessages(client) => Self::PiMessages(client.with_headers(headers)),
+            Self::OpenAi(client) => Self::OpenAi(client),
             Self::Deferred(_) => unreachable!("deferred provider headers resolve per request"),
         }
     }
@@ -364,6 +387,7 @@ impl Client {
                 .map(|model| model.id)
                 .collect()),
             Self::PiMessages(client) => client.models().await,
+            Self::OpenAi(client) => client.models().await,
             Self::Deferred(client) => Box::pin(client.resolve().await?.models()).await,
         }
     }
@@ -420,6 +444,7 @@ impl Client {
                     .collect()
             }
             Self::PiMessages(client) => client.model_details(models).await,
+            Self::OpenAi(_) => BTreeMap::new(),
             Self::Deferred(client) => match client.resolve().await {
                 Ok(client) => Box::pin(client.model_details(models)).await,
                 Err(_) => BTreeMap::new(),
@@ -433,6 +458,7 @@ impl Client {
             Self::Anthropic(client) => Self::Anthropic(client.with_context_probe(enabled)),
             Self::Google(client) => Self::Google(client.with_context_probe(enabled)),
             Self::PiMessages(client) => Self::PiMessages(client.with_context_probe(enabled)),
+            Self::OpenAi(client) => Self::OpenAi(client),
             Self::Deferred(mut client) => {
                 client.probe_context = enabled;
                 Self::Deferred(client)
@@ -514,6 +540,15 @@ impl Client {
             }
             Self::Google(client) => Self::Google(client.with_thinking(thinking)),
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
+            Self::OpenAi(client) => {
+                let levels = pi_rs::openai::thinking_levels(&args.model);
+                let thinking = if levels.len() == 1 {
+                    None
+                } else {
+                    thinking.filter(|level| levels.iter().any(|item| item == level))
+                };
+                Self::OpenAi(client.with_thinking(thinking))
+            }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));
                 Self::Deferred(client)
@@ -539,6 +574,7 @@ impl Client {
                     .remove(model)?
                     .thinking_levels
             }
+            Self::OpenAi(_) => Some(pi_rs::openai::thinking_levels(model)),
             Self::Deferred(client) => {
                 Box::pin(client.resolve().await.ok()?.thinking_levels(model)).await
             }
@@ -554,6 +590,7 @@ impl Client {
             Self::Anthropic(client) => Self::Anthropic(client.with_progress(progress)),
             Self::Google(client) => Self::Google(client.with_progress(progress)),
             Self::PiMessages(client) => Self::PiMessages(client.observe(progress)),
+            Self::OpenAi(client) => Self::OpenAi(client),
             Self::Deferred(mut client) => {
                 client.observed = true;
                 Self::Deferred(client)
@@ -570,6 +607,7 @@ impl Model for Client {
             Self::Anthropic(client) => client.context_window(model).await,
             Self::Google(client) => client.context_window(model).await,
             Self::PiMessages(client) => client.context_window(model).await,
+            Self::OpenAi(client) => client.context_window(model).await,
             Self::Deferred(client) => client.resolve().await.ok()?.context_window(model).await,
         }
     }
@@ -580,6 +618,7 @@ impl Model for Client {
             Self::Anthropic(client) => client.stream(request).await,
             Self::Google(client) => client.stream(request).await,
             Self::PiMessages(client) => client.stream(request).await,
+            Self::OpenAi(client) => client.stream(request).await,
             Self::Deferred(_) => {
                 self.stream_with_headers(request, &HeaderMap::new(), false)
                     .await
