@@ -1743,6 +1743,11 @@ edits. RPC session entries keep the original Pi representation without
 duplicating the converted journal records. Codemode store entries also continue
 to restore their branch-local state.
 
+Imported failed or aborted assistant messages retain their original transcript
+and failure status. Incomplete tool calls in those messages are not executed,
+and their partial output is excluded from subsequent model requests, matching
+Pi's treatment of unsuccessful responses.
+
 ### Reported session cost checkpoint
 
 Model metadata can retain an optional USD total, preserving old journals that

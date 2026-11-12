@@ -422,8 +422,15 @@ fn convert(
             match required(message, "role")? {
                 "user" => push_user(&mut events, &message["content"])?,
                 "assistant" => {
+                    let failure = match message["stopReason"].as_str() {
+                        Some("error") => Some(pi_rs::ModelFailure::Failed),
+                        Some("aborted") => Some(pi_rs::ModelFailure::Cancelled),
+                        _ => None,
+                    };
                     let mut invocations = Vec::new();
-                    if let Some(blocks) = message["content"].as_array() {
+                    if failure.is_none()
+                        && let Some(blocks) = message["content"].as_array()
+                    {
                         for block in blocks.iter().filter(|block| block["type"] == "toolCall") {
                             let id = required(block, "id")?.to_owned();
                             let operation_id = Uuid::new_v4();
@@ -501,7 +508,7 @@ fn convert(
                         usage: usage
                             .map(|usage| pi_rs::UsageReport::Measured { usage })
                             .unwrap_or(pi_rs::UsageReport::Unconfirmed),
-                        failure: None,
+                        failure,
                         partial: String::new(),
                         reply: None,
                     });
@@ -1047,6 +1054,26 @@ mod tests {
             6
         );
     }
+    #[test]
+    fn imports_failed_assistant_with_incomplete_tool_call_without_replaying_it() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"text","text":"partial"},{"type":"toolCall"}],"stopReason":"error","errorMessage":"connection lost"}}),
+        ]).unwrap();
+        assert!(session.operations().is_empty());
+        assert!(session.records().iter().any(|record| matches!(
+            record.event,
+            Event::ModelFinished {
+                failure: Some(pi_rs::ModelFailure::Failed),
+                ..
+            }
+        )));
+        let (messages, _) = super::super::rpc_messages::snapshot(&session);
+        assert_eq!(messages.last().unwrap()["errorMessage"], "connection lost");
+        assert_eq!(messages.last().unwrap()["stopReason"], "error");
+    }
+
     #[test]
     fn rejects_missing_parents_and_unsupported_content() {
         let header = json!({"type":"session","version":3});
