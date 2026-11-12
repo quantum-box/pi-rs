@@ -1537,6 +1537,7 @@ struct RpcCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
 impl Drop for RpcCancellation {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
+        process::RPC_INTERRUPTED.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1828,6 +1829,7 @@ async fn execute(
                 "RPC mode accepts images in prompt requests, not @file arguments".into(),
             ));
         }
+        process::RPC_INTERRUPTED.store(false, Ordering::SeqCst);
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _guard = RpcCancellation(cancelled.clone());
         return tokio::task::spawn_blocking(move || rpc::run(args, cancelled))

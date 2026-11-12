@@ -440,6 +440,79 @@ enum RemoteEvent {
     Finished(Result<Vec<String>>),
 }
 
+struct AuthReload {
+    revision: String,
+    receiver: std::sync::mpsc::Receiver<Result<super::model_auth::Keys>>,
+    _cancel: tokio::sync::oneshot::Sender<()>,
+}
+impl AuthReload {
+    fn start(revision: String) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled => Ok(None),
+                        result = super::model_auth::Keys::load_async() => result.map(Some),
+                    }
+                })
+            })();
+            match result {
+                Ok(Some(keys)) => {
+                    let _ = sender.send(Ok(keys));
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                }
+                Ok(None) => (),
+            }
+        });
+        Self {
+            revision,
+            receiver,
+            _cancel: cancel,
+        }
+    }
+}
+
+fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("pi-terminal-signal".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                super::install_ctrl_c(move || {
+                    super::process::TERMINAL_INTERRUPTED
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    notify.notify_one();
+                })
+                .await;
+                let _ = sender.send(Ok(()));
+                std::future::pending::<()>().await;
+            });
+        })?;
+    receiver
+        .recv()
+        .map_err(|_| Error::Config("terminal signal listener stopped".into()))??;
+    super::process::TERMINAL_SIGNAL_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 struct RemoteTask {
     status: &'static str,
     cancelled: &'static str,
@@ -3351,11 +3424,14 @@ pub(super) async fn run(
     let mut keys = Keys::load()?;
     let mut _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
     let mut input = crate::ui::input::Reader::new()?;
+    let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    install_terminal_signal(terminal_signal.clone())?;
     super::startup_ready(&mut ready);
     if view.graphics.enabled() {
         crate::ui::images::query_cell_size()?;
     }
     let mut worker: Option<Worker> = None;
+    let mut auth_reload: Option<AuthReload> = None;
     let mut startup_extensions: Option<Vec<PathBuf>> = None;
     let mut initial: VecDeque<_> = args
         .initial_prompt
@@ -3377,6 +3453,35 @@ pub(super) async fn run(
     let mut last_theme_check = Instant::now();
     let mut deferred_input = VecDeque::new();
     loop {
+        if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
+        if let Some(task) = &auth_reload {
+            match task.receiver.try_recv() {
+                Ok(Ok(keys)) => {
+                    if args.model_keys.revision() == task.revision {
+                        args.model_keys = keys;
+                        view.invalidate_model_catalog();
+                        view.append("Provider credentials reloaded");
+                    } else {
+                        view.append("Provider credentials changed during reload; keeping the newer selection");
+                    }
+                    auth_reload = None;
+                    dirty = true;
+                }
+                Ok(Err(error)) => {
+                    view.append(&format!("Auth reload: {error}"));
+                    auth_reload = None;
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    view.append("Auth reload stopped");
+                    auth_reload = None;
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => (),
+            }
+        }
         if let Some(receiver) = &view.pending_transition {
             let ready = match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -4607,6 +4712,10 @@ pub(super) async fn run(
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
+                    "app.interrupt" if auth_reload.is_some() && !is_busy(&worker) => {
+                        auth_reload = None;
+                        view.append("Provider credential reload cancelled");
+                    }
                     "app.interrupt" if worker.as_ref().is_some_and(|active| active.busy) => {
                         if let Err(error) =
                             Worker::control(&mut worker, &args, json!({"type":"clear_queue"}))
@@ -4842,12 +4951,14 @@ pub(super) async fn run(
                             view.widgets.clear();
                             args.settings =
                                 crate::config::Settings::load(&args.workspace, args.trusted)?;
-                            match super::model_auth::Keys::load_async().await {
-                                Ok(keys) => args.model_keys = keys,
-                                Err(error) => view.append(&format!("Auth reload: {error}")),
-                            }
+                            auth_reload =
+                                Some(AuthReload::start(args.model_keys.revision().to_owned()));
+                            view.append("Reloading provider credentials (Esc to cancel)");
                             args.reload_model_profiles()?;
-                            super::packages::prepare(&args).await?;
+                            tokio::select! {
+                                result = super::packages::prepare(&args) => result?,
+                                _ = terminal_signal.notified() => return Err(Error::Cancelled),
+                            }
                             view.resources = super::resources::Resources::load(&args)?;
                             args.theme_paths = view.resources.themes.clone();
                             match Keys::load() {

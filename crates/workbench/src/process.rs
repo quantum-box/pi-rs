@@ -13,6 +13,16 @@ pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
 
+pub(super) static TERMINAL_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(super) static RPC_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(super) static TERMINAL_SIGNAL_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+fn terminal_signal_enabled() -> bool {
+    TERMINAL_SIGNAL_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 static IN_FLIGHT_REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(super) struct RefreshBarrier {
@@ -64,6 +74,7 @@ pub(super) struct Worker {
     session: std::path::PathBuf,
     pub(super) busy: bool,
     persistent: bool,
+    prompt_shutdown: bool,
     shutdown: Option<(SessionShutdownReason, Option<std::path::PathBuf>)>,
     configuration: Value,
     pub(super) child: Child,
@@ -261,6 +272,7 @@ impl Worker {
             session: args.session.clone(),
             busy: !persistent,
             persistent,
+            prompt_shutdown: false,
             shutdown: None,
             configuration: configuration(args),
             child,
@@ -357,7 +369,20 @@ impl Worker {
         events
     }
 
+    pub(super) fn interrupt_shutdown(&mut self) {
+        self.prompt_shutdown = true;
+    }
+
     pub(super) fn check_session_transition(
+        slot: Option<&mut Option<Self>>,
+        args: &Cli,
+        event: pi_rs::BeforeSessionTransition,
+    ) -> Result<bool> {
+        Self::check_session_transition_cancellable(None, slot, args, event)
+    }
+
+    pub(super) fn check_session_transition_cancellable(
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
         slot: Option<&mut Option<Self>>,
         args: &Cli,
         event: pi_rs::BeforeSessionTransition,
@@ -372,12 +397,30 @@ impl Worker {
         active.send(json!({"type":"check_session_transition","id":id,"event":event}))?;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let event = active
-                .events
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|error| {
-                    Error::Config(format!("could not check the session transition: {error}"))
-                })?;
+            if TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                active.interrupt_shutdown();
+                return Err(Error::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Config("session transition check timed out".into()));
+            }
+            let wait = if cancelled.is_some() || terminal_signal_enabled() {
+                remaining.min(Duration::from_millis(50))
+            } else {
+                remaining
+            };
+            let event = match active.events.recv_timeout(wait) {
+                Ok(event) => event,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(error) => {
+                    return Err(Error::Config(format!(
+                        "could not check the session transition: {error}"
+                    )));
+                }
+            };
             if event["type"] == "session_transition_checked" {
                 if event["id"] != id {
                     continue;
@@ -428,6 +471,15 @@ impl Worker {
         args: &Cli,
         event: &pi_rs::LifecycleEvent,
     ) -> Result<()> {
+        Self::notify_selection_cancellable(None, slot, args, event)
+    }
+
+    pub(super) fn notify_selection_cancellable(
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        slot: &mut Option<Self>,
+        args: &Cli,
+        event: &pi_rs::LifecycleEvent,
+    ) -> Result<()> {
         let Some(active) = Self::extension_worker(slot, args)? else {
             return Ok(());
         };
@@ -440,12 +492,32 @@ impl Worker {
         )?;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let received = active
-                .events
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|error| {
-                    Error::Config(format!("could not notify model selection: {error}"))
-                })?;
+            if TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                active.interrupt_shutdown();
+                return Err(Error::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Config(
+                    "model selection notification timed out".into(),
+                ));
+            }
+            let wait = if terminal_signal_enabled() || cancelled.is_some() {
+                remaining.min(Duration::from_millis(50))
+            } else {
+                remaining
+            };
+            let received = match active.events.recv_timeout(wait) {
+                Ok(value) => value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(error) => {
+                    return Err(Error::Config(format!(
+                        "could not notify model selection: {error}"
+                    )));
+                }
+            };
             if received["type"] == "selection_notified" && received["id"] == id {
                 return Ok(());
             }
@@ -578,8 +650,19 @@ impl Drop for Worker {
             };
             let _ = self.send(message);
             self.stdin.take();
-            let deadline =
-                Instant::now() + Duration::from_secs(if self.persistent { 30 } else { 5 });
+            let deadline = Instant::now()
+                + Duration::from_secs(
+                    if self.prompt_shutdown
+                        || TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                        || RPC_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        2
+                    } else if self.persistent {
+                        30
+                    } else {
+                        5
+                    },
+                );
             terminate_after_grace(&mut self.child, self.refresh_barrier.as_file(), deadline);
         }
         let _ = self.child.wait();
@@ -590,7 +673,13 @@ impl Drop for Worker {
 }
 
 fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: Instant) {
+    let mut deadline = deadline;
     while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+        if TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+            || RPC_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     if child.try_wait().ok().flatten().is_none() {
@@ -609,6 +698,79 @@ fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: I
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[cfg(unix)]
+    #[test]
+    fn rpc_transition_wait_and_worker_shutdown_respond_to_cancellation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = root.path().join("session.jsonl");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let (sender, events) = mpsc::channel();
+        let worker = super::Worker {
+            compacting: false,
+            retrying: false,
+            bashing: false,
+            steering_mode: pi_rs::QueueMode::All,
+            follow_up_mode: pi_rs::QueueMode::All,
+            session: args.session.clone(),
+            busy: false,
+            persistent: true,
+            prompt_shutdown: false,
+            shutdown: None,
+            configuration: serde_json::Value::Null,
+            child,
+            stdin,
+            events,
+            pending_events: Vec::new(),
+            readers: Vec::new(),
+            refresh_barrier: tempfile::NamedTempFile::new().unwrap(),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let flag = cancelled.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let _sender = sender;
+                let mut slot = Some(worker);
+                let result = super::Worker::check_session_transition_cancellable(
+                    Some(&flag),
+                    Some(&mut slot),
+                    &args,
+                    pi_rs::BeforeSessionTransition::Switch {
+                        reason: pi_rs::SessionSwitchReason::New,
+                        target_session_file: None,
+                    },
+                );
+                assert!(matches!(result, Err(pi_rs::Error::Cancelled)));
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancelled.store(true, Ordering::SeqCst);
+            drop(task);
+        });
+        let start = Instant::now();
+        drop(runtime);
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "RPC transition delayed runtime shutdown"
+        );
+    }
+
     #[test]
     fn process_shutdown_waits_for_detached_refresh() {
         use std::sync::mpsc;

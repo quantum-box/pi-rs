@@ -717,10 +717,6 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
         original.c_lflag & !libc::PENDIN
     );
     assert_eq!(
-        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGINT) },
-        0
-    );
-    assert_eq!(
         unsafe { libc::kill(-(process.0.id() as libc::pid_t), libc::SIGCONT) },
         0
     );
@@ -1851,16 +1847,38 @@ fn reload_waits_for_auth_lock_without_closing_terminal() {
     let lock = home.join("auth.json.lock");
     std::fs::create_dir(&lock).unwrap();
     master.write_all(b"/reload\r").unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        process.0.try_wait().unwrap().is_none(),
-        "terminal exited while auth store was locked"
-    );
-    std::fs::remove_dir(lock).unwrap();
-    output_until(&mut master, |text| text.contains("Reloaded settings"));
+    output_until(&mut master, |text| {
+        text.contains("Reloading provider credentials")
+    });
     master.write_all(b"reload-still-responsive").unwrap();
     output_until(&mut master, |text| text.contains("reload-still-responsive"));
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Provider credential reload cancelled")
+    });
     assert!(process.0.try_wait().unwrap().is_none());
+    std::fs::remove_dir(lock).unwrap();
+    master.write_all(b"\x15/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Provider credentials reloaded")
+    });
+    assert!(process.0.try_wait().unwrap().is_none());
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as i32, libc::SIGINT) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        process
+            .0
+            .try_wait()
+            .unwrap()
+            .and_then(|status| status.code()),
+        Some(130)
+    );
 }
 
 #[test]
@@ -1940,4 +1958,112 @@ fn sigint_cancels_interactive_startup_model_discovery() {
     let _ = release_tx.send(());
     server.join().unwrap();
     assert_eq!(status.and_then(|status| status.code()), Some(130));
+}
+
+#[test]
+fn external_sigint_interrupts_stalled_interactive_transition() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let extension = root.path().join("slow-transition.py");
+    let marker = home.join("transition-started");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys, time
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'slow-transition', 'dependencies':[], 'commands':[], 'tools':[], 'session_transition_hook':True}
+elif request['type'] == 'before_session_transition':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'transition-started'), 'w') as f: f.write(str(os.getpid()))
+    time.sleep(30)
+    result = False
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--tui-mode",
+                "fullscreen",
+                "--extension",
+            ])
+            .arg(extension)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/new\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(marker.exists(), "transition hook did not start");
+    let extension_pid: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as i32, libc::SIGINT) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        process
+            .0
+            .try_wait()
+            .unwrap()
+            .and_then(|status| status.code()),
+        Some(130)
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(extension_pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(
+        unsafe { libc::kill(extension_pid, 0) },
+        0,
+        "transition extension survived shutdown"
+    );
 }

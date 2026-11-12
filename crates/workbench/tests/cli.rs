@@ -5006,3 +5006,91 @@ fn radius_refresh_survives_sigint_and_persists_rotated_token() {
     let stored: Value = serde_json::from_slice(&std::fs::read(auth).unwrap()).unwrap();
     assert_eq!(stored["radius"]["refresh"], "rotated");
 }
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_rpc_session_transition_hook() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("slow-transition.py");
+    let marker = root.path().join("transition-started");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys, time
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'slow-transition', 'dependencies':[], 'commands':[], 'tools':[], 'session_transition_hook':True}
+elif request['type'] == 'before_session_transition':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'transition-started'), 'w') as f:
+        f.write(str(os.getpid()))
+    time.sleep(30)
+    result = False
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--model",
+            "fixture",
+            "--extension",
+        ])
+        .arg(extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{}", json!({"type":"new_session", "id":"test"})).unwrap();
+    stdin.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "transition hook did not start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(status.is_some(), "RPC transition wait ignored SIGINT");
+    let extension_pid: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(extension_pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(
+        unsafe { libc::kill(extension_pid, 0) },
+        0,
+        "transition extension survived shutdown"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

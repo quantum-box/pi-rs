@@ -388,24 +388,22 @@ async fn run_worker(
             continue;
         }
         if let Request::CheckSessionTransition { id, event } = request {
-            let result = if runtime.registry.has_session_transition_hooks() {
-                match Session::snapshot(&args.session) {
-                    Ok(session) if session.host_binding().is_none() => Ok(runtime
-                        .registry
-                        .session_transition_cancelled(
-                            &event,
-                            &session.extension_states(),
-                            args.tool_timeout(),
-                            &mut |notification| observe(notification, args.trace),
-                        )
-                        .await),
-                    Ok(_) => Err(Error::Session(
-                        "managed session transitions require their host".into(),
-                    )),
-                    Err(error) => Err(error),
-                }
-            } else {
-                Ok(false)
+            let result = tokio::select! {
+                result = async {
+                    if runtime.registry.has_session_transition_hooks() {
+                        match Session::snapshot(&args.session) {
+                            Ok(session) if session.host_binding().is_none() => Ok(runtime.registry.session_transition_cancelled(
+                                &event, &session.extension_states(), args.tool_timeout(),
+                                &mut |notification| observe(notification, args.trace),
+                            ).await),
+                            Ok(_) => Err(Error::Session("managed session transitions require their host".into())),
+                            Err(error) => Err(error),
+                        }
+                    } else { Ok(false) }
+                } => result,
+                _ = async {
+                    while !stopping.load(Ordering::SeqCst) { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
+                } => Err(Error::Cancelled),
             };
             match result {
                 Ok(cancelled) => output(
@@ -438,14 +436,20 @@ async fn run_worker(
                     LifecycleEvent::ModelSelect { .. } | LifecycleEvent::ThinkingLevelSelect { .. }
                 )
             {
-                pi_rs::notify_extension_lifecycle(
-                    &runtime.registry,
-                    event,
-                    &session.extension_states(),
-                    args.tool_timeout(),
-                    &mut |notification| observe(notification, args.trace),
-                )
-                .await;
+                let states = session.extension_states();
+                let mut observer =
+                    |notification: pi_rs::Notification<'_>| observe(notification, args.trace);
+                tokio::select! {
+                    _ = pi_rs::notify_extension_lifecycle(
+                        &runtime.registry, event, &states, args.tool_timeout(),
+                        &mut observer,
+                    ) => (),
+                    _ = async {
+                        while !stopping.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    } => (),
+                }
             }
             output(json!({"type":"selection_notified","id":id}));
             continue;

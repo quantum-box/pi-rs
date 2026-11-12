@@ -58,6 +58,9 @@ pub(super) fn run(
     let mut stream = super::rpc_events::Stream::default();
     'run: loop {
         if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(active) = &mut worker {
+                active.interrupt_shutdown();
+            }
             return Err(Error::Cancelled);
         }
         // Drain accepted input before committing a completed transition. This
@@ -334,7 +337,8 @@ pub(super) fn run(
                     }
                     Some(_) => None,
                 };
-                if Worker::check_session_transition(
+                if Worker::check_session_transition_cancellable(
+                    Some(&cancelled),
                     Some(&mut worker),
                     &args,
                     pi_rs::BeforeSessionTransition::Switch {
@@ -594,19 +598,20 @@ pub(super) fn run(
         } else {
             None
         };
-        let result = command(&request, &mut args, &mut worker).and_then(|data| {
-            if data.as_ref().is_some_and(|data| data["cancelled"] == true) {
-                return Ok(data);
-            }
-            let reason = match request["type"].as_str() {
-                Some("new_session") => pi_rs::SessionStartReason::New,
-                Some("switch_session") => pi_rs::SessionStartReason::Resume,
-                Some("fork" | "clone") => pi_rs::SessionStartReason::Fork,
-                _ => return Ok(data),
-            };
-            Worker::transition(&mut worker, &args, reason)?;
-            Ok(data)
-        });
+        let result = command_cancellable(&request, &mut args, &mut worker, Some(&cancelled))
+            .and_then(|data| {
+                if data.as_ref().is_some_and(|data| data["cancelled"] == true) {
+                    return Ok(data);
+                }
+                let reason = match request["type"].as_str() {
+                    Some("new_session") => pi_rs::SessionStartReason::New,
+                    Some("switch_session") => pi_rs::SessionStartReason::Resume,
+                    Some("fork" | "clone") => pi_rs::SessionStartReason::Fork,
+                    _ => return Ok(data),
+                };
+                Worker::transition(&mut worker, &args, reason)?;
+                Ok(data)
+            });
         if result.is_ok()
             && let Some(previous) = previous_records
             && let Ok(session) = Session::snapshot(&args.session)
@@ -624,7 +629,9 @@ pub(super) fn run(
             )?;
         }
         for event in std::mem::take(&mut args.selection_events) {
-            if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+            if let Err(error) =
+                Worker::notify_selection_cancellable(Some(&cancelled), &mut worker, &args, &event)
+            {
                 eprintln!("Extension selection notification: {error}");
             }
         }
@@ -726,7 +733,16 @@ fn requires_idle(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Result<Option<Value>> {
+    command_cancellable(request, args, worker, None)
+}
+fn command_cancellable(
+    request: &Value,
+    args: &mut Cli,
+    worker: &mut Option<Worker>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<Value>> {
     let name = request["type"].as_str().unwrap_or_default();
     if requires_idle(name) && busy(worker) {
         return Err(Error::Config(format!(
@@ -784,7 +800,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .as_str()
                 .ok_or_else(|| Error::Config("sessionPath is required".into()))?;
             let path = args.workspace.join(path);
-            if Worker::check_session_transition(
+            if Worker::check_session_transition_cancellable(
+                cancelled,
                 Some(worker),
                 args,
                 pi_rs::BeforeSessionTransition::Switch {
@@ -837,7 +854,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                     None,
                 )
             };
-            if Worker::check_session_transition(
+            if Worker::check_session_transition_cancellable(
+                cancelled,
                 Some(worker),
                 args,
                 pi_rs::BeforeSessionTransition::Fork { entry_id, position },
@@ -879,7 +897,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 Some(Value::String(path)) => Some(path.as_str()).filter(|path| !path.is_empty()),
                 Some(_) => return Err(Error::Config("parentSession must be a string".into())),
             };
-            if Worker::check_session_transition(
+            if Worker::check_session_transition_cancellable(
+                cancelled,
                 Some(worker),
                 args,
                 pi_rs::BeforeSessionTransition::Switch {
