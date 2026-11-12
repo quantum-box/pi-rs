@@ -16,8 +16,8 @@ use crate::{
     AgentInput, CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind,
     Invocation, Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest,
     OperationState, Outcome, QueuedMessage, Record, RecordedReply, Registry, RequestPurpose,
-    Result, RunState, Session, ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, Usage,
-    UsageReport,
+    Result, RunState, Session, Tool, ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec,
+    Usage, UsageReport,
 };
 
 /// Shared switch checked before each automatic context compaction.
@@ -89,6 +89,8 @@ pub struct Limits {
     pub output_tokens_per_request: u32,
     pub output_tokens_per_run: u32,
     pub model_timeout: Duration,
+    /// Explicit tool execution timeout. The default sentinel preserves the SDK
+    /// default for ordinary tools and lets orchestrators opt out.
     pub tool_timeout: Duration,
     /// Explicit input/output context capacity. Otherwise use provider discovery when available.
     pub context_window: Option<u32>,
@@ -101,8 +103,34 @@ impl Default for Limits {
             output_tokens_per_request: 2048,
             output_tokens_per_run: 8192,
             model_timeout: Duration::from_secs(120),
-            tool_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::MAX,
             context_window: None,
+        }
+    }
+}
+
+impl Limits {
+    /// The CLI and SDK have different historical defaults for ordinary tools.
+    pub const CLI_DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_nanos(u64::MAX);
+
+    pub(crate) fn effective_tool_timeout(&self) -> Duration {
+        if self.tool_timeout == Duration::MAX {
+            Duration::from_secs(30)
+        } else if self.tool_timeout == Self::CLI_DEFAULT_TOOL_TIMEOUT {
+            Duration::from_secs(2_147_483)
+        } else {
+            self.tool_timeout
+        }
+    }
+
+    fn tool_invocation_timeout(&self, tool: &dyn Tool) -> Option<Duration> {
+        if (self.tool_timeout == Duration::MAX
+            || self.tool_timeout == Self::CLI_DEFAULT_TOOL_TIMEOUT)
+            && !tool.use_default_timeout()
+        {
+            None
+        } else {
+            Some(self.effective_tool_timeout())
         }
     }
 }
@@ -1582,7 +1610,7 @@ impl Agent<'_> {
             let arguments = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.prepare_arguments(arguments)) =>
+                result = tokio::time::timeout(self.limits.effective_tool_timeout(), tool.tool.prepare_arguments(arguments)) =>
                     result.ok().and_then(std::result::Result::ok).ok_or(Error::PendingOperation(operation_id))?,
             };
             if arguments.to_string().len() > 16 * 1024 * 1024
@@ -1604,7 +1632,7 @@ impl Agent<'_> {
             let outcome = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.poll(&reference, context)) => result.ok().flatten().ok_or(Error::PendingOperation(operation_id))?,
+                result = tokio::time::timeout(self.limits.effective_tool_timeout(), tool.tool.poll(&reference, context)) => result.ok().flatten().ok_or(Error::PendingOperation(operation_id))?,
             };
             let mut reply = outcome.into();
             self.transform_tool_result(&invocation, &mut reply, states, cancel, observer)
@@ -1644,7 +1672,7 @@ impl Agent<'_> {
         let args = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.prepare_arguments(args)) => match result {
+            result = tokio::time::timeout(self.limits.effective_tool_timeout(), tool.tool.prepare_arguments(args)) => match result {
                 Ok(Ok(arguments)) if arguments.to_string().len() <= 16 * 1024 * 1024 => arguments,
                 Ok(Ok(_)) => return Ok(Preparation::Skipped("prepared arguments exceed size limit".into())),
                 Ok(Err(error)) => return Ok(Preparation::Skipped(format!("argument preparation failed: {error}"))),
@@ -1665,7 +1693,7 @@ impl Agent<'_> {
         let decision = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            decision = tokio::time::timeout(self.limits.tool_timeout, self.authorize(&call.name, &args, &context, states)) =>
+            decision = tokio::time::timeout(self.limits.effective_tool_timeout(), self.authorize(&call.name, &args, &context, states)) =>
                 decision.map_err(|_| Error::Config("pre-tool hooks timed out".into()))??,
         };
         Ok(match decision {
@@ -1708,7 +1736,7 @@ impl Agent<'_> {
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = tokio::time::timeout(self.limits.tool_timeout, extension.tool_result(
+                result = tokio::time::timeout(self.limits.effective_tool_timeout(), extension.tool_result(
                     &invocation.call, &reply.outcome, &context, states.get(extension.id()),
                 )) => result,
             };
@@ -1896,6 +1924,7 @@ impl Agent<'_> {
             } => (tool, args, context, state, guard),
             Preparation::Skipped(reason) => return Outcome::Skipped(reason).into(),
         };
+        let timeout = self.limits.tool_invocation_timeout(tool.tool.as_ref());
         let invocation = async {
             if programmatic {
                 tool.tool
@@ -1903,15 +1932,20 @@ impl Agent<'_> {
                     .await
             } else {
                 tool.tool
-                    .invoke_transaction(args, context, state.as_ref(), host)
+                    .invoke_transaction_with_timeout(args, context, state.as_ref(), host, timeout)
                     .await
             }
         };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()).into(),
-            result = tokio::time::timeout(self.limits.tool_timeout, invocation) =>
-                result.unwrap_or_else(|_| Outcome::Unknown("tool timed out".into()).into()),
+            result = async {
+                match timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, invocation).await
+                        .unwrap_or_else(|_| Outcome::Unknown("tool timed out".into()).into()),
+                    None => invocation.await,
+                }
+            } => result,
         }
     }
 
@@ -2261,8 +2295,11 @@ impl Agent<'_> {
                 label: options.label.map(str::to_owned),
             };
             let states = session.extension_states();
-            let deadline =
-                tokio::time::Instant::now() + self.limits.tool_timeout.min(Duration::from_secs(10));
+            let deadline = tokio::time::Instant::now()
+                + self
+                    .limits
+                    .effective_tool_timeout()
+                    .min(Duration::from_secs(10));
             for extension in self
                 .registry
                 .extensions
@@ -2381,7 +2418,7 @@ impl Agent<'_> {
                     from_extension,
                 },
                 &session.extension_states(),
-                self.limits.tool_timeout,
+                self.limits.effective_tool_timeout(),
                 observer,
             )
             .await;
@@ -4078,5 +4115,46 @@ mod queue_tests {
             crate::QueueMode::OneAtATime
         );
         assert_eq!(fork.queue_mode(InputKind::Steer), crate::QueueMode::All);
+    }
+}
+
+#[cfg(test)]
+mod timeout_policy_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    struct Orchestrator;
+    #[async_trait::async_trait]
+    impl Tool for Orchestrator {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "orchestrator".into(),
+                description: String::new(),
+                parameters: json!({}),
+            }
+        }
+        fn use_default_timeout(&self) -> bool {
+            false
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            Outcome::Succeeded(String::new())
+        }
+    }
+    #[test]
+    fn default_and_explicit_invocation_limits() {
+        let mut limits = Limits::default();
+        assert_eq!(limits.effective_tool_timeout(), Duration::from_secs(30));
+        assert_eq!(limits.tool_invocation_timeout(&Orchestrator), None);
+        limits.tool_timeout = Limits::CLI_DEFAULT_TOOL_TIMEOUT;
+        assert_eq!(
+            limits.effective_tool_timeout(),
+            Duration::from_secs(2_147_483)
+        );
+        assert_eq!(limits.tool_invocation_timeout(&Orchestrator), None);
+        limits.tool_timeout = Duration::from_secs(30);
+        assert_eq!(
+            limits.tool_invocation_timeout(&Orchestrator),
+            Some(Duration::from_secs(30))
+        );
     }
 }

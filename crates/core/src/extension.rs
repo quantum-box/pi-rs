@@ -204,6 +204,10 @@ pub trait ToolHost: Send + Sync {
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Whether the host default execution timeout applies when none was explicitly configured.
+    fn use_default_timeout(&self) -> bool {
+        true
+    }
     fn execution(&self) -> ToolExecution {
         ToolExecution::Sequential
     }
@@ -246,6 +250,18 @@ pub trait Tool: Send + Sync {
         self.invoke_with_host(arguments, context, state, host)
             .await
             .into()
+    }
+    /// Pass an explicit host deadline to tools that need synchronous interruption.
+    async fn invoke_transaction_with_timeout(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+        _timeout: Option<std::time::Duration>,
+    ) -> ToolReply {
+        self.invoke_transaction(arguments, context, state, host)
+            .await
     }
     /// Programmatic callers may request a structured form of a tool's output.
     async fn invoke_programmatic(

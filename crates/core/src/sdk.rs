@@ -355,7 +355,7 @@ impl SessionBuilder {
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let weak_events = events.downgrade();
-        let tool_timeout = self.limits.tool_timeout;
+        let tool_timeout = self.limits.effective_tool_timeout();
         let auto_compaction = session.auto_compaction_control();
         let retry = session.retry_control();
         let input_hooks = Arc::new(Mutex::new(InputHooks::new(&self.registry, &session)));
@@ -545,7 +545,7 @@ impl AgentSession {
                 &self.registry,
                 event,
                 &self.session.extension_states(),
-                self.limits.tool_timeout,
+                self.limits.effective_tool_timeout(),
                 &mut |notification| emit(events, &notification),
             )
             .await;
@@ -675,7 +675,7 @@ impl AgentSession {
                 &self.registry,
                 event,
                 &self.session.extension_states(),
-                self.limits.tool_timeout,
+                self.limits.effective_tool_timeout(),
                 &mut |notification| emit(events, &notification),
             )
             .await;
@@ -778,7 +778,7 @@ impl AgentSession {
                 .session_transition_cancelled(
                     &crate::BeforeSessionTransition::Fork { entry_id, position },
                     &self.session.extension_states(),
-                    self.limits.tool_timeout,
+                    self.limits.effective_tool_timeout(),
                     &mut |notification| emit(events, &notification),
                 )
                 .await

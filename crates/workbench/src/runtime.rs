@@ -250,7 +250,10 @@ impl Runtime {
                 output_tokens_per_request: args.effective_max_output_tokens(),
                 output_tokens_per_run: args.output_budget,
                 model_timeout: Duration::from_secs(args.model_timeout_secs),
-                tool_timeout: args.tool_timeout(),
+                tool_timeout: args
+                    .tool_timeout_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(Limits::CLI_DEFAULT_TOOL_TIMEOUT),
                 context_window: args.effective_context_window(),
             },
         }
@@ -534,7 +537,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
                     .as_u64()
                     .unwrap_or(3000)
                     .min(100_000) as usize,
-                timeout: args.tool_timeout(),
+                timeout: None,
             }));
         }
         if let Some(project) = &args.project
