@@ -721,14 +721,20 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             if let Some(directory) = destination.parent() {
                 std::fs::create_dir_all(directory)?;
             }
-            let mut session = Session::open(&destination)?;
-            session.set_working_directory(&args.workspace)?;
-            super::backend::initialize_queue_modes(&mut session, args)?;
+            let mut next = args.clone();
+            next.refresh_workspace_selection();
+            next.session = destination;
+            let mut session = Session::open(&next.session)?;
+            session.set_working_directory(&next.workspace)?;
+            super::backend::initialize_queue_modes(&mut session, &next)?;
             if let Some(parent) = parent {
                 session.set_parent_session(parent)?;
             }
+            next.restore_session_model(&session);
+            super::thinking::adjust(&mut next);
+            next.record_automatic_model_selection(&mut session)?;
             drop(session);
-            args.session = destination;
+            *args = next;
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" => {
@@ -1651,6 +1657,97 @@ mod tests {
         args.model = "current-model".into();
         switch_session(&mut args, &path).unwrap();
         assert_eq!(args.model, "initial-model");
+    }
+
+    #[test]
+    fn new_session_restores_original_explicit_cli_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = root.path().into();
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().into());
+        args.endpoint = "https://example.invalid/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        args.model = "alpha".into();
+        args.thinking = Some("low".into());
+        args.model_explicit = true;
+        args.thinking_explicit = true;
+        args.remember_initial_selection();
+        args.change_model(
+            super::super::Provider::Ollama,
+            "beta".into(),
+            Some("high".into()),
+            pi_rs::ModelSelectSource::Set,
+        )
+        .unwrap();
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("alpha", Some("low"))
+        );
+        assert_eq!(
+            Session::open(&args.session).unwrap().model_selection(),
+            Some(("alpha".into(), Some("low".into())))
+        );
+    }
+
+    #[test]
+    fn switching_workspace_rebuilds_defaults_and_scope_for_new_session() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        for (workspace, model, thinking) in [(&launch, "alpha", "low"), (&target, "beta", "high")] {
+            std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+            std::fs::write(workspace.join(".pi/settings.json"), json!({"defaultProvider":"ollama", "defaultModel":model, "defaultThinkingLevel":thinking, "enabledModels":[format!("ollama/{model}:{thinking}")]}).to_string()).unwrap();
+        }
+        let target_session = root.path().join("target.jsonl");
+        let mut session = Session::open(&target_session).unwrap();
+        session.set_working_directory(&target).unwrap();
+        drop(session);
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch.clone();
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().into());
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha","reasoning":true},{"id":"beta","reasoning":true}]}}})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.settings = super::super::config::Settings::load(&launch, true).unwrap();
+        args.model = "alpha".into();
+        args.refresh_workspace_selection();
+        args.thinking = Some("low".into());
+        args.remember_initial_selection();
+        switch_session(&mut args, &target_session).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("beta", Some("high"))
+        );
+        assert_eq!(
+            args.model_scope
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            ["beta"]
+        );
+        args.change_model(
+            super::super::Provider::Ollama,
+            "alpha".into(),
+            Some("low".into()),
+            pi_rs::ModelSelectSource::Set,
+        )
+        .unwrap();
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("beta", Some("high"))
+        );
+        assert_eq!(
+            Session::open(&args.session).unwrap().model_selection(),
+            Some(("beta".into(), Some("high".into())))
+        );
     }
 
     #[test]

@@ -162,6 +162,49 @@ pub async fn catalogs(args: &Cli, automatic: bool) -> Result<Vec<Catalog>> {
     Ok(catalogs)
 }
 
+/// Rebuild a workspace scope from the catalog data already available locally.
+pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
+    let providers = std::iter::once(args.provider.clone()).chain(
+        args.model_profiles
+            .providers()
+            .filter(|provider| *provider != args.provider),
+    );
+    providers
+        .filter_map(|provider| {
+            let client = args.connect_provider(&provider, None).ok()?;
+            let mut models = args.model_profiles.model_ids(&provider);
+            for model in args
+                .discovered_models
+                .iter()
+                .filter(|(id, _)| id == provider.id())
+                .map(|(_, model)| model)
+                .chain(
+                    args.model_scope
+                        .iter()
+                        .filter(|choice| choice.provider == provider)
+                        .map(|choice| &choice.model),
+                )
+            {
+                if !models.contains(model) {
+                    models.push(model.clone());
+                }
+            }
+            if models.is_empty() {
+                return None;
+            }
+            let aliases = aliases(&args.model_profiles, &provider, &models);
+            Some(Catalog {
+                provider,
+                client,
+                models,
+                aliases,
+                probe_details: false,
+                complete: false,
+            })
+        })
+        .collect()
+}
+
 pub fn scoped_choices<'a>(
     patterns: impl IntoIterator<Item = &'a str>,
     catalogs: &[Catalog],

@@ -2191,6 +2191,102 @@ fn rpc_model_discovery_does_not_block_other_commands() {
 }
 
 #[test]
+fn rpc_new_session_recreates_cli_and_workspace_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let launch = root.path().join("launch");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha","reasoning":true},{"id":"beta","reasoning":true}]}}}).to_string()).unwrap();
+    for (workspace, model, thinking) in [(&launch, "alpha", "low"), (&target, "beta", "high")] {
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        std::fs::write(workspace.join(".pi/settings.json"), json!({"defaultProvider":"ollama","defaultModel":model,"defaultThinkingLevel":thinking,"enabledModels":[format!("ollama/{model}:{thinking}")]}).to_string()).unwrap();
+    }
+    let target_session = root.path().join("target.jsonl");
+    let mut session = Session::open(&target_session).unwrap();
+    session.set_working_directory(&target).unwrap();
+    drop(session);
+    for explicit in [true, false] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .env("PI_RS_HOME", &home)
+            .arg("--workspace")
+            .arg(&launch)
+            .arg("--session")
+            .arg(root.path().join(if explicit {
+                "explicit.jsonl"
+            } else {
+                "workspace.jsonl"
+            }))
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--approve"]);
+        if explicit {
+            command.args(["--model", "alpha", "--thinking", "low"]);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut requests = Vec::new();
+        if !explicit {
+            requests
+                .push(json!({"id":"switch","type":"switch_session","sessionPath":target_session}));
+        }
+        requests.push(json!({"id":"model","type":"set_model","provider":"ollama","modelId":if explicit { "beta" } else { "alpha" }}));
+        requests.push(json!({"id":"thinking","type":"set_thinking_level","level":if explicit { "high" } else { "low" }}));
+        requests.push(json!({"id":"new","type":"new_session"}));
+        requests.push(json!({"id":"state","type":"get_state"}));
+        requests.push(json!({"type":"shutdown"}));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                requests
+                    .iter()
+                    .map(|request| format!("{request}\n"))
+                    .collect::<String>()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let responses: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in if explicit {
+            vec!["model", "thinking", "new"]
+        } else {
+            vec!["switch", "model", "thinking", "new"]
+        } {
+            let response = responses.iter().find(|value| value["id"] == id).unwrap();
+            assert_eq!(response["success"], true, "{response}");
+        }
+        let state = responses
+            .iter()
+            .find(|value| value["id"] == "state")
+            .unwrap();
+        assert_eq!(
+            state["data"]["model"]["id"],
+            if explicit { "alpha" } else { "beta" },
+            "{state}"
+        );
+        assert_eq!(
+            state["data"]["thinkingLevel"],
+            if explicit { "low" } else { "high" },
+            "{state}"
+        );
+    }
+}
+
+#[test]
 fn scoped_thinking_applies_to_new_sessions_and_resumes_restore_branch_thinking() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");

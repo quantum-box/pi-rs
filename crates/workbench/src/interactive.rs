@@ -2826,6 +2826,7 @@ fn slash(
                 return Ok(None);
             }
             let mut next = args.clone();
+            next.refresh_workspace_selection();
             next.session = session_path(&args.workspace, args.session_dir.as_deref());
             if let Some(directory) = next.session.parent() {
                 std::fs::create_dir_all(directory)?;
@@ -6236,8 +6237,6 @@ fn select(
 
 fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
     let mut next = args.clone();
-    next.model_explicit = false;
-    next.thinking_explicit = false;
     next.session = path;
     next.session_transition = Some(pi_rs::SessionStartReason::Resume);
     restore_workspace(&mut next)?;
@@ -6299,6 +6298,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
     args.settings = crate::config::Settings::load(&args.workspace, args.trusted)?;
+    args.refresh_workspace_selection();
     args.restore_session_model(&session);
     drop(session);
     super::thinking::adjust(args);
@@ -6940,6 +6940,75 @@ mod tests {
         drop(session);
         super::switch_session(&mut args, &mut view, empty_path).unwrap();
         assert_eq!(args.model, "alpha");
+    }
+
+    #[test]
+    fn new_session_restores_original_cli_model_and_thinking_overrides() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = directory.path().into();
+        args.session_dir = Some(directory.path().into());
+        args.session = directory.path().join("current.jsonl");
+        args.endpoint = "https://example.invalid/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        args.model = "alpha".into();
+        args.thinking = Some("low".into());
+        args.model_explicit = true;
+        args.thinking_explicit = true;
+        args.remember_initial_selection();
+        let mut view = super::View {
+            available_models: vec!["ollama/alpha".into(), "ollama/beta".into()],
+            ..Default::default()
+        };
+        super::slash("/model beta:high", &mut args, &mut view, None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("beta", Some("high"))
+        );
+        super::slash("/new", &mut args, &mut view, None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("alpha", Some("low"))
+        );
+        let session = pi_rs::Session::open(&args.session).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("alpha".into(), Some("low".into())))
+        );
+    }
+
+    #[test]
+    fn new_session_restores_individual_cli_overrides() {
+        use clap::Parser;
+        for (model_explicit, thinking_explicit, expected_thinking) in
+            [(true, false, "medium"), (false, true, "low")]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let mut args = super::Cli::parse_from(["pi", "--offline"]);
+            args.workspace = directory.path().into();
+            args.session_dir = Some(directory.path().into());
+            args.session = directory.path().join("current.jsonl");
+            args.endpoint = "https://example.invalid/v1/chat/completions".into();
+            args.endpoint_explicit = true;
+            args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+            args.model = "alpha".into();
+            args.thinking = Some("low".into());
+            args.model_explicit = model_explicit;
+            args.thinking_explicit = thinking_explicit;
+            args.remember_initial_selection();
+            let mut view = super::View {
+                available_models: vec!["ollama/alpha".into(), "ollama/beta".into()],
+                ..Default::default()
+            };
+            super::slash("/model beta:high", &mut args, &mut view, None).unwrap();
+            super::slash("/new", &mut args, &mut view, None).unwrap();
+            assert_eq!(
+                (args.model.as_str(), args.thinking.as_deref()),
+                ("alpha", Some(expected_thinking))
+            );
+        }
     }
 
     #[test]

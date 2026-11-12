@@ -70,6 +70,10 @@ struct Cli {
     #[arg(skip)]
     initial_selection: Option<InitialSelection>,
     #[arg(skip)]
+    cli_selection: Option<InitialSelection>,
+    #[arg(skip)]
+    cli_thinking: Option<String>,
+    #[arg(skip)]
     discovered_models: Vec<(String, String)>,
     #[arg(skip)]
     complete_catalogs: Vec<(String, String)>,
@@ -872,6 +876,80 @@ impl Cli {
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
         });
+        self.cli_selection = self
+            .model_explicit
+            .then(|| self.initial_selection.clone())
+            .flatten();
+        self.cli_thinking = self
+            .thinking_explicit
+            .then(|| self.thinking.clone())
+            .flatten();
+    }
+
+    /// Recreate the new-session defaults from the current workspace while
+    /// retaining the original command-line overrides across session changes.
+    fn refresh_workspace_selection(&mut self) {
+        let catalogs = model_selection::cached_catalogs(self);
+        let patterns: Vec<String> = self
+            .models
+            .as_deref()
+            .map(|value| value.split(',').map(str::to_owned).collect())
+            .unwrap_or_else(|| self.settings.strings("enabledModels"));
+        self.model_scope =
+            model_selection::scoped_choices(patterns.iter().map(String::as_str), &catalogs).0;
+
+        let fallback = self
+            .initial_selection
+            .clone()
+            .unwrap_or_else(|| InitialSelection {
+                provider: self.provider.clone(),
+                endpoint: self.endpoint.clone(),
+                model: self.model.clone(),
+            });
+        let configured = self.settings.string("defaultModel");
+        let qualified = configured
+            .and_then(|model| model_selection::qualified_model(model, &self.model_profiles));
+        let provider = self
+            .settings
+            .string("defaultProvider")
+            .and_then(|name| self.model_profiles.provider(name))
+            .or_else(|| qualified.as_ref().map(|(provider, _)| provider.clone()))
+            .unwrap_or_else(|| fallback.provider.clone());
+        let model = configured
+            .map(|value| {
+                qualified
+                    .as_ref()
+                    .filter(|(candidate, _)| *candidate == provider)
+                    .map_or(value, |(_, id)| *id)
+                    .to_owned()
+            })
+            .unwrap_or_else(|| fallback.model.clone());
+        let chosen = self
+            .model_scope
+            .iter()
+            .find(|choice| choice.provider == provider && choice.model == model)
+            .or_else(|| self.model_scope.first());
+        let (provider, model) = chosen.map_or((provider, model), |choice| {
+            (choice.provider.clone(), choice.model.clone())
+        });
+        let endpoint = self
+            .explicit_endpoint_for(&provider)
+            .unwrap_or_else(|| self.model_profiles.endpoint(&provider))
+            .to_owned();
+        let initial = InitialSelection {
+            provider,
+            model,
+            endpoint,
+        };
+        self.initial_selection = Some(initial.clone());
+        let effective = self.cli_selection.as_ref().unwrap_or(&initial);
+        self.provider = effective.provider.clone();
+        self.endpoint = effective.endpoint.clone();
+        self.model = effective.model.clone();
+        self.thinking_profile = None;
+        if self.thinking_explicit {
+            self.thinking = self.cli_thinking.clone();
+        }
     }
 }
 
