@@ -26,6 +26,7 @@ base64 = "0.22"
 eventsource-stream = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 futures-util = "0.3"
+http = "1"
 fancy-regex = "0.16"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }

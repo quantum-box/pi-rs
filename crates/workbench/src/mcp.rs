@@ -290,7 +290,7 @@ struct Connection {
     config: ServerConfig,
     workspace: PathBuf,
     provider_token: Option<TokenResolver>,
-    http_options: Option<HttpOptions>,
+    http_options: Option<HttpOptionsWithProxyHosts>,
     closed: AtomicBool,
 }
 impl Connection {
@@ -312,7 +312,7 @@ impl Connection {
             return Err(Error::Config("MCP connection is closed".into()));
         }
         if service.is_closed() || service.peer().is_transport_closed() {
-            let replacement = McpExtension::connect_with_http_options(
+            let replacement = McpExtension::connect_with_proxy_hosts(
                 &self.name,
                 &self.config,
                 &self.workspace,
@@ -344,7 +344,7 @@ impl Connection {
                 "MCP connection changed during reauthorization".into(),
             ));
         }
-        let replacement = McpExtension::connect_with_http_options(
+        let replacement = McpExtension::connect_with_proxy_hosts(
             &self.name,
             &self.config,
             &self.workspace,
@@ -430,6 +430,20 @@ pub struct HttpOptions {
     pub idle_timeout: Option<Duration>,
 }
 
+/// HTTP settings with proxy host names for OAuth DNS validation.
+#[derive(Clone)]
+pub struct HttpOptionsWithProxyHosts {
+    pub http: HttpOptions,
+    pub proxy_hosts: Vec<String>,
+}
+
+impl std::ops::Deref for HttpOptionsWithProxyHosts {
+    type Target = HttpOptions;
+    fn deref(&self) -> &HttpOptions {
+        &self.http
+    }
+}
+
 impl McpExtension {
     pub async fn connect(name: &str, config: &ServerConfig, workspace: &Path) -> Result<Self> {
         Self::connect_with_provider_token(name, config, workspace, None).await
@@ -450,6 +464,26 @@ impl McpExtension {
         workspace: &Path,
         provider_token: Option<TokenResolver>,
         http_options: Option<HttpOptions>,
+    ) -> Result<Self> {
+        Self::connect_with_proxy_hosts(
+            name,
+            config,
+            workspace,
+            provider_token,
+            http_options.map(|http| HttpOptionsWithProxyHosts {
+                http,
+                proxy_hosts: Vec::new(),
+            }),
+        )
+        .await
+    }
+
+    pub async fn connect_with_proxy_hosts(
+        name: &str,
+        config: &ServerConfig,
+        workspace: &Path,
+        provider_token: Option<TokenResolver>,
+        http_options: Option<HttpOptionsWithProxyHosts>,
     ) -> Result<Self> {
         if name.is_empty()
             || !name
@@ -622,7 +656,13 @@ impl McpExtension {
                             "MCP OAuth cannot be combined with an Authorization header".into(),
                         ));
                     }
-                    let (client, generation) = crate::mcp_auth::client(name, url, client).await?;
+                    let (client, generation) = crate::mcp_auth::client_with_http_options(
+                        name,
+                        url,
+                        client,
+                        http_options.as_ref(),
+                    )
+                    .await?;
                     identity.update(generation.as_bytes());
                     oauth_generation =
                         Some(Uuid::parse_str(&generation).map_err(|_| {
@@ -1105,8 +1145,15 @@ impl McpTool {
         if confirmation != pi_rs::UiResponse::Confirmed(true) {
             return Err(Error::Config("MCP scope upgrade declined".into()));
         }
-        let generation =
-            crate::mcp_auth::upgrade(&connection.name, url, previous, scopes, |_| {}).await?;
+        let generation = crate::mcp_auth::upgrade(
+            &connection.name,
+            url,
+            previous,
+            scopes,
+            connection.http_options.as_ref(),
+            |_| {},
+        )
+        .await?;
         connection.rebind_after_upgrade(previous, generation).await
     }
 
