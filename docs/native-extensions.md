@@ -315,3 +315,5 @@ include the tool call ID, name and arguments or the final native outcome;
 end events indicate errors and include execution duration when the tool ran.
 Nested tool calls include their parent tool-call ID. Executable extensions
 advertise this capability with `tool_execution_lifecycle_hook`.
+Parallel calls currently emit end notifications in journal order after the
+batch settles; streaming updates and completion-order notifications remain open.

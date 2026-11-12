@@ -1094,6 +1094,9 @@ impl Agent<'_> {
         mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<()> {
         let cancel = scope.cancellation;
+        let observe_tools = self.registry.extensions.iter().any(|extension| {
+            extension.handles_lifecycle() && extension.handles_tool_execution_lifecycle()
+        });
         let parallel = |inv: &Invocation| {
             self.registry
                 .tools
@@ -1112,20 +1115,26 @@ impl Agent<'_> {
             let mut prepared = Vec::with_capacity(count);
             let mut parents = Vec::with_capacity(count);
             for invocation in group {
-                let parent = tool_parent_call_id(session, invocation.operation_id);
-                self.observe_lifecycle(
-                    crate::LifecycleEvent::ToolExecutionStart {
-                        tool_call_id: invocation.call.id.clone(),
-                        tool_name: invocation.call.name.clone(),
-                        args: crate::parse_tool_arguments(&invocation.call.arguments)
-                            .unwrap_or(serde_json::Value::Null),
-                        parent_tool_call_id: parent.clone(),
-                    },
-                    states,
-                    Some(cancel),
-                    observer,
-                )
-                .await;
+                let parent = if observe_tools {
+                    tool_parent_call_id(session, invocation.operation_id)
+                } else {
+                    None
+                };
+                if observe_tools {
+                    self.observe_lifecycle(
+                        crate::LifecycleEvent::ToolExecutionStart {
+                            tool_call_id: invocation.call.id.clone(),
+                            tool_name: invocation.call.name.clone(),
+                            args: crate::parse_tool_arguments(&invocation.call.arguments)
+                                .unwrap_or(serde_json::Value::Null),
+                            parent_tool_call_id: parent.clone(),
+                        },
+                        states,
+                        Some(cancel),
+                        observer,
+                    )
+                    .await;
+                }
                 parents.push(parent);
                 let preparation = self.prepare_tool(invocation, scope.advertised, states, cancel);
                 tokio::pin!(preparation);
@@ -1246,19 +1255,22 @@ impl Agent<'_> {
                 self.transform_tool_result(invocation, &mut outcome, states, cancel, observer)
                     .await;
                 let finished = self.finish_tool(session, invocation, outcome, states, observer);
-                if let Some(result) =
-                    session
-                        .records()
-                        .iter()
-                        .rev()
-                        .find_map(|record| match &record.event {
-                            Event::ToolFinished {
-                                operation_id,
-                                outcome,
-                                ..
-                            } if *operation_id == invocation.operation_id => Some(outcome.clone()),
-                            _ => None,
-                        })
+                if observe_tools
+                    && let Some(result) =
+                        session
+                            .records()
+                            .iter()
+                            .rev()
+                            .find_map(|record| match &record.event {
+                                Event::ToolFinished {
+                                    operation_id,
+                                    outcome,
+                                    ..
+                                } if *operation_id == invocation.operation_id => {
+                                    Some(outcome.clone())
+                                }
+                                _ => None,
+                            })
                 {
                     let is_error = matches!(
                         &result,
