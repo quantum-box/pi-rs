@@ -2088,7 +2088,8 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
             json!({"httpProxy":setting,"retry":{"enabled":false}}).to_string(),
         )
         .unwrap();
-        let server = std::thread::spawn(move || {
+        let (server_tx, server_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 assert!(
@@ -2111,7 +2112,8 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     continue;
                 }
                 socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-                return (first, headers);
+                let _ = server_tx.send((first, headers));
+                return;
             }
         });
         let target = format!("http://127.0.0.1:1{path}");
@@ -2156,7 +2158,6 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         }
         if child.try_wait().unwrap().is_none() {
             let _ = child.kill();
-            let _ = child.wait();
             panic!(
                 "{provider}: CLI timed out; stderr: {}",
                 String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
@@ -2164,13 +2165,15 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         }
         let status = child.wait().unwrap();
         let stderr = std::fs::read(stderr.path()).unwrap();
-        let (request, headers) = server.join().unwrap_or_else(|_| {
-            panic!(
-                "{provider}: proxy server failed; status: {}; stderr: {}",
-                status,
-                String::from_utf8_lossy(&stderr)
-            )
-        });
+        let (request, headers) = server_rx
+            .recv_timeout(Duration::from_secs(75))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{provider}: proxy server did not finish ({error}); status: {}; stderr: {}",
+                    status,
+                    String::from_utf8_lossy(&stderr)
+                )
+            });
         assert!(
             request.starts_with("POST http://127.0.0.1:1/"),
             "{provider}: {request}"
