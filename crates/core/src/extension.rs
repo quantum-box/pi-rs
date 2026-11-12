@@ -11,7 +11,7 @@ use crate::{
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
 
-/// Partial update to a successful text result. Omitted fields retain their values.
+/// Partial update to a text result. Omitted fields retain their values.
 #[derive(Clone, Debug, Default)]
 pub struct ToolResultPatch {
     pub output: Option<String>,
@@ -20,6 +20,14 @@ pub struct ToolResultPatch {
 
 impl ToolResultPatch {
     pub fn apply(self, outcome: &Outcome) -> ExtensionResult<Outcome> {
+        if let Outcome::Failed(reason) = outcome {
+            if self.details.is_some() {
+                return Err("failure outcomes cannot carry details".into());
+            }
+            return Ok(Outcome::Failed(
+                self.output.unwrap_or_else(|| reason.clone()),
+            ));
+        }
         let (output, details) = match outcome {
             Outcome::Succeeded(output) => (output.clone(), None),
             Outcome::SucceededWithDetails { output, details } => {
@@ -709,7 +717,7 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
-    /// Patch successful text results while preserving fields omitted by the handler.
+    /// Patch text results while preserving fields omitted by the handler.
     async fn tool_result_patch(
         &self,
         _call: &crate::ToolCall,

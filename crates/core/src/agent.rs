@@ -4058,10 +4058,80 @@ mod tree_tests {
                 details: serde_json::json!({"updated": true})
             }
         );
-        assert!(
+        assert_eq!(
             crate::ToolResultPatch::default()
                 .apply(&Outcome::Failed("error".into()))
-                .is_err()
+                .unwrap(),
+            Outcome::Failed("error".into())
+        );
+        assert!(
+            crate::ToolResultPatch {
+                output: None,
+                details: Some(serde_json::json!({}))
+            }
+            .apply(&Outcome::Failed("error".into()))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_result_patches_chain_and_preserve_failure() {
+        struct Patch(&'static str);
+        #[async_trait::async_trait]
+        impl crate::Extension for Patch {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch(
+                &self,
+                _: &crate::ToolCall,
+                outcome: &Outcome,
+                _: &crate::ToolContext,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<Option<crate::ToolResultPatch>> {
+                let Outcome::Failed(reason) = outcome else {
+                    panic!("failure status lost")
+                };
+                Ok(Some(crate::ToolResultPatch {
+                    output: Some(format!("{reason}:{}", self.0)),
+                    details: None,
+                }))
+            }
+        }
+        let mut registry = Registry::default();
+        registry.register(Arc::new(Patch("first"))).unwrap();
+        registry.register(Arc::new(Patch("second"))).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut reply = ToolReply::from(Outcome::Failed("original".into()));
+        agent
+            .transform_tool_result(
+                &invocation,
+                &mut reply,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(
+            reply.outcome,
+            Outcome::Failed("original:first:second".into())
         );
     }
 
