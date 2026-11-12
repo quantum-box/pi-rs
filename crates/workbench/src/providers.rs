@@ -18,6 +18,7 @@ pub(super) enum Provider {
     Ollama,
     Anthropic,
     Google,
+    Bedrock,
     Radius,
     Custom {
         id: Arc<str>,
@@ -31,6 +32,7 @@ pub(super) enum Adapter {
     OpenAiResponses,
     Anthropic,
     Google,
+    Bedrock,
     PiMessages,
 }
 
@@ -41,6 +43,7 @@ impl Adapter {
             "openai-responses" => Some(Self::OpenAiResponses),
             "anthropic-messages" => Some(Self::Anthropic),
             "google-generative-ai" => Some(Self::Google),
+            "bedrock-converse-stream" => Some(Self::Bedrock),
             "pi-messages" => Some(Self::PiMessages),
             _ => None,
         }
@@ -52,6 +55,7 @@ impl Adapter {
             Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic-messages",
             Self::Google => "google-generative-ai",
+            Self::Bedrock => "bedrock-converse-stream",
             Self::PiMessages => "pi-messages",
         }
     }
@@ -66,13 +70,20 @@ pub(super) fn cache_retention(supports_long: bool) -> CacheRetention {
 }
 
 impl Provider {
-    pub const ALL: [Self; 4] = [Self::Ollama, Self::Anthropic, Self::Google, Self::Radius];
+    pub const ALL: [Self; 5] = [
+        Self::Ollama,
+        Self::Anthropic,
+        Self::Google,
+        Self::Bedrock,
+        Self::Radius,
+    ];
 
     pub fn adapter(&self) -> Adapter {
         match self {
             Self::Ollama => Adapter::ChatCompletions,
             Self::Anthropic => Adapter::Anthropic,
             Self::Google => Adapter::Google,
+            Self::Bedrock => Adapter::Bedrock,
             Self::Radius => Adapter::PiMessages,
             Self::Custom { adapter, .. } => *adapter,
         }
@@ -87,6 +98,7 @@ impl Provider {
             Self::Ollama => "ollama",
             Self::Anthropic => "anthropic",
             Self::Google => "google",
+            Self::Bedrock => "amazon-bedrock",
             Self::Radius => "radius",
             Self::Custom { id, .. } => id,
         }
@@ -110,6 +122,7 @@ impl Provider {
             Self::Ollama => "http://127.0.0.1:11434/v1/chat/completions",
             Self::Anthropic => pi_rs::anthropic::DEFAULT_ENDPOINT,
             Self::Google => pi_rs::google::DEFAULT_ENDPOINT,
+            Self::Bedrock => "",
             Self::Radius => super::radius_auth::DEFAULT_MODEL_ENDPOINT,
             Self::Custom { id, .. } => {
                 if id.as_ref() == "openai-chatgpt" {
@@ -192,6 +205,12 @@ impl Provider {
                 }
                 Ok(Client::Google(client))
             }
+            Adapter::Bedrock => {
+                if token.is_some() || !endpoint.is_empty() {
+                    return Err(Error::Config("Bedrock supports AWS credential chain authentication only; configure AWS_PROFILE and AWS_REGION".into()));
+                }
+                Ok(Client::Bedrock(pi_rs::bedrock::Bedrock::from_env()))
+            }
             Adapter::PiMessages => {
                 if self == &Self::Radius {
                     let gateway = super::radius_auth::Gateway::configured()?;
@@ -219,6 +238,7 @@ pub(super) enum Client {
     Ollama(Ollama),
     Anthropic(Anthropic),
     Google(Google),
+    Bedrock(pi_rs::bedrock::Bedrock),
     PiMessages(PiMessages),
     OpenAi(pi_rs::openai::OpenAiResponses),
     Deferred(Box<Deferred>),
@@ -372,6 +392,14 @@ impl Client {
                 Self::PiMessages(client.with_http_options(timeout, &proxies)?)
             }
             Self::OpenAi(client) => Self::OpenAi(client.with_http_options(timeout, &proxies)?),
+            Self::Bedrock(client) => {
+                if !proxies.is_empty() {
+                    return Err(Error::Config(
+                        "workbench HTTP proxy settings are not supported for Bedrock".into(),
+                    ));
+                }
+                Self::Bedrock(client)
+            }
             Self::Deferred(mut client) => {
                 client.http_settings = Some(settings.clone());
                 Self::Deferred(client)
@@ -445,6 +473,9 @@ impl Client {
                     .stream(request)
                     .await
             }
+            Self::Bedrock(_) if !defaults.is_empty() => Err(Error::Config(
+                "custom Bedrock headers are not supported".into(),
+            )),
             Self::Deferred(client) => {
                 if client.observed {
                     super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
@@ -474,6 +505,11 @@ impl Client {
             Self::Google(client) => Self::Google(client.with_headers(headers)),
             Self::PiMessages(client) => Self::PiMessages(client.with_headers(headers)),
             Self::OpenAi(client) => Self::OpenAi(client.with_headers(headers)),
+            Self::Bedrock(client) => Self::Bedrock(if headers.is_empty() {
+                client
+            } else {
+                client.unsupported("custom Bedrock headers are not supported")
+            }),
             Self::Deferred(_) => unreachable!("deferred provider headers resolve per request"),
         }
     }
@@ -495,6 +531,7 @@ impl Client {
                 .collect()),
             Self::PiMessages(client) => client.models().await,
             Self::OpenAi(client) => client.models().await,
+            Self::Bedrock(_) => Ok(Vec::new()),
             Self::Deferred(client) => Box::pin(client.resolve().await?.models()).await,
         }
     }
@@ -551,7 +588,7 @@ impl Client {
                     .collect()
             }
             Self::PiMessages(client) => client.model_details(models).await,
-            Self::OpenAi(_) => BTreeMap::new(),
+            Self::OpenAi(_) | Self::Bedrock(_) => BTreeMap::new(),
             Self::Deferred(client) => match client.resolve().await {
                 Ok(client) => Box::pin(client.model_details(models)).await,
                 Err(_) => BTreeMap::new(),
@@ -566,6 +603,7 @@ impl Client {
             Self::Google(client) => Self::Google(client.with_context_probe(enabled)),
             Self::PiMessages(client) => Self::PiMessages(client.with_context_probe(enabled)),
             Self::OpenAi(client) => Self::OpenAi(client),
+            Self::Bedrock(client) => Self::Bedrock(client),
             Self::Deferred(mut client) => {
                 client.probe_context = enabled;
                 Self::Deferred(client)
@@ -693,6 +731,13 @@ impl Client {
                     })?;
                 Self::OpenAi(client)
             }
+            Self::Bedrock(client) => {
+                Self::Bedrock(if thinking.is_some_and(|level| level != "off") {
+                    client.unsupported("Bedrock thinking controls are not supported")
+                } else {
+                    client
+                })
+            }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));
                 client.estimator = Arc::new(OnceLock::new());
@@ -720,6 +765,7 @@ impl Client {
                     .thinking_levels
             }
             Self::OpenAi(_) => Some(pi_rs::openai::thinking_levels(model)),
+            Self::Bedrock(_) => None,
             Self::Deferred(client) => {
                 Box::pin(client.resolve().await.ok()?.thinking_levels(model)).await
             }
@@ -736,6 +782,7 @@ impl Client {
             Self::Google(client) => Self::Google(client.with_progress(progress)),
             Self::PiMessages(client) => Self::PiMessages(client.observe(progress)),
             Self::OpenAi(client) => Self::OpenAi(client),
+            Self::Bedrock(client) => Self::Bedrock(client),
             Self::Deferred(mut client) => {
                 client.observed = true;
                 Self::Deferred(client)
@@ -778,6 +825,7 @@ impl Model for Client {
             Self::Google(client) => client.context_window(model).await,
             Self::PiMessages(client) => client.context_window(model).await,
             Self::OpenAi(client) => client.context_window(model).await,
+            Self::Bedrock(client) => client.context_window(model).await,
             Self::Deferred(client) => client.resolve().await.ok()?.context_window(model).await,
         }
     }
@@ -789,6 +837,7 @@ impl Model for Client {
             Self::Google(client) => client.stream(request).await,
             Self::PiMessages(client) => client.stream(request).await,
             Self::OpenAi(client) => client.stream(request).await,
+            Self::Bedrock(client) => client.stream(request).await,
             Self::Deferred(_) => {
                 self.stream_with_headers(request, &HeaderMap::new(), false)
                     .await

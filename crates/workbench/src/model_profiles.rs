@@ -1159,6 +1159,7 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
         Adapter::ChatCompletions => "/chat/completions",
         Adapter::OpenAiResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
+        Adapter::Bedrock => return Ok(url.to_string()),
         Adapter::Google => {
             if url.path() == "/" {
                 url.set_path("/v1beta");
