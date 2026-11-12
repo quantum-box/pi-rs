@@ -182,11 +182,62 @@ impl Session {
             return None;
         }
         let estimate = self.context_usage_estimate();
-        let after_compaction = self
-            .branch()
+        let branch = self.branch();
+        let last_compaction = branch
             .iter()
-            .any(|record| matches!(record.event, Event::Compacted { .. }));
-        let tokens = if after_compaction && estimate.last_usage_record.is_none() {
+            .rposition(|record| matches!(record.event, Event::Compacted { .. }));
+        // An edit can invalidate a usage-based estimate without removing the
+        // post-compaction assistant that makes a fresh estimate meaningful.
+        let has_post_compaction_usage = last_compaction.is_none_or(|index| {
+            let projected: std::collections::HashSet<_> = self
+                .current_message_entries()
+                .into_iter()
+                .filter_map(|(id, message)| {
+                    matches!(message, crate::Message::Assistant { .. }).then_some(id)
+                })
+                .collect();
+            let completions: std::collections::HashMap<_, _> = branch
+                .iter()
+                .filter_map(|record| match &record.event {
+                    Event::ModelFinished {
+                        request_id,
+                        metadata,
+                        failure,
+                        ..
+                    } => Some((*request_id, (metadata, failure))),
+                    _ => None,
+                })
+                .collect();
+            branch[index + 1..].iter().any(|record| {
+                let Event::Assistant {
+                    usage: Some(usage),
+                    request_id,
+                    ..
+                } = &record.event
+                else {
+                    return false;
+                };
+                if !projected.contains(&record.id) {
+                    return false;
+                }
+                let completion = request_id.and_then(|id| completions.get(&id).copied());
+                if completion.is_some_and(|(metadata, failure)| {
+                    failure.is_some()
+                        || matches!(
+                            metadata.finish_reason.as_deref(),
+                            Some("error" | "aborted" | "cancelled")
+                        )
+                }) {
+                    return false;
+                }
+                let input = completion
+                    .and_then(|(metadata, _)| metadata.provider_prompt_tokens)
+                    .filter(|n| *n > 0)
+                    .unwrap_or(usage.input_tokens);
+                input.saturating_add(usage.output_tokens) > 0
+            })
+        });
+        let tokens = if !has_post_compaction_usage {
             None
         } else {
             Some(estimate.tokens)
@@ -196,5 +247,81 @@ impl Session {
             context_window,
             percent: tokens.map(|tokens| tokens as f64 / f64::from(context_window) * 100.0),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ContextContent, MemoryStore, Usage};
+
+    #[test]
+    fn context_usage_after_compaction_and_later_edit_uses_fresh_estimate() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "before".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let before = session.head();
+        session
+            .append(Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: Some(before),
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        assert_eq!(session.context_usage(1000).unwrap().tokens, None);
+        session
+            .append(Event::User {
+                content: "question".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let question = session.head();
+        session
+            .append(Event::Assistant {
+                content: "no usage".into(),
+                invocations: vec![],
+                usage: Some(Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                }),
+                request_id: None,
+            })
+            .unwrap();
+        assert_eq!(session.context_usage(1000).unwrap().tokens, None);
+        session
+            .append(Event::Assistant {
+                content: "answer".into(),
+                invocations: vec![],
+                usage: Some(Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                }),
+                request_id: None,
+            })
+            .unwrap();
+        let assistant = session.head();
+        assert_eq!(session.context_usage(1000).unwrap().tokens, Some(110));
+        session
+            .edit_context(
+                question,
+                Some(ContextContent::Text("changed question".into())),
+            )
+            .unwrap();
+        let estimate = session.context_usage_estimate();
+        assert_eq!(estimate.last_usage_record, None);
+        assert_eq!(
+            session.context_usage(1000).unwrap().tokens,
+            Some(estimate.tokens)
+        );
+        session.edit_context(assistant, None).unwrap();
+        assert_eq!(session.context_usage(1000).unwrap().tokens, None);
     }
 }
