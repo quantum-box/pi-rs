@@ -1792,6 +1792,8 @@ Legacy `custom` and `hookMessage` message records likewise retain their display
 metadata and enter model context without being rendered as user prompts.
 Imported message-form branch summaries use Pi's summary context framing while
 retaining their original RPC representation and branch reference.
+Message-form compaction summaries are displayed as summaries and framed for
+model context without performing another compaction or removing earlier entries.
 
 Imported failed or aborted assistant messages retain their original transcript
 and failure status. Incomplete tool calls in those messages are not executed,

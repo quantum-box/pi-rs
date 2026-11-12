@@ -445,7 +445,9 @@ pub fn html(session: &Session) -> String {
                     render_export_failure(&mut html, status);
                 }
             }
-            Event::Compacted { summary, .. } | Event::BranchSummary { summary, .. } => {
+            Event::Compacted { summary, .. }
+            | Event::CompactionSummaryMessage { summary, .. }
+            | Event::BranchSummary { summary, .. } => {
                 if matches!(
                     record.event,
                     Event::Compacted {
@@ -455,7 +457,10 @@ pub fn html(session: &Session) -> String {
                 ) {
                     has_system_prompt = true;
                 }
-                let label = if matches!(record.event, Event::Compacted { .. }) {
+                let label = if matches!(
+                    record.event,
+                    Event::Compacted { .. } | Event::CompactionSummaryMessage { .. }
+                ) {
                     "Compacted context"
                 } else {
                     "Branch summary"

@@ -344,6 +344,9 @@ impl Projection {
                 content: content.clone(),
                 images: images.clone(),
             },
+            Event::CompactionSummaryMessage { summary, .. } => Message::User {
+                content: summary.clone(),
+            },
             Event::Assistant {
                 content,
                 invocations,
@@ -416,6 +419,12 @@ impl Projection {
                 Event::BashExecution { .. } => shell_message(record).expect("shell record"),
                 Event::BranchSummary { summary, from, .. } => {
                     json!({"role":"branchSummary","summary":summary,"fromId":from.map(|id| id.to_string()),"timestamp":timestamp})
+                }
+                Event::CompactionSummaryMessage {
+                    summary,
+                    tokens_before,
+                } => {
+                    json!({"role":"compactionSummary","summary":summary,"tokensBefore":tokens_before,"timestamp":timestamp})
                 }
                 _ => json!({"role":"user","content":content,"timestamp":timestamp}),
             },
@@ -595,6 +604,7 @@ fn matches_imported_message(source: &Value, event: &Event) -> bool {
         }
         Event::Compacted { .. } => source["type"] == "compaction",
         Event::BranchSummary { .. } => role == Some("branchSummary"),
+        Event::CompactionSummaryMessage { .. } => role == Some("compactionSummary"),
         Event::Assistant { .. } => role == Some("assistant"),
         Event::ToolFinished { .. } | Event::ToolReconciled { .. } => role == Some("toolResult"),
         _ => false,
