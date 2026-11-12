@@ -457,4 +457,42 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn repeated_scalar_options_use_the_last_value_and_lists_accumulate() {
+        let args = cli(&[
+            "pi",
+            "--provider",
+            "first",
+            "--provider",
+            "second",
+            "--model",
+            "old",
+            "--model=new",
+            "--mode",
+            "text",
+            "--mode",
+            "json",
+            "--name",
+            "old name",
+            "-n",
+            "new name",
+            "--append-system-prompt",
+            "one",
+            "--append-system-prompt",
+            "two",
+            "--skill",
+            "first-skill",
+            "--skill",
+            "second-skill",
+            "hello",
+        ]);
+        assert_eq!(args.provider_argument.as_deref(), Some("second"));
+        assert_eq!(args.model, "new");
+        assert!(matches!(args.mode, Some(super::super::OutputMode::Json)));
+        assert_eq!(args.name.as_deref(), Some("new name"));
+        assert_eq!(args.append_system_prompt, ["one", "two"]);
+        assert_eq!(args.skill, ["first-skill", "second-skill"]);
+        assert_eq!(args.prompt, ["hello"]);
+    }
 }

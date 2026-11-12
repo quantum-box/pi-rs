@@ -64,6 +64,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside p
     name = "pi-rs",
     version,
     about,
+    args_override_self = true,
     after_help = "Pi aliases: -v (--version), -nt (--no-tools), -nbt (--no-builtin-tools), -xt (--exclude-tools), -ne (--no-extensions), -ns (--no-skills), -np (--no-prompt-templates), -nc (--no-context-files), -na (--no-approve)."
 )]
 struct Cli {
