@@ -1064,6 +1064,14 @@ fn legacy_prompt_candidates(
 
 fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
     let pattern = pattern.trim_start_matches("./");
+    let pattern_path = Path::new(pattern);
+    if pattern_path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Vec::new();
+    }
+    let absolute = pattern_path.is_absolute();
     let Ok(glob) = globset::GlobBuilder::new(pattern)
         .literal_separator(true)
         .backslash_escape(false)
@@ -1072,16 +1080,23 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         return Vec::new();
     };
     let matcher = glob.compile_matcher();
-    let mut base = root.to_path_buf();
-    for component in Path::new(pattern).components() {
+    let mut base = if absolute {
+        PathBuf::new()
+    } else {
+        root.to_path_buf()
+    };
+    for component in pattern_path.components() {
         let part = component.as_os_str();
         if part.to_string_lossy().contains(['*', '?', '[', '{']) {
             break;
         }
-        if part.to_string_lossy().starts_with('.') && part != "." {
-            return Vec::new();
-        }
         base.push(part);
+    }
+    // Absolute patterns may start above the package, but discovery remains within it.
+    if root.starts_with(&base) {
+        base = root.to_path_buf();
+    } else if !base.starts_with(root) {
+        return Vec::new();
     }
     let mut matches: Vec<_> = ignore::WalkBuilder::new(base)
         .hidden(true)
@@ -1097,7 +1112,7 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
             entry.path().strip_prefix(root).is_ok_and(|path| {
                 path.components()
                     .all(|c| !c.as_os_str().to_string_lossy().starts_with('.'))
-                    && matcher.is_match(path)
+                    && matcher.is_match(if absolute { entry.path() } else { path })
             })
         })
         .map(|entry| entry.into_path())
@@ -1555,6 +1570,38 @@ mod tests {
             discover("./prompts/[ab]/*.md"),
             vec![root.join("prompts/a/nested.md")]
         );
+    }
+
+    #[test]
+    fn package_prompt_absolute_globs_match_only_inside_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::create_dir_all(outside.join("prompts")).unwrap();
+        std::fs::write(root.join("prompts/review.md"), "fixture").unwrap();
+        std::fs::write(root.join("prompts/.hidden.md"), "hidden").unwrap();
+        std::fs::write(outside.join("prompts/outside.md"), "outside").unwrap();
+        let discover = |pattern: String| {
+            collect_package_resources(&root, &json!({"prompts": [pattern]}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        let absolute = format!("{}/prompts/*.md", root.display());
+        assert_eq!(
+            discover(absolute.clone()),
+            vec![root.join("prompts/review.md")]
+        );
+        assert_eq!(
+            discover(absolute.replace('/', "\\")),
+            vec![root.join("prompts/review.md")]
+        );
+        assert_eq!(
+            discover(format!("{}/*/prompts/*.md", temp.path().display())),
+            vec![root.join("prompts/review.md")]
+        );
+        assert!(discover(format!("{}/prompts/*.md", outside.display())).is_empty());
+        assert!(discover("../outside/prompts/*.md".into()).is_empty());
     }
 
     #[cfg(unix)]
