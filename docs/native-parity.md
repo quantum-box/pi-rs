@@ -3265,6 +3265,14 @@ the destination. Fork hooks distinguish the selected entry from the
 position immediately before it. The owned SDK exposes the same fork
 hook through `AgentSession::fork_with_hooks`.
 
+### Tool-call argument mutation checkpoint
+
+Native extensions can modify validated tool arguments in load order before
+execution; subsequent hooks and the tool receive the changed value. The
+executable extension protocol advertises this capability and falls back to
+the existing policy hook for older executables. As in Pi, mutations are not
+revalidated against the tool schema. Argument size limits still apply.
+
 ### Full-system context diagnostics checkpoint
 
 When a `context_with_system` handler removes the leading system message, the

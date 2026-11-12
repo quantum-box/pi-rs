@@ -1655,7 +1655,7 @@ impl Agent<'_> {
                 )));
             }
         };
-        let args = tokio::select! {
+        let mut args = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
             result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.prepare_arguments(args)) => match result {
@@ -1679,7 +1679,7 @@ impl Agent<'_> {
         let decision = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            decision = tokio::time::timeout(self.limits.tool_timeout, self.authorize(&call.name, &args, &context, states)) =>
+            decision = tokio::time::timeout(self.limits.tool_timeout, self.authorize_call(&call.name, &mut args, &context, states)) =>
                 decision.map_err(|_| Error::Config("pre-tool hooks timed out".into()))??,
         };
         Ok(match decision {
@@ -1870,6 +1870,30 @@ impl Agent<'_> {
             }
         }
         Ok(changes)
+    }
+
+    async fn authorize_call(
+        &self,
+        name: &str,
+        args: &mut serde_json::Value,
+        context: &ToolContext,
+        states: &ExtensionStates,
+    ) -> Result<Decision> {
+        for extension in &self.registry.extensions {
+            let decision = hook(
+                extension.as_ref(),
+                extension
+                    .tool_call(name, args, context, states.get(extension.id()))
+                    .await,
+            )?;
+            if decision != Decision::Allow {
+                return Ok(decision);
+            }
+            if args.to_string().len() > 16 * 1024 * 1024 {
+                return Ok(Decision::Deny("tool arguments exceed size limit".into()));
+            }
+        }
+        Ok(Decision::Allow)
     }
 
     async fn authorize(
@@ -3699,6 +3723,95 @@ mod tree_tests {
         async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
             panic!("a veto or supplied summary must bypass the model");
         }
+    }
+
+    struct ArgumentHook(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::Extension for ArgumentHook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            if self.0 == "first" {
+                vec![Arc::new(ArgumentTool)]
+            } else {
+                vec![]
+            }
+        }
+        async fn tool_call(
+            &self,
+            _: &str,
+            args: &mut serde_json::Value,
+            _: &ToolContext,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Decision> {
+            if self.0 == "first" {
+                args["path"] = "changed".into();
+            } else {
+                assert_eq!(args["path"], "changed");
+                args["path"] = "final".into();
+            }
+            Ok(Decision::Allow)
+        }
+    }
+    struct ArgumentTool;
+    #[async_trait::async_trait]
+    impl crate::Tool for ArgumentTool {
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: "fixture".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type":"object", "required":["path"], "properties":{"path":{"const":"original"}}}),
+            }
+        }
+        async fn invoke(&self, args: serde_json::Value, _: ToolContext) -> Outcome {
+            Outcome::Succeeded(args["path"].as_str().unwrap().into())
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_mutations_chain_after_validation_and_reach_tool() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ArgumentHook("first"))).unwrap();
+        registry.register(Arc::new(ArgumentHook("second"))).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: r#"{"path":"original"}"#.into(),
+            },
+        };
+        let prepared = agent
+            .prepare_tool(
+                &invocation,
+                &HashSet::from(["fixture".into()]),
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let Preparation::Ready {
+            tool,
+            args,
+            context,
+            ..
+        } = prepared
+        else {
+            panic!("expected execution")
+        };
+        assert_eq!(
+            tool.tool.invoke(args, context).await,
+            Outcome::Succeeded("final".into())
+        );
     }
 
     struct ResultHook(&'static str);
