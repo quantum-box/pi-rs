@@ -1,3 +1,6 @@
+#[path = "turn_scheduler.rs"]
+mod turn_scheduler;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, RwLock,
@@ -744,7 +747,7 @@ impl Agent<'_> {
                     .await
             } else {
                 dispatcher
-                    .tool_batch(
+                    .dispatch_turn(
                         session,
                         &invocations,
                         &DispatchScope {
@@ -752,7 +755,6 @@ impl Agent<'_> {
                             advertised: &advertised,
                             depth: 0,
                             call_count: Arc::new(AtomicUsize::new(0)),
-                            replies: None,
                         },
                         &mut states,
                         observer,
@@ -1174,444 +1176,6 @@ impl Agent<'_> {
         Ok(())
     }
 
-    async fn tool_batch<T: Into<AgentInput> + Send>(
-        &self,
-        session: &mut Session,
-        invocations: &[Invocation],
-        scope: &DispatchScope<'_>,
-        states: &mut ExtensionStates,
-        observer: &mut Observer<'_>,
-        mut inputs: Option<&mut mpsc::Receiver<T>>,
-    ) -> Result<()> {
-        let cancel = scope.cancellation;
-        let observe_tools = self.registry.extensions.iter().any(|extension| {
-            extension.handles_lifecycle() && extension.handles_tool_execution_lifecycle()
-        });
-        let observe_progress = self.registry.extensions.iter().any(|extension| {
-            extension.handles_lifecycle()
-                && extension.handles_tool_execution_lifecycle()
-                && extension.handles_tool_execution_updates()
-        });
-        let parallel = |inv: &Invocation| {
-            self.registry
-                .tools
-                .get(&inv.call.name)
-                .is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead)
-        };
-        let mut remaining = invocations;
-        while let Some((first, rest)) = remaining.split_first() {
-            // Only consecutive read-only tools overlap. Writes and job dispatches are barriers.
-            let count = if parallel(first) {
-                1 + rest.iter().take(7).take_while(|inv| parallel(inv)).count()
-            } else {
-                1
-            };
-            let (group, next) = remaining.split_at(count);
-            let mut prepared = Vec::with_capacity(count);
-            let mut parents = Vec::with_capacity(count);
-            for invocation in group {
-                let parent = tool_parent_call_id(session, invocation.operation_id);
-                if observe_tools {
-                    self.observe_lifecycle(
-                        crate::LifecycleEvent::ToolExecutionStart {
-                            tool_call_id: invocation.call.id.clone(),
-                            tool_name: invocation.call.name.clone(),
-                            args: crate::parse_tool_arguments(&invocation.call.arguments)
-                                .unwrap_or(serde_json::Value::Null),
-                            parent_tool_call_id: parent.clone(),
-                        },
-                        states,
-                        Some(cancel),
-                        observer,
-                    )
-                    .await;
-                }
-                parents.push(parent);
-                let preparation = self.prepare_tool(invocation, scope.advertised, states, cancel);
-                tokio::pin!(preparation);
-                let preparation = loop {
-                    tokio::select! {
-                        result = &mut preparation => break result?,
-                        Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
-                    }
-                };
-                prepared.push(preparation);
-            }
-            if cancel.is_cancelled() {
-                return Err(Error::Cancelled);
-            }
-            let mut dispatches = Vec::new();
-            for (invocation, preparation) in group.iter().zip(&prepared) {
-                if matches!(preparation, Preparation::Ready { .. }) {
-                    if cancel.is_cancelled() {
-                        for operation_id in dispatches {
-                            commit_with_reply(
-                                session,
-                                Event::ToolFinished {
-                                    operation_id,
-                                    outcome: Outcome::Skipped(
-                                        "cancelled before the parallel group dispatched".into(),
-                                    ),
-                                    states: ExtensionStates::new(),
-                                },
-                                observer,
-                                scope.replies,
-                            )?;
-                        }
-                        return Err(Error::Cancelled);
-                    }
-                    commit(
-                        session,
-                        Event::ToolStarted {
-                            operation_id: invocation.operation_id,
-                        },
-                        observer,
-                    )?;
-                    dispatches.push(invocation.operation_id);
-                }
-            }
-            let (requests, mut incoming) = mpsc::channel(32);
-            let (updates, mut progress) = mpsc::channel::<crate::LifecycleEvent>(32);
-            let (finish_progress, mut finish_signal) = oneshot::channel();
-            let (progress_events, mut observed_progress) = mpsc::channel(32);
-            let progress_registry = self.registry.clone();
-            let progress_states = states.clone();
-            let progress_cancel = cancel.clone();
-            let progress_timeout = self.limits.model_timeout;
-            let progress_worker = tokio::spawn(async move {
-                let mut errors = Vec::new();
-                let mut closing = false;
-                loop {
-                    let event = tokio::select! {
-                        _ = &mut finish_signal, if !closing => {
-                            closing = true;
-                            progress.close();
-                            continue;
-                        }
-                        event = progress.recv() => match event { Some(event) => event, None => break },
-                    };
-                    let _ = progress_events.send(event.clone()).await;
-                    if !observe_progress {
-                        continue;
-                    }
-                    let mut collect = |notification: Notification<'_>| {
-                        if let Notification::ExtensionLifecycleError {
-                            extension,
-                            event,
-                            message,
-                        } = notification
-                        {
-                            errors.push((extension.to_owned(), event, message.to_owned()));
-                        }
-                    };
-                    tokio::select! {
-                        biased;
-                        _ = progress_cancel.cancelled() => {},
-                        _ = crate::lifecycle::notify(&progress_registry, event, &progress_states, progress_timeout, &mut collect) => {},
-                    }
-                }
-                errors
-            });
-            let specs = Arc::new(self.registry.tool_specs());
-            let invocations =
-                group
-                    .iter()
-                    .zip(prepared)
-                    .zip(&parents)
-                    .map(|((invocation, prepared), parent)| {
-                        let cancellation = match &prepared {
-                            Preparation::Ready { context, .. } => context.cancellation.clone(),
-                            Preparation::Skipped(_) => cancel.child_token(),
-                        };
-                        let host = Arc::new(NestedHost {
-                            requests: requests.clone(),
-                            specs: specs.clone(),
-                            parent_operation: invocation.operation_id,
-                            cancellation,
-                            depth: scope.depth,
-                            call_count: scope.call_count.clone(),
-                            ui: self.registry.ui.clone(),
-                            progress: Some(ProgressReporter {
-                                sender: updates.clone(),
-                                tool_call_id: invocation.call.id.clone(),
-                                tool_name: invocation.call.name.clone(),
-                                args: crate::parse_tool_arguments(&invocation.call.arguments)
-                                    .unwrap_or(serde_json::Value::Null),
-                                parent_tool_call_id: parent.clone(),
-                            }),
-                        });
-                        let ran = matches!(&prepared, Preparation::Ready { .. });
-                        async move {
-                            let started = std::time::Instant::now();
-                            let reply = self.invoke(prepared, cancel, host, scope.depth > 0).await;
-                            let duration = ran.then(|| {
-                                started.elapsed().as_millis().min(u64::MAX as u128) as u64
-                            });
-                            (reply, duration)
-                        }
-                    });
-            let outcomes = futures_util::future::join_all(invocations);
-            tokio::pin!(outcomes);
-            let mut nested_error = None;
-            let mut pending_requests = VecDeque::<NestedRequest>::new();
-            let outcomes = loop {
-                tokio::select! {
-                    completed = &mut outcomes => break completed,
-                    Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
-                    Some(event) = observed_progress.recv() => observer(Notification::ToolProgress(&event)),
-                    Some(request) = async {
-                        if pending_requests.is_empty() {
-                            pending_requests.extend(incoming.recv().await?);
-                        }
-                        pending_requests.pop_front()
-                    } => {
-                        let parent = request.parent_operation;
-                        let mut batch = vec![request];
-                        while batch.len() < 8 {
-                            if pending_requests.is_empty() {
-                                match incoming.try_recv() {
-                                    Ok(requests) => pending_requests.extend(requests),
-                                    Err(_) => break,
-                                }
-                            }
-                            let request = pending_requests.pop_front().expect("queued nested request");
-                            if request.parent_operation != parent {
-                                pending_requests.push_front(request);
-                                break;
-                            }
-                            batch.push(request);
-                        }
-                        // The nested future also emits notifications. Share the observer so
-                        // sibling progress can be forwarded while that future is pending.
-                        let completed = {
-                            let shared = std::sync::Mutex::new(&mut *observer);
-                            let mut nested_observer = |event: Notification<'_>| {
-                                (shared.lock().expect("observer"))(event);
-                            };
-                            let nested = self.nested_tools(session, batch, states, &mut nested_observer, inputs.as_deref_mut());
-                            tokio::pin!(nested);
-                            let mut completed = None;
-                            loop {
-                                tokio::select! {
-                                    result = &mut nested => {
-                                        if let Err(error) = result { nested_error.get_or_insert(error); }
-                                        break completed;
-                                    },
-                                    result = &mut outcomes, if completed.is_none() => completed = Some(result),
-                                    Some(event) = observed_progress.recv() => {
-                                        (shared.lock().expect("observer"))(Notification::ToolProgress(&event));
-                                    }
-                                }
-                            }
-                        };
-                        if let Some(completed) = completed { break completed; }
-                    }
-                }
-            };
-            let _ = finish_progress.send(());
-            // The worker may be blocked on the bounded forwarding queue. Drain
-            // it until the sender closes before joining the worker.
-            while let Some(event) = observed_progress.recv().await {
-                observer(Notification::ToolProgress(&event));
-            }
-            {
-                match progress_worker.await {
-                    Ok(errors) => {
-                        for (extension, event, message) in &errors {
-                            observer(Notification::ExtensionLifecycleError {
-                                extension,
-                                event,
-                                message,
-                            });
-                        }
-                    }
-                    Err(error) => observer(Notification::ExtensionLifecycleError {
-                        extension: "tool-progress",
-                        event: "tool_execution_update",
-                        message: &error.to_string(),
-                    }),
-                }
-            }
-            let mut first_error = None;
-            // All started outcomes are recorded even if one parallel member failed.
-            for ((invocation, (mut outcome, duration)), parent) in
-                group.iter().zip(outcomes).zip(parents)
-            {
-                self.transform_tool_result(invocation, &mut outcome, states, cancel, observer)
-                    .await;
-                let finished = self.finish_tool(
-                    session,
-                    invocation,
-                    outcome,
-                    states,
-                    observer,
-                    scope.replies,
-                );
-                if observe_tools
-                    && let Some(result) =
-                        session
-                            .records()
-                            .iter()
-                            .rev()
-                            .find_map(|record| match &record.event {
-                                Event::ToolFinished {
-                                    operation_id,
-                                    outcome,
-                                    ..
-                                } if *operation_id == invocation.operation_id => {
-                                    Some(outcome.clone())
-                                }
-                                _ => None,
-                            })
-                {
-                    let is_error = matches!(
-                        &result,
-                        Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-                    ) || matches!(&result, Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } if data["isError"] == true);
-                    self.observe_lifecycle(
-                        crate::LifecycleEvent::ToolExecutionEnd {
-                            tool_call_id: invocation.call.id.clone(),
-                            tool_name: invocation.call.name.clone(),
-                            result,
-                            is_error,
-                            duration_ms: duration,
-                            parent_tool_call_id: parent,
-                        },
-                        states,
-                        None,
-                        observer,
-                    )
-                    .await;
-                }
-                if let Err(error) = finished
-                    && (first_error.is_none()
-                        || (matches!(first_error, Some(Error::PendingOperation(_)))
-                            && !matches!(error, Error::PendingOperation(_))))
-                {
-                    first_error = Some(error);
-                }
-            }
-            match first_error {
-                Some(Error::PendingOperation(_)) => {
-                    self.poll_pending(session, states, cancel, observer, scope.replies)
-                        .await?
-                }
-                Some(error) => return Err(error),
-                None => {}
-            }
-            if let Some(error) = nested_error {
-                return Err(error);
-            }
-            remaining = next;
-        }
-        Ok(())
-    }
-
-    async fn nested_tools<T: Into<AgentInput> + Send>(
-        &self,
-        session: &mut Session,
-        requests: Vec<NestedRequest>,
-        states: &mut ExtensionStates,
-        observer: &mut Observer<'_>,
-        inputs: Option<&mut mpsc::Receiver<T>>,
-    ) -> Result<()> {
-        let invocations: Vec<_> = requests
-            .iter()
-            .map(|request| {
-                let operation_id = Uuid::new_v4();
-                Invocation {
-                    operation_id,
-                    call: crate::ToolCall {
-                        id: operation_id.to_string(),
-                        name: request.name.clone(),
-                        arguments: request.arguments.to_string(),
-                    },
-                }
-            })
-            .collect();
-        let replies: HashMap<_, _> = requests
-            .iter()
-            .zip(&invocations)
-            .map(|(request, invocation)| (invocation.operation_id, request.snapshot.clone()))
-            .collect();
-        let execute = async {
-            for (request, invocation) in requests.iter().zip(&invocations) {
-                commit(
-                    session,
-                    Event::ToolPlanned {
-                        invocation: invocation.clone(),
-                        parent_operation: request.parent_operation,
-                    },
-                    observer,
-                )?;
-            }
-            let advertised = self.registry.tools.keys().cloned().collect();
-            Box::pin(self.tool_batch(
-                session,
-                &invocations,
-                &DispatchScope {
-                    cancellation: &requests[0].cancellation,
-                    advertised: &advertised,
-                    depth: requests[0].depth,
-                    call_count: requests[0].call_count.clone(),
-                    replies: Some(&replies),
-                },
-                states,
-                observer,
-                inputs,
-            ))
-            .await
-        }
-        .await;
-        if execute.is_err() {
-            requests[0].cancellation.cancel();
-        }
-        for (request, invocation) in requests.into_iter().zip(invocations) {
-            let operation_id = invocation.operation_id;
-            let operation = session
-                .operations()
-                .into_iter()
-                .find(|(current, _)| current.operation_id == operation_id);
-            if matches!(
-                operation.as_ref().map(|(_, state)| state),
-                Some(OperationState::Planned)
-            ) {
-                let reason = execute
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "nested dispatch did not start".into());
-                commit_with_reply(
-                    session,
-                    Event::ToolFinished {
-                        operation_id,
-                        outcome: Outcome::Skipped(reason),
-                        states: ExtensionStates::new(),
-                    },
-                    observer,
-                    Some(&replies),
-                )?;
-            }
-            let outcome = session
-                .operations()
-                .into_iter()
-                .find_map(|(current, state)| {
-                    if current.operation_id != operation_id {
-                        return None;
-                    }
-                    match state {
-                        OperationState::Finished(outcome) => Some(outcome),
-                        _ => None,
-                    }
-                })
-                .unwrap_or_else(|| {
-                    Outcome::Unknown("nested tool produced no durable result".into())
-                });
-            let _ = request.reply.send(outcome);
-        }
-        execute
-    }
-
     async fn poll_pending(
         &self,
         session: &mut Session,
@@ -1673,72 +1237,6 @@ impl Agent<'_> {
         Ok(())
     }
 
-    async fn prepare_tool(
-        &self,
-        invocation: &Invocation,
-        advertised: &HashSet<String>,
-        states: &ExtensionStates,
-        cancel: &CancellationToken,
-    ) -> Result<Preparation<'_>> {
-        let call = &invocation.call;
-        let Some(tool) = self
-            .registry
-            .tools
-            .get(&call.name)
-            .filter(|_| advertised.contains(&call.name))
-        else {
-            return Ok(Preparation::Skipped(
-                "tool is not registered or advertised".into(),
-            ));
-        };
-        let args = match crate::parse_tool_arguments(&call.arguments) {
-            Ok(arguments) => arguments,
-            Err(error) => {
-                return Ok(Preparation::Skipped(format!(
-                    "Invalid arguments for tool \"{}\": {error}",
-                    call.name
-                )));
-            }
-        };
-        let mut args = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.prepare_arguments(args)) => match result {
-                Ok(Ok(arguments)) if arguments.to_string().len() <= 16 * 1024 * 1024 => arguments,
-                Ok(Ok(_)) => return Ok(Preparation::Skipped("prepared arguments exceed size limit".into())),
-                Ok(Err(error)) => return Ok(Preparation::Skipped(format!("argument preparation failed: {error}"))),
-                Err(_) => return Ok(Preparation::Skipped("argument preparation timed out".into())),
-            },
-        };
-        if !tool.validator.is_valid(&args) {
-            return Ok(Preparation::Skipped(
-                "arguments do not match the tool's JSON Schema".into(),
-            ));
-        }
-        let cancellation = cancel.child_token();
-        let guard = cancellation.clone().drop_guard();
-        let context = ToolContext {
-            operation_id: invocation.operation_id,
-            cancellation,
-        };
-        let decision = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Error::Cancelled),
-            decision = tokio::time::timeout(self.limits.tool_timeout, self.authorize_call(&call.name, &mut args, &context, states)) =>
-                decision.map_err(|_| Error::Config("pre-tool hooks timed out".into()))??,
-        };
-        Ok(match decision {
-            Decision::Allow => Preparation::Ready {
-                tool,
-                args,
-                context,
-                state: states.get(&tool.owner).cloned(),
-                guard,
-            },
-            Decision::Deny(reason) => Preparation::Skipped(reason),
-        })
-    }
-
     async fn transform_tool_result(
         &self,
         invocation: &Invocation,
@@ -1747,51 +1245,16 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) {
-        if matches!(
-            reply.outcome,
-            Outcome::Skipped(_) | Outcome::Unknown(_) | Outcome::Pending { .. }
-        ) {
-            return;
-        }
-        for extension in self
-            .registry
-            .extensions
-            .iter()
-            .filter(|item| item.handles_tool_result())
-        {
-            let context = ToolContext {
-                operation_id: invocation.operation_id,
-                cancellation: cancel.child_token(),
-            };
-            let _cancel_on_drop = context.cancellation.clone().drop_guard();
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                result = tokio::time::timeout(self.limits.tool_timeout, extension.tool_result_update(
-                    &invocation.call, &reply.outcome, &context, states.get(extension.id()),
-                )) => result,
-            };
-            let error = match result {
-                Ok(Ok(Some(outcome)))
-                    if !matches!(
-                        outcome,
-                        Outcome::Skipped(_) | Outcome::Unknown(_) | Outcome::Pending { .. }
-                    ) =>
-                {
-                    reply.outcome = outcome;
-                    continue;
-                }
-                Ok(Ok(None)) => continue,
-                Ok(Ok(Some(_))) => "invalid replacement outcome".to_owned(),
-                Ok(Err(error)) => error,
-                Err(_) => "tool result hook timed out".to_owned(),
-            };
-            observer(Notification::ExtensionLifecycleError {
-                extension: extension.id(),
-                event: "tool_result",
-                message: &error,
-            });
-        }
+        Self::turn_transform(
+            self.registry,
+            self.limits.tool_timeout,
+            invocation,
+            reply,
+            states,
+            cancel,
+            observer,
+        )
+        .await;
     }
 
     fn finish_tool(
@@ -1929,30 +1392,6 @@ impl Agent<'_> {
         Ok(changes)
     }
 
-    async fn authorize_call(
-        &self,
-        name: &str,
-        args: &mut serde_json::Value,
-        context: &ToolContext,
-        states: &ExtensionStates,
-    ) -> Result<Decision> {
-        for extension in &self.registry.extensions {
-            let decision = hook(
-                extension.as_ref(),
-                extension
-                    .tool_call(name, args, context, states.get(extension.id()))
-                    .await,
-            )?;
-            if decision != Decision::Allow {
-                return Ok(decision);
-            }
-            if args.to_string().len() > 16 * 1024 * 1024 {
-                return Ok(Decision::Deny("tool arguments exceed size limit".into()));
-            }
-        }
-        Ok(Decision::Allow)
-    }
-
     async fn authorize(
         &self,
         name: &str,
@@ -1972,53 +1411,6 @@ impl Agent<'_> {
             }
         }
         Ok(Decision::Allow)
-    }
-
-    async fn invoke(
-        &self,
-        preparation: Preparation<'_>,
-        cancel: &CancellationToken,
-        host: Arc<dyn ToolHost>,
-        programmatic: bool,
-    ) -> ToolReply {
-        let (tool, args, context, state, _guard) = match preparation {
-            Preparation::Ready {
-                tool,
-                args,
-                context,
-                state,
-                guard,
-            } => (tool, args, context, state, guard),
-            Preparation::Skipped(reason) => return Outcome::Skipped(reason).into(),
-        };
-        let timeout = if self.registry.omit_default_tool_timeout && !tool.tool.use_default_timeout()
-        {
-            None
-        } else {
-            Some(self.limits.tool_timeout)
-        };
-        let invocation = async {
-            if programmatic {
-                tool.tool
-                    .invoke_programmatic(args, context, state.as_ref(), host)
-                    .await
-            } else {
-                tool.tool
-                    .invoke_transaction_with_timeout(args, context, state.as_ref(), host, timeout)
-                    .await
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()).into(),
-            result = async {
-                match timeout {
-                    Some(timeout) => tokio::time::timeout(timeout, invocation).await
-                        .unwrap_or_else(|_| Outcome::Unknown("tool timed out".into()).into()),
-                    None => invocation.await,
-                }
-            } => result,
-        }
     }
 
     /// Execute a discovered slash command before treating input as model text.
@@ -3189,7 +2581,6 @@ struct DispatchScope<'a> {
     advertised: &'a HashSet<String>,
     depth: usize,
     call_count: Arc<AtomicUsize>,
-    replies: Option<&'a HashMap<Uuid, ReplySnapshot>>,
 }
 type ReplySnapshot = Arc<std::sync::Mutex<Option<Outcome>>>;
 struct NestedRequest {
@@ -3232,11 +2623,18 @@ struct NestedHost {
     progress: Option<ProgressReporter>,
 }
 struct ProgressReporter {
-    sender: mpsc::Sender<crate::LifecycleEvent>,
+    sender: ProgressSink,
     tool_call_id: String,
     tool_name: String,
     args: serde_json::Value,
     parent_tool_call_id: Option<String>,
+}
+enum ProgressSink {
+    Turn(mpsc::Sender<TurnProgress>),
+}
+enum TurnProgress {
+    Event(Box<crate::LifecycleEvent>),
+    Flush(oneshot::Sender<()>),
 }
 #[async_trait::async_trait]
 impl ToolHost for NestedHost {
@@ -3267,13 +2665,14 @@ impl ToolHost for NestedHost {
         if self.cancellation.is_cancelled() {
             return Err("tool progress cancelled".into());
         }
-        progress
-            .sender
-            .try_send(event)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => "tool progress queue is full".into(),
-                mpsc::error::TrySendError::Closed(_) => "tool has finished".into(),
-            })
+        match &progress.sender {
+            ProgressSink::Turn(sender) => sender
+                .try_send(TurnProgress::Event(Box::new(event)))
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => "tool progress queue is full".into(),
+                    mpsc::error::TrySendError::Closed(_) => "tool has finished".into(),
+                }),
+        }
     }
     fn has_ui(&self) -> bool {
         self.ui.is_some()
@@ -3352,17 +2751,6 @@ impl ToolHost for NestedHost {
         }))
         .await
     }
-}
-
-enum Preparation<'a> {
-    Ready {
-        tool: &'a RegisteredTool,
-        args: serde_json::Value,
-        context: ToolContext,
-        state: Option<crate::ExtensionState>,
-        guard: tokio_util::sync::DropGuard,
-    },
-    Skipped(String),
 }
 
 // Journal and accounting failures stay outside the retryable provider outcome.
@@ -3885,16 +3273,17 @@ mod tree_tests {
                 arguments: r#"{"path":"original"}"#.into(),
             },
         };
-        let prepared = agent
-            .prepare_tool(
-                &invocation,
-                &HashSet::from(["fixture".into()]),
-                &ExtensionStates::new(),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let Preparation::Ready {
+        let prepared = Agent::turn_prepare(
+            &registry,
+            agent.limits.tool_timeout,
+            &invocation,
+            &HashSet::from(["fixture".into()]),
+            &ExtensionStates::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let turn_scheduler::TurnPreparation::Ready {
             tool,
             args,
             context,

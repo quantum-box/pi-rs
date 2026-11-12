@@ -171,7 +171,9 @@ An in-process orchestrating tool can override `invoke_with_host` and use
 `ToolHost::call`. Nested calls use the registry's schemas, pre-tool policies,
 execution ordering and state hooks. The journal records each nested operation
 with its parent operation ID. Only the parent tool result enters model context.
-Consecutive nested parallel reads may overlap; mutating calls stay ordered.
+Consecutive nested parallel reads may overlap, with at most eight active per
+parent group. Mutating calls are barriers, and results are journaled in each
+parent's call order. A completed call can return while a later read is running.
 
 Cancellation after dispatch leaves the affected operations unknown and blocks
 automatic replay. Calls are bounded to eight nesting levels, 4096 nested calls
