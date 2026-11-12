@@ -89,23 +89,23 @@ pub(crate) fn estimate_source_tokens(
             ..
         }) => {
             let edited = session.branch().iter().any(|record| matches!(&record.event, Event::ContextEdited { target, .. } if *target == source));
-            let reasoning = (!edited)
-                .then(|| {
-                    session
-                        .branch()
-                        .iter()
-                        .find_map(|record| match &record.event {
-                            Event::ModelFinished {
-                                request_id: id,
-                                metadata,
-                                ..
-                            } if id == request_id => metadata.reasoning.as_deref(),
-                            _ => None,
-                        })
-                        .map(text_chars)
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
+            let reasoning = if edited {
+                0
+            } else {
+                session
+                    .branch()
+                    .iter()
+                    .find_map(|record| match &record.event {
+                        Event::ModelFinished {
+                            request_id: id,
+                            metadata,
+                            ..
+                        } if id == request_id => metadata.reasoning.as_deref(),
+                        _ => None,
+                    })
+                    .map(text_chars)
+                    .unwrap_or(0)
+            };
             message_chars(message).saturating_add(reasoning).div_ceil(4)
         }
         _ => estimate_message_tokens(message),
