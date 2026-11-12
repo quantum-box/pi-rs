@@ -118,6 +118,12 @@ fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) 
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ProtocolRequest {
     Describe,
+    ToolCall {
+        name: String,
+        arguments: Value,
+        operation_id: String,
+        state: Option<ExtensionState>,
+    },
     Migrate {
         state: Option<ExtensionState>,
     },
@@ -252,6 +258,8 @@ struct Description {
     input_hook: bool,
     #[serde(default)]
     tool_result_hook: bool,
+    #[serde(default)]
+    tool_call_hook: bool,
     #[serde(default)]
     user_bash_hook: bool,
     #[serde(default)]
@@ -793,6 +801,35 @@ impl Extension for ExecutableExtension {
                 .await
                 .map_err(|error| error.to_string())??;
         Ok(result.into())
+    }
+    fn handles_tool_call(&self) -> bool {
+        self.description.tool_call_hook
+    }
+    async fn tool_call(
+        &self,
+        name: &str,
+        arguments: &mut Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.tool_call_hook {
+            return self.before_tool(name, arguments, context, state).await;
+        }
+        let request = ProtocolRequest::ToolCall {
+            name: name.into(),
+            arguments: arguments.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let (updated, decision): (Value, DecisionValue) =
+            tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+                .await
+                .map_err(|error| error.to_string())??;
+        *arguments = updated;
+        Ok(decision.into())
     }
     fn handles_tool_result(&self) -> bool {
         self.description.tool_result_hook
@@ -1689,6 +1726,7 @@ async fn dispatch_with_host(
             command_effects: extension.supports_command_effects(),
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
+            tool_call_hook: extension.handles_tool_call(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
@@ -1812,6 +1850,18 @@ async fn dispatch_with_host(
                 return Err("unknown extension command".into());
             }
             encode(extension.command_effects(&name, &arguments, state.as_ref()))
+        }
+        ProtocolRequest::ToolCall {
+            name,
+            mut arguments,
+            operation_id,
+            state,
+        } => {
+            let context = context(&operation_id)?;
+            let decision = extension
+                .tool_call(&name, &mut arguments, &context, state.as_ref())
+                .await?;
+            encode(Ok((arguments, DecisionValue::from(decision))))
         }
         ProtocolRequest::BeforeTool {
             name,
@@ -2071,6 +2121,47 @@ mod tests {
         let encoded = serde_json::to_vec(&request).unwrap();
         let decoded = serde_json::from_slice(&encoded).unwrap();
         dispatch(extension, decoded).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_call_hook_is_advertised_and_transports_mutations() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "arguments"
+            }
+            fn handles_tool_call(&self) -> bool {
+                true
+            }
+            async fn tool_call(
+                &self,
+                _: &str,
+                args: &mut Value,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Decision> {
+                args["path"] = "changed".into();
+                Ok(Decision::Allow)
+            }
+        }
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["tool_call_hook"], true);
+        let request = ProtocolRequest::ToolCall {
+            name: "fixture".into(),
+            arguments: serde_json::json!({"path":"original"}),
+            operation_id: "00000000-0000-4000-8000-000000000001".into(),
+            state: None,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let result = dispatch(extension, serde_json::from_slice(&encoded).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result[0]["path"], "changed");
+        assert_eq!(result[1]["allow"], true);
     }
 
     #[tokio::test]

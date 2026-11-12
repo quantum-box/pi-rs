@@ -637,6 +637,22 @@ pub trait Extension: Send + Sync {
         Ok(Decision::Allow)
     }
 
+    /// Opt in to modifying validated tool arguments before execution.
+    fn handles_tool_call(&self) -> bool {
+        false
+    }
+
+    /// Later hooks observe changes to `args`. The default preserves the policy hook.
+    async fn tool_call(
+        &self,
+        name: &str,
+        args: &mut Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Decision> {
+        self.before_tool(name, args, context, state).await
+    }
+
     /// Opt in to transforming completed tool results before they enter the journal.
     fn handles_tool_result(&self) -> bool {
         false
