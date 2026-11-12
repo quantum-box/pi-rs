@@ -2060,16 +2060,21 @@ mod tests {
                 .get("maximum")
                 .is_none()
         );
-        let outcome = tool
-            .invoke(
-                json!({"pattern":"needle", "context":1001}),
-                ToolContext {
-                    operation_id: uuid::Uuid::nil(),
-                    cancellation: pi_rs::CancellationToken::new(),
-                },
-            )
-            .await;
-        assert!(outcome.tool_content().starts_with("fixture-1- before\n"));
+        let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        for context in [json!(1001), json!(1001.0), json!(1e20)] {
+            let args = json!({"pattern":"needle", "context":context});
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(outcome.tool_content().starts_with("fixture-1- before\n"));
+        }
     }
 
     #[tokio::test]
