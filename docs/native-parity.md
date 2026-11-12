@@ -1623,6 +1623,15 @@ round trip produced exactly the same results as the pinned Pi tool for the same
 fixture. Workspace tests and all-target Clippy passed. Full structured tool details and
 remaining native search edge cases still require acceptance work.
 
+### Local image reads
+
+Local `read` preserves supported image bytes and MIME types when they fit Pi's
+default image limits, and applies model-specific limits when configured. Its
+text result reports the MIME type and, when dimensions change, the coordinate
+scale back to the original image. The local read tool allows enough result
+space for Pi's default inline image payload; scoped hosted tools retain their
+existing tighter output bound.
+
 ### Local file-path input checkpoint
 
 The file tools share Pi-style input normalization for leading `@`, home-directory

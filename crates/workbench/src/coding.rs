@@ -421,6 +421,16 @@ impl Tool for CodingTool {
         }
     }
 
+    fn output_limit(&self) -> usize {
+        if self.unrestricted && matches!(self.kind, Kind::Read { .. }) {
+            // The reference permits inline images up to a 4.5 MiB base64
+            // payload; include room for the surrounding JSON and text.
+            8 * 1024 * 1024
+        } else {
+            1024 * 1024
+        }
+    }
+
     async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
         if matches!(self.kind, Kind::Edit) {
             crate::text_edit::prepare_arguments(arguments).map_err(edit_error_text)
@@ -598,6 +608,36 @@ impl CodingTool {
         if path.metadata()?.len() > 20 * 1024 * 1024 {
             return Err(Error::Config("image exceeds 20 MiB".into()));
         }
+        if self.unrestricted
+            && let Kind::Read {
+                auto_resize: true,
+                profile,
+            } = self.kind
+        {
+            let original_mime = format.to_mime_type();
+            let prepared = crate::image_profile::normalize(reader, profile.unwrap_or_default())?;
+            let mut note = format!("Read image file [{}]", prepared.mime_type);
+            if !matches!(
+                original_mime,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            ) {
+                note.push_str(&format!(
+                    "\n[Image converted from {original_mime} to {}.]",
+                    prepared.mime_type
+                ));
+            }
+            if prepared.source != prepared.output {
+                let scale = prepared.source.0 as f64 / prepared.output.0 as f64;
+                note.push_str(&format!(
+                    "\n[Image: original {}x{}, displayed at {}x{}. Multiply coordinates by {scale:.2} to map to original image.]",
+                    prepared.source.0, prepared.source.1, prepared.output.0, prepared.output.1
+                ));
+            }
+            return Ok(Some(json!({"content":[
+                {"type":"text", "text":note},
+                {"type":"image", "mimeType":prepared.mime_type, "data":base64::engine::general_purpose::STANDARD.encode(prepared.bytes)}
+            ]})));
+        }
         let (bytes, mime_type, source, output) = if matches!(
             self.kind,
             Kind::Read {
@@ -647,8 +687,20 @@ impl CodingTool {
                 (prepared.width, prepared.height),
             )
         };
+        let note = if self.unrestricted {
+            format!("Read image file [{mime_type}]")
+        } else {
+            format!(
+                "Read image {} ({}×{}, provided at {}×{})",
+                path.display(),
+                source.0,
+                source.1,
+                output.0,
+                output.1
+            )
+        };
         Ok(Some(json!({"content":[
-            {"type":"text","text":format!("Read image {} ({}×{}, provided at {}×{})",path.display(),source.0,source.1,output.0,output.1)},
+            {"type":"text","text":note},
             {"type":"image","mimeType":mime_type,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}
         ]})))
     }
@@ -2036,6 +2088,56 @@ mod tests {
             std::fs::read_to_string(root.join("file.txt")).unwrap(),
             "A B\n"
         );
+    }
+
+    #[test]
+    fn local_image_reads_preserve_supported_bytes_and_report_resized_coordinates() {
+        let directory = tempfile::tempdir().unwrap();
+        let small = directory.path().join("small.jpg");
+        image::RgbImage::from_pixel(32, 24, image::Rgb([12, 34, 56]))
+            .save(&small)
+            .unwrap();
+        let wide = directory.path().join("wide.png");
+        image::RgbImage::from_pixel(2100, 42, image::Rgb([12, 34, 56]))
+            .save(&wide)
+            .unwrap();
+        let tool = CodingTool {
+            root: directory.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+            },
+        };
+        assert_eq!(tool.output_limit(), 8 * 1024 * 1024);
+        let result = tool.read_image(&small).unwrap().unwrap();
+        assert_eq!(result["content"][0]["text"], "Read image file [image/jpeg]");
+        assert_eq!(result["content"][1]["mimeType"], "image/jpeg");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(result["content"][1]["data"].as_str().unwrap())
+                .unwrap(),
+            std::fs::read(&small).unwrap()
+        );
+        let result = tool.read_image(&wide).unwrap().unwrap();
+        let note = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            note.contains("original 2100x42, displayed at 2000x40"),
+            "{note}"
+        );
+        assert!(note.contains("Multiply coordinates by 1.05"), "{note}");
+        let result = CodingTool {
+            kind: Kind::Read {
+                auto_resize: false,
+                profile: None,
+            },
+            ..tool
+        }
+        .read_image(&small)
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["content"][0]["text"], "Read image file [image/jpeg]");
     }
 
     #[test]
