@@ -908,10 +908,13 @@ fn collect_package_resources(
                 }
             });
         validate_patterns(&patterns)?;
+        if name == "prompts" {
+            *target = collect_package_prompts(root, &patterns);
+            continue;
+        }
         for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
             .git_ignore(false)
-            .follow_links(name == "prompts")
             .filter_entry(|entry| {
                 !matches!(
                     entry.file_name().to_str(),
@@ -930,6 +933,102 @@ fn collect_package_resources(
         }
     }
     Ok(resources)
+}
+
+fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let overrides: Vec<String> = patterns
+        .iter()
+        .filter(|p| p.starts_with(['!', '+', '-']))
+        .cloned()
+        .collect();
+    for pattern in patterns.iter().filter(|p| !p.starts_with(['!', '+', '-'])) {
+        let sources = if pattern.contains(['*', '?']) {
+            expand_prompt_glob(root, pattern)
+        } else {
+            vec![root.join(pattern)]
+        };
+        for source in sources {
+            if source.is_file() {
+                paths.push(source);
+            } else if source.is_dir() {
+                // A selected directory is the ignore root, including when it is a symlink.
+                for entry in ignore::WalkBuilder::new(&source)
+                    .hidden(true)
+                    .parents(false)
+                    .git_ignore(true)
+                    .require_git(false)
+                    .git_global(false)
+                    .git_exclude(false)
+                    .add_custom_ignore_filename(".fdignore")
+                    .follow_links(true)
+                    .filter_entry(|entry| entry.file_name() != "node_modules")
+                    .build()
+                    .flatten()
+                {
+                    if entry.file_type().is_some_and(|kind| kind.is_file())
+                        && entry.file_name().to_string_lossy().ends_with(".md")
+                    {
+                        paths.push(entry.into_path());
+                    }
+                }
+            }
+        }
+    }
+    if !overrides.is_empty() {
+        paths.retain(|path| manifest_selected(path, root, &overrides));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    let Ok(glob) = globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .backslash_escape(false)
+        .build()
+    else {
+        return Vec::new();
+    };
+    let matcher = glob.compile_matcher();
+    let mut base = root.to_path_buf();
+    for component in Path::new(pattern).components() {
+        let part = component.as_os_str();
+        if part.to_string_lossy().contains(['*', '?']) {
+            break;
+        }
+        if part.to_string_lossy().starts_with('.') && part != "." {
+            return Vec::new();
+        }
+        base.push(part);
+        // Glob expansion must not traverse a symlink, even in its fixed prefix.
+        if base
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Vec::new();
+        }
+    }
+    ignore::WalkBuilder::new(base)
+        .hidden(true)
+        .parents(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .follow_links(false)
+        .build()
+        .flatten()
+        .filter(|entry| {
+            entry.path().strip_prefix(root).is_ok_and(|path| {
+                path.components()
+                    .all(|c| !c.as_os_str().to_string_lossy().starts_with('.'))
+                    && matcher.is_match(path)
+            })
+        })
+        .map(|entry| entry.into_path())
+        .collect()
 }
 fn snapshot_registry_source(source: &Path, cache: &Path) -> Result<PathBuf> {
     use std::io::{Read, Write};
@@ -1174,6 +1273,81 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.prompts, vec![root.join("prompts/linked.md")]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_selection_bounds_symlink_traversal_and_globs() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(root.join("prompts/visible.md"), "visible").unwrap();
+        std::fs::write(external.join("linked.md"), "linked").unwrap();
+        symlink(&external, root.join("prompts/link")).unwrap();
+        symlink("/", root.join("unrelated")).unwrap();
+
+        let discover = |patterns: serde_json::Value| {
+            collect_package_resources(&root, &json!({"prompts": patterns}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        assert!(discover(json!([])).is_empty());
+        assert_eq!(
+            discover(json!(["prompts/visible.md"])),
+            vec![root.join("prompts/visible.md")]
+        );
+        assert_eq!(
+            discover(json!(["prompts/**/*.md"])),
+            vec![root.join("prompts/visible.md")]
+        );
+        assert!(discover(json!(["prompts/link/*.md"])).is_empty());
+        assert_eq!(
+            discover(json!(["prompts/link"])),
+            vec![root.join("prompts/link/linked.md")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_symlink_targets_respect_local_ignores_and_hidden_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(external.join(".hidden-dir")).unwrap();
+        for name in [
+            "visible.md",
+            "git.md",
+            "fd.md",
+            ".hidden.md",
+            ".hidden-dir/nested.md",
+        ] {
+            std::fs::write(external.join(name), "fixture").unwrap();
+        }
+        std::fs::write(external.join(".gitignore"), "git.md\n").unwrap();
+        std::fs::write(external.join(".fdignore"), "fd.md\n").unwrap();
+        symlink(&external, root.join("prompts")).unwrap();
+        for manifest in [json!({}), json!({"prompts": ["prompts"]})] {
+            let prompts = collect_package_resources(&root, &manifest, Vec::new())
+                .unwrap()
+                .prompts;
+            assert_eq!(prompts, vec![root.join("prompts/visible.md")]);
+        }
+        let explicit = collect_package_resources(
+            &root,
+            &json!({"prompts": ["prompts/.hidden.md", "prompts/git.md"]}),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.prompts,
+            vec![root.join("prompts/.hidden.md"), root.join("prompts/git.md")]
+        );
     }
     #[test]
     fn explicit_manifest_excludes_undeclared_resource_types() {
