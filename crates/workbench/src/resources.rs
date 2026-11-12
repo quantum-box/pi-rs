@@ -559,7 +559,7 @@ fn parse_prompt(path: &Path) -> Result<Prompt> {
             description
         });
     Ok(Prompt {
-        path: path.canonicalize()?,
+        path: path.to_owned(),
         description,
         body,
     })

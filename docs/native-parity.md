@@ -2,6 +2,10 @@
 
 The reference is Pi v1.5.0, commit
 `f9a26365568127461c47a07a37dcb42c140a3ac5`.
+
+Automatic user and trusted-project prompt discovery scans visible Markdown files
+directly in each `prompts` directory and honors its ignore files, matching Pi.
+Nested or hidden prompt files can still be selected explicitly.
 The requested compatibility is equivalent functionality implemented in Rust.
 
 Markdown headings are separated from a following block by one blank line,
@@ -478,7 +482,8 @@ profile selects PowerShell. Windows CI exercises PowerShell output, timeout and 
 directory traversal. `grep` also checks cancellation between file reads, even
 when a file produces no matches. Local `grep` and `ls` report the resolved
 absolute path when the target is missing, and `grep` clamps a zero match limit
-to one as Pi does.
+to one as Pi does. Grep honors requested context beyond 1,000 lines and
+still applies the 50 KiB output limit with truncation metadata.
 
 ### Model-selection checkpoint
 

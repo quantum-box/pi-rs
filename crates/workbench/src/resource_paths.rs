@@ -104,19 +104,22 @@ pub fn resolve(
     let workspace = args.workspace.canonicalize()?;
     let mut paths = Vec::new();
     for path in explicit {
-        append(
-            &mut paths,
-            expand(
-                &absolute(&workspace, &path.to_string_lossy()),
-                kind,
-                true,
-                warnings,
-            )?,
-        );
+        let path = absolute(&workspace, &path.to_string_lossy());
+        if kind == Kind::Prompt && path.is_dir() {
+            append(&mut paths, vec![path]);
+            continue;
+        }
+        append(&mut paths, expand(&path, kind, true, warnings)?);
     }
     if kind.disabled(args) {
         return Ok(paths);
     }
+    // Pi merges enabled prompt resources before additional CLI prompt paths.
+    let additional_prompts = if kind == Kind::Prompt {
+        std::mem::take(&mut paths)
+    } else {
+        Vec::new()
+    };
     let mut layers = args.settings.resource_layers(kind.key())?;
     let project = workspace.join(".pi");
     let project = project.canonicalize().unwrap_or(project);
@@ -127,6 +130,7 @@ pub fn resolve(
     {
         layers.push((project, Vec::new()));
     }
+    let mut seen_prompts = Vec::new();
     for (layer_index, (base, entries)) in layers.into_iter().enumerate().rev() {
         let base = base.canonicalize().unwrap_or(base);
         let entries: Vec<_> = entries
@@ -152,9 +156,16 @@ pub fn resolve(
             if found.is_empty() && !path.exists() {
                 warnings.push(format!("Resource {} was not found", path.display()));
             }
-            append(&mut configured, found);
+            configured.extend(found);
         }
-        if !patterns.is_empty() {
+        if kind == Kind::Prompt {
+            configured.retain(|path| {
+                let previous = seen_prompts.len();
+                append(&mut seen_prompts, vec![path.clone()]);
+                seen_prompts.len() != previous
+                    && (patterns.is_empty() || packages::selected(path, &base, &patterns))
+            });
+        } else if !patterns.is_empty() {
             configured.retain(|path| packages::selected(path, &base, &patterns));
         }
         append(&mut paths, configured);
@@ -190,8 +201,21 @@ pub fn resolve(
                 .cloned(),
         );
         for (root, scope) in roots {
-            let mut discovered = collect(&root, kind, false, warnings)?;
-            discovered.retain(|path| packages::selected(path, &scope, &overrides));
+            let mut discovered = if kind == Kind::Prompt {
+                auto_prompts(&root, warnings)?
+            } else {
+                collect(&root, kind, false, warnings)?
+            };
+            discovered.retain(|path| {
+                if kind == Kind::Prompt {
+                    let previous = seen_prompts.len();
+                    append(&mut seen_prompts, vec![path.clone()]);
+                    if seen_prompts.len() == previous {
+                        return false;
+                    }
+                }
+                packages::selected(path, &scope, &overrides)
+            });
             append(&mut paths, discovered);
         }
     }
@@ -203,11 +227,50 @@ pub fn resolve(
             .cloned()
             .collect(),
     );
+    append(&mut paths, additional_prompts);
     Ok(paths)
+}
+// Pi's automatic prompt discovery scans only visible files in the prompt root,
+// applying ignore files from that directory. Configured paths use collect instead.
+fn auto_prompts(root: &Path, warnings: &mut Vec<String>) -> Result<Vec<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in ignore::WalkBuilder::new(root)
+        .max_depth(Some(1))
+        .hidden(true)
+        .parents(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .add_custom_ignore_filename(".fdignore")
+        .follow_links(true)
+        .build()
+    {
+        match entry {
+            Ok(entry)
+                if entry.depth() == 1
+                    && entry.path().is_file()
+                    && Kind::Prompt.accepts(entry.path()) =>
+            {
+                files.push(entry.into_path());
+            }
+            Err(error) => warnings.push(error.to_string()),
+            _ => {}
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 fn append(paths: &mut Vec<PathBuf>, additions: Vec<PathBuf>) {
     for path in additions {
-        if !paths.contains(&path) {
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !paths
+            .iter()
+            .any(|existing| existing.canonicalize().unwrap_or_else(|_| existing.clone()) == key)
+        {
             paths.push(path);
         }
     }
@@ -272,7 +335,11 @@ fn collect_matching(
     matcher: Option<&globset::GlobMatcher>,
 ) -> Result<Vec<PathBuf>> {
     if path.is_file() {
-        return Ok(vec![path.canonicalize()?]);
+        return Ok(vec![if kind == Kind::Prompt {
+            path.to_owned()
+        } else {
+            path.canonicalize()?
+        }]);
     }
     if !path.is_dir() {
         return if required {
@@ -295,16 +362,30 @@ fn collect_matching(
         return Ok(files);
     }
     let mut files = Vec::new();
-    for entry in ignore::WalkBuilder::new(path)
-        .hidden(false)
-        .git_ignore(false)
+    let mut walker = ignore::WalkBuilder::new(path);
+    walker
+        .hidden(kind == Kind::Prompt)
+        .git_ignore(kind == Kind::Prompt);
+    if kind == Kind::Prompt {
+        walker
+            .parents(false)
+            .git_global(false)
+            .git_exclude(false)
+            .require_git(false)
+            .add_custom_ignore_filename(".fdignore");
+    }
+    for entry in walker
         .follow_links(true)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             entry.depth() == 0
-                || !matches!(
-                    entry.file_name().to_str(),
-                    Some(".git" | "target" | "node_modules")
-                )
+                || if kind == Kind::Prompt {
+                    entry.file_name() != "node_modules"
+                } else {
+                    !matches!(
+                        entry.file_name().to_str(),
+                        Some(".git" | "target" | "node_modules")
+                    )
+                }
         })
         .build()
     {
@@ -319,7 +400,11 @@ fn collect_matching(
             && kind.accepts(entry.path())
             && matches_pattern(entry.path(), path, matcher)
         {
-            files.push(entry.path().canonicalize()?);
+            files.push(if kind == Kind::Prompt {
+                entry.into_path()
+            } else {
+                entry.path().canonicalize()?
+            });
         }
     }
     files.sort();
