@@ -412,6 +412,10 @@ impl Cli {
     ) -> Option<model_auth::Credential> {
         self.model_keys
             .credential(provider, endpoint)
+            .or_else(|| {
+                self.model_keys
+                    .custom_credential(provider, endpoint, &self.model_profiles)
+            })
             .cloned()
             .or_else(|| self.model_profiles.credential(provider, endpoint))
             .or_else(|| {
