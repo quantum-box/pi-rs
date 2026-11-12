@@ -4491,3 +4491,182 @@ fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
         assert_eq!(state["data"]["model"]["id"], "beta", "{state}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn kimi_auth_commands_wait_for_refresh_after_sigint() {
+    for command in ["check", "print-bearer-token"] {
+        let root = tempfile::tempdir().unwrap();
+        let auth = root.path().join("auth.json");
+        std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).unwrap() > 0);
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let barrier = tempfile::NamedTempFile::new().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_WORKER_REFRESH_BARRIER", barrier.path())
+            .env("PI_RS_HOME", root.path())
+            .env("KIMI_CODE_OAUTH_HOST", host)
+            .args(["--provider", "kimi-coding", "auth", command])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(
+            barrier.as_file().try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{command} exited during refresh"
+        );
+        release_tx.send(()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stored: Value = serde_json::from_slice(&std::fs::read(&auth).unwrap()).unwrap();
+        assert_eq!(stored["kimi-coding"]["refresh"], "rotated");
+        barrier.as_file().try_lock().unwrap();
+        barrier.as_file().unlock().unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_check_reads_readonly_store_and_environment_keys() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let auth = home.join("auth.json");
+    std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"cached","refresh":"refresh","expires":9_000_000_000_000_u64}}).to_string()).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let kimi = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--provider", "kimi-coding", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    let env_key = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "fixture-key")
+        .args(["--provider", "openai", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        &auth,
+        json!({"kimi-coding":{"type":"oauth","access":"expired","refresh":"refresh","expires":0}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let expired = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--provider", "kimi-coding", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_file(&auth).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let missing = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "fixture-key")
+        .args(["--provider", "openai", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(expired.status.code(), Some(2));
+    assert!(missing.status.success());
+    assert!(
+        kimi.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kimi.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&kimi.stdout).unwrap()["status"],
+        "ready"
+    );
+    assert!(
+        env_key.status.success(),
+        "{}",
+        String::from_utf8_lossy(&env_key.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&env_key.stdout).unwrap()["status"],
+        "ready"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_chatgpt_login_does_not_wait_for_held_refresh_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.path().join("chatgpt-refresh.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .args(["login", "openai-chatgpt"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    lock.unlock().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        status.is_some(),
+        "login did not cancel while the lock was held"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

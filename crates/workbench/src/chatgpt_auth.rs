@@ -101,22 +101,27 @@ fn load() -> Result<Option<pi_rs::openai::oauth::Credential>> {
         .transpose()
 }
 async fn lock() -> Result<std::fs::File> {
-    let path = super::config::agent_dir().join("chatgpt-refresh.lock");
-    tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(path.parent().expect("lock parent"))?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        file.lock()?;
-        Ok::<_, std::io::Error>(file)
-    })
-    .await
-    .map_err(|_| Error::Config("could not lock ChatGPT credentials".into()))?
-    .map_err(Error::Io)
+    lock_path(super::config::agent_dir().join("chatgpt-refresh.lock")).await
 }
+async fn lock_path(path: std::path::PathBuf) -> Result<std::fs::File> {
+    std::fs::create_dir_all(path.parent().expect("lock parent"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
+        }
+    }
+}
+
 fn host_id() -> Result<String> {
     let mut result = String::new();
     super::config::update_object(

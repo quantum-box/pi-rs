@@ -240,6 +240,9 @@ fn auth_path() -> std::path::PathBuf {
 }
 fn load(path: &std::path::Path) -> Result<Option<Credential>> {
     let value = super::config::read_object_unlocked(path)?;
+    parse_credential(&value)
+}
+fn parse_credential(value: &Value) -> Result<Option<Credential>> {
     let Some(entry) = value.get("kimi-coding").filter(|e| e["type"] == "oauth") else {
         return Ok(None);
     };
@@ -294,7 +297,18 @@ async fn access_at(
     no_refresh: bool,
 ) -> Result<String> {
     let required = minimum.unwrap_or_default().max(NORMAL_MINIMUM);
-    let guard = super::auth_lock::acquire_async(&path).await?;
+    let guard = match super::auth_lock::acquire_async(&path).await {
+        Ok(guard) => guard,
+        Err(err) => {
+            let stored = super::config::read_readonly_auth(&path, err)?;
+            let value =
+                parse_credential(&stored)?.ok_or_else(|| error("credentials not configured"))?;
+            if no_refresh || !expires_soon(&value, required) {
+                return Ok(value.access);
+            }
+            return Err(error("cannot refresh credentials in a read-only store"));
+        }
+    };
     let value = load(&path)?.ok_or_else(|| error("credentials not configured"))?;
     guard.check()?;
     if no_refresh || !expires_soon(&value, required) {
@@ -307,6 +321,17 @@ async fn access_at(
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
+        let barrier = std::env::var_os(super::process::REFRESH_BARRIER_ENV)
+            .map(|path| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+            })
+            .transpose()?;
+        if let Some(file) = &barrier {
+            file.lock()?;
+        }
         let previous = serde_json::to_value(&value)?;
         let value = runtime.block_on(service.refresh(&value.refresh))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {

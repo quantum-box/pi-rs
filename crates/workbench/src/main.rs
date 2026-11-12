@@ -1263,6 +1263,14 @@ fn main() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() -> i32 {
+    // Register before parsing or starting any operation, including auth commands.
+    let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = signal_tx.send(());
+        }
+    });
+    tokio::task::yield_now().await;
     let argv: Vec<_> = std::env::args_os().collect();
     let (matches, extension_flags) = match cli_compat::parse(argv.iter().cloned()) {
         Ok(parsed) => parsed,
@@ -1325,9 +1333,10 @@ async fn run_cli() -> i32 {
                 ));
             }
             let command = command.clone();
-            return auth_cli::run(args, command).await.map(|code| {
-                cli_exit_code = code;
-            });
+            return tokio::select! {
+                result = auth_cli::run(args, command) => result.map(|code| { cli_exit_code = code; }),
+                _ = &mut signal_rx => Err(Error::Cancelled),
+            };
         }
         let decision = config::project_trust(
             &args.workspace,
@@ -1408,7 +1417,14 @@ async fn run_cli() -> i32 {
         if matches.value_source("session") != Some(clap::parser::ValueSource::CommandLine) {
             args.session = interactive::session_path(&args.workspace, args.session_dir.as_deref());
         }
-        Box::pin(execute(args, &mut output_truncated)).await
+        if matches!(&args.command, Some(Command::Login { .. })) {
+            tokio::select! {
+                result = Box::pin(execute(args, &mut output_truncated)) => result,
+                _ = &mut signal_rx => Err(Error::Cancelled),
+            }
+        } else {
+            Box::pin(execute(args, &mut output_truncated)).await
+        }
     }
     .await;
     if let Err(err) = result {

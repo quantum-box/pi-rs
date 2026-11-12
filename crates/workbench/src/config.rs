@@ -481,16 +481,125 @@ pub(super) fn update_object_locked(
 }
 
 pub fn read_object(path: &Path) -> Result<Value> {
-    let shared = if path.file_name().is_some_and(|name| name == "auth.json") {
-        Some(super::auth_lock::acquire(path)?)
-    } else {
-        None
-    };
-    let value = read_object_unlocked(path)?;
-    if let Some(guard) = shared {
-        guard.check()?;
+    if !path.file_name().is_some_and(|name| name == "auth.json") {
+        return read_object_unlocked(path);
     }
-    Ok(value)
+    match super::auth_lock::acquire(path) {
+        Ok(guard) => {
+            let value = read_object_unlocked(path)?;
+            guard.check()?;
+            Ok(value)
+        }
+        Err(error) => read_readonly_auth(path, error),
+    }
+}
+
+fn same_auth_metadata(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    if a.len() != b.len() || a.modified().ok() != b.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && a.ctime() == b.ctime()
+            && a.ctime_nsec() == b.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        a.created().ok() == b.created().ok()
+    }
+}
+
+// Readers unable to create the shared lock can use a stable snapshot only when
+// the directory is read-only. Any observed lock or concurrent change fails closed.
+pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
+    let denied = matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(libc::EROFS));
+    if !denied {
+        return Err(error);
+    }
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let metadata = std::fs::metadata(parent)?;
+    #[cfg(unix)]
+    let readonly = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o222 == 0
+            || matches!(&error, Error::Io(e) if e.raw_os_error() == Some(libc::EROFS))
+    };
+    #[cfg(not(unix))]
+    let readonly = metadata.permissions().readonly();
+    if !readonly {
+        return Err(error);
+    }
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    let lock = std::path::PathBuf::from(lock);
+    let unlocked = || match std::fs::symlink_metadata(&lock) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(Error::Config(
+            "auth.json is locked; cannot read a read-only store safely".into(),
+        )),
+        Err(e) => Err(Error::Io(e)),
+    };
+    let snapshot = || -> Result<Option<(Vec<u8>, std::fs::Metadata)>> {
+        match std::fs::File::open(path) {
+            Ok(mut file) => {
+                use std::io::Read;
+                let before = file.metadata()?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                let after = file.metadata()?;
+                if !same_auth_metadata(&before, &after) {
+                    return Err(Error::Config("auth.json changed while reading".into()));
+                }
+                Ok(Some((bytes, after)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+    unlocked()?;
+    let first = snapshot()?;
+    unlocked()?;
+    let second = snapshot()?;
+    unlocked()?;
+    let same = match (&first, &second) {
+        (None, None) => true,
+        (Some((a, ma)), Some((b, mb))) => a == b && same_auth_metadata(ma, mb),
+        _ => false,
+    };
+    if !same {
+        return Err(Error::Config("auth.json changed while reading".into()));
+    }
+    // A writer could finish and remove its lock after the second read; compare
+    // the path again after the final lock check before accepting the snapshot.
+    let current = match std::fs::metadata(path) {
+        Ok(value) => Some(value),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if !match (&second, current.as_ref()) {
+        (None, None) => true,
+        (Some((_, before)), Some(after)) => same_auth_metadata(before, after),
+        _ => false,
+    } {
+        return Err(Error::Config("auth.json changed while reading".into()));
+    }
+    match second {
+        None => Ok(Value::Object(Map::new())),
+        Some((bytes, _)) => {
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+            if !value.is_object() {
+                return Err(Error::Config(format!(
+                    "{} must contain an object",
+                    path.display()
+                )));
+            }
+            Ok(value)
+        }
+    }
 }
 
 pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
@@ -569,6 +678,26 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn readonly_auth_snapshot_rejects_active_pi_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"provider":{"type":"api_key","key":"fixture"}}"#).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let denied =
+            || pi_rs::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            super::read_readonly_auth(&path, denied()).unwrap()["provider"]["key"],
+            "fixture"
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(dir.path().join("auth.json.lock")).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(super::read_readonly_auth(&path, denied()).is_err());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     #[test]
     fn global_updates_preserve_project_precedence_in_memory_and_on_disk() {
         use super::*;

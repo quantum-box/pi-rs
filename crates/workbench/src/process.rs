@@ -8,6 +8,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub(super) const REFRESH_BARRIER_ENV: &str = "PI_RS_WORKER_REFRESH_BARRIER";
 pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 pub(super) const SELECTION_PROVENANCE_ENV: &str = "PI_RS_WORKER_SELECTION_PROVENANCE";
@@ -35,6 +36,7 @@ pub(super) struct Worker {
     configuration: Value,
     pub(super) child: Child,
     stdin: Option<ChildStdin>,
+    refresh_barrier: tempfile::NamedTempFile,
     events: Receiver<Value>,
     pending_events: Vec<Value>,
     pub(super) readers: Vec<JoinHandle<()>>,
@@ -51,7 +53,9 @@ impl Worker {
     ) -> Result<Self> {
         let steering_mode = session_queue_mode(args, pi_rs::InputKind::Steer)?;
         let follow_up_mode = session_queue_mode(args, pi_rs::InputKind::FollowUp)?;
+        let refresh_barrier = tempfile::NamedTempFile::new()?;
         let mut command = Command::new(std::env::current_exe()?);
+        command.env(REFRESH_BARRIER_ENV, refresh_barrier.path());
         command.env_remove("PI_RS_MODEL_TOKEN");
         command.env_remove(SESSION_TRANSITION_ENV);
         command.env(
@@ -229,6 +233,7 @@ impl Worker {
             configuration: configuration(args),
             child,
             stdin,
+            refresh_barrier,
             events,
             pending_events: Vec::new(),
             readers,
@@ -543,10 +548,7 @@ impl Drop for Worker {
             self.stdin.take();
             let deadline =
                 Instant::now() + Duration::from_secs(if self.persistent { 30 } else { 5 });
-            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let _ = self.child.kill();
+            terminate_after_grace(&mut self.child, self.refresh_barrier.as_file(), deadline);
         }
         let _ = self.child.wait();
         for reader in self.readers.drain(..) {
@@ -555,9 +557,52 @@ impl Drop for Worker {
     }
 }
 
+fn terminate_after_grace(child: &mut Child, barrier: &std::fs::File, deadline: Instant) {
+    while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        // The child locks this file before the token exchange. Holding it while
+        // killing prevents a new exchange from starting after the grace period.
+        if barrier.lock().is_ok() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = barrier.unlock();
+        } else {
+            let _ = child.wait();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[cfg(unix)]
+    #[test]
+    fn worker_teardown_waits_for_refresh_barrier_after_grace() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let barrier = tempfile::NamedTempFile::new().unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(barrier.path())
+            .unwrap();
+        held.lock().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            super::terminate_after_grace(&mut child, barrier.as_file(), Instant::now());
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        held.unlock().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        waiter.join().unwrap();
+    }
     #[test]
     fn queue_mode_uses_current_branch_even_when_session_is_locked() {
         let root = tempfile::tempdir().unwrap();
