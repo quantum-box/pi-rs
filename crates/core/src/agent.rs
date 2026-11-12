@@ -1253,6 +1253,36 @@ impl Agent<'_> {
             }
             let (requests, mut incoming) = mpsc::channel(32);
             let (updates, mut progress) = mpsc::channel(32);
+            let (finish_progress, mut finish_signal) = oneshot::channel();
+            let progress_registry = self.registry.clone();
+            let progress_states = states.clone();
+            let progress_cancel = cancel.clone();
+            let progress_timeout = self.limits.model_timeout;
+            let progress_worker = observe_progress.then(|| tokio::spawn(async move {
+                let mut errors = Vec::new();
+                let mut closing = false;
+                loop {
+                    let event = tokio::select! {
+                        _ = &mut finish_signal, if !closing => {
+                            closing = true;
+                            progress.close();
+                            continue;
+                        }
+                        event = progress.recv() => match event { Some(event) => event, None => break },
+                    };
+                    let mut collect = |notification: Notification<'_>| {
+                        if let Notification::ExtensionLifecycleError { extension, event, message } = notification {
+                            errors.push((extension.to_owned(), event, message.to_owned()));
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = progress_cancel.cancelled() => {},
+                        _ = crate::lifecycle::notify(&progress_registry, event, &progress_states, progress_timeout, &mut collect) => {},
+                    }
+                }
+                errors
+            }));
             let specs = Arc::new(self.registry.tool_specs());
             let invocations =
                 group
@@ -1298,9 +1328,6 @@ impl Agent<'_> {
             let outcomes = loop {
                 tokio::select! {
                     completed = &mut outcomes => break completed,
-                    Some(event) = progress.recv() => {
-                        self.observe_lifecycle(event, states, Some(cancel), observer).await;
-                    }
                     Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
                     Some(request) = async {
                         if pending_requests.is_empty() {
@@ -1324,55 +1351,38 @@ impl Agent<'_> {
                             }
                             batch.push(request);
                         }
-                        let snapshot = states.clone();
-                        let mut progress_errors = Vec::new();
-                        let mut completed_batch = None;
-                        {
-                            let nested = self.nested_tools(session, batch, states, observer, inputs.as_deref_mut());
-                            tokio::pin!(nested);
-                            let mut nested_result = None;
-                            loop {
-                                tokio::select! {
-                                    result = &mut nested => {
-                                        nested_result = Some(result);
-                                        break;
-                                    },
-                                    completed = &mut outcomes, if completed_batch.is_none() => {
-                                        completed_batch = Some(completed);
-                                    },
-                                    Some(event) = progress.recv() => {
-                                        let mut collect = |notification: Notification<'_>| {
-                                            if let Notification::ExtensionLifecycleError { extension, event, message } = notification {
-                                                progress_errors.push((extension.to_owned(), event, message.to_owned()));
-                                            }
-                                        };
-                                        let notify = self.observe_lifecycle(event, &snapshot, Some(cancel), &mut collect);
-                                        tokio::pin!(notify);
-                                        loop {
-                                            tokio::select! {
-                                                _ = &mut notify => break,
-                                                result = &mut nested, if nested_result.is_none() => nested_result = Some(result),
-                                                completed = &mut outcomes, if completed_batch.is_none() => completed_batch = Some(completed),
-                                            }
-                                        }
-                                        if nested_result.is_some() { break; }
-                                    }
-                                }
+                        let nested = self.nested_tools(session, batch, states, observer, inputs.as_deref_mut());
+                        tokio::pin!(nested);
+                        tokio::select! {
+                            result = &mut nested => {
+                                if let Err(error) = result { nested_error.get_or_insert(error); }
+                            },
+                            completed = &mut outcomes => {
+                                if let Err(error) = nested.await { nested_error.get_or_insert(error); }
+                                break completed;
                             }
-                            if let Some(Err(error)) = nested_result { nested_error.get_or_insert(error); }
-                        }
-                        for (extension, event, message) in &progress_errors {
-                            observer(Notification::ExtensionLifecycleError { extension, event, message });
-                        }
-                        if let Some(completed) = completed_batch {
-                            break completed;
                         }
                     }
                 }
             };
-            while let Ok(event) = progress.try_recv() {
-                self.observe_lifecycle(event, states, Some(cancel), observer)
-                    .await;
+            let _ = finish_progress.send(());
+            if let Some(worker) = progress_worker {
+                match worker.await {
+                    Ok(errors) => {
+                        for (extension, event, message) in &errors {
+                            observer(Notification::ExtensionLifecycleError {
+                                extension,
+                                event,
+                                message,
+                            });
+                        }
+                    }
+                    Err(error) => observer(Notification::ExtensionLifecycleError {
+                        extension: "tool-progress",
+                        event: "tool_execution_update",
+                        message: &error.to_string(),
+                    }),
+                }
             }
             let mut first_error = None;
             // All started outcomes are recorded even if one parallel member failed.
@@ -3139,11 +3149,16 @@ impl ToolHost for NestedHost {
             partial_result,
             parent_tool_call_id: progress.parent_tool_call_id.clone(),
         };
-        tokio::select! {
-            biased;
-            _ = self.cancellation.cancelled() => Err("tool progress cancelled".into()),
-            sent = progress.sender.send(event) => sent.map_err(|_| "tool has finished".into()),
+        if self.cancellation.is_cancelled() {
+            return Err("tool progress cancelled".into());
         }
+        progress
+            .sender
+            .try_send(event)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => "tool progress queue is full".into(),
+                mpsc::error::TrySendError::Closed(_) => "tool has finished".into(),
+            })
     }
     fn has_ui(&self) -> bool {
         self.ui.is_some()

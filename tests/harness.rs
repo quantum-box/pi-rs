@@ -339,6 +339,99 @@ fn answer(value: &str) -> Vec<ModelEvent> {
 fn ignore(_: Notification<'_>) {}
 
 #[tokio::test]
+async fn progress_hook_does_not_suspend_running_tool() {
+    struct LockingTool(Arc<tokio::sync::Mutex<()>>);
+    #[async_trait::async_trait]
+    impl Tool for LockingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "locking tool".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let _guard = self.0.lock().await;
+            host.report_progress(json!({"text":"working"}))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Outcome::Succeeded("done".into())
+        }
+    }
+    struct Hook {
+        tool: Arc<LockingTool>,
+        events: Arc<Mutex<Vec<Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for Hook {
+        fn id(&self) -> &str {
+            "locking-hook"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![self.tool.clone()]
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_updates(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &LifecycleEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            if matches!(event, LifecycleEvent::ToolExecutionUpdate { .. }) {
+                let _guard = self.tool.0.lock().await;
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            }
+            Ok(())
+        }
+    }
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Hook {
+            tool: Arc::new(LockingTool(Arc::new(tokio::sync::Mutex::new(())))),
+            events: events.clone(),
+        }))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&[r#"{"id":"x"}"#]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("tool progress hook blocked the tool")
+    .unwrap();
+    assert_eq!(events.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn sibling_progress_is_delivered_while_nested_tool_runs() {
     struct Parent {
         started: Arc<tokio::sync::Notify>,

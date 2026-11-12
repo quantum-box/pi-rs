@@ -317,7 +317,8 @@ Nested tool calls include their parent tool-call ID. Executable extensions
 advertise this capability with `tool_execution_lifecycle_hook`. A tool using
 `invoke_with_host` may call `host.report_progress(partial_result).await` to emit
 ephemeral update events during execution. Progress is limited to 1 MiB per
-update and is not journaled. The v2 executable protocol negotiates support;
+update and is not journaled. The bounded progress queue returns an error when
+full so a slow observer cannot indefinitely block a tool. The v2 executable protocol negotiates support;
 new executables work with old hosts, where progress is ignored. Parallel calls
 currently emit end notifications in journal order after the batch settles;
 completion-order notifications and progress from built-in tools remain open.
