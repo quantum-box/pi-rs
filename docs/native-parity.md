@@ -76,6 +76,9 @@ without `defaultProvider` are still accepted.
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+Input hooks identify command-line print and JSON prompts as `interactive`, as
+Pi does, while RPC and extension-originated submissions retain their own source.
+
 Known text-only chat models receive Pi's image-omission placeholders for user
 and tool images. Unknown model capabilities leave image handling to the
 provider, and the explicit image-blocking setting retains precedence.
@@ -93,7 +96,8 @@ conversation branch.
 Native extensions can opt into tool execution start, update and end events,
 including nested call ancestry, partial results, final outcomes and elapsed
 execution time. Rust tools with a host can emit bounded progress while running;
-progress from built-in tools and completion-order notifications remain open.
+the built-in shell tool emits bounded cumulative output updates. Other built-in
+tool progress and completion-order notifications remain open.
 
 ### xAI Responses checkpoint
 
