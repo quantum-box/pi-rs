@@ -1811,7 +1811,7 @@ fn reload_waits_for_auth_lock_without_closing_terminal() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -1917,7 +1917,7 @@ fn sigint_cancels_interactive_startup_model_discovery() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -1999,7 +1999,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0
@@ -2111,7 +2111,7 @@ fn sigint_restores_terminal_before_waiting_for_refresh_barrier() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::addr_of_mut!(size),
             )
         },
         0

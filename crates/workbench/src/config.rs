@@ -481,7 +481,7 @@ pub(super) fn update_object_locked(
 }
 
 pub fn read_object(path: &Path) -> Result<Value> {
-    if !path.file_name().is_some_and(|name| name == "auth.json") {
+    if path.file_name().is_none_or(|name| name != "auth.json") {
         return read_object_unlocked(path);
     }
     match super::auth_lock::acquire(path) {
