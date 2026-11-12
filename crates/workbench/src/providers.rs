@@ -545,11 +545,26 @@ impl Client {
             Self::Google(client) => Self::Google(client.with_thinking(thinking)),
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
             Self::OpenAi(client) => {
-                let levels = pi_rs::openai::thinking_levels(&args.model);
-                let thinking = if levels.len() == 1 {
+                let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let levels = metadata
+                    .as_ref()
+                    .and_then(|model| model.levels(Adapter::OpenAiResponses))
+                    .unwrap_or_else(|| pi_rs::openai::thinking_levels(&args.model));
+                let thinking = if metadata
+                    .as_ref()
+                    .is_some_and(|model| model.reasoning == Some(false))
+                    || levels.len() == 1 && levels[0] == "off"
+                {
                     None
                 } else {
-                    thinking.filter(|level| levels.iter().any(|item| item == level))
+                    thinking
+                        .filter(|level| levels.iter().any(|item| item == level))
+                        .and_then(|level| {
+                            metadata
+                                .as_ref()
+                                .and_then(|model| model.mapped_effort(level))
+                                .unwrap_or(Some(level))
+                        })
                 };
                 Self::OpenAi(client.with_thinking(thinking))
             }

@@ -526,8 +526,10 @@ impl ModelMetadata {
         if self.reasoning == Some(false) {
             return Some(vec!["off".into()]);
         }
-        if !matches!(adapter, Adapter::ChatCompletions | Adapter::Anthropic)
-            || self.thinking_level_map.is_empty()
+        if !matches!(
+            adapter,
+            Adapter::ChatCompletions | Adapter::Anthropic | Adapter::OpenAiResponses
+        ) || self.thinking_level_map.is_empty()
         {
             return None;
         }
@@ -1215,6 +1217,11 @@ mod tests {
             profiles.model(&provider, "gpt-4.1").unwrap().reasoning,
             Some(false)
         );
+        let reasoning = profiles.model(&provider, "gpt-5").unwrap();
+        let levels = reasoning.levels(Adapter::OpenAiResponses).unwrap();
+        assert!(levels.contains(&"high".to_owned()));
+        assert!(!levels.contains(&"off".to_owned()));
+        assert_eq!(reasoning.mapped_effort("high"), Some(Some("high")));
     }
 
     #[test]
