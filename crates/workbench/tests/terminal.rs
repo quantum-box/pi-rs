@@ -115,12 +115,25 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     master.write_all(b"/thinking low\r").unwrap();
     let path = home.join("events.jsonl");
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut terminal_output = Vec::new();
+    let mut buffer = [0; 8192];
     while std::fs::metadata(&path).map_or(true, |metadata| metadata.len() == 0)
         && Instant::now() < deadline
     {
+        match master.read(&mut buffer) {
+            Ok(count) => terminal_output.extend_from_slice(&buffer[..count]),
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+            Err(error) => panic!("terminal read failed: {error}"),
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let contents = std::fs::read_to_string(path).expect("extension did not receive selection");
+    let contents = std::fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "extension did not receive selection: {error}; terminal output: {}",
+            String::from_utf8_lossy(&terminal_output)
+        )
+    });
     let event: serde_json::Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
     assert_eq!(
         event,
