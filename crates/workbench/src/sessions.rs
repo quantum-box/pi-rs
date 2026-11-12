@@ -406,7 +406,9 @@ pub fn html(session: &Session) -> String {
                 {
                     html.push_str(&format!("<details class=\"thinking\"><summary>Thinking</summary><pre>{}</pre></details>", escape(reasoning)));
                 }
-                if let Some(failure) = failure {
+                if let Some(failure) = failure
+                    && imported_assistant.is_none()
+                {
                     if !partial.trim().is_empty() {
                         html.push_str("<article><b>Pi</b>");
                         render_export_markdown(&mut html, partial);
@@ -1195,6 +1197,8 @@ mod tests {
         assert!(document.contains("<strong>partial</strong>"));
         assert!(document.contains("<div class=\"error-text\">Aborted</div>"));
         assert!(document.contains("Error: &lt;script&gt;error&lt;/script&gt;"));
+        assert_eq!(document.matches("<div class=\"error-text\">").count(), 2);
+        assert!(!document.contains("Error: Model request failed"));
         assert!(!document.contains("<script>"));
     }
 
