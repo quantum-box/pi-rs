@@ -190,7 +190,11 @@ pub fn resolve(
                 .cloned(),
         );
         for (root, scope) in roots {
-            let mut discovered = collect(&root, kind, false, warnings)?;
+            let mut discovered = if kind == Kind::Prompt {
+                auto_prompts(&root, warnings)?
+            } else {
+                collect(&root, kind, false, warnings)?
+            };
             discovered.retain(|path| packages::selected(path, &scope, &overrides));
             append(&mut paths, discovered);
         }
@@ -204,6 +208,40 @@ pub fn resolve(
             .collect(),
     );
     Ok(paths)
+}
+// Pi's automatic prompt discovery scans only visible files in the prompt root,
+// applying ignore files from that directory. Configured paths use collect instead.
+fn auto_prompts(root: &Path, warnings: &mut Vec<String>) -> Result<Vec<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in ignore::WalkBuilder::new(root)
+        .max_depth(Some(1))
+        .hidden(true)
+        .parents(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .add_custom_ignore_filename(".fdignore")
+        .follow_links(true)
+        .build()
+    {
+        match entry {
+            Ok(entry)
+                if entry.depth() == 1
+                    && entry.path().is_file()
+                    && Kind::Prompt.accepts(entry.path()) =>
+            {
+                files.push(entry.path().canonicalize()?);
+            }
+            Err(error) => warnings.push(error.to_string()),
+            _ => {}
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 fn append(paths: &mut Vec<PathBuf>, additions: Vec<PathBuf>) {
     for path in additions {

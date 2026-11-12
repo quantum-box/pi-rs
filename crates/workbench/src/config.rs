@@ -622,6 +622,47 @@ mod tests {
     }
 
     #[test]
+    fn automatic_prompts_are_visible_top_level_files_respecting_local_ignores() {
+        use super::super::resource_paths::{self, Kind};
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("agent");
+        let workspace = dir.path().join("work");
+        let project = workspace.join(".pi");
+        for base in [&user, &project] {
+            let prompts = base.join("prompts");
+            std::fs::create_dir_all(prompts.join("nested")).unwrap();
+            for name in ["visible.md", ".hidden.md", "ignored.md", "nested/child.md"] {
+                std::fs::write(prompts.join(name), "prompt").unwrap();
+            }
+            std::fs::write(prompts.join(".fdignore"), "ignored.md\n").unwrap();
+        }
+        let mut args = super::super::Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![(user.clone(), json!({})), (project.clone(), json!({}))],
+        };
+        let mut warnings = Vec::new();
+        let paths = resource_paths::resolve(&args, Kind::Prompt, &[], &[], &mut warnings).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                project.join("prompts/visible.md").canonicalize().unwrap(),
+                user.join("prompts/visible.md").canonicalize().unwrap()
+            ]
+        );
+        // Explicit files remain loadable even when automatic discovery skips them.
+        let explicit = project.join("prompts/nested/child.md");
+        let paths =
+            resource_paths::resolve(&args, Kind::Prompt, &[], &[explicit.clone()], &mut warnings)
+                .unwrap();
+        assert!(paths.contains(&explicit.canonicalize().unwrap()));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn project_settings_merge_nested_objects_and_resource_lists() {
         let mut base = json!({"theme":"dark","compaction":{"enabled":true,"reserveTokens":100},"skills":["first"]});
         merge(
