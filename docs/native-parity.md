@@ -217,6 +217,9 @@ imported timestamps with UTC offsets. Siblings with the same instant retain
 append order. Entries whose parent is missing or points to themselves appear as
 roots.
 
+During manual compaction, an RPC `abort` response waits for the compaction
+command to finish, even if an internal agent-settled event arrives first.
+
 Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID when present. Malformed JSON produces a `parse` response with a
 parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
