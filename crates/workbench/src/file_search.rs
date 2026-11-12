@@ -357,15 +357,13 @@ fn render_context(
     }
     events.sort_unstable();
     let mut reader = BufReader::new(std::fs::File::open(path)?);
-    // Match grep-searcher's default BOM sniffing and stripping. Subsequent
-    // block offsets are raw byte positions at decoded line boundaries.
+    // Decode UTF-16 context at raw line boundaries. Preserve a UTF-8 BOM:
+    // Pi's context path reads the file as text and includes it in line one.
     let bom = reader.fill_buf()?;
     let (encoding, bom_len) = if bom.starts_with(&[0xff, 0xfe]) {
         (UTF_16LE, 2)
     } else if bom.starts_with(&[0xfe, 0xff]) {
         (UTF_16BE, 2)
-    } else if bom.starts_with(&[0xef, 0xbb, 0xbf]) {
-        (UTF_8, 3)
     } else {
         (UTF_8, 0)
     };
@@ -649,7 +647,6 @@ mod tests {
         let text = "\u{0a01} first 🦀\r\nneedle one\nneedle two\nafter\n";
         for bytes in [
             text.as_bytes().to_vec(),
-            [b"\xef\xbb\xbf".as_slice(), text.as_bytes()].concat(),
             utf16_bytes(text, true),
             utf16_bytes(text, false),
         ] {
@@ -661,6 +658,76 @@ mod tests {
                 grep.finish().tool_content(),
                 "f-1- \u{0a01} first 🦀\nf:2: needle one\nf-3- needle two\nf-2- needle one\nf:3: needle two\nf-4- after"
             );
+        }
+    }
+
+    #[test]
+    fn utf8_bom_is_preserved_in_context_and_counts_toward_line_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let text = format!("\u{feff}{}\nneedle\n", "x".repeat(500));
+        std::fs::write(file.path(), text).unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"needle", "context":1}), 100).unwrap();
+        grep.search(file.path(), "f", &CancellationToken::new())
+            .unwrap();
+        match grep.finish() {
+            Outcome::SucceededWithDetails { output, details } => {
+                assert_eq!(
+                    output,
+                    format!(
+                        "f-1- \u{feff}{}... [truncated]\nf:2: needle\nf-3- \n\n[Some lines truncated to 500 chars. Use read tool to see full lines]",
+                        "x".repeat(499)
+                    )
+                );
+                assert_eq!(details["linesTruncated"], true);
+            }
+            other => panic!("expected line truncation, got {other:?}"),
+        }
+        // The no-context path uses the searcher's BOM-stripped match text.
+        std::fs::write(file.path(), "\u{feff}needle\n").unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"needle"}), 100).unwrap();
+        grep.search(file.path(), "f", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(grep.finish().tool_content(), "f:1: needle");
+        let mut grep = Grep::new(&json!({"pattern":"needle", "context":1}), 100).unwrap();
+        grep.search(file.path(), "f", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(grep.finish().tool_content(), "f:1: \u{feff}needle\nf-2- ");
+    }
+
+    #[test]
+    fn utf8_bom_contributes_bytes_to_each_overlapping_context_block() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let text = format!(
+            "first\nneedle one\nneedle two\n{}",
+            "padding\n".repeat(5000)
+        );
+        let mut outcomes = Vec::new();
+        for text in [text.clone(), format!("\u{feff}{text}")] {
+            std::fs::write(file.path(), text).unwrap();
+            let mut grep = Grep::new(&json!({"pattern":"needle", "context":1e20}), 100).unwrap();
+            grep.search(file.path(), "f", &CancellationToken::new())
+                .unwrap();
+            outcomes.push(grep.finish());
+        }
+        match (&outcomes[0], &outcomes[1]) {
+            (
+                Outcome::SucceededWithDetails { details: plain, .. },
+                Outcome::SucceededWithDetails {
+                    output,
+                    details: bom,
+                },
+            ) => {
+                assert!(output.starts_with("f-1- \u{feff}first\n"));
+                assert_eq!(
+                    bom["truncation"]["totalBytes"].as_u64().unwrap(),
+                    plain["truncation"]["totalBytes"].as_u64().unwrap() + 6
+                );
+                assert_eq!(
+                    bom["truncation"]["totalLines"],
+                    plain["truncation"]["totalLines"]
+                );
+            }
+            other => panic!("expected byte truncation, got {other:?}"),
         }
     }
 
