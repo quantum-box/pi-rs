@@ -80,6 +80,9 @@ Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and
 mouse interaction preserves theme previews and keyboard remapping.
 
+Input hooks identify command-line print and JSON prompts as `interactive`, as
+Pi does, while RPC and extension-originated submissions retain their own source.
+
 Known text-only chat models receive Pi's image-omission placeholders for user
 and tool images. Unknown model capabilities leave image handling to the
 provider, and the explicit image-blocking setting retains precedence.
@@ -97,7 +100,8 @@ conversation branch.
 Native extensions can opt into tool execution start, update and end events,
 including nested call ancestry, partial results, final outcomes and elapsed
 execution time. Rust tools with a host can emit bounded progress while running;
-progress from built-in tools and completion-order notifications remain open.
+the built-in shell tool emits bounded cumulative output updates. Other built-in
+tool progress and completion-order notifications remain open.
 
 ### xAI Responses checkpoint
 
