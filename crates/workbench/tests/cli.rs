@@ -2191,6 +2191,78 @@ fn rpc_model_discovery_does_not_block_other_commands() {
 }
 
 #[test]
+fn scoped_thinking_level_wins_over_saved_session_level() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        json!({
+            "defaultProvider":"ollama", "defaultModel":"alpha",
+            "enabledModels":["ollama/alpha:high", "ollama/beta:medium"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"ollama":{
+            "baseUrl":"https://example.invalid/v1", "models":[
+                {"id":"alpha", "reasoning":true}, {"id":"beta", "reasoning":true},
+                {"id":"gamma", "reasoning":true}
+            ]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    for (index, arguments, saved_model, expected_model, expected_thinking) in [
+        (0, vec![], "alpha", "alpha", "high"),
+        (1, vec!["--model", "alpha"], "alpha", "alpha", "high"),
+        (2, vec!["--model", "beta"], "alpha", "beta", "medium"),
+        (4, vec![], "gamma", "alpha", "high"),
+        (
+            3,
+            vec!["--model", "beta", "--thinking", "minimal"],
+            "alpha",
+            "beta",
+            "minimal",
+        ),
+    ] {
+        let path = directory.path().join(format!("session-{index}.jsonl"));
+        let mut session = Session::open(&path).unwrap();
+        session
+            .select_provider_model(None, saved_model, Some("low"))
+            .unwrap();
+        drop(session);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .args(["--session"])
+            .arg(&path)
+            .args(["--workspace"])
+            .arg(directory.path())
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--no-trust"])
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state: Value =
+            serde_json::from_slice(output.stdout.split(|byte| *byte == b'\n').next().unwrap())
+                .unwrap();
+        assert_eq!(state["data"]["model"]["id"], expected_model, "{state}");
+        assert_eq!(state["data"]["thinkingLevel"], expected_thinking, "{state}");
+    }
+}
+
+#[test]
 fn invalid_thinking_levels_warn_and_keep_the_last_valid_selection() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(

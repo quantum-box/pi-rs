@@ -731,7 +731,14 @@ impl Cli {
             self.thinking_profile = None;
         }
         if !self.thinking_explicit {
-            self.thinking = Some(thinking.unwrap_or_else(|| self.default_branch_thinking()));
+            self.thinking = Some(
+                self.model_scope
+                    .iter()
+                    .find(|choice| choice.provider == self.provider && choice.model == self.model)
+                    .and_then(|choice| choice.thinking.clone())
+                    .or(thinking)
+                    .unwrap_or_else(|| self.default_branch_thinking()),
+            );
         }
     }
 
@@ -788,8 +795,6 @@ impl Cli {
         let unavailable = availability.is_none_or(|(known, complete)| !known && complete);
         if unavailable || !self.restore_model_selection(model, thinking.clone(), provider) {
             self.restore_initial_selection(thinking);
-        } else if !self.thinking_explicit && thinking.is_some() {
-            self.thinking = thinking;
         }
     }
 
