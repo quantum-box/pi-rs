@@ -1255,7 +1255,11 @@ fn previous_word_start(text: &str) -> usize {
     let mut start = 0;
     for (end, word_type) in segmenter.segment_str(text).iter_with_word_type() {
         if end > start {
-            segments.push((start, end, word_type.is_word_like()));
+            // ICU4X can classify Hebrew word segments as None even when
+            // Intl.Segmenter reports them as word-like.
+            let word_like =
+                word_type.is_word_like() || text[start..end].chars().any(char::is_alphanumeric);
+            segments.push((start, end, word_like));
         }
         start = end;
     }
@@ -1273,7 +1277,12 @@ fn previous_word_start(text: &str) -> usize {
             .char_indices()
             .rev()
             .find(|(_, c)| "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`".contains(*c))
-            .map_or(start, |(i, c)| start + i + c.len_utf8())
+            .map_or(start, |(i, c)| {
+                let after = start + i + c.len_utf8();
+                // A word-like segment can end in punctuation (e.g. Hebrew
+                // apostrophe). Deleting from its end would leave it stuck.
+                if after == end { start + i } else { after }
+            })
     } else {
         segments
             .iter()
@@ -1480,6 +1489,31 @@ mod tests {
             assert_eq!(picker.query, expected, "first deletion from {query}");
             picker.input(delete, &keys);
             assert_eq!(picker.query, next, "second deletion from {query}");
+        }
+    }
+
+    #[test]
+    fn search_word_deletion_progresses_past_hebrew_apostrophes() {
+        let keys = Keys::default();
+        let delete = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        for (query, expected) in [
+            ("אב'", vec!["אב", ""]),
+            ("אב'ג", vec!["אב'", "אב", ""]),
+            ("אב'  ", vec!["אב", ""]),
+        ] {
+            let mut picker = Picker::new("Choose", vec![]);
+            picker.paste(query);
+            for remaining in expected {
+                let previous_len = picker.query.len();
+                picker.input(delete, &keys);
+                assert_eq!(
+                    picker.query, remaining,
+                    "deleting from {query:?} at length {previous_len}"
+                );
+                assert!(picker.query.len() < previous_len);
+            }
+            picker.input(delete, &keys);
+            assert!(picker.query.is_empty());
         }
     }
 
