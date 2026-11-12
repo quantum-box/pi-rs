@@ -2,6 +2,10 @@
 
 The reference is Pi v1.5.0, commit
 `f9a26365568127461c47a07a37dcb42c140a3ac5`.
+
+Automatic user and trusted-project prompt discovery scans visible Markdown files
+directly in each `prompts` directory and honors its ignore files, matching Pi.
+Nested or hidden prompt files can still be selected explicitly.
 The requested compatibility is equivalent functionality implemented in Rust.
 
 Markdown headings are separated from a following block by one blank line,

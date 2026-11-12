@@ -609,7 +609,7 @@ mod tests {
                 &mut warnings
             )
             .unwrap(),
-            vec![explicit.canonicalize().unwrap()]
+            vec![explicit]
         );
         assert!(warnings.is_empty());
         args.settings.resource_layers[0].1["prompts"] = json!("invalid array");
@@ -619,6 +619,283 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("settings.json") && error.contains("prompts"));
+    }
+
+    #[test]
+    fn automatic_prompts_are_visible_top_level_files_respecting_local_ignores() {
+        use super::super::resource_paths::{self, Kind};
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("agent");
+        let workspace = dir.path().join("work");
+        let project = workspace.join(".pi");
+        for base in [&user, &project] {
+            let prompts = base.join("prompts");
+            std::fs::create_dir_all(prompts.join("nested")).unwrap();
+            for name in ["visible.md", ".hidden.md", "ignored.md", "nested/child.md"] {
+                std::fs::write(prompts.join(name), "prompt").unwrap();
+            }
+            std::fs::write(prompts.join(".fdignore"), "ignored.md\n").unwrap();
+        }
+        let mut args = super::super::Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![(user.clone(), json!({})), (project.clone(), json!({}))],
+        };
+        let mut warnings = Vec::new();
+        let paths = resource_paths::resolve(&args, Kind::Prompt, &[], &[], &mut warnings).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                project.join("prompts/visible.md").canonicalize().unwrap(),
+                user.join("prompts/visible.md").canonicalize().unwrap()
+            ]
+        );
+        // Explicit files remain loadable even when automatic discovery skips them.
+        let explicit = project.join("prompts/nested/child.md");
+        let paths = resource_paths::resolve(
+            &args,
+            Kind::Prompt,
+            &[],
+            std::slice::from_ref(&explicit),
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(paths.contains(&explicit));
+        assert!(warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_symlink_names_and_overrides_use_discovered_paths() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        let project = workspace.join(".pi");
+        std::fs::create_dir_all(project.join("prompts")).unwrap();
+        std::fs::write(dir.path().join("template.md"), "Review $1").unwrap();
+        let link = project.join("prompts/review.md");
+        symlink(dir.path().join("template.md"), &link).unwrap();
+        let mut args = super::super::Cli::try_parse_from(["pi", "--no-skills"]).unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![
+                (dir.path().join("agent"), json!({})),
+                (project.clone(), json!({})),
+            ],
+        };
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert_eq!(
+            resources.prompts["review"].path,
+            project.canonicalize().unwrap().join("prompts/review.md")
+        );
+        assert_eq!(
+            resources.expand("/review code").as_deref(),
+            Some("Review code")
+        );
+        assert!(!resources.prompts.contains_key("template"));
+        let mut warnings = Vec::new();
+        let paths = super::super::resource_paths::resolve(
+            &args,
+            super::super::resource_paths::Kind::Prompt,
+            &[],
+            &[link.clone(), dir.path().join("template.md")],
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(
+            paths,
+            vec![project.canonicalize().unwrap().join("prompts/review.md")]
+        );
+        args.settings.resource_layers[1].1 = json!({"prompts": ["-prompts/review.md"]});
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(!resources.prompts.contains_key("review"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_prompt_directories_apply_recursive_ignore_and_preserve_symlinks() {
+        use super::super::resource_paths::{self, Kind};
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("work/.pi");
+        let root = project.join("custom");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        for file in [
+            "visible.md",
+            ".hidden.md",
+            "ignored.md",
+            "nested/child.md",
+            "nested/skip.md",
+            "target/build.md",
+            "node_modules/skip.md",
+        ] {
+            std::fs::write(root.join(file), "prompt").unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "ignored.md\n").unwrap();
+        std::fs::write(root.join("nested/.fdignore"), "skip.md\n").unwrap();
+        symlink(dir.path().join("target.md"), root.join("alias.md")).unwrap();
+        std::fs::write(dir.path().join("target.md"), "target").unwrap();
+        let mut args = super::super::Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = dir.path().join("work");
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![
+                (dir.path().join("agent"), json!({})),
+                (
+                    project,
+                    json!({"prompts": ["custom", "-custom/visible.md"]}),
+                ),
+            ],
+        };
+        let mut warnings = Vec::new();
+        let paths = resource_paths::resolve(&args, Kind::Prompt, &[], &[], &mut warnings).unwrap();
+        let root = root.canonicalize().unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                root.join("alias.md"),
+                root.join("nested/child.md"),
+                root.join("target/build.md")
+            ]
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_directory_aliases_and_configured_alias_deduplication() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        let project = workspace.join(".pi");
+        let custom = project.join("custom");
+        std::fs::create_dir_all(&custom).unwrap();
+        let target = dir.path().join("template.md");
+        std::fs::write(&target, "Shared $1").unwrap();
+        symlink(&target, custom.join("audit.md")).unwrap();
+        symlink(&target, custom.join("review.md")).unwrap();
+        let mut args =
+            super::super::Cli::try_parse_from(["pi", "--no-skills", "--no-prompt-templates"])
+                .unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.prompt_template.push(custom.clone());
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![
+                (dir.path().join("agent"), json!({})),
+                (project, json!({"prompts": ["custom", "-custom/audit.md"]})),
+            ],
+        };
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert_eq!(
+            resources.expand("/audit one").as_deref(),
+            Some("Shared one")
+        );
+        assert_eq!(
+            resources.expand("/review two").as_deref(),
+            Some("Shared two")
+        );
+        args.prompt_template = vec![custom.join("audit.md"), custom.join("review.md")];
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.prompts.contains_key("audit"));
+        assert!(!resources.prompts.contains_key("review"));
+        args.prompt_template.clear();
+        args.no_prompt_templates = false;
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(!resources.prompts.contains_key("audit"));
+        assert!(!resources.prompts.contains_key("review"));
+        args.settings.resource_layers[1].1 = json!({"prompts": ["custom"]});
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.prompts.contains_key("audit"));
+        assert!(!resources.prompts.contains_key("review"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_prompt_aliases_deduplicate_before_disabled_filtering() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("work/.pi");
+        let prompts = project.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        let target = dir.path().join("template.md");
+        std::fs::write(&target, "Shared").unwrap();
+        symlink(&target, prompts.join("audit.md")).unwrap();
+        symlink(&target, prompts.join("review.md")).unwrap();
+        let mut args = super::super::Cli::try_parse_from(["pi", "--no-skills"]).unwrap();
+        args.workspace = dir.path().join("work");
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![(dir.path().join("agent"), json!({})), (project, json!({}))],
+        };
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.prompts.contains_key("audit"));
+        assert!(!resources.prompts.contains_key("review"));
+        args.settings.resource_layers[1].1 = json!({"prompts": ["-prompts/audit.md"]});
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(!resources.prompts.contains_key("audit"));
+        assert!(!resources.prompts.contains_key("review"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovered_prompts_precede_explicit_prompt_files() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        let project = workspace.join(".pi");
+        let prompts = project.join("prompts");
+        let extra = workspace.join("extra");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(prompts.join("review.md"), "discovered $1").unwrap();
+        std::fs::write(extra.join("review.md"), "explicit $1").unwrap();
+        symlink(prompts.join("review.md"), extra.join("audit.md")).unwrap();
+        let mut args = super::super::Cli::try_parse_from(["pi", "--no-skills"]).unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![(dir.path().join("agent"), json!({})), (project, json!({}))],
+        };
+        args.prompt_template = vec![extra.join("review.md"), extra.join("audit.md")];
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert_eq!(
+            resources.expand("/review code").as_deref(),
+            Some("discovered code")
+        );
+        assert!(!resources.prompts.contains_key("audit"));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Duplicate prompt review"))
+        );
+        args.no_prompt_templates = true;
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert_eq!(
+            resources.expand("/review code").as_deref(),
+            Some("explicit code")
+        );
+        assert_eq!(
+            resources.expand("/audit code").as_deref(),
+            Some("discovered code")
+        );
     }
 
     #[test]
