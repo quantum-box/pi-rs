@@ -48,10 +48,11 @@ impl Bedrock {
         if token.is_empty() || !token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
             return Err(Error::Config("invalid Bedrock bearer token".into()));
         }
-        if let Some(client) = self.client.get() {
-            let client = bearer_client(client.config().to_builder(), &token);
-            self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client)));
-        }
+        let client = self
+            .client
+            .get()
+            .map(|client| bearer_client(client.config().to_builder(), &token));
+        self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(client));
         self.bearer = Some(token);
         Ok(self)
     }
