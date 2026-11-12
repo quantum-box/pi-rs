@@ -112,6 +112,30 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({}),
     },
     Builtin {
+        id: "xiaomi",
+        endpoint: "https://api.xiaomimimo.com/v1/chat/completions",
+        env: "XIAOMI_API_KEY",
+        compatibility: xiaomi,
+    },
+    Builtin {
+        id: "xiaomi-token-plan-cn",
+        endpoint: "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+        env: "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+        compatibility: xiaomi,
+    },
+    Builtin {
+        id: "xiaomi-token-plan-ams",
+        endpoint: "https://token-plan-ams.xiaomimimo.com/v1/chat/completions",
+        env: "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+        compatibility: xiaomi,
+    },
+    Builtin {
+        id: "xiaomi-token-plan-sgp",
+        endpoint: "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions",
+        env: "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+        compatibility: xiaomi,
+    },
+    Builtin {
         id: "zai",
         endpoint: "https://api.z.ai/api/coding/paas/v4/chat/completions",
         env: "ZAI_API_KEY",
@@ -131,6 +155,11 @@ fn standard() -> Value {
 
 fn moonshot() -> Value {
     json!({"supportsReasoningEffort":false})
+}
+
+fn xiaomi() -> Value {
+    json!({"thinkingFormat":"deepseek", "supportsReasoningEffort":false,
+        "requiresReasoningContentOnAssistantMessages":true})
 }
 
 fn zai() -> Value {

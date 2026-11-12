@@ -96,6 +96,13 @@ separate from OpenAI and ChatGPT. The adapter supports streamed Responses
 events and tool calls through the shared Responses implementation. Loopback
 CLI coverage does not replace live acceptance with an xAI account.
 
+### Xiaomi MiMo checkpoint
+
+Xiaomi's pay-as-you-go endpoint and its China, Amsterdam and Singapore token
+plan endpoints use distinct Pi v1.5.0 catalogs and credentials. Their chat
+requests use enabled/disabled thinking and replay reasoning content through
+tool turns. Loopback CLI coverage does not replace live Xiaomi acceptance.
+
 Markdown links use the reference's non-hyperlink terminal fallback: link text
 is underlined and destinations appear in parentheses only when they differ from
 the visible URL or email address. OSC 8 hyperlink capability remains open.

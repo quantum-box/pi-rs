@@ -1282,6 +1282,49 @@ mod tests {
     }
 
     #[test]
+    fn xiaomi_regional_catalogs_preserve_reasoning_and_credentials() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        for (name, endpoint, variable, count) in [
+            (
+                "xiaomi",
+                "https://api.xiaomimimo.com/v1/chat/completions",
+                "XIAOMI_API_KEY",
+                3,
+            ),
+            (
+                "xiaomi-token-plan-cn",
+                "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+                "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+                2,
+            ),
+            (
+                "xiaomi-token-plan-ams",
+                "https://token-plan-ams.xiaomimimo.com/v1/chat/completions",
+                "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+                2,
+            ),
+            (
+                "xiaomi-token-plan-sgp",
+                "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions",
+                "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+                2,
+            ),
+        ] {
+            let provider = profiles.provider(name).unwrap();
+            assert_eq!(provider.adapter(), Adapter::ChatCompletions);
+            assert_eq!(profiles.endpoint(&provider), endpoint);
+            assert_eq!(builtin_chat::find(name).unwrap().env(), variable);
+            assert_eq!(profiles.model_ids(&provider).len(), count);
+            let model = profiles.model(&provider, "mimo-v2.6-pro").unwrap();
+            assert_eq!(
+                model.levels(Adapter::ChatCompletions).unwrap(),
+                ["off", "high"]
+            );
+            assert_eq!(model.reasoning, Some(true));
+        }
+    }
+
+    #[test]
     fn minimax_catalogs_use_native_messages_and_regional_credentials() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         for (name, endpoint, variable) in [
