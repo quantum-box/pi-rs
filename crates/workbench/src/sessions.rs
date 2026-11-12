@@ -327,10 +327,12 @@ pub fn html(session: &Session) -> String {
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\"><title>{title}</title><style>body{{max-width:960px;margin:40px auto;padding:0 20px;font:16px system-ui;background:#16181d;color:#e4e6eb}}article,details{{padding:16px;margin:12px 0;border-radius:8px;background:#252932}}.user{{background:#243448}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}}summary{{cursor:pointer}}.thinking{{color:#a5abb6}}h1{{font-size:24px}}</style><h1>{title}</h1>"
     );
     let mut imported_assistant = None;
+    let mut imported_custom_entry = false;
     let mut has_system_prompt = false;
     for record in session.branch() {
         match &record.event {
             Event::SourceEntry { format, entry } => {
+                imported_custom_entry = format == "pi" && entry["type"] == "custom_message";
                 imported_assistant = (format == "pi"
                     && entry["type"] == "message"
                     && entry["message"]["role"] == "assistant")
@@ -341,8 +343,16 @@ pub fn html(session: &Session) -> String {
                 content, images, ..
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
-            Event::CustomMessage { message } if message.display => {
+            Event::CustomMessage { message } => {
+                let show = message.display || imported_custom_entry;
+                imported_custom_entry = false;
+                if !show {
+                    continue;
+                }
                 html.push_str(&format!("<article><b>{}</b>", escape(&message.custom_type)));
+                if !message.display {
+                    html.push_str(" <span>Hidden in terminal</span>");
+                }
                 match &message.content {
                     pi_rs::ContextContent::Text(text) => render_export_markdown(&mut html, text),
                     pi_rs::ContextContent::Blocks(blocks) => {
@@ -1224,6 +1234,26 @@ mod tests {
         let document = html(&session);
         assert!(!document.contains("secret context"));
         assert!(document.contains("visible <strong>note</strong>"));
+    }
+
+    #[test]
+    fn html_exports_hidden_custom_entries_with_terminal_visibility_label() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"custom_message","id":"a","parentId":null,"customType":"<note>","content":"hidden **context**", "display":false}),
+            serde_json::json!({"type":"custom_message","id":"b","parentId":"a","customType":"visible","content":"shown", "display":true}),
+            serde_json::json!({"type":"message","id":"c","parentId":"b","message":{"role":"custom","customType":"private","content":"private role", "display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(fixture.path()).unwrap();
+        let document = html(&session);
+        assert!(document.contains("<b>&lt;note&gt;</b> <span>Hidden in terminal</span>"));
+        assert!(document.contains("hidden <strong>context</strong>"));
+        assert!(document.contains("<b>visible</b>"));
+        assert_eq!(document.matches("Hidden in terminal").count(), 1);
+        assert!(!document.contains("private role"));
     }
 
     #[test]
