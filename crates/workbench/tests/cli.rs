@@ -4229,7 +4229,7 @@ fn default_model_and_provider_are_read_as_separate_fields() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
         let output = process.wait_with_output().unwrap();
         assert!(
             output.status.success(),
@@ -4244,5 +4244,51 @@ fn default_model_and_provider_are_read_as_separate_fields() {
         let state = events.iter().find(|event| event["id"] == "state").unwrap();
         assert_eq!(state["data"]["model"]["provider"], provider);
         assert_eq!(state["data"]["model"]["id"], model);
+        let after = events.iter().find(|event| event["id"] == "after").unwrap();
+        assert_eq!(after["data"]["model"]["provider"], provider);
+        assert_eq!(after["data"]["model"]["id"], model);
+    }
+}
+
+#[test]
+fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("models.json"), json!({"providers":{
+        "ollama":{"baseUrl":"https://example.invalid/v1","models":[{"id":"alpha"}]},
+        "relay":{"baseUrl":"https://example.invalid/v1","api":"openai-completions","models":[{"id":"beta"}]}
+    }}).to_string()).unwrap();
+    std::fs::write(root.path().join("settings.json"), json!({"defaultProvider":"ollama","defaultModel":"alpha","enabledModels":["ollama/alpha","relay/beta"]}).to_string()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--offline",
+            "--provider",
+            "relay",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{\"id\":\"before\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for id in ["before", "after"] {
+        let state = events.iter().find(|event| event["id"] == id).unwrap();
+        assert_eq!(state["data"]["model"]["provider"], "relay", "{state}");
+        assert_eq!(state["data"]["model"]["id"], "beta", "{state}");
     }
 }

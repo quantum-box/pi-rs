@@ -3355,6 +3355,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let mut last_clear: Option<Instant> = None;
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
+    let mut deferred_input = VecDeque::new();
     loop {
         if let Some(receiver) = &view.pending_transition {
             let ready = match receiver.try_recv() {
@@ -3365,6 +3366,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
             };
             if let Some(result) = ready {
+                if queued_transition_cancel(&mut deferred_input, |timeout| input.next(timeout))? {
+                    view.pending_transition = None;
+                    view.append("Session transition cancelled");
+                    dirty = true;
+                    continue;
+                }
                 view.pending_transition = None;
                 match result.and_then(|next| apply_session(&mut args, &mut view, next)) {
                     Ok(()) => {}
@@ -3806,7 +3813,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         } else {
             Duration::from_millis(40)
         };
-        let event = match input.next(input_wait)? {
+        let next_input = if let Some(event) = deferred_input.pop_front() {
+            Some(event)
+        } else {
+            input.next(input_wait)?
+        };
+        let event = match next_input {
             Some(crate::ui::input::InputEvent::Event(event)) => event,
             #[cfg(unix)]
             Some(crate::ui::input::InputEvent::KeyboardEnhancementFlags(flags)) => {
@@ -6296,6 +6308,30 @@ fn select(
     Ok(())
 }
 
+// A bare Escape may need the input decoder's 25 ms disambiguation window.
+// Give already-arrived input priority over committing a prepared session.
+fn queued_transition_cancel(
+    deferred: &mut VecDeque<crate::ui::input::InputEvent>,
+    mut next: impl FnMut(Duration) -> std::io::Result<Option<crate::ui::input::InputEvent>>,
+) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_millis(30);
+    while Instant::now() < deadline {
+        match next(deadline.saturating_duration_since(Instant::now()))? {
+            Some(crate::ui::input::InputEvent::Event(Event::Key(key)))
+                if key.code == KeyCode::Esc && key.kind != KeyEventKind::Release =>
+            {
+                return Ok(true);
+            }
+            Some(crate::ui::input::InputEvent::Event(
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_),
+            )) => {}
+            Some(event) => deferred.push_back(event),
+            None => {}
+        }
+    }
+    Ok(false)
+}
+
 fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
     let mut next = args.clone();
     next.session = path;
@@ -6587,6 +6623,39 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_escape_wins_over_ready_new_session() {
+        use clap::Parser;
+        use std::collections::VecDeque;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.jsonl");
+        let mut next = super::Cli::parse_from(["pi"]);
+        next.session = path.clone();
+        next.session_transition = Some(pi_rs::SessionStartReason::New);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok::<_, pi_rs::Error>(next)).unwrap();
+        let ready = receiver.try_recv().unwrap().unwrap();
+        let mut input = VecDeque::from([crate::ui::input::InputEvent::Event(
+            crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        )]);
+        let mut preserved = VecDeque::new();
+        let cancelled =
+            super::queued_transition_cancel(&mut preserved, |_| Ok(input.pop_front())).unwrap();
+        if !cancelled {
+            super::apply_session(
+                &mut super::Cli::parse_from(["pi"]),
+                &mut super::View::default(),
+                ready,
+            )
+            .unwrap();
+        }
+        assert!(cancelled);
+        assert!(!path.exists());
+    }
+
     #[test]
     fn cancelled_new_session_does_not_create_a_journal_after_discovery() {
         use clap::Parser;

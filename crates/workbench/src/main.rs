@@ -1020,15 +1020,26 @@ impl Cli {
                 model: self.model.clone(),
             });
         let configured = self.settings.string("defaultModel");
+        let configured_provider = self.settings.string("defaultProvider");
         let qualified = configured
+            .filter(|_| configured_provider.is_none())
             .and_then(|model| model_selection::qualified_model(model, &self.model_profiles));
         let provider = self
-            .settings
-            .string("defaultProvider")
+            .provider_argument
+            .as_deref()
             .and_then(|name| self.model_profiles.provider(name))
+            .or_else(|| configured_provider.and_then(|name| self.model_profiles.provider(name)))
             .or_else(|| qualified.as_ref().map(|(provider, _)| provider.clone()))
             .unwrap_or_else(|| fallback.provider.clone());
-        let model = configured
+        let configured_for_provider = configured.filter(|_| {
+            self.provider_argument.is_none()
+                || configured_provider
+                    .and_then(|name| self.model_profiles.provider(name))
+                    .or_else(|| qualified.as_ref().map(|(candidate, _)| candidate.clone()))
+                    .unwrap_or_default()
+                    == provider
+        });
+        let model = configured_for_provider
             .map(|value| {
                 qualified
                     .as_ref()
@@ -1052,7 +1063,11 @@ impl Cli {
             .model_scope
             .iter()
             .find(|choice| choice.provider == provider && choice.model == model)
-            .or_else(|| self.model_scope.first());
+            .or_else(|| {
+                self.model_scope
+                    .iter()
+                    .find(|choice| !self.connection_explicit || choice.provider == provider)
+            });
         let (provider, model) = chosen.map_or((provider, model), |choice| {
             (choice.provider.clone(), choice.model.clone())
         });
