@@ -115,6 +115,95 @@ async fn extension_observes_agent_settled_after_success_and_cancellation() {
     assert_eq!(events[5]["aborted"], true);
 }
 
+#[tokio::test]
+async fn pending_tool_does_not_report_settlement_until_reconciled() {
+    struct PendingTool;
+    #[async_trait::async_trait]
+    impl Tool for PendingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "pending job".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            Outcome::Pending {
+                reference: "job".into(),
+            }
+        }
+    }
+    struct PendingExtension;
+    impl Extension for PendingExtension {
+        fn id(&self) -> &str {
+            "pending-job"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(PendingTool)]
+        }
+    }
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(SettlementObserver(events.clone())))
+        .unwrap();
+    registry.register(Arc::new(PendingExtension)).unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"]), answer("done")]);
+    let agent = agent(&model, &registry);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let error = agent
+        .run(
+            &mut session,
+            Some("start".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap_err();
+    let Error::PendingOperation(id) = error else {
+        panic!("unexpected error: {error}")
+    };
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        ["agent_start", "agent_end"]
+    );
+    session
+        .reconcile(id, Outcome::Succeeded("done".into()))
+        .unwrap();
+    agent
+        .run(
+            &mut session,
+            None,
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        [
+            "agent_start",
+            "agent_end",
+            "agent_start",
+            "agent_end",
+            "agent_settled"
+        ]
+    );
+}
+
 #[async_trait::async_trait]
 impl Extension for CompactionObserver {
     fn id(&self) -> &str {
@@ -1627,7 +1716,11 @@ async fn tool_timeout_blocks_until_reconciliation() {
     });
     let mut registry = Registry::default();
     registry.register(Arc::new(Tools(fixture.clone()))).unwrap();
-    let model = Script::new(vec![tool_reply(&[r#"{"id":"42"}"#])]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    registry
+        .register(Arc::new(SettlementObserver(events.clone())))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&[r#"{"id":"42"}"#]), answer("recovered")]);
     let mut agent = agent(&model, &registry);
     agent.limits.tool_timeout = Duration::from_millis(20);
     let (_, mut inputs) = mpsc::channel(1);
@@ -1646,6 +1739,46 @@ async fn tool_timeout_blocks_until_reconciliation() {
         matches!(&session.operations()[0].1, OperationState::Finished(Outcome::Unknown(reason)) if reason == "tool timed out")
     );
     assert_eq!(fixture.called.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        ["agent_start", "agent_end"]
+    );
+    let Error::Reconciliation(id) = error else {
+        unreachable!()
+    };
+    session
+        .reconcile(id, Outcome::Succeeded("resolved".into()))
+        .unwrap();
+    agent
+        .run(
+            &mut session,
+            None,
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        [
+            "agent_start",
+            "agent_end",
+            "agent_start",
+            "agent_end",
+            "agent_settled"
+        ]
+    );
 }
 
 #[tokio::test]
