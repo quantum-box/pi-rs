@@ -36,43 +36,44 @@ impl Reader {
     pub fn drain(&mut self, max: Duration, idle: Duration) -> io::Result<()> {
         // Read bytes directly: an incomplete escape sequence is still activity,
         // even when the event decoder cannot yet produce an event.
-        super::drain_until_idle(max, idle, |timeout| {
-            let mut descriptor = libc::pollfd {
-                fd: self.file.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let millis = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
-            let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                return if error.kind() == io::ErrorKind::Interrupted {
-                    Ok(false)
-                } else {
-                    Err(error)
-                };
-            }
-            if ready == 0 {
-                return Ok(false);
-            }
-            let mut bytes = [0_u8; 1024];
-            match self.file.read(&mut bytes) {
-                Ok(0) => Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "terminal input closed",
-                )),
-                Ok(_) => Ok(true),
+        super::drain_until_idle(max, idle, |timeout| self.discard_input(timeout))
+    }
+    fn discard_input(&mut self, timeout: Duration) -> io::Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd: self.file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
                 Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    Ok(false)
-                }
-                Err(error) => Err(error),
+            };
+        }
+        if ready == 0 {
+            return Ok(false);
+        }
+        let mut bytes = [0_u8; 1024];
+        match self.file.read(&mut bytes) {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "terminal input closed",
+            )),
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Ok(false)
             }
-        })
+            Err(error) => Err(error),
+        }
     }
     pub fn next(&mut self, timeout: Duration) -> io::Result<Option<InputEvent>> {
         self.decoder.flush_escape();
@@ -177,9 +178,26 @@ mod tests {
         writer.write_all(&[b'x'; 1023]).unwrap();
         writer.write_all(b"\x1b[").unwrap();
         writer.write_all(b"99;5:3u").unwrap();
-        input
-            .drain(Duration::from_secs(1), Duration::from_millis(20))
-            .unwrap();
+        let start = std::time::Instant::now();
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut reads = 0;
+        super::super::drain_until_idle_with_clock(
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+            || start + elapsed.get(),
+            |timeout| {
+                let consumed = input.discard_input(Duration::ZERO)?;
+                if consumed {
+                    reads += 1;
+                } else {
+                    elapsed.set(elapsed.get() + timeout);
+                }
+                Ok(consumed)
+            },
+        )
+        .unwrap();
+        assert!(reads >= 2);
+        assert_eq!(elapsed.get(), Duration::from_millis(20));
         let mut bytes = [0; 32];
         assert_eq!(
             input.file.read(&mut bytes).unwrap_err().kind(),

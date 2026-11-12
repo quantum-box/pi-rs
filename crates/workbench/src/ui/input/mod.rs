@@ -82,6 +82,7 @@ fn escape_delay() -> Duration {
 
 // Keep raw mode active until input has been quiet, but bound shutdown even if
 // a terminal continuously sends events. `read` must wait at most its timeout.
+#[cfg(not(windows))]
 fn drain_until_idle(
     max: Duration,
     idle: Duration,
@@ -111,14 +112,25 @@ fn drain_until_idle_with_clock(
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn drain_console_records(
     max: Duration,
     idle: Duration,
+    wait: impl FnMut(Duration) -> std::io::Result<bool>,
+    discard: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    drain_console_records_with_clock(max, idle, Instant::now, wait, discard)
+}
+
+#[cfg(any(windows, test))]
+fn drain_console_records_with_clock(
+    max: Duration,
+    idle: Duration,
+    clock: impl FnMut() -> Instant,
     mut wait: impl FnMut(Duration) -> std::io::Result<bool>,
     mut discard: impl FnMut() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    drain_until_idle(max, idle, |timeout| {
+    drain_until_idle_with_clock(max, idle, clock, |timeout| {
         if wait(timeout)? {
             discard()?;
             Ok(true)
@@ -134,19 +146,31 @@ mod drain_tests {
 
     #[test]
     fn drain_counts_incomplete_vt_records_as_activity() {
+        let start = Instant::now();
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
         let pending = std::cell::Cell::new(None);
-        let records =
-            std::cell::RefCell::new(std::collections::VecDeque::from([b'\x1b', b'[', b'9']));
+        let mut records = std::collections::VecDeque::from([
+            (Duration::from_millis(20), b'\x1b'),
+            (Duration::from_millis(55), b'['),
+            (Duration::from_millis(90), b'9'),
+        ]);
         let mut discarded = Vec::new();
-        drain_console_records(
+        drain_console_records_with_clock(
             Duration::from_secs(1),
-            Duration::from_millis(1),
+            Duration::from_millis(50),
+            || start + elapsed.get(),
             |timeout| {
-                if let Some(byte) = records.borrow_mut().pop_front() {
+                let until = elapsed.get() + timeout;
+                if records
+                    .front()
+                    .is_some_and(|(arrival, _)| *arrival <= until)
+                {
+                    let (arrival, byte) = records.pop_front().unwrap();
+                    elapsed.set(arrival);
                     pending.set(Some(byte));
                     Ok(true)
                 } else {
-                    std::thread::sleep(timeout);
+                    elapsed.set(until);
                     Ok(false)
                 }
             },
@@ -157,6 +181,8 @@ mod drain_tests {
         )
         .unwrap();
         assert_eq!(discarded, b"\x1b[9");
+        assert!(records.is_empty());
+        assert_eq!(elapsed.get(), Duration::from_millis(140));
     }
 
     #[test]
