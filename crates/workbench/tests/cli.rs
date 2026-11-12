@@ -42,6 +42,66 @@ fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStrea
     }
 }
 
+#[test]
+fn chatgpt_plan_provider_streams_through_the_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(first.starts_with("POST /v1/responses "), "{first}");
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut body = vec![0; length.unwrap()];
+        reader.read_exact(&mut body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], "fixture-model");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        let events = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fixture answer\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",events.len()).unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "openai-chatgpt",
+            "--model",
+            "fixture-model",
+            "--api-key",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+    server.join().unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn extension_command_can_trigger_model_in_print_and_json_modes() {
@@ -1986,28 +2046,9 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         )
         .unwrap();
         let server = std::thread::spawn(move || {
-            // Parallel CLI tests can delay process startup on hosted runners.
-            let deadline = std::time::Instant::now() + Duration::from_secs(60);
             loop {
-                let (mut socket, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("proxy request not received: {error}"),
-                };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                let mut reader = BufReader::new(socket.try_clone().unwrap());
-                let mut first = String::new();
-                if reader.read_line(&mut first).is_err() || first.is_empty() {
-                    continue;
-                }
+                let (mut socket, mut reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
                 let mut headers = String::new();
                 loop {
                     let mut line = String::new();
