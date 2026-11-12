@@ -1756,6 +1756,82 @@ mod tests {
     }
 
     #[test]
+    fn workspace_discovery_retains_success_and_retries_a_timed_out_provider() {
+        use std::io::Read;
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"enabledModels":["ollama/fast", "slow/late"]}).to_string(),
+        )
+        .unwrap();
+        let fast = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let slow = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fast_url = format!("http://{}/v1", fast.local_addr().unwrap());
+        let slow_url = format!("http://{}/v1", slow.local_addr().unwrap());
+        let serve = |listener: std::net::TcpListener, id: &'static str, delayed: bool| {
+            std::thread::spawn(move || {
+                for i in 0..2 {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let mut buf = [0; 2048];
+                    let _ = socket.read(&mut buf);
+                    if delayed && i == 0 {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    let body = json!({"data":[{"id":id}]}).to_string();
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                }
+            })
+        };
+        let fast_thread = serve(fast, "fast", false);
+        let slow_thread = serve(slow, "late", true);
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":fast_url, "models":[{"id":"alpha"}]},
+            "slow":{"baseUrl":slow_url, "api":"openai-completions", "apiKey":"test", "models":[]}
+        }}))
+        .unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        args.workspace = target.clone();
+        args.settings = super::super::config::Settings::load(&target, true).unwrap();
+        args.refresh_workspace_selection_with_timeout(Duration::from_millis(100));
+        assert_eq!(args.model, "fast");
+        assert_eq!(
+            args.model_scope
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            ["fast"]
+        );
+        assert!(args.selection_discovery_pending);
+        std::thread::sleep(Duration::from_millis(200));
+        args.refresh_workspace_selection_with_timeout(Duration::from_secs(2));
+        assert!(
+            args.model_scope.iter().any(|choice| choice.model == "late"),
+            "catalog={:?} pending={}",
+            args.discovered_models,
+            args.selection_discovery_pending
+        );
+        assert!(!args.selection_discovery_pending);
+        fast_thread.join().unwrap();
+        slow_thread.join().unwrap();
+    }
+
+    #[test]
     fn workspace_provider_only_default_never_uses_previous_provider_model() {
         let root = tempfile::tempdir().unwrap();
         let launch = root.path().join("launch");

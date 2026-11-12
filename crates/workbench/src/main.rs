@@ -76,6 +76,8 @@ struct Cli {
     #[arg(skip)]
     selection_workspace: Option<PathBuf>,
     #[arg(skip)]
+    selection_discovery_pending: bool,
+    #[arg(skip)]
     discovered_models: Vec<(String, String)>,
     #[arg(skip)]
     complete_catalogs: Vec<(String, String)>,
@@ -901,23 +903,28 @@ impl Cli {
     /// Recreate the new-session defaults from the current workspace while
     /// retaining the original command-line overrides across session changes.
     fn refresh_workspace_selection(&mut self) {
+        self.refresh_workspace_selection_with_timeout(Duration::from_secs(15));
+    }
+
+    fn refresh_workspace_selection_with_timeout(&mut self, timeout: Duration) {
         let patterns: Vec<String> = self
             .models
             .as_deref()
             .map(|value| value.split(',').map(str::to_owned).collect())
             .unwrap_or_else(|| self.settings.strings("enabledModels"));
         let mut catalogs = model_selection::cached_catalogs(self);
-        if self
-            .selection_workspace
-            .as_ref()
-            .is_some_and(|cwd| cwd != &self.workspace)
+        if self.selection_discovery_pending
+            || self
+                .selection_workspace
+                .as_ref()
+                .is_some_and(|cwd| cwd != &self.workspace)
         {
             // A previous runtime's negative catalog is not authoritative for
             // this workspace, especially when rediscovery is unavailable.
             self.complete_catalogs.clear();
             let args = self.clone();
             let patterns = patterns.clone();
-            if let Ok(discovered) = std::thread::spawn(move || {
+            let discovered = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
@@ -949,26 +956,32 @@ impl Cli {
                             selected.push(provider);
                         }
                     }
-                    let discovery = futures_util::future::join_all(
-                        selected
-                            .into_iter()
-                            .map(|provider| model_selection::catalog(&args, provider, true)),
-                    );
-                    tokio::time::timeout(Duration::from_secs(15), discovery)
-                        .await
-                        .map(|results| {
-                            results
-                                .into_iter()
-                                .filter_map(Result::ok)
-                                .collect::<Vec<_>>()
-                        })
-                        .map_err(|_| Error::Config("model discovery timed out".into()))
+                    Ok::<_, Error>(
+                        futures_util::future::join_all(selected.into_iter().map(
+                            |provider| async {
+                                tokio::time::timeout(
+                                    timeout,
+                                    model_selection::catalog(&args, provider, true),
+                                )
+                                .await
+                            },
+                        ))
+                        .await,
+                    )
                 })
             })
             .join()
-            .unwrap_or_else(|_| Err(Error::Config("model discovery worker stopped".into())))
-            {
-                for catalog in discovered {
+            .unwrap_or_else(|_| Err(Error::Config("model discovery worker stopped".into())));
+            self.selection_discovery_pending = discovered.as_ref().map_or(true, |results| {
+                results
+                    .iter()
+                    .any(|result| !matches!(result, Ok(Ok(catalog)) if catalog.complete))
+            });
+            if let Ok(results) = discovered {
+                for catalog in results
+                    .into_iter()
+                    .filter_map(|result| result.ok().and_then(Result::ok))
+                {
                     if catalog.complete {
                         self.complete_catalogs.push((
                             catalog.provider.id().to_owned(),
