@@ -18,7 +18,11 @@ fn text_chars(text: &str) -> u64 {
 
 /// Approximate a message using Pi's four UTF-16 units per token and image budget.
 pub fn estimate_message_tokens(message: &Message) -> u64 {
-    let chars = match message {
+    message_chars(message).div_ceil(4)
+}
+
+fn message_chars(message: &Message) -> u64 {
+    match message {
         Message::System { content } | Message::User { content } => text_chars(content),
         Message::UserWithImages { content, images } => text_chars(content)
             .saturating_add((images.len() as u64).saturating_mul(ESTIMATED_IMAGE_CHARS)),
@@ -45,8 +49,7 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
             text_chars(&content)
                 .saturating_add((images.len() as u64).saturating_mul(ESTIMATED_IMAGE_CHARS))
         }
-    };
-    chars.div_ceil(4)
+    }
 }
 
 /// Input estimate including the current system prompt and advertised tool schemas.
@@ -81,8 +84,91 @@ pub(crate) fn estimate_source_tokens(
         Some(Event::BashExecution { execution }) => text_chars(&execution.command)
             .saturating_add(text_chars(&execution.output))
             .div_ceil(4),
+        Some(Event::Assistant {
+            request_id: Some(request_id),
+            ..
+        }) => {
+            let edited = session.branch().iter().any(|record| matches!(&record.event, Event::ContextEdited { target, .. } if *target == source));
+            let reasoning = (!edited)
+                .then(|| {
+                    session
+                        .branch()
+                        .iter()
+                        .find_map(|record| match &record.event {
+                            Event::ModelFinished {
+                                request_id: id,
+                                metadata,
+                                ..
+                            } if id == request_id => metadata.reasoning.as_deref(),
+                            _ => None,
+                        })
+                        .map(text_chars)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            message_chars(message).saturating_add(reasoning).div_ceil(4)
+        }
         _ => estimate_message_tokens(message),
     }
+}
+
+pub(crate) fn estimate_system_tokens(branch: &[&crate::Record]) -> u64 {
+    let mut contents = Vec::new();
+    let mut sections = std::collections::BTreeMap::new();
+    let mut tools: Vec<crate::ToolSpec> = Vec::new();
+    for record in branch {
+        if matches!(record.event, Event::Compacted { .. }) {
+            contents.clear();
+            sections.clear();
+            tools.clear();
+        }
+        let (content, changes, added, removed) = match &record.event {
+            Event::SystemCheckpoint {
+                content,
+                sections,
+                tools_added,
+                tools_removed,
+            } => (content, sections, tools_added, tools_removed.as_slice()),
+            Event::Compacted {
+                system_prompt: Some(snapshot),
+                ..
+            } => (
+                &snapshot.content,
+                &snapshot.sections,
+                &snapshot.tools,
+                &[][..],
+            ),
+            _ => continue,
+        };
+        if !content.is_empty() {
+            contents.push(content.as_str());
+        }
+        for (name, value) in changes {
+            if let Some(value) = value {
+                sections.insert(name, value);
+            } else {
+                sections.remove(name);
+            }
+        }
+        tools.retain(|tool| !removed.contains(&tool.name));
+        for tool in added {
+            if let Some(index) = tools.iter().position(|item| item.name == tool.name) {
+                tools[index] = tool.clone();
+            } else {
+                tools.push(tool.clone());
+            }
+        }
+    }
+    let mut chars = text_chars(&contents.join("\n\n"));
+    for value in sections.values() {
+        chars = chars.saturating_add(text_chars(value));
+    }
+    if !tools.is_empty() {
+        chars = chars.saturating_add(text_chars(
+            &serde_json::to_string(&tools).unwrap_or_default(),
+        ));
+    }
+    chars.div_ceil(4)
 }
 
 #[cfg(test)]

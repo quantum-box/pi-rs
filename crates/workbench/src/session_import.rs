@@ -1032,6 +1032,32 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn imported_assistant_total_tokens_survive_projection_and_edits() {
+        let entries = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[],"stopReason":"stop","usage":{"totalTokens":234}}}),
+            json!({"type":"model_change","id":"m","parentId":"a","provider":"ollama","modelId":"new"}),
+        ];
+        let session = import_pi(entries).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 234);
+        assert_eq!(session.context_usage(1000).unwrap().tokens, Some(234));
+    }
+
+    #[test]
+    fn imported_total_only_usage_keeps_post_compaction_estimate_available() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"compaction","id":"c","parentId":"u","summary":"summary","firstKeptEntryId":"u","tokensBefore":10}),
+            json!({"type":"message","id":"a","parentId":"c","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning"}],"stopReason":"stop","usage":{"totalTokens":234}}}),
+            json!({"type":"context_edit","id":"e","parentId":"a","targetId":"u","replacement":{"content":"changed"}}),
+        ]).unwrap();
+        assert!(session.context_usage_estimate().last_usage_record.is_none());
+        assert!(session.context_usage(1000).unwrap().tokens.is_some());
+    }
+
+    #[test]
     fn continuation_counts_empty_assistants_and_respects_omissions() {
         use clap::Parser;
         for reason in ["error", "aborted", "stop"] {

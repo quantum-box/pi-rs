@@ -682,17 +682,14 @@ impl Session {
 
     pub fn context_usage_estimate(&self) -> crate::ContextUsageEstimate {
         let branch = self.branch();
-        let entries = conversation_entries(&branch, self.operations());
+        let entries = conversation_entries_unrepaired(&branch, self.operations());
         let invalidated_at = branch
             .iter()
             .rev()
             .find_map(|record| {
                 matches!(
                     record.event,
-                    Event::ContextEdited { .. }
-                        | Event::Compacted { .. }
-                        | Event::SystemCheckpoint { .. }
-                        | Event::ModelSelected { .. }
+                    Event::ContextEdited { .. } | Event::Compacted { .. }
                 )
                 .then_some(record.id)
             })
@@ -739,7 +736,9 @@ impl Session {
                 .and_then(|(metadata, _)| metadata.provider_prompt_tokens)
                 .filter(|tokens| *tokens > 0)
                 .unwrap_or(usage.input_tokens);
-            let usage_tokens = input.saturating_add(usage.output_tokens);
+            let usage_tokens = self
+                .imported_context_total(*source)
+                .unwrap_or_else(|| input.saturating_add(usage.output_tokens));
             if usage_tokens == 0 {
                 continue;
             }
@@ -751,6 +750,15 @@ impl Session {
                             self, *source, message,
                         ))
                     });
+            // Pi estimates each system delta that follows the measured reply.
+            let trailing_tokens = branch
+                .iter()
+                .filter(|record| {
+                    record.id > *source && matches!(record.event, Event::SystemCheckpoint { .. })
+                })
+                .fold(trailing_tokens, |tokens, record| {
+                    tokens.saturating_add(crate::tokens::estimate_system_tokens(&[*record]))
+                });
             return crate::ContextUsageEstimate {
                 tokens: usage_tokens.saturating_add(trailing_tokens),
                 usage_tokens,
@@ -762,11 +770,13 @@ impl Session {
             Event::Compacted { summary, .. } => Some(summary),
             _ => None,
         });
-        let initial = summary.map_or(0, |summary| {
-            crate::estimate_message_tokens(&Message::User {
-                content: summary.clone(),
+        let initial = summary
+            .map_or(0, |summary| {
+                crate::estimate_message_tokens(&Message::User {
+                    content: summary.clone(),
+                })
             })
-        });
+            .saturating_add(crate::tokens::estimate_system_tokens(&branch));
         let tokens = entries.iter().fold(initial, |tokens, (source, message)| {
             tokens.saturating_add(crate::tokens::estimate_source_tokens(
                 self, *source, message,
@@ -778,6 +788,34 @@ impl Session {
             trailing_tokens: tokens,
             last_usage_record: None,
         }
+    }
+
+    pub(crate) fn imported_context_total(&self, source: u64) -> Option<u64> {
+        let assistant = self.records.get(source.checked_sub(1)? as usize)?;
+        let Event::Assistant {
+            request_id: Some(request_id),
+            ..
+        } = &assistant.event
+        else {
+            return None;
+        };
+        let completion = self
+            .records
+            .get(assistant.parent?.checked_sub(1)? as usize)?;
+        if !matches!(&completion.event, Event::ModelFinished { request_id: id, .. } if id == request_id)
+        {
+            return None;
+        }
+        let original = self
+            .records
+            .get(completion.parent?.checked_sub(1)? as usize)?;
+        let Event::SourceEntry { format, entry } = &original.event else {
+            return None;
+        };
+        (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
+            .then(|| entry["message"]["usage"]["totalTokens"].as_u64())
+            .flatten()
+            .filter(|total| *total > 0)
     }
 
     pub fn operations(&self) -> Vec<(Invocation, OperationState)> {
@@ -2073,10 +2111,34 @@ pub(crate) fn conversation_entries(
     conversation_entries_since(path, operations, retain_from)
 }
 
+pub(crate) fn conversation_entries_unrepaired(
+    path: &[&Record],
+    operations: Vec<(Invocation, OperationState)>,
+) -> Vec<(u64, Message)> {
+    let retain_from = path
+        .iter()
+        .rev()
+        .find_map(|record| match record.event {
+            Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(record.id)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    conversation_entries_since_inner(path, operations, retain_from, false)
+}
+
 fn conversation_entries_since(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
     retain_from: u64,
+) -> Vec<(u64, Message)> {
+    conversation_entries_since_inner(path, operations, retain_from, true)
+}
+
+fn conversation_entries_since_inner(
+    path: &[&Record],
+    operations: Vec<(Invocation, OperationState)>,
+    retain_from: u64,
+    repair: bool,
 ) -> Vec<(u64, Message)> {
     let results: BTreeMap<_, _> = operations
         .into_iter()
@@ -2215,7 +2277,7 @@ fn conversation_entries_since(
             None => Some((source, message)),
         })
         .collect();
-    if !edits.is_empty() {
+    if repair && !edits.is_empty() {
         messages = repair_tool_pairs(messages);
     }
     messages

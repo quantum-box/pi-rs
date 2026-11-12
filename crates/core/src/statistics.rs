@@ -189,13 +189,13 @@ impl Session {
         // An edit can invalidate a usage-based estimate without removing the
         // post-compaction assistant that makes a fresh estimate meaningful.
         let has_post_compaction_usage = last_compaction.is_none_or(|index| {
-            let projected: std::collections::HashSet<_> = self
-                .current_message_entries()
-                .into_iter()
-                .filter_map(|(id, message)| {
-                    matches!(message, crate::Message::Assistant { .. }).then_some(id)
-                })
-                .collect();
+            let projected: std::collections::HashSet<_> =
+                crate::journal::conversation_entries_unrepaired(&branch, self.operations())
+                    .into_iter()
+                    .filter_map(|(id, message)| {
+                        matches!(message, crate::Message::Assistant { .. }).then_some(id)
+                    })
+                    .collect();
             let completions: std::collections::HashMap<_, _> = branch
                 .iter()
                 .filter_map(|record| match &record.event {
@@ -234,7 +234,9 @@ impl Session {
                     .and_then(|(metadata, _)| metadata.provider_prompt_tokens)
                     .filter(|n| *n > 0)
                     .unwrap_or(usage.input_tokens);
-                input.saturating_add(usage.output_tokens) > 0
+                self.imported_context_total(record.id)
+                    .unwrap_or_else(|| input.saturating_add(usage.output_tokens))
+                    > 0
             })
         });
         let tokens = if !has_post_compaction_usage {
@@ -254,6 +256,146 @@ impl Session {
 mod tests {
     use super::*;
     use crate::{ContextContent, MemoryStore, Usage};
+
+    fn assistant(
+        session: &mut Session,
+        content: &str,
+        reasoning: Option<&str>,
+        usage: Usage,
+    ) -> u64 {
+        let request_id = uuid::Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: crate::ModelMetadata {
+                    reasoning: reasoning.map(str::to_owned),
+                    ..Default::default()
+                },
+                usage: crate::UsageReport::Measured { usage },
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: content.into(),
+                invocations: vec![],
+                usage: Some(usage),
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        session.head()
+    }
+
+    #[test]
+    fn estimation_counts_current_system_and_thinking_after_edit() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::SystemCheckpoint {
+                content: "abcdefgh".into(),
+                sections: vec![("rules".into(), Some("1234".into()))],
+                tools_added: vec![],
+                tools_removed: vec![],
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "abcd".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let user = session.head();
+        assistant(
+            &mut session,
+            "text",
+            Some("thinking"),
+            Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+        );
+        session
+            .edit_context(user, Some(ContextContent::Text("abcd".into())))
+            .unwrap();
+        // System: 12 chars = 3 tokens; user: 1; assistant text+thinking: 3.
+        assert_eq!(session.context_usage_estimate().tokens, 7);
+    }
+
+    #[test]
+    fn model_selection_does_not_invalidate_measured_usage() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        assistant(
+            &mut session,
+            "answer",
+            None,
+            Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+        );
+        session
+            .append(Event::ModelSelected {
+                model: "other".into(),
+                thinking: None,
+                provider: None,
+            })
+            .unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 105);
+        session
+            .append(Event::SystemCheckpoint {
+                content: "extra".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            })
+            .unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 107);
+    }
+
+    #[test]
+    fn post_compaction_thinking_only_assistant_survives_unrelated_edit_for_usage() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let before = session.head();
+        session
+            .append(Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: Some(before),
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "question".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let question = session.head();
+        assistant(
+            &mut session,
+            "",
+            Some("thinking"),
+            Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+        );
+        session
+            .edit_context(question, Some(ContextContent::Text("changed".into())))
+            .unwrap();
+        assert!(session.context_usage(1000).unwrap().tokens.is_some());
+        assert!(session.context_usage_estimate().tokens >= 2);
+    }
 
     #[test]
     fn context_usage_after_compaction_and_later_edit_uses_fresh_estimate() {
