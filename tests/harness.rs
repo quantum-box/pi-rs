@@ -84,13 +84,14 @@ async fn extension_observes_agent_settled_after_success_and_cancellation() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancellation.cancel();
     };
+    let mut observer = ignore;
     let (result, ()) = tokio::join!(
         agent.run(
             &mut session,
             Some("cancel".into()),
             &mut inputs,
             &cancel,
-            &mut ignore
+            &mut observer
         ),
         task
     );
