@@ -198,45 +198,82 @@ struct Options {
     max_output_tokens: usize,
     timeout: Duration,
 }
-#[derive(Deserialize)]
-struct WireOptions {
-    max_output_tokens: Option<usize>,
-    timeout_ms: Option<u64>,
-}
 fn options(code: &str, maximum: Duration) -> Result<(Options, &str), String> {
-    let first = code.lines().next().unwrap_or_default();
-    let parsed = first
-        .strip_prefix("// @options:")
-        .map(|value| serde_json::from_str::<WireOptions>(value).map_err(|error| error.to_string()))
-        .transpose()?;
-    if code
-        .lines()
-        .skip(1)
-        .any(|line| line.trim_start().starts_with("// @options:"))
-    {
-        return Err("options must be on the first line".into());
+    const PREFIX: &str = "// @options:";
+    const FIELDS: &str = "`max_output_tokens` and `timeout_ms`";
+    if code.trim().is_empty() {
+        return Err("Expected JavaScript source text (non-empty)".into());
     }
-    let tokens = parsed
-        .as_ref()
-        .and_then(|options| options.max_output_tokens)
-        .unwrap_or(10_000);
-    let timeout = parsed
-        .and_then(|options| options.timeout_ms)
-        .map(Duration::from_millis)
-        .unwrap_or(maximum)
-        .min(maximum);
-    if tokens == 0 || timeout.is_zero() {
-        return Err("output and timeout limits must be positive".into());
+    for (index, line) in code.split('\n').enumerate().skip(1) {
+        if line.trim_start().starts_with(PREFIX) {
+            return Err(format!(
+                "The {PREFIX} line must be the first line of the input; found one on line {}",
+                index + 1
+            ));
+        }
     }
-    let source = if first.starts_with("// @options:") {
-        code.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
-    } else {
-        code
+    let first = code.split('\n').next().unwrap_or_default().trim_start();
+    let Some(directive) = first.strip_prefix(PREFIX) else {
+        return Ok((
+            Options {
+                max_output_tokens: 10_000,
+                timeout: maximum,
+            },
+            code,
+        ));
     };
+    // Keep the newline so errors point at the original source line.
+    let source = code.find('\n').map(|index| &code[index..]).unwrap_or("");
+    if source.trim().is_empty() {
+        return Err(
+            "The @options line must be followed by JavaScript source on subsequent lines".into(),
+        );
+    }
+    let directive = directive.trim();
+    if directive.is_empty() {
+        return Err(format!(
+            "@options must be a JSON object with supported fields {FIELDS}"
+        ));
+    }
+    let value: Value = serde_json::from_str(directive).map_err(|error| {
+        format!("@options must be valid JSON with supported fields {FIELDS}: {error}")
+    })?;
+    let fields = value
+        .as_object()
+        .ok_or_else(|| format!("@options must be a JSON object with supported fields {FIELDS}"))?;
+    for key in fields.keys() {
+        if key != "max_output_tokens" && key != "timeout_ms" {
+            return Err(format!("@options only supports {FIELDS}; got `{key}`"));
+        }
+    }
+    let integer = |name: &str, limit: u64| -> Result<Option<u64>, String> {
+        let Some(value) = fields.get(name) else {
+            return Ok(None);
+        };
+        let number = value
+            .as_f64()
+            .filter(|n| *n >= 0.0 && *n <= limit as f64 && n.fract() == 0.0);
+        number.map(|n| Some(n as u64)).ok_or_else(|| match name {
+            "timeout_ms" => {
+                "@options field `timeout_ms` must be a positive integer up to 2147483647".into()
+            }
+            _ => "@options field `max_output_tokens` must be a non-negative safe integer".into(),
+        })
+    };
+    let tokens = integer("max_output_tokens", 9_007_199_254_740_991)?.unwrap_or(10_000);
+    let timeout = integer("timeout_ms", 2_147_483_647)?;
+    if timeout == Some(0) {
+        return Err(
+            "@options field `timeout_ms` must be a positive integer up to 2147483647".into(),
+        );
+    }
     Ok((
         Options {
-            max_output_tokens: tokens,
-            timeout,
+            max_output_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
+            timeout: timeout
+                .map(Duration::from_millis)
+                .unwrap_or(maximum)
+                .min(maximum),
         },
         source,
     ))
@@ -773,6 +810,36 @@ mod tests {
                     Arc::new(Host),
                 ),
             )
+    }
+    #[test]
+    fn options_match_reference_source_validation() {
+        let maximum = Duration::from_secs(2);
+        let (parsed, source) = options(
+            "  // @options: {\"max_output_tokens\":0,\"timeout_ms\":25}\r\ntext(1)",
+            maximum,
+        )
+        .unwrap();
+        assert_eq!(parsed.max_output_tokens, 0);
+        assert_eq!(parsed.timeout, Duration::from_millis(25));
+        assert_eq!(source, "\ntext(1)");
+        for invalid in [
+            "",
+            "// @options: {}",
+            "// @options: {}\n  ",
+            "// @options: {\"yield\":1}\ntext(1)",
+            "// @options: {\"timeout_ms\":null}\ntext(1)",
+            "// @options: {\"timeout_ms\":2147483648}\ntext(1)",
+            "// @options: {\"max_output_tokens\":1.5}\ntext(1)",
+            "text(1)\n // @options: {}",
+        ] {
+            assert!(options(invalid, maximum).is_err(), "accepted {invalid:?}");
+        }
+        let reply = run("  // @options: {\"timeout_ms\":20}\nwhile (true) {}", None);
+        assert!(matches!(reply.outcome, Outcome::Failed(_)));
+        assert!(matches!(
+            run("// @options: {\"yield\":1}\nstore('x', 1)", None).outcome,
+            Outcome::Failed(_)
+        ));
     }
     #[test]
     fn scripts_call_tools_and_commit_private_store_without_io_globals() {
