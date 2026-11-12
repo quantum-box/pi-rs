@@ -2056,7 +2056,8 @@ fn model_listing_uses_proxy_before_a_model_request() {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(10))
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
                 Err(error) => panic!("model discovery did not reach proxy: {error}"),
             };
@@ -2133,7 +2134,8 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(10))
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
                 Err(error) => panic!("OAuth refresh did not reach proxy: {error}"),
             };
@@ -2212,7 +2214,8 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(10))
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
                 Err(error) => panic!("MCP request did not reach proxy: {error}"),
             };
