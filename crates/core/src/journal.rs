@@ -309,6 +309,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage_metadata: Option<Box<SummaryUsageMetadata>>,
     },
+    /// A summary message imported from Pi, without applying a new compaction.
+    CompactionSummaryMessage {
+        summary: String,
+        tokens_before: u64,
+    },
     /// Summary of a branch left behind, optionally committed at a new position.
     BranchSummary {
         summary: String,
@@ -1989,6 +1994,12 @@ fn conversation_entries_since(
                 record.id,
                 Message::User {
                     content: format!("The following is a summary of a branch that this conversation came back from:\n\n<summary>\n{summary}</summary>"),
+                },
+            )),
+            Event::CompactionSummaryMessage { summary, .. } => messages.push((
+                record.id,
+                Message::User {
+                    content: format!("The conversation history before this point was compacted into the following summary:\n\n<summary>\n{summary}\n</summary>"),
                 },
             )),
             Event::UserImages { images } => {

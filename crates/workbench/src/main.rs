@@ -1988,6 +1988,9 @@ fn metadata(record: &pi_rs::Record) -> Value {
         } => {
             json!({"event": "compacted", "retain_from": retain_from, "usage": usage})
         }
+        Event::CompactionSummaryMessage { tokens_before, .. } => {
+            json!({"event":"compaction_summary_message", "tokens_before":tokens_before})
+        }
         Event::BranchSummary {
             from,
             target,

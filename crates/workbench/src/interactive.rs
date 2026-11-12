@@ -890,6 +890,15 @@ impl View {
                 summary,
             ),
             pi_rs::Event::BranchSummary { summary, .. } => (SummaryKind::Branch, summary),
+            pi_rs::Event::CompactionSummaryMessage {
+                summary,
+                tokens_before,
+            } => (
+                SummaryKind::Compaction {
+                    tokens_before: *tokens_before,
+                },
+                summary,
+            ),
             _ => return,
         };
         self.lines.push(Entry::Summary {
