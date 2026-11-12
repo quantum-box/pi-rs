@@ -1465,6 +1465,7 @@ impl Agent<'_> {
                 operation_id: invocation.operation_id,
                 cancellation: cancel.child_token(),
             };
+            let _cancel_on_drop = context.cancellation.clone().drop_guard();
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
@@ -3320,6 +3321,63 @@ mod tree_tests {
             )
             .await;
         assert_eq!(skipped.outcome, Outcome::Skipped("denied".into()));
+    }
+
+    #[tokio::test]
+    async fn timed_out_result_hook_cancels_its_context_and_preserves_result() {
+        struct Waiting(std::sync::Mutex<Option<CancellationToken>>);
+        #[async_trait::async_trait]
+        impl crate::Extension for Waiting {
+            fn id(&self) -> &str {
+                "waiting"
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result(
+                &self,
+                _: &crate::ToolCall,
+                _: &Outcome,
+                context: &crate::ToolContext,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<Option<Outcome>> {
+                *self.0.lock().unwrap() = Some(context.cancellation.clone());
+                std::future::pending().await
+            }
+        }
+        let hook = Arc::new(Waiting(std::sync::Mutex::new(None)));
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                tool_timeout: Duration::from_millis(10),
+                ..Limits::default()
+            },
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut reply = ToolReply::from(Outcome::Succeeded("original".into()));
+        agent
+            .transform_tool_result(
+                &invocation,
+                &mut reply,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(reply.outcome, Outcome::Succeeded("original".into()));
+        assert!(hook.0.lock().unwrap().as_ref().unwrap().is_cancelled());
     }
 
     #[tokio::test]
