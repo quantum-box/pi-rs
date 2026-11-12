@@ -327,17 +327,21 @@ pub fn html(session: &Session) -> String {
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\"><title>{title}</title><style>body{{max-width:960px;margin:40px auto;padding:0 20px;font:16px system-ui;background:#16181d;color:#e4e6eb}}article,details{{padding:16px;margin:12px 0;border-radius:8px;background:#252932}}.user{{background:#243448}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}}summary{{cursor:pointer}}.thinking{{color:#a5abb6}}h1{{font-size:24px}}</style><h1>{title}</h1>"
     );
     let mut imported_assistant = None;
-    let mut imported_legacy_custom = false;
+    let mut imported_legacy_custom = None;
     let mut has_system_prompt = false;
     for record in session.branch() {
         match &record.event {
             Event::SourceEntry { format, entry } => {
-                imported_legacy_custom = format == "pi"
+                // The importer assigns the converted legacy message the next record ID.
+                // Keep that identity: a later branch may diverge at the source entry.
+                imported_legacy_custom = (format == "pi"
                     && entry["type"] == "message"
                     && matches!(
                         entry["message"]["role"].as_str(),
                         Some("custom" | "hookMessage")
-                    );
+                    ))
+                .then(|| record.id.checked_add(1))
+                .flatten();
                 imported_assistant = (format == "pi"
                     && entry["type"] == "message"
                     && entry["message"]["role"] == "assistant")
@@ -349,8 +353,8 @@ pub fn html(session: &Session) -> String {
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
             Event::CustomMessage { message } => {
-                let show = message.display || !imported_legacy_custom;
-                imported_legacy_custom = false;
+                let show = message.display || imported_legacy_custom != Some(record.id);
+                imported_legacy_custom = None;
                 if !show {
                     continue;
                 }
@@ -1288,6 +1292,42 @@ mod tests {
         assert!(document.contains("hidden <strong>native</strong>"));
         assert!(document.contains("visible native"));
         assert_eq!(document.matches("Hidden in terminal").count(), 1);
+    }
+
+    #[test]
+    fn html_exports_native_hidden_message_after_checkout_to_legacy_source() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"legacy hidden","display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let mut session = super::super::session_import::read(fixture.path()).unwrap();
+        let source = session
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event,
+                    Event::SourceEntry { entry, .. } if entry["id"] == "a"
+                )
+            })
+            .unwrap()
+            .id;
+        session.checkout(source).unwrap();
+        session
+            .append_custom_message(pi_rs::CustomMessage {
+                custom_type: "native".into(),
+                content: pi_rs::ContextContent::Text("native after checkout".into()),
+                display: false,
+                details: None,
+            })
+            .unwrap();
+        let document = html(&session);
+        assert!(document.contains("<b>native</b> <span>Hidden in terminal</span>"));
+        assert!(document.contains("native after checkout"));
+        assert!(!document.contains("legacy hidden"));
     }
 
     #[test]
