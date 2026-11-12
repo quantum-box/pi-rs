@@ -1758,6 +1758,8 @@ Imported custom messages remain model context and support branch-local context
 edits. RPC session entries keep the original Pi representation without
 duplicating the converted journal records. Codemode store entries also continue
 to restore their branch-local state.
+Legacy `custom` and `hookMessage` message records likewise retain their display
+metadata and enter model context without being rendered as user prompts.
 
 Imported failed or aborted assistant messages retain their original transcript
 and failure status. Incomplete tool calls in those messages are not executed,

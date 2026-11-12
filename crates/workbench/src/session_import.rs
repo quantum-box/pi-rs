@@ -319,6 +319,58 @@ fn push_user(events: &mut Vec<Event>, value: &Value) -> Result<()> {
     }
     Ok(())
 }
+fn imported_custom_message(entry: &Value, legacy: bool) -> Result<pi_rs::CustomMessage> {
+    let value = entry
+        .get("content")
+        .ok_or_else(|| Error::Session("imported custom message is missing content".into()))?;
+    let content = if let Some(text) = value.as_str() {
+        pi_rs::ContextContent::Text(text.into())
+    } else {
+        let blocks = value
+            .as_array()
+            .ok_or_else(|| Error::Session("invalid imported custom message content".into()))?;
+        let mut result = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("text") => result.push(pi_rs::ContentBlock::Text {
+                    text: required(block, "text")?.into(),
+                }),
+                Some("image") => {
+                    let (_, images) = user_content(&Value::Array(vec![block.clone()]))?;
+                    let image = &images[0];
+                    result.push(pi_rs::ContentBlock::Image {
+                        data: image.data.clone(),
+                        mime_type: image.mime_type.clone(),
+                    });
+                }
+                _ => {
+                    return Err(Error::Session(
+                        "invalid imported custom message block".into(),
+                    ));
+                }
+            }
+        }
+        pi_rs::ContextContent::Blocks(result)
+    };
+    Ok(pi_rs::CustomMessage {
+        custom_type: if legacy {
+            entry["customType"].as_str().unwrap_or_default()
+        } else {
+            required(entry, "customType")?
+        }
+        .into(),
+        content,
+        display: if legacy {
+            entry["display"].as_bool().unwrap_or(false)
+        } else {
+            entry["display"].as_bool().ok_or_else(|| {
+                Error::Session("imported custom message is missing display".into())
+            })?
+        },
+        details: entry.get("details").cloned(),
+    })
+}
+
 fn anthropic_replay(message: &Value) -> Option<Box<pi_rs::ProviderReplay>> {
     if message["provider"] != "anthropic" || message["api"] != "anthropic-messages" {
         return None;
@@ -550,7 +602,9 @@ fn convert(
                         states: Default::default(),
                     });
                 }
-                "custom" | "hookMessage" => push_user(&mut events, &message["content"])?,
+                "custom" | "hookMessage" => events.push(Event::CustomMessage {
+                    message: imported_custom_message(message, true)?,
+                }),
                 "bashExecution" => events.push(Event::BashExecution {
                     execution: serde_json::from_value(message.clone())?,
                 }),
@@ -686,50 +740,9 @@ fn convert(
                 modified_files: files("modifiedFiles"),
             });
         }
-        "custom_message" => {
-            let value = entry.get("content").ok_or_else(|| {
-                Error::Session("imported custom message is missing content".into())
-            })?;
-            let content = if let Some(text) = value.as_str() {
-                pi_rs::ContextContent::Text(text.into())
-            } else {
-                let blocks = value.as_array().ok_or_else(|| {
-                    Error::Session("invalid imported custom message content".into())
-                })?;
-                let mut result = Vec::with_capacity(blocks.len());
-                for block in blocks {
-                    match block["type"].as_str() {
-                        Some("text") => result.push(pi_rs::ContentBlock::Text {
-                            text: required(block, "text")?.into(),
-                        }),
-                        Some("image") => {
-                            let (_, images) = user_content(&Value::Array(vec![block.clone()]))?;
-                            let image = &images[0];
-                            result.push(pi_rs::ContentBlock::Image {
-                                data: image.data.clone(),
-                                mime_type: image.mime_type.clone(),
-                            });
-                        }
-                        _ => {
-                            return Err(Error::Session(
-                                "invalid imported custom message block".into(),
-                            ));
-                        }
-                    }
-                }
-                pi_rs::ContextContent::Blocks(result)
-            };
-            events.push(Event::CustomMessage {
-                message: pi_rs::CustomMessage {
-                    custom_type: required(entry, "customType")?.into(),
-                    content,
-                    display: entry["display"].as_bool().ok_or_else(|| {
-                        Error::Session("imported custom message is missing display".into())
-                    })?,
-                    details: entry.get("details").cloned(),
-                },
-            });
-        }
+        "custom_message" => events.push(Event::CustomMessage {
+            message: imported_custom_message(entry, false)?,
+        }),
         "custom" => {
             events.push(Event::CustomEntry {
                 entry: pi_rs::CustomEntry {
@@ -1094,6 +1107,38 @@ mod tests {
             matches!(&messages[1], Message::UserWithImages { content, images } if content == "look" && images.len() == 1)
         );
     }
+    #[test]
+    fn imports_legacy_custom_messages_without_losing_visibility_or_metadata() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":2}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"custom","customType":"private","content":"hidden context","display":false,"details":{"source":"extension"}}}),
+            json!({"type":"message","id":"b","parentId":"a","message":{"role":"hookMessage","content":"old hook"}}),
+        ]).unwrap();
+        let custom: Vec<_> = session
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::CustomMessage { message } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(custom.len(), 2);
+        assert!(!custom[0].display);
+        assert_eq!(custom[0].custom_type, "private");
+        assert_eq!(custom[0].details, Some(json!({"source":"extension"})));
+        assert!(!custom[1].display);
+        assert_eq!(session.conversation_at(session.head()).unwrap().len(), 2);
+        let entries = super::super::rpc_entries::Entries::new(&session)
+            .after(None)
+            .unwrap();
+        assert_eq!(entries["entries"].as_array().unwrap().len(), 2);
+        let (messages, _) = super::super::rpc_messages::snapshot(&session);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["customType"], "private");
+        assert_eq!(messages[0]["display"], false);
+        assert_eq!(messages[1]["role"], "hookMessage");
+    }
+
     #[test]
     fn imports_custom_entries_and_messages_with_metadata_and_context_edits() {
         let session = import_pi(vec![

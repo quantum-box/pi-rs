@@ -590,6 +590,9 @@ fn matches_imported_message(source: &Value, event: &Event) -> bool {
                 )
         }
         Event::SystemCheckpoint { .. } => role == Some("system"),
+        Event::CustomMessage { .. } => {
+            matches!(role, Some("custom" | "hookMessage")) || source["type"] == "custom_message"
+        }
         Event::Compacted { .. } => source["type"] == "compaction",
         Event::Assistant { .. } => role == Some("assistant"),
         Event::ToolFinished { .. } | Event::ToolReconciled { .. } => role == Some("toolResult"),
