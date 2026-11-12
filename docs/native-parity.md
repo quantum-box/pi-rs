@@ -80,6 +80,14 @@ Native extensions can opt into tool execution start and end events, including
 nested call ancestry, final outcomes, and elapsed execution time. Streaming
 tool execution updates remain a separate parity item.
 
+### xAI Responses checkpoint
+
+The native xAI provider uses the pinned Pi Responses catalog and
+`XAI_API_KEY`, with model-specific thinking levels and a provider identity
+separate from OpenAI and ChatGPT. The adapter supports streamed Responses
+events and tool calls through the shared Responses implementation. Loopback
+CLI coverage does not replace live acceptance with an xAI account.
+
 Markdown links use the reference's non-hyperlink terminal fallback: link text
 is underlined and destinations appear in parentheses only when they differ from
 the visible URL or email address. OSC 8 hyperlink capability remains open.
@@ -219,6 +227,13 @@ These checks cover the native integration paths. Live provider sign-in and the
 remaining feature rows above still need their own acceptance checks.
 
 ### Faithful terminal checkpoint
+
+Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
+fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
+automatic detection; tmux is probed for its `hyperlinks` terminal feature.
+Wrapped link fragments are closed on every rendered line, and control characters
+in destinations cannot enter terminal escape sequences. Opening links through
+the fullscreen application's own mouse handling remains open.
 
 The terminal now uses Pi v1.5.0 theme assets and schema, with attribution in
 `crates/workbench/assets/NOTICE`. It renders Markdown, highlighted code, shaded
@@ -1774,6 +1789,8 @@ duplicating the converted journal records. Codemode store entries also continue
 to restore their branch-local state.
 Legacy `custom` and `hookMessage` message records likewise retain their display
 metadata and enter model context without being rendered as user prompts.
+Imported message-form branch summaries use Pi's summary context framing while
+retaining their original RPC representation and branch reference.
 
 Imported failed or aborted assistant messages retain their original transcript
 and failure status. Incomplete tool calls in those messages are not executed,

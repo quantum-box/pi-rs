@@ -608,7 +608,20 @@ fn convert(
                 "bashExecution" => events.push(Event::BashExecution {
                     execution: serde_json::from_value(message.clone())?,
                 }),
-                "branchSummary" | "compactionSummary" => events.push(Event::User {
+                "branchSummary" => events.push(Event::BranchSummary {
+                    summary: required(message, "summary")?.into(),
+                    extension_summary: None,
+                    from: message["fromId"]
+                        .as_str()
+                        .and_then(|id| branches.get(id))
+                        .map(|branch| branch.head),
+                    target: None,
+                    usage: None,
+                    usage_metadata: None,
+                    read_files: Vec::new(),
+                    modified_files: Vec::new(),
+                }),
+                "compactionSummary" => events.push(Event::User {
                     content: required(message, "summary")?.into(),
                     input_id: None,
                 }),
@@ -1107,6 +1120,27 @@ mod tests {
             matches!(&messages[1], Message::UserWithImages { content, images } if content == "look" && images.len() == 1)
         );
     }
+    #[test]
+    fn imports_branch_summary_message_with_reference_context() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"root","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"branch","parentId":"root","message":{"role":"user","content":"old branch"}}),
+            json!({"type":"message","id":"summary","parentId":"root","message":{"role":"branchSummary","summary":"branch facts","fromId":"branch","timestamp":123}}),
+        ]).unwrap();
+        let messages = session.conversation_at(session.head()).unwrap();
+        assert!(
+            matches!(&messages[1], Message::User { content } if content == "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nbranch facts</summary>")
+        );
+        let (visible, _) = super::super::rpc_messages::snapshot(&session);
+        assert_eq!(visible.last().unwrap()["role"], "branchSummary");
+        assert_eq!(visible.last().unwrap()["summary"], "branch facts");
+        let entries = super::super::rpc_entries::Entries::new(&session)
+            .after(None)
+            .unwrap();
+        assert_eq!(entries["entries"].as_array().unwrap().len(), 3);
+    }
+
     #[test]
     fn imports_legacy_custom_messages_without_losing_visibility_or_metadata() {
         let session = import_pi(vec![
