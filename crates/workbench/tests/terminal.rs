@@ -1209,15 +1209,20 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
 
 #[test]
 fn settings_choose_and_clear_per_model_thinking() {
-    check_per_model_thinking_settings(false);
+    check_per_model_thinking_settings(false, false);
 }
 
 #[test]
 fn project_per_model_thinking_preserves_live_edits_and_disk_precedence() {
-    check_per_model_thinking_settings(true);
+    check_per_model_thinking_settings(true, false);
 }
 
-fn check_per_model_thinking_settings(project_override: bool) {
+#[test]
+fn clearing_per_model_thinking_uses_unqualified_model_fallback() {
+    check_per_model_thinking_settings(false, true);
+}
+
+fn check_per_model_thinking_settings(project_override: bool, model_fallback: bool) {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -1238,11 +1243,12 @@ else:
 print(json.dumps({'version':1, 'response':{'Ok':result}}))
 "##).unwrap();
     std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(
-        home.join("settings.json"),
-        br#"{"defaultThinkingLevel":"low"}"#,
-    )
-    .unwrap();
+    let initial_settings = if model_fallback {
+        serde_json::json!({"defaultThinkingLevel":"medium", "modelThinkingLevels":{"fixture-model":"low"}})
+    } else {
+        serde_json::json!({"defaultThinkingLevel":"low"})
+    };
+    std::fs::write(home.join("settings.json"), initial_settings.to_string()).unwrap();
     if project_override {
         std::fs::create_dir_all(root.path().join(".pi")).unwrap();
         std::fs::write(
@@ -1349,7 +1355,12 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     wait_level(displayed);
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Default thinking level per model") && text.contains("1 configured")
+        text.contains("Default thinking level per model")
+            && text.contains(if model_fallback {
+                "2 configured"
+            } else {
+                "1 configured"
+            })
     });
     master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| text.contains("Thinking: select model"));
@@ -1364,7 +1375,14 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     });
     master.write_all(b"Clear\r").unwrap();
     output_until(&mut master, |text| text.contains("Thinking: select model"));
-    assert!(read_settings().get("modelThinkingLevels").is_none());
+    if model_fallback {
+        assert_eq!(
+            read_settings()["modelThinkingLevels"],
+            serde_json::json!({"fixture-model":"low"})
+        );
+    } else {
+        assert!(read_settings().get("modelThinkingLevels").is_none());
+    }
     wait_level("low");
     let deadline = Instant::now() + Duration::from_secs(10);
     let notifications = loop {
@@ -1413,7 +1431,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
         text.contains("Default thinking level per model")
-            && text.contains(if project_override {
+            && text.contains(if project_override || model_fallback {
                 "2 configured"
             } else {
                 "1 configured"

@@ -83,10 +83,16 @@ impl Settings {
         self.value.get(key)?.as_str()
     }
     pub fn thinking_for_model(&self, provider: &str, model: &str) -> Option<&str> {
-        let levels = self.value.get("modelThinkingLevels");
-        levels
+        self.value
+            .get("modelThinkingLevels")
             .and_then(|levels| levels.get(format!("{provider}/{model}")))
-            .or_else(|| levels.and_then(|levels| levels.get(model)))
+            .and_then(Value::as_str)
+            .or_else(|| self.thinking_without_qualified_override(model))
+    }
+    pub fn thinking_without_qualified_override(&self, model: &str) -> Option<&str> {
+        self.value
+            .get("modelThinkingLevels")
+            .and_then(|levels| levels.get(model))
             .and_then(Value::as_str)
             .or_else(|| self.string("defaultThinkingLevel"))
     }

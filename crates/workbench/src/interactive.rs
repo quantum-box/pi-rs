@@ -4272,7 +4272,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                         {
                                             let requested = level.as_deref().unwrap_or_else(|| {
                                                 args.settings
-                                                    .string("defaultThinkingLevel")
+                                                    .thinking_without_qualified_override(id)
                                                     .unwrap_or("medium")
                                             });
                                             let effective = super::thinking::clamp(
