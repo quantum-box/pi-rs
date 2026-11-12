@@ -3452,9 +3452,11 @@ pub(super) async fn run(
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     let mut deferred_input = VecDeque::new();
-    loop {
+    let mut interrupted = false;
+    'interactive: loop {
         if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(Error::Cancelled);
+            interrupted = true;
+            break 'interactive;
         }
         if let Some(task) = &auth_reload {
             match task.receiver.try_recv() {
@@ -4957,7 +4959,7 @@ pub(super) async fn run(
                             args.reload_model_profiles()?;
                             tokio::select! {
                                 result = super::packages::prepare(&args) => result?,
-                                _ = terminal_signal.notified() => return Err(Error::Cancelled),
+                                _ = terminal_signal.notified() => { interrupted = true; break 'interactive; },
                             }
                             view.resources = super::resources::Resources::load(&args)?;
                             args.theme_paths = view.resources.themes.clone();
@@ -5103,7 +5105,12 @@ pub(super) async fn run(
         };
         println!("Resume this session with pi --session {path}");
     }
-    Ok(())
+    if interrupted || super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn show_startup_header(args: &Cli) -> bool {
