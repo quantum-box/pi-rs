@@ -576,10 +576,11 @@ impl Agent<'_> {
                 }
                 let capacity = active.context_capacity(&request, cancel).await?;
                 let estimate = session.context_usage_estimate();
+                let request_estimate = crate::estimate_request_tokens(&request);
                 let input_tokens = if estimate.last_usage_record.is_some() {
-                    estimate.tokens
+                    estimate.tokens.max(request_estimate)
                 } else {
-                    crate::estimate_request_tokens(&request)
+                    request_estimate
                 };
                 let exceeds = capacity.is_some_and(|window| {
                     input_tokens.saturating_add(u64::from(request.max_output_tokens))

@@ -2179,6 +2179,59 @@ async fn measured_context_triggers_reserve_even_when_text_estimate_is_small() {
 }
 
 #[tokio::test]
+async fn measured_usage_does_not_hide_large_structured_tool_envelope_from_capacity_check() {
+    struct LargeStructuredTool;
+    #[async_trait::async_trait]
+    impl Tool for LargeStructuredTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "fixture".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            Outcome::Structured {
+                data: json!({"content":[],"extra":"x".repeat(12000)}),
+                attachments: vec![],
+            }
+        }
+    }
+    struct StructuredExtension;
+    impl Extension for StructuredExtension {
+        fn id(&self) -> &str {
+            "structured-test"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(LargeStructuredTool)]
+        }
+    }
+    let mut registry = Registry::default();
+    registry.register(Arc::new(StructuredExtension)).unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"])]);
+    let mut harness = agent(&model, &registry);
+    harness.limits.context_window = Some(1000);
+    harness.limits.output_tokens_per_request = 64;
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    session.auto_compaction_control().set_enabled(false);
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let result = harness
+        .run(
+            &mut session,
+            Some("go".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Model(message)) if message.contains("automatic compaction is disabled"))
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert_eq!(session.context_usage_estimate().usage_tokens, 28);
+}
+
+#[tokio::test]
 async fn measured_context_uses_raw_prompt_counts_without_adding_cache_twice() {
     for (prompt, expected) in [(None, 28), (Some(0), 28), (Some(30), 38)] {
         let mut reply = answer("reply");

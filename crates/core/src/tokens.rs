@@ -63,7 +63,8 @@ fn message_chars(message: &Message) -> u64 {
     }
 }
 
-/// Input estimate including the current system prompt and advertised tool schemas.
+/// Conservative input estimate for native provider requests, including the
+/// current system prompt and advertised tool schemas.
 pub fn estimate_request_tokens(request: &ModelRequest) -> u64 {
     let mut system_chars = 0_u64;
     let mut tokens = 0_u64;
@@ -71,7 +72,7 @@ pub fn estimate_request_tokens(request: &ModelRequest) -> u64 {
         if let Message::System { content } = message {
             system_chars = system_chars.saturating_add(text_chars(content));
         } else {
-            tokens = tokens.saturating_add(estimate_message_tokens(message));
+            tokens = tokens.saturating_add(estimate_request_message_tokens(message));
         }
     }
     if !request.tools.is_empty()
@@ -80,6 +81,24 @@ pub fn estimate_request_tokens(request: &ModelRequest) -> u64 {
         system_chars = system_chars.saturating_add(text_chars(&tools));
     }
     tokens.saturating_add(system_chars.div_ceil(4))
+}
+
+fn estimate_request_message_tokens(message: &Message) -> u64 {
+    if let Message::Tool {
+        content,
+        is_structured,
+        ..
+    } = message
+        && crate::tool_content_is_structured(content, *is_structured)
+    {
+        // Some adapters send the full JSON envelope, while others extract
+        // images but retain the remaining JSON as text. Cover both shapes.
+        let (text, images) = crate::extract_tool_images(content.clone());
+        let extracted = text_chars(&text)
+            .saturating_add((images.len() as u64).saturating_mul(ESTIMATED_IMAGE_CHARS));
+        return text_chars(content).max(extracted).div_ceil(4);
+    }
+    estimate_message_tokens(message)
 }
 
 pub(crate) fn estimate_source_tokens(
@@ -396,6 +415,40 @@ mod tests {
             content: serde_json::json!({"data":{"content":[{"type":"text","text":"a"},{"type":"image","data":"AA==","mimeType":"image/png"},{"type":"text","text":"🦀"}],"extra":"irrelevant"},"attachments":[]}).to_string(),
         };
         assert_eq!(estimate_message_tokens(&message), 1201);
+    }
+
+    #[test]
+    fn request_budget_counts_structured_envelope_and_provider_image_shapes() {
+        let content = serde_json::json!({"data":{"content":[{"type":"text","text":"ok"},{"type":"image","data":"AA==","mimeType":"image/png"}],"extra":"x".repeat(12000)},"attachments":[]}).to_string();
+        let message = Message::Tool {
+            call_id: "call".into(),
+            content: content.clone(),
+            is_error: false,
+            is_structured: Some(true),
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![message.clone()],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let (extracted, images) = crate::extract_tool_images(content.clone());
+        assert_eq!(estimate_message_tokens(&message), 1201);
+        assert_eq!(
+            estimate_request_tokens(&request),
+            text_chars(&content)
+                .max(text_chars(&extracted) + images.len() as u64 * ESTIMATED_IMAGE_CHARS)
+                .div_ceil(4)
+        );
+        assert!(estimate_request_tokens(&request) > 4000);
+        let mut large_image = request;
+        let expected = if let Message::Tool { content, .. } = &mut large_image.messages[0] {
+            *content = serde_json::json!({"data":{"content":[{"type":"image","data":"A".repeat(20000),"mimeType":"image/png"}]}}).to_string();
+            text_chars(content).div_ceil(4)
+        } else {
+            unreachable!()
+        };
+        assert_eq!(estimate_request_tokens(&large_image), expected);
     }
 
     #[test]
