@@ -79,22 +79,21 @@ async fn extension_observes_agent_settled_after_success_and_cancellation() {
         .await
         .unwrap();
     let cancel = CancellationToken::new();
-    let cancellation = cancel.clone();
-    let task = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        cancellation.cancel();
+    let mut observer = |event: Notification<'_>| {
+        if matches!(event, Notification::Committed(record) if matches!(record.event, Event::Assistant { .. }))
+        {
+            cancel.cancel();
+        }
     };
-    let mut observer = ignore;
-    let (result, ()) = tokio::join!(
-        agent.run(
+    let result = agent
+        .run(
             &mut session,
             Some("cancel".into()),
             &mut inputs,
             &cancel,
-            &mut observer
-        ),
-        task
-    );
+            &mut observer,
+        )
+        .await;
     assert!(matches!(result, Err(Error::Cancelled)));
     let events = events.lock().unwrap();
     let types: Vec<_> = events
