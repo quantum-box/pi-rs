@@ -921,12 +921,17 @@ impl CodingTool {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let path = self.path(args["path"].as_str().unwrap_or("."))?;
+        let requested_path = args["path"].as_str().unwrap_or(".");
+        let path = self.path(requested_path)?;
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
             return Err(Error::Config(format!(
                 "Not a directory: {}",
-                path.display()
+                crate::coding_paths::resolve(
+                    &self.root,
+                    &crate::coding_paths::normalize(requested_path)?
+                )
+                .display()
             )));
         }
         let directory = std::fs::read_dir(&path)
@@ -2864,6 +2869,29 @@ mod tests {
             sort("C.UTF-8", vec!["Zeta", "Älmhult"]),
             ["Älmhult", "Zeta"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_a_symlink_to_a_file_reports_the_requested_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("target"), "contents").unwrap();
+        std::os::unix::fs::symlink("target", root.join("link")).unwrap();
+        for unrestricted in [false, true] {
+            let tool = CodingTool {
+                root: root.clone(),
+                unrestricted,
+                shell: ShellConfig::default(),
+                kind: Kind::List,
+            };
+            let error = tool
+                .list(&json!({"path":"link"}), &pi_rs::CancellationToken::new())
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::Config(message) if message == format!("Not a directory: {}", root.join("link").display()))
+            );
+        }
     }
 
     #[test]
