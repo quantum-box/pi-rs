@@ -80,6 +80,7 @@ fn host() -> Result<Url> {
     }
     Ok(url)
 }
+#[derive(Clone)]
 struct Service {
     host: Url,
     client: Client,
@@ -234,8 +235,11 @@ fn credential(json: Value) -> Result<Credential> {
         expires: now().saturating_add(token.expires_in.saturating_mul(1000)),
     })
 }
-fn load() -> Result<Option<Credential>> {
-    let value = super::config::read_object(&super::config::agent_dir().join("auth.json"))?;
+fn auth_path() -> std::path::PathBuf {
+    super::config::agent_dir().join("auth.json")
+}
+fn load(path: &std::path::Path) -> Result<Option<Credential>> {
+    let value = super::config::read_object(path)?;
     let Some(entry) = value.get("kimi-coding").filter(|e| e["type"] == "oauth") else {
         return Ok(None);
     };
@@ -248,66 +252,87 @@ fn load() -> Result<Option<Credential>> {
     }
     Ok(Some(credential))
 }
-fn save(value: &Credential) -> Result<()> {
-    super::config::update_object(&super::config::agent_dir().join("auth.json"), |data| {
+fn save(path: &std::path::Path, guard: &super::auth_lock::Guard, value: &Credential) -> Result<()> {
+    super::config::update_object_locked(path, Some(guard), |data| {
         data.insert("kimi-coding".into(), serde_json::to_value(value)?);
         Ok(())
     })
-}
-async fn lock() -> Result<std::fs::File> {
-    let dir = super::config::agent_dir();
-    std::fs::create_dir_all(&dir)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join("kimi-oauth.lock"))?;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(file),
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await
-                }
-                Err(std::fs::TryLockError::Error(e)) => return Err(Error::Io(e)),
-            }
-        }
-    })
-    .await
-    .map_err(|_| error("credential storage is busy"))?
 }
 pub(super) async fn login(
     settings: &super::config::Settings,
     announce: impl Fn(&Url, &str),
 ) -> Result<()> {
     let value = Service::new(settings)?.login(announce).await?;
-    let _guard = lock().await?;
-    save(&value)
+    let path = auth_path();
+    let guard = super::auth_lock::acquire_async(&path).await?;
+    save(&path, &guard, &value)
 }
 pub(super) async fn logout() -> Result<bool> {
-    let _guard = lock().await?;
-    super::model_auth::remove(&super::Provider::named("kimi-coding").expect("Kimi provider"))
+    let path = auth_path();
+    let guard = super::auth_lock::acquire_async(&path).await?;
+    let mut removed = false;
+    super::config::update_object_locked(&path, Some(&guard), |data| {
+        if data
+            .get("kimi-coding")
+            .is_some_and(|v| v["type"] == "oauth" || v["type"] == "api_key")
+        {
+            data.remove("kimi-coding");
+            removed = true;
+        }
+        Ok(())
+    })?;
+    Ok(removed)
+}
+const NORMAL_MINIMUM: Duration = Duration::from_secs(300);
+fn expires_soon(value: &Credential, minimum: Duration) -> bool {
+    value.expires <= now().saturating_add(minimum.as_millis().try_into().unwrap_or(u64::MAX))
+}
+async fn access_at(
+    path: std::path::PathBuf,
+    service: Service,
+    minimum: Option<Duration>,
+    no_refresh: bool,
+) -> Result<String> {
+    let required = minimum.unwrap_or_default().max(NORMAL_MINIMUM);
+    let value = load(&path)?.ok_or_else(|| error("credentials not configured"))?;
+    if no_refresh || !expires_soon(&value, required) {
+        return Ok(value.access);
+    }
+    let guard = super::auth_lock::acquire_async(&path).await?;
+    // Once refresh can rotate a token, dropping the caller must not discard it.
+    tokio::spawn(async move {
+        let value = load(&path)?.ok_or_else(|| error("credentials not configured"))?;
+        if !expires_soon(&value, required) {
+            return Ok(value.access);
+        }
+        let previous = serde_json::to_value(&value)?;
+        let value = service.refresh(&value.refresh).await?;
+        super::config::update_object_locked(&path, Some(&guard), |data| {
+            let unchanged = data.get("kimi-coding").is_some_and(|current| {
+                ["type", "access", "refresh", "expires"]
+                    .iter()
+                    .all(|key| current[*key] == previous[*key])
+            });
+            if !unchanged {
+                return Err(error("credentials changed during refresh"));
+            }
+            data.insert("kimi-coding".into(), serde_json::to_value(&value)?);
+            Ok(())
+        })?;
+        if minimum.is_some() && expires_soon(&value, required) {
+            return Err(error("refreshed token expires too soon"));
+        }
+        Ok(value.access)
+    })
+    .await
+    .map_err(|_| error("refresh task failed"))?
 }
 pub(super) async fn access(
     settings: &super::config::Settings,
-    minimum: Duration,
+    minimum: Option<Duration>,
     no_refresh: bool,
 ) -> Result<String> {
-    let value = load()?.ok_or_else(|| error("credentials not configured"))?;
-    if no_refresh
-        || value.expires > now().saturating_add(minimum.as_millis().try_into().unwrap_or(u64::MAX))
-    {
-        return Ok(value.access);
-    }
-    let _guard = lock().await?;
-    let value = load()?.ok_or_else(|| error("credentials not configured"))?;
-    if value.expires > now().saturating_add(minimum.as_millis().try_into().unwrap_or(u64::MAX)) {
-        return Ok(value.access);
-    }
-    let value = Service::new(settings)?.refresh(&value.refresh).await?;
-    save(&value)?;
-    Ok(value.access)
+    access_at(auth_path(), Service::new(settings)?, minimum, no_refresh).await
 }
 
 #[cfg(test)]
@@ -398,5 +423,155 @@ mod tests {
                 .is_err()
         );
         assert!(trusted("javascript:alert(1)").is_err());
+    }
+    fn fixture(path: &std::path::Path, expires: u64) {
+        std::fs::write(path, serde_json::json!({"kimi-coding":{"type":"oauth","access":"old","refresh":"old-refresh","expires":expires},"other":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+    }
+    async fn refresh_server(
+        expires_in: u64,
+    ) -> (
+        Service,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with("POST /api/oauth/token "));
+            started_tx.send(()).unwrap();
+            reply_rx.await.unwrap();
+            let body = format!(
+                r#"{{"access_token":"new","refresh_token":"rotated","expires_in":{expires_in}}}"#
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (
+            Service {
+                host,
+                client: Client::builder().no_proxy().build().unwrap(),
+            },
+            started_rx,
+            reply_tx,
+            task,
+        )
+    }
+    #[tokio::test]
+    async fn shared_pi_lock_serializes_refresh_and_api_key_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fixture(&path, now() + 60_000);
+        // Simulate Pi's proper-lockfile holder, whose lock is a directory.
+        let lock = dir.path().join("auth.json.lock");
+        std::fs::create_dir(&lock).unwrap();
+        let (service, mut started, reply, server) = refresh_server(3600).await;
+        let task = tokio::spawn(access_at(path.clone(), service.clone(), None, false));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut started)
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir(&lock).unwrap();
+        started.await.unwrap();
+        let second = tokio::spawn(access_at(path.clone(), service, None, false));
+        let writer_path = path.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            super::super::config::update_object(&writer_path, |data| {
+                data.insert(
+                    "kimi-coding".into(),
+                    serde_json::json!({"type":"api_key","key":"user-key"}),
+                );
+                Ok(())
+            })
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!writer.is_finished());
+        reply.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), "new");
+        server.await.unwrap();
+        writer.await.unwrap().unwrap();
+        // The second caller either observes the rotated credential or the API key.
+        let result = second.await.unwrap();
+        assert!(result.is_err() || result.unwrap() == "new");
+        let json = super::super::config::read_object(&path).unwrap();
+        assert_eq!(json["kimi-coding"]["key"], "user-key");
+        assert_eq!(json["other"]["key"], "keep");
+    }
+    #[tokio::test]
+    async fn refresh_persists_rotation_before_minimum_error_and_survives_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fixture(&path, now() + 60_000);
+        let (service, started, reply, server) = refresh_server(60).await;
+        let task = tokio::spawn(access_at(
+            path.clone(),
+            service,
+            Some(Duration::from_secs(3600)),
+            false,
+        ));
+        started.await.unwrap();
+        reply.send(()).unwrap();
+        assert!(task.await.unwrap().is_err());
+        server.await.unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().refresh, "rotated");
+        fixture(&path, now() + 60_000);
+        let (service, started, reply, server) = refresh_server(60).await;
+        let normal = tokio::spawn(access_at(path.clone(), service, None, false));
+        started.await.unwrap();
+        reply.send(()).unwrap();
+        assert_eq!(normal.await.unwrap().unwrap(), "new");
+        server.await.unwrap();
+        fixture(&path, now() + 60_000);
+        let (service, started, reply, server) = refresh_server(3600).await;
+        let task = tokio::spawn(access_at(path.clone(), service, None, false));
+        started.await.unwrap();
+        task.abort();
+        reply.send(()).unwrap();
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if load(&path).unwrap().unwrap().refresh == "rotated" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn noncooperating_api_key_change_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fixture(&path, now());
+        let (service, started, reply, server) = refresh_server(3600).await;
+        let task = tokio::spawn(access_at(path.clone(), service, None, false));
+        started.await.unwrap();
+        std::fs::write(
+            &path,
+            r#"{"kimi-coding":{"type":"api_key","key":"new-key"}}"#,
+        )
+        .unwrap();
+        reply.send(()).unwrap();
+        assert!(task.await.unwrap().is_err());
+        server.await.unwrap();
+        assert_eq!(
+            super::super::config::read_object(&path).unwrap()["kimi-coding"]["key"],
+            "new-key"
+        );
     }
 }

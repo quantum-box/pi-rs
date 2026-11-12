@@ -247,7 +247,7 @@ impl Deferred {
             Some(Credential::Kimi) if self.http_settings.is_some() => Some(
                 super::kimi_auth::access(
                     self.http_settings.as_ref().expect("settings checked"),
-                    std::time::Duration::ZERO,
+                    None,
                     false,
                 )
                 .await?,

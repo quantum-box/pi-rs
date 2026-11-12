@@ -75,7 +75,7 @@ impl Credential {
             }
             Self::Kimi => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
-                return super::kimi_auth::access(&settings, std::time::Duration::ZERO, false).await;
+                return super::kimi_auth::access(&settings, None, false).await;
             }
             Self::Command(command) => resolve_command(command).await,
             Self::StoredCommand(command) => {

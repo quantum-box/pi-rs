@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 mod attachments;
 mod auth_cli;
+mod auth_lock;
 mod backend;
 mod builtin_chat;
 mod cache_stats;

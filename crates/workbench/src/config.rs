@@ -450,6 +450,19 @@ pub fn update_object(
     path: &Path,
     update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
 ) -> Result<()> {
+    let shared = if path.file_name().is_some_and(|name| name == "auth.json") {
+        Some(super::auth_lock::acquire(path)?)
+    } else {
+        None
+    };
+    update_object_locked(path, shared.as_ref(), update)
+}
+
+pub(super) fn update_object_locked(
+    path: &Path,
+    shared: Option<&super::auth_lock::Guard>,
+    update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
     let lock = std::fs::OpenOptions::new()
@@ -461,6 +474,9 @@ pub fn update_object(
     lock.lock()?;
     let mut value = read_object(path)?;
     update(value.as_object_mut().expect("object"))?;
+    if let Some(guard) = shared {
+        guard.check()?;
+    }
     write_json(path, &value)
 }
 

@@ -128,7 +128,12 @@ async fn resolve(
             return Ok(None);
         }
         let value = if matches!(credential, super::model_auth::Credential::Kimi) {
-            super::kimi_auth::access(&args.settings, minimum, no_refresh).await?
+            super::kimi_auth::access(
+                &args.settings,
+                (wanted == Some(AuthType::OAuth)).then_some(minimum),
+                no_refresh,
+            )
+            .await?
         } else {
             credential.resolve().await?
         };
