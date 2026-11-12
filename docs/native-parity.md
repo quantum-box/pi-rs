@@ -3224,3 +3224,11 @@ transition even before a model request. A veto keeps the active journal and skip
 the destination. Fork hooks distinguish the selected entry from the
 position immediately before it. The owned SDK exposes the same fork
 hook through `AgentSession::fork_with_hooks`.
+
+### Full-system context diagnostics checkpoint
+
+When a `context_with_system` handler removes the leading system message, the
+host reports a non-fatal extension error for that handler. Later handlers and
+the provider still receive its transformed context, matching Pi v1.5.0. A
+handler that restores and then removes the leading system message is reported
+again.

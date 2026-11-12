@@ -561,6 +561,7 @@ impl Agent<'_> {
                         None,
                         RequestPurpose::Turn,
                         cancel,
+                        observer,
                     )
                     .await?;
                 // A context extension can lower the budget but cannot increase the host's limit.
@@ -834,6 +835,7 @@ impl Agent<'_> {
         before: Option<u64>,
         purpose: RequestPurpose,
         cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
     ) -> Result<ModelRequest> {
         let branch = session.branch();
         let summary = branch.iter().rev().find_map(|record| match &record.event {
@@ -899,6 +901,8 @@ impl Agent<'_> {
             if !extension.handles_context_with_system() {
                 continue;
             }
+            let had_leading_system =
+                matches!(request.messages.first(), Some(Message::System { .. }));
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
@@ -906,6 +910,15 @@ impl Agent<'_> {
                     result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
             };
             hook(extension.as_ref(), result)?;
+            if had_leading_system
+                && !matches!(request.messages.first(), Some(Message::System { .. }))
+            {
+                observer(Notification::ExtensionLifecycleError {
+                    extension: extension.id(),
+                    event: "context_with_system",
+                    message: "Handler removed the leading system message; the request has no system prompt. Keep it at index 0 or replace the dropped prefix with a system message.",
+                });
+            }
         }
         request
             .tools
@@ -2695,6 +2708,7 @@ impl Agent<'_> {
                 before,
                 RequestPurpose::Summary,
                 cancel,
+                observer,
             )
             .await?;
         request.max_output_tokens = request.max_output_tokens.min(limit);

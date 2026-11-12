@@ -143,6 +143,9 @@ transform the complete message list, including system messages. All ordinary
 Changes apply only to the current request and do not rewrite the session.
 Executable extensions opt in through the same Rust trait and receive the
 `context_with_system` protocol request with `messages` and branch-local `state`.
+If a handler removes the leading system message, the host reports a non-fatal `context_with_system` extension error
+attributed to that handler. Later handlers and the model still receive the
+transformed messages, as in Pi v1.5.0.
 
 An extension can also add temporary skills, prompt templates, and themes:
 
