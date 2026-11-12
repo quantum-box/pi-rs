@@ -534,8 +534,8 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
             return Err(invalid());
         }
         url.to_file_path().map_err(|_| invalid())?
-    } else if source == "~" || source.starts_with("~/") {
-        let path = source.strip_prefix("~/").unwrap_or("");
+    } else if trimmed == "~" || trimmed.starts_with("~/") {
+        let path = trimmed.strip_prefix("~/").unwrap_or("");
         PathBuf::from(
             std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
@@ -543,7 +543,7 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
         )
         .join(path)
     } else {
-        base.join(source)
+        base.join(trimmed)
     };
     Ok(resolve_source_path(&path)?.to_string_lossy().into_owned())
 }
@@ -1515,6 +1515,27 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_package_sources_trim_surrounding_whitespace() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("native package")).unwrap();
+        let expected = normalize("native package", directory.path()).unwrap();
+        assert_eq!(
+            normalize(" \tnative package\n", directory.path()).unwrap(),
+            expected
+        );
+        assert!(is_package_source(" native package ", directory.path()));
+        assert!(matches_source(
+            &json!(" native package "),
+            &expected,
+            directory.path()
+        ));
+        assert_eq!(
+            normalize(" ~/pi-package ", directory.path()).unwrap(),
+            normalize("~/pi-package", directory.path()).unwrap()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn package_prompts_follow_file_and_directory_symlinks() {
