@@ -40,6 +40,11 @@ pub enum SessionEvent {
         run_id: Uuid,
         succeeded: bool,
     },
+    /// Diagnostic for a failed run, including automatically triggered runs.
+    RunFailed {
+        run_id: Uuid,
+        message: String,
+    },
 }
 
 /// Result of navigating to a transcript entry through extension hooks.
@@ -765,7 +770,6 @@ impl AgentSession {
             system_prompt: &self.system_prompt,
             limits: self.limits.clone(),
         };
-        let _ = events.send(SessionEvent::RunStarted { run_id: trigger_id });
         let result = agent
             .run_correlated(
                 &mut self.session,
@@ -777,10 +781,6 @@ impl AgentSession {
             )
             .await;
         let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observe);
-        let _ = events.send(SessionEvent::RunEnded {
-            run_id: trigger_id,
-            succeeded: result.is_ok() && final_inputs.is_ok(),
-        });
         let answer = result?;
         final_inputs?;
         Ok(Some(answer))
@@ -1053,7 +1053,6 @@ impl AgentSession {
         self.start().await?;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
-        let mut started = false;
         let mut observe = |event: Notification<'_>| {
             self.control.observe(&event);
             emit(&events, &event);
@@ -1107,8 +1106,6 @@ impl AgentSession {
                 input = Some(prepared.text);
                 images = (!prepared.images.is_empty()).then_some(prepared.images);
             }
-            started = true;
-            let _ = events.send(SessionEvent::RunStarted { run_id });
             if let Some(images) = images {
                 self.session.append_user_with_images(
                     input.take().unwrap_or_default(),
@@ -1139,12 +1136,6 @@ impl AgentSession {
             && let Err(error) = final_inputs
         {
             result = Err(error);
-        }
-        if started {
-            let _ = events.send(SessionEvent::RunEnded {
-                run_id,
-                succeeded: result.is_ok(),
-            });
         }
         result
     }
@@ -1380,6 +1371,13 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         return;
     }
     let event = match notification {
+        Notification::RunStarted { run_id } => SessionEvent::RunStarted { run_id: *run_id },
+        Notification::RunEnded {
+            run_id, succeeded, ..
+        } => SessionEvent::RunEnded {
+            run_id: *run_id,
+            succeeded: *succeeded,
+        },
         Notification::Committed(record) => SessionEvent::Record(Arc::new((*record).clone())),
         Notification::Request(request) => SessionEvent::Request(Arc::new((*request).clone())),
         Notification::Text(text) => SessionEvent::Text((*text).into()),
@@ -1405,6 +1403,17 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
         },
     };
     let _ = events.send(event);
+    if let Notification::RunEnded {
+        run_id,
+        error: Some(error),
+        ..
+    } = notification
+    {
+        let _ = events.send(SessionEvent::RunFailed {
+            run_id: *run_id,
+            message: (*error).into(),
+        });
+    }
     if let Notification::Committed(record) = notification
         && let crate::Event::SessionInfo {
             name: Some(name), ..
@@ -3503,6 +3512,421 @@ mod tests {
             );
             assert_eq!(session.journal().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
             assert!(session.journal().pending_custom_trigger().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_and_undelivered_cancelled_triggers_resume_on_start() {
+        for state in [
+            crate::RunState::WaitingForOperation,
+            crate::RunState::WaitingForReconciliation,
+            crate::RunState::Cancelled,
+        ] {
+            let id = Uuid::new_v4();
+            let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+            crate::agent::queue_custom_message(
+                &mut journal,
+                crate::QueuedCustomMessage {
+                    id,
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    message: crate::CustomMessage {
+                        custom_type: "trigger".into(),
+                        content: crate::ContextContent::Text("pending".into()),
+                        display: false,
+                        details: None,
+                    },
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+            journal.set_run_id(Some(id));
+            journal
+                .append(crate::Event::Run {
+                    state,
+                    initial: None,
+                })
+                .unwrap();
+            journal.set_run_id(None);
+            let restored = Session::from_records(journal.records().to_vec()).unwrap();
+            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .build(restored)
+                .unwrap();
+            session.start().await.unwrap();
+            assert_eq!(model.0.load(Ordering::SeqCst), 1, "{state:?}");
+            assert!(session.journal().pending_custom_trigger().is_none());
+            assert_eq!(session.journal().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn delivered_waiting_triggers_resume_but_delivered_cancelled_trigger_does_not() {
+        for (state, should_resume) in [
+            (crate::RunState::WaitingForOperation, true),
+            (crate::RunState::WaitingForReconciliation, true),
+            (crate::RunState::Cancelled, false),
+        ] {
+            let id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "trigger".into(),
+                content: crate::ContextContent::Text("already delivered".into()),
+                display: false,
+                details: None,
+            };
+            let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+            crate::agent::queue_custom_message(
+                &mut journal,
+                crate::QueuedCustomMessage {
+                    id,
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    message: message.clone(),
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+            journal.set_run_id(Some(id));
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::CustomMessageDelivered { id, message })
+                .unwrap();
+            journal
+                .append(crate::Event::Run {
+                    state,
+                    initial: None,
+                })
+                .unwrap();
+            journal.set_run_id(None);
+            let restored = Session::from_records(journal.records().to_vec()).unwrap();
+            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .build(restored)
+                .unwrap();
+            session.start().await.unwrap();
+            assert_eq!(
+                model.0.load(Ordering::SeqCst),
+                usize::from(should_resume),
+                "{state:?}"
+            );
+            assert_eq!(session.journal().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn earlier_waiting_trigger_resumes_after_a_later_completed_run() {
+        for delivered in [false, true] {
+            let id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "trigger".into(),
+                content: crate::ContextContent::Text("recover earlier".into()),
+                display: false,
+                details: None,
+            };
+            let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+            crate::agent::queue_custom_message(
+                &mut journal,
+                crate::QueuedCustomMessage {
+                    id,
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    message: message.clone(),
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+            journal.set_run_id(Some(id));
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: None,
+                })
+                .unwrap();
+            if delivered {
+                journal
+                    .append(crate::Event::CustomMessageDelivered { id, message })
+                    .unwrap();
+            }
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::WaitingForOperation,
+                    initial: None,
+                })
+                .unwrap();
+            let later = Uuid::new_v4();
+            journal.set_run_id(Some(later));
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: Some("later".into()),
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::User {
+                    content: "later".into(),
+                    input_id: Some(later),
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::Assistant {
+                    content: "later answer".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::Completed,
+                    initial: None,
+                })
+                .unwrap();
+            journal.set_run_id(None);
+            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .build(Session::from_records(journal.records().to_vec()).unwrap())
+                .unwrap();
+            session.start().await.unwrap();
+            assert_eq!(model.0.load(Ordering::SeqCst), 1, "delivered={delivered}");
+            assert!(session.journal().pending_custom_trigger().is_none());
+            assert_eq!(session.journal().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: x, .. } if x == id)).count(), 1);
+        }
+    }
+
+    struct ReplayStartHook {
+        ready: Arc<tokio::sync::Notify>,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ReplayStartHook {
+        fn id(&self) -> &str {
+            "replay-start"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::AgentStart { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "start".into(),
+                        content: crate::ContextContent::Text("once".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::Steer,
+                )
+                .await?;
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.ready.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn replayed_agent_start_deduplicates_acknowledged_messages() {
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let hook = Arc::new(ReplayStartHook {
+            ready: ready.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let model = EchoModel(AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
+        let mut observer = |_: Notification<'_>| {};
+        let (first, ()) = tokio::join!(
+            agent.run_correlated(
+                &mut session,
+                run_id,
+                Some("prompt".into()),
+                &mut inputs,
+                &cancel,
+                &mut observer
+            ),
+            async {
+                ready.notified().await;
+                cancel.cancel();
+            }
+        );
+        assert!(matches!(first, Err(Error::Cancelled)));
+        let mut session = Session::from_records(session.records().to_vec()).unwrap();
+        agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "start")).count(), 1);
+        assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "start")).count(), 1);
+    }
+
+    struct TwoRunModel {
+        count: AtomicUsize,
+        fail_first: bool,
+    }
+    #[async_trait::async_trait]
+    impl Model for TwoRunModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            let index = self.count.fetch_add(1, Ordering::SeqCst);
+            if (index == 0) == self.fail_first {
+                return Err(Error::Model(format!("failure {index}")));
+            }
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text(format!("answer {index}"))),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+    #[tokio::test]
+    async fn triggered_result_does_not_replace_original_and_runs_have_separate_brackets() {
+        for fail_first in [false, true] {
+            let model = Arc::new(TwoRunModel {
+                count: AtomicUsize::new(0),
+                fail_first,
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .extension(Arc::new(TriggerFromLifecycle {
+                    settled: true,
+                    fired: std::sync::atomic::AtomicBool::new(false),
+                }))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            let mut events = session.subscribe();
+            let result = session.prompt("user").await;
+            if fail_first {
+                assert!(
+                    matches!(result, Err(Error::Model(message)) if message.contains("failure 0"))
+                );
+            } else {
+                assert_eq!(result.unwrap(), "answer 0");
+            }
+            assert_eq!(model.count.load(Ordering::SeqCst), 2);
+            let mut brackets = Vec::new();
+            let mut failures = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    SessionEvent::RunFailed { run_id, message } => failures.push((run_id, message)),
+                    SessionEvent::RunStarted { run_id } => brackets.push((true, run_id, None)),
+                    SessionEvent::RunEnded { run_id, succeeded } => {
+                        brackets.push((false, run_id, Some(succeeded)))
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(brackets.len(), 4);
+            assert!(brackets[0].0 && !brackets[1].0 && brackets[2].0 && !brackets[3].0);
+            assert_eq!(brackets[0].1, brackets[1].1);
+            assert_eq!(brackets[2].1, brackets[3].1);
+            assert_ne!(brackets[0].1, brackets[2].1);
+            assert_eq!(brackets[1].2, Some(!fail_first));
+            assert_eq!(brackets[3].2, Some(fail_first));
+            assert_eq!(failures.len(), 1);
+            assert_eq!(
+                failures[0].0,
+                if fail_first {
+                    brackets[0].1
+                } else {
+                    brackets[2].1
+                }
+            );
+            assert!(
+                failures[0]
+                    .1
+                    .contains(if fail_first { "failure 0" } else { "failure 1" })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_trigger_does_not_replace_prompt_answer() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(TriggerFromLifecycle {
+                settled: true,
+                fired: std::sync::atomic::AtomicBool::new(false),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        assert_eq!(session.prompt("user").await.unwrap(), "answer 1");
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn next_turn_follows_starting_message_for_user_and_custom_runs() {
+        for custom_start in [false, true] {
+            let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+            let mut session = SessionBuilder::new(model, "fixture").in_memory().unwrap();
+            let make = |text: &str| crate::CustomMessage {
+                custom_type: "order".into(),
+                content: crate::ContextContent::Text(text.into()),
+                display: false,
+                details: None,
+            };
+            session
+                .queue_custom_message_next_turn(make("older next turn"))
+                .unwrap();
+            if custom_start {
+                session
+                    .send_custom_message(make("starting custom"), true)
+                    .await
+                    .unwrap();
+            } else {
+                session.prompt("starting user").await.unwrap();
+            }
+            let texts: Vec<_> = session
+                .messages()
+                .unwrap()
+                .into_iter()
+                .filter_map(|m| {
+                    if let Message::User { content } = m {
+                        Some(content)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                texts,
+                [
+                    if custom_start {
+                        "starting custom"
+                    } else {
+                        "starting user"
+                    },
+                    "older next turn"
+                ]
+            );
         }
     }
 

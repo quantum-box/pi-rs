@@ -1251,8 +1251,10 @@ impl Session {
                 Event::Run { state, .. } if entry.run_id == Some(input.id) => Some(state),
                 _ => None,
             });
+            let delivered = branch.iter().any(|entry| matches!(entry.event, Event::CustomMessageDelivered { id, .. } if id == input.id));
             match last_state {
-                None | Some(RunState::Running) => Some(input.id),
+                None | Some(RunState::Running | RunState::WaitingForOperation | RunState::WaitingForReconciliation) => Some(input.id),
+                Some(RunState::Cancelled) if !delivered => Some(input.id),
                 _ => None,
             }
         })

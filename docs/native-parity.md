@@ -2797,9 +2797,18 @@ Separately built extensions negotiate the individual callback capabilities.
 Focused tests cover queue and tool-result ordering, callback reentrancy,
 initial and streaming input, provider-request delivery, session start and
 settled boundaries, process protocol metadata, and reopening before the next
-prompt. Tests also cover multiple triggers, idle and active delivery, and
-restarts before run creation, before and after message delivery, and after the
-answer was recorded. Host-aware `before_tool` policies can opt in with
+prompt. Tests also cover multiple triggers, idle and active delivery, waiting and
+undelivered cancelled runs, replayed `agent_start` callbacks, separate SDK run
+brackets, and restarts before run creation, before and after message delivery,
+and after the answer was recorded. `agent_start` message IDs derive from the
+run ID and send ordinal; an acknowledged replay with different content is
+rejected rather than duplicated. Automatic trigger runs retain their own SDK
+run events and do not replace the initiating run's result.
+
+The pinned Pi [`_prepareRun` implementation](https://github.com/badlogic/pi-mono/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/src/core/agent-session.ts#L1941-L1982)
+places the starting user or custom message before pending `nextTurn` messages,
+even when the latter were queued earlier. The native scheduler follows that
+order; it is covered for both user and custom starting messages. Host-aware `before_tool` policies can opt in with
 `handles_before_tool_host`; separately built extensions negotiate this support.
 Host calls also remain unavailable in idle `SessionControl` input hooks,
 user-bash, resource discovery, compaction, tree, and workbench

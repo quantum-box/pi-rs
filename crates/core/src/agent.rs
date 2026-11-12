@@ -119,6 +119,14 @@ pub struct Agent<'a> {
 }
 
 pub enum Notification<'a> {
+    RunStarted {
+        run_id: Uuid,
+    },
+    RunEnded {
+        run_id: Uuid,
+        succeeded: bool,
+        error: Option<&'a str>,
+    },
     Retry(crate::RetryEvent),
     Committed(&'a Record),
     /// The following model request generates a compaction summary.
@@ -219,24 +227,42 @@ impl Agent<'_> {
                 Event::Run { .. } => record.run_id,
                 _ => None,
             }) != Some(run_id)
+                && session.pending_custom_trigger() != Some(run_id)
             {
                 return Err(Error::DuplicateRun(run_id));
             }
         }
         session.set_run_id(Some(run_id));
-        let mut result = self
+        observer(Notification::RunStarted { run_id });
+        let result = self
             .run_turns(session, run_id, input, followups, cancel, observer)
             .await;
+        let error = result.as_ref().err().map(ToString::to_string);
+        observer(Notification::RunEnded {
+            run_id,
+            succeeded: result.is_ok(),
+            error: error.as_deref(),
+        });
         session.set_run_id(None);
-        while result.is_ok() && !cancel.is_cancelled() {
+        while !cancel.is_cancelled() && ensure_settled(session.operations()).is_ok() {
             let Some(trigger_id) = session.pending_custom_trigger() else {
                 break;
             };
             session.set_run_id(Some(trigger_id));
-            result = self
+            observer(Notification::RunStarted { run_id: trigger_id });
+            let trigger_result = self
                 .run_turns(session, trigger_id, None, followups, cancel, observer)
                 .await;
+            let trigger_error = trigger_result.as_ref().err().map(ToString::to_string);
+            observer(Notification::RunEnded {
+                run_id: trigger_id,
+                succeeded: trigger_result.is_ok(),
+                error: trigger_error.as_deref(),
+            });
             session.set_run_id(None);
+            if trigger_result.is_err() {
+                break;
+            }
         }
         result
     }
@@ -426,10 +452,19 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
     ) -> Result<()> {
         let (sender, mut incoming) = mpsc::channel(32);
-        let host = Arc::new(LifecycleMessageHost {
-            sender,
-            idle: false,
-        });
+        let host: Arc<dyn ToolHost> = match &event {
+            crate::LifecycleEvent::AgentStart { run_id, .. } => {
+                Arc::new(ReplayLifecycleMessageHost {
+                    sender,
+                    run_id: *run_id,
+                    ordinal: AtomicUsize::new(0),
+                })
+            }
+            _ => Arc::new(LifecycleMessageHost {
+                sender,
+                idle: false,
+            }),
+        };
         let mut errors = Vec::new();
         let mut collect = |event: Notification<'_>| {
             if let Notification::ExtensionLifecycleError {
@@ -618,6 +653,8 @@ impl Agent<'_> {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
+        let trigger_unanswered = session.branch().iter().any(|record| matches!(&record.event, Event::CustomMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
+            && !session.branch().iter().any(|record| record.run_id == Some(run_id) && matches!(&record.event, Event::Assistant { .. }));
         if let Some(answer) = session
             .branch()
             .iter()
@@ -639,6 +676,7 @@ impl Agent<'_> {
                 _ => None,
             })
             .flatten()
+            .filter(|_| !trigger_unanswered)
         {
             if !apply_inputs(session, true, observer)? {
                 return Ok(answer);
@@ -2874,6 +2912,62 @@ fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> 
             (invocation.operation_id == parent).then_some(invocation.call.id)
         })
 }
+struct ReplayLifecycleMessageHost {
+    sender: mpsc::Sender<(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    )>,
+    run_id: Uuid,
+    ordinal: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl ToolHost for ReplayLifecycleMessageHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("tool calls unavailable in lifecycle hooks".into())
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        use sha2::{Digest, Sha256};
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let ordinal = self.ordinal.fetch_add(1, Ordering::SeqCst) as u64;
+        let mut digest = Sha256::new();
+        digest.update(b"pi-rs:agent-start-message:v1");
+        digest.update(self.run_id.as_bytes());
+        digest.update(ordinal.to_be_bytes());
+        let bytes = digest.finalize();
+        let id = Uuid::from_bytes(bytes[..16].try_into().expect("digest length"));
+        let delivery = if delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send((
+                crate::QueuedCustomMessage {
+                    id,
+                    delivery,
+                    message,
+                },
+                reply,
+            ))
+            .await
+            .map_err(|_| "lifecycle hook has finished".to_owned())?;
+        result
+            .await
+            .map_err(|_| "lifecycle message response was lost".to_owned())?
+    }
+}
+
 pub(crate) struct LifecycleMessageHost {
     pub(crate) idle: bool,
     pub(crate) sender: mpsc::Sender<(
@@ -3381,11 +3475,24 @@ pub(crate) fn queue_custom_message(
     observer: &mut Observer<'_>,
 ) -> Result<()> {
     crate::journal::validate_custom_message(&input.message)?;
-    if session.records().iter().any(|record| {
-        matches!(&record.event,
-        Event::CustomMessageQueued { input: existing } if existing.id == input.id)
-    }) {
-        return Err(Error::Config("custom message ID already exists".into()));
+    if let Some(existing) = session
+        .records()
+        .iter()
+        .find_map(|record| match &record.event {
+            Event::CustomMessageQueued { input: existing } if existing.id == input.id => {
+                Some(existing)
+            }
+            _ => None,
+        })
+    {
+        if serde_json::to_value(existing)? != serde_json::to_value(&input)? {
+            return Err(Error::Config(
+                "custom message ID already exists with different content".into(),
+            ));
+        }
+        if session.branch().iter().any(|record| matches!(&record.event, Event::CustomMessageQueued { input: existing } if existing.id == input.id)) {
+            return Ok(());
+        }
     }
     commit(session, Event::CustomMessageQueued { input }, observer)?;
     Ok(())
