@@ -104,7 +104,8 @@ struct SavedKey {
     endpoint: Option<String>,
     official_routes: bool,
     oauth: bool,
-    key: Credential,
+    key: Option<Credential>,
+    env: Option<serde_json::Map<String, Value>>,
 }
 
 impl Keys {
@@ -128,31 +129,33 @@ impl Keys {
                         entry["credential"].clone(),
                     )
                     .ok()?;
-                    Credential::ChatGpt
+                    Some(Credential::ChatGpt)
                 } else if oauth {
                     let access = entry["access"].as_str()?;
-                    valid_key(access).then(|| Credential::Literal(access.into()))?
+                    Some(valid_key(access).then(|| Credential::Literal(access.into()))?)
                 } else {
                     if entry["type"] != "api_key" {
                         return None;
                     }
-                    entry["key"].as_str().map_or(Credential::Invalid, |value| {
-                        if entry["literal"] == true {
-                            return if valid_key(value) {
-                                Credential::Literal(value.into())
-                            } else {
-                                Credential::Invalid
-                            };
-                        }
-                        match Credential::configured_with_env(value, entry["env"].as_object()) {
-                            Some(Credential::Command(command)) => {
-                                Credential::StoredCommand(command)
+                    entry.get("key").map(|key| {
+                        key.as_str().map_or(Credential::Invalid, |value| {
+                            if entry["literal"] == true {
+                                return if valid_key(value) {
+                                    Credential::Literal(value.into())
+                                } else {
+                                    Credential::Invalid
+                                };
                             }
-                            Some(Credential::Literal(value)) if valid_key(&value) => {
-                                Credential::Literal(value)
+                            match Credential::configured_with_env(value, entry["env"].as_object()) {
+                                Some(Credential::Command(command)) => {
+                                    Credential::StoredCommand(command)
+                                }
+                                Some(Credential::Literal(value)) if valid_key(&value) => {
+                                    Credential::Literal(value)
+                                }
+                                _ => Credential::Invalid,
                             }
-                            _ => Credential::Invalid,
-                        }
+                        })
                     })
                 };
                 let endpoint = match entry.get("endpoint") {
@@ -177,6 +180,7 @@ impl Keys {
                         official_routes: oauth || entry.get("endpoint").is_none(),
                         oauth,
                         key,
+                        env: entry["env"].as_object().cloned(),
                     },
                 ))
             })
@@ -192,6 +196,10 @@ impl Keys {
     }
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<&Credential> {
+        self.entry_for(provider, endpoint)?.key.as_ref()
+    }
+
+    fn entry_for(&self, provider: &Provider, endpoint: &str) -> Option<&SavedKey> {
         let entry = self.entries.get(provider.id())?;
         let legacy_radius = provider == &Provider::Radius
             && endpoint == super::radius_auth::DEFAULT_MODEL_ENDPOINT
@@ -200,7 +208,7 @@ impl Keys {
             && super::builtin_chat::find(provider.id())
                 .is_some_and(|builtin| builtin.is_official_endpoint(endpoint));
         (entry.endpoint.as_deref() == Some(endpoint) || legacy_radius || builtin_route)
-            .then_some(&entry.key)
+            .then_some(entry)
     }
 
     pub fn custom_credential(
@@ -211,7 +219,24 @@ impl Keys {
     ) -> Option<&Credential> {
         let entry = self.entries.get(provider.id())?;
         (entry.endpoint.is_none() && profiles.has_endpoint(provider, endpoint))
-            .then_some(&entry.key)
+            .then_some(entry.key.as_ref())
+            .flatten()
+    }
+
+    pub fn environment(
+        &self,
+        provider: &Provider,
+        endpoint: &str,
+        profiles: &super::model_profiles::Profiles,
+    ) -> Option<&serde_json::Map<String, Value>> {
+        self.entry_for(provider, endpoint)
+            .or_else(|| {
+                self.entries.get(provider.id()).filter(|entry| {
+                    entry.endpoint.is_none() && profiles.has_endpoint(provider, endpoint)
+                })
+            })?
+            .env
+            .as_ref()
     }
 
     pub fn oauth(&self, provider: &Provider, endpoint: &str) -> bool {
@@ -228,6 +253,23 @@ impl Keys {
         endpoint: &str,
         official: bool,
     ) -> Option<&Credential> {
+        self.operation_entry(provider, endpoint, official)?
+            .key
+            .as_ref()
+    }
+
+    pub fn operation_environment(
+        &self,
+        provider: &str,
+        endpoint: &str,
+        official: bool,
+    ) -> Option<&serde_json::Map<String, Value>> {
+        self.operation_entry(provider, endpoint, official)?
+            .env
+            .as_ref()
+    }
+
+    fn operation_entry(&self, provider: &str, endpoint: &str, official: bool) -> Option<&SavedKey> {
         let entry = self.entries.get(provider)?;
         (entry.endpoint.as_deref() == Some(endpoint)
             || (official
@@ -235,7 +277,7 @@ impl Keys {
                     && super::operation_models::official_base(provider)
                         == entry.endpoint.as_deref())
                     || (entry.official_routes && super::builtin_chat::find(provider).is_some()))))
-        .then_some(&entry.key)
+        .then_some(entry)
     }
 
     #[cfg(test)]

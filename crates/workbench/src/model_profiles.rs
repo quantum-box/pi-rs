@@ -38,9 +38,14 @@ struct Profile {
 pub(super) struct RequestHeaders {
     values: BTreeMap<String, String>,
     auth_header: bool,
+    env: Option<serde_json::Map<String, Value>>,
 }
 
 impl RequestHeaders {
+    pub fn with_environment(mut self, env: Option<&serde_json::Map<String, Value>>) -> Self {
+        self.env = env.cloned();
+        self
+    }
     pub fn has_command(&self) -> bool {
         self.values.values().any(|value| value.starts_with('!'))
     }
@@ -48,7 +53,7 @@ impl RequestHeaders {
     pub fn static_headers(&self, provider: &Provider, token: Option<&str>) -> Result<HeaderMap> {
         let mut headers = HeaderMap::with_capacity(self.values.len());
         for (name, value) in &self.values {
-            let value = expand_value(value)
+            let value = expand_value_with_env(value, self.env.as_ref())
                 .ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))?;
             Self::insert(&mut headers, name, &value)?;
         }
@@ -64,7 +69,7 @@ impl RequestHeaders {
                     .ok()
                     .filter(|value| !value.trim().is_empty())
             } else {
-                expand_value(value)
+                expand_value_with_env(value, self.env.as_ref())
             };
             let value = resolved
                 .ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))?;
@@ -934,6 +939,7 @@ impl Profiles {
         RequestHeaders {
             values: configured,
             auth_header: profile.auth_header,
+            env: None,
         }
     }
 
@@ -1891,6 +1897,61 @@ mod tests {
         );
         assert!(
             Profiles::parse(&json!({"providers":{"ollama":{"headers":{"Host":"other"}}}})).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_credential_environment_resolves_chat_headers_on_bound_endpoint() {
+        let profiles = Profiles::parse(&json!({"providers":{"relay":{
+            "api":"openai-completions", "baseUrl":"https://relay.example/v1",
+            "headers":{"X-Credential":"$HEADER_VALUE"}, "models":[{"id":"chat"}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("relay").unwrap();
+        let endpoint = profiles.endpoint(&provider);
+        let keys = super::super::model_auth::Keys::parse(&json!({"relay":{
+            "type":"api_key", "key":"$TOKEN", "env":{"TOKEN":"key-value", "HEADER_VALUE":"header-value"}
+        }}));
+        let credential = keys
+            .custom_credential(&provider, endpoint, &profiles)
+            .unwrap();
+        assert_eq!(credential.resolve().await.unwrap(), "key-value");
+        let settings = profiles
+            .header_settings(&provider, endpoint, Some("chat"))
+            .with_environment(keys.environment(&provider, endpoint, &profiles));
+        assert_eq!(
+            settings
+                .static_headers(&provider, Some("key-value"))
+                .unwrap()["x-credential"],
+            "header-value"
+        );
+        assert_eq!(
+            settings
+                .resolve(&provider, Some("key-value"))
+                .await
+                .unwrap()["x-credential"],
+            "header-value"
+        );
+        assert!(
+            keys.environment(
+                &provider,
+                "https://other.example/v1/chat/completions",
+                &profiles
+            )
+            .is_none()
+        );
+        let missing = super::super::model_auth::Keys::parse(
+            &json!({"relay":{"type":"api_key", "env":{"HEADER_VALUE":"header-value"}}}),
+        );
+        assert!(
+            missing
+                .custom_credential(&provider, endpoint, &profiles)
+                .is_none()
+        );
+        assert!(
+            missing
+                .environment(&provider, endpoint, &profiles)
+                .is_some()
         );
     }
 }
