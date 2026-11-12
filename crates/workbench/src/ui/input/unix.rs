@@ -162,7 +162,6 @@ mod tests {
     use std::io::Write;
     use std::os::fd::IntoRawFd;
     use std::os::unix::net::UnixStream;
-    use std::time::Instant;
 
     #[test]
     fn drain_consumes_fragmented_late_input_until_quiet() {
@@ -173,23 +172,18 @@ mod tests {
             decoder: Decoder::default(),
             size: None,
         };
-        let producer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(15));
-            writer.write_all(b"\x1b[").unwrap();
-            std::thread::sleep(Duration::from_millis(25));
-            writer.write_all(b"99;5:3u").unwrap();
-            std::thread::sleep(Duration::from_millis(100));
-        });
-        let start = Instant::now();
+        // Force the raw reader to make multiple reads, with an incomplete
+        // escape sequence crossing its 1024-byte buffer boundary.
+        writer.write_all(&[b'x'; 1023]).unwrap();
+        writer.write_all(b"\x1b[").unwrap();
+        writer.write_all(b"99;5:3u").unwrap();
         input
-            .drain(Duration::from_secs(1), Duration::from_millis(50))
+            .drain(Duration::from_secs(1), Duration::from_millis(20))
             .unwrap();
-        assert!(start.elapsed() >= Duration::from_millis(75));
         let mut bytes = [0; 32];
         assert_eq!(
             input.file.read(&mut bytes).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        producer.join().unwrap();
     }
 }

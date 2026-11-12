@@ -85,19 +85,28 @@ fn escape_delay() -> Duration {
 fn drain_until_idle(
     max: Duration,
     idle: Duration,
+    read: impl FnMut(Duration) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    drain_until_idle_with_clock(max, idle, Instant::now, read)
+}
+
+fn drain_until_idle_with_clock(
+    max: Duration,
+    idle: Duration,
+    mut clock: impl FnMut() -> Instant,
     mut read: impl FnMut(Duration) -> std::io::Result<bool>,
 ) -> std::io::Result<()> {
-    let started = Instant::now();
+    let started = clock();
     let mut last_data = started;
     loop {
-        let now = Instant::now();
+        let now = clock();
         let remaining = max.saturating_sub(now.duration_since(started));
         let quiet = idle.saturating_sub(now.duration_since(last_data));
         if remaining.is_zero() || quiet.is_zero() {
             return Ok(());
         }
         if read(remaining.min(quiet))? {
-            last_data = Instant::now();
+            last_data = clock();
         }
     }
 }
@@ -125,29 +134,18 @@ mod drain_tests {
 
     #[test]
     fn drain_counts_incomplete_vt_records_as_activity() {
-        use std::sync::mpsc;
-        let (sender, receiver) = mpsc::channel();
-        let producer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            sender.send(b'\x1b').unwrap();
-            std::thread::sleep(Duration::from_millis(35));
-            sender.send(b'[').unwrap();
-            std::thread::sleep(Duration::from_millis(35));
-            sender.send(b'9').unwrap();
-        });
         let pending = std::cell::Cell::new(None);
+        let records =
+            std::cell::RefCell::new(std::collections::VecDeque::from([b'\x1b', b'[', b'9']));
         let mut discarded = Vec::new();
         drain_console_records(
             Duration::from_secs(1),
-            Duration::from_millis(50),
-            |timeout| match receiver.recv_timeout(timeout) {
-                Ok(byte) => {
+            Duration::from_millis(1),
+            |timeout| {
+                if let Some(byte) = records.borrow_mut().pop_front() {
                     pending.set(Some(byte));
                     Ok(true)
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => Ok(false),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // Model a quiet console, not an immediately readable EOF.
+                } else {
                     std::thread::sleep(timeout);
                     Ok(false)
                 }
@@ -158,25 +156,55 @@ mod drain_tests {
             },
         )
         .unwrap();
-        producer.join().unwrap();
         assert_eq!(discarded, b"\x1b[9");
+    }
+
+    #[test]
+    fn drain_extends_quiet_period_after_each_fragment() {
+        let start = Instant::now();
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut arrivals =
+            std::collections::VecDeque::from([20, 55, 90].map(Duration::from_millis));
+        let mut waits = Vec::new();
+        drain_until_idle_with_clock(
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+            || start + elapsed.get(),
+            |timeout| {
+                waits.push(timeout);
+                let until = elapsed.get() + timeout;
+                if arrivals.front().is_some_and(|arrival| *arrival <= until) {
+                    elapsed.set(arrivals.pop_front().unwrap());
+                    Ok(true)
+                } else {
+                    elapsed.set(until);
+                    Ok(false)
+                }
+            },
+        )
+        .unwrap();
+        assert!(arrivals.is_empty());
+        assert_eq!(waits, vec![Duration::from_millis(50); 4]);
+        assert_eq!(elapsed.get(), Duration::from_millis(140));
     }
 
     #[test]
     fn drain_stops_at_deadline_during_continuous_input() {
         let start = Instant::now();
-        let mut reads = 0;
-        drain_until_idle(
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut waits = Vec::new();
+        drain_until_idle_with_clock(
             Duration::from_millis(40),
             Duration::from_millis(30),
+            || start + elapsed.get(),
             |timeout| {
-                std::thread::sleep(timeout.min(Duration::from_millis(5)));
-                reads += 1;
+                waits.push(timeout);
+                elapsed.set(elapsed.get() + timeout.min(Duration::from_millis(10)));
                 Ok(true)
             },
         )
         .unwrap();
-        assert!(reads > 1);
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(waits, [30, 30, 20, 10].map(Duration::from_millis));
+        assert_eq!(elapsed.get(), Duration::from_millis(40));
     }
 }
