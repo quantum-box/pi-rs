@@ -563,6 +563,12 @@ impl ModelMetadata {
         self.input_limits.as_ref()?.images.as_ref()?.resize
     }
 
+    pub fn supports_images(&self) -> Option<bool> {
+        self.input
+            .as_ref()
+            .map(|input| input.contains(&Modality::Image))
+    }
+
     pub fn prompt_cache_seconds(&self, retention: pi_rs::CacheRetention) -> Option<f64> {
         let cache = self.prompt_cache?;
         match retention {
@@ -1437,14 +1443,25 @@ mod tests {
     #[test]
     fn declared_models_and_overrides_preserve_identity_and_unset_fields() {
         let profiles = Profiles::parse(&json!({"providers":{"ollama":{
-            "models":[{"id":"custom","name":"Local Fixture","input":["text","image"],"maxTokens":200}],
+            "models":[{"id":"custom","name":"Local Fixture","input":["text","image"],"maxTokens":200}, {"id":"text-only","input":["text"]}],
             "modelOverrides":{
                 "custom":{"maxTokens":100},
                 "existing":{"contextWindow":32000}
             }
         }}})).unwrap();
-        assert_eq!(profiles.model_ids(&Provider::Ollama), ["custom"]);
+        assert_eq!(
+            profiles.model_ids(&Provider::Ollama),
+            ["custom", "text-only"]
+        );
+        assert_eq!(
+            profiles
+                .model(&Provider::Ollama, "text-only")
+                .unwrap()
+                .supports_images(),
+            Some(false)
+        );
         let custom = profiles.model(&Provider::Ollama, "custom").unwrap();
+        assert_eq!(custom.supports_images(), Some(true));
         assert_eq!(custom.name.as_deref(), Some("Local Fixture"));
         assert_eq!(custom.max_tokens, Some(100));
         assert_eq!(custom.context_window, Some(128_000));
@@ -1453,6 +1470,7 @@ mod tests {
         assert_eq!(details.images, Some(true));
         assert_eq!(details.thinking_levels, Some(vec!["off".into()]));
         let existing = profiles.model(&Provider::Ollama, "existing").unwrap();
+        assert_eq!(existing.supports_images(), None);
         assert_eq!(existing.context_window, Some(32000));
         assert_eq!(existing.max_tokens, None);
     }
