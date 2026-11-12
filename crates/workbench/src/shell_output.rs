@@ -67,6 +67,31 @@ impl Accumulator {
         Ok(())
     }
 
+    /// A bounded, ephemeral view for tool progress subscribers.
+    pub fn partial_result(&self) -> Value {
+        let (display, limit, lines, partial) = self.display.snapshot();
+        let mut details = json!({});
+        if let Some(limit) = limit {
+            details["truncation"] = json!(Truncation {
+                content: &display,
+                truncated: true,
+                truncated_by: Some(limit),
+                total_lines: self.display.lines(),
+                total_bytes: self.display.bytes,
+                output_lines: lines,
+                output_bytes: display.len(),
+                last_line_partial: partial,
+                first_line_exceeds_limit: false,
+                max_lines: DISPLAY_LINES as u64,
+                max_bytes: DISPLAY_BYTES,
+            });
+            if let Some(file) = &self.file {
+                details["fullOutputPath"] = json!(file.path());
+            }
+        }
+        json!({"content":[{"type":"text","text":display}], "details":details})
+    }
+
     fn spill(&mut self, include_raw: bool) -> std::io::Result<()> {
         if self.file.is_none()
             && (self.bytes > DISPLAY_BYTES as u64
@@ -300,6 +325,19 @@ fn decode_head(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn progress_snapshot_is_bounded_and_exposes_complete_output_path() {
+        let mut output = Accumulator::default();
+        let bytes = vec![b'x'; DISPLAY_BYTES + 200];
+        output.append(&bytes).unwrap();
+        let snapshot = output.partial_result();
+        assert!(snapshot["content"][0]["text"].as_str().unwrap().len() <= DISPLAY_BYTES);
+        assert_eq!(snapshot["details"]["truncation"]["truncated"], true);
+        let path = snapshot["details"]["fullOutputPath"].as_str().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        let finished = output.finish().unwrap();
+        std::fs::remove_file(finished.path.unwrap()).unwrap();
+    }
     #[test]
     fn small_output_retains_bytes_without_a_file() {
         let mut output = Accumulator::default();

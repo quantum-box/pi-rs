@@ -102,7 +102,7 @@ impl CodingTools {
             arguments["timeout"] = json!(timeout.as_secs_f64());
         }
         let result = tool
-            .shell_stream(&arguments, cancellation, progress, true)
+            .shell_stream(&arguments, cancellation, progress, true, None)
             .await?;
         let output = if result.timed_out {
             format!(
@@ -483,7 +483,11 @@ impl Tool for CodingTool {
                 .await
                 .unwrap_or_else(|error| Err(Error::Config(error.to_string())))
             }
-            Kind::Bash | Kind::PowerShell => return self.bash(&args, &context.cancellation).await,
+            Kind::Bash | Kind::PowerShell => {
+                return self
+                    .bash_with_host(&args, &context.cancellation, None)
+                    .await;
+            }
         };
         match result {
             Ok(outcome) => outcome,
@@ -499,15 +503,33 @@ impl Tool for CodingTool {
             Err(error) => Outcome::Failed(error.to_string()),
         }
     }
+    async fn invoke_with_host(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _state: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> Outcome {
+        if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
+            self.bash_with_host(&args, &context.cancellation, Some(host))
+                .await
+        } else {
+            self.invoke(args, context).await
+        }
+    }
+
     async fn invoke_programmatic(
         &self,
         args: Value,
         context: ToolContext,
         _state: Option<&pi_rs::ExtensionState>,
-        _host: Arc<dyn ToolHost>,
+        host: Arc<dyn ToolHost>,
     ) -> ToolReply {
         if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
-            return match self.shell(&args, &context.cancellation).await {
+            return match self
+                .shell_with_host(&args, &context.cancellation, Some(host))
+                .await
+            {
                 Ok(result) => {
                     let elapsed = if self.unrestricted {
                         (result.elapsed * 10.0).round() / 10.0
@@ -1066,8 +1088,18 @@ impl CodingTool {
         })
     }
 
+    #[cfg(test)]
     async fn bash(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Outcome {
-        let result = match self.shell(args, cancellation).await {
+        self.bash_with_host(args, cancellation, None).await
+    }
+
+    async fn bash_with_host(
+        &self,
+        args: &Value,
+        cancellation: &pi_rs::CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> Outcome {
+        let result = match self.shell_with_host(args, cancellation, host).await {
             Ok(result) => result,
             Err(Error::Config(message)) if self.unrestricted => return Outcome::Failed(message),
             Err(error) => return Outcome::Failed(error.to_string()),
@@ -1097,16 +1129,25 @@ impl CodingTool {
         }
     }
 
+    #[cfg(test)]
     async fn shell(
         &self,
         args: &Value,
         cancellation: &pi_rs::CancellationToken,
     ) -> Result<ShellResult> {
+        self.shell_with_host(args, cancellation, None).await
+    }
+    async fn shell_with_host(
+        &self,
+        args: &Value,
+        cancellation: &pi_rs::CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> Result<ShellResult> {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let result = self
-            .shell_stream(args, cancellation, &mut |_| {}, false)
+            .shell_stream(args, cancellation, &mut |_| {}, false, host)
             .await?;
         if result.timed_out {
             let status = format!(
@@ -1129,6 +1170,7 @@ impl CodingTool {
         cancellation: &pi_rs::CancellationToken,
         progress: &mut (dyn FnMut(&str) + Send),
         sanitize_user_output: bool,
+        host: Option<Arc<dyn ToolHost>>,
     ) -> Result<ShellResult> {
         let started = std::time::Instant::now();
         let timeout = shell_timeout(args)?;
@@ -1176,6 +1218,20 @@ impl CodingTool {
         } else {
             crate::shell_output::Accumulator::default()
         };
+        let progress_forwarder = host.filter(|host| host.supports_progress()).map(|host| {
+            let (sender, mut receiver) = tokio::sync::watch::channel::<Option<Value>>(None);
+            let worker = tokio::spawn(async move {
+                let _ = host.report_progress(json!({"content":[]})).await;
+                while receiver.changed().await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let value = receiver.borrow_and_update().clone();
+                    if let Some(value) = value {
+                        let _ = host.report_progress(value).await;
+                    }
+                }
+            });
+            (sender, worker)
+        });
         let mut stdout_open = true;
         let mut stderr_open = true;
         let mut status = None;
@@ -1219,6 +1275,9 @@ impl CodingTool {
                         output.append(&stdout_chunk[..count])?;
                         stdout_text.push(&stdout_chunk[..count], progress);
                     }
+                    if count != 0 && let Some((sender, _)) = &progress_forwarder {
+                        let _ = sender.send_replace(Some(output.partial_result()));
+                    }
                 }
                 count = stderr.read(&mut stderr_chunk), if stderr_open => {
                     let count = count?;
@@ -1234,6 +1293,9 @@ impl CodingTool {
                     } else {
                         output.append(&stderr_chunk[..count])?;
                         stderr_text.push(&stderr_chunk[..count], progress);
+                    }
+                    if count != 0 && let Some((sender, _)) = &progress_forwarder {
+                        let _ = sender.send_replace(Some(output.partial_result()));
                     }
                 }
                 _ = async {
@@ -1258,6 +1320,15 @@ impl CodingTool {
         } else {
             stdout_text.finish(progress);
             stderr_text.finish(progress);
+        }
+        if let Some((sender, mut worker)) = progress_forwarder {
+            drop(sender);
+            if tokio::time::timeout(Duration::from_secs(1), &mut worker)
+                .await
+                .is_err()
+            {
+                worker.abort();
+            }
         }
         Ok(ShellResult {
             cancelled,
@@ -1666,6 +1737,60 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_shell_reports_bounded_cumulative_progress() {
+        struct ProgressHost(std::sync::Mutex<Vec<Value>>);
+        #[async_trait::async_trait]
+        impl ToolHost for ProgressHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                Vec::new()
+            }
+            fn supports_progress(&self) -> bool {
+                true
+            }
+            async fn report_progress(&self, value: Value) -> pi_rs::ExtensionResult<()> {
+                self.0.lock().unwrap().push(value);
+                Ok(())
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                unreachable!()
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let host = Arc::new(ProgressHost(std::sync::Mutex::new(Vec::new())));
+        let result = tool
+            .invoke_with_host(
+                json!({"command":"printf first; sleep 0.3; printf second"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+                None,
+                host.clone(),
+            )
+            .await;
+        assert!(matches!(result, Outcome::Succeeded(ref text) if text == "firstsecond"));
+        let events = host.0.lock().unwrap();
+        assert_eq!(events[0]["content"], json!([]));
+        assert!(
+            events
+                .iter()
+                .any(|event| event["content"][0]["text"] == "first")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["content"][0]["text"] == "firstsecond")
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
