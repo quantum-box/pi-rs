@@ -575,12 +575,11 @@ impl Agent<'_> {
                     return Err(Error::Budget);
                 }
                 let capacity = active.context_capacity(&request, cancel).await?;
-                let estimate = session.context_usage_estimate();
-                let request_estimate = crate::estimate_request_tokens(&request);
+                let estimate = session.context_budget_estimate();
                 let input_tokens = if estimate.last_usage_record.is_some() {
-                    estimate.tokens.max(request_estimate)
+                    estimate.tokens
                 } else {
-                    request_estimate
+                    crate::estimate_request_tokens(&request)
                 };
                 let exceeds = capacity.is_some_and(|window| {
                     input_tokens.saturating_add(u64::from(request.max_output_tokens))
@@ -2305,7 +2304,7 @@ impl Agent<'_> {
         }
         let (usage, usage_metadata) =
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
-        let tokens_before = session.estimated_context_tokens();
+        let tokens_before = session.context_budget_estimate().tokens;
         let from_extension = original_summary != compaction.summary;
         commit(
             session,
@@ -2404,7 +2403,7 @@ fn configured_retention(
     let mut cut = first;
     let mut accumulated = 0_u64;
     for (index, (source, message)) in entries.iter().enumerate().rev() {
-        accumulated = accumulated.saturating_add(crate::tokens::estimate_source_tokens(
+        accumulated = accumulated.saturating_add(crate::tokens::estimate_budget_source_tokens(
             session, *source, message,
         ));
         if accumulated >= target {
@@ -2485,7 +2484,7 @@ fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> 
         let middle = low + (high - low) / 2;
         let messages = conversation_entries(&branch[turns[middle]..], operations.clone());
         let tokens = messages.iter().fold(0_u64, |tokens, (source, message)| {
-            tokens.saturating_add(crate::tokens::estimate_source_tokens(
+            tokens.saturating_add(crate::tokens::estimate_budget_source_tokens(
                 session, *source, message,
             ))
         });

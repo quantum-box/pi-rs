@@ -791,6 +791,106 @@ impl Session {
         }
     }
 
+    pub(crate) fn context_budget_estimate(&self) -> crate::ContextUsageEstimate {
+        let branch = self.branch();
+        let entries = conversation_entries(&branch, self.operations());
+        let invalidated_at = branch
+            .iter()
+            .rev()
+            .find_map(|record| {
+                matches!(
+                    record.event,
+                    Event::ContextEdited { .. }
+                        | Event::Compacted { .. }
+                        | Event::SystemCheckpoint { .. }
+                        | Event::ModelSelected { .. }
+                )
+                .then_some(record.id)
+            })
+            .unwrap_or(0);
+        let completions: BTreeMap<_, _> = branch
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::ModelFinished {
+                    request_id,
+                    metadata,
+                    failure,
+                    ..
+                } => Some((*request_id, (metadata, failure))),
+                _ => None,
+            })
+            .collect();
+        for (index, (source, message)) in entries.iter().enumerate().rev() {
+            if !matches!(message, Message::Assistant { .. }) || *source <= invalidated_at {
+                continue;
+            }
+            let Some(record) = self.records.get(source.saturating_sub(1) as usize) else {
+                continue;
+            };
+            let Event::Assistant {
+                usage: Some(usage),
+                request_id,
+                ..
+            } = &record.event
+            else {
+                continue;
+            };
+            let completion =
+                request_id.and_then(|request_id| completions.get(&request_id).copied());
+            if completion.is_some_and(|(metadata, failure)| {
+                failure.is_some()
+                    || matches!(
+                        metadata.finish_reason.as_deref(),
+                        Some("error" | "aborted" | "cancelled")
+                    )
+            }) {
+                continue;
+            }
+            let input = completion
+                .and_then(|(metadata, _)| metadata.provider_prompt_tokens)
+                .filter(|tokens| *tokens > 0)
+                .unwrap_or(usage.input_tokens);
+            let usage_tokens = input.saturating_add(usage.output_tokens);
+            if usage_tokens == 0 {
+                continue;
+            }
+            let trailing_tokens =
+                entries[index + 1..]
+                    .iter()
+                    .fold(0_u64, |tokens, (source, message)| {
+                        tokens.saturating_add(crate::tokens::estimate_budget_source_tokens(
+                            self, *source, message,
+                        ))
+                    });
+            return crate::ContextUsageEstimate {
+                tokens: usage_tokens.saturating_add(trailing_tokens),
+                usage_tokens,
+                trailing_tokens,
+                last_usage_record: Some(*source),
+            };
+        }
+        let summary = branch.iter().rev().find_map(|record| match &record.event {
+            Event::Compacted { summary, .. } => Some(summary),
+            _ => None,
+        });
+        let initial = summary.map_or(0, |summary| {
+            crate::estimate_message_tokens(&Message::User {
+                content: summary.clone(),
+            })
+        });
+        let tokens = entries.iter().fold(initial, |tokens, (source, message)| {
+            tokens.saturating_add(crate::tokens::estimate_budget_source_tokens(
+                self, *source, message,
+            ))
+        });
+        crate::ContextUsageEstimate {
+            tokens,
+            usage_tokens: 0,
+            trailing_tokens: tokens,
+            last_usage_record: None,
+        }
+    }
+
     pub(crate) fn imported_context_total(&self, source: u64) -> Option<u64> {
         self.imported_assistant_message(source)?["usage"]["totalTokens"]
             .as_u64()

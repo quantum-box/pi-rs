@@ -386,6 +386,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(session.context_usage_estimate().tokens, 105);
+        assert_eq!(session.context_budget_estimate().last_usage_record, None);
         session
             .append(Event::SystemCheckpoint {
                 content: "extra".into(),
