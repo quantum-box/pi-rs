@@ -47,6 +47,9 @@ data resets it. Use `/settings` to change it, or set `httpIdleTimeoutMs` in
 `{"httpIdleTimeoutMs":"disabled"}` removes the HTTP idle deadline.
 `--model-timeout-secs` separately sets a deadline for the complete operation.
 
+To use an OpenAI API key and API billing, set `OPENAI_API_KEY` and select the
+`openai` provider, for example `pi --provider openai --model gpt-4.1`.
+
 To use eligible ChatGPT plan usage, sign in with your ChatGPT account and
 authorize plan usage in the browser:
 

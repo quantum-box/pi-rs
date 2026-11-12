@@ -147,10 +147,14 @@ impl Provider {
             })
         };
         match adapter {
-            Adapter::OpenAiResponses => Ok(Client::OpenAi(pi_rs::openai::OpenAiResponses::new(
-                endpoint,
-                token.ok_or_else(missing_key)?,
-            )?)),
+            Adapter::OpenAiResponses => {
+                let token = token.ok_or_else(missing_key)?;
+                Ok(Client::OpenAi(if self.id() == "openai" {
+                    pi_rs::openai::OpenAiResponses::new_api(endpoint, token)?
+                } else {
+                    pi_rs::openai::OpenAiResponses::new(endpoint, token)?
+                }))
+            }
             Adapter::ChatCompletions => {
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
@@ -366,7 +370,7 @@ impl Client {
             Self::Anthropic(client) => Self::Anthropic(client.with_headers(headers)),
             Self::Google(client) => Self::Google(client.with_headers(headers)),
             Self::PiMessages(client) => Self::PiMessages(client.with_headers(headers)),
-            Self::OpenAi(client) => Self::OpenAi(client),
+            Self::OpenAi(client) => Self::OpenAi(client.with_headers(headers)),
             Self::Deferred(_) => unreachable!("deferred provider headers resolve per request"),
         }
     }

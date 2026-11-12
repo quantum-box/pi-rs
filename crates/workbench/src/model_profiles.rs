@@ -1198,6 +1198,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn openai_api_key_provider_includes_upstream_responses_models() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        let provider = profiles.provider("openai").unwrap();
+        assert_eq!(provider.adapter(), Adapter::OpenAiResponses);
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://api.openai.com/v1/responses"
+        );
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .contains(&"gpt-4.1".to_owned())
+        );
+        assert_eq!(
+            profiles.model(&provider, "gpt-4.1").unwrap().reasoning,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn baseten_and_nvidia_builtin_models_keep_capabilities_and_headers() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let baseten = profiles.provider("baseten").unwrap();

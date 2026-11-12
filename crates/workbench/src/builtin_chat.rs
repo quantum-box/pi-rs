@@ -14,6 +14,12 @@ pub(super) struct Builtin {
 
 pub(super) const PROVIDERS: &[Builtin] = &[
     Builtin {
+        id: "openai",
+        endpoint: "https://api.openai.com/v1/responses",
+        env: "OPENAI_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "baseten",
         endpoint: "https://inference.baseten.co/v1/chat/completions",
         env: "BASETEN_API_KEY",
@@ -123,7 +129,11 @@ impl Builtin {
     pub fn provider(&self) -> Provider {
         Provider::Custom {
             id: Arc::from(self.id),
-            adapter: Adapter::ChatCompletions,
+            adapter: if self.id == "openai" {
+                Adapter::OpenAiResponses
+            } else {
+                Adapter::ChatCompletions
+            },
         }
     }
 
@@ -133,7 +143,8 @@ impl Builtin {
 
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
-            (Adapter::ChatCompletions, _) => Some(self.endpoint),
+            (Adapter::OpenAiResponses, "openai") => Some(self.endpoint),
+            (Adapter::ChatCompletions, id) if id != "openai" => Some(self.endpoint),
             (Adapter::Anthropic, "fireworks") => {
                 Some("https://api.fireworks.ai/inference/v1/messages")
             }
