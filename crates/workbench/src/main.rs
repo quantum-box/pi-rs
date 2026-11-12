@@ -708,6 +708,15 @@ enum Command {
         provider: String,
         #[arg(long)]
         device_code: bool,
+        /// Register a different ChatGPT account or workspace.
+        #[arg(long, conflicts_with_all = ["account", "list_accounts"])]
+        new_account: bool,
+        /// Reauthorize an existing ChatGPT account by client ID.
+        #[arg(long, conflicts_with = "list_accounts")]
+        account: Option<String>,
+        /// List saved ChatGPT account registrations.
+        #[arg(long)]
+        list_accounts: bool,
     },
     /// Remove a saved provider credential.
     Logout {
@@ -1131,13 +1140,34 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         Some(Command::Login {
             provider,
             device_code,
+            new_account,
+            account,
+            list_accounts,
         }) => {
+            if *list_accounts {
+                if provider != "openai-chatgpt" {
+                    return Err(Error::Config(
+                        "--list-accounts requires openai-chatgpt".into(),
+                    ));
+                }
+                for (client_id, label, active) in chatgpt_auth::list_accounts()? {
+                    output(
+                        json!({"type":"chatgpt_account", "clientId":client_id, "label":label, "active":active}),
+                    );
+                }
+                return Ok(());
+            }
+            if provider != "openai-chatgpt" && (*new_account || account.is_some()) {
+                return Err(Error::Config(
+                    "--new-account and --account require openai-chatgpt".into(),
+                ));
+            }
             let login = async {
                 if provider == "openai-chatgpt" {
                     if *device_code {
                         return Err(Error::Config("ChatGPT uses browser authorization".into()));
                     }
-                    chatgpt_auth::login(&args.settings, |url| {
+                    chatgpt_auth::login(&args.settings, *new_account, account.as_deref(), |url| {
                         eprintln!("Continue with ChatGPT in your browser: {url}")
                     })
                     .await

@@ -24,6 +24,8 @@ pub enum Selection {
     LoginProvider(super::super::Provider),
     LoginOpenRouter,
     LoginChatGpt,
+    LoginChatGptNew,
+    LoginChatGptAccount(String),
     LogoutChatGpt,
     LogoutProvider(super::super::Provider),
     RadiusMethods,

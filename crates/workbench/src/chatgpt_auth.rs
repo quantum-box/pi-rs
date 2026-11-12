@@ -5,25 +5,73 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const PROVIDER: &str = "openai-chatgpt";
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Registration {
     client_id: String,
     subject: String,
     email: Option<String>,
 }
 
-fn registration() -> Result<Option<Registration>> {
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Registrations {
+    active: Option<String>,
+    accounts: Vec<Registration>,
+}
+
+fn registrations() -> Result<Registrations> {
+    let path = super::config::agent_dir().join("chatgpt-registrations.json");
+    let value = super::config::read_object(&path)?;
+    if !value.as_object().is_some_and(|data| data.is_empty()) {
+        return serde_json::from_value(value)
+            .map_err(|_| Error::Config("invalid ChatGPT registrations".into()));
+    }
     let value =
         super::config::read_object(&super::config::agent_dir().join("chatgpt-registration.json"))?;
     if value.as_object().is_some_and(|data| data.is_empty()) {
-        return Ok(None);
+        return Ok(Registrations::default());
     }
-    serde_json::from_value(value)
-        .map(Some)
-        .map_err(|_| Error::Config("invalid ChatGPT registration".into()))
+    let account: Registration = serde_json::from_value(value)
+        .map_err(|_| Error::Config("invalid ChatGPT registration".into()))?;
+    Ok(Registrations {
+        active: Some(account.client_id.clone()),
+        accounts: vec![account],
+    })
+}
+
+pub(super) fn list_accounts() -> Result<Vec<(String, String, bool)>> {
+    let store = registrations()?;
+    Ok(store
+        .accounts
+        .iter()
+        .enumerate()
+        .map(|(index, account)| {
+            let label = account
+                .email
+                .clone()
+                .unwrap_or_else(|| format!("ChatGPT account {}", index + 1));
+            (
+                account.client_id.clone(),
+                label,
+                store.active.as_deref() == Some(&account.client_id),
+            )
+        })
+        .collect())
 }
 fn auth_path() -> std::path::PathBuf {
     super::config::agent_dir().join("auth.json")
+}
+fn sessions_path() -> std::path::PathBuf {
+    super::config::agent_dir().join("chatgpt-sessions.json")
+}
+fn saved_session(id: &str) -> Result<Option<pi_rs::openai::oauth::Credential>> {
+    let sessions = super::config::read_object(&sessions_path())?;
+    sessions
+        .get(id)
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|_| Error::Config("invalid ChatGPT session".into()))
+        })
+        .transpose()
 }
 fn load() -> Result<Option<pi_rs::openai::oauth::Credential>> {
     let value = super::config::read_object(&auth_path())?;
@@ -76,17 +124,35 @@ fn save(credential: &pi_rs::openai::oauth::Credential) -> Result<()> {
         subject: credential.subject.clone(),
         email: credential.email.clone(),
     };
-    super::config::write_json(
-        &super::config::agent_dir().join("chatgpt-registration.json"),
-        &serde_json::to_value(registration)?,
-    )?;
+    let mut store = registrations()?;
+    if let Some(existing) = store
+        .accounts
+        .iter_mut()
+        .find(|account| account.client_id == registration.client_id)
+    {
+        *existing = registration;
+    } else {
+        store.accounts.push(registration);
+    }
+    store.active = Some(credential.client_id.clone());
+    super::config::update_object(&sessions_path(), |sessions| {
+        sessions.insert(
+            credential.client_id.clone(),
+            serde_json::to_value(credential)?,
+        );
+        Ok(())
+    })?;
     super::config::update_object(&auth_path(), |data| {
         data.insert(
             PROVIDER.into(),
             serde_json::json!({"type":"oauth","credential":credential}),
         );
         Ok(())
-    })
+    })?;
+    super::config::write_json(
+        &super::config::agent_dir().join("chatgpt-registrations.json"),
+        &serde_json::to_value(store)?,
+    )
 }
 
 fn client(settings: &super::config::Settings) -> Result<reqwest::Client> {
@@ -98,11 +164,56 @@ fn client(settings: &super::config::Settings) -> Result<reqwest::Client> {
 
 pub(super) async fn login(
     settings: &super::config::Settings,
+    new_account: bool,
+    account: Option<&str>,
     announce: impl FnOnce(&Url),
 ) -> Result<()> {
     let _lock = lock().await?;
-    let existing = load()?;
-    let registered = registration()?;
+    let store = registrations()?;
+    let registered = if new_account {
+        None
+    } else if let Some(account) = account {
+        Some(
+            store
+                .accounts
+                .iter()
+                .find(|saved| saved.client_id == account)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Config("unknown ChatGPT account; use --list-accounts".into())
+                })?,
+        )
+    } else {
+        store
+            .active
+            .as_deref()
+            .and_then(|id| store.accounts.iter().find(|saved| saved.client_id == id))
+            .cloned()
+    };
+    if let Some(account) = registered.as_ref()
+        && let Some(mut credential) = saved_session(&account.client_id)?
+    {
+        if credential.subject != account.subject || credential.client_id != account.client_id {
+            return Err(Error::Config("ChatGPT account identity mismatch".into()));
+        }
+        if !credential
+            .scopes
+            .iter()
+            .any(|scope| scope == "chatgpt.tokens.use.direct")
+        {
+            return Err(Error::Config(
+                "ChatGPT plan permission is not granted".into(),
+            ));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::Config("invalid system clock".into()))?
+            .as_secs();
+        if credential.expires_at <= now.saturating_add(180) {
+            credential = credential.refresh(&client(settings)?).await?;
+        }
+        return save(&credential);
+    }
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let callback = Url::parse(&format!(
         "http://127.0.0.1:{}/auth/callback",
@@ -112,10 +223,7 @@ pub(super) async fn login(
     let auth = pi_rs::openai::oauth::Authorization::new(
         callback.clone(),
         host_id()?,
-        existing
-            .as_ref()
-            .map(|credential| credential.client_id.clone())
-            .or_else(|| registered.as_ref().map(|account| account.client_id.clone())),
+        registered.as_ref().map(|account| account.client_id.clone()),
     )?;
     let url = auth.url();
     announce(&url);
@@ -129,12 +237,9 @@ pub(super) async fn login(
     let result = async {
         let client = client(settings)?;
         let credential = auth.exchange(&client, &redirect.url).await?;
-        if existing
+        if registered
             .as_ref()
             .is_some_and(|previous| previous.subject != credential.subject)
-            || registered
-                .as_ref()
-                .is_some_and(|previous| previous.subject != credential.subject)
         {
             return Err(Error::Config(
                 "ChatGPT account changed during sign-in".into(),
@@ -151,6 +256,21 @@ pub(super) async fn access(settings: &super::config::Settings) -> Result<String>
     let _lock = lock().await?;
     let mut credential =
         load()?.ok_or_else(|| Error::Config("sign in with pi login openai-chatgpt".into()))?;
+    if let Some(saved) = saved_session(&credential.client_id)?
+        && saved.subject == credential.subject
+        && saved.expires_at >= credential.expires_at
+    {
+        credential = saved;
+    }
+    if !credential
+        .scopes
+        .iter()
+        .any(|scope| scope == "chatgpt.tokens.use.direct")
+    {
+        return Err(Error::Config(
+            "ChatGPT plan permission is not granted".into(),
+        ));
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Error::Config("invalid system clock".into()))?
@@ -174,6 +294,10 @@ pub(super) async fn logout(settings: &super::config::Settings) -> Result<bool> {
     };
     super::config::update_object(&auth_path(), |data| {
         data.remove(PROVIDER);
+        Ok(())
+    })?;
+    super::config::update_object(&sessions_path(), |sessions| {
+        sessions.remove(&credential.client_id);
         Ok(())
     })?;
     revoked.map(|()| true).map_err(|_| {

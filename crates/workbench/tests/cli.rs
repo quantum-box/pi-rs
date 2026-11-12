@@ -102,6 +102,43 @@ fn chatgpt_plan_provider_streams_through_the_cli() {
     server.join().unwrap();
 }
 
+#[test]
+fn chatgpt_account_switch_preserves_separate_saved_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let credential = |id: &str| json!({"client_id":id,"subject":format!("user-{id}"),"email":null,"id_token":"id","access_token":format!("access-{id}"),"refresh_token":format!("refresh-{id}"),"expires_at":4_000_000_000u64,"scopes":["chatgpt.tokens.use.direct"]});
+    std::fs::write(root.path().join("chatgpt-registrations.json"),json!({"active":"one","accounts":[{"client_id":"one","subject":"user-one","email":null},{"client_id":"two","subject":"user-two","email":null}]}).to_string()).unwrap();
+    std::fs::write(
+        root.path().join("chatgpt-sessions.json"),
+        json!({"one":credential("one"),"two":credential("two")}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("auth.json"),
+        json!({"openai-chatgpt":{"type":"oauth","credential":credential("one")}}).to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["login", "openai-chatgpt", "--account", "two"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("access-two"));
+    let auth: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["openai-chatgpt"]["credential"]["client_id"], "two");
+    let store: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("chatgpt-sessions.json")).unwrap())
+            .unwrap();
+    assert_eq!(store["one"]["client_id"], "one");
+    assert_eq!(store["two"]["client_id"], "two");
+}
+
 #[cfg(unix)]
 #[test]
 fn extension_command_can_trigger_model_in_print_and_json_modes() {

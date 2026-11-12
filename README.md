@@ -58,6 +58,10 @@ pi --provider openai-chatgpt
 Inside the terminal, `/login openai-chatgpt` starts the same flow, and
 `/logout openai-chatgpt` signs out. Available models and usage depend on the
 account and workspace. Manage app usage in [ChatGPT Settings](https://chatgpt.com/settings/usage).
+Use `pi login openai-chatgpt --new-account` to add another account or workspace,
+`pi login openai-chatgpt --list-accounts` to list registrations, and
+`pi login openai-chatgpt --account <client-id>` to select one. The terminal's
+`/login` menu also offers saved accounts and a new-account option.
 
 ## Native extensions
 

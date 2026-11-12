@@ -2544,8 +2544,17 @@ fn slash(
             start_radius_logout(view, &args.settings)?
         }
         "/login" if rest.eq_ignore_ascii_case("openai-chatgpt") => {
-            start_chatgpt_login(view, &args.settings)
+            start_chatgpt_login(view, &args.settings, false, None)
         }
+        "/login" if rest.eq_ignore_ascii_case("openai-chatgpt new") => {
+            start_chatgpt_login(view, &args.settings, true, None)
+        }
+        "/login" if rest.starts_with("openai-chatgpt account ") => start_chatgpt_login(
+            view,
+            &args.settings,
+            false,
+            Some(rest["openai-chatgpt account ".len()..].trim().into()),
+        ),
         "/logout" if rest.eq_ignore_ascii_case("openai-chatgpt") => {
             start_chatgpt_logout(view, &args.settings)
         }
@@ -2615,6 +2624,21 @@ fn slash(
                             },
                         },
                     );
+                }
+                if login {
+                    items.push(Item {
+                        label: "ChatGPT · Add account or workspace".into(),
+                        selection: Selection::LoginChatGptNew,
+                    });
+                    for (id, label, active) in super::chatgpt_auth::list_accounts()? {
+                        items.push(Item {
+                            label: format!(
+                                "ChatGPT · {label} · {id}{}",
+                                if active { " (selected)" } else { "" }
+                            ),
+                            selection: Selection::LoginChatGptAccount(id),
+                        });
+                    }
                 }
                 if items.is_empty() {
                     view.append("No saved provider credentials");
@@ -4850,13 +4874,18 @@ fn start_openrouter_login(view: &mut View, settings: &crate::config::Settings) {
     ));
 }
 
-fn start_chatgpt_login(view: &mut View, settings: &crate::config::Settings) {
+fn start_chatgpt_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    new_account: bool,
+    account: Option<String>,
+) {
     let settings = settings.clone();
     view.remote_task = Some(RemoteTask::start(
         "Signing in with ChatGPT",
         "ChatGPT sign-in cancelled",
         move |sender| async move {
-            super::chatgpt_auth::login(&settings, |url| {
+            super::chatgpt_auth::login(&settings, new_account, account.as_deref(), |url| {
                 let _ = sender.send(RemoteEvent::Notice(format!(
                     "Continue with ChatGPT in your browser: {url}"
                 )));
@@ -5815,7 +5844,11 @@ fn select(
         Selection::Completion { range, text } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
-        Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings),
+        Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings, false, None),
+        Selection::LoginChatGptNew => start_chatgpt_login(view, &args.settings, true, None),
+        Selection::LoginChatGptAccount(id) => {
+            start_chatgpt_login(view, &args.settings, false, Some(id))
+        }
         Selection::LogoutChatGpt => start_chatgpt_logout(view, &args.settings),
         Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
         Selection::RadiusMethods => show_radius_methods(view),
