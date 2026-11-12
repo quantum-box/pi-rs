@@ -1065,8 +1065,71 @@ fn legacy_prompt_candidates(
 }
 
 fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    let Some(patterns) = expand_prompt_braces(pattern) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<_> = patterns
+        .iter()
+        .flat_map(|pattern| expand_prompt_glob_variant(root, pattern))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+// Expand alternatives before splitting into path components for traversal pruning.
+fn expand_prompt_braces(pattern: &str) -> Option<Vec<String>> {
+    let mut start = None;
+    let mut depth = 0;
+    let mut in_class = false;
+    let mut separators = Vec::new();
+    for (index, ch) in pattern.char_indices() {
+        match ch {
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '{' if !in_class => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            ',' if !in_class && depth == 1 => separators.push(index),
+            '}' if !in_class && depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let start = start?;
+                    let mut variants = Vec::new();
+                    let mut begin = start + 1;
+                    for end in separators.into_iter().chain(std::iter::once(index)) {
+                        let next = format!(
+                            "{}{}{}",
+                            &pattern[..start],
+                            &pattern[begin..end],
+                            &pattern[index + 1..]
+                        );
+                        variants.extend(expand_prompt_braces(&next)?);
+                        if variants.len() > 256 {
+                            return None;
+                        }
+                        begin = end + 1;
+                    }
+                    return Some(variants);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(vec![pattern.to_owned()])
+}
+
+fn expand_prompt_glob_variant(root: &Path, pattern: &str) -> Vec<PathBuf> {
     let root = dunce::simplified(root);
     let input = dunce::simplified(Path::new(pattern));
+    let mut literal_prefix = if input.is_absolute() {
+        PathBuf::new()
+    } else {
+        root.to_path_buf()
+    };
     let mut pattern_path = if input.is_absolute() {
         PathBuf::new()
     } else {
@@ -1082,6 +1145,9 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
             if saw_wildcard || !pattern_path.pop() {
                 return Vec::new();
             }
+            if literal_prefix.starts_with(&pattern_path) {
+                literal_prefix = pattern_path.clone();
+            }
         } else {
             saw_wildcard |= component
                 .as_os_str()
@@ -1090,7 +1156,20 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
             pattern_path.push(component.as_os_str());
         }
     }
-    let normalized = pattern_path.to_string_lossy().replace('\\', "/");
+    let literal_count = literal_prefix
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count();
+    let suffix = pattern_path
+        .strip_prefix(&literal_prefix)
+        .unwrap_or(&pattern_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut normalized = globset::escape(&literal_prefix.to_string_lossy().replace('\\', "/"));
+    if !normalized.is_empty() && !normalized.ends_with('/') && !suffix.is_empty() {
+        normalized.push('/');
+    }
+    normalized.push_str(&suffix);
     let Ok(glob) = globset::GlobBuilder::new(&normalized)
         .literal_separator(true)
         .backslash_escape(false)
@@ -1100,10 +1179,16 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
     };
     let matcher = glob.compile_matcher();
     let mut base = PathBuf::new();
+    let mut normal_count = 0;
     for component in pattern_path.components() {
         let part = component.as_os_str();
-        if part.to_string_lossy().contains(['*', '?', '[', '{']) {
+        let literal =
+            matches!(component, std::path::Component::Normal(_)) && normal_count < literal_count;
+        if !literal && part.to_string_lossy().contains(['*', '?', '[', '{']) {
             break;
+        }
+        if matches!(component, std::path::Component::Normal(_)) {
+            normal_count += 1;
         }
         base.push(part);
     }
@@ -1115,7 +1200,7 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
             return Vec::new();
         }
     }
-    let Some(prefix) = PromptGlobPrefix::new(&pattern_path) else {
+    let Some(prefix) = PromptGlobPrefix::new(&pattern_path, literal_count) else {
         return Vec::new();
     };
     let depth = prefix.max_depth(&base);
@@ -1152,15 +1237,22 @@ struct PromptGlobPrefix {
 }
 
 impl PromptGlobPrefix {
-    fn new(pattern: &Path) -> Option<Self> {
+    fn new(pattern: &Path, literal_count: usize) -> Option<Self> {
         let mut components = Vec::new();
         for component in pattern.components() {
             if let std::path::Component::Normal(name) = component {
                 let name = name.to_string_lossy();
-                if name == "**" {
+                if components.len() >= literal_count && name == "**" {
                     components.push(None);
                 } else {
-                    let glob = globset::GlobBuilder::new(&name)
+                    let escaped;
+                    let name = if components.len() < literal_count {
+                        escaped = globset::escape(&name);
+                        escaped.as_str()
+                    } else {
+                        name.as_ref()
+                    };
+                    let glob = globset::GlobBuilder::new(name)
                         .literal_separator(true)
                         .backslash_escape(false)
                         .build()
@@ -1669,6 +1761,40 @@ mod tests {
     }
 
     #[test]
+    fn package_prompt_glob_expands_cross_component_braces_under_literal_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("pkg[1]");
+        for directory in ["prompts/team/a", "prompts/team/b/nested", "prompts/team/c"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("prompts/team/a/review.md"), "a").unwrap();
+        std::fs::write(root.join("prompts/team/b/nested/review.md"), "b").unwrap();
+        std::fs::write(root.join("prompts/team/c/review.md"), "c").unwrap();
+        let prompts = collect_package_resources(
+            &root,
+            &json!({"prompts": ["prompts/{team/a,team/b}/**/*.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(
+            prompts,
+            vec![
+                root.join("prompts/team/a/review.md"),
+                root.join("prompts/team/b/nested/review.md")
+            ]
+        );
+        let simple = collect_package_resources(
+            &root,
+            &json!({"prompts": ["prompts/team/a/*.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(simple, vec![root.join("prompts/team/a/review.md")]);
+    }
+
+    #[test]
     fn package_prompt_globs_match_explicit_external_paths() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("package");
@@ -1722,7 +1848,7 @@ mod tests {
         std::fs::write(deep.join("unexpected.md"), "fixture").unwrap();
         std::fs::write(root.join("prompts/visible.md"), "fixture").unwrap();
         let pattern = base.join("*/prompts/*.md");
-        let prefix = PromptGlobPrefix::new(&pattern).unwrap();
+        let prefix = PromptGlobPrefix::new(&pattern, 0).unwrap();
         assert_eq!(prefix.max_depth(&base), Some(3));
         assert!(prefix.can_match(&base.join("other")));
         assert!(!prefix.can_match(&base.join("other/unrelated")));
@@ -1735,7 +1861,7 @@ mod tests {
         .unwrap()
         .prompts;
         assert_eq!(prompts, vec![root.join("prompts/visible.md")]);
-        let recursive = PromptGlobPrefix::new(&base.join("*/**/prompts/*.md")).unwrap();
+        let recursive = PromptGlobPrefix::new(&base.join("*/**/prompts/*.md"), 0).unwrap();
         assert_eq!(recursive.max_depth(&base), None);
         assert!(recursive.can_match(&deep));
     }
