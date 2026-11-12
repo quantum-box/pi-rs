@@ -116,6 +116,7 @@ enum KeyboardProtocol {
     Probing,
     Kitty,
     Xterm,
+    Disabled,
 }
 
 #[cfg(any(unix, windows))]
@@ -290,6 +291,17 @@ impl Terminal {
         Ok(())
     }
     #[cfg(unix)]
+    fn disable_keyboard_protocol(&mut self) {
+        if self.keyboard == KeyboardProtocol::Disabled {
+            return;
+        }
+        if self.keyboard == KeyboardProtocol::Xterm {
+            let _ = execute!(std::io::stdout(), Print("\x1b[>4;0m"));
+        }
+        let _ = execute!(std::io::stdout(), Print("\x1b[<u"));
+        self.keyboard = KeyboardProtocol::Disabled;
+    }
+    #[cfg(unix)]
     fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
         drop(guard.take());
         // The foreground job owns this process group, including its frontend worker.
@@ -325,12 +337,7 @@ impl Drop for Terminal {
             self.images.clear();
         }
         #[cfg(unix)]
-        {
-            if self.keyboard == KeyboardProtocol::Xterm {
-                let _ = execute!(std::io::stdout(), Print("\x1b[>4;0m"));
-            }
-            let _ = execute!(std::io::stdout(), Print("\x1b[<u"));
-        }
+        self.disable_keyboard_protocol();
         #[cfg(any(unix, windows))]
         let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
@@ -4828,6 +4835,20 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             _ => {}
         }
     }
+    // Stop terminal input and restore the terminal before any worker teardown,
+    // which can block while a running command or extension shuts down.
+    #[cfg(unix)]
+    if let Some(terminal) = &mut _terminal {
+        terminal.disable_keyboard_protocol();
+    }
+    let _ = input.drain(Duration::from_secs(1), Duration::from_millis(50));
+    let finish = if args.tui_mode == Some(TuiMode::Regular) {
+        view.finish_regular()
+    } else {
+        Ok(())
+    };
+    drop(_terminal.take());
+    finish?;
     if is_busy(&worker) {
         drop(worker.take());
     }
@@ -4847,10 +4868,6 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         }
     }
     drop(worker);
-    if args.tui_mode == Some(TuiMode::Regular) {
-        view.finish_regular()?;
-    }
-    drop(_terminal.take());
     if args.tui_mode != Some(TuiMode::Regular)
         && args.settings.string("fullscreenExitOutput") != Some("resume-hint")
     {
@@ -6467,7 +6484,6 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
     }
     view.editor.take();
     view.draft_images.clear();
-    view.clipboard = None;
     *last_clear = Some(now);
     false
 }
@@ -6512,7 +6528,13 @@ mod tests {
         assert!(!super::clear_editor_or_exit(&mut view, &mut last, now));
         assert!(view.editor.text.is_empty());
         assert!(view.draft_images.is_empty());
-        assert!(view.clipboard.is_none());
+        assert!(view.clipboard.is_some());
+        _sender
+            .send(Ok(super::super::clipboard::Content::Text("pasted".into())))
+            .unwrap();
+        assert!(view.poll_clipboard());
+        assert_eq!(view.editor.text, "pasted");
+        view.editor.take();
         view.editor.insert("new draft");
         assert!(super::clear_editor_or_exit(
             &mut view,

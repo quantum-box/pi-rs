@@ -1,5 +1,5 @@
 //! Native input events, including terminal replies that are not keyboard input.
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
@@ -61,6 +61,11 @@ impl Reader {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self)
     }
+    pub fn drain(&mut self, max: Duration, idle: Duration) -> std::io::Result<()> {
+        drain_until_idle(max, idle, |timeout| {
+            self.next(timeout).map(|event| event.is_some())
+        })
+    }
     pub fn next(&mut self, timeout: Duration) -> std::io::Result<Option<InputEvent>> {
         if crossterm::event::poll(timeout)? {
             crossterm::event::read().map(InputEvent::Event).map(Some)
@@ -73,4 +78,49 @@ impl Reader {
 #[cfg(any(unix, windows))]
 fn escape_delay() -> Duration {
     Duration::from_millis(25)
+}
+
+// Keep raw mode active until input has been quiet, but bound shutdown even if
+// a terminal continuously sends events. `read` must wait at most its timeout.
+fn drain_until_idle(
+    max: Duration,
+    idle: Duration,
+    mut read: impl FnMut(Duration) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    let started = Instant::now();
+    let mut last_data = started;
+    loop {
+        let now = Instant::now();
+        let remaining = max.saturating_sub(now.duration_since(started));
+        let quiet = idle.saturating_sub(now.duration_since(last_data));
+        if remaining.is_zero() || quiet.is_zero() {
+            return Ok(());
+        }
+        if read(remaining.min(quiet))? {
+            last_data = Instant::now();
+        }
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[test]
+    fn drain_stops_at_deadline_during_continuous_input() {
+        let start = Instant::now();
+        let mut reads = 0;
+        drain_until_idle(
+            Duration::from_millis(40),
+            Duration::from_millis(30),
+            |timeout| {
+                std::thread::sleep(timeout.min(Duration::from_millis(5)));
+                reads += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(reads > 1);
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
 }

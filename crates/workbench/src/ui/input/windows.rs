@@ -36,6 +36,12 @@ impl Reader {
         })
     }
 
+    pub fn drain(&mut self, max: Duration, idle: Duration) -> io::Result<()> {
+        super::drain_until_idle(max, idle, |timeout| {
+            self.next(timeout).map(|event| event.is_some())
+        })
+    }
+
     pub fn next(&mut self, timeout: Duration) -> io::Result<Option<InputEvent>> {
         let started = Instant::now();
         loop {
