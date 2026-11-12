@@ -2401,6 +2401,11 @@ impl Agent<'_> {
         let reply = self
             .reply_for_branch_summary(session, request, cancel, observer)
             .await?;
+        if reply.truncated {
+            return Err(Error::Model(
+                "branch summary reached the output token limit".into(),
+            ));
+        }
         if !reply.invocations.is_empty() {
             return Err(Error::Model("branch summary attempted a tool call".into()));
         }
@@ -2645,6 +2650,11 @@ impl Agent<'_> {
             .reply(session, request, false, cancel, observer, inputs)
             .await?
             .outcome?;
+        if reply.truncated {
+            return Err(Error::Model(
+                "summary reached the output token limit".into(),
+            ));
+        }
         if !reply.invocations.is_empty() {
             return Err(Error::Model(
                 "summary response attempted a tool call".into(),

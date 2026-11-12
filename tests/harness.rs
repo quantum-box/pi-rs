@@ -1060,6 +1060,49 @@ fn project_instructions_are_ordered_and_skills_are_explicit() {
 }
 
 #[tokio::test]
+async fn truncated_summary_does_not_compact_history() {
+    let mut partial = vec![ModelEvent::Metadata(ModelMetadata {
+        finish_reason: Some("length".into()),
+        ..Default::default()
+    })];
+    partial.extend(answer("unfinished summary"));
+    let model = Script::new(vec![answer("original"), partial]);
+    let registry = Registry::default();
+    let agent = agent(&model, &registry);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let cancel = CancellationToken::new();
+    agent
+        .run(
+            &mut session,
+            Some("question".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let error = agent
+        .summarize(&mut session, 0, &cancel, &mut ignore)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("output token limit"));
+    assert!(
+        !session
+            .records()
+            .iter()
+            .any(|record| matches!(record.event, Event::Compacted { .. }))
+    );
+    assert!(
+        session
+            .conversation_at(session.head())
+            .unwrap()
+            .iter()
+            .any(|message| matches!(message, Message::User { content } if content == "question"))
+    );
+}
+
+#[tokio::test]
 async fn model_summary_uses_no_tools_and_preserves_the_prior_branch() {
     let dir = tempdir().unwrap();
     let mut session = Session::open(dir.path().join("session")).unwrap();
