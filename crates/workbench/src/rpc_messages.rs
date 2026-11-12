@@ -388,7 +388,10 @@ impl Projection {
         edited: bool,
     ) -> Value {
         let timestamp = record.timestamp_millis().unwrap_or_default();
-        if let Event::CustomMessage { message: custom } = &record.event {
+        if let Event::CustomMessage {
+            message: custom, ..
+        } = &record.event
+        {
             let content = if edited {
                 match message {
                     Message::User { content } => json!(content),

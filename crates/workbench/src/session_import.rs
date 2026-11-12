@@ -354,7 +354,7 @@ fn push_user(events: &mut Vec<Event>, value: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn imported_custom_message(entry: &Value, legacy: bool) -> Result<pi_rs::CustomMessage> {
+pub(super) fn imported_custom_message(entry: &Value, legacy: bool) -> Result<pi_rs::CustomMessage> {
     let value = entry
         .get("content")
         .ok_or_else(|| Error::Session("imported custom message is missing content".into()))?;
@@ -650,6 +650,7 @@ fn convert(
                 }
                 "custom" | "hookMessage" => events.push(Event::CustomMessage {
                     message: imported_custom_message(message, true)?,
+                    legacy_source: Some(true),
                 }),
                 "bashExecution" => events.push(Event::BashExecution {
                     execution: serde_json::from_value(message.clone())?,
@@ -801,6 +802,7 @@ fn convert(
         }
         "custom_message" => events.push(Event::CustomMessage {
             message: imported_custom_message(entry, false)?,
+            legacy_source: Some(false),
         }),
         "custom" => {
             events.push(Event::CustomEntry {
@@ -1342,7 +1344,7 @@ mod tests {
             .records()
             .iter()
             .filter_map(|record| match &record.event {
-                Event::CustomMessage { message } => Some(message),
+                Event::CustomMessage { message, .. } => Some(message),
                 _ => None,
             })
             .collect();
@@ -1376,7 +1378,7 @@ mod tests {
             if entry.custom_type == "bookmark" && entry.data == Some(Value::Null)
         )));
         assert!(session.records().iter().any(|record| matches!(
-            &record.event, Event::CustomMessage { message }
+            &record.event, Event::CustomMessage { message, .. }
             if message.custom_type == "hint" && !message.display && message.details == Some(Value::Null)
                 && matches!(&message.content, pi_rs::ContextContent::Blocks(blocks) if blocks.len() == 3)
         )));

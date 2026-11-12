@@ -1018,7 +1018,7 @@ impl View {
             )
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
         {
-            if let pi_rs::Event::CustomMessage { message } = &record.event {
+            if let pi_rs::Event::CustomMessage { message, .. } = &record.event {
                 self.show_custom_message(message);
             }
             if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
@@ -1106,7 +1106,7 @@ impl View {
             .collect();
         for record in session.branch() {
             match &record.event {
-                pi_rs::Event::CustomMessage { message } => self.show_custom_message(message),
+                pi_rs::Event::CustomMessage { message, .. } => self.show_custom_message(message),
                 pi_rs::Event::User { content, .. }
                 | pi_rs::Event::UserWithImages { content, .. } => {
                     self.history.push(content.clone());

@@ -327,21 +327,10 @@ pub fn html(session: &Session) -> String {
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\"><title>{title}</title><style>body{{max-width:960px;margin:40px auto;padding:0 20px;font:16px system-ui;background:#16181d;color:#e4e6eb}}article,details{{padding:16px;margin:12px 0;border-radius:8px;background:#252932}}.user{{background:#243448}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}}summary{{cursor:pointer}}.thinking{{color:#a5abb6}}h1{{font-size:24px}}</style><h1>{title}</h1>"
     );
     let mut imported_assistant = None;
-    let mut imported_legacy_custom = None;
     let mut has_system_prompt = false;
     for record in session.branch() {
         match &record.event {
             Event::SourceEntry { format, entry } => {
-                // The importer assigns the converted legacy message the next record ID.
-                // Keep that identity: a later branch may diverge at the source entry.
-                imported_legacy_custom = (format == "pi"
-                    && entry["type"] == "message"
-                    && matches!(
-                        entry["message"]["role"].as_str(),
-                        Some("custom" | "hookMessage")
-                    ))
-                .then(|| record.id.checked_add(1))
-                .flatten();
                 imported_assistant = (format == "pi"
                     && entry["type"] == "message"
                     && entry["message"]["role"] == "assistant")
@@ -352,9 +341,43 @@ pub fn html(session: &Session) -> String {
                 content, images, ..
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
-            Event::CustomMessage { message } => {
-                let show = message.display || imported_legacy_custom != Some(record.id);
-                imported_legacy_custom = None;
+            Event::CustomMessage {
+                message,
+                legacy_source,
+            } => {
+                // Older journals have no provenance field; match their converted
+                // content against the immediately preceding source entry.
+                let legacy = legacy_source.unwrap_or_else(|| {
+                    record
+                        .parent
+                        .and_then(|id| id.checked_sub(1))
+                        .and_then(|index| usize::try_from(index).ok())
+                        .and_then(|index| session.records().get(index))
+                        .is_some_and(|parent| match &parent.event {
+                            Event::SourceEntry { format, entry }
+                                if format == "pi"
+                                    && entry["type"] == "message"
+                                    && matches!(
+                                        entry["message"]["role"].as_str(),
+                                        Some("custom" | "hookMessage")
+                                    ) =>
+                            {
+                                super::session_import::imported_custom_message(
+                                    &entry["message"],
+                                    true,
+                                )
+                                .ok()
+                                .is_some_and(|original| {
+                                    serde_json::to_value(original)
+                                        .ok()
+                                        .zip(serde_json::to_value(message).ok())
+                                        .is_some_and(|(original, message)| original == message)
+                                })
+                            }
+                            _ => false,
+                        })
+                });
+                let show = message.display || !legacy;
                 if !show {
                     continue;
                 }
@@ -1328,6 +1351,65 @@ mod tests {
         assert!(document.contains("<b>native</b> <span>Hidden in terminal</span>"));
         assert!(document.contains("native after checkout"));
         assert!(!document.contains("legacy hidden"));
+    }
+
+    #[test]
+    fn html_exports_native_message_after_fork_at_legacy_source_even_if_content_matches() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"same content","display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let imported = super::super::session_import::read(fixture.path()).unwrap();
+        let source = imported
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a"
+                )
+            })
+            .unwrap()
+            .id;
+        let mut fork = Session::from_records(imported.fork_records(source).unwrap()).unwrap();
+        fork.append_custom_message(pi_rs::CustomMessage {
+            custom_type: String::new(),
+            content: pi_rs::ContextContent::Text("same content".into()),
+            display: false,
+            details: None,
+        })
+        .unwrap();
+        let records = serde_json::to_string(fork.records()).unwrap();
+        let reopened = Session::from_records(serde_json::from_str(&records).unwrap()).unwrap();
+        let document = html(&reopened);
+        assert!(document.contains("Hidden in terminal"));
+        assert!(document.contains("same content"));
+    }
+
+    #[test]
+    fn html_reads_legacy_journals_without_custom_message_provenance() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"old hidden","display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let imported = super::super::session_import::read(fixture.path()).unwrap();
+        let mut values = serde_json::to_value(imported.records()).unwrap();
+        let removed = values.as_array_mut().unwrap().iter_mut().any(|record| {
+            record["event"]["type"] == "custom_message"
+                && record["event"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("legacy_source")
+                    .is_some()
+        });
+        assert!(removed);
+        let old = Session::from_records(serde_json::from_value(values).unwrap()).unwrap();
+        assert!(!html(&old).contains("old hidden"));
     }
 
     #[test]

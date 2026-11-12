@@ -184,6 +184,9 @@ pub enum Event {
     CustomMessage {
         #[serde(flatten)]
         message: crate::CustomMessage,
+        /// Distinguishes legacy imported message roles from native extension messages.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_source: Option<bool>,
     },
     ModelSelected {
         model: String,
@@ -1047,7 +1050,10 @@ impl Session {
     pub fn append_custom_message(&mut self, message: crate::CustomMessage) -> Result<()> {
         self.ensure_settled()?;
         validate_custom_message(&message)?;
-        self.append(Event::CustomMessage { message })?;
+        self.append(Event::CustomMessage {
+            message,
+            legacy_source: Some(false),
+        })?;
         Ok(())
     }
 
@@ -1967,7 +1973,7 @@ fn conversation_entries_since(
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
-            Event::CustomMessage { message } => messages.push((record.id, project_content(Message::User { content: String::new() }, &message.content))),
+            Event::CustomMessage { message, .. } => messages.push((record.id, project_content(Message::User { content: String::new() }, &message.content))),
             Event::User { content, .. } => messages.push((
                 record.id,
                 Message::User {
