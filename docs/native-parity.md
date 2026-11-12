@@ -939,6 +939,8 @@ unordered list markers and escaped punctuation. Task-list markers and wrapped
 continuations use Pi's bracketed form and indentation.
 Recursive quote rendering stops at 32 levels and preserves deeper content as text.
 Horizontal rules use the reference 80-column maximum.
+Consecutive paragraphs retain a single separating blank line, including inside
+block quotes; hard line breaks do not add paragraph spacing.
 
 Unit tests cover these layouts and Unicode widths. A PTY fixture verifies both
 terminal modes, heading decoration, code fences, nested quotes and clean exit.

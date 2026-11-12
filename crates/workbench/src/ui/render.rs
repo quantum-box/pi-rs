@@ -842,6 +842,7 @@ fn markdown_at_depth(
     let mut item_prefixes = Vec::new();
     let mut table: Option<Table> = None;
     let mut links = Vec::new();
+    let mut previous_paragraph_end = None;
     for (event, range) in Parser::new_ext(
         text,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
@@ -857,6 +858,14 @@ fn markdown_at_depth(
             continue;
         }
         match event {
+            Event::Start(Tag::Paragraph) if lists.is_empty() => {
+                if let Some(end) = previous_paragraph_end.take()
+                    && end <= range.start
+                    && text[end..range.start].trim().is_empty()
+                {
+                    lines.push(Line::default());
+                }
+            }
             Event::Start(Tag::Table(alignments)) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 table = Some(Table {
@@ -1129,9 +1138,13 @@ fn markdown_at_depth(
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 item_prefixes.pop();
             }
-            Event::HardBreak | Event::End(TagEnd::Paragraph) => {
-                flush(&mut spans, &mut lines, width, item_prefixes.last())
+            Event::End(TagEnd::Paragraph) => {
+                flush(&mut spans, &mut lines, width, item_prefixes.last());
+                if lists.is_empty() {
+                    previous_paragraph_end = Some(range.end);
+                }
             }
+            Event::HardBreak => flush(&mut spans, &mut lines, width, item_prefixes.last()),
             Event::Rule => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 lines.push(Line::themed(&"─".repeat(width.min(80)), theme, "mdHr"));
@@ -1187,6 +1200,28 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markdown_keeps_blank_lines_between_paragraphs() {
+        let theme = Theme::system();
+        for source in [
+            "first\n\nsecond",
+            "first\n\n\nsecond",
+            "> first\n>\n> second",
+        ] {
+            let lines = markdown(source, &theme, 80);
+            let rendered: Vec<String> = lines
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            if source.starts_with('>') {
+                assert_eq!(rendered, ["│ first", "│ ", "│ second"]);
+            } else {
+                assert_eq!(rendered, ["first", "", "second"]);
+            }
+        }
+        let lines = markdown("first  \nsecond", &theme, 80);
+        assert_eq!(lines.len(), 2);
+    }
     #[test]
     fn system_dim_roles_survive_wrapping_and_emit_dim_attributes() {
         let system = Theme::system();
