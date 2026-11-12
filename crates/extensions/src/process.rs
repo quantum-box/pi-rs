@@ -115,6 +115,25 @@ fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) 
     }
 }
 
+// Executables built before tool-message status support discard unknown fields.
+// Restore the original status by call ID while retaining their content edits.
+fn restore_legacy_tool_status(original: &ModelRequest, updated: &mut ModelRequest) {
+    for message in &mut updated.messages {
+        if let Message::Tool {
+            call_id, is_error, ..
+        } = message
+            && let Some(Message::Tool {
+                is_error: previous, ..
+            }) = original
+                .messages
+                .iter()
+                .find(|item| matches!(item, Message::Tool { call_id: id, .. } if id == call_id))
+        {
+            *is_error = *previous;
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ProtocolRequest {
@@ -263,6 +282,8 @@ struct Description {
     tool_result_hook: bool,
     #[serde(default)]
     text_result_v2: bool,
+    #[serde(default)]
+    tool_message_error: bool,
     #[serde(default)]
     tool_call_hook: bool,
     #[serde(default)]
@@ -677,6 +698,9 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })?;
         restore_provider_replay(request, &mut updated);
+        if !self.description.tool_message_error {
+            restore_legacy_tool_status(request, &mut updated);
+        }
         *request = updated;
         Ok(())
     }
@@ -693,6 +717,9 @@ impl Extension for ExecutableExtension {
         };
         let mut updated = self.request_async(message).await?;
         restore_provider_replay(request, &mut updated);
+        if !self.description.tool_message_error {
+            restore_legacy_tool_status(request, &mut updated);
+        }
         *request = updated;
         Ok(())
     }
@@ -721,6 +748,9 @@ impl Extension for ExecutableExtension {
             ..original.clone()
         };
         restore_provider_replay(&original, &mut updated);
+        if !self.description.tool_message_error {
+            restore_legacy_tool_status(&original, &mut updated);
+        }
         *messages = updated.messages;
         Ok(())
     }
@@ -1791,6 +1821,7 @@ async fn dispatch_with_host(
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
             text_result_v2: true,
+            tool_message_error: true,
             tool_call_hook: extension.handles_tool_call(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
@@ -2048,6 +2079,20 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_tool_messages_decode_without_status_and_omit_false_on_wire() {
+        let legacy = serde_json::json!({"role":"tool","call_id":"call","content":"text"});
+        let message: Message = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            &message,
+            Message::Tool {
+                is_error: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(message).unwrap(), legacy);
+    }
 
     #[test]
     fn lifecycle_wire_naming_is_negotiated_without_duplicate_fields() {
@@ -2387,6 +2432,65 @@ mod tests {
                 is_error: true
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_context_hooks_preserve_tool_status_while_current_hooks_can_change_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'tool_message_error':name=='modern'}
+else:
+    value=r.get('messages') if r['type']=='context_with_system' else r['request']
+    messages=value if isinstance(value,list) else value['messages']
+    for m in messages:
+        if m['role']=='tool':
+            m.pop('is_error',None)
+            m['content']='rewritten'
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["legacy", "modern"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let extension = ExecutableExtension::load(path).unwrap();
+            let original = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![Message::Tool {
+                    call_id: "call".into(),
+                    content: "original".into(),
+                    is_error: true,
+                }],
+                tools: vec![],
+                max_output_tokens: 10,
+            };
+            let mut request = original.clone();
+            extension.context(&mut request, None).unwrap();
+            assert!(
+                matches!(&request.messages[0], Message::Tool { content, is_error, .. } if content == "rewritten" && *is_error == (name == "legacy"))
+            );
+            let mut request = original.clone();
+            extension
+                .before_request(&mut request, RequestPurpose::Turn, None)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&request.messages[0], Message::Tool { content, is_error, .. } if content == "rewritten" && *is_error == (name == "legacy"))
+            );
+            let mut messages = original.messages;
+            extension
+                .context_with_system(&mut messages, None)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&messages[0], Message::Tool { content, is_error, .. } if content == "rewritten" && *is_error == (name == "legacy"))
+            );
+        }
     }
 
     #[cfg(unix)]

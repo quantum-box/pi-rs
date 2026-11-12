@@ -112,6 +112,7 @@ mod tests {
     #[test]
     fn structured_tool_images_have_a_fixed_cost_and_preserve_original_data() {
         let result = |data: &str| Message::Tool {
+            is_error: false,
             call_id: "lookup".into(),
             content: serde_json::json!({"data":{"content":[
                 {"type":"text","text":"image"},

@@ -3445,7 +3445,9 @@ fn branch_excerpt(entry: Message) -> String {
             excerpt
         }
         Message::System { content } => format!("System: {content}"),
-        Message::Tool { call_id, content } => format!("Tool {call_id}: {content}"),
+        Message::Tool {
+            call_id, content, ..
+        } => format!("Tool {call_id}: {content}"),
     }
 }
 

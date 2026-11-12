@@ -2063,6 +2063,7 @@ fn conversation_entries_since(
                             Message::Tool {
                                 call_id: inv.call.id.clone(),
                                 content: outcome.tool_content(),
+                                is_error: outcome.is_error(),
                             },
                         ));
                     }
@@ -2183,8 +2184,11 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
                 })
                 .collect(),
         },
-        Message::Tool { call_id, .. } => Message::Tool {
+        Message::Tool {
+            call_id, is_error, ..
+        } => Message::Tool {
             call_id,
+            is_error,
             content: if images.is_empty() {
                 text
             } else {
@@ -2950,8 +2954,13 @@ mod snapshot_tests {
                 matches!(&session.operations()[0].1, OperationState::Finished(outcome) if outcome == &result)
             );
             assert!(session.current_messages().iter().any(
-                |message| matches!(message, Message::Tool { content, .. } if content == "confirmed")
+                |message| matches!(message, Message::Tool { content, is_error: status, .. } if content == "confirmed" && *status == is_error)
             ));
+            let target = session.head();
+            session
+                .edit_context(target, Some(crate::ContextContent::Text("edited".into())))
+                .unwrap();
+            assert!(session.current_messages().iter().any(|message| matches!(message, Message::Tool { content, is_error: status, .. } if content == "edited" && *status == is_error)));
         }
     }
 

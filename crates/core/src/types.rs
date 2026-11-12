@@ -256,6 +256,9 @@ pub enum Message {
     Tool {
         call_id: String,
         content: String,
+        /// Whether the tool result represents an error; absent in older messages.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
     },
 }
 

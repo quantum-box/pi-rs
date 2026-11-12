@@ -485,12 +485,18 @@ fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
                 };
                 ("assistant", blocks)
             }
-            Message::Tool { call_id, content } => (
-                "user",
-                vec![json!({
-                    "type":"tool_result","tool_use_id":call_id,"content":content
-                })],
-            ),
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+            } => {
+                let mut block =
+                    json!({"type":"tool_result","tool_use_id":call_id,"content":content});
+                if is_error {
+                    block["is_error"] = json!(true);
+                }
+                ("user", vec![block])
+            }
         };
         if blocks.is_empty() {
             continue;
@@ -1088,6 +1094,45 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_result_error_status_is_encoded_independently_of_text() {
+        let body = encode_request(
+            ModelRequest {
+                model: "fixture".into(),
+                messages: vec![
+                    Message::User {
+                        content: "go".into(),
+                    },
+                    Message::Tool {
+                        call_id: "failed".into(),
+                        content: "normal text".into(),
+                        is_error: true,
+                    },
+                    Message::Tool {
+                        call_id: "ok".into(),
+                        content: "Tool failed: but succeeded".into(),
+                        is_error: false,
+                    },
+                ],
+                tools: vec![],
+                max_output_tokens: 128,
+            },
+            "fixture",
+        )
+        .unwrap();
+        let blocks = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["content"].as_array().unwrap())
+            .filter(|block| block["type"] == "tool_result")
+            .collect::<Vec<_>>();
+        assert_eq!(blocks[0]["is_error"], true);
+        assert_eq!(blocks[0]["content"], "normal text");
+        assert!(blocks[1].get("is_error").is_none());
+        assert_eq!(blocks[1]["content"], "Tool failed: but succeeded");
+    }
 
     #[test]
     fn input_transformations_keep_only_diagnostic_fields() {

@@ -631,7 +631,11 @@ fn convert(
                             }
                         }
                     } else if message["isError"] == true {
-                        Outcome::Failed(text)
+                        Outcome::TextResult {
+                            output: text,
+                            details: message.get("details").cloned(),
+                            is_error: true,
+                        }
                     } else if let Some(details) =
                         message.get("details").filter(|details| !details.is_null())
                     {

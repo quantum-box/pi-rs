@@ -257,7 +257,9 @@ fn payload(request: &ModelRequest, provider: &str) -> Value {
                     }));
                 }
             }
-            Message::Tool { call_id, content } => {
+            Message::Tool {
+                call_id, content, ..
+            } => {
                 let (text, images) = pi_rs_core::extract_tool_images(content.clone());
                 let output = if images.is_empty() {
                     json!(text)
@@ -531,7 +533,7 @@ mod tests {
     #[test]
     fn tool_images_are_sent_as_images_not_base64_text() {
         let mut request = request();
-        request.messages.push(Message::Tool { call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
+        request.messages.push(Message::Tool { is_error: false, call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
         let body = payload(&request, "openai-chatgpt");
         let output = &body["input"][2]["output"];
         assert_eq!(output[0]["type"], "input_text");

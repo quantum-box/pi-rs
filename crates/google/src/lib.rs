@@ -552,7 +552,9 @@ fn wire_request(
                 }
                 push_content(&mut contents, "model", parts, false);
             }
-            Message::Tool { call_id, content } => {
+            Message::Tool {
+                call_id, content, ..
+            } => {
                 let Some((name, id)) = calls.get(call_id.as_str()) else {
                     return Err(Error::Model(
                         "Google tool result has no preceding call".into(),
@@ -839,10 +841,12 @@ mod tests {
                         replay: None,
                     },
                     Message::Tool {
+                        is_error: false,
                         call_id: "a".into(),
                         content: image_result.clone(),
                     },
                     Message::Tool {
+                        is_error: false,
                         call_id: "b".into(),
                         content: "second result".into(),
                     },
@@ -1067,6 +1071,7 @@ mod tests {
                     })),
                 },
                 Message::Tool {
+                    is_error: false,
                     call_id: "logical-call".into(),
                     content: "tool output".into(),
                 },

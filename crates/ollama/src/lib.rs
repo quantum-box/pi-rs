@@ -842,7 +842,9 @@ fn encode_message(message: Message) -> Vec<Value> {
             blocks.extend(images.into_iter().map(|image| json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}", image.mime_type, image.data)}})));
             vec![json!({"role":"user","content":blocks})]
         }
-        Message::Tool { call_id, content } => encode_tool_result(&call_id, content),
+        Message::Tool {
+            call_id, content, ..
+        } => encode_tool_result(&call_id, content),
         Message::Assistant { content, calls, .. } => {
             let mut message = json!({"role": "assistant", "content": content});
             if !calls.is_empty() {

@@ -167,6 +167,7 @@ mod tests {
                 }],
             },
             Message::Tool {
+                is_error: false,
                 call_id: "call".into(),
                 content: original.to_string(),
             },
@@ -195,7 +196,7 @@ mod tests {
                 images: vec![pi_rs::ImageContent { data: "private".into(), mime_type: "image/png".into() }],
             },
             Message::Tool {
-                call_id: "call".into(),
+                is_error: false, call_id: "call".into(),
                 content: json!({"data":{"content":[{"type":"text","text":"before"},{"type":"image","data":"private"},{"type":"image","data":"private"},{"type":"text","text":"after"}]}}).to_string(),
             },
         ];
