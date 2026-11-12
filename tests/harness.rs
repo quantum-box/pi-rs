@@ -2623,6 +2623,42 @@ async fn measured_baseline_requires_stable_adapter_identity() {
 }
 
 #[tokio::test]
+async fn unknown_capacity_skips_request_estimation() {
+    struct CountEstimates {
+        script: Script,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Model for CountEstimates {
+        fn estimate_request_tokens(&self, _: &ModelRequest) -> u64 {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.script.stream(request).await
+        }
+    }
+    let model = CountEstimates {
+        script: Script::new(vec![answer("done")]),
+        calls: AtomicUsize::new(0),
+    };
+    let registry = Registry::default();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("go".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn measured_context_triggers_reserve_even_when_text_estimate_is_small() {
     let mut first = answer("short");
     if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {

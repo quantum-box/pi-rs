@@ -8,7 +8,7 @@ use pi_rs::{CacheRetention, Error, Model, ModelRequest, ModelStream, Result};
 use reqwest::header::HeaderMap;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{Cli, model_auth::Credential, model_profiles::RequestHeaders, pi_messages::PiMessages};
 
@@ -235,9 +235,27 @@ pub(super) struct Deferred {
     options: Option<(Box<Cli>, bool)>,
     probe_context: bool,
     observed: bool,
+    estimator: Arc<OnceLock<Option<Box<Client>>>>,
 }
 
 impl Deferred {
+    // Construct without resolving credentials or dynamic headers. Clones share
+    // the result until an option that affects serialization changes.
+    fn estimation_client(&self) -> Option<&Client> {
+        self.estimator
+            .get_or_init(|| {
+                self.provider
+                    .connect(self.adapter, &self.endpoint, Some("estimate".into()), false)
+                    .and_then(|client| match &self.options {
+                        Some((args, reported)) => client.with_model_options(args, *reported),
+                        None => Ok(client),
+                    })
+                    .ok()
+                    .map(Box::new)
+            })
+            .as_deref()
+    }
+
     async fn resolve(&self) -> Result<Client> {
         let token = match &self.credential {
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
@@ -289,6 +307,7 @@ impl Client {
             options: None,
             probe_context: true,
             observed: false,
+            estimator: Arc::new(OnceLock::new()),
         }))
     }
 
@@ -596,6 +615,7 @@ impl Client {
             }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));
+                client.estimator = Arc::new(OnceLock::new());
                 Self::Deferred(client)
             }
         })
@@ -664,19 +684,10 @@ impl Model for Client {
             Self::Google(c) => c.estimate_message_tokens(request, message),
             Self::PiMessages(c) => c.estimate_message_tokens(request, message),
             Self::OpenAi(c) => c.estimate_message_tokens(request, message),
-            Self::Deferred(c) => {
-                let client = c
-                    .provider
-                    .connect(c.adapter, &c.endpoint, Some("estimate".into()), false)
-                    .and_then(|client| match &c.options {
-                        Some((args, reported)) => client.with_model_options(args, *reported),
-                        None => Ok(client),
-                    });
-                client.map_or_else(
-                    |_| pi_rs::estimate_message_tokens(message),
-                    |client| client.estimate_message_tokens(request, message),
-                )
-            }
+            Self::Deferred(c) => c.estimation_client().map_or_else(
+                || pi_rs::estimate_message_tokens(message),
+                |client| client.estimate_message_tokens(request, message),
+            ),
         }
     }
 
@@ -703,5 +714,55 @@ impl Model for Client {
                     .await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod estimation_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn deferred_estimator_is_reused_and_options_invalidate_cache() {
+        let client = Client::deferred(
+            Provider::Google,
+            Adapter::Google,
+            "https://example.com/v1",
+            None,
+            RequestHeaders::default(),
+        );
+        let Client::Deferred(deferred) = &client else {
+            panic!("expected deferred adapter")
+        };
+        assert!(deferred.estimator.get().is_none());
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let message = pi_rs::Message::User {
+            content: "hello".into(),
+        };
+        assert!(client.estimate_message_tokens(&request, &message) > 0);
+        let first = deferred.estimation_client().unwrap();
+        for _ in 0..32 {
+            assert!(client.estimate_message_tokens(&request, &message) > 0);
+            assert!(std::ptr::eq(first, deferred.estimation_client().unwrap()));
+        }
+        let clone = client.clone();
+        let Client::Deferred(shared) = &clone else {
+            unreachable!()
+        };
+        assert!(std::ptr::eq(first, shared.estimation_client().unwrap()));
+        let changed = clone
+            .with_model_options(&Cli::parse_from(["pi"]), false)
+            .unwrap();
+        let Client::Deferred(changed) = &changed else {
+            unreachable!()
+        };
+        assert!(changed.estimator.get().is_none());
+        assert!(!std::ptr::eq(first, changed.estimation_client().unwrap()));
+        assert!(std::ptr::eq(first, deferred.estimation_client().unwrap()));
     }
 }

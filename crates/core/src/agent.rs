@@ -575,9 +575,10 @@ impl Agent<'_> {
                     return Err(Error::Budget);
                 }
                 let capacity = active.context_capacity(&request, cancel).await?;
-                let estimate = session.context_budget_estimate();
-                let input_tokens =
-                    active.request_budget_tokens(session, &request, estimate, transformed);
+                let input_tokens = capacity.map_or(0, |_| {
+                    let estimate = session.context_budget_estimate();
+                    active.request_budget_tokens(session, &request, estimate, transformed)
+                });
                 let exceeds = capacity.is_some_and(|window| {
                     input_tokens.saturating_add(u64::from(request.max_output_tokens))
                         > u64::from(window)
