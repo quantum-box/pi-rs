@@ -538,7 +538,9 @@ System theme accent and syntax roles use Pi's fallback ANSI palette slots.
 Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
 arrive. Color requests are serialized and coalesced. A device-attributes reply starts
-the next request, with a two-second fallback when the terminal does not reply. Contrast-based system theme generation remains
+the next request, with a two-second fallback when the terminal does not reply.
+When the background is unknown, the system theme retains ANSI-indexed colors
+even if the palette is available, matching Pi's fallback. Contrast-based system theme generation remains
 to be implemented. Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.
