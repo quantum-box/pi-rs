@@ -37,6 +37,7 @@ pub fn extension_flag(name: &str) -> Option<ExtensionFlagValue> {
 struct Endpoint {
     path: PathBuf,
     flags: Option<Arc<str>>,
+    pi_lifecycle_fields: bool,
 }
 
 impl Endpoint {
@@ -265,6 +266,9 @@ struct Description {
     session_lifecycle_hook: bool,
     #[serde(default)]
     session_transition_reasons: bool,
+    /// Opt in to Pi-compatible camelCase lifecycle and tree fields.
+    #[serde(default)]
+    pi_lifecycle_fields: bool,
     #[serde(default)]
     session_info_hook: bool,
     #[serde(default)]
@@ -337,6 +341,7 @@ impl ExecutableExtension {
         let endpoint = Endpoint {
             path: executable,
             flags: None,
+            pi_lifecycle_fields: false,
         };
         let description =
             call(&endpoint, ProtocolRequest::Describe, None).map_err(Error::Config)?;
@@ -344,6 +349,7 @@ impl ExecutableExtension {
             endpoint,
             description,
         };
+        extension.endpoint.pi_lifecycle_fields = extension.description.pi_lifecycle_fields;
         extension.apply_flags(&mut BTreeMap::new())?;
         Ok(extension)
     }
@@ -1336,12 +1342,89 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Select the field naming advertised by the executable. Older v1 executables
+/// never advertised this capability and must keep receiving the v1 names.
+fn wire_request(request: &ProtocolRequest, pi_fields: bool) -> ExtensionResult<Value> {
+    let mut value = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    if pi_fields {
+        if value["type"] == "before_tree" {
+            value["lifecycleFieldNames"] = Value::String("camelCase".into());
+        }
+        return Ok(value);
+    }
+    fn rename(value: &mut Value, pairs: &[(&str, &str)]) {
+        if let Some(object) = value.as_object_mut() {
+            for (new, old) in pairs {
+                if let Some(field) = object.remove(*new) {
+                    object.insert((*old).to_owned(), field);
+                }
+            }
+        }
+    }
+    match value["type"].as_str() {
+        Some("before_tree") => rename(
+            &mut value["preparation"],
+            &[
+                ("targetId", "target_id"),
+                ("oldLeafId", "old_leaf_id"),
+                ("commonAncestorId", "common_ancestor_id"),
+                ("entriesToSummarize", "entries_to_summarize"),
+                ("userWantsSummary", "user_wants_summary"),
+                ("customInstructions", "custom_instructions"),
+                ("replaceInstructions", "replace_instructions"),
+            ],
+        ),
+        Some("before_session_transition") => rename(
+            &mut value["event"],
+            &[
+                ("targetSessionFile", "target_session_file"),
+                ("entryId", "entry_id"),
+            ],
+        ),
+        Some("lifecycle") => {
+            let event = &mut value["event"];
+            match event["type"].as_str() {
+                Some("session_start") => {
+                    rename(event, &[("previousSessionFile", "previous_session_file")])
+                }
+                Some("session_shutdown") => {
+                    rename(event, &[("targetSessionFile", "target_session_file")])
+                }
+                Some("agent_start" | "agent_end") => {
+                    rename(event, &[("sessionId", "session_id"), ("runId", "run_id")])
+                }
+                Some("turn_start" | "turn_end") => {
+                    rename(event, &[("runId", "run_id"), ("turnIndex", "turn_index")])
+                }
+                Some("session_tree") => rename(
+                    event,
+                    &[
+                        ("newLeafId", "new_leaf_id"),
+                        ("oldLeafId", "old_leaf_id"),
+                        ("summaryEntry", "summary_entry"),
+                        ("fromExtension", "from_extension"),
+                    ],
+                ),
+                _ => {}
+            }
+            if let Some(messages) = event.get_mut("messages").and_then(Value::as_array_mut) {
+                for message in messages {
+                    rename(message, &[("recordId", "record_id")]);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(value)
+}
+
 fn call<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
     request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
-    let bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&wire_request(&request, endpoint.pi_lifecycle_fields)?)
+        .map_err(|error| error.to_string())?;
     if bytes.len() as u64 > MAX_REQUEST {
         return Err("extension request exceeds 64 MiB".into());
     }
@@ -1486,12 +1569,26 @@ pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
     let response = if input.len() as u64 > MAX_REQUEST {
         Err("extension request exceeds 64 MiB".into())
     } else {
-        match serde_json::from_slice(&input) {
-            Ok(request) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                runtime.block_on(dispatch(extension, request))
+        match serde_json::from_slice::<Value>(&input) {
+            Ok(raw) => {
+                let legacy_tree_response =
+                    raw["type"] == "before_tree" && raw["lifecycleFieldNames"] != "camelCase";
+                match serde_json::from_value(raw) {
+                    Ok(request) => {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        runtime
+                            .block_on(dispatch(extension, request))
+                            .map(|mut response| {
+                                if legacy_tree_response {
+                                    legacy_tree_decision(&mut response);
+                                }
+                                response
+                            })
+                    }
+                    Err(error) => Err(format!("invalid extension request: {error}")),
+                }
             }
             Err(error) => Err(format!("invalid extension request: {error}")),
         }
@@ -1504,6 +1601,19 @@ pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
     serde_json::to_writer(&mut stdout, &envelope)?;
     writeln!(stdout)?;
     Ok(())
+}
+
+fn legacy_tree_decision(response: &mut Value) {
+    if let Some(object) = response.as_object_mut() {
+        for (modern, legacy) in [
+            ("customInstructions", "custom_instructions"),
+            ("replaceInstructions", "replace_instructions"),
+        ] {
+            if let Some(field) = object.remove(modern) {
+                object.insert(legacy.into(), field);
+            }
+        }
+    }
 }
 
 async fn dispatch(
@@ -1544,6 +1654,7 @@ async fn dispatch_with_host(
             model_selection_hook: extension.handles_model_selection(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
+            pi_lifecycle_fields: true,
             session_info_hook: true,
             cache_warming_hook: extension.handles_cache_warming(),
             tree_navigation_hook: extension.handles_tree_navigation(),
@@ -1771,6 +1882,86 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_wire_naming_is_negotiated_without_duplicate_fields() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyFork {
+            r#type: String,
+            entry_id: u64,
+            position: String,
+        }
+        let request = ProtocolRequest::BeforeSessionTransition {
+            event: pi_rs_core::BeforeSessionTransition::Fork {
+                entry_id: 42,
+                position: pi_rs_core::ForkPosition::Before,
+            },
+            state: None,
+        };
+        let legacy = wire_request(&request, false).unwrap();
+        let decoded: LegacyFork = serde_json::from_value(legacy["event"].clone()).unwrap();
+        assert_eq!(
+            (
+                decoded.r#type.as_str(),
+                decoded.entry_id,
+                decoded.position.as_str()
+            ),
+            ("session_before_fork", 42, "before")
+        );
+        assert!(legacy["event"].get("entryId").is_none());
+        let modern = wire_request(&request, true).unwrap();
+        assert_eq!(modern["event"]["entryId"], 42);
+        assert!(modern["event"].get("entry_id").is_none());
+        // The current executable decoder must accept each profile separately.
+        assert!(serde_json::from_value::<ProtocolRequest>(legacy).is_ok());
+        assert!(serde_json::from_value::<ProtocolRequest>(modern).is_ok());
+    }
+
+    #[test]
+    fn old_descriptor_defaults_to_legacy_lifecycle_fields() {
+        let description: Description = serde_json::from_value(serde_json::json!({
+            "id":"legacy", "dependencies":[], "commands":[], "tools":[]
+        }))
+        .unwrap();
+        assert!(!description.pi_lifecycle_fields);
+    }
+
+    #[test]
+    fn tree_request_and_response_preserve_both_protocol_generations() {
+        let request = ProtocolRequest::BeforeTree {
+            preparation: TreePreparation {
+                target_id: 3,
+                old_leaf_id: 5,
+                common_ancestor_id: Some(2),
+                entries_to_summarize: Vec::new(),
+                user_wants_summary: true,
+                custom_instructions: None,
+                replace_instructions: false,
+                label: None,
+            },
+            state: None,
+        };
+        let old = wire_request(&request, false).unwrap();
+        let new = wire_request(&request, true).unwrap();
+        assert_eq!(old["preparation"]["target_id"], 3);
+        assert!(old["preparation"].get("targetId").is_none());
+        assert!(old.get("lifecycleFieldNames").is_none());
+        assert_eq!(new["preparation"]["targetId"], 3);
+        assert_eq!(new["lifecycleFieldNames"], "camelCase");
+        assert!(serde_json::from_value::<ProtocolRequest>(old).is_ok());
+        assert!(serde_json::from_value::<ProtocolRequest>(new).is_ok());
+
+        let mut legacy_response =
+            serde_json::json!({"customInstructions":"custom","replaceInstructions":true});
+        legacy_tree_decision(&mut legacy_response);
+        assert_eq!(legacy_response["custom_instructions"], "custom");
+        assert_eq!(legacy_response["replace_instructions"], true);
+        assert!(legacy_response.get("customInstructions").is_none());
+        let decoded: TreeDecision = serde_json::from_value(legacy_response).unwrap();
+        assert_eq!(decoded.custom_instructions.as_deref(), Some("custom"));
+        assert_eq!(decoded.replace_instructions, Some(true));
+    }
 
     #[tokio::test]
     async fn tool_execution_lifecycle_capability_and_events_round_trip() {

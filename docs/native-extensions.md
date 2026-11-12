@@ -317,3 +317,10 @@ Nested tool calls include their parent tool-call ID. Executable extensions
 advertise this capability with `tool_execution_lifecycle_hook`.
 Parallel calls currently emit end notifications in journal order after the
 batch settles; streaming updates and completion-order notifications remain open.
+
+Executable extensions built with the current SDK advertise
+`pi_lifecycle_fields` and receive Pi's camelCase lifecycle and tree fields,
+such as `previousSessionFile`, `entryId`, and `turnIndex`. Older executables
+that do not advertise this capability continue receiving the previous
+snake_case fields. New executables accept either format, and return tree
+decisions in the format requested by the host, so older hosts remain usable.
