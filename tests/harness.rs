@@ -571,6 +571,38 @@ async fn context_with_system_runs_after_context_hooks_in_registration_order() {
 }
 
 #[tokio::test]
+async fn truncated_response_never_executes_even_valid_tool_arguments() {
+    let mut first = vec![ModelEvent::Metadata(ModelMetadata {
+        finish_reason: Some("length".into()),
+        ..Default::default()
+    })];
+    first.extend(tool_reply(&[r#"{"id":"42"}"#]));
+    let model = Script::new(vec![first, answer("done")]);
+    let fixture = Arc::new(Fixture {
+        called: AtomicUsize::new(0),
+        hold: false,
+        effects: Mutex::default(),
+    });
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Tools(fixture.clone()))).unwrap();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("check".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.called.load(Ordering::SeqCst), 0);
+    assert!(session.operations().iter().any(|(_, state)| matches!(state, OperationState::Finished(Outcome::Failed(message)) if message.contains("not executed") && message.contains("output token limit"))));
+    assert!(model.requests.lock().unwrap()[1].messages.iter().any(|message| matches!(message, Message::Tool { content, .. } if content.contains("not executed"))));
+}
+
+#[tokio::test]
 async fn result_hooks_transform_executed_tools_before_model_and_journal() {
     struct Hook;
     #[async_trait::async_trait]

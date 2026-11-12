@@ -537,6 +537,7 @@ impl Agent<'_> {
                         content: recorded.content,
                         invocations: recorded.invocations,
                         usage: measured,
+                        truncated: metadata.finish_reason.as_deref() == Some("length"),
                     },
                     recorded.advertised_tools.into_iter().collect(),
                     allowance,
@@ -684,6 +685,7 @@ impl Agent<'_> {
             let finished = reply.invocations.is_empty();
             let answer = finished.then(|| reply.content.clone());
             let invocations = reply.invocations.clone();
+            let truncated = reply.truncated;
             let output_tokens = reply
                 .usage
                 .map_or(u64::from(allowance), |usage| usage.output_tokens);
@@ -703,7 +705,7 @@ impl Agent<'_> {
             )?;
             let assistant_record = session.head();
 
-            let dispatch_update = if invocations.is_empty() {
+            let dispatch_update = if invocations.is_empty() || truncated {
                 Ok(None)
             } else {
                 tokio::select! {
@@ -728,22 +730,28 @@ impl Agent<'_> {
                 model_name: active.model_name,
                 limits: active.limits.clone(),
             };
-            if let Err(err) = dispatcher
-                .tool_batch(
-                    session,
-                    &invocations,
-                    &DispatchScope {
-                        cancellation: cancel,
-                        advertised: &advertised,
-                        depth: 0,
-                        call_count: Arc::new(AtomicUsize::new(0)),
-                    },
-                    &mut states,
-                    observer,
-                    Some(followups),
-                )
-                .await
-            {
+            let dispatched = if truncated {
+                dispatcher
+                    .reject_truncated_tools(session, &invocations, &states, observer)
+                    .await
+            } else {
+                dispatcher
+                    .tool_batch(
+                        session,
+                        &invocations,
+                        &DispatchScope {
+                            cancellation: cancel,
+                            advertised: &advertised,
+                            depth: 0,
+                            call_count: Arc::new(AtomicUsize::new(0)),
+                        },
+                        &mut states,
+                        observer,
+                        Some(followups),
+                    )
+                    .await
+            };
+            if let Err(err) = dispatched {
                 recover_unstarted(session, observer)?;
                 return Err(err);
             }
@@ -1015,6 +1023,7 @@ impl Agent<'_> {
                             content: std::mem::take(&mut content),
                             invocations,
                             usage,
+                            truncated: metadata.finish_reason.as_deref() == Some("length"),
                         });
                     }
                 }
@@ -1082,6 +1091,65 @@ impl Agent<'_> {
         )
         .await
         .map_err(|_| Error::RetryableModel("model usage settlement timed out".into()))?
+    }
+
+    async fn reject_truncated_tools(
+        &self,
+        session: &mut Session,
+        invocations: &[Invocation],
+        states: &ExtensionStates,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let observe_tools = self.registry.extensions.iter().any(|extension| {
+            extension.handles_lifecycle() && extension.handles_tool_execution_lifecycle()
+        });
+        for invocation in invocations {
+            if observe_tools {
+                self.observe_lifecycle(
+                    crate::LifecycleEvent::ToolExecutionStart {
+                        tool_call_id: invocation.call.id.clone(),
+                        tool_name: invocation.call.name.clone(),
+                        args: crate::parse_tool_arguments(&invocation.call.arguments)
+                            .unwrap_or(serde_json::Value::Null),
+                        parent_tool_call_id: None,
+                    },
+                    states,
+                    None,
+                    observer,
+                )
+                .await;
+            }
+            let outcome = Outcome::Failed(format!(
+                "Tool call \"{}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+                invocation.call.name
+            ));
+            commit(
+                session,
+                Event::ToolFinished {
+                    operation_id: invocation.operation_id,
+                    outcome: outcome.clone(),
+                    states: ExtensionStates::new(),
+                },
+                observer,
+            )?;
+            if observe_tools {
+                self.observe_lifecycle(
+                    crate::LifecycleEvent::ToolExecutionEnd {
+                        tool_call_id: invocation.call.id.clone(),
+                        tool_name: invocation.call.name.clone(),
+                        result: outcome,
+                        is_error: true,
+                        duration_ms: 0,
+                        parent_tool_call_id: None,
+                    },
+                    states,
+                    None,
+                    observer,
+                )
+                .await;
+            }
+        }
+        Ok(())
     }
 
     async fn tool_batch<T: Into<AgentInput> + Send>(
@@ -3064,6 +3132,7 @@ struct Reply {
     content: String,
     invocations: Vec<Invocation>,
     usage: Option<Usage>,
+    truncated: bool,
 }
 
 fn summary_usage_metadata(

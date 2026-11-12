@@ -336,9 +336,16 @@ impl Model for OpenAiResponses {
                         calls.get_mut(&index).ok_or_else(|| Error::Model("unknown OpenAI tool call".into()))?.arguments.push_str(delta);
                         yield ModelEvent::ToolCallDelta(ToolCallDelta { index, id:String::new(), name:String::new(), arguments:delta.into() });
                     }
-                    "response.completed" => {
+                    "response.completed" | "response.incomplete" => {
                         let response = &event["response"];
-                        if response["status"] != "completed" { Err(Error::Model("invalid OpenAI completion status".into()))?; }
+                        let finish_reason = match (event["type"].as_str(), response["status"].as_str(), response["incomplete_details"]["reason"].as_str()) {
+                            (Some("response.completed"), Some("completed"), _) => "stop",
+                            (Some("response.incomplete"), Some("incomplete"), Some("max_output_tokens")) => "length",
+                            (Some("response.incomplete"), Some("incomplete"), reason) => {
+                                Err(Error::Model(reason.map_or_else(|| "OpenAI response incomplete without a reason".to_owned(), |reason| format!("OpenAI response incomplete: {reason}"))))?
+                            }
+                            _ => Err(Error::Model("invalid OpenAI completion status".into()))?,
+                        };
                         let output = response["output"].as_array().ok_or_else(|| Error::Model("OpenAI completion missing output".into()))?;
                         let reported_calls: Vec<_> = output.iter().filter(|item| item["type"] == "function_call").collect();
                         if reported_calls.len() != calls.len() { Err(Error::Model("incomplete OpenAI tool stream".into()))?; }
@@ -347,11 +354,11 @@ impl Model for OpenAiResponses {
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
-                        yield ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), resolved_model:Some(identity.clone()), finish_reason:Some("stop".into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:Some(Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
+                        yield ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
                         yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
                         return;
                     }
-                    "response.failed" | "response.incomplete" | "error" => Err(response_error(event["response"]["error"]["code"].as_str().or_else(|| event["error"]["code"].as_str()), None))?,
+                    "response.failed" | "error" => Err(response_error(event["response"]["error"]["code"].as_str().or_else(|| event["error"]["code"].as_str()), None))?,
                     _ => {}
                 }
             }
@@ -541,6 +548,68 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .is_err()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn output_limit_keeps_partial_text_and_reports_length() {
+        let events = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":7}}}\n\n"
+        );
+        let (client, server) = fixture(events).await;
+        let events: Vec<_> = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(matches!(&events[0], ModelEvent::Text(text) if text == "partial"));
+        assert!(events.iter().any(|event| matches!(event, ModelEvent::Metadata(metadata) if metadata.finish_reason.as_deref() == Some("length"))));
+        assert!(matches!(
+            events.last(),
+            Some(ModelEvent::Complete {
+                usage: Some(Usage {
+                    input_tokens: 4,
+                    output_tokens: 7
+                }),
+                ..
+            })
+        ));
+        server.await.unwrap();
+
+        let (client, server) = fixture("data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},\"output\":[]}}\n\n").await;
+        let error = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("content_filter"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn output_limit_preserves_partial_tool_for_safe_rejection() {
+        let events = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"namespace\":\"pi\",\"call_id\":\"call\",\"name\":\"read\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\"}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"function_call\",\"namespace\":\"pi\",\"call_id\":\"call\",\"name\":\"read\",\"arguments\":\"{\"}]}}\n\n"
+        );
+        let (client, server) = fixture(events).await;
+        let events: Vec<_> = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(event, ModelEvent::Metadata(metadata) if metadata.finish_reason.as_deref() == Some("length") && metadata.replay.is_none())));
+        assert!(
+            matches!(events.last(), Some(ModelEvent::Complete { calls, .. }) if calls[0].arguments == "{")
         );
         server.await.unwrap();
     }

@@ -76,6 +76,12 @@ without `defaultProvider` are still accepted.
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+OpenAI Responses `max_output_tokens` incomplete events preserve the streamed
+partial response and report the `length` finish reason. Across model providers,
+tool calls in a length-limited response are recorded as failed without executing
+their potentially incomplete arguments; the model receives those results and
+may request the tools again. Other incomplete reasons remain errors.
+
 Native extensions can opt into tool execution start and end events, including
 nested call ancestry, final outcomes, and elapsed execution time. Streaming
 tool execution updates remain a separate parity item.
