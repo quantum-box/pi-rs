@@ -1080,6 +1080,10 @@ finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
 
+`defaultTools` follows Pi's layered selection: project modifiers extend the
+user selection, while project plain-name lists replace it. Mixed plain names
+and ordered modifiers in settings resolve before CLI tool selection.
+
 The interactive `/debug` command writes `pi-debug.log` in the agent directory,
 including styled transcript and widget lines, terminal dimensions, and the
 current Pi-format session messages. It is available while a response is

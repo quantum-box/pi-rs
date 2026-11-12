@@ -31,12 +31,21 @@ impl Selection {
             BTreeSet::new()
         } else if let Some(defaults) = defaults {
             let entries: Vec<String> = serde_json::from_value(defaults.clone())?;
-            let mut active = standard();
-            if entries.iter().any(|entry| entry.starts_with(['+', '-'])) {
-                modify(&mut active, &entries)?;
+            let plain: BTreeSet<String> = entries
+                .iter()
+                .filter(|entry| !entry.starts_with(['+', '-']))
+                .cloned()
+                .collect();
+            let mut active = if plain.is_empty() && !entries.is_empty() {
+                standard()
             } else {
-                active = entries.into_iter().collect();
-            }
+                plain
+            };
+            let modifiers: Vec<String> = entries
+                .into_iter()
+                .filter(|entry| entry.starts_with(['+', '-']))
+                .collect();
+            modify(&mut active, &modifiers)?;
             active
         } else if args.coding_tools {
             BUILTINS.iter().map(|name| (*name).into()).collect()
