@@ -149,10 +149,10 @@ impl Provider {
         match adapter {
             Adapter::OpenAiResponses => {
                 let token = token.ok_or_else(missing_key)?;
-                Ok(Client::OpenAi(if self.id() == "openai" {
-                    pi_rs::openai::OpenAiResponses::new_api(endpoint, token)?
-                } else {
+                Ok(Client::OpenAi(if self.id() == "openai-chatgpt" {
                     pi_rs::openai::OpenAiResponses::new(endpoint, token)?
+                } else {
+                    pi_rs::openai::OpenAiResponses::new_api_provider(endpoint, token, self.id())?
                 }))
             }
             Adapter::ChatCompletions => {

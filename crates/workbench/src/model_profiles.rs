@@ -1213,6 +1213,33 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn xai_catalog_uses_responses_and_model_specific_thinking_levels() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        let provider = profiles.provider("xai").unwrap();
+        assert_eq!(provider.adapter(), Adapter::OpenAiResponses);
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://api.x.ai/v1/responses"
+        );
+        assert_eq!(builtin_chat::find("xai").unwrap().env(), "XAI_API_KEY");
+        assert_eq!(profiles.model_ids(&provider).len(), 4);
+        let model = profiles.model(&provider, "grok-4.3").unwrap();
+        assert!(
+            model
+                .levels(Adapter::OpenAiResponses)
+                .unwrap()
+                .contains(&"off".into())
+        );
+        let model = profiles.model(&provider, "grok-4.7").unwrap();
+        assert!(
+            !model
+                .levels(Adapter::OpenAiResponses)
+                .unwrap()
+                .contains(&"off".into())
+        );
+    }
+
+    #[test]
     fn openai_api_key_provider_includes_upstream_responses_models() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let provider = profiles.provider("openai").unwrap();
