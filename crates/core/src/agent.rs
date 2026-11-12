@@ -868,6 +868,18 @@ impl Agent<'_> {
             };
             hook(extension.as_ref(), result)?;
         }
+        for extension in &self.registry.extensions {
+            if !extension.handles_context_with_system() {
+                continue;
+            }
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = tokio::time::timeout(self.limits.model_timeout, extension.context_with_system(&mut request.messages, states.get(extension.id()))) =>
+                    result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
+            };
+            hook(extension.as_ref(), result)?;
+        }
         request
             .tools
             .retain(|spec| self.registry.has_tool(&spec.name));
