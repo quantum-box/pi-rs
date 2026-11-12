@@ -309,7 +309,12 @@ impl Cursor {
                 .imported
                 .is_some_and(|id| imported_conversion(records, id, record)) =>
             {
-                position.imported = None;
+                // A codemode source entry converts into both its original
+                // custom entry and a derived extension-state snapshot.
+                if !matches!(&record.event, Event::CustomEntry { entry } if entry.custom_type == "codemode-store")
+                {
+                    position.imported = None;
+                }
                 if matches!(record.event, Event::ModelSelected { .. }) {
                     position.model = Some(record.id);
                 }
@@ -506,7 +511,7 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
                 | Event::BashExecution { .. }
         ) | (
             Some("custom_message"),
-            Event::User { .. } | Event::UserWithImages { .. }
+            Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. }
         ) | (
             Some("model_change" | "thinking_level_change"),
             Event::ModelSelected { .. }
@@ -515,7 +520,10 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
             | (Some("context_edit"), Event::ContextEdited { .. })
             | (Some("compaction"), Event::Compacted { .. })
             | (Some("branch_summary"), Event::BranchSummary { .. })
-            | (Some("custom"), Event::ExtensionStates { .. })
+            | (
+                Some("custom"),
+                Event::ExtensionStates { .. } | Event::CustomEntry { .. }
+            )
     )
 }
 

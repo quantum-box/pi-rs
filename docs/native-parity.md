@@ -1717,6 +1717,15 @@ cache accounting, summary usage deduplication and unknown post-compaction contex
 The complete workspace tests and all-target Clippy pass.
 
 
+### Imported extension entries
+
+Pi JSONL custom entries and custom messages retain their type, optional data
+and details, display flag, and ordered text/image content in the native journal.
+Imported custom messages remain model context and support branch-local context
+edits. RPC session entries keep the original Pi representation without
+duplicating the converted journal records. Codemode store entries also continue
+to restore their branch-local state.
+
 ### Reported session cost checkpoint
 
 Model metadata can retain an optional USD total, preserving old journals that

@@ -235,6 +235,7 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
             let context = matches!(
                 event,
                 Event::User { .. }
+                    | Event::CustomMessage { .. }
                     | Event::Assistant { .. }
                     | Event::ToolFinished { .. }
                     | Event::ToolReconciled { .. }
@@ -678,12 +679,63 @@ fn convert(
                 modified_files: files("modifiedFiles"),
             });
         }
-        "custom_message" => push_user(&mut events, &entry["content"])?,
-        "custom" if entry["customType"] == "codemode-store" => {
-            if let (Some(set), Some(deleted)) = (
-                entry["data"]["set"].as_object(),
-                entry["data"]["delete"].as_array(),
-            ) && deleted.iter().all(Value::is_string)
+        "custom_message" => {
+            let value = entry.get("content").ok_or_else(|| {
+                Error::Session("imported custom message is missing content".into())
+            })?;
+            let content = if let Some(text) = value.as_str() {
+                pi_rs::ContextContent::Text(text.into())
+            } else {
+                let blocks = value.as_array().ok_or_else(|| {
+                    Error::Session("invalid imported custom message content".into())
+                })?;
+                let mut result = Vec::with_capacity(blocks.len());
+                for block in blocks {
+                    match block["type"].as_str() {
+                        Some("text") => result.push(pi_rs::ContentBlock::Text {
+                            text: required(block, "text")?.into(),
+                        }),
+                        Some("image") => {
+                            let (_, images) = user_content(&Value::Array(vec![block.clone()]))?;
+                            let image = &images[0];
+                            result.push(pi_rs::ContentBlock::Image {
+                                data: image.data.clone(),
+                                mime_type: image.mime_type.clone(),
+                            });
+                        }
+                        _ => {
+                            return Err(Error::Session(
+                                "invalid imported custom message block".into(),
+                            ));
+                        }
+                    }
+                }
+                pi_rs::ContextContent::Blocks(result)
+            };
+            events.push(Event::CustomMessage {
+                message: pi_rs::CustomMessage {
+                    custom_type: required(entry, "customType")?.into(),
+                    content,
+                    display: entry["display"].as_bool().ok_or_else(|| {
+                        Error::Session("imported custom message is missing display".into())
+                    })?,
+                    details: entry.get("details").cloned(),
+                },
+            });
+        }
+        "custom" => {
+            events.push(Event::CustomEntry {
+                entry: pi_rs::CustomEntry {
+                    custom_type: required(entry, "customType")?.into(),
+                    data: entry.get("data").cloned(),
+                },
+            });
+            if entry["customType"] == "codemode-store"
+                && let (Some(set), Some(deleted)) = (
+                    entry["data"]["set"].as_object(),
+                    entry["data"]["delete"].as_array(),
+                )
+                && deleted.iter().all(Value::is_string)
             {
                 for key in deleted.iter().filter_map(Value::as_str) {
                     branch.store.remove(key);
@@ -709,7 +761,6 @@ fn convert(
         "usage" => {
             append_imported_usage(&mut events, &entry["usage"]);
         }
-        "custom" => {}
         "context_edit" => {
             let source = required(entry, "targetId")?;
             let target = branches
@@ -1017,6 +1068,47 @@ mod tests {
         );
     }
     #[test]
+    fn imports_custom_entries_and_messages_with_metadata_and_context_edits() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"custom","id":"entry","parentId":null,"customType":"bookmark","data":null}),
+            json!({"type":"custom_message","id":"message","parentId":"entry","customType":"hint","display":false,"details":null,"content":[{"type":"text","text":"before"},{"type":"image","data":"aW1hZ2U=","mimeType":"image/png"},{"type":"text","text":"after"}]}),
+            json!({"type":"context_edit","id":"edit","parentId":"message","targetId":"message","replacement":{"content":"replacement"}}),
+        ]).unwrap();
+        assert!(session.records().iter().any(|record| matches!(
+            &record.event, Event::CustomEntry { entry }
+            if entry.custom_type == "bookmark" && entry.data == Some(Value::Null)
+        )));
+        assert!(session.records().iter().any(|record| matches!(
+            &record.event, Event::CustomMessage { message }
+            if message.custom_type == "hint" && !message.display && message.details == Some(Value::Null)
+                && matches!(&message.content, pi_rs::ContextContent::Blocks(blocks) if blocks.len() == 3)
+        )));
+        assert!(
+            matches!(session.conversation_at(session.head()).unwrap().as_slice(),
+            [Message::User { content }] if content == "replacement")
+        );
+        let entries = super::super::rpc_entries::Entries::new(&session)
+            .after(None)
+            .unwrap();
+        let entries = entries["entries"].as_array().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["type"] == "custom")
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["type"] == "custom_message")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn codemode_store_import_follows_the_selected_branch() {
         let session = import_pi(vec![
             json!({"type":"session","version":3}),
@@ -1027,6 +1119,16 @@ mod tests {
         assert_eq!(
             session.extension_states()["codemode"].data,
             json!({"value":1,"other":3})
+        );
+        let entries = super::super::rpc_entries::Entries::new(&session)
+            .after(None)
+            .unwrap();
+        let entries = entries["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["customType"] == "codemode-store")
         );
     }
     #[test]
