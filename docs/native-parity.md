@@ -103,6 +103,15 @@ separate from OpenAI and ChatGPT. The adapter supports streamed Responses
 events and tool calls through the shared Responses implementation. Loopback
 CLI coverage does not replace live acceptance with an xAI account.
 
+### Qwen Token Plan checkpoint
+
+The international, China, and individual Qwen Token Plan providers expose the
+pinned Pi model catalogs, regional credentials, per-model reasoning maps, and
+image limits. Their chat-completions requests use Qwen's `enable_thinking`
+switch, with `reasoning_effort` only where the selected model supports it.
+Explicit strict-mode support emits the reference `strict: false` tool setting.
+Loopback CLI coverage does not replace live Token Plan acceptance.
+
 ### Xiaomi MiMo checkpoint
 
 Xiaomi's pay-as-you-go endpoint and its China, Amsterdam and Singapore token

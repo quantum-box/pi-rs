@@ -113,6 +113,24 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         },
     },
     Builtin {
+        id: "qwen-token-plan",
+        endpoint: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+        env: "QWEN_TOKEN_PLAN_API_KEY",
+        compatibility: qwen_token_plan,
+    },
+    Builtin {
+        id: "qwen-token-plan-cn",
+        endpoint: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+        env: "QWEN_TOKEN_PLAN_CN_API_KEY",
+        compatibility: qwen_token_plan,
+    },
+    Builtin {
+        id: "qwen-token-plan-individual",
+        endpoint: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+        env: "QWEN_TOKEN_PLAN_API_KEY",
+        compatibility: qwen_token_plan,
+    },
+    Builtin {
         id: "together",
         endpoint: "https://api.together.ai/v1/chat/completions",
         env: "TOGETHER_API_KEY",
@@ -168,6 +186,10 @@ fn standard() -> Value {
 
 fn moonshot() -> Value {
     json!({"supportsReasoningEffort":false})
+}
+
+fn qwen_token_plan() -> Value {
+    json!({"thinkingFormat":"qwen", "supportsDeveloperRole":false, "supportsStore":false})
 }
 
 fn xiaomi() -> Value {

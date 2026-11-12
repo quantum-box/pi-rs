@@ -561,7 +561,13 @@ impl Model for Ollama {
         let tools: Vec<_> = request
             .tools
             .into_iter()
-            .map(|function| json!({"type": "function", "function": function}))
+            .map(|function| {
+                let mut function = json!(function);
+                if self.compatibility.supports_strict_mode == Some(true) {
+                    function["strict"] = json!(false);
+                }
+                json!({"type": "function", "function": function})
+            })
             .collect();
         let mut body = json!({"model":request.model,"messages":messages,"stream":true});
         self.compatibility

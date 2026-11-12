@@ -10,6 +10,7 @@ pub struct ChatCompatibility {
     supports_usage_in_streaming: Option<bool>,
     pub(super) supports_finish_reason: Option<bool>,
     supports_reasoning_effort: Option<bool>,
+    pub(super) supports_strict_mode: Option<bool>,
     pub(super) requires_reasoning_content_on_assistant_messages: Option<bool>,
     max_tokens_field: Option<MaxTokensField>,
     thinking_format: Option<ThinkingFormat>,
@@ -83,6 +84,7 @@ impl ChatCompatibility {
             supports_reasoning_effort: model
                 .supports_reasoning_effort
                 .or(self.supports_reasoning_effort),
+            supports_strict_mode: model.supports_strict_mode.or(self.supports_strict_mode),
             requires_reasoning_content_on_assistant_messages: model
                 .requires_reasoning_content_on_assistant_messages
                 .or(self.requires_reasoning_content_on_assistant_messages),
