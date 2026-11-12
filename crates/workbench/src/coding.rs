@@ -26,6 +26,7 @@ pub struct CodingTools {
     shell: ShellConfig,
     auto_resize_images: bool,
     image_profile: Option<crate::image_profile::ImageResizeProfile>,
+    model_supports_images: Option<bool>,
 }
 
 impl CodingTools {
@@ -40,6 +41,7 @@ impl CodingTools {
             shell: ShellConfig::default(),
             auto_resize_images: true,
             image_profile: None,
+            model_supports_images: None,
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -63,6 +65,11 @@ impl CodingTools {
         profile: Option<crate::image_profile::ImageResizeProfile>,
     ) -> Self {
         self.image_profile = profile;
+        self
+    }
+
+    pub fn with_model_image_support(mut self, supports_images: Option<bool>) -> Self {
+        self.model_supports_images = supports_images;
         self
     }
 
@@ -220,6 +227,7 @@ impl CodingTools {
             kind: Kind::Read {
                 auto_resize: self.auto_resize_images,
                 profile: self.image_profile,
+                model_supports_images: None,
             },
         }
         .path(
@@ -237,6 +245,7 @@ impl CodingTools {
             kind: Kind::Read {
                 auto_resize: self.auto_resize_images,
                 profile: self.image_profile,
+                model_supports_images: None,
             },
         };
         let name = path
@@ -290,6 +299,7 @@ impl Extension for CodingTools {
             Kind::Read {
                 auto_resize: self.auto_resize_images,
                 profile: self.image_profile,
+                model_supports_images: self.model_supports_images,
             },
             Kind::Write,
             Kind::Edit,
@@ -322,6 +332,7 @@ enum Kind {
     Read {
         auto_resize: bool,
         profile: Option<crate::image_profile::ImageResizeProfile>,
+        model_supports_images: Option<bool>,
     },
     Write,
     Edit,
@@ -612,6 +623,7 @@ impl CodingTool {
             && let Kind::Read {
                 auto_resize: true,
                 profile,
+                ..
             } = self.kind
         {
             let original_mime = format.to_mime_type();
@@ -717,7 +729,21 @@ impl CodingTool {
         }
         let display_path = string(args, "path")?;
         let path = self.path(display_path)?;
-        if let Some(data) = self.read_image(&path)? {
+        if let Some(mut data) = self.read_image(&path)? {
+            if self.unrestricted
+                && matches!(
+                    self.kind,
+                    Kind::Read {
+                        model_supports_images: Some(false),
+                        ..
+                    }
+                )
+                && let Some(note) = data["content"][0]["text"].as_str()
+            {
+                data["content"][0]["text"] = json!(format!(
+                    "{note}\n[Current model does not support images. The image will be omitted from this request.]"
+                ));
+            }
             return Ok(Outcome::Structured {
                 data,
                 attachments: vec![],
@@ -1896,6 +1922,7 @@ mod tests {
         tool.kind = Kind::Read {
             auto_resize: true,
             profile: None,
+            model_supports_images: None,
         };
         assert!(matches!(
             tool.invoke(json!({"path":"file.txt"}), context()).await,
@@ -2097,6 +2124,48 @@ mod tests {
     }
 
     #[test]
+    fn read_image_notes_when_current_model_is_text_only() {
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3]))
+            .save(directory.path().join("image.png"))
+            .unwrap();
+        std::fs::write(directory.path().join("text.txt"), "plain").unwrap();
+        for support in [None, Some(true), Some(false)] {
+            let tool = CodingTool {
+                root: directory.path().canonicalize().unwrap(),
+                unrestricted: true,
+                shell: ShellConfig::default(),
+                kind: Kind::Read {
+                    auto_resize: true,
+                    profile: None,
+                    model_supports_images: support,
+                },
+            };
+            let Outcome::Structured { data, .. } = tool
+                .read(
+                    &json!({"path":"image.png"}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .unwrap()
+            else {
+                panic!("expected image")
+            };
+            let note = data["content"][0]["text"].as_str().unwrap();
+            assert_eq!(note.contains("[Current model does not support images. The image will be omitted from this request.]"), support == Some(false));
+            assert_eq!(data["content"][1]["type"], "image");
+            assert_eq!(
+                tool.read(
+                    &json!({"path":"text.txt"}),
+                    &pi_rs::CancellationToken::new()
+                )
+                .unwrap()
+                .tool_content(),
+                "plain"
+            );
+        }
+    }
+
+    #[test]
     fn local_image_reads_preserve_supported_bytes_and_report_resized_coordinates() {
         let directory = tempfile::tempdir().unwrap();
         let small = directory.path().join("small.jpg");
@@ -2114,6 +2183,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
+                model_supports_images: None,
             },
         };
         assert_eq!(tool.output_limit(), 8 * 1024 * 1024);
@@ -2147,6 +2217,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: false,
                 profile: None,
+                model_supports_images: None,
             },
             ..tool
         }
@@ -2170,6 +2241,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
+                model_supports_images: None,
             },
         };
         let value = tool.read_image(&path).unwrap().unwrap();
@@ -2196,6 +2268,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
+                model_supports_images: None,
             },
         };
         assert!(scoped.path(skill.to_str().unwrap()).is_err());
@@ -2206,6 +2279,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
+                model_supports_images: None,
             },
         };
         assert_eq!(
@@ -2279,6 +2353,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
+                model_supports_images: None,
             },
             ..tool
         };
