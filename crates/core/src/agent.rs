@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -420,7 +420,7 @@ impl Agent<'_> {
                     return Err(Error::PendingOperation(invocation.operation_id));
                 }
                 let mut states = self.migrate(session, observer)?;
-                self.poll_pending(session, &mut states, cancel, observer)
+                self.poll_pending(session, &mut states, cancel, observer, None)
                     .await?;
                 recover(session, observer)?;
                 states
@@ -752,6 +752,7 @@ impl Agent<'_> {
                             advertised: &advertised,
                             depth: 0,
                             call_count: Arc::new(AtomicUsize::new(0)),
+                            replies: None,
                         },
                         &mut states,
                         observer,
@@ -1244,7 +1245,7 @@ impl Agent<'_> {
                 if matches!(preparation, Preparation::Ready { .. }) {
                     if cancel.is_cancelled() {
                         for operation_id in dispatches {
-                            commit(
+                            commit_with_reply(
                                 session,
                                 Event::ToolFinished {
                                     operation_id,
@@ -1254,6 +1255,7 @@ impl Agent<'_> {
                                     states: ExtensionStates::new(),
                                 },
                                 observer,
+                                scope.replies,
                             )?;
                         }
                         return Err(Error::Cancelled);
@@ -1437,7 +1439,14 @@ impl Agent<'_> {
             {
                 self.transform_tool_result(invocation, &mut outcome, states, cancel, observer)
                     .await;
-                let finished = self.finish_tool(session, invocation, outcome, states, observer);
+                let finished = self.finish_tool(
+                    session,
+                    invocation,
+                    outcome,
+                    states,
+                    observer,
+                    scope.replies,
+                );
                 if observe_tools
                     && let Some(result) =
                         session
@@ -1484,7 +1493,8 @@ impl Agent<'_> {
             }
             match first_error {
                 Some(Error::PendingOperation(_)) => {
-                    self.poll_pending(session, states, cancel, observer).await?
+                    self.poll_pending(session, states, cancel, observer, scope.replies)
+                        .await?
                 }
                 Some(error) => return Err(error),
                 None => {}
@@ -1519,6 +1529,11 @@ impl Agent<'_> {
                 }
             })
             .collect();
+        let replies: HashMap<_, _> = requests
+            .iter()
+            .zip(&invocations)
+            .map(|(request, invocation)| (invocation.operation_id, request.snapshot.clone()))
+            .collect();
         let execute = async {
             for (request, invocation) in requests.iter().zip(&invocations) {
                 commit(
@@ -1539,6 +1554,7 @@ impl Agent<'_> {
                     advertised: &advertised,
                     depth: requests[0].depth,
                     call_count: requests[0].call_count.clone(),
+                    replies: Some(&replies),
                 },
                 states,
                 observer,
@@ -1565,7 +1581,7 @@ impl Agent<'_> {
                     .err()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "nested dispatch did not start".into());
-                commit(
+                commit_with_reply(
                     session,
                     Event::ToolFinished {
                         operation_id,
@@ -1573,6 +1589,7 @@ impl Agent<'_> {
                         states: ExtensionStates::new(),
                     },
                     observer,
+                    Some(&replies),
                 )?;
             }
             let outcome = session
@@ -1601,6 +1618,7 @@ impl Agent<'_> {
         states: &mut ExtensionStates,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
+        replies: Option<&HashMap<Uuid, ReplySnapshot>>,
     ) -> Result<()> {
         for (invocation, state) in session.operations() {
             let OperationState::Finished(Outcome::Pending { reference }) = state else {
@@ -1650,7 +1668,7 @@ impl Agent<'_> {
             let mut reply = outcome.into();
             self.transform_tool_result(&invocation, &mut reply, states, cancel, observer)
                 .await;
-            self.finish_tool(session, &invocation, reply, states, observer)?;
+            self.finish_tool(session, &invocation, reply, states, observer, replies)?;
         }
         Ok(())
     }
@@ -1783,6 +1801,7 @@ impl Agent<'_> {
         reply: ToolReply,
         states: &mut ExtensionStates,
         observer: &mut Observer<'_>,
+        replies: Option<&HashMap<Uuid, ReplySnapshot>>,
     ) -> Result<()> {
         let ToolReply {
             outcome,
@@ -1856,7 +1875,7 @@ impl Agent<'_> {
         };
         let changes = self.tool_state_changes(&invocation.call.name, &outcome, states, update);
         let persisted = changes.as_ref().cloned().unwrap_or_default();
-        commit(
+        commit_with_reply(
             session,
             Event::ToolFinished {
                 operation_id,
@@ -1864,6 +1883,7 @@ impl Agent<'_> {
                 states: persisted,
             },
             observer,
+            replies,
         )?;
         if let Some(error) = waiting {
             return Err(error);
@@ -3169,7 +3189,9 @@ struct DispatchScope<'a> {
     advertised: &'a HashSet<String>,
     depth: usize,
     call_count: Arc<AtomicUsize>,
+    replies: Option<&'a HashMap<Uuid, ReplySnapshot>>,
 }
+type ReplySnapshot = Arc<std::sync::Mutex<Option<Outcome>>>;
 struct NestedRequest {
     name: String,
     arguments: serde_json::Value,
@@ -3178,6 +3200,7 @@ struct NestedRequest {
     depth: usize,
     call_count: Arc<AtomicUsize>,
     reply: oneshot::Sender<Outcome>,
+    snapshot: ReplySnapshot,
 }
 
 fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> {
@@ -3292,6 +3315,7 @@ impl ToolHost for NestedHost {
                     None
                 };
             let (reply, result) = oneshot::channel();
+            let snapshot = Arc::new(std::sync::Mutex::new(None));
             if let Some(error) = error {
                 let _ = reply.send(Outcome::Skipped(error.into()));
             } else {
@@ -3303,9 +3327,10 @@ impl ToolHost for NestedHost {
                     depth: self.depth + 1,
                     call_count: self.call_count.clone(),
                     reply,
+                    snapshot: snapshot.clone(),
                 });
             }
-            results.push(result);
+            results.push((result, snapshot));
         }
         if !requests.is_empty() {
             tokio::select! {
@@ -3316,11 +3341,13 @@ impl ToolHost for NestedHost {
                 }
             }
         }
-        futures_util::future::join_all(results.into_iter().map(|result| async move {
+        futures_util::future::join_all(results.into_iter().map(|(result, snapshot)| async move {
             tokio::select! {
                 biased;
-                result = result => result.unwrap_or_else(|_| Outcome::Unknown("nested tool response was lost".into())),
-                _ = self.cancellation.cancelled() => Outcome::Unknown("cancelled while awaiting nested tool result".into()),
+                result = result => result.unwrap_or_else(|_| snapshot.lock().expect("nested reply snapshot").clone()
+                    .unwrap_or_else(|| Outcome::Unknown("nested tool response was lost".into()))),
+                _ = self.cancellation.cancelled() => snapshot.lock().expect("nested reply snapshot").clone()
+                    .unwrap_or_else(|| Outcome::Unknown("cancelled while awaiting nested tool result".into())),
             }
         }))
         .await
@@ -3416,6 +3443,35 @@ fn branch_excerpt(entry: Message) -> String {
 fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> Result<()> {
     observer(Notification::Committed(session.append(event)?));
     Ok(())
+}
+
+// Serialize cancellation's snapshot read with the durable append and publication.
+fn commit_with_reply(
+    session: &mut Session,
+    event: Event,
+    observer: &mut Observer<'_>,
+    replies: Option<&HashMap<Uuid, ReplySnapshot>>,
+) -> Result<()> {
+    let snapshot = match &event {
+        Event::ToolFinished { operation_id, .. } => {
+            replies.and_then(|replies| replies.get(operation_id))
+        }
+        _ => None,
+    };
+    if let Some(snapshot) = snapshot {
+        let mut snapshot = snapshot.lock().expect("nested reply snapshot");
+        let outcome = match &event {
+            Event::ToolFinished { outcome, .. } => outcome.clone(),
+            _ => unreachable!(),
+        };
+        let record = session.append(event)?;
+        *snapshot = Some(outcome);
+        drop(snapshot);
+        observer(Notification::Committed(record));
+        Ok(())
+    } else {
+        commit(session, event, observer)
+    }
 }
 
 async fn receive_input<T>(inputs: &mut Option<&mut mpsc::Receiver<T>>) -> Option<T> {

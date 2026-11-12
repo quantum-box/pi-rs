@@ -3451,3 +3451,131 @@ async fn bounded_tool_progress_queue_drains_before_worker_join() {
     .unwrap();
     assert_eq!(indices, (0..100).collect::<Vec<_>>());
 }
+
+#[tokio::test]
+async fn cancelled_nested_batch_preserves_already_journaled_result() {
+    struct Parent(
+        mpsc::UnboundedSender<Vec<Outcome>>,
+        std::sync::mpsc::Sender<()>,
+    );
+    struct Child(CancellationToken, Arc<Mutex<std::sync::mpsc::Receiver<()>>>);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let results = self.0.clone();
+            let acknowledged = self.1.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let outcomes = runtime.block_on(host.call_batch(vec![
+                    ("serial_child".into(), json!({"id":1})),
+                    ("serial_child".into(), json!({"id":2})),
+                ]));
+                let _ = acknowledged.send(());
+                let _ = results.send(outcomes);
+            });
+            std::future::pending().await
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Child {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "serial_child".into(),
+                description: "serial child".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+            if args["id"] == 1 {
+                return Outcome::Succeeded("first finished".into());
+            }
+            self.0.cancel();
+            self.1
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(1))
+                .expect("host did not observe cancellation while second child ran");
+            std::future::pending().await
+        }
+    }
+    struct Fixture(
+        mpsc::UnboundedSender<Vec<Outcome>>,
+        CancellationToken,
+        std::sync::mpsc::Sender<()>,
+        Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    );
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "nested-cancel-journal"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone(), self.2.clone())),
+                Arc::new(Child(self.1.clone(), self.3.clone())),
+            ]
+        }
+    }
+    let cancel = CancellationToken::new();
+    let (results, mut received) = mpsc::unbounded_channel();
+    let (acknowledge, acknowledged) = std::sync::mpsc::channel();
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            results,
+            cancel.clone(),
+            acknowledge,
+            Arc::new(Mutex::new(acknowledged)),
+        )))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"])]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("test".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("agent did not settle after cancellation");
+    let outcomes = tokio::time::timeout(Duration::from_secs(2), received.recv())
+        .await
+        .expect("host did not settle")
+        .unwrap();
+    let first = session
+        .operations()
+        .into_iter()
+        .find(|(invocation, _)| {
+            invocation.call.name == "serial_child" && invocation.call.arguments.contains("1")
+        })
+        .unwrap();
+    assert_eq!(
+        first.1,
+        OperationState::Finished(Outcome::Succeeded("first finished".into()))
+    );
+    assert_eq!(outcomes[0], Outcome::Succeeded("first finished".into()));
+    assert!(matches!(outcomes[1], Outcome::Unknown(_)));
+}
