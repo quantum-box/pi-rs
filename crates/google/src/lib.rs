@@ -741,7 +741,7 @@ impl Model for Google {
                             calls.push(ToolCall { id: id.clone(), name: name.into(), arguments: arguments.clone() });
                             yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta { index, id, name: name.into(), arguments });
                         }
-                        blocks.push(part.clone());
+                        append_replay_part(&mut blocks, part);
                     }
                 }
                 if let Some(reason) = candidate["finishReason"].as_str().filter(|reason| *reason != "FINISH_REASON_UNSPECIFIED") {
@@ -769,6 +769,38 @@ impl Model for Google {
     }
 }
 
+// Streaming text parts are deltas of one logical block until its kind changes
+// or another kind of part (such as a function call) interrupts it.
+fn append_replay_part(blocks: &mut Vec<Value>, part: &Value) {
+    let Some(text) = part.get("text").and_then(Value::as_str) else {
+        blocks.push(part.clone());
+        return;
+    };
+    let is_text_only = |value: &Value| {
+        value.as_object().is_some_and(|object| {
+            object
+                .keys()
+                .all(|key| matches!(key.as_str(), "text" | "thought" | "thoughtSignature"))
+                && value.get("text").is_some_and(Value::is_string)
+        })
+    };
+    let thought = part["thought"].as_bool().unwrap_or(false);
+    if is_text_only(part)
+        && let Some(previous) = blocks.last_mut().filter(|previous| {
+            is_text_only(previous) && previous["thought"].as_bool().unwrap_or(false) == thought
+        })
+    {
+        if let Some(Value::String(combined)) = previous.get_mut("text") {
+            combined.push_str(text);
+        }
+        if let Some(signature) = part["thoughtSignature"].as_str().filter(|s| !s.is_empty()) {
+            previous["thoughtSignature"] = json!(signature);
+        }
+    } else {
+        blocks.push(part.clone());
+    }
+}
+
 fn report_progress(
     observer: &Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     last: &mut Option<Progress>,
@@ -785,6 +817,101 @@ fn report_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streamed_thinking_and_text_replay_as_signed_blocks() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.local_addr().unwrap());
+        let serve = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            let mut reader = BufReader::new(&socket);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let parts = [
+                json!({"thought":true,"text":"think ","thoughtSignature":"first"}),
+                json!({"thought":true,"text":"more","thoughtSignature":""}),
+                json!({"text":"answer ","thoughtSignature":"old"}),
+                json!({"text":"done","thoughtSignature":"new"}),
+                json!({"functionCall":{"name":"read","args":{}},"thoughtSignature":"call"}),
+                json!({"text":"after"}),
+            ];
+            let mut body = String::new();
+            for part in parts {
+                body.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"candidates":[{"content":{"parts":[part]}}]})
+                ));
+            }
+            body.push_str("data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let model = Google::new(&endpoint, "test")
+            .unwrap()
+            .with_context_probe(false);
+        let mut stream = model
+            .stream(ModelRequest {
+                model: "gemini-3.5-flash".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 32,
+            })
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        let mut replay = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ModelEvent::Reasoning(s) => events.push(format!("thinking:{s}")),
+                ModelEvent::Text(s) => events.push(format!("text:{s}")),
+                ModelEvent::Metadata(metadata) => replay = metadata.replay,
+                _ => {}
+            }
+        }
+        serve.join().unwrap();
+        assert_eq!(
+            events,
+            [
+                "thinking:think ",
+                "thinking:more",
+                "text:answer ",
+                "text:done",
+                "text:after"
+            ]
+        );
+        let replay = replay.unwrap();
+        assert_eq!(
+            replay.blocks,
+            vec![
+                json!({"thought":true,"text":"think more","thoughtSignature":"first"}),
+                json!({"text":"answer done","thoughtSignature":"new"}),
+                json!({"functionCall":{"name":"read","args":{}},"thoughtSignature":"call"}),
+                json!({"text":"after"}),
+            ]
+        );
+        let expected = json!(replay.blocks);
+        let request = ModelRequest {
+            model: "gemini-3.5-flash".into(),
+            messages: vec![Message::Assistant {
+                content: "answer doneafter".into(),
+                calls: vec![],
+                replay: Some(replay),
+            }],
+            tools: vec![],
+            max_output_tokens: 32,
+        };
+        assert_eq!(
+            wire_request(&request, None, "google").unwrap()["contents"][0]["parts"],
+            expected
+        );
+    }
 
     #[test]
     fn signed_tool_parts_and_wire_ids_stay_with_the_exact_model() {
