@@ -50,8 +50,76 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut pending_queries: Vec<Value> = Vec::new();
     let mut pending_inputs: Vec<Value> = Vec::new();
     let mut model_queries: Vec<(Value, mpsc::Receiver<Result<Value>>)> = Vec::new();
+    let mut transition: Option<(Value, mpsc::Receiver<Result<Cli>>)> = None;
+    let mut deferred = std::collections::VecDeque::<Value>::new();
     let mut stream = super::rpc_events::Stream::default();
-    loop {
+    'run: loop {
+        // Drain accepted input before committing a completed transition. This
+        // gives abort/shutdown priority over prompts queued while it was pending.
+        if transition.is_some() {
+            while let Ok(line) = receiver.try_recv() {
+                let request = match parse_request(&line?) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        response(&json!({"type":"parse"}), Err(error))?;
+                        continue;
+                    }
+                };
+                if matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
+                    let (pending, _) = transition.take().expect("pending transition");
+                    response(&pending, Ok(Some(json!({"cancelled":true}))))?;
+                    for queued in deferred.drain(..) {
+                        response(
+                            &queued,
+                            Err(Error::Config("session transition cancelled".into())),
+                        )?;
+                    }
+                    if request["type"] == "shutdown" {
+                        drop(worker.take());
+                        response(&request, Ok(None))?;
+                        break 'run;
+                    }
+                    response(&request, Ok(None))?;
+                    continue 'run;
+                }
+                if deferred.len() >= 256 {
+                    response(
+                        &request,
+                        Err(Error::Config(
+                            "too many commands waiting for session transition".into(),
+                        )),
+                    )?;
+                } else {
+                    deferred.push_back(request);
+                }
+            }
+        }
+        if let Some((_, receiver)) = &transition {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(Error::Config(
+                    "session transition worker stopped".into(),
+                ))),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                let (request, _) = transition.take().expect("pending transition");
+                let result = result.and_then(|mut next| {
+                    let previous_thinking = args.thinking.clone();
+                    let reason = if request["type"] == "new_session" { pi_rs::SessionStartReason::New } else { pi_rs::SessionStartReason::Resume };
+                    if request["type"] == "new_session" {
+                        finish_new_session(&mut next, request["parentSession"].as_str().filter(|path| !path.is_empty()))?;
+                    }
+                    Worker::transition(&mut worker, &next, reason)?;
+                    args = next;
+                    if previous_thinking.as_deref().unwrap_or("off") != args.thinking.as_deref().unwrap_or("off") {
+                        emit(json!({"type":"thinking_level_changed","level":args.thinking.as_deref().unwrap_or("off")}))?;
+                    }
+                    Ok(Some(json!({"cancelled":false})))
+                });
+                response(&request, result)?;
+            }
+        }
         let mut index = 0;
         while index < model_queries.len() {
             match model_queries[index].1.try_recv() {
@@ -159,24 +227,62 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        let line = match receiver.recv_timeout(Duration::from_millis(20)) {
-            Ok(line) => line?,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) if model_queries.is_empty() => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Do not drop accepted model-list requests when a batch client
-                // closes stdin before discovery finishes.
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
+        let request = if transition.is_none() && !deferred.is_empty() {
+            deferred.pop_front().expect("deferred request")
+        } else {
+            let line = match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok(line) => line?,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected)
+                    if model_queries.is_empty() && transition.is_none() && deferred.is_empty() =>
+                {
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Do not drop accepted model-list requests when a batch client
+                    // closes stdin before discovery finishes.
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            };
+            match parse_request(&line) {
+                Ok(request) => request,
+                Err(error) => {
+                    response(&json!({"type":"parse"}), Err(error))?;
+                    continue;
+                }
             }
         };
-        let request = match parse_request(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                response(&json!({"type":"parse"}), Err(error))?;
-                continue;
+        if transition.is_some() && matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
+            let (pending, _) = transition.take().expect("pending transition");
+            response(&pending, Ok(Some(json!({"cancelled":true}))))?;
+            for queued in deferred.drain(..) {
+                response(
+                    &queued,
+                    Err(Error::Config("session transition cancelled".into())),
+                )?;
             }
-        };
+            if request["type"] == "shutdown" {
+                drop(worker.take());
+                response(&request, Ok(None))?;
+                break;
+            }
+            response(&request, Ok(None))?;
+            continue;
+        }
+        if transition.is_some() {
+            if deferred.len() >= 256 {
+                response(
+                    &request,
+                    Err(Error::Config(
+                        "too many commands waiting for session transition".into(),
+                    )),
+                )?;
+            } else {
+                deferred.push_back(request);
+            }
+            continue;
+        }
         if request["type"] == "get_available_models" {
             if model_queries.len() >= 16 {
                 response(
@@ -192,6 +298,67 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     let _ = sender.send(result);
                 });
                 model_queries.push((request, receiver));
+            }
+            continue;
+        }
+        if request["type"] == "switch_session" || request["type"] == "new_session" {
+            let prepared = (|| {
+                if !pending_inputs.is_empty() || busy(&worker) {
+                    return Err(Error::Config(
+                        "wait for the current operation before switching sessions".into(),
+                    ));
+                }
+                let is_new = request["type"] == "new_session";
+                let path = if is_new {
+                    None
+                } else {
+                    Some(
+                        args.workspace.join(
+                            request["sessionPath"]
+                                .as_str()
+                                .ok_or_else(|| Error::Config("sessionPath is required".into()))?,
+                        ),
+                    )
+                };
+                match request.get("parentSession") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(path)) => Some(path.clone()).filter(|path| !path.is_empty()),
+                    Some(_) if is_new => {
+                        return Err(Error::Config("parentSession must be a string".into()));
+                    }
+                    Some(_) => None,
+                };
+                if Worker::check_session_transition(
+                    Some(&mut worker),
+                    &args,
+                    pi_rs::BeforeSessionTransition::Switch {
+                        reason: if is_new {
+                            pi_rs::SessionSwitchReason::New
+                        } else {
+                            pi_rs::SessionSwitchReason::Resume
+                        },
+                        target_session_file: path.clone(),
+                    },
+                )? {
+                    return Ok(None);
+                }
+                let mut next = args.clone();
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = if let Some(path) = path {
+                        switch_session(&mut next, &path)
+                    } else {
+                        prepare_new_session_draft(&mut next)
+                    }
+                    .map(|()| next);
+                    let _ = sender.send(result);
+                });
+                Ok(Some(receiver))
+            })();
+            match prepared {
+                Ok(Some(receiver)) => transition = Some((request, receiver)),
+                Ok(None) => response(&request, Ok(Some(json!({"cancelled":true}))))?,
+                Err(error) => response(&request, Err(error))?,
             }
             continue;
         }
@@ -685,7 +852,11 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 &args.workspace,
             )?;
             drop(session);
-            switch_session(args, &destination)?;
+            let retry_discovery = args.selection_discovery_pending;
+            args.selection_discovery_pending = false;
+            let switched = switch_session(args, &destination);
+            args.selection_discovery_pending = retry_discovery;
+            switched?;
             let mut data = json!({"cancelled":false});
             if let Some(text) = text {
                 data["text"] = json!(text);
@@ -712,23 +883,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             )? {
                 return Ok(Some(json!({"cancelled":true})));
             }
-            let destination = if args.no_session {
-                args.session
-                    .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
-            } else {
-                interactive::session_path(&args.workspace, args.session_dir.as_deref())
-            };
-            if let Some(directory) = destination.parent() {
-                std::fs::create_dir_all(directory)?;
-            }
-            let mut session = Session::open(&destination)?;
-            session.set_working_directory(&args.workspace)?;
-            super::backend::initialize_queue_modes(&mut session, args)?;
-            if let Some(parent) = parent {
-                session.set_parent_session(parent)?;
-            }
-            drop(session);
-            args.session = destination;
+            prepare_new_session(args, parent)?;
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" => {
@@ -1071,6 +1226,41 @@ fn record_id(value: &Value) -> Result<u64> {
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
         .filter(|id| *id > 0)
         .ok_or_else(|| Error::Config("entry ID must be a positive integer".into()))
+}
+
+fn prepare_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
+    let mut next = args.clone();
+    prepare_new_session_draft(&mut next)?;
+    finish_new_session(&mut next, parent)?;
+    *args = next;
+    Ok(())
+}
+
+fn prepare_new_session_draft(args: &mut Cli) -> Result<()> {
+    args.refresh_workspace_selection();
+    args.session = if args.no_session {
+        args.session
+            .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
+    } else {
+        interactive::session_path(&args.workspace, args.session_dir.as_deref())
+    };
+    Ok(())
+}
+
+fn finish_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
+    if let Some(directory) = args.session.parent() {
+        std::fs::create_dir_all(directory)?;
+    }
+    let mut session = Session::open(&args.session)?;
+    session.set_working_directory(&args.workspace)?;
+    super::backend::initialize_queue_modes(&mut session, args)?;
+    if let Some(parent) = parent {
+        session.set_parent_session(parent)?;
+    }
+    args.restore_session_model(&session);
+    super::thinking::adjust(args);
+    args.record_automatic_model_selection(&mut session)?;
+    Ok(())
 }
 
 fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
@@ -1612,6 +1802,9 @@ mod tests {
         let mut session = Session::open(&path).unwrap();
         session.set_working_directory(&workspace).unwrap();
         session.select_model("other-model", None).unwrap();
+        session
+            .append_user_with_images("existing conversation".into(), Vec::new(), None)
+            .unwrap();
         drop(session);
         let mut args = Cli::try_parse_from(["pi", "--no-trust"]).unwrap();
         switch_session(&mut args, &path).unwrap();
@@ -1631,6 +1824,441 @@ mod tests {
         assert_eq!(args.workspace, workspace.canonicalize().unwrap());
         assert_eq!(args.session, previous);
         assert_eq!(args.model, "other-model");
+    }
+
+    #[test]
+    fn switching_to_empty_saved_session_uses_initial_model() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("empty.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session.set_working_directory(root.path()).unwrap();
+        session.select_model("old-model", Some("low")).unwrap();
+        drop(session);
+        let mut args = Cli::try_parse_from(["pi", "--no-trust"]).unwrap();
+        args.workspace = root.path().into();
+        args.model = "initial-model".into();
+        args.remember_initial_selection();
+        args.model = "current-model".into();
+        switch_session(&mut args, &path).unwrap();
+        assert_eq!(args.model, "initial-model");
+    }
+
+    #[test]
+    fn new_session_restores_original_explicit_cli_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = root.path().into();
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().into());
+        args.endpoint = "https://example.invalid/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        args.model = "alpha".into();
+        args.thinking = Some("low".into());
+        args.model_explicit = true;
+        args.thinking_explicit = true;
+        args.remember_initial_selection();
+        args.change_model(
+            super::super::Provider::Ollama,
+            "beta".into(),
+            Some("high".into()),
+            pi_rs::ModelSelectSource::Set,
+        )
+        .unwrap();
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("alpha", Some("low"))
+        );
+        assert_eq!(
+            Session::open(&args.session).unwrap().model_selection(),
+            Some(("alpha".into(), Some("low".into())))
+        );
+    }
+
+    #[test]
+    fn workspace_switch_discovers_dynamic_scope_models() {
+        use std::io::Read;
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(launch.join(".pi")).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"enabledModels":["ollama/dynamic:high"]}).to_string(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let n = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /v1/models "));
+            let body = r#"{"data":[{"id":"dynamic"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let target_session = root.path().join("target.jsonl");
+        Session::open(&target_session)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.session = root.path().join("launch.jsonl");
+        args.session_dir = Some(root.path().into());
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(
+            &json!({"providers":{"ollama":{"baseUrl":endpoint, "models":[{"id":"alpha"}]}}}),
+        )
+        .unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        switch_session(&mut args, &target_session).unwrap();
+        server.join().unwrap();
+        assert_eq!(args.model, "dynamic");
+        assert_eq!(
+            args.model_scope
+                .iter()
+                .map(|c| c.model.as_str())
+                .collect::<Vec<_>>(),
+            ["dynamic"]
+        );
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(args.model, "dynamic");
+    }
+
+    #[test]
+    fn workspace_discovery_retains_success_and_retries_a_timed_out_provider() {
+        use std::io::Read;
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"enabledModels":["ollama/fast", "slow/late"]}).to_string(),
+        )
+        .unwrap();
+        let fast = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let slow = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fast_url = format!("http://{}/v1", fast.local_addr().unwrap());
+        let slow_url = format!("http://{}/v1", slow.local_addr().unwrap());
+        let serve = |listener: std::net::TcpListener, id: &'static str, delayed: bool| {
+            std::thread::spawn(move || {
+                for i in 0..2 {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let mut buf = [0; 2048];
+                    let _ = socket.read(&mut buf);
+                    if delayed && i == 0 {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    let body = json!({"data":[{"id":id}]}).to_string();
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                }
+            })
+        };
+        let fast_thread = serve(fast, "fast", false);
+        let slow_thread = serve(slow, "late", true);
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":fast_url, "models":[{"id":"alpha"}]},
+            "slow":{"baseUrl":slow_url, "api":"openai-completions", "apiKey":"test", "models":[]}
+        }}))
+        .unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        args.workspace = target.clone();
+        args.settings = super::super::config::Settings::load(&target, true).unwrap();
+        args.refresh_workspace_selection_with_timeout(Duration::from_millis(100));
+        assert_eq!(args.model, "fast");
+        assert_eq!(
+            args.model_scope
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            ["fast"]
+        );
+        assert!(args.selection_discovery_pending);
+        std::thread::sleep(Duration::from_millis(200));
+        args.refresh_workspace_selection_with_timeout(Duration::from_secs(2));
+        assert!(
+            args.model_scope.iter().any(|choice| choice.model == "late"),
+            "catalog={:?} pending={}",
+            args.discovered_models,
+            args.selection_discovery_pending
+        );
+        assert!(!args.selection_discovery_pending);
+        fast_thread.join().unwrap();
+        slow_thread.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_endpoint_keeps_original_provider_on_workspace_switch_and_new_session() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(target.join(".pi/settings.json"), json!({"defaultProvider":"relay","defaultModel":"beta","enabledModels":["relay/beta","ollama/alpha"]}).to_string()).unwrap();
+        let path = root.path().join("target.jsonl");
+        Session::open(&path)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().to_path_buf());
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":"https://example.invalid/v1","models":[{"id":"alpha"}]},
+            "relay":{"baseUrl":"https://example.invalid/v1","api":"openai-completions","models":[{"id":"beta"}]}
+        }})).unwrap();
+        args.provider = super::super::Provider::Ollama;
+        args.model = "alpha".into();
+        args.endpoint = "https://explicit.example/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.connection_explicit = true;
+        args.initial_connection = Some((args.provider.clone(), args.endpoint.clone()));
+        args.remember_initial_selection();
+        switch_session(&mut args, &path).unwrap();
+        assert_eq!(
+            (
+                args.provider.id(),
+                args.model.as_str(),
+                args.endpoint.as_str()
+            ),
+            (
+                "ollama",
+                "alpha",
+                "https://explicit.example/v1/chat/completions"
+            )
+        );
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(
+            (
+                args.provider.id(),
+                args.model.as_str(),
+                args.endpoint.as_str()
+            ),
+            (
+                "ollama",
+                "alpha",
+                "https://explicit.example/v1/chat/completions"
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_provider_only_default_never_uses_previous_provider_model() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"defaultProvider":"target"}).to_string(),
+        )
+        .unwrap();
+        let target_session = root.path().join("target.jsonl");
+        Session::open(&target_session)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.session = root.path().join("launch.jsonl");
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha"}]},
+            "target":{"baseUrl":"https://example.invalid/v1", "api":"openai-completions", "models":[{"id":"beta"}]}
+        }})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        let mut unavailable = args.clone();
+        unavailable.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha"}]},
+            "target":{"baseUrl":"https://example.invalid/v1", "api":"openai-completions", "models":[]}
+        }})).unwrap();
+        switch_session(&mut unavailable, &target_session).unwrap();
+        assert_eq!(
+            (unavailable.provider.id(), unavailable.model.as_str()),
+            ("ollama", "alpha")
+        );
+        switch_session(&mut args, &target_session).unwrap();
+        assert_eq!(
+            (args.provider.id(), args.model.as_str()),
+            ("target", "beta")
+        );
+    }
+
+    #[test]
+    fn switching_workspace_rebuilds_defaults_and_scope_for_new_session() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        for (workspace, model, thinking) in [(&launch, "alpha", "low"), (&target, "beta", "high")] {
+            std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+            std::fs::write(workspace.join(".pi/settings.json"), json!({"defaultProvider":"ollama", "defaultModel":model, "defaultThinkingLevel":thinking, "enabledModels":[format!("ollama/{model}:{thinking}")]}).to_string()).unwrap();
+        }
+        let target_session = root.path().join("target.jsonl");
+        let mut session = Session::open(&target_session).unwrap();
+        session.set_working_directory(&target).unwrap();
+        drop(session);
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch.clone();
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().into());
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha","reasoning":true},{"id":"beta","reasoning":true}]}}})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.settings = super::super::config::Settings::load(&launch, true).unwrap();
+        args.model = "alpha".into();
+        args.refresh_workspace_selection();
+        args.thinking = Some("low".into());
+        args.remember_initial_selection();
+        let mut thinking_override = args.clone();
+        thinking_override.thinking_explicit = true;
+        thinking_override.remember_initial_selection();
+        switch_session(&mut thinking_override, &target_session).unwrap();
+        assert_eq!(
+            (
+                thinking_override.model.as_str(),
+                thinking_override.thinking.as_deref()
+            ),
+            ("beta", Some("low"))
+        );
+        thinking_override.thinking = Some("high".into());
+        command(
+            &json!({"type":"new_session"}),
+            &mut thinking_override,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                thinking_override.model.as_str(),
+                thinking_override.thinking.as_deref()
+            ),
+            ("beta", Some("low"))
+        );
+        switch_session(&mut args, &target_session).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("beta", Some("high"))
+        );
+        assert_eq!(
+            args.model_scope
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            ["beta"]
+        );
+        args.change_model(
+            super::super::Provider::Ollama,
+            "alpha".into(),
+            Some("low".into()),
+            pi_rs::ModelSelectSource::Set,
+        )
+        .unwrap();
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("beta", Some("high"))
+        );
+        assert_eq!(
+            Session::open(&args.session).unwrap().model_selection(),
+            Some(("beta".into(), Some("high".into())))
+        );
+    }
+
+    #[test]
+    fn thinking_rpc_does_not_emit_model_change_after_virtual_response() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+            json!({"type":"message","id":"assistant","parentId":"change","message":{"role":"assistant","provider":"ollama","model":"physical","content":[]}}),
+        ];
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let native = root.path().join("native.jsonl");
+        super::super::session_import::read(&source)
+            .unwrap()
+            .export_jsonl(&native)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = native.clone();
+        args.model = "physical".into();
+        args.thinking = Some("low".into());
+        command(
+            &json!({"type":"set_thinking_level","level":"high"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap();
+        let session = Session::open(&native).unwrap();
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, root.path())
+            .unwrap();
+        let entries: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["type"] == "model_change")
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .rev()
+                .find(|entry| entry["type"] == "thinking_level_change")
+                .unwrap()["thinkingLevel"],
+            "high"
+        );
     }
 
     #[test]

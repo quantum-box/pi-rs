@@ -21,6 +21,8 @@ struct Position {
     visible: Option<u64>,
     imported: Option<u64>,
     model: Option<u64>,
+    response_model: Option<u64>,
+    explicit_model_seen: bool,
 }
 
 pub(super) struct Entries {
@@ -68,6 +70,69 @@ impl Entries {
 
     pub(super) fn has_leaf(&self) -> bool {
         self.leaf.is_some()
+    }
+
+    /// Whether Pi's compaction-aware, un-repaired projection has messages.
+    pub(super) fn has_session_context(&self) -> bool {
+        let by_id: HashMap<_, _> = self
+            .values
+            .iter()
+            .filter_map(|entry| entry["id"].as_str().map(|id| (id, entry)))
+            .collect();
+        let mut branch = Vec::new();
+        let mut id = self.leaf.as_deref();
+        while let Some(entry) = id.and_then(|id| by_id.get(id)) {
+            branch.push(*entry);
+            id = entry["parentId"].as_str();
+        }
+        branch.reverse();
+        let context = if let Some(index) = branch
+            .iter()
+            .rposition(|entry| entry["type"] == "compaction")
+        {
+            let compacted = branch[index];
+            let mut entries = vec![compacted];
+            if let Some(first) = compacted["firstKeptEntryId"].as_str().and_then(|first| {
+                branch[..index]
+                    .iter()
+                    .position(|entry| entry["id"] == first)
+            }) {
+                entries.extend(branch[first..index].iter().copied().filter(|entry| {
+                    !(entry["type"] == "message" && entry["message"]["role"] == "system")
+                }));
+            }
+            entries.extend_from_slice(&branch[index + 1..]);
+            entries
+        } else {
+            branch
+        };
+        let edits: HashMap<_, _> = context
+            .iter()
+            .filter_map(|entry| {
+                (entry["type"] == "context_edit")
+                    .then(|| {
+                        entry["targetId"]
+                            .as_str()
+                            .map(|id| (id, entry["replacement"].is_null()))
+                    })
+                    .flatten()
+            })
+            .collect();
+        context.iter().any(|entry| {
+            let contributes = match entry["type"].as_str() {
+                Some("message" | "custom_message" | "compaction") => true,
+                Some("branch_summary") => entry["summary"]
+                    .as_str()
+                    .is_some_and(|summary| !summary.is_empty()),
+                _ => false,
+            };
+            contributes
+                && !entry["id"]
+                    .as_str()
+                    .and_then(|id| edits.get(id))
+                    .copied()
+                    .unwrap_or(false)
+        })
     }
 
     pub(super) fn new(session: &Session) -> Self {
@@ -267,6 +332,15 @@ impl Cursor {
         let mut position = parent;
         let entry = match &record.event {
             Event::SourceEntry { format, entry } if format == "pi" => {
+                if entry["type"] == "model_change" {
+                    position.response_model = None;
+                    position.explicit_model_seen = true;
+                } else if entry["type"] == "message"
+                    && entry["message"]["role"] == "assistant"
+                    && entry["message"]["api"] != "pi-virtual"
+                {
+                    position.response_model = Some(record.id);
+                }
                 position.imported = (entry["type"] != "session").then_some(record.id);
                 if position.imported.is_some() {
                     if let Some(source_id) = entry["id"].as_str() {
@@ -285,6 +359,19 @@ impl Cursor {
                 } else {
                     None
                 }
+            }
+            Event::SourceEntry { format, .. } if format == "pi-rs:native-model-selection" => {
+                position.imported = None;
+                None
+            }
+            Event::SourceEntry { format, .. }
+                if matches!(
+                    format.as_str(),
+                    "pi-rs:thinking-selection" | "pi-rs:request-identity"
+                ) =>
+            {
+                position.imported = None;
+                None
             }
             Event::CacheWarm {
                 metadata,
@@ -327,6 +414,21 @@ impl Cursor {
             } => {
                 let current = selection(model, provider.as_deref(), thinking.as_deref());
                 position.model = Some(record.id);
+                let thinking_only = record.parent.and_then(|id| records.get(id as usize - 1)).is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection"));
+                if thinking_only {
+                    let entry = json!({"type":"thinking_level_change","thinkingLevel":current.2});
+                    entries.push(with_identity(
+                        entry,
+                        &record.id.to_string(),
+                        wire_id(parent.visible),
+                        record,
+                    ));
+                    position.visible = Some(record.id);
+                    self.positions.push(position);
+                    return entries;
+                }
+                position.response_model = None;
+                position.explicit_model_seen = true;
                 let previous = parent.model.and_then(|id| {
                     let Event::ModelSelected {
                         model,
@@ -338,8 +440,12 @@ impl Cursor {
                     };
                     Some(selection(model, provider.as_deref(), thinking.as_deref()))
                 });
-                let model_changed =
-                    previous.is_none_or(|old| (old.0, old.1) != (current.0, current.1));
+                // A response may have been routed by a virtual selection. An
+                // explicit native selection must override that selection even
+                // when it names the same physical model as the response.
+                let model_changed = !parent.explicit_model_seen
+                    || parent.response_model.is_some()
+                    || previous.is_none_or(|old| (old.0, old.1) != (current.0, current.1));
                 let thinking_changed = previous.is_none_or(|old| old.2 != current.2);
                 let model_entry =
                     || json!({"type":"model_change","provider":current.0,"modelId":current.1});

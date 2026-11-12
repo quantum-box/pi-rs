@@ -68,6 +68,20 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside p
 )]
 struct Cli {
     #[arg(skip)]
+    initial_selection: Option<InitialSelection>,
+    #[arg(skip)]
+    cli_selection: Option<InitialSelection>,
+    #[arg(skip)]
+    cli_thinking: Option<String>,
+    #[arg(skip)]
+    selection_workspace: Option<PathBuf>,
+    #[arg(skip)]
+    selection_discovery_pending: bool,
+    #[arg(skip)]
+    discovered_models: Vec<(String, String)>,
+    #[arg(skip)]
+    complete_catalogs: Vec<(String, String)>,
+    #[arg(skip)]
     session_transition: Option<pi_rs::SessionStartReason>,
     #[arg(skip)]
     settings: config::Settings,
@@ -296,6 +310,13 @@ struct Cli {
     /// Initial prompt when no explicit subcommand is used.
     #[arg(value_name = "PROMPT", num_args = 0.., trailing_var_arg = true)]
     prompt: Vec<String>,
+}
+
+#[derive(Clone)]
+struct InitialSelection {
+    provider: Provider,
+    endpoint: String,
+    model: String,
 }
 
 impl Cli {
@@ -643,16 +664,41 @@ impl Cli {
         )
     }
 
+    fn record_automatic_model_selection(&self, session: &mut Session) -> Result<()> {
+        session.record_request_identity(self.provider.id(), &self.model)?;
+        if !rpc_entries::Entries::new(session).has_session_context() {
+            return self.record_model_selection(session);
+        }
+        if !self.model_explicit
+            && self.thinking_explicit
+            && let Some(thinking) = self.thinking.as_deref()
+        {
+            return session.select_thinking_level(self.recorded_provider(), &self.model, thinking);
+        }
+        if !self.model_explicit
+            && !self.thinking_explicit
+            && !matches!(
+                session_import::branch_selection(session, |_, _| None),
+                session_import::BranchSelection::Native
+            )
+        {
+            return Ok(());
+        }
+        self.record_model_selection(session)
+    }
+
     fn restore_model_selection(
         &mut self,
         model: String,
         thinking: Option<String>,
         provider: Option<&str>,
-    ) {
+        continuing: bool,
+    ) -> bool {
         let Some(provider) = self.model_profiles.provider(provider.unwrap_or("ollama")) else {
-            return;
+            return false;
         };
-        let in_scope = self.model_scope.is_empty()
+        let in_scope = continuing
+            || self.model_scope.is_empty()
             || self
                 .model_scope
                 .iter()
@@ -663,7 +709,19 @@ impl Cli {
                 || !in_scope
                 || self.activate_provider(provider, Some(&model)).is_err())
         {
-            return;
+            return false;
+        }
+        if !in_scope && !self.model_explicit {
+            if !self.thinking_explicit
+                && let Some(thinking) = self
+                    .model_scope
+                    .iter()
+                    .find(|choice| choice.provider == self.provider && choice.model == self.model)
+                    .and_then(|choice| choice.thinking.clone())
+            {
+                self.thinking = Some(thinking);
+            }
+            return false;
         }
         if !self.model_explicit && in_scope {
             self.model = model.clone();
@@ -680,7 +738,365 @@ impl Cli {
                         .thinking_for_model(self.provider.id(), &self.model)
                         .map(str::to_owned)
                 })
-                .or_else(|| self.thinking.clone());
+                .or_else(|| Some("medium".into()));
+        }
+        true
+    }
+
+    fn restore_initial_selection(&mut self, thinking: Option<String>) {
+        if let Some(initial) = &self.initial_selection
+            && !self.model_explicit
+        {
+            self.provider = initial.provider.clone();
+            self.endpoint = initial.endpoint.clone();
+            self.model = initial.model.clone();
+            self.thinking_profile = None;
+        }
+        if !self.thinking_explicit {
+            self.thinking = Some(
+                self.model_scope
+                    .iter()
+                    .find(|choice| choice.provider == self.provider && choice.model == self.model)
+                    .and_then(|choice| choice.thinking.clone())
+                    .or(thinking)
+                    .unwrap_or_else(|| self.default_branch_thinking()),
+            );
+        }
+    }
+
+    fn default_branch_thinking(&self) -> String {
+        self.model_scope
+            .iter()
+            .find(|choice| choice.provider == self.provider && choice.model == self.model)
+            .and_then(|choice| choice.thinking.clone())
+            .or_else(|| {
+                self.settings
+                    .thinking_for_model(self.provider.id(), &self.model)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "medium".into())
+    }
+
+    fn restore_branch_selection(
+        &mut self,
+        model: String,
+        thinking: Option<String>,
+        provider: Option<&str>,
+    ) {
+        let availability = self
+            .model_profiles
+            .provider(provider.unwrap_or("ollama"))
+            .map(|provider| {
+                let endpoint = self.endpoint_for(&provider);
+                let known = self
+                    .model_profiles
+                    .model_ids(&provider)
+                    .iter()
+                    .any(|id| id == &model)
+                    || self
+                        .discovered_models
+                        .iter()
+                        .any(|(p, id)| p == provider.id() && id == &model)
+                    || self
+                        .model_scope
+                        .iter()
+                        .any(|choice| choice.provider == provider && choice.model == model)
+                    || self.initial_selection.as_ref().is_some_and(|initial| {
+                        initial.provider == provider && initial.model == model
+                    });
+                let official_catalog = !self.model_profiles.model_ids(&provider).is_empty()
+                    && endpoint == provider.default_endpoint()
+                    && matches!(provider, Provider::Anthropic | Provider::Google);
+                let complete = official_catalog
+                    || self
+                        .complete_catalogs
+                        .iter()
+                        .any(|(p, e)| p == provider.id() && e == endpoint);
+                (known, complete)
+            });
+        let unavailable = availability.is_none_or(|(known, complete)| !known && complete);
+        if unavailable || !self.restore_model_selection(model, thinking.clone(), provider, true) {
+            self.restore_initial_selection(thinking);
+        }
+    }
+
+    fn restore_session_model(&mut self, session: &Session) {
+        // Pi treats a journal with no projected messages as a new session,
+        // even if it already contains model or thinking bookkeeping.
+        if !rpc_entries::Entries::new(session).has_session_context() {
+            if !self.model_explicit
+                && let Some(initial) = &self.initial_selection
+            {
+                self.provider = initial.provider.clone();
+                self.endpoint = initial.endpoint.clone();
+                self.model = initial.model.clone();
+                self.thinking_profile = None;
+            }
+            if !self.thinking_explicit {
+                self.thinking = Some(if self.model_explicit {
+                    self.settings
+                        .thinking_for_model(self.provider.id(), &self.model)
+                        .unwrap_or("medium")
+                        .to_owned()
+                } else {
+                    self.default_branch_thinking()
+                });
+            }
+            return;
+        }
+        // Extension-registered Pi virtual models are absent from this catalog.
+        // Pi treats absent catalog entries as nonvirtual.
+        let selection = session_import::branch_selection(session, |_, _| None);
+        let branch_thinking = match &selection {
+            session_import::BranchSelection::Native => {
+                session.model_selection().and_then(|(_, thinking)| thinking)
+            }
+            session_import::BranchSelection::Selected { thinking, .. }
+            | session_import::BranchSelection::Unresolved { thinking } => thinking.clone(),
+        };
+        match selection {
+            session_import::BranchSelection::Native => {
+                if let Some((model, thinking)) = session.model_selection() {
+                    self.restore_branch_selection(model, thinking, session.model_provider());
+                } else if !self.thinking_explicit {
+                    self.thinking = Some(self.default_branch_thinking());
+                }
+            }
+            session_import::BranchSelection::Selected {
+                provider,
+                model,
+                thinking,
+            } => {
+                self.restore_branch_selection(model, thinking, Some(&provider));
+            }
+            session_import::BranchSelection::Unresolved { thinking } => {
+                self.restore_initial_selection(thinking);
+            }
+        }
+        if !self.thinking_explicit {
+            self.thinking = Some(branch_thinking.unwrap_or_else(|| {
+                self.settings
+                    .string("defaultThinkingLevel")
+                    .unwrap_or("medium")
+                    .to_owned()
+            }));
+        }
+    }
+
+    fn remember_initial_selection(&mut self) {
+        self.selection_workspace = Some(self.workspace.clone());
+        self.initial_selection = Some(InitialSelection {
+            provider: self.provider.clone(),
+            endpoint: self.endpoint.clone(),
+            model: self.model.clone(),
+        });
+        self.cli_selection = self
+            .model_explicit
+            .then(|| self.initial_selection.clone())
+            .flatten();
+        self.cli_thinking = self
+            .thinking_explicit
+            .then(|| self.thinking.clone())
+            .flatten();
+    }
+
+    /// Recreate the new-session defaults from the current workspace while
+    /// retaining the original command-line overrides across session changes.
+    fn refresh_workspace_selection(&mut self) {
+        self.refresh_workspace_selection_with_timeout(Duration::from_secs(15));
+    }
+
+    fn refresh_workspace_selection_with_timeout(&mut self, timeout: Duration) {
+        let patterns: Vec<String> = self
+            .models
+            .as_deref()
+            .map(|value| value.split(',').map(str::to_owned).collect())
+            .unwrap_or_else(|| self.settings.strings("enabledModels"));
+        let mut catalogs = model_selection::cached_catalogs(self);
+        if self.selection_discovery_pending
+            || self
+                .selection_workspace
+                .as_ref()
+                .is_some_and(|cwd| cwd != &self.workspace)
+        {
+            // A previous runtime's negative catalog is not authoritative for
+            // this workspace, especially when rediscovery is unavailable.
+            self.complete_catalogs.clear();
+            let args = self.clone();
+            let patterns = patterns.clone();
+            let discovered = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let providers = std::iter::once(args.provider.clone())
+                        .chain(args.model_profiles.providers());
+                    let mut selected = Vec::new();
+                    for provider in providers {
+                        let in_scope =
+                            patterns
+                                .iter()
+                                .any(|pattern| match pattern.split_once('/') {
+                                    Some((prefix, _))
+                                        if args.model_profiles.provider(prefix).is_some() =>
+                                    {
+                                        prefix.eq_ignore_ascii_case(provider.id())
+                                    }
+                                    _ => true,
+                                });
+                        let needs_default = args.settings.string("defaultModel").is_none()
+                            && args
+                                .settings
+                                .string("defaultProvider")
+                                .is_some_and(|id| id.eq_ignore_ascii_case(provider.id()));
+                        if (in_scope || needs_default)
+                            && !selected.contains(&provider)
+                            && args.allow_endpoint_probes(args.endpoint_for(&provider))
+                        {
+                            selected.push(provider);
+                        }
+                    }
+                    Ok::<_, Error>(
+                        futures_util::future::join_all(selected.into_iter().map(
+                            |provider| async {
+                                tokio::time::timeout(
+                                    timeout,
+                                    model_selection::catalog(&args, provider, true),
+                                )
+                                .await
+                            },
+                        ))
+                        .await,
+                    )
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| Err(Error::Config("model discovery worker stopped".into())));
+            self.selection_discovery_pending = discovered.as_ref().map_or(true, |results| {
+                results
+                    .iter()
+                    .any(|result| !matches!(result, Ok(Ok(catalog)) if catalog.complete))
+            });
+            if let Ok(results) = discovered {
+                for catalog in results
+                    .into_iter()
+                    .filter_map(|result| result.ok().and_then(Result::ok))
+                {
+                    if catalog.complete {
+                        self.complete_catalogs.push((
+                            catalog.provider.id().to_owned(),
+                            self.endpoint_for(&catalog.provider).to_owned(),
+                        ));
+                        catalogs.retain(|cached| cached.provider != catalog.provider);
+                    } else if catalogs
+                        .iter()
+                        .any(|cached| cached.provider == catalog.provider)
+                    {
+                        continue;
+                    }
+                    catalogs.push(catalog);
+                }
+            }
+        }
+        self.selection_workspace = Some(self.workspace.clone());
+        self.discovered_models = catalogs
+            .iter()
+            .flat_map(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .map(|model| (catalog.provider.id().to_owned(), model.clone()))
+            })
+            .collect();
+        self.model_scope =
+            model_selection::scoped_choices(patterns.iter().map(String::as_str), &catalogs).0;
+
+        let fallback = self
+            .initial_selection
+            .clone()
+            .unwrap_or_else(|| InitialSelection {
+                provider: self.provider.clone(),
+                endpoint: self.endpoint.clone(),
+                model: self.model.clone(),
+            });
+        let configured = self.settings.string("defaultModel");
+        let configured_provider = self.settings.string("defaultProvider");
+        let qualified = configured
+            .filter(|_| configured_provider.is_none())
+            .and_then(|model| model_selection::qualified_model(model, &self.model_profiles));
+        let provider = self
+            .provider_argument
+            .as_deref()
+            .and_then(|name| self.model_profiles.provider(name))
+            .or_else(|| {
+                self.endpoint_explicit
+                    .then(|| {
+                        self.initial_connection
+                            .as_ref()
+                            .map(|(provider, _)| provider.clone())
+                    })
+                    .flatten()
+            })
+            .or_else(|| configured_provider.and_then(|name| self.model_profiles.provider(name)))
+            .or_else(|| qualified.as_ref().map(|(provider, _)| provider.clone()))
+            .unwrap_or_else(|| fallback.provider.clone());
+        let configured_for_provider = configured.filter(|_| {
+            (self.provider_argument.is_none() && !self.endpoint_explicit)
+                || configured_provider
+                    .and_then(|name| self.model_profiles.provider(name))
+                    .or_else(|| qualified.as_ref().map(|(candidate, _)| candidate.clone()))
+                    .unwrap_or_default()
+                    == provider
+        });
+        let model = configured_for_provider
+            .map(|value| {
+                qualified
+                    .as_ref()
+                    .filter(|(candidate, _)| *candidate == provider)
+                    .map_or(value, |(_, id)| *id)
+                    .to_owned()
+            })
+            .or_else(|| (provider == fallback.provider).then(|| fallback.model.clone()))
+            .or_else(|| {
+                catalogs
+                    .iter()
+                    .find(|catalog| catalog.provider == provider)
+                    .and_then(|catalog| catalog.models.first())
+                    .cloned()
+            });
+        let (provider, model) = model.map_or_else(
+            || (fallback.provider.clone(), fallback.model.clone()),
+            |model| (provider, model),
+        );
+        let chosen = self
+            .model_scope
+            .iter()
+            .find(|choice| choice.provider == provider && choice.model == model)
+            .or_else(|| {
+                self.model_scope
+                    .iter()
+                    .find(|choice| !self.connection_explicit || choice.provider == provider)
+            });
+        let (provider, model) = chosen.map_or((provider, model), |choice| {
+            (choice.provider.clone(), choice.model.clone())
+        });
+        let endpoint = self
+            .explicit_endpoint_for(&provider)
+            .unwrap_or_else(|| self.model_profiles.endpoint(&provider))
+            .to_owned();
+        let initial = InitialSelection {
+            provider,
+            model,
+            endpoint,
+        };
+        self.initial_selection = Some(initial.clone());
+        let effective = self.cli_selection.as_ref().unwrap_or(&initial);
+        self.provider = effective.provider.clone();
+        self.endpoint = effective.endpoint.clone();
+        self.model = effective.model.clone();
+        self.thinking_profile = None;
+        if self.thinking_explicit {
+            self.thinking = self.cli_thinking.clone();
         }
     }
 }
@@ -1086,6 +1502,25 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         .iter()
         .find(|catalog| catalog.provider == args.provider)
         .map_or(&[][..], |catalog| catalog.models.as_slice());
+    args.discovered_models = catalogs
+        .iter()
+        .flat_map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .map(|model| (catalog.provider.id().to_owned(), model.clone()))
+        })
+        .collect();
+    args.complete_catalogs = catalogs
+        .iter()
+        .filter(|catalog| catalog.complete)
+        .map(|catalog| {
+            (
+                catalog.provider.id().to_owned(),
+                args.endpoint_for(&catalog.provider).to_owned(),
+            )
+        })
+        .collect();
     // The hidden worker command receives an already-resolved, literal model ID.
     if !args.model.is_empty()
         && !args.model_from_settings
@@ -1140,11 +1575,19 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     if !args.thinking_explicit {
         args.apply_model_thinking_defaults();
     }
+    args.remember_initial_selection();
 
     if let Some(Command::Package(command)) = args.command.as_ref() {
         return packages::command(&args, command.clone()).await;
     }
     if matches!(args.command, Some(Command::Serve)) {
+        if let Ok(provenance) = std::env::var(process::SELECTION_PROVENANCE_ENV) {
+            let (model_explicit, thinking_explicit): (bool, bool) =
+                serde_json::from_str(&provenance)
+                    .map_err(|_| Error::Config("invalid worker selection provenance".into()))?;
+            args.model_explicit = model_explicit;
+            args.thinking_explicit = thinking_explicit;
+        }
         return backend::run(args).await;
     }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
@@ -1515,12 +1958,10 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         }
         _ => {}
     }
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking, session.model_provider());
-    }
+    args.restore_session_model(&session);
     if !args.model.is_empty() {
         thinking::adjust(&mut args);
-        args.record_model_selection(&mut session)?;
+        args.record_automatic_model_selection(&mut session)?;
     }
     if args.mode == Some(OutputMode::Json)
         && matches!(
@@ -1568,7 +2009,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 args.bind_initial_model_endpoint();
                 if !args.thinking_explicit { args.apply_model_thinking_defaults(); }
                 thinking::adjust(&mut args);
-                args.record_model_selection(&mut session)?;
+                args.record_automatic_model_selection(&mut session)?;
                 runtime.close().await?;
                 runtime = runtime::configure(&args, false).await?;
                 session.set_auto_compaction_control(runtime.auto_compaction.clone());

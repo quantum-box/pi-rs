@@ -45,6 +45,7 @@ pub struct Catalog {
     pub models: Vec<String>,
     aliases: Vec<(String, String)>,
     probe_details: bool,
+    pub complete: bool,
 }
 
 impl Catalog {
@@ -96,9 +97,11 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
     let mut probe_details = false;
     let bundled = super::builtin_chat::find(provider.id())
         .is_some_and(|builtin| args.endpoint_for(&provider) == builtin.endpoint());
+    let mut complete = false;
     if (probe && !bundled) || provider == Provider::Radius {
         match client.models().await {
             Ok(discovered) => {
+                complete = true;
                 let mut seen: std::collections::BTreeSet<_> = models.iter().cloned().collect();
                 models.extend(discovered.into_iter().filter(|id| seen.insert(id.clone())));
                 probe_details = true;
@@ -122,6 +125,7 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
         models,
         aliases,
         probe_details,
+        complete,
     })
 }
 
@@ -156,6 +160,49 @@ pub async fn catalogs(args: &Cli, automatic: bool) -> Result<Vec<Catalog>> {
         return Err(error);
     }
     Ok(catalogs)
+}
+
+/// Rebuild a workspace scope from the catalog data already available locally.
+pub(super) fn cached_catalogs(args: &Cli) -> Vec<Catalog> {
+    let providers = std::iter::once(args.provider.clone()).chain(
+        args.model_profiles
+            .providers()
+            .filter(|provider| *provider != args.provider),
+    );
+    providers
+        .filter_map(|provider| {
+            let client = args.connect_provider(&provider, None).ok()?;
+            let mut models = args.model_profiles.model_ids(&provider);
+            for model in args
+                .discovered_models
+                .iter()
+                .filter(|(id, _)| id == provider.id())
+                .map(|(_, model)| model)
+                .chain(
+                    args.model_scope
+                        .iter()
+                        .filter(|choice| choice.provider == provider)
+                        .map(|choice| &choice.model),
+                )
+            {
+                if !models.contains(model) {
+                    models.push(model.clone());
+                }
+            }
+            if models.is_empty() {
+                return None;
+            }
+            let aliases = aliases(&args.model_profiles, &provider, &models);
+            Some(Catalog {
+                provider,
+                client,
+                models,
+                aliases,
+                probe_details: false,
+                complete: false,
+            })
+        })
+        .collect()
 }
 
 pub fn scoped_choices<'a>(
@@ -477,6 +524,16 @@ pub fn fuzzy(query: &str, value: &str) -> bool {
 mod tests {
     use super::{Choice, Scope};
 
+    #[tokio::test]
+    async fn unqueried_dynamic_catalog_is_not_complete() {
+        use clap::Parser;
+        let args = super::Cli::parse_from(["pi"]);
+        let catalog = super::catalog(&args, super::Provider::Ollama, false)
+            .await
+            .unwrap();
+        assert!(!catalog.complete);
+    }
+
     #[test]
     fn scope_keeps_provider_identity_and_pattern_order() {
         use super::{Catalog, Provider, scoped_choices};
@@ -494,6 +551,7 @@ mod tests {
                 models: vec!["same".into(), "exact-extra".into()],
                 aliases: Vec::new(),
                 probe_details: false,
+                complete: false,
             },
             Catalog {
                 provider: Provider::Anthropic,
@@ -508,6 +566,7 @@ mod tests {
                 models: vec!["same".into(), "exact".into()],
                 aliases: Vec::new(),
                 probe_details: false,
+                complete: false,
             },
         ];
         let (choices, warnings) = scoped_choices(
@@ -675,12 +734,12 @@ mod tests {
             thinking: Some("high".into()),
         }];
         args.model = "beta:4b".into();
-        args.restore_model_selection("alpha:4b".into(), Some("low".into()), None);
+        args.restore_model_selection("alpha:4b".into(), Some("low".into()), None, false);
         assert_eq!(args.model, "beta:4b");
         assert_eq!(args.thinking.as_deref(), Some("high"));
         args.thinking_explicit = true;
         args.thinking = Some("off".into());
-        args.restore_model_selection("beta:4b".into(), Some("low".into()), None);
+        args.restore_model_selection("beta:4b".into(), Some("low".into()), None, false);
         assert_eq!(args.thinking.as_deref(), Some("off"));
     }
 }

@@ -1934,7 +1934,7 @@ mod tests {
         assert_eq!(args.model_scope[0].model, "local-scoped");
         assert_eq!(args.model_token().as_deref(), Some("local-override"));
         args.model = "local-scoped".into();
-        args.restore_model_selection("outside-scope".into(), None, Some("anthropic"));
+        args.restore_model_selection("outside-scope".into(), None, Some("anthropic"), false);
         assert_eq!(args.provider.id(), "ollama");
         assert_eq!(args.model, "local-scoped");
     }

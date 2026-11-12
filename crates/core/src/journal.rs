@@ -842,6 +842,8 @@ impl Session {
         }
         if self.model_selection() != Some((model.into(), thinking.map(str::to_owned)))
             || self.model_provider() != provider
+            || self.has_imported_response_since_selection()
+            || self.has_only_thinking_selection()
         {
             self.append(Event::ModelSelected {
                 model: model.into(),
@@ -850,6 +852,125 @@ impl Session {
             })?;
         }
         Ok(())
+    }
+
+    // Older journals may contain only a thinking marker and its synthetic
+    // ModelSelected record. An explicit model choice must establish a model.
+    fn has_only_thinking_selection(&self) -> bool {
+        let branch = self.branch();
+        let mut saw_thinking = false;
+        for (index, record) in branch.iter().enumerate().rev() {
+            if matches!(record.event, Event::ModelSelected { .. }) {
+                let thinking_only = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
+                    matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")
+                });
+                if !thinking_only {
+                    return false;
+                }
+                saw_thinking = true;
+            }
+        }
+        saw_thinking
+    }
+
+    /// Persist a thinking-only change without implying a model selection.
+    pub fn select_thinking_level(
+        &mut self,
+        provider: Option<&str>,
+        model: &str,
+        thinking: &str,
+    ) -> Result<()> {
+        if model.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        if !self.has_model_context() {
+            return self.select_provider_model(provider, model, Some(thinking));
+        }
+        if self
+            .model_selection()
+            .is_some_and(|(_, level)| level.as_deref() == Some(thinking))
+        {
+            return Ok(());
+        }
+        self.append(Event::SourceEntry {
+            format: "pi-rs:thinking-selection".into(),
+            entry: serde_json::Value::Null,
+        })?;
+        self.append(Event::ModelSelected {
+            model: model.into(),
+            provider: provider.map(str::to_owned),
+            thinking: Some(thinking.into()),
+        })?;
+        Ok(())
+    }
+
+    fn has_model_context(&self) -> bool {
+        let branch = self.branch();
+        branch.iter().enumerate().any(|(index, record)| match &record.event {
+            Event::SourceEntry { format, entry } if format == "pi" => entry["type"] == "model_change"
+                || (entry["type"] == "message" && entry["message"]["role"] == "assistant"),
+            Event::ModelSelected { .. } => !index.checked_sub(1).and_then(|i| branch.get(i))
+                .is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")),
+            Event::Assistant { request_id: Some(_), .. } => true,
+            _ => false,
+        })
+    }
+
+    /// Record the host connection used for subsequent model requests.
+    pub fn record_request_identity(&mut self, provider: &str, model: &str) -> Result<()> {
+        let identity = serde_json::json!({"provider": provider, "model": model});
+        if self
+            .branch()
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:request-identity" => {
+                    Some(entry)
+                }
+                _ => None,
+            })
+            .is_some_and(|previous| previous == &identity)
+        {
+            return Ok(());
+        }
+        self.append(Event::SourceEntry {
+            format: "pi-rs:request-identity".into(),
+            entry: identity,
+        })?;
+        Ok(())
+    }
+
+    // A Pi assistant may have been routed to another model after the last
+    // explicit selection. Without the host catalog we cannot resolve virtual
+    // models here, so persist an explicit user selection instead of deduping it.
+    fn has_imported_response_since_selection(&self) -> bool {
+        let branch = self.branch();
+        for (index, record) in branch.iter().enumerate().rev() {
+            match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi" => {
+                    if entry["type"] == "model_change" {
+                        return false;
+                    }
+                    if entry["type"] == "message"
+                        && entry["message"]["role"] == "assistant"
+                        && entry["message"]["api"] != "pi-virtual"
+                    {
+                        return true;
+                    }
+                }
+                Event::ModelSelected { .. } => {
+                    let imported = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
+                        matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection") ||
+                        (parent.timestamp == record.timestamp && record.run_id.is_none() && matches!(&parent.event, Event::SourceEntry { format, entry } if format == "pi" && matches!(entry["type"].as_str(), Some("model_change" | "thinking_level_change" | "message"))))
+                    });
+                    if !imported {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -1408,6 +1529,19 @@ impl Session {
         {
             self.append(Event::SourceEntry {
                 format: "pi-rs:native-custom-message".into(),
+                entry: serde_json::Value::Null,
+            })?;
+        }
+        // Distinguish a native selection from a conversion appended directly
+        // after a Pi source entry that did not itself produce a selection.
+        if matches!(&event, Event::ModelSelected { .. })
+            && self.records.get(self.head.saturating_sub(1) as usize).is_some_and(|record| {
+                matches!(&record.event, Event::SourceEntry { format, entry }
+                    if format == "pi" && matches!(entry["type"].as_str(), Some("model_change" | "thinking_level_change" | "message")))
+            })
+        {
+            self.append(Event::SourceEntry {
+                format: "pi-rs:native-model-selection".into(),
                 entry: serde_json::Value::Null,
             })?;
         }

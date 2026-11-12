@@ -506,6 +506,8 @@ type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
 
 #[derive(Default)]
 struct View {
+    async_transitions: bool,
+    pending_transition: Option<std::sync::mpsc::Receiver<Result<Cli>>>,
     regular: RegularState,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
@@ -2600,6 +2602,7 @@ fn slash(
             )?;
             drop(session);
             args.session = destination;
+            args.restore_session_model(&Session::open(&args.session)?);
             view.restore(args)?;
             args.session_transition = Some(pi_rs::SessionStartReason::Fork);
             if let Some(input) = input {
@@ -2838,6 +2841,22 @@ fn slash(
                 return Ok(None);
             }
             let mut next = args.clone();
+            if view.async_transitions {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = {
+                        next.refresh_workspace_selection();
+                        next.session = session_path(&next.workspace, next.session_dir.as_deref());
+                        next.session_transition = Some(pi_rs::SessionStartReason::New);
+                        Ok(next)
+                    };
+                    let _ = sender.send(result);
+                });
+                view.pending_transition = Some(receiver);
+                view.append("Preparing session (Esc to cancel)");
+                return Ok(None);
+            }
+            next.refresh_workspace_selection();
             next.session = session_path(&args.workspace, args.session_dir.as_deref());
             if let Some(directory) = next.session.parent() {
                 std::fs::create_dir_all(directory)?;
@@ -3119,6 +3138,7 @@ fn slash(
                 .map_err(|_| Error::Config("use /checkout <record-id>".into()))?;
             let mut session = Session::open(&args.session)?;
             session.checkout(id)?;
+            args.restore_session_model(&session);
             drop(session);
             view.restore(args)?;
         }
@@ -3272,8 +3292,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     {
         std::fs::create_dir_all(parent)?;
     }
-    initialize_session(&mut args)?;
-    restore_workspace(&mut args)?;
+    prepare_initial_session(&mut args)?;
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
@@ -3293,6 +3312,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         Err(error) => return Err(error),
     };
     let mut view = View {
+        async_transitions: true,
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
         ..View::default()
@@ -3335,7 +3355,31 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let mut last_clear: Option<Instant> = None;
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
+    let mut deferred_input = VecDeque::new();
     loop {
+        if let Some(receiver) = &view.pending_transition {
+            let ready = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(Error::Config(
+                    "session transition worker stopped".into(),
+                ))),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = ready {
+                if queued_transition_cancel(&mut deferred_input, |timeout| input.next(timeout))? {
+                    view.pending_transition = None;
+                    view.append("Session transition cancelled");
+                    dirty = true;
+                    continue;
+                }
+                view.pending_transition = None;
+                match result.and_then(|next| apply_session(&mut args, &mut view, next)) {
+                    Ok(()) => {}
+                    Err(error) => view.append(&error.to_string()),
+                }
+                dirty = true;
+            }
+        }
         if !is_busy(&worker) {
             for event in std::mem::take(&mut args.selection_events) {
                 if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
@@ -3733,6 +3777,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         }
         if !args.trust_pending
             && view.picker.is_none()
+            && view.pending_transition.is_none()
             && !is_busy(&worker)
             && let Some((prompt, images)) = initial.pop_front()
         {
@@ -3768,7 +3813,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         } else {
             Duration::from_millis(40)
         };
-        let event = match input.next(input_wait)? {
+        let next_input = if let Some(event) = deferred_input.pop_front() {
+            Some(event)
+        } else {
+            input.next(input_wait)?
+        };
+        let event = match next_input {
             Some(crate::ui::input::InputEvent::Event(event)) => event,
             #[cfg(unix)]
             Some(crate::ui::input::InputEvent::KeyboardEnhancementFlags(flags)) => {
@@ -3883,6 +3933,18 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             }
             _ => continue,
         };
+        if view.pending_transition.is_some() {
+            match &event {
+                Event::Key(key) if key.code == KeyCode::Esc => {
+                    view.pending_transition = None;
+                    view.append("Session transition cancelled");
+                    dirty = true;
+                    continue;
+                }
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => continue,
+                _ => {}
+            }
+        }
         let mut mouse_activate = false;
         let event = match event {
             Event::Mouse(mouse)
@@ -4921,10 +4983,10 @@ fn is_busy(worker: &Option<Worker>) -> bool {
 }
 
 fn persist_pending_thinking(pending: &PendingThinking) -> Result<()> {
-    Session::open(&pending.session)?.select_provider_model(
+    Session::open(&pending.session)?.select_thinking_level(
         pending.provider.as_deref(),
         &pending.model,
-        Some(&pending.level),
+        &pending.level,
     )
 }
 
@@ -6246,15 +6308,60 @@ fn select(
     Ok(())
 }
 
+// A bare Escape may need the input decoder's 25 ms disambiguation window.
+// Give already-arrived input priority over committing a prepared session.
+fn queued_transition_cancel(
+    deferred: &mut VecDeque<crate::ui::input::InputEvent>,
+    mut next: impl FnMut(Duration) -> std::io::Result<Option<crate::ui::input::InputEvent>>,
+) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_millis(30);
+    while Instant::now() < deadline {
+        match next(deadline.saturating_duration_since(Instant::now()))? {
+            Some(crate::ui::input::InputEvent::Event(Event::Key(key)))
+                if key.code == KeyCode::Esc && key.kind != KeyEventKind::Release =>
+            {
+                return Ok(true);
+            }
+            Some(crate::ui::input::InputEvent::Event(
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_),
+            )) => {}
+            Some(event) => deferred.push_back(event),
+            None => {}
+        }
+    }
+    Ok(false)
+}
+
 fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
     let mut next = args.clone();
-    next.model_explicit = false;
-    next.thinking_explicit = false;
     next.session = path;
     next.session_transition = Some(pi_rs::SessionStartReason::Resume);
+    if view.async_transitions {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = restore_workspace(&mut next).map(|()| next);
+            let _ = sender.send(result);
+        });
+        view.pending_transition = Some(receiver);
+        view.append("Preparing session (Esc to cancel)");
+        return Ok(());
+    }
     restore_workspace(&mut next)?;
+    apply_session(args, view, next)
+}
+
+fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
     let resources = super::resources::Resources::load(&next)?;
     next.theme_paths = resources.themes.clone();
+    if matches!(
+        next.session_transition,
+        Some(pi_rs::SessionStartReason::New)
+    ) {
+        if let Some(directory) = next.session.parent() {
+            std::fs::create_dir_all(directory)?;
+        }
+        initialize_session(&mut next)?;
+    }
     view.restore(&next)?;
     view.resources = resources;
     *args = next;
@@ -6262,6 +6369,11 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
         slash("/trust", args, view, None)?;
     }
     Ok(())
+}
+
+fn prepare_initial_session(args: &mut Cli) -> Result<()> {
+    restore_workspace(args)?;
+    initialize_session(args)
 }
 
 fn initialize_session(args: &mut Cli) -> Result<()> {
@@ -6277,18 +6389,13 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking, session.model_provider());
-    }
+    args.restore_session_model(&session);
     super::thinking::adjust(args);
-    args.record_model_selection(&mut session)?;
+    args.record_automatic_model_selection(&mut session)?;
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = Session::open(&args.session)?;
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking, session.model_provider());
-    }
     if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
         if !path.is_dir() {
@@ -6311,6 +6418,8 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
     args.settings = crate::config::Settings::load(&args.workspace, args.trusted)?;
+    args.refresh_workspace_selection();
+    args.restore_session_model(&session);
     drop(session);
     super::thinking::adjust(args);
     Ok(())
@@ -6514,6 +6623,292 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_escape_wins_over_ready_new_session() {
+        use clap::Parser;
+        use std::collections::VecDeque;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.jsonl");
+        let mut next = super::Cli::parse_from(["pi"]);
+        next.session = path.clone();
+        next.session_transition = Some(pi_rs::SessionStartReason::New);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok::<_, pi_rs::Error>(next)).unwrap();
+        let ready = receiver.try_recv().unwrap().unwrap();
+        let mut input = VecDeque::from([crate::ui::input::InputEvent::Event(
+            crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        )]);
+        let mut preserved = VecDeque::new();
+        let cancelled =
+            super::queued_transition_cancel(&mut preserved, |_| Ok(input.pop_front())).unwrap();
+        if !cancelled {
+            super::apply_session(
+                &mut super::Cli::parse_from(["pi"]),
+                &mut super::View::default(),
+                ready,
+            )
+            .unwrap();
+        }
+        assert!(cancelled);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancelled_new_session_does_not_create_a_journal_after_discovery() {
+        use clap::Parser;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("work");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        std::fs::write(
+            workspace.join(".pi/settings.json"),
+            r#"{"enabledModels":["ollama/dynamic"]}"#,
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 2048];
+            let _ = socket.read(&mut buf).unwrap();
+            accepted.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            let body = r#"{"data":[{"id":"dynamic"}]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = workspace.clone();
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().join("sessions"));
+        args.trust = true;
+        args.settings = super::super::config::Settings::load(&workspace, true).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"ollama":{"baseUrl":endpoint,"models":[{"id":"alpha"}]}}})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        args.selection_discovery_pending = true;
+        let mut view = super::View {
+            async_transitions: true,
+            ..Default::default()
+        };
+        super::slash("/new", &mut args, &mut view, None).unwrap();
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        let cancelled = view.pending_transition.take().unwrap();
+        release.send(()).unwrap();
+        let prepared = cancelled
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(!prepared.session.exists());
+        assert!(!root.path().join("sessions").exists());
+        assert_eq!(args.session, root.path().join("current.jsonl"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn interactive_workspace_switch_prepares_in_background_before_applying_scope() {
+        use clap::Parser;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            r#"{"enabledModels":["ollama/dynamic"]}"#,
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 2048];
+            let _ = socket.read(&mut buf).unwrap();
+            accepted.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(10)).unwrap();
+            let body = r#"{"data":[{"id":"dynamic"}]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let path = root.path().join("target.jsonl");
+        pi_rs::Session::open(&path)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = launch;
+        args.session = root.path().join("launch.jsonl");
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"ollama":{"baseUrl":endpoint,"models":[{"id":"alpha"}]}}})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        let mut view = super::View {
+            async_transitions: true,
+            ..Default::default()
+        };
+        super::switch_session(&mut args, &mut view, path.clone()).unwrap();
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(args.model, "alpha");
+        assert_ne!(args.session, path);
+        assert!(matches!(
+            view.pending_transition.as_ref().unwrap().try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let next = view
+            .pending_transition
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        super::apply_session(&mut args, &mut view, next).unwrap();
+        assert_eq!(args.session, path);
+        assert_eq!(args.model, "dynamic");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn startup_loads_saved_workspace_settings_before_recording_selection() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let launch = directory.path().join("launch");
+        let target = directory.path().join("target");
+        for (path, level) in [(&launch, "low"), (&target, "high")] {
+            std::fs::create_dir_all(path.join(".pi")).unwrap();
+            std::fs::write(
+                path.join(".pi/settings.json"),
+                format!(r#"{{"defaultThinkingLevel":"{level}"}}"#),
+            )
+            .unwrap();
+        }
+        let session_path = directory.path().join("session.jsonl");
+        let mut session = pi_rs::Session::open(&session_path).unwrap();
+        session.set_working_directory(&target).unwrap();
+        drop(session);
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = session_path.clone();
+        args.workspace = launch.clone();
+        args.settings = super::super::config::Settings::load(&launch, true).unwrap();
+        args.trust = true;
+        args.model = "fixture".into();
+        args.thinking = Some("low".into());
+        args.remember_initial_selection();
+        super::prepare_initial_session(&mut args).unwrap();
+        assert_eq!(
+            args.workspace.canonicalize().unwrap(),
+            target.canonicalize().unwrap()
+        );
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        let session = pi_rs::Session::open(&session_path).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("fixture".into(), Some("high".into())))
+        );
+    }
+    #[test]
+    fn imported_branch_checkout_fork_and_switch_restore_selection() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"a","parentId":null,"provider":"ollama","modelId":"model-a"}),
+            json!({"type":"message","id":"u1","parentId":"a","message":{"role":"user","content":"first"}}),
+            json!({"type":"message","id":"b","parentId":"u1","message":{"role":"assistant","provider":"ollama","model":"model-b","content":[]}}),
+            json!({"type":"message","id":"u2","parentId":"b","message":{"role":"user","content":"second"}}),
+        ];
+        std::fs::write(
+            &source,
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let first = imported
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, pi_rs::Event::User { content, .. } if content == "first"))
+            .unwrap()
+            .id;
+        let second = imported
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, pi_rs::Event::User { content, .. } if content == "second"))
+            .unwrap()
+            .id;
+        let session_path = directory.path().join("native.jsonl");
+        imported.export_jsonl(&session_path).unwrap();
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.workspace = directory.path().into();
+        args.session_dir = Some(directory.path().into());
+        args.session = session_path;
+        args.model = "initial".into();
+        args.discovered_models = vec![
+            ("ollama".into(), "model-a".into()),
+            ("ollama".into(), "model-b".into()),
+        ];
+        args.no_trust = true;
+        args.remember_initial_selection();
+        let mut view = super::View::default();
+        super::slash(&format!("/checkout {second}"), &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "model-b");
+        super::slash(&format!("/checkout {first}"), &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "model-a");
+        super::slash(&format!("/checkout {second}"), &mut args, &mut view, None).unwrap();
+        super::slash(&format!("/fork {first}"), &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "model-a");
+
+        let invalid_source = directory.path().join("invalid-pi.jsonl");
+        let invalid = [
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"t","parentId":null,"thinkingLevel":"high"}),
+            json!({"type":"message","id":"m","parentId":"t","message":{"role":"assistant","model":"missing-provider","content":[]}}),
+        ];
+        std::fs::write(
+            &invalid_source,
+            invalid.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let invalid_session = directory.path().join("invalid-native.jsonl");
+        super::super::session_import::read(&invalid_source)
+            .unwrap()
+            .export_jsonl(&invalid_session)
+            .unwrap();
+        super::switch_session(&mut args, &mut view, invalid_session).unwrap();
+        assert_eq!(args.model, "initial");
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+    }
     #[test]
     fn patched_results_render_status_and_details_from_record_events() {
         use super::*;
@@ -6808,6 +7203,120 @@ mod tests {
             args.session_transition,
             Some(pi_rs::SessionStartReason::New)
         ));
+    }
+
+    #[test]
+    fn new_and_empty_saved_sessions_use_initial_model_and_default_thinking() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = directory.path().to_owned();
+        args.session_dir = Some(directory.path().to_owned());
+        args.session = directory.path().join("current.jsonl");
+        args.endpoint = "https://example.invalid/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        std::fs::create_dir_all(directory.path().join(".pi")).unwrap();
+        std::fs::write(
+            directory.path().join(".pi/settings.json"),
+            r#"{"defaultThinkingLevel":"low"}"#,
+        )
+        .unwrap();
+        args.settings = super::super::config::Settings::load(directory.path(), true).unwrap();
+        args.model = "alpha".into();
+        args.thinking = Some("low".into());
+        args.no_trust = true;
+        args.remember_initial_selection();
+        let empty_path = directory.path().join("saved-empty.jsonl");
+        drop(pi_rs::Session::open(&empty_path).unwrap());
+        let mut view = super::View {
+            available_models: vec!["ollama/alpha".into(), "ollama/beta".into()],
+            ..Default::default()
+        };
+        super::slash("/model beta:high", &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "beta");
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        super::slash("/new", &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "alpha");
+        assert_eq!(args.thinking.as_deref(), Some("low"));
+        let session = pi_rs::Session::open(&args.session).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("alpha".into(), Some("low".into())))
+        );
+        assert_eq!(session.model_provider(), None);
+        drop(session);
+        super::switch_session(&mut args, &mut view, empty_path).unwrap();
+        assert_eq!(args.model, "alpha");
+    }
+
+    #[test]
+    fn new_session_restores_original_cli_model_and_thinking_overrides() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = directory.path().into();
+        args.session_dir = Some(directory.path().into());
+        args.session = directory.path().join("current.jsonl");
+        args.endpoint = "https://example.invalid/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        args.model = "alpha".into();
+        args.thinking = Some("low".into());
+        args.model_explicit = true;
+        args.thinking_explicit = true;
+        args.remember_initial_selection();
+        let mut view = super::View {
+            available_models: vec!["ollama/alpha".into(), "ollama/beta".into()],
+            ..Default::default()
+        };
+        super::slash("/model beta:high", &mut args, &mut view, None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("beta", Some("high"))
+        );
+        super::slash("/new", &mut args, &mut view, None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("alpha", Some("low"))
+        );
+        let session = pi_rs::Session::open(&args.session).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("alpha".into(), Some("low".into())))
+        );
+    }
+
+    #[test]
+    fn new_session_restores_individual_cli_overrides() {
+        use clap::Parser;
+        for (model_explicit, thinking_explicit, expected_thinking) in
+            [(true, false, "medium"), (false, true, "low")]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let mut args = super::Cli::parse_from(["pi", "--offline"]);
+            args.workspace = directory.path().into();
+            args.session_dir = Some(directory.path().into());
+            args.session = directory.path().join("current.jsonl");
+            args.endpoint = "https://example.invalid/v1/chat/completions".into();
+            args.endpoint_explicit = true;
+            args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+            args.model = "alpha".into();
+            args.thinking = Some("low".into());
+            args.model_explicit = model_explicit;
+            args.thinking_explicit = thinking_explicit;
+            args.remember_initial_selection();
+            let mut view = super::View {
+                available_models: vec!["ollama/alpha".into(), "ollama/beta".into()],
+                ..Default::default()
+            };
+            super::slash("/model beta:high", &mut args, &mut view, None).unwrap();
+            super::slash("/new", &mut args, &mut view, None).unwrap();
+            assert_eq!(
+                (args.model.as_str(), args.thinking.as_deref()),
+                ("alpha", Some(expected_thinking))
+            );
+        }
     }
 
     #[test]

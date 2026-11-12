@@ -126,10 +126,10 @@ pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
 
 fn persist(args: &mut Cli, level: &str) -> Result<()> {
     let previous_level = args.thinking.as_deref().unwrap_or("off").to_owned();
-    Session::open(&args.session)?.select_provider_model(
+    Session::open(&args.session)?.select_thinking_level(
         args.recorded_provider(),
         &args.model,
-        Some(level),
+        level,
     )?;
     args.thinking = Some(level.into());
     if previous_level != level {

@@ -2055,7 +2055,6 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
         r#"{"id":"unknown","type":"unsupported"}"#,
         r#"{"id":"stats","type":"get_session_stats"}"#,
         r#"{"id":"native","type":"get_state","includeNative":true}"#,
-        r#"{"id":"stop","type":"shutdown"}"#,
     ] {
         writeln!(stdin, "{request}").unwrap();
     }
@@ -2071,7 +2070,7 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 6);
+    assert_eq!(replies.len(), 5);
     assert_eq!(replies[0]["id"], "state");
     assert_eq!(replies[0]["data"]["isStreaming"], false);
     assert!(replies[0]["data"].get("sessionFile").is_none());
@@ -2083,7 +2082,6 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
     assert!(replies[3]["data"].get("sessionFile").is_none());
     assert_eq!(replies[4]["id"], "native");
     assert!(replies[4]["data"]["sessionFile"].is_string());
-    assert_eq!(replies[5]["id"], "stop");
 }
 
 #[test]
@@ -2098,20 +2096,32 @@ fn rpc_model_discovery_does_not_block_other_commands() {
     let (accepted, ready) = std::sync::mpsc::channel();
     let (release, gate) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let (mut socket, mut reader, first) = accept_proxy_request(listener);
-        assert!(first.starts_with("GET "), "{first}");
         loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            if line == "\r\n" || line.is_empty() {
-                break;
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
             }
+            if first.starts_with("GET /api/ps ") {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            assert!(first.starts_with("GET /v1/models "), "{first}");
+            accepted.send(()).unwrap();
+            let _ = gate.recv_timeout(Duration::from_secs(30));
+            let body = br#"{"data":[{"id":"fixture-model"}]}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(body).unwrap();
+            break;
         }
-        accepted.send(()).unwrap();
-        let _ = gate.recv_timeout(Duration::from_secs(30));
-        let body = br#"{"data":[{"id":"fixture-model"}]}"#;
-        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-        socket.write_all(body).unwrap();
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", root.path())
@@ -2164,7 +2174,7 @@ fn rpc_model_discovery_does_not_block_other_commands() {
     assert_eq!(event["success"], true);
     let models = received.recv_timeout(Duration::from_secs(30)).unwrap();
     assert_eq!(models["id"], "models", "{models}");
-    assert_eq!(models["success"], true);
+    assert_eq!(models["success"], true, "{models}");
     assert!(
         models["data"]["models"]
             .as_array()
@@ -2176,6 +2186,694 @@ fn rpc_model_discovery_does_not_block_other_commands() {
     reader.join().unwrap();
     server.join().unwrap();
     assert!(status.success());
+}
+
+#[test]
+fn rpc_workspace_switch_defers_thinking_levels_and_orders_session_commands() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let launch = root.path().join("launch");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(launch.join(".pi")).unwrap();
+    std::fs::create_dir_all(target.join(".pi")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"alpha","reasoning":false},{"id":"dynamic","reasoning":true}]}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        launch.join(".pi/settings.json"),
+        json!({"defaultProvider":"ollama","defaultModel":"alpha"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        target.join(".pi/settings.json"),
+        json!({"enabledModels":["ollama/dynamic"]}).to_string(),
+    )
+    .unwrap();
+    let target_session = root.path().join("target.jsonl");
+    Session::open(&target_session)
+        .unwrap()
+        .set_working_directory(&target)
+        .unwrap();
+    let (accepted, ready) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(first.starts_with("GET /v1/models "), "{first}");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        accepted.send(()).unwrap();
+        gate.recv_timeout(Duration::from_secs(10)).unwrap();
+        let body = br#"{"data":[{"id":"dynamic"}]}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        socket.write_all(body).unwrap();
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", &home)
+        .arg("--workspace")
+        .arg(&launch)
+        .arg("--session")
+        .arg(root.path().join("launch.jsonl"))
+        .args(["--mode", "rpc", "--offline", "--no-mcp", "--approve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(child.stdout.take().unwrap())
+            .lines()
+            .map_while(Result::ok)
+        {
+            if send
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+        child.wait_with_output().unwrap()
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"switch","type":"switch_session","sessionPath":target_session})
+    )
+    .unwrap();
+    ready.recv_timeout(Duration::from_secs(10)).unwrap();
+    writeln!(input, "{}", json!({"id":"state","type":"get_state"})).unwrap();
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"levels","type":"get_available_thinking_levels"})
+    )
+    .unwrap();
+    assert!(receive.recv_timeout(Duration::from_millis(150)).is_err());
+    writeln!(input, "{}", json!({"id":"new","type":"new_session"})).unwrap();
+    writeln!(input, "{}", json!({"id":"state2","type":"get_state"})).unwrap();
+    release.send(()).unwrap();
+    let mut replies = Vec::new();
+    while replies.len() < 5 {
+        let event = receive.recv_timeout(Duration::from_secs(10)).unwrap();
+        if ["switch", "state", "levels", "new", "state2"]
+            .contains(&event["id"].as_str().unwrap_or_default())
+        {
+            replies.push(event);
+        }
+    }
+    assert_eq!(replies[0]["id"], "switch");
+    assert_eq!(replies[0]["success"], true);
+    assert_eq!(replies[1]["id"], "state");
+    assert_eq!(replies[1]["data"]["model"]["id"], "dynamic");
+    assert_eq!(replies[2]["id"], "levels");
+    assert!(replies[2]["data"]["levels"].as_array().unwrap().len() > 1);
+    assert_eq!(replies[3]["id"], "new");
+    assert_eq!(replies[3]["success"], true);
+    assert_eq!(replies[4]["id"], "state2");
+    assert_eq!(replies[4]["data"]["model"]["id"], "dynamic");
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let output = reader.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn rpc_abort_and_shutdown_cancel_pending_switch_and_queued_prompt() {
+    for control in ["abort", "shutdown"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(launch.join(".pi")).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"alpha","reasoning":false}]}}}).to_string()).unwrap();
+        std::fs::write(
+            launch.join(".pi/settings.json"),
+            json!({"defaultProvider":"ollama","defaultModel":"alpha"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"enabledModels":["ollama/dynamic"]}).to_string(),
+        )
+        .unwrap();
+        let path = root.path().join("target.jsonl");
+        Session::open(&path)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, _) = accept_proxy_request(listener);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            accepted.send(()).unwrap();
+            let _ = gate.recv_timeout(Duration::from_secs(10));
+            let body = br#"{"data":[{"id":"dynamic"}]}"#;
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(body);
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .arg("--workspace")
+            .arg(&launch)
+            .arg("--session")
+            .arg(root.path().join("launch.jsonl"))
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--approve"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(child.stdout.take().unwrap())
+                .lines()
+                .map_while(Result::ok)
+            {
+                if send
+                    .send(serde_json::from_str::<Value>(&line).unwrap())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            child.wait_with_output().unwrap()
+        });
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"switch","type":"switch_session","sessionPath":path})
+        )
+        .unwrap();
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"prompt","type":"prompt","message":"must not run"})
+        )
+        .unwrap();
+        writeln!(input, "{}", json!({"id":"control","type":control})).unwrap();
+        let mut replies = Vec::new();
+        while replies.len() < 3 {
+            let event = receive
+                .recv_timeout(Duration::from_secs(3))
+                .expect("control blocked by discovery");
+            if event.get("id").is_some() {
+                replies.push(event);
+            }
+        }
+        assert_eq!(replies[0]["id"], "switch");
+        assert_eq!(replies[0]["data"]["cancelled"], true);
+        assert_eq!(replies[1]["id"], "prompt");
+        assert_eq!(replies[1]["success"], false);
+        assert_eq!(replies[2]["id"], "control");
+        assert_eq!(replies[2]["success"], true);
+        if control == "abort" {
+            writeln!(input, "{}", json!({"id":"state","type":"get_state"})).unwrap();
+            let state = receive.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(state["id"], "state");
+            assert_eq!(state["data"]["model"]["id"], "alpha");
+            writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+        }
+        drop(input);
+        let _ = release.send(());
+        let output = reader.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn rpc_new_session_recreates_cli_and_workspace_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let launch = root.path().join("launch");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha","reasoning":true},{"id":"beta","reasoning":true}]}}}).to_string()).unwrap();
+    for (workspace, model, thinking) in [(&launch, "alpha", "low"), (&target, "beta", "high")] {
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        std::fs::write(workspace.join(".pi/settings.json"), json!({"defaultProvider":"ollama","defaultModel":model,"defaultThinkingLevel":thinking,"enabledModels":[format!("ollama/{model}:{thinking}")]}).to_string()).unwrap();
+    }
+    let target_session = root.path().join("target.jsonl");
+    let mut session = Session::open(&target_session).unwrap();
+    session.set_working_directory(&target).unwrap();
+    drop(session);
+    for explicit in [true, false] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .env("PI_RS_HOME", &home)
+            .arg("--workspace")
+            .arg(&launch)
+            .arg("--session")
+            .arg(root.path().join(if explicit {
+                "explicit.jsonl"
+            } else {
+                "workspace.jsonl"
+            }))
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--approve"]);
+        if explicit {
+            command.args(["--model", "alpha", "--thinking", "low"]);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut requests = Vec::new();
+        if !explicit {
+            requests
+                .push(json!({"id":"switch","type":"switch_session","sessionPath":target_session}));
+        }
+        requests.push(json!({"id":"model","type":"set_model","provider":"ollama","modelId":if explicit { "beta" } else { "alpha" }}));
+        requests.push(json!({"id":"thinking","type":"set_thinking_level","level":if explicit { "high" } else { "low" }}));
+        requests.push(json!({"id":"new","type":"new_session"}));
+        requests.push(json!({"id":"state","type":"get_state"}));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                requests
+                    .iter()
+                    .map(|request| format!("{request}\n"))
+                    .collect::<String>()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let responses: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in if explicit {
+            vec!["model", "thinking", "new"]
+        } else {
+            vec!["switch", "model", "thinking", "new"]
+        } {
+            let response = responses.iter().find(|value| value["id"] == id).unwrap();
+            assert_eq!(response["success"], true, "{response}");
+        }
+        let state = responses
+            .iter()
+            .find(|value| value["id"] == "state")
+            .unwrap();
+        assert_eq!(
+            state["data"]["model"]["id"],
+            if explicit { "alpha" } else { "beta" },
+            "{state}"
+        );
+        assert_eq!(
+            state["data"]["thinkingLevel"],
+            if explicit { "low" } else { "high" },
+            "{state}"
+        );
+    }
+}
+
+#[test]
+fn scoped_thinking_applies_to_new_sessions_and_resumes_restore_branch_thinking() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        json!({
+            "defaultProvider":"ollama", "defaultModel":"alpha",
+            "defaultThinkingLevel":"medium",
+            "enabledModels":["ollama/alpha:high", "ollama/beta:high"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"ollama":{
+            "baseUrl":"https://example.invalid/v1", "models":[
+                {"id":"alpha", "reasoning":true}, {"id":"beta", "reasoning":true},
+                {"id":"gamma", "reasoning":true}
+            ]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    for (index, arguments, saved_model, has_message, expected_model, expected_thinking) in [
+        (0, vec![], "alpha", false, "alpha", "high"),
+        (
+            1,
+            vec!["--model", "alpha"],
+            "alpha",
+            false,
+            "alpha",
+            "medium",
+        ),
+        (2, vec!["--model", "beta"], "alpha", false, "beta", "medium"),
+        (4, vec![], "gamma", false, "alpha", "high"),
+        (
+            3,
+            vec!["--model", "beta", "--thinking", "minimal"],
+            "alpha",
+            false,
+            "beta",
+            "minimal",
+        ),
+        (5, vec![], "alpha", true, "alpha", "low"),
+        (6, vec!["--model", "alpha"], "alpha", true, "alpha", "low"),
+        (7, vec!["--model", "beta"], "alpha", true, "beta", "low"),
+        (
+            8,
+            vec!["--model", "beta", "--thinking", "minimal"],
+            "alpha",
+            true,
+            "beta",
+            "minimal",
+        ),
+        (9, vec![], "gamma", true, "gamma", "low"),
+        (
+            10,
+            vec!["--provider", "ollama", "--model", "beta"],
+            "alpha",
+            true,
+            "beta",
+            "low",
+        ),
+    ] {
+        let path = directory.path().join(format!("session-{index}.jsonl"));
+        let mut session = Session::open(&path).unwrap();
+        session
+            .select_provider_model(None, saved_model, Some("low"))
+            .unwrap();
+        if has_message {
+            session
+                .append_user_with_images("existing conversation".into(), Vec::new(), None)
+                .unwrap();
+        }
+        drop(session);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .args(["--session"])
+            .arg(&path)
+            .args(["--workspace"])
+            .arg(directory.path())
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--no-trust"])
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state: Value =
+            serde_json::from_slice(output.stdout.split(|byte| *byte == b'\n').next().unwrap())
+                .unwrap();
+        assert_eq!(state["data"]["model"]["id"], expected_model, "{state}");
+        assert_eq!(state["data"]["thinkingLevel"], expected_thinking, "{state}");
+    }
+}
+
+#[test]
+fn rpc_worker_preserves_imported_selection_and_cli_provenance() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"defaultProvider":"ollama","defaultModel":"physical"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1","models":[{"id":"physical","reasoning":true}]}}}).to_string()).unwrap();
+    let source = root.path().join("pi.jsonl");
+    let entries = [
+        json!({"type":"session","version":3}),
+        json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+        json!({"type":"message","id":"user","parentId":"change","message":{"role":"user","content":"question"}}),
+        json!({"type":"message","id":"assistant","parentId":"user","message":{"role":"assistant","provider":"ollama","model":"physical","content":[]}}),
+    ];
+    std::fs::write(
+        &source,
+        entries
+            .iter()
+            .map(|entry| format!("{entry}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    for (label, flags, expected) in [
+        ("implicit", vec![], vec!["virtual"]),
+        ("thinking", vec!["--thinking", "high"], vec!["virtual"]),
+        (
+            "model",
+            vec!["--model", "physical"],
+            vec!["virtual", "physical"],
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"physical","reasoning":true}]}}}).to_string()).unwrap();
+        let server = std::thread::spawn(move || {
+            loop {
+                let (mut socket, mut reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                if !first.starts_with("POST /v1/chat/completions ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                let events = concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+                break;
+            }
+        });
+        let native = root.path().join(format!("{label}.jsonl"));
+        let imported = Command::new(env!("CARGO_BIN_EXE_pi-rs"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(root.path())
+            .args(["--offline", "--no-mcp", "--no-trust", "import"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(root.path())
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--no-trust"])
+            .args(flags)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(child.stdout.take().unwrap())
+                .lines()
+                .map_while(Result::ok)
+            {
+                if send
+                    .send(serde_json::from_str::<Value>(&line).unwrap())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            child.wait_with_output().unwrap()
+        });
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"prompt","type":"prompt","message":"continue"})
+        )
+        .unwrap();
+        loop {
+            let event = receive.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["type"] == "agent_settled" {
+                assert_eq!(event["aborted"], false, "{event}");
+                break;
+            }
+        }
+        writeln!(input, "{}", json!({"id":"entries","type":"get_entries"})).unwrap();
+        let projected = loop {
+            let event = receive.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["type"] == "response" && event["id"] == "entries" {
+                break event;
+            }
+        };
+        let changes: Vec<_> = projected["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["type"] == "model_change")
+            .filter_map(|entry| entry["modelId"].as_str())
+            .collect();
+        assert_eq!(changes, expected, "{label}: {projected}");
+        if label == "thinking" {
+            assert!(
+                projected["data"]["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["type"] == "thinking_level_change"
+                        && entry["thinkingLevel"] == "high"),
+                "{projected}"
+            );
+        }
+        writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+        drop(input);
+        let output = reader.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn omitted_user_with_empty_failed_assistant_is_a_resumed_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("settings.json"), json!({"defaultProvider":"ollama", "defaultModel":"alpha", "enabledModels":["ollama/alpha:high"]}).to_string()).unwrap();
+    std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha", "reasoning":true}]}}}).to_string()).unwrap();
+    for (index, reason, omit_assistant, expected) in [
+        (0, "error", false, "low"),
+        (1, "aborted", false, "low"),
+        (2, "error", true, "high"),
+    ] {
+        let source = directory.path().join(format!("source-{index}.jsonl"));
+        let native = directory.path().join(format!("native-{index}.jsonl"));
+        let mut entries = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"m","parentId":null,"provider":"ollama","modelId":"alpha"}),
+            json!({"type":"thinking_level_change","id":"t","parentId":"m","thinkingLevel":"low"}),
+            json!({"type":"message","id":"u","parentId":"t","message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","provider":"ollama","model":"alpha","stopReason":reason,"content":[]}}),
+            json!({"type":"context_edit","id":"eu","parentId":"a","targetId":"u","replacement":null}),
+        ];
+        if omit_assistant {
+            entries.push(json!({"type":"context_edit","id":"ea","parentId":"eu","targetId":"a","replacement":null}));
+        }
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = Command::new(env!("CARGO_BIN_EXE_pi-rs"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(directory.path())
+            .args(["--offline", "--no-mcp", "--no-trust", "import"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(directory.path())
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--no-trust"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state: Value =
+            serde_json::from_slice(output.stdout.split(|byte| *byte == b'\n').next().unwrap())
+                .unwrap();
+        assert_eq!(state["data"]["thinkingLevel"], expected, "{state}");
+    }
 }
 
 #[test]
@@ -3689,7 +4387,7 @@ fn default_model_and_provider_are_read_as_separate_fields() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
         let output = process.wait_with_output().unwrap();
         assert!(
             output.status.success(),
@@ -3704,5 +4402,51 @@ fn default_model_and_provider_are_read_as_separate_fields() {
         let state = events.iter().find(|event| event["id"] == "state").unwrap();
         assert_eq!(state["data"]["model"]["provider"], provider);
         assert_eq!(state["data"]["model"]["id"], model);
+        let after = events.iter().find(|event| event["id"] == "after").unwrap();
+        assert_eq!(after["data"]["model"]["provider"], provider);
+        assert_eq!(after["data"]["model"]["id"], model);
+    }
+}
+
+#[test]
+fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("models.json"), json!({"providers":{
+        "ollama":{"baseUrl":"https://example.invalid/v1","models":[{"id":"alpha"}]},
+        "relay":{"baseUrl":"https://example.invalid/v1","api":"openai-completions","models":[{"id":"beta"}]}
+    }}).to_string()).unwrap();
+    std::fs::write(root.path().join("settings.json"), json!({"defaultProvider":"ollama","defaultModel":"alpha","enabledModels":["ollama/alpha","relay/beta"]}).to_string()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--offline",
+            "--provider",
+            "relay",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{\"id\":\"before\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for id in ["before", "after"] {
+        let state = events.iter().find(|event| event["id"] == id).unwrap();
+        assert_eq!(state["data"]["model"]["provider"], "relay", "{state}");
+        assert_eq!(state["data"]["model"]["id"], "beta", "{state}");
     }
 }

@@ -584,7 +584,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             if session.working_directory().is_none() {
                 session.set_working_directory(&args.workspace)?;
             }
-            args.record_model_selection(session)?;
+            args.record_automatic_model_selection(session)?;
             initialize_queue_modes(session, &args)?;
             snapshot.lock().expect("session snapshot").refresh(session);
             cache_capture.initialize(session, &runtime.registry);
