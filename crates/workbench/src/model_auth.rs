@@ -25,11 +25,18 @@ static STORED_COMMANDS: LazyLock<Mutex<BTreeMap<String, CachedCommand>>> =
 
 impl Credential {
     pub fn configured(value: &str) -> Option<Self> {
+        Self::configured_with_env(value, None)
+    }
+
+    fn configured_with_env(
+        value: &str,
+        env: Option<&serde_json::Map<String, Value>>,
+    ) -> Option<Self> {
         if let Some(command) = value.strip_prefix('!') {
             return (!command.trim().is_empty() && value.len() <= 16 * 1024)
                 .then(|| Self::Command(value.into()));
         }
-        super::model_profiles::expand_value(value)
+        super::model_profiles::expand_value_with_env(value, env)
             .filter(|value| !value.trim().is_empty())
             .map(Self::Literal)
     }
@@ -137,7 +144,7 @@ impl Keys {
                                 Credential::Invalid
                             };
                         }
-                        match Credential::configured(value) {
+                        match Credential::configured_with_env(value, entry["env"].as_object()) {
                             Some(Credential::Command(command)) => {
                                 Credential::StoredCommand(command)
                             }
@@ -293,6 +300,43 @@ pub(super) fn valid_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stored_api_key_interpolates_credential_environment() {
+        let keys = Keys::parse(&json!({
+            "anthropic": {"type":"api_key", "key":"prefix-${TOKEN}-$$", "env":{"TOKEN":"credential-secret"}},
+            "typesafe": {"type":"api_key", "key":"$TOKEN", "env":{"TOKEN":"operation-secret"}},
+            "openai": {"type":"api_key", "key":"$TOKEN", "literal":true, "env":{"TOKEN":"ignored"}}
+        }));
+        let key = keys
+            .credential(&Provider::Anthropic, Provider::Anthropic.default_endpoint())
+            .unwrap();
+        assert_eq!(key.resolve().await.unwrap(), "prefix-credential-secret-$");
+        let key = keys
+            .operation_credential("typesafe", "https://api.typesafe.ai/v1/systemone", true)
+            .unwrap();
+        assert_eq!(key.resolve().await.unwrap(), "operation-secret");
+        let openai = Provider::named("openai").unwrap();
+        assert_eq!(
+            keys.credential(&openai, openai.default_endpoint())
+                .unwrap()
+                .resolve()
+                .await
+                .unwrap(),
+            "$TOKEN"
+        );
+        let local = json!({"PATH":"credential-path"});
+        assert_eq!(
+            super::super::model_profiles::expand_value_with_env("$PATH", local.as_object())
+                .as_deref(),
+            Some("credential-path")
+        );
+        let empty = json!({"PATH":""});
+        assert_eq!(
+            super::super::model_profiles::expand_value_with_env("$PATH", empty.as_object()),
+            std::env::var("PATH").ok().filter(|v| !v.is_empty())
+        );
+    }
 
     #[test]
     fn chatgpt_oauth_credentials_are_bound_to_the_official_endpoint() {

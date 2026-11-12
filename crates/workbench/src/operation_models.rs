@@ -155,6 +155,12 @@ impl Catalogue {
         let mut seen = BTreeSet::new();
         for (name, provider) in &combined {
             let name = name.to_ascii_lowercase();
+            let inferred_base =
+                if provider["baseUrl"].as_str().is_none() && official_base(&name).is_none() {
+                    unambiguous_model_base(provider)
+                } else {
+                    None
+                };
             for model in provider["models"].as_array().into_iter().flatten() {
                 let kind = match model["type"].as_str() {
                     Some("classifier") => Kind::Classifier,
@@ -219,6 +225,7 @@ impl Catalogue {
                 let key_endpoint = provider["baseUrl"]
                     .as_str()
                     .or_else(|| official_base(&name))
+                    .or(inferred_base.as_deref())
                     .map(|base| endpoints(base, api.route()))
                     .transpose()?
                     .map(|(_, endpoint)| endpoint);
@@ -303,6 +310,21 @@ impl Catalogue {
         }
         entries
     }
+}
+
+fn unambiguous_model_base(provider: &Value) -> Option<String> {
+    let models = provider["models"].as_array()?;
+    let mut bases = BTreeSet::new();
+    for model in models {
+        let raw = model["baseUrl"].as_str()?;
+        let mut base = Url::parse(raw).ok()?;
+        let path = base.path().trim_end_matches('/').to_owned();
+        base.set_path(&path);
+        bases.insert(base.to_string());
+    }
+    (bases.len() == 1)
+        .then(|| bases.into_iter().next())
+        .flatten()
 }
 
 pub(super) fn official_base(provider: &str) -> Option<&'static str> {
@@ -855,6 +877,40 @@ mod tests {
                     .as_deref(),
                 (override_base == "https://api.typesafe.ai/v1").then_some("ambient-key")
             );
+        }
+    }
+
+    #[test]
+    fn configured_key_uses_unambiguous_model_base_when_provider_has_none() {
+        let model = |id, base| json!({"type":"classifier", "id":id, "api":"typesafe-system-one", "baseUrl":base});
+        for (models, expected) in [
+            (vec![model("one", "https://proxy.example/v1")], true),
+            (
+                vec![
+                    model("one", "https://proxy.example/v1"),
+                    model("two", "https://proxy.example/v1/"),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    model("one", "https://proxy.example/v1"),
+                    model("two", "https://other.example/v1"),
+                ],
+                false,
+            ),
+        ] {
+            let config = json!({"relay":{"apiKey":"provider-key", "models":models}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entries: Vec<_> = catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "relay")
+                .collect();
+            assert!(!entries.is_empty());
+            for entry in entries {
+                assert_eq!(entry.api_key.as_deref(), expected.then_some("provider-key"));
+            }
         }
     }
 

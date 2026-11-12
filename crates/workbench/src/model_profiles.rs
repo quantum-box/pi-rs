@@ -1166,6 +1166,13 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
 }
 
 pub(super) fn expand_value(value: &str) -> Option<String> {
+    expand_value_with_env(value, None)
+}
+
+pub(super) fn expand_value_with_env(
+    value: &str,
+    env: Option<&serde_json::Map<String, Value>>,
+) -> Option<String> {
     if value.starts_with('!') {
         return None;
     }
@@ -1179,10 +1186,19 @@ pub(super) fn expand_value(value: &str) -> Option<String> {
         let Some(name) = capture.get(1).or_else(|| capture.get(2)) else {
             return token[1..].to_owned();
         };
-        std::env::var(name.as_str()).unwrap_or_else(|_| {
-            missing = true;
-            String::new()
-        })
+        env.and_then(|env| env.get(name.as_str()))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var(name.as_str())
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| {
+                missing = true;
+                String::new()
+            })
     });
     (!missing).then(|| expanded.into_owned())
 }
