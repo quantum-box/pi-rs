@@ -942,48 +942,71 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
         .filter(|p| p.starts_with(['!', '+', '-']))
         .cloned()
         .collect();
-    for pattern in patterns.iter().filter(|p| !p.starts_with(['!', '+', '-'])) {
-        let sources = if pattern.contains(['*', '?']) {
-            expand_prompt_glob(root, pattern)
-        } else {
-            vec![root.join(pattern)]
-        };
-        for source in sources {
-            if source.is_file() {
-                paths.push(source);
-            } else if source.is_dir() {
-                // A selected directory is the ignore root, including when it is a symlink.
-                for entry in ignore::WalkBuilder::new(&source)
-                    .hidden(true)
-                    .parents(false)
-                    .git_ignore(true)
-                    .require_git(false)
-                    .git_global(false)
-                    .git_exclude(false)
-                    .add_custom_ignore_filename(".fdignore")
-                    .follow_links(true)
-                    .filter_entry(|entry| entry.file_name() != "node_modules")
-                    .build()
-                    .flatten()
+    let plain: Vec<_> = patterns
+        .iter()
+        .filter(|p| !p.starts_with(['!', '+', '-']))
+        .collect();
+    // Override-only manifests historically selected from the package contents.
+    // Do not follow symlinks while gathering that implicit candidate set.
+    let implicit = plain.is_empty() && !overrides.is_empty();
+    let sources: Vec<(PathBuf, bool)> = if implicit {
+        vec![(root.to_path_buf(), false)]
+    } else {
+        plain
+            .iter()
+            .flat_map(|pattern| {
+                let sources = if pattern.contains(['*', '?', '[', '{']) {
+                    expand_prompt_glob(root, pattern)
+                } else {
+                    vec![root.join(pattern)]
+                };
+                sources.into_iter().map(|source| (source, true))
+            })
+            .collect()
+    };
+    for (source, follow_links) in sources {
+        if source.is_file() {
+            paths.push(source);
+        } else if source.is_dir() {
+            // A selected directory is the ignore root, including when it is a symlink.
+            for entry in ignore::WalkBuilder::new(&source)
+                .hidden(true)
+                .parents(false)
+                .git_ignore(true)
+                .require_git(false)
+                .git_global(false)
+                .git_exclude(false)
+                .add_custom_ignore_filename(".fdignore")
+                .follow_links(follow_links)
+                .filter_entry(|entry| entry.file_name() != "node_modules")
+                .build()
+                .flatten()
+            {
+                if entry.file_type().is_some_and(|kind| kind.is_file())
+                    && entry.file_name().to_string_lossy().ends_with(".md")
                 {
-                    if entry.file_type().is_some_and(|kind| kind.is_file())
-                        && entry.file_name().to_string_lossy().ends_with(".md")
-                    {
-                        paths.push(entry.into_path());
-                    }
+                    paths.push(entry.into_path());
                 }
             }
+        }
+    }
+    // Exact force-includes may select a file outside the plain source entries.
+    for path in overrides.iter().filter_map(|p| p.strip_prefix('+')) {
+        let path = root.join(path);
+        if path.is_file() {
+            paths.push(path);
         }
     }
     if !overrides.is_empty() {
         paths.retain(|path| manifest_selected(path, root, &overrides));
     }
-    paths.sort();
-    paths.dedup();
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
     paths
 }
 
 fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    let pattern = pattern.trim_start_matches("./");
     let Ok(glob) = globset::GlobBuilder::new(pattern)
         .literal_separator(true)
         .backslash_escape(false)
@@ -995,22 +1018,15 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
     let mut base = root.to_path_buf();
     for component in Path::new(pattern).components() {
         let part = component.as_os_str();
-        if part.to_string_lossy().contains(['*', '?']) {
+        if part.to_string_lossy().contains(['*', '?', '[', '{']) {
             break;
         }
         if part.to_string_lossy().starts_with('.') && part != "." {
             return Vec::new();
         }
         base.push(part);
-        // Glob expansion must not traverse a symlink, even in its fixed prefix.
-        if base
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink())
-        {
-            return Vec::new();
-        }
     }
-    ignore::WalkBuilder::new(base)
+    let mut matches: Vec<_> = ignore::WalkBuilder::new(base)
         .hidden(true)
         .parents(false)
         .ignore(false)
@@ -1028,7 +1044,9 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
             })
         })
         .map(|entry| entry.into_path())
-        .collect()
+        .collect();
+    matches.sort();
+    matches
 }
 fn snapshot_registry_source(source: &Path, cache: &Path) -> Result<PathBuf> {
     use std::io::{Read, Write};
@@ -1296,6 +1314,10 @@ mod tests {
         };
         assert!(discover(json!([])).is_empty());
         assert_eq!(
+            discover(json!(["!prompts/missing.md"])),
+            vec![root.join("prompts/visible.md")]
+        );
+        assert_eq!(
             discover(json!(["prompts/visible.md"])),
             vec![root.join("prompts/visible.md")]
         );
@@ -1303,10 +1325,122 @@ mod tests {
             discover(json!(["prompts/**/*.md"])),
             vec![root.join("prompts/visible.md")]
         );
-        assert!(discover(json!(["prompts/link/*.md"])).is_empty());
+        assert_eq!(
+            discover(json!(["prompts/link/*.md"])),
+            vec![root.join("prompts/link/linked.md")]
+        );
+        assert_eq!(
+            discover(json!(["./prompts/link/*.md"])),
+            vec![root.join("prompts/link/linked.md")]
+        );
         assert_eq!(
             discover(json!(["prompts/link"])),
             vec![root.join("prompts/link/linked.md")]
+        );
+    }
+
+    #[test]
+    fn package_prompt_manifest_preserves_source_order_and_sorts_each_glob() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for directory in ["z", "a"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+            std::fs::write(root.join(directory).join("review.md"), "review").unwrap();
+        }
+        std::fs::write(root.join("z/another.md"), "another").unwrap();
+        let prompts = collect_package_resources(
+            root,
+            &json!({"prompts": ["z/review.md", "a/review.md", "z/*.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(
+            prompts,
+            vec![
+                root.join("z/review.md"),
+                root.join("a/review.md"),
+                root.join("z/another.md")
+            ]
+        );
+        let globbed =
+            collect_package_resources(root, &json!({"prompts": ["./z/*.md"]}), Vec::new())
+                .unwrap()
+                .prompts;
+        assert_eq!(
+            globbed,
+            vec![root.join("z/another.md"), root.join("z/review.md")]
+        );
+    }
+
+    #[test]
+    fn package_prompt_manifest_override_only_and_force_include() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("prompts")).unwrap();
+        for name in ["public.md", "private.md", "extra.md"] {
+            std::fs::write(root.join("prompts").join(name), "fixture").unwrap();
+        }
+        let discover = |patterns| {
+            collect_package_resources(root, &json!({"prompts": patterns}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        let mut excluded = discover(json!(["!prompts/private.md"]));
+        excluded.sort();
+        assert_eq!(
+            excluded,
+            vec![
+                root.join("prompts/extra.md"),
+                root.join("prompts/public.md")
+            ]
+        );
+        assert_eq!(
+            discover(json!(["prompts/public.md", "+prompts/extra.md"])),
+            vec![
+                root.join("prompts/public.md"),
+                root.join("prompts/extra.md")
+            ]
+        );
+        assert_eq!(
+            discover(json!([
+                "prompts/public.md",
+                "+prompts/extra.md",
+                "-prompts/extra.md"
+            ])),
+            vec![root.join("prompts/public.md")]
+        );
+    }
+
+    #[test]
+    fn package_prompt_globs_expand_brackets_and_braces() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("prompts")).unwrap();
+        for name in ["a.md", "b.md", "review.md", "deploy.md"] {
+            std::fs::write(root.join("prompts").join(name), "fixture").unwrap();
+        }
+        std::fs::create_dir(root.join("prompts/a")).unwrap();
+        std::fs::write(root.join("prompts/a/nested.md"), "fixture").unwrap();
+        let discover = |pattern| {
+            collect_package_resources(root, &json!({"prompts": [pattern]}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        assert_eq!(
+            discover("./prompts/[ab].md"),
+            vec![root.join("prompts/a.md"), root.join("prompts/b.md")]
+        );
+        assert_eq!(
+            discover("prompts/{review,deploy}.md"),
+            vec![
+                root.join("prompts/deploy.md"),
+                root.join("prompts/review.md")
+            ]
+        );
+        assert_eq!(
+            discover("./prompts/[ab]/*.md"),
+            vec![root.join("prompts/a/nested.md")]
         );
     }
 
