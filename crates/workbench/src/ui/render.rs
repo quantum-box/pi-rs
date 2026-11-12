@@ -1067,9 +1067,15 @@ fn markdown_at_depth(
                 if code.is_some() {
                     code_text.push_str(&content);
                 } else {
-                    let raw = &text[range];
-                    let displayed = if preserve_source && raw.starts_with('\\') {
-                        raw
+                    let preceding = text.as_bytes()[..range.start]
+                        .iter()
+                        .rev()
+                        .take_while(|byte| **byte == b'\\')
+                        .count();
+                    let displayed = if preserve_source && preceding % 2 == 1 {
+                        &text[range.start - 1..range.end]
+                    } else if preserve_source && text[range.clone()].starts_with('\\') {
+                        &text[range]
                     } else {
                         content.as_ref()
                     };
@@ -1334,6 +1340,13 @@ mod tests {
             .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
             .collect();
         assert_eq!(rendered, ["- [ ] pending", "    - child"]);
+        let escaped = user_lines(r"\*literal\*", &theme, 40, options);
+        let text: String = escaped
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(text, r"\*literal\*");
     }
 
     #[test]
@@ -1602,12 +1615,7 @@ mod tests {
                 .flat_map(|l| &l.spans)
                 .any(|s| s.bold && s.text == "Title")
         );
-        assert!(
-            lines
-                .iter()
-                .flat_map(|l| &l.spans)
-                .any(|s| s.text.contains('•'))
-        );
+        assert!(lines.iter().flat_map(|l| &l.spans).any(|s| s.text == "- "));
         assert!(
             lines
                 .iter()
