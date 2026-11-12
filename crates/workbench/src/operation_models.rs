@@ -941,6 +941,77 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn slash_terminated_official_saved_bases_keep_key_precedence() {
+        for (provider, base, variable) in [
+            ("typesafe", "https://api.typesafe.ai/v1", "TYPESAFE_API_KEY"),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "OPENROUTER_API_KEY",
+            ),
+        ] {
+            let config = json!({provider:{"apiKey":"configured-key"}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entries: Vec<_> = catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == provider && entry.is_official())
+                .collect();
+            assert!(!entries.is_empty());
+            let env = |name: &str| (name == variable).then(|| "ambient-key".to_owned());
+            for saved_base in [base.to_owned(), format!("{base}/")] {
+                let keys = Keys::parse(
+                    &json!({provider:{"type":"api_key", "key":"stored-key", "endpoint":saved_base, "env":{"HEADER":"stored-header"}}}),
+                );
+                for entry in &entries {
+                    assert_eq!(
+                        entry
+                            .credential_with_env(&keys, env)
+                            .unwrap()
+                            .resolve()
+                            .await
+                            .unwrap(),
+                        "stored-key"
+                    );
+                    let header_env =
+                        keys.operation_environment(provider, entry.endpoint.as_str(), true);
+                    assert_eq!(
+                        resolve_header("$HEADER", header_env).await.as_deref(),
+                        Some("stored-header")
+                    );
+                    assert!(
+                        keys.operation_credential(
+                            provider,
+                            "https://other.example/v1/systemone",
+                            false
+                        )
+                        .is_none()
+                    );
+                }
+            }
+            let other = Keys::parse(
+                &json!({provider:{"type":"api_key", "key":"wrong-key", "endpoint":"https://other.example/v1/"}}),
+            );
+            for entry in entries {
+                assert_eq!(
+                    entry
+                        .credential_with_env(&other, env)
+                        .unwrap()
+                        .resolve()
+                        .await
+                        .unwrap(),
+                    "configured-key"
+                );
+                assert!(
+                    other
+                        .operation_environment(provider, entry.endpoint.as_str(), true)
+                        .is_none()
+                );
+            }
+        }
+    }
+
     #[test]
     fn configured_key_is_bound_to_provider_endpoint_not_model_override() {
         for (base, override_base) in [

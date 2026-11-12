@@ -276,9 +276,11 @@ impl Keys {
             .as_deref()
             .is_some_and(|saved| same_operation_endpoint(saved, endpoint))
             || (official
-                && ((entry.endpoint.is_some()
-                    && super::operation_models::official_base(provider)
-                        == entry.endpoint.as_deref())
+                && ((entry
+                    .endpoint
+                    .as_deref()
+                    .zip(super::operation_models::official_base(provider))
+                    .is_some_and(|(saved, base)| same_operation_endpoint(saved, base)))
                     || (entry.official_routes && super::builtin_chat::find(provider).is_some()))))
         .then_some(entry)
     }
