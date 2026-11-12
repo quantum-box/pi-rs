@@ -1063,16 +1063,33 @@ fn legacy_prompt_candidates(
 }
 
 fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
-    let pattern = pattern.trim_start_matches("./");
-    let pattern_path = Path::new(pattern);
-    if pattern_path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Vec::new();
+    let root = dunce::simplified(root);
+    let input = dunce::simplified(Path::new(pattern));
+    let mut pattern_path = if input.is_absolute() {
+        PathBuf::new()
+    } else {
+        root.to_path_buf()
+    };
+    let mut saw_wildcard = false;
+    for component in input.components() {
+        if matches!(component, std::path::Component::CurDir) {
+            continue;
+        }
+        if matches!(component, std::path::Component::ParentDir) {
+            // Resolving a parent after a wildcard would widen the search unpredictably.
+            if saw_wildcard || !pattern_path.pop() {
+                return Vec::new();
+            }
+        } else {
+            saw_wildcard |= component
+                .as_os_str()
+                .to_string_lossy()
+                .contains(['*', '?', '[', '{']);
+            pattern_path.push(component.as_os_str());
+        }
     }
-    let absolute = pattern_path.is_absolute();
-    let Ok(glob) = globset::GlobBuilder::new(pattern)
+    let normalized = pattern_path.to_string_lossy().replace('\\', "/");
+    let Ok(glob) = globset::GlobBuilder::new(&normalized)
         .literal_separator(true)
         .backslash_escape(false)
         .build()
@@ -1080,11 +1097,7 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         return Vec::new();
     };
     let matcher = glob.compile_matcher();
-    let mut base = if absolute {
-        PathBuf::new()
-    } else {
-        root.to_path_buf()
-    };
+    let mut base = PathBuf::new();
     for component in pattern_path.components() {
         let part = component.as_os_str();
         if part.to_string_lossy().contains(['*', '?', '[', '{']) {
@@ -1092,11 +1105,13 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         }
         base.push(part);
     }
-    // Absolute patterns may start above the package, but discovery remains within it.
-    if root.starts_with(&base) {
-        base = root.to_path_buf();
-    } else if !base.starts_with(root) {
-        return Vec::new();
+    // A wildcard directly under a filesystem root must not cause a root-wide scan.
+    if base.parent().is_none() {
+        if root.starts_with(&base) {
+            base = root.to_path_buf();
+        } else {
+            return Vec::new();
+        }
     }
     let mut matches: Vec<_> = ignore::WalkBuilder::new(base)
         .hidden(true)
@@ -1109,11 +1124,12 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         .build()
         .flatten()
         .filter(|entry| {
-            entry.path().strip_prefix(root).is_ok_and(|path| {
-                path.components()
-                    .all(|c| !c.as_os_str().to_string_lossy().starts_with('.'))
-                    && matcher.is_match(if absolute { entry.path() } else { path })
-            })
+            let entry_components: Vec<_> = entry.path().components().collect();
+            let root_components: Vec<_> = root.components().collect();
+            let common = entry_components.iter().zip(&root_components).take_while(|(a, b)| a == b).count();
+            entry_components[common..].iter().all(|c| {
+                !matches!(c, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+            }) && matcher.is_match(entry.path())
         })
         .map(|entry| entry.into_path())
         .collect();
@@ -1573,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn package_prompt_absolute_globs_match_only_inside_package() {
+    fn package_prompt_globs_match_explicit_external_paths() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("package");
         let outside = temp.path().join("outside");
@@ -1582,6 +1598,7 @@ mod tests {
         std::fs::write(root.join("prompts/review.md"), "fixture").unwrap();
         std::fs::write(root.join("prompts/.hidden.md"), "hidden").unwrap();
         std::fs::write(outside.join("prompts/outside.md"), "outside").unwrap();
+        std::fs::write(outside.join("prompts/.hidden.md"), "hidden").unwrap();
         let discover = |pattern: String| {
             collect_package_resources(&root, &json!({"prompts": [pattern]}), Vec::new())
                 .unwrap()
@@ -1598,10 +1615,41 @@ mod tests {
         );
         assert_eq!(
             discover(format!("{}/*/prompts/*.md", temp.path().display())),
-            vec![root.join("prompts/review.md")]
+            vec![
+                outside.join("prompts/outside.md"),
+                root.join("prompts/review.md")
+            ]
         );
-        assert!(discover(format!("{}/prompts/*.md", outside.display())).is_empty());
-        assert!(discover("../outside/prompts/*.md".into()).is_empty());
+        assert_eq!(
+            discover(format!("{}/prompts/*.md", outside.display())),
+            vec![outside.join("prompts/outside.md")]
+        );
+        assert_eq!(
+            discover("../outside/prompts/*.md".into()),
+            vec![outside.join("prompts/outside.md")]
+        );
+        assert!(discover("*/../outside/prompts/*.md".into()).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_prompt_absolute_glob_matches_verbatim_package_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::write(root.join("prompts/review.md"), "fixture").unwrap();
+        let canonical = root.canonicalize().unwrap();
+        let ordinary = dunce::simplified(&canonical);
+        let pattern = format!("{}/prompts/*.md", ordinary.display());
+        let prompts =
+            collect_package_resources(&canonical, &json!({"prompts": [pattern]}), Vec::new())
+                .unwrap()
+                .prompts;
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            prompts[0].canonicalize().unwrap(),
+            canonical.join("prompts/review.md")
+        );
     }
 
     #[cfg(unix)]
