@@ -426,6 +426,7 @@ fn validate_id_token(
             .as_array()
             .is_some_and(|values| values.len() > 1)
             && claims["azp"] != client_id
+        || !claims["azp"].is_null() && claims["azp"] != client_id
         || claims["nonce"] != nonce
         || claims["exp"].as_u64().is_none_or(|exp| exp <= now)
         || claims["iat"]
@@ -550,6 +551,12 @@ mod tests {
         assert!(validate_id_token(&valid, &keys, "other", "nonce", 100).is_err());
         assert!(validate_id_token(&valid, &keys, "client", "other", 100).is_err());
         assert!(validate_id_token(&valid, &keys, "client", "nonce", 200).is_err());
+        let mut wrong_authorized_party = claims.clone();
+        wrong_authorized_party["azp"] = "other".into();
+        assert!(
+            validate_id_token(&sign(wrong_authorized_party), &keys, "client", "nonce", 100)
+                .is_err()
+        );
         let mut forged = claims;
         forged["sub"] = "attacker".into();
         let parts: Vec<_> = valid.split('.').collect();
