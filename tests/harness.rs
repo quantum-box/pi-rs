@@ -1063,6 +1063,87 @@ async fn context_with_system_runs_after_context_hooks_in_registration_order() {
 }
 
 #[tokio::test]
+async fn context_with_system_reports_each_removed_leading_system_without_blocking() {
+    struct Hook(&'static str);
+    #[async_trait::async_trait]
+    impl Extension for Hook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut Vec<Message>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            match self.0 {
+                "remove" | "remove-again" => {
+                    messages.remove(0);
+                }
+                "observe" => assert!(!matches!(messages.first(), Some(Message::System { .. }))),
+                "restore" => messages.insert(
+                    0,
+                    Message::System {
+                        content: "replacement".into(),
+                    },
+                ),
+                _ => unreachable!(),
+            }
+            Ok(())
+        }
+    }
+    let model = Script::new(vec![answer("done")]);
+    let mut registry = Registry::default();
+    for id in ["remove", "observe", "restore", "remove-again"] {
+        registry.register(Arc::new(Hook(id))).unwrap();
+    }
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let mut errors = Vec::new();
+    let mut observer = |notification: Notification<'_>| {
+        if let Notification::ExtensionLifecycleError {
+            extension,
+            event,
+            message,
+        } = notification
+        {
+            errors.push((extension.to_owned(), event.to_owned(), message.to_owned()));
+        }
+    };
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        errors
+            .iter()
+            .map(|e| (e.0.as_str(), e.1.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("remove", "context_with_system"),
+            ("remove-again", "context_with_system")
+        ]
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|e| e.2.contains("leading system message"))
+    );
+    let requests = model.requests.lock().unwrap();
+    assert!(
+        matches!(requests[0].messages.first(), Some(Message::User { content }) if content == "hello")
+    );
+}
+
+#[tokio::test]
 async fn truncated_response_never_executes_even_valid_tool_arguments() {
     let mut first = vec![ModelEvent::Metadata(ModelMetadata {
         finish_reason: Some("length".into()),
