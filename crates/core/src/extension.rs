@@ -700,6 +700,15 @@ pub trait Extension: Send + Sync {
         Ok(false)
     }
 
+    async fn before_session_transition_with_host(
+        &self,
+        event: &crate::BeforeSessionTransition,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        self.before_session_transition(event, state).await
+    }
+
     async fn before_tree(
         &self,
         _preparation: &crate::TreePreparation,
@@ -1034,6 +1043,30 @@ impl Registry {
         timeout: std::time::Duration,
         observer: &mut crate::Observer<'_>,
     ) -> bool {
+        self.session_transition_cancelled_inner(event, states, timeout, observer, None)
+            .await
+    }
+
+    pub(crate) async fn session_transition_cancelled_with_host(
+        &self,
+        event: &crate::BeforeSessionTransition,
+        states: &ExtensionStates,
+        timeout: std::time::Duration,
+        observer: &mut crate::Observer<'_>,
+        host: Arc<dyn ToolHost>,
+    ) -> bool {
+        self.session_transition_cancelled_inner(event, states, timeout, observer, Some(host))
+            .await
+    }
+
+    async fn session_transition_cancelled_inner(
+        &self,
+        event: &crate::BeforeSessionTransition,
+        states: &ExtensionStates,
+        timeout: std::time::Duration,
+        observer: &mut crate::Observer<'_>,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> bool {
         let deadline =
             tokio::time::Instant::now() + timeout.min(std::time::Duration::from_secs(10));
         for extension in self
@@ -1041,10 +1074,24 @@ impl Registry {
             .iter()
             .filter(|extension| extension.handles_session_transitions())
         {
-            let error = match tokio::time::timeout_at(
-                deadline,
-                extension.before_session_transition(event, states.get(extension.id())),
-            )
+            let error = match tokio::time::timeout_at(deadline, async {
+                match &host {
+                    Some(host) => {
+                        extension
+                            .before_session_transition_with_host(
+                                event,
+                                states.get(extension.id()),
+                                host.clone(),
+                            )
+                            .await
+                    }
+                    None => {
+                        extension
+                            .before_session_transition(event, states.get(extension.id()))
+                            .await
+                    }
+                }
+            })
             .await
             {
                 Ok(Ok(true)) => return true,

@@ -2802,7 +2802,8 @@ restarts before run creation, before and after message delivery, and after the
 answer was recorded. Host-aware `before_tool` policies can opt in with
 `handles_before_tool_host`; separately built extensions negotiate this support.
 Host calls also remain unavailable in idle `SessionControl` input hooks,
-user-bash, resource discovery, compaction, tree, and session-transition hooks.
+user-bash, resource discovery, compaction, tree, and workbench
+session-transition hooks.
 A trigger requested by a session shutdown callback remains queued for the next
 session start because the closing session cannot start another run.
 Command effects retain their existing return-value mechanism; custom message

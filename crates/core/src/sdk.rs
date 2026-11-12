@@ -916,16 +916,57 @@ impl AgentSession {
         self.start().await?;
         if self.registry.has_session_transition_hooks() {
             let events = self.events.as_ref().expect("open session");
-            if self
-                .registry
-                .session_transition_cancelled(
-                    &crate::BeforeSessionTransition::Fork { entry_id, position },
-                    &self.session.extension_states(),
+            let states = self.session.extension_states();
+            let transition = crate::BeforeSessionTransition::Fork { entry_id, position };
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+            let mut errors = Vec::new();
+            let mut collect = |event: Notification<'_>| {
+                if let Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                } = event
+                {
+                    errors.push((extension.to_owned(), event, message.to_owned()));
+                }
+            };
+            let cancelled = {
+                let future = self.registry.session_transition_cancelled_with_host(
+                    &transition,
+                    &states,
                     self.limits.tool_timeout,
-                    &mut |notification| emit(events, &notification),
-                )
-                .await
-            {
+                    &mut collect,
+                    host,
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((input, reply)) = incoming.recv() => {
+                            let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                                crate::agent::queue_custom_message(&mut self.session, input, &mut |event| emit(events, &event))
+                            } else {
+                                self.session.append_custom_message(input.message).map(|()| emit(events, &Notification::Committed(self.session.records().last().expect("appended custom message"))))
+                            };
+                            match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                        }
+                        result = &mut future => break result,
+                    }
+                }
+            };
+            for (extension, event, message) in &errors {
+                emit(
+                    events,
+                    &Notification::ExtensionLifecycleError {
+                        extension,
+                        event,
+                        message,
+                    },
+                );
+            }
+            let _ = self.drain_idle_triggers().await?;
+            if cancelled {
                 return Err(Error::Cancelled);
             }
         }
@@ -3600,6 +3641,83 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["trigger", "next", "user"]);
+    }
+
+    struct TransitionMessageHook(crate::CustomMessageDelivery);
+    #[async_trait::async_trait]
+    impl Extension for TransitionMessageHook {
+        fn id(&self) -> &str {
+            "transition-message"
+        }
+        fn handles_session_transitions(&self) -> bool {
+            true
+        }
+        async fn before_session_transition_with_host(
+            &self,
+            _: &crate::BeforeSessionTransition,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<bool> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "transition".into(),
+                    content: crate::ContextContent::Text("after cancelled fork".into()),
+                    display: false,
+                    details: None,
+                },
+                self.0,
+            )
+            .await?;
+            Ok(true)
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_fork_callback_journals_its_message_without_deadlock() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .extension(Arc::new(TransitionMessageHook(
+                crate::CustomMessageDelivery::NextTurn,
+            )))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let target = session.journal().head();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            session.fork_with_hooks(target, crate::ForkPosition::At, None),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+        let restored = Session::from_records(session.journal().records().to_vec()).unwrap();
+        assert_eq!(restored.queued_custom_messages().len(), 1);
+        assert_eq!(
+            restored.queued_custom_messages()[0].1.message.content,
+            crate::ContextContent::Text("after cancelled fork".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_fork_trigger_runs_once_before_returning() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(TransitionMessageHook(
+                crate::CustomMessageDelivery::TriggerTurn,
+            )))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let target = session.journal().head();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            session.fork_with_hooks(target, crate::ForkPosition::At, None),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+        assert!(session.journal().pending_custom_trigger().is_none());
     }
 
     struct NestedModel;

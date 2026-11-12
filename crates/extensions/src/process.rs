@@ -331,6 +331,8 @@ struct Description {
     #[serde(default)]
     context_hook_host_calls: bool,
     #[serde(default)]
+    transition_hook_host_calls: bool,
+    #[serde(default)]
     tool_execution_lifecycle_hook: bool,
     #[serde(default)]
     tool_execution_update_hook: bool,
@@ -749,6 +751,27 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn before_session_transition_with_host(
+        &self,
+        event: &pi_rs_core::BeforeSessionTransition,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        if !self.description.transition_hook_host_calls {
+            return self.before_session_transition(event, state).await;
+        }
+        let request = ProtocolRequest::BeforeSessionTransition {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     async fn before_tree(
         &self,
@@ -2137,6 +2160,7 @@ async fn dispatch_with_host(
             request_hook_host_calls: true,
             input_hook_host_calls: true,
             context_hook_host_calls: true,
+            transition_hook_host_calls: true,
             tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
             tool_execution_update_hook: extension.handles_tool_execution_updates(),
             model_selection_hook: extension.handles_model_selection(),
@@ -2215,11 +2239,21 @@ async fn dispatch_with_host(
                 .before_tree(&preparation, state.as_ref(), &CancellationToken::new())
                 .await,
         ),
-        ProtocolRequest::BeforeSessionTransition { event, state } => encode(
-            extension
-                .before_session_transition(&event, state.as_ref())
-                .await,
-        ),
+        ProtocolRequest::BeforeSessionTransition { event, state } => {
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .before_session_transition_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(
+                    extension
+                        .before_session_transition(&event, state.as_ref())
+                        .await,
+                )
+            }
+        }
         ProtocolRequest::BeforeRequest {
             mut request,
             summary,
@@ -3121,7 +3155,7 @@ else:
 import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     json.load(sys.stdin)
-    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
@@ -3131,6 +3165,7 @@ else:
     if kind=='input': result={'action':'continue'}
     elif kind=='before_request': result=r['request']
     elif kind=='context_with_system': result=r['messages']
+    elif kind=='before_session_transition': result=False
     elif kind=='before_tool': result={'allow':True,'reason':None}
     elif kind=='tool_call': result=[r['arguments'],{'allow':True,'reason':None}]
     elif kind=='tool_result': result=None
@@ -3172,6 +3207,19 @@ else:
             .context_with_system_with_host(&mut request.messages, None, host.clone())
             .await
             .unwrap();
+        assert!(
+            !extension
+                .before_session_transition_with_host(
+                    &pi_rs_core::BeforeSessionTransition::Fork {
+                        entry_id: 1,
+                        position: pi_rs_core::ForkPosition::At
+                    },
+                    None,
+                    host.clone()
+                )
+                .await
+                .unwrap()
+        );
         let context = ToolContext {
             operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
             cancellation: CancellationToken::new(),
@@ -3209,7 +3257,7 @@ else:
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 6);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 7);
     }
 
     #[tokio::test]
