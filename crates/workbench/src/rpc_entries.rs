@@ -507,6 +507,7 @@ fn imported_conversion(records: &[Record], source: u64, record: &Record) -> bool
                 | Event::UserWithImages { .. }
                 | Event::CustomMessage { .. }
                 | Event::Assistant { .. }
+                | Event::BranchSummary { .. }
                 | Event::ToolFinished { .. }
                 | Event::SystemCheckpoint { .. }
                 | Event::BashExecution { .. }

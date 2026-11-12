@@ -594,6 +594,7 @@ fn matches_imported_message(source: &Value, event: &Event) -> bool {
             matches!(role, Some("custom" | "hookMessage")) || source["type"] == "custom_message"
         }
         Event::Compacted { .. } => source["type"] == "compaction",
+        Event::BranchSummary { .. } => role == Some("branchSummary"),
         Event::Assistant { .. } => role == Some("assistant"),
         Event::ToolFinished { .. } | Event::ToolReconciled { .. } => role == Some("toolResult"),
         _ => false,
