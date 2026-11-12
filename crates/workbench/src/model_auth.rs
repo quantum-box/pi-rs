@@ -218,7 +218,7 @@ impl Keys {
         profiles: &super::model_profiles::Profiles,
     ) -> Option<&Credential> {
         let entry = self.entries.get(provider.id())?;
-        (entry.endpoint.is_none() && profiles.has_endpoint(provider, endpoint))
+        (entry.endpoint.is_none() && profiles.has_provider_endpoint(provider, endpoint))
             .then_some(entry.key.as_ref())
             .flatten()
     }
@@ -232,7 +232,7 @@ impl Keys {
         self.entry_for(provider, endpoint)
             .or_else(|| {
                 self.entries.get(provider.id()).filter(|entry| {
-                    entry.endpoint.is_none() && profiles.has_endpoint(provider, endpoint)
+                    entry.endpoint.is_none() && profiles.has_provider_endpoint(provider, endpoint)
                 })
             })?
             .env

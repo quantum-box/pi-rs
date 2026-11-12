@@ -900,14 +900,10 @@ impl Profiles {
         Credential::configured(profile.api_key.as_deref()?)
     }
 
-    pub fn has_endpoint(&self, provider: &Provider, endpoint: &str) -> bool {
-        self.entries.get(provider.id()).is_some_and(|profile| {
-            profile.endpoint == endpoint
-                || profile
-                    .model_endpoints
-                    .values()
-                    .any(|value| value == endpoint)
-        })
+    pub fn has_provider_endpoint(&self, provider: &Provider, endpoint: &str) -> bool {
+        self.entries
+            .get(provider.id())
+            .is_some_and(|profile| profile.endpoint == endpoint)
     }
 
     pub fn header_settings(
@@ -1953,5 +1949,67 @@ mod tests {
                 .environment(&provider, endpoint, &profiles)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn endpointless_saved_credentials_do_not_follow_model_overrides() {
+        for models in [
+            json!([{ "id":"hostile", "baseUrl":"https://hostile.example/v1" }]),
+            json!([{ "id":"normal" }, { "id":"hostile", "baseUrl":"https://hostile.example/v1" }]),
+        ] {
+            let profiles = Profiles::parse(&json!({"providers":{"relay":{
+                "api":"openai-completions", "baseUrl":"https://trusted.example/v1",
+                "headers":{"X-Secret":"$PI_RS_TEST_HEADER_SECRET_3614"}, "models":models
+            }}}))
+            .unwrap();
+            let provider = profiles.provider("relay").unwrap();
+            let trusted = profiles.endpoint(&provider);
+            let hostile = profiles.model_endpoint(&provider, "hostile").unwrap();
+            let saved = json!({"relay":{"type":"api_key", "key":"saved-key", "env":{"PI_RS_TEST_HEADER_SECRET_3614":"sensitive"}}});
+            let keys = super::super::model_auth::Keys::parse(&saved);
+            assert!(keys.environment(&provider, trusted, &profiles).is_some());
+            assert!(
+                keys.custom_credential(&provider, trusted, &profiles)
+                    .is_some()
+            );
+            assert!(keys.environment(&provider, hostile, &profiles).is_none());
+            assert!(
+                keys.custom_credential(&provider, hostile, &profiles)
+                    .is_none()
+            );
+            let headers = profiles
+                .header_settings(&provider, hostile, Some("hostile"))
+                .with_environment(keys.environment(&provider, hostile, &profiles));
+            assert!(headers.static_headers(&provider, None).is_err());
+
+            let mut explicit = saved;
+            explicit["relay"]["endpoint"] = json!(hostile);
+            let keys = super::super::model_auth::Keys::parse(&explicit);
+            assert!(keys.environment(&provider, trusted, &profiles).is_none());
+            assert!(keys.environment(&provider, hostile, &profiles).is_some());
+            assert_eq!(
+                keys.credential(&provider, hostile).unwrap().literal(),
+                Some("saved-key")
+            );
+            let headers = profiles
+                .header_settings(&provider, hostile, Some("hostile"))
+                .with_environment(keys.environment(&provider, hostile, &profiles));
+            assert_eq!(
+                headers.static_headers(&provider, None).unwrap()["x-secret"],
+                "sensitive"
+            );
+        }
+        let profiles = Profiles::parse(&json!({"providers":{"relay":{
+            "api":"openai-completions", "baseUrl":"https://trusted.example/v1",
+            "models":[{"id":"only", "baseUrl":"https://trusted.example/v1/"}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("relay").unwrap();
+        let endpoint = profiles.model_endpoint(&provider, "only").unwrap();
+        let keys = super::super::model_auth::Keys::parse(&json!({"relay":{
+            "type":"api_key", "env":{"HEADER_VALUE":"local"}
+        }}));
+        assert_eq!(endpoint, profiles.endpoint(&provider));
+        assert!(keys.environment(&provider, endpoint, &profiles).is_some());
     }
 }
