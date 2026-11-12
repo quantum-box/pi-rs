@@ -854,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_stored_key_falls_back_and_stored_env_resolves_headers() {
-        let catalogue = Catalogue::parse(&json!({}).as_object().unwrap()).unwrap();
+        let catalogue = Catalogue::parse(json!({}).as_object().unwrap()).unwrap();
         let entry = catalogue
             .0
             .iter()

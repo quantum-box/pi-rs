@@ -1175,10 +1175,6 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
     Ok(url.to_string())
 }
 
-pub(super) fn expand_value(value: &str) -> Option<String> {
-    expand_value_with_env(value, None)
-}
-
 pub(super) fn expand_value_with_env(
     value: &str,
     env: Option<&serde_json::Map<String, Value>>,
