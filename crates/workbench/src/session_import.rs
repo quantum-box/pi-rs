@@ -1120,6 +1120,16 @@ mod tests {
             session.extension_states()["codemode"].data,
             json!({"value":1,"other":3})
         );
+        let entries = super::super::rpc_entries::Entries::new(&session)
+            .after(None)
+            .unwrap();
+        let entries = entries["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["customType"] == "codemode-store")
+        );
     }
     #[test]
     fn imported_context_edits_are_branch_relative_and_preserve_original_entries() {

@@ -309,7 +309,12 @@ impl Cursor {
                 .imported
                 .is_some_and(|id| imported_conversion(records, id, record)) =>
             {
-                position.imported = None;
+                // A codemode source entry converts into both its original
+                // custom entry and a derived extension-state snapshot.
+                if !matches!(&record.event, Event::CustomEntry { entry } if entry.custom_type == "codemode-store")
+                {
+                    position.imported = None;
+                }
                 if matches!(record.event, Event::ModelSelected { .. }) {
                     position.model = Some(record.id);
                 }
