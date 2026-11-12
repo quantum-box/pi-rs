@@ -734,6 +734,10 @@ impl Profiles {
                 };
                 if let Some(base) = profile.base_url.as_deref() {
                     provider_endpoints.insert(endpoint_from_base(&provider, adapter, base)?);
+                } else if let Some(official) = builtin_chat::find(provider.id())
+                    .and_then(|builtin| builtin.endpoint_for(adapter))
+                {
+                    provider_endpoints.insert(official.to_owned());
                 }
                 if let Some(base) = model.base_url.as_deref().or_else(|| {
                     profile
@@ -787,9 +791,7 @@ impl Profiles {
                         || Ok(official.to_owned()),
                         |base| endpoint_from_base(&provider, adapter, base),
                     )?;
-                    if profile.base_url.is_some() {
-                        provider_endpoints.insert(endpoint.clone());
-                    }
+                    provider_endpoints.insert(endpoint.clone());
                     model_endpoints.insert(model.id.clone(), endpoint);
                 }
             }
@@ -1803,6 +1805,107 @@ mod tests {
                     .environment(&provider, &other, &args.model_profiles),
             );
         assert!(headers.static_headers(&provider, None).is_err());
+    }
+
+    #[test]
+    fn builtin_official_messages_routes_prefer_configured_key() {
+        const CHILD: &str = "PI_RS_TEST_OFFICIAL_ROUTE_CHILD_6D23";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model_profiles::tests::builtin_official_messages_routes_prefer_configured_key",
+                ])
+                .env(CHILD, "1")
+                .env("OPENROUTER_API_KEY", "ambient-openrouter")
+                .env("FIREWORKS_API_KEY", "ambient-fireworks")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        for (id, messages, ambient) in [
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1/messages",
+                "ambient-openrouter",
+            ),
+            (
+                "fireworks",
+                "https://api.fireworks.ai/inference/v1/messages",
+                "ambient-fireworks",
+            ),
+        ] {
+            let catalogue_profile =
+                Profiles::parse(&json!({"providers":{id:{"apiKey":"catalogue-key"}}})).unwrap();
+            let catalogue_provider = catalogue_profile.provider(id).unwrap();
+            assert_eq!(
+                catalogue_profile
+                    .credential(&catalogue_provider, messages)
+                    .unwrap()
+                    .literal(),
+                Some("catalogue-key")
+            );
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = Profiles::parse(&json!({"providers":{id:{
+                "apiKey":"configured-key", "models":[
+                    {"id":"messages-test", "api":"anthropic-messages"},
+                    {"id":"other-test", "api":"anthropic-messages", "baseUrl":"https://other.example/v1"}
+                ]
+            }}})).unwrap();
+            let provider = args.model_profiles.provider(id).unwrap();
+            let official = args
+                .model_profiles
+                .model_endpoint(&provider, "messages-test")
+                .unwrap();
+            let other = args
+                .model_profiles
+                .model_endpoint(&provider, "other-test")
+                .unwrap();
+            assert_eq!(official, messages);
+            assert_eq!(
+                args.configured_model_credential(&provider, official)
+                    .unwrap()
+                    .literal(),
+                Some("configured-key")
+            );
+            assert!(args.configured_model_credential(&provider, other).is_none());
+            args.model_keys = super::super::model_auth::Keys::parse(
+                &json!({id:{"type":"api_key", "key":"stored-key"}}),
+            );
+            assert_eq!(
+                args.configured_model_credential(&provider, official)
+                    .unwrap()
+                    .literal(),
+                Some("stored-key")
+            );
+            assert!(args.configured_model_credential(&provider, other).is_none());
+            args.model_keys = super::super::model_auth::Keys::parse(&json!({}));
+            let no_key = json!({"providers":{id:{"models":[{"id":"messages-test", "api":"anthropic-messages"}]}}});
+            let no_key = Profiles::parse(&no_key).unwrap();
+            args.model_profiles = no_key;
+            assert_eq!(
+                args.configured_model_credential(&provider, messages)
+                    .unwrap()
+                    .literal(),
+                Some(ambient)
+            );
+            args.model_keys = super::super::model_auth::Keys::parse(
+                &json!({id:{"type":"api_key", "key":"stored-key"}}),
+            );
+            assert_eq!(
+                args.configured_model_credential(&provider, messages)
+                    .unwrap()
+                    .literal(),
+                Some("stored-key")
+            );
+        }
     }
 
     #[test]
