@@ -342,6 +342,8 @@ pub(crate) fn resource_matches(
     exact: bool,
     directory_roots: bool,
 ) -> bool {
+    let path = dunce::simplified(path);
+    let root = dunce::simplified(root);
     let normalize = |path: &Path| path.to_string_lossy().replace('\\', "/");
     let pattern = pattern.replace('\\', "/");
     let pattern = pattern.trim_start_matches("./").to_owned();
@@ -1014,7 +1016,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
         paths.retain(|path| manifest_selected(path, root, &overrides));
     }
     let mut seen = std::collections::HashSet::new();
-    paths.retain(|path| seen.insert(path.clone()));
+    paths.retain(|path| seen.insert(dunce::simplified(path).to_path_buf()));
     paths
 }
 
@@ -1113,7 +1115,12 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
             return Vec::new();
         }
     }
+    let Some(prefix) = PromptGlobPrefix::new(&pattern_path) else {
+        return Vec::new();
+    };
+    let depth = prefix.max_depth(&base);
     let mut matches: Vec<_> = ignore::WalkBuilder::new(base)
+        .max_depth(depth)
         .hidden(true)
         .parents(false)
         .ignore(false)
@@ -1121,6 +1128,7 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         .git_global(false)
         .git_exclude(false)
         .follow_links(false)
+        .filter_entry(move |entry| entry.depth() == 0 || prefix.can_match(entry.path()))
         .build()
         .flatten()
         .filter(|entry| {
@@ -1135,6 +1143,78 @@ fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
         .collect();
     matches.sort();
     matches
+}
+
+// A component NFA lets the walker discard subtrees that cannot match, including
+// patterns with **, without traversing every descendant of the fixed prefix.
+struct PromptGlobPrefix {
+    components: Vec<Option<globset::GlobMatcher>>,
+}
+
+impl PromptGlobPrefix {
+    fn new(pattern: &Path) -> Option<Self> {
+        let mut components = Vec::new();
+        for component in pattern.components() {
+            if let std::path::Component::Normal(name) = component {
+                let name = name.to_string_lossy();
+                if name == "**" {
+                    components.push(None);
+                } else {
+                    let glob = globset::GlobBuilder::new(&name)
+                        .literal_separator(true)
+                        .backslash_escape(false)
+                        .build()
+                        .ok()?;
+                    components.push(Some(glob.compile_matcher()));
+                }
+            }
+        }
+        Some(Self { components })
+    }
+
+    fn max_depth(&self, base: &Path) -> Option<usize> {
+        if self.components.iter().any(Option::is_none) {
+            None
+        } else {
+            let count = base
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count();
+            Some(self.components.len().saturating_sub(count))
+        }
+    }
+
+    fn can_match(&self, path: &Path) -> bool {
+        let mut states = vec![false; self.components.len() + 1];
+        states[0] = true;
+        for component in path.components().filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        }) {
+            self.expand_globstars(&mut states);
+            let mut next = vec![false; states.len()];
+            for (index, matcher) in self.components.iter().enumerate() {
+                if states[index] {
+                    match matcher {
+                        None => next[index] = true,
+                        Some(matcher) if matcher.is_match(component) => next[index + 1] = true,
+                        _ => {}
+                    }
+                }
+            }
+            states = next;
+        }
+        self.expand_globstars(&mut states);
+        states.iter().any(|state| *state)
+    }
+
+    fn expand_globstars(&self, states: &mut [bool]) {
+        for (index, matcher) in self.components.iter().enumerate() {
+            if states[index] && matcher.is_none() {
+                states[index + 1] = true;
+            }
+        }
+    }
 }
 fn snapshot_registry_source(source: &Path, cache: &Path) -> Result<PathBuf> {
     use std::io::{Read, Write};
@@ -1631,6 +1711,35 @@ mod tests {
         assert!(discover("*/../outside/prompts/*.md".into()).is_empty());
     }
 
+    #[test]
+    fn package_prompt_glob_prunes_unrelated_subtrees_and_limits_depth() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("users");
+        let root = base.join("owner");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        let deep = base.join("other/unrelated/a/b/c/prompts");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("unexpected.md"), "fixture").unwrap();
+        std::fs::write(root.join("prompts/visible.md"), "fixture").unwrap();
+        let pattern = base.join("*/prompts/*.md");
+        let prefix = PromptGlobPrefix::new(&pattern).unwrap();
+        assert_eq!(prefix.max_depth(&base), Some(3));
+        assert!(prefix.can_match(&base.join("other")));
+        assert!(!prefix.can_match(&base.join("other/unrelated")));
+        assert!(!prefix.can_match(&deep));
+        let prompts = collect_package_resources(
+            &root,
+            &json!({"prompts": [pattern.to_string_lossy()]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(prompts, vec![root.join("prompts/visible.md")]);
+        let recursive = PromptGlobPrefix::new(&base.join("*/**/prompts/*.md")).unwrap();
+        assert_eq!(recursive.max_depth(&base), None);
+        assert!(recursive.can_match(&deep));
+    }
+
     #[cfg(windows)]
     #[test]
     fn package_prompt_absolute_glob_matches_verbatim_package_root() {
@@ -1650,6 +1759,32 @@ mod tests {
             prompts[0].canonicalize().unwrap(),
             canonical.join("prompts/review.md")
         );
+        let excluded = collect_package_resources(
+            &canonical,
+            &json!({"prompts": [pattern, "!prompts/review.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert!(excluded.is_empty());
+        let pattern = format!("{}/prompts/*.md", ordinary.display());
+        let excluded = collect_package_resources(
+            &canonical,
+            &json!({"prompts": [pattern, "-prompts/review.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert!(excluded.is_empty());
+        let pattern = format!("{}/prompts/*.md", ordinary.display());
+        let included = collect_package_resources(
+            &canonical,
+            &json!({"prompts": [pattern, "!prompts/review.md", "+prompts/review.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(included.len(), 1);
     }
 
     #[cfg(unix)]
