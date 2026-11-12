@@ -1134,6 +1134,10 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     wait_level("low");
     let deadline = Instant::now() + Duration::from_secs(10);
     let notifications = loop {
+        // Keep draining the PTY while waiting: fullscreen redraws can fill its
+        // output buffer and block the UI before it dispatches the notification.
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
         let entries: Vec<serde_json::Value> = std::fs::read_to_string(home.join("events.jsonl"))
             .unwrap_or_default()
             .lines()
