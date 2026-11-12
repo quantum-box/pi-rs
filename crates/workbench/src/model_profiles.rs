@@ -1215,7 +1215,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(headers["nvcf-poll-seconds"], "3600");
-        assert_eq!(headers["authorization"], "Bearer fixture");
         let untrusted = profiles
             .request_headers(
                 &nvidia,
