@@ -45,6 +45,7 @@ pub struct Catalog {
     pub models: Vec<String>,
     aliases: Vec<(String, String)>,
     probe_details: bool,
+    pub complete: bool,
 }
 
 impl Catalog {
@@ -96,9 +97,11 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
     let mut probe_details = false;
     let bundled = super::builtin_chat::find(provider.id())
         .is_some_and(|builtin| args.endpoint_for(&provider) == builtin.endpoint());
+    let mut complete = false;
     if (probe && !bundled) || provider == Provider::Radius {
         match client.models().await {
             Ok(discovered) => {
+                complete = true;
                 let mut seen: std::collections::BTreeSet<_> = models.iter().cloned().collect();
                 models.extend(discovered.into_iter().filter(|id| seen.insert(id.clone())));
                 probe_details = true;
@@ -122,6 +125,7 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
         models,
         aliases,
         probe_details,
+        complete,
     })
 }
 
@@ -477,6 +481,16 @@ pub fn fuzzy(query: &str, value: &str) -> bool {
 mod tests {
     use super::{Choice, Scope};
 
+    #[tokio::test]
+    async fn unqueried_dynamic_catalog_is_not_complete() {
+        use clap::Parser;
+        let args = super::Cli::parse_from(["pi"]);
+        let catalog = super::catalog(&args, super::Provider::Ollama, false)
+            .await
+            .unwrap();
+        assert!(!catalog.complete);
+    }
+
     #[test]
     fn scope_keeps_provider_identity_and_pattern_order() {
         use super::{Catalog, Provider, scoped_choices};
@@ -494,6 +508,7 @@ mod tests {
                 models: vec!["same".into(), "exact-extra".into()],
                 aliases: Vec::new(),
                 probe_details: false,
+                complete: false,
             },
             Catalog {
                 provider: Provider::Anthropic,
@@ -508,6 +523,7 @@ mod tests {
                 models: vec!["same".into(), "exact".into()],
                 aliases: Vec::new(),
                 probe_details: false,
+                complete: false,
             },
         ];
         let (choices, warnings) = scoped_choices(

@@ -1256,13 +1256,13 @@ mod tests {
     }
 
     #[test]
-    fn restoration_requires_known_model_and_uses_default_thinking_for_unset_branch() {
+    fn restoration_distinguishes_unknown_and_authoritative_catalog_misses() {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join(".pi")).unwrap();
         std::fs::write(
             directory.path().join(".pi/settings.json"),
-            r#"{"defaultThinkingLevel":"low"}"#,
+            r#"{"defaultThinkingLevel":"low","modelThinkingLevels":{"ollama/known":"xhigh"}}"#,
         )
         .unwrap();
         let mut args = super::super::Cli::parse_from(["pi"]);
@@ -1271,7 +1271,10 @@ mod tests {
         args.remember_initial_selection();
         args.discovered_models
             .push(("ollama".into(), "known".into()));
-        for (model, expected) in [("not-in-offline-catalog", "initial"), ("known", "known")] {
+        for (model, expected) in [
+            ("not-in-offline-catalog", "not-in-offline-catalog"),
+            ("known", "known"),
+        ] {
             args.model = "previous-branch".into();
             args.thinking = Some("high".into());
             let session = import_pi(vec![
@@ -1280,8 +1283,30 @@ mod tests {
             ]).unwrap();
             args.restore_session_model(&session);
             assert_eq!(args.model, expected);
-            assert_eq!(args.thinking.as_deref(), Some("low"));
+            assert_eq!(
+                args.thinking.as_deref(),
+                Some(if model == "known" { "xhigh" } else { "low" })
+            );
         }
+        args.model_scope
+            .push(super::super::model_selection::ScopedChoice {
+                provider: super::super::Provider::Ollama,
+                model: "known".into(),
+                thinking: Some("high".into()),
+            });
+        let scoped = import_pi(vec![json!({"type":"session","version":3}), json!({"type":"message","id":"m","parentId":null,"message":{"role":"assistant","provider":"ollama","model":"known","content":[]}})]).unwrap();
+        args.restore_session_model(&scoped);
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        args.model_scope.clear();
+        let mut native = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        native
+            .select_provider_model(None, "saved-dynamic", Some("low"))
+            .unwrap();
+        let native_path = directory.path().join("saved-native.jsonl");
+        native.export_jsonl(&native_path).unwrap();
+        let reopened = read(&native_path).unwrap();
+        args.restore_session_model(&reopened);
+        assert_eq!(args.model, "saved-dynamic");
         let session = import_pi(vec![
             json!({"type":"session","version":3}),
             json!({"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","provider":"anthropic","model":"nonexistent-model-id","content":[]}}),
@@ -1290,6 +1315,52 @@ mod tests {
         args.restore_session_model(&session);
         assert_eq!(args.model, "initial");
         assert_eq!(args.thinking.as_deref(), Some("low"));
+        args.complete_catalogs.push((
+            "ollama".into(),
+            args.endpoint_for(&super::super::Provider::Ollama)
+                .to_owned(),
+        ));
+        let unknown_dynamic = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"assistant","parentId":null,"message":{"role":"assistant","provider":"ollama","model":"missing-from-complete-catalog","content":[]}}),
+        ]).unwrap();
+        args.restore_session_model(&unknown_dynamic);
+        assert_eq!(args.model, "initial");
+    }
+
+    #[test]
+    fn automatic_recording_does_not_override_imported_virtual_selection() {
+        use clap::Parser;
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+            json!({"type":"message","id":"assistant","parentId":"change","message":{"role":"assistant","provider":"anthropic","model":"physical","content":[]}}),
+        ]).unwrap();
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.provider = super::super::Provider::Anthropic;
+        args.model = "physical".into();
+        let before = session.records().len();
+        args.record_automatic_model_selection(&mut session).unwrap();
+        assert_eq!(session.records().len(), before);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("share.jsonl");
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let shared = read(&path).unwrap();
+        assert!(
+            matches!(branch_selection(&shared, |_, _| Some(true)), BranchSelection::Selected { model, .. } if model == "virtual")
+        );
+        args.record_model_selection(&mut session).unwrap();
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let shared = read(&path).unwrap();
+        assert!(
+            matches!(branch_selection(&shared, |_, _| Some(true)), BranchSelection::Selected { model, .. } if model == "physical")
+        );
     }
 
     #[test]

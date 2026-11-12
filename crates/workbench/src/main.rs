@@ -72,6 +72,8 @@ struct Cli {
     #[arg(skip)]
     discovered_models: Vec<(String, String)>,
     #[arg(skip)]
+    complete_catalogs: Vec<(String, String)>,
+    #[arg(skip)]
     session_transition: Option<pi_rs::SessionStartReason>,
     #[arg(skip)]
     settings: config::Settings,
@@ -645,6 +647,19 @@ impl Cli {
         )
     }
 
+    fn record_automatic_model_selection(&self, session: &mut Session) -> Result<()> {
+        if !self.model_explicit
+            && !self.thinking_explicit
+            && !matches!(
+                session_import::branch_selection(session, |_, _| None),
+                session_import::BranchSelection::Native
+            )
+        {
+            return Ok(());
+        }
+        self.record_model_selection(session)
+    }
+
     fn restore_model_selection(
         &mut self,
         model: String,
@@ -694,20 +709,12 @@ impl Cli {
                         .thinking_for_model(self.provider.id(), &self.model)
                         .map(str::to_owned)
                 })
-                .or_else(|| self.thinking.clone());
+                .or_else(|| Some("medium".into()));
         }
         true
     }
 
     fn restore_initial_selection(&mut self, thinking: Option<String>) {
-        let thinking = thinking.or_else(|| {
-            Some(
-                self.settings
-                    .string("defaultThinkingLevel")
-                    .unwrap_or("medium")
-                    .to_owned(),
-            )
-        });
         if let Some(initial) = &self.initial_selection {
             if !self.model_explicit {
                 self.provider = initial.provider.clone();
@@ -715,12 +722,23 @@ impl Cli {
                 self.model = initial.model.clone();
                 self.thinking_profile = None;
             }
-            if !self.thinking_explicit {
-                self.thinking = thinking;
-            }
-        } else if !self.thinking_explicit {
-            self.thinking = thinking;
         }
+        if !self.thinking_explicit {
+            self.thinking = Some(thinking.unwrap_or_else(|| self.default_branch_thinking()));
+        }
+    }
+
+    fn default_branch_thinking(&self) -> String {
+        self.model_scope
+            .iter()
+            .find(|choice| choice.provider == self.provider && choice.model == self.model)
+            .and_then(|choice| choice.thinking.clone())
+            .or_else(|| {
+                self.settings
+                    .thinking_for_model(self.provider.id(), &self.model)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "medium".into())
     }
 
     fn restore_branch_selection(
@@ -729,11 +747,13 @@ impl Cli {
         thinking: Option<String>,
         provider: Option<&str>,
     ) {
-        let known = self
+        let availability = self
             .model_profiles
             .provider(provider.unwrap_or("ollama"))
-            .is_some_and(|provider| {
-                self.model_profiles
+            .map(|provider| {
+                let endpoint = self.endpoint_for(&provider);
+                let known = self
+                    .model_profiles
                     .model_ids(&provider)
                     .iter()
                     .any(|id| id == &model)
@@ -747,21 +767,22 @@ impl Cli {
                         .any(|choice| choice.provider == provider && choice.model == model)
                     || self.initial_selection.as_ref().is_some_and(|initial| {
                         initial.provider == provider && initial.model == model
-                    })
+                    });
+                let official_catalog = !self.model_profiles.model_ids(&provider).is_empty()
+                    && endpoint == provider.default_endpoint()
+                    && matches!(provider, Provider::Anthropic | Provider::Google);
+                let complete = official_catalog
+                    || self
+                        .complete_catalogs
+                        .iter()
+                        .any(|(p, e)| p == provider.id() && e == endpoint);
+                (known, complete)
             });
-        // Unknown dynamic models may exist, but cannot be verified by this
-        // synchronous, potentially offline restoration path.
-        if !known || !self.restore_model_selection(model, thinking.clone(), provider) {
+        let unavailable = availability.is_none_or(|(known, complete)| !known && complete);
+        if unavailable || !self.restore_model_selection(model, thinking.clone(), provider) {
             self.restore_initial_selection(thinking);
-        } else if !self.thinking_explicit {
-            self.thinking = thinking.or_else(|| {
-                Some(
-                    self.settings
-                        .string("defaultThinkingLevel")
-                        .unwrap_or("medium")
-                        .to_owned(),
-                )
-            });
+        } else if !self.thinking_explicit && thinking.is_some() {
+            self.thinking = thinking;
         }
     }
 
@@ -772,6 +793,8 @@ impl Cli {
             session_import::BranchSelection::Native => {
                 if let Some((model, thinking)) = session.model_selection() {
                     self.restore_branch_selection(model, thinking, session.model_provider());
+                } else if !self.thinking_explicit {
+                    self.thinking = Some(self.default_branch_thinking());
                 }
             }
             session_import::BranchSelection::Selected {
@@ -1204,6 +1227,16 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 .models
                 .iter()
                 .map(|model| (catalog.provider.id().to_owned(), model.clone()))
+        })
+        .collect();
+    args.complete_catalogs = catalogs
+        .iter()
+        .filter(|catalog| catalog.complete)
+        .map(|catalog| {
+            (
+                catalog.provider.id().to_owned(),
+                args.endpoint_for(&catalog.provider).to_owned(),
+            )
         })
         .collect();
     // The hidden worker command receives an already-resolved, literal model ID.
@@ -1639,7 +1672,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     args.restore_session_model(&session);
     if !args.model.is_empty() {
         thinking::adjust(&mut args);
-        args.record_model_selection(&mut session)?;
+        args.record_automatic_model_selection(&mut session)?;
     }
     if args.mode == Some(OutputMode::Json)
         && matches!(
@@ -1687,7 +1720,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 args.bind_initial_model_endpoint();
                 if !args.thinking_explicit { args.apply_model_thinking_defaults(); }
                 thinking::adjust(&mut args);
-                args.record_model_selection(&mut session)?;
+                args.record_automatic_model_selection(&mut session)?;
                 runtime.close().await?;
                 runtime = runtime::configure(&args, false).await?;
                 session.set_auto_compaction_control(runtime.auto_compaction.clone());

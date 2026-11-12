@@ -3261,8 +3261,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     {
         std::fs::create_dir_all(parent)?;
     }
-    initialize_session(&mut args)?;
-    restore_workspace(&mut args)?;
+    prepare_initial_session(&mut args)?;
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
@@ -6253,6 +6252,11 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
     Ok(())
 }
 
+fn prepare_initial_session(args: &mut Cli) -> Result<()> {
+    restore_workspace(args)?;
+    initialize_session(args)
+}
+
 fn initialize_session(args: &mut Cli) -> Result<()> {
     let mut session = Session::open(&args.session)?;
     if session.host_binding().is_some() {
@@ -6268,7 +6272,7 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     }
     args.restore_session_model(&session);
     super::thinking::adjust(args);
-    args.record_model_selection(&mut session)?;
+    args.record_automatic_model_selection(&mut session)?;
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
@@ -6499,6 +6503,44 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_loads_saved_workspace_settings_before_recording_selection() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let launch = directory.path().join("launch");
+        let target = directory.path().join("target");
+        for (path, level) in [(&launch, "low"), (&target, "high")] {
+            std::fs::create_dir_all(path.join(".pi")).unwrap();
+            std::fs::write(
+                path.join(".pi/settings.json"),
+                format!(r#"{{"defaultThinkingLevel":"{level}"}}"#),
+            )
+            .unwrap();
+        }
+        let session_path = directory.path().join("session.jsonl");
+        let mut session = pi_rs::Session::open(&session_path).unwrap();
+        session.set_working_directory(&target).unwrap();
+        drop(session);
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = session_path.clone();
+        args.workspace = launch.clone();
+        args.settings = super::super::config::Settings::load(&launch, true).unwrap();
+        args.trust = true;
+        args.model = "fixture".into();
+        args.thinking = Some("low".into());
+        args.remember_initial_selection();
+        super::prepare_initial_session(&mut args).unwrap();
+        assert_eq!(
+            args.workspace.canonicalize().unwrap(),
+            target.canonicalize().unwrap()
+        );
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        let session = pi_rs::Session::open(&session_path).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("fixture".into(), Some("high".into())))
+        );
+    }
     #[test]
     fn imported_branch_checkout_fork_and_switch_restore_selection() {
         use clap::Parser;
