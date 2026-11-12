@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -8,6 +8,39 @@ use pi_rs::{
     Agent, CancellationToken, Limits, MemoryStore, Notification, Registry, Session, ollama::Ollama,
 };
 use serde_json::{Value, json};
+
+// Some hosted runners open idle connections to local listeners. Read each
+// connection independently so one idle peer cannot block the real request.
+fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStream>, String) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(request) = receiver.try_recv() {
+            return request;
+        }
+        match listener.accept() {
+            Ok((socket, _)) => {
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let mut reader = BufReader::new(socket.try_clone().unwrap());
+                    let mut first = String::new();
+                    if reader.read_line(&mut first).is_ok() && !first.is_empty() {
+                        let _ = sender.send((socket, reader, first));
+                    }
+                });
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("proxy request not received: {error}"),
+        }
+    }
+}
 
 #[cfg(unix)]
 #[test]
@@ -2048,28 +2081,7 @@ fn model_listing_uses_proxy_before_a_model_request() {
     )
     .unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let (mut socket, mut reader, first) = loop {
-            let (socket, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(error) => panic!("model discovery did not reach proxy: {error}"),
-            };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut first = String::new();
-            if reader.read_line(&mut first).is_ok() && !first.is_empty() {
-                break (socket, reader, first);
-            }
-        };
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -2126,28 +2138,7 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     .unwrap();
     std::fs::write(root.path().join("auth.json"), json!({"radius":{"type":"oauth","gateway":"http://127.0.0.1:1/","access":"old-token","refresh":"fixture-refresh","expires":0}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let (mut socket, mut reader, first) = loop {
-            let (socket, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(error) => panic!("OAuth refresh did not reach proxy: {error}"),
-            };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut first = String::new();
-            if reader.read_line(&mut first).is_ok() && !first.is_empty() {
-                break (socket, reader, first);
-            }
-        };
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
         let mut length = 0;
         loop {
             let mut line = String::new();
@@ -2206,28 +2197,7 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
     .unwrap();
     std::fs::write(root.path().join("mcp.json"), json!({"mcpServers":{"fixture":{"url":"http://127.0.0.1:1/mcp","auth":{"provider":"anthropic"},"oauth":false}}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let (mut socket, mut reader, first) = loop {
-            let (socket, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(error) => panic!("MCP request did not reach proxy: {error}"),
-            };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut first = String::new();
-            if reader.read_line(&mut first).is_ok() && !first.is_empty() {
-                break (socket, reader, first);
-            }
-        };
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
         let mut headers = String::new();
         loop {
             let mut line = String::new();
