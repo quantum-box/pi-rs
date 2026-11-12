@@ -741,7 +741,8 @@ impl Model for Google {
                             calls.push(ToolCall { id: id.clone(), name: name.into(), arguments: arguments.clone() });
                             yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta { index, id, name: name.into(), arguments });
                         }
-                        append_replay_part(&mut blocks, part);
+                        // Preserve every part exactly: signatures belong to their original part.
+                        blocks.push(part.clone());
                     }
                 }
                 if let Some(reason) = candidate["finishReason"].as_str().filter(|reason| *reason != "FINISH_REASON_UNSPECIFIED") {
@@ -769,38 +770,6 @@ impl Model for Google {
     }
 }
 
-// Streaming text parts are deltas of one logical block until its kind changes
-// or another kind of part (such as a function call) interrupts it.
-fn append_replay_part(blocks: &mut Vec<Value>, part: &Value) {
-    let Some(text) = part.get("text").and_then(Value::as_str) else {
-        blocks.push(part.clone());
-        return;
-    };
-    let is_text_only = |value: &Value| {
-        value.as_object().is_some_and(|object| {
-            object
-                .keys()
-                .all(|key| matches!(key.as_str(), "text" | "thought" | "thoughtSignature"))
-                && value.get("text").is_some_and(Value::is_string)
-        })
-    };
-    let thought = part["thought"].as_bool().unwrap_or(false);
-    if is_text_only(part)
-        && let Some(previous) = blocks.last_mut().filter(|previous| {
-            is_text_only(previous) && previous["thought"].as_bool().unwrap_or(false) == thought
-        })
-    {
-        if let Some(Value::String(combined)) = previous.get_mut("text") {
-            combined.push_str(text);
-        }
-        if let Some(signature) = part["thoughtSignature"].as_str().filter(|s| !s.is_empty()) {
-            previous["thoughtSignature"] = json!(signature);
-        }
-    } else {
-        blocks.push(part.clone());
-    }
-}
-
 fn report_progress(
     observer: &Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     last: &mut Option<Progress>,
@@ -819,7 +788,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn streamed_thinking_and_text_replay_as_signed_blocks() {
+    async fn streamed_parts_replay_with_original_signature_boundaries() {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
 
@@ -837,9 +806,12 @@ mod tests {
             }
             let parts = [
                 json!({"thought":true,"text":"think ","thoughtSignature":"first"}),
-                json!({"thought":true,"text":"more","thoughtSignature":""}),
+                json!({"thought":true,"text":"more"}),
                 json!({"text":"answer ","thoughtSignature":"old"}),
                 json!({"text":"done","thoughtSignature":"new"}),
+                json!({"text":" unsigned"}),
+                json!({"text":"","thoughtSignature":"empty-text"}),
+                json!({"thoughtSignature":"signature-only"}),
                 json!({"functionCall":{"name":"read","args":{}},"thoughtSignature":"call"}),
                 json!({"text":"after"}),
             ];
@@ -883,6 +855,7 @@ mod tests {
                 "thinking:more",
                 "text:answer ",
                 "text:done",
+                "text: unsigned",
                 "text:after"
             ]
         );
@@ -890,8 +863,13 @@ mod tests {
         assert_eq!(
             replay.blocks,
             vec![
-                json!({"thought":true,"text":"think more","thoughtSignature":"first"}),
-                json!({"text":"answer done","thoughtSignature":"new"}),
+                json!({"thought":true,"text":"think ","thoughtSignature":"first"}),
+                json!({"thought":true,"text":"more"}),
+                json!({"text":"answer ","thoughtSignature":"old"}),
+                json!({"text":"done","thoughtSignature":"new"}),
+                json!({"text":" unsigned"}),
+                json!({"text":"","thoughtSignature":"empty-text"}),
+                json!({"thoughtSignature":"signature-only"}),
                 json!({"functionCall":{"name":"read","args":{}},"thoughtSignature":"call"}),
                 json!({"text":"after"}),
             ]
@@ -900,7 +878,7 @@ mod tests {
         let request = ModelRequest {
             model: "gemini-3.5-flash".into(),
             messages: vec![Message::Assistant {
-                content: "answer doneafter".into(),
+                content: "answer done unsignedafter".into(),
                 calls: vec![],
                 replay: Some(replay),
             }],
