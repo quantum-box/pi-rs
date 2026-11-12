@@ -410,6 +410,8 @@ struct ModelDiscovery {
 struct ThinkingSettings {
     parent: Picker,
     models: Vec<String>,
+    // The open picker reflects live choices even when project settings win on reload.
+    overrides: serde_json::Map<String, Value>,
     model_picker: Option<Picker>,
     selected: Option<String>,
     levels: Option<std::sync::mpsc::Receiver<Vec<String>>>,
@@ -3410,7 +3412,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 state.models = models;
                                 let mut picker = Picker::new(
                                     "Thinking: select model",
-                                    thinking_model_items(&state.models, &args),
+                                    thinking_model_items(&state.models, &state.overrides),
                                 );
                                 picker.focus_thinking_model(&format!(
                                     "{}/{}",
@@ -3504,7 +3506,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     levels.dedup();
                     state.available_levels = levels;
                     state.levels = None;
-                    view.picker = Some(thinking_level_picker(state, &args));
+                    view.picker = Some(thinking_level_picker(state));
                     dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -4195,6 +4197,10 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                     view.thinking_settings = Some(ThinkingSettings {
                                         parent: picker,
                                         models: Vec::new(),
+                                        overrides: args.settings.value()["modelThinkingLevels"]
+                                            .as_object()
+                                            .cloned()
+                                            .unwrap_or_default(),
                                         model_picker: None,
                                         selected: None,
                                         levels: None,
@@ -4251,6 +4257,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 };
                                 match result {
                                     Ok(()) => {
+                                        if let Some(level) = level {
+                                            state.overrides.insert(model.to_owned(), json!(level));
+                                        } else {
+                                            state.overrides.remove(model);
+                                        }
                                         if let Some((provider, id)) =
                                             super::model_selection::qualified_model(
                                                 model,
@@ -4259,10 +4270,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                             && provider == args.provider
                                             && id == args.model
                                         {
-                                            let requested = args
-                                                .settings
-                                                .thinking_for_model(provider.id(), id)
-                                                .unwrap_or("medium");
+                                            let requested = level.as_deref().unwrap_or_else(|| {
+                                                args.settings
+                                                    .string("defaultThinkingLevel")
+                                                    .unwrap_or("medium")
+                                            });
                                             let effective = super::thinking::clamp(
                                                 requested,
                                                 &state.available_levels,
@@ -4306,7 +4318,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                             state.model_picker.take().expect("model picker");
                                         models.refresh_thinking_models(thinking_model_items(
                                             &state.models,
-                                            &args,
+                                            &state.overrides,
                                         ));
                                         state.selected = None;
                                         view.picker = Some(models);
@@ -5404,13 +5416,14 @@ impl ThemeSettings {
     }
 }
 
-fn thinking_model_items(models: &[String], args: &Cli) -> Vec<Item> {
+fn thinking_model_items(
+    models: &[String],
+    overrides: &serde_json::Map<String, Value>,
+) -> Vec<Item> {
     models
         .iter()
         .map(|model| {
-            let override_level = args.settings.value()["modelThinkingLevels"]
-                .get(model)
-                .and_then(Value::as_str);
+            let override_level = overrides.get(model).and_then(Value::as_str);
             Item {
                 label: override_level
                     .map_or_else(|| model.clone(), |level| format!("{model} · {level}")),
@@ -5420,11 +5433,9 @@ fn thinking_model_items(models: &[String], args: &Cli) -> Vec<Item> {
         .collect()
 }
 
-fn thinking_level_picker(state: &ThinkingSettings, args: &Cli) -> Picker {
+fn thinking_level_picker(state: &ThinkingSettings) -> Picker {
     let model = state.selected.as_deref().expect("selected model");
-    let selected = args.settings.value()["modelThinkingLevels"]
-        .get(model)
-        .and_then(Value::as_str);
+    let selected = state.overrides.get(model).and_then(Value::as_str);
     let mut items: Vec<_> = state
         .available_levels
         .iter()

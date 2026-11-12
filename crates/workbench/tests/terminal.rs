@@ -1209,6 +1209,15 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
 
 #[test]
 fn settings_choose_and_clear_per_model_thinking() {
+    check_per_model_thinking_settings(false);
+}
+
+#[test]
+fn project_per_model_thinking_preserves_live_edits_and_disk_precedence() {
+    check_per_model_thinking_settings(true);
+}
+
+fn check_per_model_thinking_settings(project_override: bool) {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -1234,12 +1243,14 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         br#"{"defaultThinkingLevel":"low"}"#,
     )
     .unwrap();
-    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
-    std::fs::write(
-        root.path().join(".pi/settings.json"),
-        br#"{"modelThinkingLevels":{"ollama/fixture-model":"low"}}"#,
-    )
-    .unwrap();
+    if project_override {
+        std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+        std::fs::write(
+            root.path().join(".pi/settings.json"),
+            br#"{"modelThinkingLevels":{"ollama/fixture-model":"low"}}"#,
+        )
+        .unwrap();
+    }
     std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"models":[{"id":"fixture-model","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}},{"id":"plain-model","reasoning":false}]}}}"#).unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -1307,8 +1318,9 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         text.contains("Thinking level · ollama/fixture-model") && text.contains("high")
     });
     master.write_all(b"high\r").unwrap();
+    let displayed = "high";
     output_until(&mut master, |text| {
-        text.contains("ollama/fixture-model · high")
+        text.contains(&format!("ollama/fixture-model · {displayed}"))
     });
     let read_settings = || -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap()
@@ -1334,7 +1346,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    wait_level("high");
+    wait_level(displayed);
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
         text.contains("Default thinking level per model") && text.contains("1 configured")
@@ -1342,8 +1354,9 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| text.contains("Thinking: select model"));
     master.write_all(b"ollama/fixture-model").unwrap();
+    let reopened = if project_override { "low" } else { "high" };
     output_until(&mut master, |text| {
-        text.contains("ollama/fixture-model · high")
+        text.contains(&format!("ollama/fixture-model · {reopened}"))
     });
     master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| {
@@ -1399,7 +1412,12 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     wait_level("low");
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Default thinking level per model") && text.contains("2 configured")
+        text.contains("Default thinking level per model")
+            && text.contains(if project_override {
+                "2 configured"
+            } else {
+                "1 configured"
+            })
     });
 }
 
