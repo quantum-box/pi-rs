@@ -3377,7 +3377,8 @@ checkpoints after the system content and at the end of the final user message.
 Set `PI_CACHE_RETENTION=long` to request one-hour checkpoints on models that
 support that TTL, or use `with_cache_retention` in the library. Set
 `AWS_BEDROCK_FORCE_CACHE=1` when the model ID and configured name cannot identify
-a supported model. Tool-free summaries disable checkpoints. Cache usage includes
+a supported model. Tool-free summaries disable checkpoints and reasoning so
+that their smaller output limit remains usable. Cache usage includes
 one-hour write details when Bedrock reports them. Model support and minimum
 cacheable lengths are determined by Bedrock.
 

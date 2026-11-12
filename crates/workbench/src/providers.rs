@@ -384,11 +384,7 @@ impl Client {
                 "custom Bedrock headers are not supported".into(),
             )),
             Self::Bedrock(client) if cache_disabled => {
-                client
-                    .clone()
-                    .with_cache_retention(CacheRetention::None)
-                    .stream(request)
-                    .await
+                client.clone().for_summary().stream(request).await
             }
             Self::Deferred(client) => {
                 if client.observed {
@@ -741,5 +737,132 @@ impl Model for Client {
                     .await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bedrock_tests {
+    use super::*;
+    use clap::Parser;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn bedrock_summary_and_configured_effort_reach_workbench() {
+        const CHILD: &str = "PI_RS_BEDROCK_WORKBENCH_SUMMARY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut args = super::super::Cli::try_parse_from(["pi", "--offline"]).unwrap();
+            args.model_profiles=super::super::model_profiles::Profiles::parse(&json!({"providers":{"amazon-bedrock":{"models":[{"id":"anthropic.claude-opus-4-8","name":"Claude Opus 4.8","reasoning":true,"thinkingLevelMap":{"xhigh":"high"}}]}}})).unwrap();
+            args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
+            let request = |model: &str| ModelRequest {
+                model: model.into(),
+                messages: vec![
+                    pi_rs::Message::System {
+                        content: "system".into(),
+                    },
+                    pi_rs::Message::User {
+                        content: "hello".into(),
+                    },
+                ],
+                tools: vec![],
+                max_output_tokens: 512,
+            };
+            args.model = "anthropic.claude-sonnet-4-5-20250929-v1:0".into();
+            args.thinking = Some("high".into());
+            let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                .with_model_options(&args, false)
+                .unwrap();
+            let _stream = client
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), true)
+                .await
+                .unwrap();
+            args.model = "anthropic.claude-opus-4-8".into();
+            args.thinking = Some("xhigh".into());
+            let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                .with_model_options(&args, false)
+                .unwrap();
+            let _stream = client
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .await
+                .unwrap();
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "providers::bedrock_tests::bedrock_summary_and_configured_effort_reach_workbench",
+            ])
+            .env(CHILD, "1")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_DEFAULT_REGION", "us-east-1")
+            .env("AWS_ACCESS_KEY_ID", "SYNTHETIC_ACCESS_KEY")
+            .env("AWS_SECRET_ACCESS_KEY", "synthetic-secret")
+            .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", format!("http://{addr}"))
+            .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK")
+            .env_remove("AWS_SESSION_TOKEN")
+            .env_remove("AWS_PROFILE")
+            .spawn()
+            .unwrap();
+        let server = async {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 8192];
+                let (end, len) = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..pos]);
+                        let len = headers
+                            .lines()
+                            .find_map(|l| {
+                                l.split_once(':')
+                                    .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                                    .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (pos + 4, len);
+                    }
+                };
+                while bytes.len() < end + len {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                requests.push(
+                    serde_json::from_slice::<serde_json::Value>(&bytes[end..end + len]).unwrap(),
+                );
+                socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: 0\r\n\r\n").await.unwrap();
+            }
+            requests
+        };
+        let requests = match tokio::time::timeout(std::time::Duration::from_secs(20), server).await
+        {
+            Ok(requests) => requests,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("workbench child did not complete loopback requests")
+            }
+        };
+        assert!(child.wait().unwrap().success());
+        let summary = &requests[0];
+        assert_eq!(summary["inferenceConfig"]["maxTokens"], 512);
+        assert!(summary.get("additionalModelRequestFields").is_none());
+        assert_eq!(summary["system"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            summary["messages"][0]["content"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            requests[1]["additionalModelRequestFields"]["output_config"]["effort"],
+            "high"
+        );
     }
 }

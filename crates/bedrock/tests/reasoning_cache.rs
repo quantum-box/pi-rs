@@ -171,6 +171,21 @@ async fn adaptive_profile_long_cache_and_govcloud_rules() {
         body["messages"][0]["content"][1]["cachePoint"],
         json!({"type":"default","ttl":"1h"})
     );
+    let (mapped, _) = capture(
+        "us-east-1",
+        |c| {
+            c.with_model_name(arn, Some("Claude Opus 4.8"))
+                .with_reasoning(Some("xhigh"), Some("high"))
+                .unwrap()
+        },
+        request(arn, 512),
+        false,
+    )
+    .await;
+    assert_eq!(
+        mapped["additionalModelRequestFields"]["output_config"]["effort"],
+        "high"
+    );
     let (gov, _) = capture(
         "us-gov-west-1",
         |c| {
@@ -207,6 +222,17 @@ async fn gpt_mapping_summary_and_unsupported_cache_models() {
         json!({"reasoning_effort":"high"})
     );
     assert_eq!(oss["messages"][0]["content"].as_array().unwrap().len(), 1);
+    let (mapped_oss, _) = capture(
+        "us-east-1",
+        |c| c.with_reasoning(Some("xhigh"), Some("low")).unwrap(),
+        request("openai.gpt-oss-120b", 1024),
+        false,
+    )
+    .await;
+    assert_eq!(
+        mapped_oss["additionalModelRequestFields"]["reasoning_effort"],
+        "low"
+    );
     let (gpt, _) = capture(
         "us-east-1",
         |c| {
@@ -226,8 +252,12 @@ async fn gpt_mapping_summary_and_unsupported_cache_models() {
     assert!(gpt["messages"][0]["content"][1].get("cachePoint").is_some());
     let (summary, _) = capture(
         "us-east-1",
-        |c| c.with_cache_retention(CacheRetention::Long),
-        request("anthropic.claude-sonnet-4-5", 1024),
+        |c| {
+            c.with_cache_retention(CacheRetention::Long)
+                .with_reasoning(Some("high"), None)
+                .unwrap()
+        },
+        request("anthropic.claude-sonnet-4-5", 512),
         true,
     )
     .await;

@@ -161,10 +161,10 @@ pub(crate) fn reasoning_fields(
         }
         let mut fields = json!({"thinking":thinking});
         if adaptive {
-            let effort = if level == ReasoningLevel::Xhigh && has_any(&items, NEW_ADAPTIVE) {
-                "xhigh"
-            } else if let Some(mapped) = mapped {
+            let effort = if let Some(mapped) = mapped {
                 mapped
+            } else if level == ReasoningLevel::Xhigh && has_any(&items, NEW_ADAPTIVE) {
+                "xhigh"
             } else {
                 match level {
                     ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
@@ -182,7 +182,9 @@ pub(crate) fn reasoning_fields(
         return Ok(Some(fields));
     }
     if has_any(&items, &["gpt-oss"]) {
-        return Ok(Some(json!({"reasoning_effort":level.oss_effort()})));
+        return Ok(Some(
+            json!({"reasoning_effort":mapped.unwrap_or(level.oss_effort())}),
+        ));
     }
     if has_any(&items, &["gpt-"]) {
         return Ok(Some(

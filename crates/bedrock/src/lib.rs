@@ -99,6 +99,13 @@ impl Bedrock {
         self.cache_retention = retention;
         self
     }
+    /// Prepare a one-off summary without cache checkpoints or model thinking.
+    pub fn for_summary(mut self) -> Self {
+        self.cache_retention = CacheRetention::None;
+        self.reasoning = None;
+        self.mapped_effort = None;
+        self
+    }
     /// Enable cache checkpoints for a model whose capabilities cannot be inferred from its name.
     pub fn with_force_cache(mut self, enabled: bool) -> Self {
         self.force_cache = enabled;
@@ -390,10 +397,7 @@ impl Model for Bedrock {
         _session_id: uuid::Uuid,
         request: ModelRequest,
     ) -> Result<ModelStream> {
-        self.clone()
-            .with_cache_retention(CacheRetention::None)
-            .stream(request)
-            .await
+        self.clone().for_summary().stream(request).await
     }
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         if let Some(reason) = &self.unsupported {
