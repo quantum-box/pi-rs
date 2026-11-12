@@ -949,8 +949,9 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     // Override-only manifests historically selected from the package contents.
     // Do not follow symlinks while gathering that implicit candidate set.
     let implicit = plain.is_empty() && !overrides.is_empty();
-    let sources: Vec<(PathBuf, bool)> = if implicit {
-        vec![(root.to_path_buf(), false)]
+    let sources: Vec<PathBuf> = if implicit {
+        paths.extend(legacy_prompt_candidates(root, None));
+        Vec::new()
     } else {
         plain
             .iter()
@@ -960,13 +961,18 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
                 } else {
                     vec![root.join(pattern)]
                 };
-                sources.into_iter().map(|source| (source, true))
+                sources
             })
             .collect()
     };
-    for (source, follow_links) in sources {
+    for source in sources {
         if source.is_file() {
-            paths.push(source);
+            if source
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".md"))
+            {
+                paths.push(source);
+            }
         } else if source.is_dir() {
             // A selected directory is the ignore root, including when it is a symlink.
             for entry in ignore::WalkBuilder::new(&source)
@@ -977,7 +983,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
                 .git_global(false)
                 .git_exclude(false)
                 .add_custom_ignore_filename(".fdignore")
-                .follow_links(follow_links)
+                .follow_links(true)
                 .filter_entry(|entry| entry.file_name() != "node_modules")
                 .build()
                 .flatten()
@@ -993,9 +999,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     // Exact force-includes may select a file outside the plain source entries.
     for path in overrides.iter().filter_map(|p| p.strip_prefix('+')) {
         let path = root.join(path);
-        if path.is_file() {
-            paths.push(path);
-        }
+        paths.extend(legacy_prompt_candidates(root, Some(&path)));
     }
     if !overrides.is_empty() {
         paths.retain(|path| manifest_selected(path, root, &overrides));
@@ -1003,6 +1007,44 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     paths.retain(|path| seen.insert(path.clone()));
     paths
+}
+
+// Match the previous package-wide candidate rules, without following links.
+// An exact target prunes traversal to its ancestors and cannot escape the root.
+fn legacy_prompt_candidates(root: &Path, target: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(target) = target {
+        let Ok(relative) = target.strip_prefix(root) else {
+            return Vec::new();
+        };
+        if relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Vec::new();
+        }
+    }
+    let target_for_filter = target.map(Path::to_path_buf);
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(false)
+        .follow_links(false)
+        .filter_entry(move |entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "target" | "node_modules")
+            ) && target_for_filter
+                .as_ref()
+                .is_none_or(|target| target.starts_with(entry.path()))
+        })
+        .build()
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().is_some_and(|kind| kind.is_file())
+                && entry.file_name().to_string_lossy().ends_with(".md")
+                && target.is_none_or(|target| entry.path() == target)
+        })
+        .map(|entry| entry.into_path())
+        .collect()
 }
 
 fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
@@ -1410,6 +1452,55 @@ mod tests {
             ])),
             vec![root.join("prompts/public.md")]
         );
+    }
+
+    #[test]
+    fn package_prompt_overrides_respect_legacy_candidates_and_markdown_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for directory in ["prompts", "prompts/pruned", "node_modules"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        for file in [
+            "prompts/visible.md",
+            "prompts/.hidden.md",
+            "prompts/git.md",
+            "prompts/private.md",
+            "prompts/pruned/secret.md",
+            "prompts/not-prompt.txt",
+            "node_modules/module.md",
+        ] {
+            std::fs::write(root.join(file), "fixture").unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "prompts/git.md\n").unwrap();
+        std::fs::write(
+            root.join(".ignore"),
+            "prompts/private.md\nprompts/pruned/\n",
+        )
+        .unwrap();
+        let discover = |patterns| {
+            collect_package_resources(root, &json!({"prompts": patterns}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        let mut implicit = discover(json!(["!prompts/visible.md"]));
+        implicit.sort();
+        assert_eq!(
+            implicit,
+            vec![root.join("prompts/.hidden.md"), root.join("prompts/git.md")]
+        );
+        assert_eq!(
+            discover(json!([
+                "prompts/visible.md",
+                "+prompts/private.md",
+                "+prompts/pruned/secret.md",
+                "+node_modules/module.md",
+                "+prompts/not-prompt.txt"
+            ])),
+            vec![root.join("prompts/visible.md")]
+        );
+        assert!(discover(json!(["prompts/not-prompt.txt"])).is_empty());
+        assert!(discover(json!(["prompts/*.txt"])).is_empty());
     }
 
     #[test]
