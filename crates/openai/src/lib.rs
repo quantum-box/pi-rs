@@ -171,8 +171,19 @@ fn payload(request: &ModelRequest) -> Value {
                     input.extend(calls.iter().map(|call| json!({"type":"function_call", "call_id":call.id, "name":call.name, "namespace":NAMESPACE, "arguments":call.arguments})));
                 }
             }
-            Message::Tool { call_id, content } => input
-                .push(json!({"type":"function_call_output", "call_id":call_id, "output":content})),
+            Message::Tool { call_id, content } => {
+                let (text, images) = pi_rs_core::extract_tool_images(content.clone());
+                let output = if images.is_empty() {
+                    json!(text)
+                } else {
+                    let mut blocks = vec![json!({"type":"input_text", "text":text})];
+                    blocks.extend(images.iter().map(|image| json!({"type":"input_image", "image_url":format!("data:{};base64,{}",image.mime_type,image.data)})));
+                    json!(blocks)
+                };
+                input.push(
+                    json!({"type":"function_call_output", "call_id":call_id, "output":output}),
+                );
+            }
         }
     }
     let mut body = json!({"model":request.model, "input":input, "store":false, "stream":true});
@@ -337,6 +348,20 @@ mod tests {
         assert_eq!(body["tools"][0]["tools"][0]["name"], "read");
         assert!(body.get("max_output_tokens").is_none());
         assert!(OpenAiResponses::new("http://example.com/responses", "token".into()).is_err());
+    }
+
+    #[test]
+    fn tool_images_are_sent_as_images_not_base64_text() {
+        let mut request = request();
+        request.messages.push(Message::Tool { call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
+        let body = payload(&request);
+        let output = &body["input"][2]["output"];
+        assert_eq!(output[0]["type"], "input_text");
+        assert!(!output[0]["text"].as_str().unwrap().contains("aW1hZ2U="));
+        assert_eq!(
+            output[1],
+            json!({"type":"input_image","image_url":"data:image/png;base64,aW1hZ2U="})
+        );
     }
 
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {
