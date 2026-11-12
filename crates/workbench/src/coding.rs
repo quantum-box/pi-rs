@@ -493,6 +493,13 @@ impl Tool for CodingTool {
             Ok(outcome) => outcome,
             Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
             Err(Error::Config(message))
+                if self.unrestricted
+                    && matches!(self.kind, Kind::Read { .. })
+                    && message.starts_with("ENOENT: no such file or directory, access '") =>
+            {
+                Outcome::Failed(message)
+            }
+            Err(Error::Config(message))
                 if self.unrestricted && matches!(self.kind, Kind::Grep | Kind::List) =>
             {
                 Outcome::Failed(message)
@@ -606,7 +613,15 @@ impl CodingTool {
             path
         };
         let resolved = path.canonicalize().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound
+            if self.unrestricted
+                && error.kind() == std::io::ErrorKind::NotFound
+                && matches!(self.kind, Kind::Read { .. })
+            {
+                Error::Config(format!(
+                    "ENOENT: no such file or directory, access '{}'",
+                    path.display()
+                ))
+            } else if error.kind() == std::io::ErrorKind::NotFound
                 && matches!(self.kind, Kind::Grep | Kind::List)
             {
                 Error::Config(format!("Path not found: {}", path.display()))
@@ -2055,6 +2070,16 @@ mod tests {
                 .await;
             assert!(matches!(output, Outcome::Failed(message)
                     if message == format!("Path not found: {}", root.join("missing").display())));
+        }
+        tool.kind = Kind::Read {
+            auto_resize: true,
+            profile: None,
+            model_supports_images: None,
+        };
+        for path in ["missing", "missing/nested file.txt"] {
+            let output = tool.invoke(json!({"path": path}), context()).await;
+            assert!(matches!(output, Outcome::Failed(message)
+                if message == format!("ENOENT: no such file or directory, access '{}'", root.join(path).display())));
         }
         cancellation.cancel();
         tool.kind = Kind::Read {

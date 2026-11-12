@@ -1225,7 +1225,11 @@ fn forward_event(
             emit(
                 json!({"type":"agent_settled","aborted":event["aborted"] == true || (event["started"] != false && stream.aborted())}),
             )?;
-            if let Some(request) = pending_abort.take() {
+            // Manual compaction can emit agent_settled before its command
+            // response. An abort must wait until the whole operation is idle.
+            if pending_compact.is_none()
+                && let Some(request) = pending_abort.take()
+            {
                 response(&request, Ok(None))?;
             }
             Ok(())
@@ -1359,7 +1363,7 @@ mod tests {
     #[test]
     fn compaction_stays_busy_until_its_completion_response() {
         let mut busy = true;
-        let mut abort = None;
+        let mut abort = Some(json!({"type":"abort","id":"during-compaction"}));
         let mut bash = None;
         let mut compact = Some(json!({"type":"compact","id":"focus"}));
         let mut stream = super::super::rpc_events::Stream::default();
@@ -1376,7 +1380,7 @@ mod tests {
         .unwrap();
         assert!(busy);
         assert!(compact.is_some());
-        abort = Some(json!({"type":"abort","id":"late-abort"}));
+        assert_eq!(abort.as_ref().unwrap()["id"], "during-compaction");
         let response = json!({
             "type": "response", "command": "compact", "id": "focus",
             "success": true, "data": {"summary": "done"},

@@ -3826,8 +3826,13 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             }
                             None => false,
                         };
-                        accepted
-                            && crate::ui::theme::set_terminal_color(foreground, red, green, blue)
+                        let changed = accepted
+                            && crate::ui::theme::set_terminal_color(foreground, red, green, blue);
+                        if accepted && !foreground && theme.name == "system" {
+                            theme = Theme::system();
+                            dirty = true;
+                        }
+                        changed
                     }
                     _ => unreachable!(),
                 };

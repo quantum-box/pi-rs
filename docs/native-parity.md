@@ -217,6 +217,9 @@ imported timestamps with UTC offsets. Siblings with the same instant retain
 append order. Entries whose parent is missing or points to themselves appear as
 roots.
 
+During manual compaction, an RPC `abort` response waits for the compaction
+command to finish, even if an internal agent-settled event arrives first.
+
 Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID when present. Malformed JSON produces a `parse` response with a
 parser diagnostic. The diagnostic wording comes from the Rust JSON parser.
@@ -538,7 +541,9 @@ System theme accent and syntax roles use Pi's fallback ANSI palette slots.
 Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
 arrive. Color requests are serialized and coalesced. A device-attributes reply starts
-the next request, with a two-second fallback when the terminal does not reply. Contrast-based system theme generation remains
+the next request, with a two-second fallback when the terminal does not reply.
+When the background is unknown, the system theme retains ANSI-indexed colors
+even if the palette is available, matching Pi's fallback. Contrast-based system theme generation remains
 to be implemented. Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.
@@ -1286,6 +1291,11 @@ Explicit non-default ports and case-sensitive repository paths remain distinct.
 Regression tests cover transport aliases, ports, revisions and missing local
 sources.
 
+An explicit native package resource manifest limits loading to its declared
+resource types, including when a declared array is empty. A manifest containing
+only metadata retains automatic directory and native executable discovery.
+This prevents undeclared package resources from being enabled accidentally.
+
 ### MCP form elicitation checkpoint
 
 MCP form requests now use the active tool call's native interaction surface.
@@ -1901,6 +1911,13 @@ the pinned Pi statistics implementation and the native RPC. The complete
 workspace tests and all-target Clippy pass. Provider price
 catalogs, automatic native pricing and detailed cost provenance remain open.
 
+### Imported session names
+
+Session and owned SDK name reads trim ECMAScript whitespace from the latest
+stored name, as Pi does, including names imported from external JSONL. A
+whitespace-only name clears the title without falling back to an older name;
+reading preserves internal line breaks and does not rewrite the journal.
+
 ### SDK statistics checkpoint
 
 `Session::statistics` and `AgentSession::statistics` expose the same typed,
@@ -2120,6 +2137,13 @@ as the earlier newline and truncation boundaries. Focused tests exercise a
 small streaming buffer and verify the complete decoded byte count.
 
 Full workspace tests and all-target Clippy pass.
+
+### Missing read path diagnostics
+
+An unrestricted local `read` of a missing path now reports the resolved path
+in Pi's `ENOENT: no such file or directory, access '…'` diagnostic. This also
+identifies the requested file when a parent directory is missing. Other I/O
+errors and restricted workspace path checks retain their existing behavior.
 
 ### Write and edit result checkpoint
 
@@ -3232,3 +3256,11 @@ execution; subsequent hooks and the tool receive the changed value. The
 executable extension protocol advertises this capability and falls back to
 the existing policy hook for older executables. As in Pi, mutations are not
 revalidated against the tool schema. Argument size limits still apply.
+
+### Full-system context diagnostics checkpoint
+
+When a `context_with_system` handler removes the leading system message, the
+host reports a non-fatal extension error for that handler. Later handlers and
+the provider still receive its transformed context, matching Pi v1.5.0. A
+handler that restores and then removes the leading system message is reported
+again.
