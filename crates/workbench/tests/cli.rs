@@ -2319,7 +2319,13 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let (request, headers) = server.join().unwrap();
+    let (request, headers) = server.join().unwrap_or_else(|_| {
+        panic!(
+            "MCP proxy fixture failed; status: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
     assert!(
         request.starts_with("POST http://127.0.0.1:1/mcp "),
         "{request}"
