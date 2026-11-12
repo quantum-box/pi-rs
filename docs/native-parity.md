@@ -1736,11 +1736,14 @@ prefix-specific character estimates rather than borrowing usage for the whole
 conversation. The compaction record and RPC response report Pi-compatible
 `tokensBefore`, independently of the native retention budget.
 
-Native request budgeting uses adapter-specific message estimates. Anthropic tool
-results count their original text envelope; adapters that extract tool images
+Native request budgeting uses adapter-specific message estimates. Anthropic and
+Bedrock tool results count their original text envelope; adapters that extract tool images
 use a fixed image allowance instead of counting encoded image bytes. Matching
-provider replay blocks, including reasoning and signatures, are included. A
-measured baseline is combined with provider-aware estimates of subsequent
+provider replay blocks, including reasoning and signatures, are included when
+the adapter actually replays them. Bedrock currently omits replay and rejects
+user image input. Its dynamic AWS credentials and endpoint resolver do not
+provide a provably stable identity, so measured baselines are not reused for
+Bedrock requests. A measured baseline is combined with provider-aware estimates of subsequent
 messages and any additional replay content. Request hooks that change the
 model, messages or tools invalidate the measured baseline; that fact is recorded
 with the request so it remains effective after reopening. A fingerprint also

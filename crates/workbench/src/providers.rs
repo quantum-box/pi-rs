@@ -264,8 +264,9 @@ impl Deferred {
     fn estimation_client(&self) -> Option<&Client> {
         self.estimator
             .get_or_init(|| {
+                let credential = (self.adapter != Adapter::Bedrock).then(|| "estimate".into());
                 self.provider
-                    .connect(self.adapter, &self.endpoint, Some("estimate".into()), false)
+                    .connect(self.adapter, &self.endpoint, credential, false)
                     .and_then(|client| match &self.options {
                         Some((args, reported)) => client.with_model_options(args, *reported),
                         None => Ok(client),
@@ -800,6 +801,7 @@ impl Model for Client {
             Self::Google(c) => c.context_identity(),
             Self::PiMessages(c) => c.context_identity(),
             Self::OpenAi(c) => c.context_identity(),
+            Self::Bedrock(c) => c.context_identity(),
             Self::Deferred(client) => client.context_identity(),
         }
     }
@@ -811,6 +813,7 @@ impl Model for Client {
             Self::Google(c) => c.estimate_message_tokens(request, message),
             Self::PiMessages(c) => c.estimate_message_tokens(request, message),
             Self::OpenAi(c) => c.estimate_message_tokens(request, message),
+            Self::Bedrock(c) => c.estimate_message_tokens(request, message),
             Self::Deferred(c) => c.estimation_client().map_or_else(
                 || pi_rs::estimate_message_tokens(message),
                 |client| client.estimate_message_tokens(request, message),
@@ -850,6 +853,34 @@ impl Model for Client {
 mod estimation_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn deferred_bedrock_uses_text_tool_estimator_without_synthetic_credentials() {
+        let client = Client::deferred(
+            Provider::Bedrock,
+            Adapter::Bedrock,
+            "",
+            None,
+            RequestHeaders::default(),
+        );
+        let Client::Deferred(deferred) = &client else {
+            unreachable!()
+        };
+        assert!(matches!(
+            deferred.estimation_client(),
+            Some(Client::Bedrock(_))
+        ));
+        assert!(client.context_identity().is_none());
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let message = pi_rs::Message::Tool { call_id: "id".into(), is_error: false, is_structured: Some(true),
+            content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(20000)}]}}).to_string() };
+        assert!(client.estimate_message_tokens(&request, &message) > 4000);
+    }
 
     #[test]
     fn deferred_static_credentials_have_stable_route_bound_identity() {

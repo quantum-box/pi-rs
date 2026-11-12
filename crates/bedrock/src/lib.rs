@@ -170,6 +170,65 @@ fn request_error(
 
 #[async_trait::async_trait]
 impl Model for Bedrock {
+    // The SDK's credential chain and endpoint resolver can change independently
+    // of the visible request. Do not reuse measured anchors without a stable
+    // account and route identity.
+    fn context_identity(&self) -> Option<String> {
+        None
+    }
+
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        fn text_tokens(text: &str) -> u64 {
+            (text.encode_utf16().count() as u64).div_ceil(4)
+        }
+        let visible = match message {
+            Message::System { content } if content.trim().is_empty() => return 0,
+            Message::User { content } => required_text(content.clone()),
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+                ..
+            } if request.tools.is_empty() => format!(
+                "Historical tool result ({}; {}):\n{}",
+                call_id,
+                if *is_error { "error" } else { "success" },
+                content,
+            ),
+            Message::Tool { content, .. } => required_text(content.clone()),
+            Message::Assistant { content, calls, .. } if request.tools.is_empty() => {
+                let mut text = if content.trim().is_empty() {
+                    String::new()
+                } else {
+                    content.clone()
+                };
+                for call in calls {
+                    text.push_str(&format!(
+                        "Historical tool call ({}; {}):\n{}",
+                        call.id, call.name, call.arguments
+                    ));
+                }
+                text
+            }
+            Message::Assistant { content, calls, .. } => {
+                let mut text = if content.trim().is_empty() {
+                    String::new()
+                } else {
+                    content.clone()
+                };
+                for call in calls {
+                    let input = pi_rs_core::parse_tool_arguments(&call.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    text.push_str(&call.name);
+                    text.push_str(&input.to_string());
+                }
+                text
+            }
+            _ => return pi_rs_core::estimate_message_tokens(message),
+        };
+        text_tokens(&visible)
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         if let Some(reason) = &self.unsupported {
             return Err(Error::Config(reason.clone()));
@@ -365,6 +424,91 @@ impl Model for Bedrock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn bedrock_still_rejects_user_images_before_provider_access() {
+        let model = Bedrock::from_env();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::UserWithImages {
+                content: "look".into(),
+                images: vec![pi_rs_core::ImageContent {
+                    mime_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        assert!(
+            matches!(model.stream(request).await, Err(Error::Config(message)) if message.contains("image input is not supported"))
+        );
+    }
+
+    #[test]
+    fn capacity_estimates_follow_bedrock_text_encoding_and_ignore_replay() {
+        let model = Bedrock::from_env();
+        assert!(model.context_identity().is_none());
+        let mut request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let tool = |size| {
+            Message::Tool { call_id: "id".into(), content: serde_json::json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(size)}]}}).to_string(), is_error: false, is_structured: Some(true) }
+        };
+        let small = model.estimate_message_tokens(&request, &tool(4));
+        let large = model.estimate_message_tokens(&request, &tool(20000));
+        assert!(large > small + 4000);
+        let call = ToolCall {
+            id: "call".into(),
+            name: "lookup".into(),
+            arguments: "x".repeat(8000),
+        };
+        let replay = pi_rs_core::ProviderReplay {
+            identity: pi_rs_core::ResolvedModelIdentity {
+                provider: "bedrock".into(),
+                model: "fixture".into(),
+            },
+            blocks: vec![serde_json::json!({"reasoning":"x".repeat(30000)})],
+        };
+        let assistant = Message::Assistant {
+            content: "ok".into(),
+            calls: vec![call],
+            replay: Some(Box::new(replay)),
+        };
+        let with_replay = model.estimate_message_tokens(&request, &assistant);
+        let without_replay = if let Message::Assistant { content, calls, .. } = assistant {
+            Message::Assistant {
+                content,
+                calls,
+                replay: None,
+            }
+        } else {
+            unreachable!()
+        };
+        assert_eq!(
+            with_replay,
+            model.estimate_message_tokens(&request, &without_replay)
+        );
+        assert!(with_replay > 1900);
+        request.tools.push(pi_rs_core::ToolSpec {
+            name: "lookup".into(),
+            description: "".into(),
+            parameters: serde_json::json!({}),
+        });
+        assert!(model.estimate_message_tokens(&request, &without_replay) < 20);
+        assert_eq!(
+            model.estimate_message_tokens(
+                &request,
+                &Message::User {
+                    content: " ".into()
+                }
+            ),
+            2
+        );
+    }
+
     #[test]
     fn dispatch_retry_classification_respects_smithy_transient_kind() {
         use aws_sdk_bedrockruntime::error::{ConnectorError, SdkError};
