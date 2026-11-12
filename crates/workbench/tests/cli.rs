@@ -88,14 +88,16 @@ fn minimax_regional_providers_use_the_messages_adapter() {
                 }
                 headers.push_str(&line);
             }
-            assert!(headers.contains("x-api-key: fixture"));
+            assert!(headers.contains("authorization: bearer fixture"));
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["model"], "MiniMax-M2.7");
+            assert_eq!(body["model"], "MiniMax-M3");
             assert_eq!(body["stream"], true);
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert!(body.get("output_config").is_none());
             let events = concat!(
-                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"MiniMax-M2.7\"}}\n\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"MiniMax-M3\"}}\n\n",
                 "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
                 "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fixture answer\"}}\n\n",
                 "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
@@ -116,7 +118,9 @@ fn minimax_regional_providers_use_the_messages_adapter() {
                 "--provider",
                 provider,
                 "--model",
-                "MiniMax-M2.7",
+                "MiniMax-M3",
+                "--thinking",
+                "high",
                 "--api-key",
                 "fixture",
                 "--endpoint",

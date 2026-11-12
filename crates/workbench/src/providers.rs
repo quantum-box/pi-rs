@@ -170,7 +170,11 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = if bearer || matches!(self.id(), "fireworks" | "openrouter") {
+                let mut client = if bearer
+                    || matches!(
+                        self.id(),
+                        "fireworks" | "openrouter" | "minimax" | "minimax-cn"
+                    ) {
                     Anthropic::with_bearer_token(endpoint, &token)?
                 } else {
                     Anthropic::new(endpoint, &token)?
@@ -537,6 +541,11 @@ impl Client {
                                 adaptive.unwrap_or(false),
                                 true,
                             );
+                            if matches!(args.provider.id(), "minimax" | "minimax-cn")
+                                && args.model == "MiniMax-M3"
+                            {
+                                client = client.without_thinking_effort();
+                            }
                         }
                     }
                 }

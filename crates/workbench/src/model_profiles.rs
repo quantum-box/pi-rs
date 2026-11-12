@@ -1273,7 +1273,10 @@ mod tests {
             assert_eq!(provider.adapter(), Adapter::Anthropic);
             assert_eq!(profiles.endpoint(&provider), endpoint);
             assert_eq!(builtin_chat::find(name).unwrap().env(), variable);
-            assert_eq!(profiles.model_ids(&provider).len(), 4);
+            assert_eq!(profiles.model_ids(&provider).len(), 2);
+            let m3 = profiles.model(&provider, "MiniMax-M3").unwrap();
+            assert_eq!(m3.levels(Adapter::Anthropic).unwrap(), ["off", "high"]);
+            assert_eq!(m3.adaptive_thinking(), Some(true));
             let model = profiles.model(&provider, "MiniMax-M3.1-Flash").unwrap();
             assert_eq!(model.reasoning, Some(true));
             let levels = model.levels(Adapter::Anthropic).unwrap();

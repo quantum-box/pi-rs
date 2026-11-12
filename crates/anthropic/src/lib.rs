@@ -216,6 +216,14 @@ impl Anthropic {
         self
     }
 
+    /// Adaptive thinking can be supported without an output effort selector.
+    pub fn without_thinking_effort(mut self) -> Self {
+        if let Some(details) = &mut self.configured_thinking {
+            details.effort_levels = false;
+        }
+        self
+    }
+
     pub fn with_empty_thinking_signature(mut self, enabled: bool) -> Self {
         self.allow_empty_signature = enabled;
         self
