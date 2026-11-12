@@ -741,6 +741,7 @@ impl Model for Google {
                             calls.push(ToolCall { id: id.clone(), name: name.into(), arguments: arguments.clone() });
                             yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta { index, id, name: name.into(), arguments });
                         }
+                        // Preserve every part exactly: signatures belong to their original part.
                         blocks.push(part.clone());
                     }
                 }
@@ -785,6 +786,110 @@ fn report_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streamed_parts_replay_with_original_signature_boundaries() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.local_addr().unwrap());
+        let serve = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            let mut reader = BufReader::new(&socket);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let parts = [
+                json!({"thought":true,"text":"think ","thoughtSignature":"first"}),
+                json!({"thought":true,"text":"more"}),
+                json!({"text":"answer ","thoughtSignature":"old"}),
+                json!({"text":"done","thoughtSignature":"new"}),
+                json!({"text":" unsigned"}),
+                json!({"text":"","thoughtSignature":"empty-text"}),
+                json!({"thoughtSignature":"signature-only"}),
+                json!({"functionCall":{"name":"read","args":{}},"thoughtSignature":"call"}),
+                json!({"text":"after"}),
+            ];
+            let mut body = String::new();
+            for part in parts {
+                body.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"candidates":[{"content":{"parts":[part]}}]})
+                ));
+            }
+            body.push_str("data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let model = Google::new(&endpoint, "test")
+            .unwrap()
+            .with_context_probe(false);
+        let mut stream = model
+            .stream(ModelRequest {
+                model: "gemini-3.5-flash".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 32,
+            })
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        let mut replay = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ModelEvent::Reasoning(s) => events.push(format!("thinking:{s}")),
+                ModelEvent::Text(s) => events.push(format!("text:{s}")),
+                ModelEvent::Metadata(metadata) => replay = metadata.replay,
+                _ => {}
+            }
+        }
+        serve.join().unwrap();
+        assert_eq!(
+            events,
+            [
+                "thinking:think ",
+                "thinking:more",
+                "text:answer ",
+                "text:done",
+                "text: unsigned",
+                "text:after"
+            ]
+        );
+        let replay = replay.unwrap();
+        assert_eq!(
+            replay.blocks,
+            vec![
+                json!({"thought":true,"text":"think ","thoughtSignature":"first"}),
+                json!({"thought":true,"text":"more"}),
+                json!({"text":"answer ","thoughtSignature":"old"}),
+                json!({"text":"done","thoughtSignature":"new"}),
+                json!({"text":" unsigned"}),
+                json!({"text":"","thoughtSignature":"empty-text"}),
+                json!({"thoughtSignature":"signature-only"}),
+                json!({"functionCall":{"name":"read","args":{}},"thoughtSignature":"call"}),
+                json!({"text":"after"}),
+            ]
+        );
+        let expected = json!(replay.blocks);
+        let request = ModelRequest {
+            model: "gemini-3.5-flash".into(),
+            messages: vec![Message::Assistant {
+                content: "answer done unsignedafter".into(),
+                calls: vec![],
+                replay: Some(replay),
+            }],
+            tools: vec![],
+            max_output_tokens: 32,
+        };
+        assert_eq!(
+            wire_request(&request, None, "google").unwrap()["contents"][0]["parts"],
+            expected
+        );
+    }
 
     #[test]
     fn signed_tool_parts_and_wire_ids_stay_with_the_exact_model() {
