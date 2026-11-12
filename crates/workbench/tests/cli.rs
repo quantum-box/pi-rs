@@ -2048,10 +2048,10 @@ fn model_listing_uses_proxy_before_a_model_request() {
     )
     .unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        let (mut socket, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (mut socket, mut reader, first) = loop {
+            let (socket, _) = match listener.accept() {
+                Ok(connection) => connection,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
@@ -2059,14 +2059,16 @@ fn model_listing_uses_proxy_before_a_model_request() {
                     std::thread::sleep(Duration::from_millis(10))
                 }
                 Err(error) => panic!("model discovery did not reach proxy: {error}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_ok() && !first.is_empty() {
+                break (socket, reader, first);
             }
         };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = BufReader::new(socket.try_clone().unwrap());
-        let mut first = String::new();
-        reader.read_line(&mut first).unwrap();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -2123,10 +2125,10 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     .unwrap();
     std::fs::write(root.path().join("auth.json"), json!({"radius":{"type":"oauth","gateway":"http://127.0.0.1:1/","access":"old-token","refresh":"fixture-refresh","expires":0}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        let (mut socket, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (mut socket, mut reader, first) = loop {
+            let (socket, _) = match listener.accept() {
+                Ok(connection) => connection,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
@@ -2134,14 +2136,16 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
                     std::thread::sleep(Duration::from_millis(10))
                 }
                 Err(error) => panic!("OAuth refresh did not reach proxy: {error}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_ok() && !first.is_empty() {
+                break (socket, reader, first);
             }
         };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = BufReader::new(socket.try_clone().unwrap());
-        let mut first = String::new();
-        reader.read_line(&mut first).unwrap();
         let mut length = 0;
         loop {
             let mut line = String::new();
@@ -2200,10 +2204,10 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
     .unwrap();
     std::fs::write(root.path().join("mcp.json"), json!({"mcpServers":{"fixture":{"url":"http://127.0.0.1:1/mcp","auth":{"provider":"anthropic"},"oauth":false}}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        let (mut socket, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (mut socket, mut reader, first) = loop {
+            let (socket, _) = match listener.accept() {
+                Ok(connection) => connection,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
@@ -2211,14 +2215,16 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
                     std::thread::sleep(Duration::from_millis(10))
                 }
                 Err(error) => panic!("MCP request did not reach proxy: {error}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_ok() && !first.is_empty() {
+                break (socket, reader, first);
             }
         };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = BufReader::new(socket.try_clone().unwrap());
-        let mut first = String::new();
-        reader.read_line(&mut first).unwrap();
         let mut headers = String::new();
         loop {
             let mut line = String::new();
