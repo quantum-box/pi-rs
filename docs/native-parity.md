@@ -80,6 +80,11 @@ Markdown links use the reference's non-hyperlink terminal fallback: link text
 is underlined and destinations appear in parentheses only when they differ from
 the visible URL or email address. OSC 8 hyperlink capability remains open.
 
+MiniMax and MiniMax CN use their separate Pi v1.5.0 Messages endpoints and
+`MINIMAX_API_KEY` / `MINIMAX_CN_API_KEY` credentials. Their bundled model
+catalogs include reasoning, image, context and pricing metadata; the same
+Anthropic-compatible streaming adapter is used for both regions.
+
 The interactive `/hotkeys` view groups navigation, editing, application and
 fullscreen actions. It displays effective user-configured bindings in readable
 form, including multiple keys and explicitly unbound actions.

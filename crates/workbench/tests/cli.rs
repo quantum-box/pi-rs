@@ -61,6 +61,81 @@ fn openai_api_key_provider_streams_through_the_cli() {
     responses_provider_streams_through_the_cli("openai");
 }
 
+#[test]
+fn minimax_regional_providers_use_the_messages_adapter() {
+    for provider in ["minimax", "minimax-cn"] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/anthropic/v1/messages",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /anthropic/v1/messages "), "{first}");
+            let mut length = 0;
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                let line = line.to_ascii_lowercase();
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.contains("x-api-key: fixture"));
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "MiniMax-M2.7");
+            assert_eq!(body["stream"], true);
+            let events = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"MiniMax-M2.7\"}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fixture answer\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                provider,
+                "--model",
+                "MiniMax-M2.7",
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+        server.join().unwrap();
+    }
+}
+
 fn responses_provider_streams_through_the_cli(provider: &str) {
     let root = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

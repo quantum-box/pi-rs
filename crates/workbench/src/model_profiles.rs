@@ -1255,6 +1255,34 @@ mod tests {
     }
 
     #[test]
+    fn minimax_catalogs_use_native_messages_and_regional_credentials() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        for (name, endpoint, variable) in [
+            (
+                "minimax",
+                "https://api.minimax.io/anthropic/v1/messages",
+                "MINIMAX_API_KEY",
+            ),
+            (
+                "minimax-cn",
+                "https://api.minimaxi.com/anthropic/v1/messages",
+                "MINIMAX_CN_API_KEY",
+            ),
+        ] {
+            let provider = profiles.provider(name).unwrap();
+            assert_eq!(provider.adapter(), Adapter::Anthropic);
+            assert_eq!(profiles.endpoint(&provider), endpoint);
+            assert_eq!(builtin_chat::find(name).unwrap().env(), variable);
+            assert_eq!(profiles.model_ids(&provider).len(), 4);
+            let model = profiles.model(&provider, "MiniMax-M3.1-Flash").unwrap();
+            assert_eq!(model.reasoning, Some(true));
+            let levels = model.levels(Adapter::Anthropic).unwrap();
+            assert!(levels.contains(&"high".into()));
+            assert!(!levels.contains(&"off".into()));
+        }
+    }
+
+    #[test]
     fn baseten_and_nvidia_builtin_models_keep_capabilities_and_headers() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let baseten = profiles.provider("baseten").unwrap();
