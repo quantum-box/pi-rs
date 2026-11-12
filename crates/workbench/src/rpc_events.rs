@@ -575,6 +575,28 @@ mod streaming_tool_tests {
     }
 
     #[test]
+    fn json_trace_emits_progress_once_and_worker_trace_still_forwards() {
+        let event = pi_rs::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: "call".into(),
+            tool_name: "bash".into(),
+            args: json!({}),
+            partial_result: json!({"content":[]}),
+            parent_tool_call_id: None,
+        };
+        let args = Cli::parse_from(["pi"]);
+        for trace in [false, true] {
+            let mut stream = Stream::default();
+            let mut output = stream.notify(&Notification::ToolProgress(&event), &args);
+            output.extend(super::super::trace_tool_progress(&event, trace, true));
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0]["type"], "tool_execution_update");
+        }
+        let worker_event = super::super::trace_tool_progress(&event, true, false).unwrap();
+        assert_eq!(worker_event["type"], "tool_execution_update");
+        assert!(super::super::trace_tool_progress(&event, false, false).is_none());
+    }
+
+    #[test]
     fn completed_tool_call_reports_repaired_and_invalid_arguments() {
         let call = |arguments: &str| ToolCall {
             id: "id".into(),
