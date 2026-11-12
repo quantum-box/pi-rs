@@ -233,7 +233,7 @@ fn auto_prompts(root: &Path, warnings: &mut Vec<String>) -> Result<Vec<PathBuf>>
                     && entry.path().is_file()
                     && Kind::Prompt.accepts(entry.path()) =>
             {
-                files.push(entry.path().canonicalize()?);
+                files.push(entry.into_path());
             }
             Err(error) => warnings.push(error.to_string()),
             _ => {}
@@ -245,7 +245,11 @@ fn auto_prompts(root: &Path, warnings: &mut Vec<String>) -> Result<Vec<PathBuf>>
 }
 fn append(paths: &mut Vec<PathBuf>, additions: Vec<PathBuf>) {
     for path in additions {
-        if !paths.contains(&path) {
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !paths
+            .iter()
+            .any(|existing| existing.canonicalize().unwrap_or_else(|_| existing.clone()) == key)
+        {
             paths.push(path);
         }
     }
@@ -310,7 +314,11 @@ fn collect_matching(
     matcher: Option<&globset::GlobMatcher>,
 ) -> Result<Vec<PathBuf>> {
     if path.is_file() {
-        return Ok(vec![path.canonicalize()?]);
+        return Ok(vec![if kind == Kind::Prompt {
+            path.to_owned()
+        } else {
+            path.canonicalize()?
+        }]);
     }
     if !path.is_dir() {
         return if required {
@@ -333,9 +341,19 @@ fn collect_matching(
         return Ok(files);
     }
     let mut files = Vec::new();
-    for entry in ignore::WalkBuilder::new(path)
-        .hidden(false)
-        .git_ignore(false)
+    let mut walker = ignore::WalkBuilder::new(path);
+    walker
+        .hidden(kind == Kind::Prompt)
+        .git_ignore(kind == Kind::Prompt);
+    if kind == Kind::Prompt {
+        walker
+            .parents(false)
+            .git_global(false)
+            .git_exclude(false)
+            .require_git(false)
+            .add_custom_ignore_filename(".fdignore");
+    }
+    for entry in walker
         .follow_links(true)
         .filter_entry(|entry| {
             entry.depth() == 0
@@ -357,7 +375,11 @@ fn collect_matching(
             && kind.accepts(entry.path())
             && matches_pattern(entry.path(), path, matcher)
         {
-            files.push(entry.path().canonicalize()?);
+            files.push(if kind == Kind::Prompt {
+                entry.into_path()
+            } else {
+                entry.path().canonicalize()?
+            });
         }
     }
     files.sort();

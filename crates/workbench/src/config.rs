@@ -609,7 +609,7 @@ mod tests {
                 &mut warnings
             )
             .unwrap(),
-            vec![explicit.canonicalize().unwrap()]
+            vec![explicit]
         );
         assert!(warnings.is_empty());
         args.settings.resource_layers[0].1["prompts"] = json!("invalid array");
@@ -655,10 +655,108 @@ mod tests {
         );
         // Explicit files remain loadable even when automatic discovery skips them.
         let explicit = project.join("prompts/nested/child.md");
-        let paths =
-            resource_paths::resolve(&args, Kind::Prompt, &[], &[explicit.clone()], &mut warnings)
-                .unwrap();
-        assert!(paths.contains(&explicit.canonicalize().unwrap()));
+        let paths = resource_paths::resolve(
+            &args,
+            Kind::Prompt,
+            &[],
+            std::slice::from_ref(&explicit),
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(paths.contains(&explicit));
+        assert!(warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_symlink_names_and_overrides_use_discovered_paths() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        let project = workspace.join(".pi");
+        std::fs::create_dir_all(project.join("prompts")).unwrap();
+        std::fs::write(dir.path().join("template.md"), "Review $1").unwrap();
+        let link = project.join("prompts/review.md");
+        symlink(dir.path().join("template.md"), &link).unwrap();
+        let mut args = super::super::Cli::try_parse_from(["pi", "--no-skills"]).unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![
+                (dir.path().join("agent"), json!({})),
+                (project.clone(), json!({})),
+            ],
+        };
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert_eq!(
+            resources.prompts["review"].path,
+            project.canonicalize().unwrap().join("prompts/review.md")
+        );
+        assert_eq!(
+            resources.expand("/review code").as_deref(),
+            Some("Review code")
+        );
+        assert!(!resources.prompts.contains_key("template"));
+        let mut warnings = Vec::new();
+        let paths = super::super::resource_paths::resolve(
+            &args,
+            super::super::resource_paths::Kind::Prompt,
+            &[],
+            &[link.clone(), dir.path().join("template.md")],
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(paths, vec![link]);
+        args.settings.resource_layers[1].1 = json!({"prompts": ["-prompts/review.md"]});
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(!resources.prompts.contains_key("review"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_prompt_directories_apply_recursive_ignore_and_preserve_symlinks() {
+        use super::super::resource_paths::{self, Kind};
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("work/.pi");
+        let root = project.join("custom");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        for file in [
+            "visible.md",
+            ".hidden.md",
+            "ignored.md",
+            "nested/child.md",
+            "nested/skip.md",
+        ] {
+            std::fs::write(root.join(file), "prompt").unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "ignored.md\n").unwrap();
+        std::fs::write(root.join("nested/.fdignore"), "skip.md\n").unwrap();
+        symlink(dir.path().join("target.md"), root.join("alias.md")).unwrap();
+        std::fs::write(dir.path().join("target.md"), "target").unwrap();
+        let mut args = super::super::Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = dir.path().join("work");
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![
+                (dir.path().join("agent"), json!({})),
+                (
+                    project,
+                    json!({"prompts": ["custom", "-custom/visible.md"]}),
+                ),
+            ],
+        };
+        let mut warnings = Vec::new();
+        let paths = resource_paths::resolve(&args, Kind::Prompt, &[], &[], &mut warnings).unwrap();
+        let root = root.canonicalize().unwrap();
+        assert_eq!(
+            paths,
+            vec![root.join("alias.md"), root.join("nested/child.md")]
+        );
         assert!(warnings.is_empty());
     }
 
