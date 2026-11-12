@@ -911,6 +911,7 @@ fn collect_package_resources(
         for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
             .git_ignore(false)
+            .follow_links(name == "prompts")
             .filter_entry(|entry| {
                 !matches!(
                     entry.file_name().to_str(),
@@ -1137,6 +1138,43 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn package_prompts_follow_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("package");
+        let external = directory.path().join("external");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("file.md"), "file").unwrap();
+        std::fs::write(external.join("ignored.md"), "ignored").unwrap();
+        std::fs::write(external.join(".ignore"), "ignored.md\n").unwrap();
+        symlink(external.join("file.md"), root.join("prompts/linked.md")).unwrap();
+        symlink(&external, root.join("prompts/linked-dir")).unwrap();
+        symlink(external.join("missing"), root.join("prompts/broken.md")).unwrap();
+        symlink(root.join("prompts"), external.join("cycle")).unwrap();
+
+        let mut prompts = collect_package_resources(&root, &json!({}), Vec::new())
+            .unwrap()
+            .prompts;
+        prompts.sort();
+        assert_eq!(
+            prompts,
+            vec![
+                root.join("prompts/linked-dir/file.md"),
+                root.join("prompts/linked.md"),
+            ]
+        );
+        let selected = collect_package_resources(
+            &root,
+            &json!({"prompts": ["prompts/linked.md"]}),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(selected.prompts, vec![root.join("prompts/linked.md")]);
+    }
     #[test]
     fn explicit_manifest_excludes_undeclared_resource_types() {
         let directory = tempfile::tempdir().unwrap();
