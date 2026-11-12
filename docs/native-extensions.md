@@ -309,6 +309,11 @@ are delivered to extensions that opt into session lifecycle notifications.
 Direct SDK compaction with a supplied summary remains synchronous and does not
 emit these asynchronous lifecycle notifications.
 
+`agent_settled` follows a terminal run result; a run waiting for an external
+operation or reconciliation emits `agent_end` but does not claim settlement.
+After the operation is resolved and the run continues to a terminal result,
+the extension receives `agent_settled`.
+
 Extensions may also opt into `tool_execution_start`, `tool_execution_update`, and `tool_execution_end`
 with both `handles_lifecycle` and `handles_tool_execution_lifecycle`. Events
 include the tool call ID, name and arguments or the final native outcome;
