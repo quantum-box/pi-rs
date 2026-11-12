@@ -691,12 +691,12 @@ mod tests {
             thinking: Some("high".into()),
         }];
         args.model = "beta:4b".into();
-        args.restore_model_selection("alpha:4b".into(), Some("low".into()), None);
+        args.restore_model_selection("alpha:4b".into(), Some("low".into()), None, false);
         assert_eq!(args.model, "beta:4b");
         assert_eq!(args.thinking.as_deref(), Some("high"));
         args.thinking_explicit = true;
         args.thinking = Some("off".into());
-        args.restore_model_selection("beta:4b".into(), Some("low".into()), None);
+        args.restore_model_selection("beta:4b".into(), Some("low".into()), None, false);
         assert_eq!(args.thinking.as_deref(), Some("off"));
     }
 }

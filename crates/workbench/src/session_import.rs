@@ -1478,10 +1478,7 @@ mod tests {
             ]).unwrap();
             args.restore_session_model(&session);
             assert_eq!(args.model, expected);
-            assert_eq!(
-                args.thinking.as_deref(),
-                Some(if model == "known" { "xhigh" } else { "low" })
-            );
+            assert_eq!(args.thinking.as_deref(), Some("low"));
         }
         args.model_scope
             .push(super::super::model_selection::ScopedChoice {
@@ -1491,11 +1488,14 @@ mod tests {
             });
         let scoped = import_pi(vec![json!({"type":"session","version":3}), json!({"type":"message","id":"m","parentId":null,"message":{"role":"assistant","provider":"ollama","model":"known","content":[]}})]).unwrap();
         args.restore_session_model(&scoped);
-        assert_eq!(args.thinking.as_deref(), Some("high"));
+        assert_eq!(args.thinking.as_deref(), Some("low"));
         args.model_scope.clear();
         let mut native = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
         native
             .select_provider_model(None, "saved-dynamic", Some("low"))
+            .unwrap();
+        native
+            .append_user_with_images("existing".into(), Vec::new(), None)
             .unwrap();
         let native_path = directory.path().join("saved-native.jsonl");
         native.export_jsonl(&native_path).unwrap();

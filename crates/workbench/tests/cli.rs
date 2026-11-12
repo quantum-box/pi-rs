@@ -2191,7 +2191,7 @@ fn rpc_model_discovery_does_not_block_other_commands() {
 }
 
 #[test]
-fn scoped_thinking_level_wins_over_saved_session_level() {
+fn scoped_thinking_applies_to_new_sessions_and_resumes_restore_branch_thinking() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2199,7 +2199,8 @@ fn scoped_thinking_level_wins_over_saved_session_level() {
         home.join("settings.json"),
         json!({
             "defaultProvider":"ollama", "defaultModel":"alpha",
-            "enabledModels":["ollama/alpha:high", "ollama/beta:medium"]
+            "defaultThinkingLevel":"medium",
+            "enabledModels":["ollama/alpha:high", "ollama/beta:high"]
         })
         .to_string(),
     )
@@ -2215,17 +2216,45 @@ fn scoped_thinking_level_wins_over_saved_session_level() {
         .to_string(),
     )
     .unwrap();
-    for (index, arguments, saved_model, expected_model, expected_thinking) in [
-        (0, vec![], "alpha", "alpha", "high"),
-        (1, vec!["--model", "alpha"], "alpha", "alpha", "high"),
-        (2, vec!["--model", "beta"], "alpha", "beta", "medium"),
-        (4, vec![], "gamma", "alpha", "high"),
+    for (index, arguments, saved_model, has_message, expected_model, expected_thinking) in [
+        (0, vec![], "alpha", false, "alpha", "high"),
+        (
+            1,
+            vec!["--model", "alpha"],
+            "alpha",
+            false,
+            "alpha",
+            "medium",
+        ),
+        (2, vec!["--model", "beta"], "alpha", false, "beta", "medium"),
+        (4, vec![], "gamma", false, "alpha", "high"),
         (
             3,
             vec!["--model", "beta", "--thinking", "minimal"],
             "alpha",
+            false,
             "beta",
             "minimal",
+        ),
+        (5, vec![], "alpha", true, "alpha", "low"),
+        (6, vec!["--model", "alpha"], "alpha", true, "alpha", "low"),
+        (7, vec!["--model", "beta"], "alpha", true, "beta", "low"),
+        (
+            8,
+            vec!["--model", "beta", "--thinking", "minimal"],
+            "alpha",
+            true,
+            "beta",
+            "minimal",
+        ),
+        (9, vec![], "gamma", true, "gamma", "low"),
+        (
+            10,
+            vec!["--provider", "ollama", "--model", "beta"],
+            "alpha",
+            true,
+            "beta",
+            "low",
         ),
     ] {
         let path = directory.path().join(format!("session-{index}.jsonl"));
@@ -2233,6 +2262,11 @@ fn scoped_thinking_level_wins_over_saved_session_level() {
         session
             .select_provider_model(None, saved_model, Some("low"))
             .unwrap();
+        if has_message {
+            session
+                .append_user_with_images("existing conversation".into(), Vec::new(), None)
+                .unwrap();
+        }
         drop(session);
         let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
             .env("PI_RS_HOME", &home)

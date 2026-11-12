@@ -649,6 +649,9 @@ impl Cli {
 
     fn record_automatic_model_selection(&self, session: &mut Session) -> Result<()> {
         session.record_request_identity(self.provider.id(), &self.model)?;
+        if rpc_messages::snapshot(session).0.is_empty() {
+            return self.record_model_selection(session);
+        }
         if !self.model_explicit
             && self.thinking_explicit
             && let Some(thinking) = self.thinking.as_deref()
@@ -672,11 +675,13 @@ impl Cli {
         model: String,
         thinking: Option<String>,
         provider: Option<&str>,
+        continuing: bool,
     ) -> bool {
         let Some(provider) = self.model_profiles.provider(provider.unwrap_or("ollama")) else {
             return false;
         };
-        let in_scope = self.model_scope.is_empty()
+        let in_scope = continuing
+            || self.model_scope.is_empty()
             || self
                 .model_scope
                 .iter()
@@ -793,15 +798,46 @@ impl Cli {
                 (known, complete)
             });
         let unavailable = availability.is_none_or(|(known, complete)| !known && complete);
-        if unavailable || !self.restore_model_selection(model, thinking.clone(), provider) {
+        if unavailable || !self.restore_model_selection(model, thinking.clone(), provider, true) {
             self.restore_initial_selection(thinking);
         }
     }
 
     fn restore_session_model(&mut self, session: &Session) {
+        // Pi treats a journal with no projected messages as a new session,
+        // even if it already contains model or thinking bookkeeping.
+        if rpc_messages::snapshot(session).0.is_empty() {
+            if !self.model_explicit
+                && let Some(initial) = &self.initial_selection
+            {
+                self.provider = initial.provider.clone();
+                self.endpoint = initial.endpoint.clone();
+                self.model = initial.model.clone();
+                self.thinking_profile = None;
+            }
+            if !self.thinking_explicit {
+                self.thinking = Some(if self.model_explicit {
+                    self.settings
+                        .thinking_for_model(self.provider.id(), &self.model)
+                        .unwrap_or("medium")
+                        .to_owned()
+                } else {
+                    self.default_branch_thinking()
+                });
+            }
+            return;
+        }
         // Extension-registered Pi virtual models are absent from this catalog.
         // Pi treats absent catalog entries as nonvirtual.
-        match session_import::branch_selection(session, |_, _| None) {
+        let selection = session_import::branch_selection(session, |_, _| None);
+        let branch_thinking = match &selection {
+            session_import::BranchSelection::Native => {
+                session.model_selection().and_then(|(_, thinking)| thinking)
+            }
+            session_import::BranchSelection::Selected { thinking, .. }
+            | session_import::BranchSelection::Unresolved { thinking } => thinking.clone(),
+        };
+        match selection {
             session_import::BranchSelection::Native => {
                 if let Some((model, thinking)) = session.model_selection() {
                     self.restore_branch_selection(model, thinking, session.model_provider());
@@ -819,6 +855,14 @@ impl Cli {
             session_import::BranchSelection::Unresolved { thinking } => {
                 self.restore_initial_selection(thinking);
             }
+        }
+        if !self.thinking_explicit {
+            self.thinking = Some(branch_thinking.unwrap_or_else(|| {
+                self.settings
+                    .string("defaultThinkingLevel")
+                    .unwrap_or("medium")
+                    .to_owned()
+            }));
         }
     }
 
