@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
+// A lifecycle event can include an 8 MiB journaled tool result, whose JSON
+// representation may expand to six times its original size when escaped.
+const MAX_REQUEST: u64 = 64 * 1024 * 1024;
 const PROTOCOL: u16 = 1;
 const FLAGS_ENV: &str = "PI_RS_NATIVE_EXTENSION_FLAGS";
 
@@ -1339,8 +1342,8 @@ fn call<T: serde::de::DeserializeOwned>(
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
     let bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_MESSAGE {
-        return Err("extension request exceeds 4 MiB".into());
+    if bytes.len() as u64 > MAX_REQUEST {
+        return Err("extension request exceeds 64 MiB".into());
     }
     let command = endpoint.command("--pi-rs-extension-v1");
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
@@ -1478,10 +1481,10 @@ pub fn serve_extension(extension: Arc<dyn Extension>) -> Result<()> {
     }
     let mut input = Vec::new();
     std::io::stdin()
-        .take(MAX_MESSAGE + 1)
+        .take(MAX_REQUEST + 1)
         .read_to_end(&mut input)?;
-    let response = if input.len() as u64 > MAX_MESSAGE {
-        Err("extension request exceeds 4 MiB".into())
+    let response = if input.len() as u64 > MAX_REQUEST {
+        Err("extension request exceeds 64 MiB".into())
     } else {
         match serde_json::from_slice(&input) {
             Ok(request) => {
