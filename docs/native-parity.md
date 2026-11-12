@@ -216,6 +216,13 @@ remaining feature rows above still need their own acceptance checks.
 
 ### Faithful terminal checkpoint
 
+Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
+fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
+automatic detection; tmux is probed for its `hyperlinks` terminal feature.
+Wrapped link fragments are closed on every rendered line, and control characters
+in destinations cannot enter terminal escape sequences. Opening links through
+the fullscreen application's own mouse handling remains open.
+
 The terminal now uses Pi v1.5.0 theme assets and schema, with attribution in
 `crates/workbench/assets/NOTICE`. It renders Markdown, highlighted code, shaded
 user/tool panels, collapsed tool output and separately styled reasoning.
