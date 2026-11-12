@@ -811,8 +811,8 @@ same saved notes reached both requests.
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
 context lines, bounds long displayed lines at 500 characters, and reports match
-and byte limits. Large text files remain searchable. Adjacent context ranges
-are combined. Search memory is bounded at 64 MiB, and the configurable context
+and byte limits. Large text files remain searchable. Overlapping context ranges
+are repeated for each match. Search memory is bounded at 64 MiB, and the configurable context
 radius is limited to 1,000 lines.
 
 `find` uses a 1,000-result default and reports result limits. `ls` sorts names
@@ -820,6 +820,11 @@ case-insensitively, identifies linked directories, reports entry limits and
 labels empty directories. Head truncation preserves complete lines where they
 fit. Fixtures cover large-file search, Unicode and literal patterns, context,
 empty directory output and continuation notices.
+
+Single-file `grep` preserves the requested file name in its output when the
+path is a symbolic link, while workspace boundary checks still use the resolved
+target. Focused checks compare the output with Pi v1.5.0 for both linked and
+ordinary files, including context lines.
 
 ### Published native package checkpoint
 

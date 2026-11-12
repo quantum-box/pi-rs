@@ -942,6 +942,16 @@ impl CodingTool {
         }
         let base = self.path(args["path"].as_str().unwrap_or("."))?;
         let is_find = matches!(self.kind, Kind::Find);
+        // Keep the requested name for a single-file grep, even when path()
+        // resolves a symlink to enforce workspace boundaries.
+        let grep_file_name = if !is_find && base.is_file() {
+            let input = crate::coding_paths::normalize(args["path"].as_str().unwrap_or("."))?;
+            crate::coding_paths::resolve(&self.root, &input)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        } else {
+            None
+        };
         let limit = args["limit"]
             .as_u64()
             .unwrap_or(if is_find { 1000 } else { 100 })
@@ -1026,7 +1036,10 @@ impl CodingTool {
                 continue;
             }
             if let Some(grep) = &mut grep {
-                if !grep.search(entry.path(), &relative.to_string_lossy(), cancellation)? {
+                let display = grep_file_name
+                    .as_deref()
+                    .map_or_else(|| relative.to_string_lossy(), std::borrow::Cow::from);
+                if !grep.search(entry.path(), &display, cancellation)? {
                     break;
                 }
             } else {
@@ -1933,6 +1946,53 @@ mod tests {
             let output = tool.invoke(json!({"pattern": "match"}), context()).await;
             assert!(matches!(output, Outcome::Failed(message) if message == "Operation aborted"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_single_file_uses_requested_symlink_name() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("original.txt"), "before\nneedle\nafter\n").unwrap();
+        std::os::unix::fs::symlink("original.txt", root.path().join("alias.txt")).unwrap();
+        let cancellation = pi_rs::CancellationToken::new();
+        for unrestricted in [false, true] {
+            let tool = CodingTool {
+                root: root.path().canonicalize().unwrap(),
+                unrestricted,
+                shell: ShellConfig::default(),
+                kind: Kind::Grep,
+            };
+            for (path, expected) in [("alias.txt", "alias.txt"), ("original.txt", "original.txt")] {
+                let output = tool
+                    .search(
+                        &json!({"path":path,"pattern":"needle","context":1}),
+                        &cancellation,
+                    )
+                    .unwrap()
+                    .tool_content();
+                assert_eq!(
+                    output,
+                    format!("{expected}-1- before\n{expected}:2: needle\n{expected}-3- after")
+                );
+            }
+        }
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("outside.txt")).unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        assert!(
+            tool.search(
+                &json!({"path":"outside.txt","pattern":"needle"}),
+                &cancellation
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("path is outside the workspace")
+        );
     }
 
     #[test]
