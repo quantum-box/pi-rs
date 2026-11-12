@@ -669,6 +669,56 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn configured_and_packaged_prompts_deduplicate_before_suffix_filtering() {
+        use super::super::resource_paths::{self, Kind};
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("work");
+        let project = workspace.join(".pi");
+        std::fs::create_dir_all(&project).unwrap();
+        let txt = project.join("content.txt");
+        let md = project.join("alias.md");
+        std::fs::write(&txt, "fixture").unwrap();
+        symlink("content.txt", &md).unwrap();
+        let mut args = super::super::Cli::try_parse_from(["pi", "--no-skills"]).unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![(
+                project.clone(),
+                json!({"prompts": ["content.txt", "alias.md"]}),
+            )],
+        };
+        assert!(
+            super::super::resources::Resources::load(&args)
+                .unwrap()
+                .prompts
+                .is_empty()
+        );
+        args.settings.resource_layers[0].1 = json!({"prompts": ["alias.md", "content.txt"]});
+        assert_eq!(
+            super::super::resources::Resources::load(&args)
+                .unwrap()
+                .prompts["alias"]
+                .body,
+            "fixture"
+        );
+        args.settings.resource_layers[0].1 = json!({});
+        for (paths, expected) in [
+            (vec![txt.clone(), md.clone()], txt.clone()),
+            (vec![md.clone(), txt.clone()], md.clone()),
+        ] {
+            let mut warnings = Vec::new();
+            let resolved =
+                resource_paths::resolve(&args, Kind::Prompt, &paths, &[], &mut warnings).unwrap();
+            assert_eq!(resolved, vec![expected]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn prompt_symlink_names_and_overrides_use_discovered_paths() {
         use clap::Parser;
         use std::os::unix::fs::symlink;

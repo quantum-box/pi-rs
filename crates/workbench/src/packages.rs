@@ -342,6 +342,8 @@ pub(crate) fn resource_matches(
     exact: bool,
     directory_roots: bool,
 ) -> bool {
+    let path = dunce::simplified(path);
+    let root = dunce::simplified(root);
     let normalize = |path: &Path| path.to_string_lossy().replace('\\', "/");
     let pattern = pattern.replace('\\', "/");
     let pattern = pattern.trim_start_matches("./").to_owned();
@@ -908,6 +910,10 @@ fn collect_package_resources(
                 }
             });
         validate_patterns(&patterns)?;
+        if name == "prompts" {
+            *target = collect_package_prompts(root, &patterns);
+            continue;
+        }
         for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
             .git_ignore(false)
@@ -929,6 +935,378 @@ fn collect_package_resources(
         }
     }
     Ok(resources)
+}
+
+fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let overrides: Vec<String> = patterns
+        .iter()
+        .filter(|p| p.starts_with(['!', '+', '-']))
+        .cloned()
+        .collect();
+    let plain: Vec<_> = patterns
+        .iter()
+        .filter(|p| !p.starts_with(['!', '+', '-']))
+        .collect();
+    // Override-only manifests historically selected from the package contents.
+    // Do not follow symlinks while gathering that implicit candidate set.
+    let implicit = plain.is_empty() && !overrides.is_empty();
+    let sources: Vec<PathBuf> = if implicit {
+        paths.extend(legacy_prompt_candidates(root, None, false));
+        Vec::new()
+    } else {
+        plain
+            .iter()
+            .flat_map(|pattern| {
+                let pattern = pattern.replace('\\', "/");
+                if pattern.contains(['*', '?', '[', '{']) {
+                    if !pattern.trim_start_matches("./").contains('/') {
+                        let mut legacy = legacy_prompt_candidates(root, None, true);
+                        legacy.retain(|path| resource_matches(path, root, &pattern, false, true));
+                        legacy.sort();
+                        legacy
+                    } else {
+                        expand_prompt_glob(root, &pattern)
+                    }
+                } else {
+                    let mut sources = vec![root.join(&pattern)];
+                    if pattern.ends_with(".md") && !pattern.trim_start_matches("./").contains('/') {
+                        let mut legacy = legacy_prompt_candidates(root, None, true);
+                        legacy.retain(|path| resource_matches(path, root, &pattern, false, true));
+                        legacy.sort();
+                        sources.extend(legacy);
+                    }
+                    sources
+                }
+            })
+            .collect()
+    };
+    for source in sources {
+        if source.is_file() {
+            paths.push(source);
+        } else if source.is_dir() {
+            // A selected directory is the ignore root, including when it is a symlink.
+            for entry in ignore::WalkBuilder::new(&source)
+                .hidden(true)
+                .parents(false)
+                .git_ignore(true)
+                .require_git(false)
+                .git_global(false)
+                .git_exclude(false)
+                .add_custom_ignore_filename(".fdignore")
+                .follow_links(true)
+                .filter_entry(|entry| entry.file_name() != "node_modules")
+                .build()
+                .flatten()
+            {
+                if entry.file_type().is_some_and(|kind| kind.is_file())
+                    && entry.file_name().to_string_lossy().ends_with(".md")
+                {
+                    paths.push(entry.into_path());
+                }
+            }
+        }
+    }
+    // Exact force-includes may select a file outside the plain source entries.
+    for path in overrides.iter().filter_map(|p| p.strip_prefix('+')) {
+        let path = root.join(path.replace('\\', "/"));
+        paths.extend(legacy_prompt_candidates(root, Some(&path), false));
+    }
+    if !overrides.is_empty() {
+        paths.retain(|path| manifest_selected(path, root, &overrides));
+    }
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| seen.insert(dunce::simplified(path).to_path_buf()));
+    paths
+}
+
+// Match package-wide candidate rules without traversing directory links.
+// An exact target prunes traversal to its ancestors and cannot escape the root.
+fn legacy_prompt_candidates(
+    root: &Path,
+    target: Option<&Path>,
+    include_file_links: bool,
+) -> Vec<PathBuf> {
+    if let Some(target) = target {
+        let Ok(relative) = target.strip_prefix(root) else {
+            return Vec::new();
+        };
+        if relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Vec::new();
+        }
+    }
+    let target_for_filter = target.map(Path::to_path_buf);
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(false)
+        .follow_links(false)
+        .filter_entry(move |entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "target" | "node_modules")
+            ) && target_for_filter
+                .as_ref()
+                .is_none_or(|target| target.starts_with(entry.path()))
+        })
+        .build()
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().is_some_and(|kind| {
+                kind.is_file()
+                    || (include_file_links && kind.is_symlink() && entry.path().is_file())
+            }) && entry.file_name().to_string_lossy().ends_with(".md")
+                && target.is_none_or(|target| entry.path() == target)
+        })
+        .map(|entry| entry.into_path())
+        .collect()
+}
+
+fn expand_prompt_glob(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    let Some(patterns) = expand_prompt_braces(pattern) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<_> = patterns
+        .iter()
+        .flat_map(|pattern| expand_prompt_glob_variant(root, pattern))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+// Expand alternatives before splitting into path components for traversal pruning.
+fn expand_prompt_braces(pattern: &str) -> Option<Vec<String>> {
+    let mut start = None;
+    let mut depth = 0;
+    let mut in_class = false;
+    let mut separators = Vec::new();
+    for (index, ch) in pattern.char_indices() {
+        match ch {
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '{' if !in_class => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            ',' if !in_class && depth == 1 => separators.push(index),
+            '}' if !in_class && depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let start = start?;
+                    let mut variants = Vec::new();
+                    let mut begin = start + 1;
+                    for end in separators.into_iter().chain(std::iter::once(index)) {
+                        let next = format!(
+                            "{}{}{}",
+                            &pattern[..start],
+                            &pattern[begin..end],
+                            &pattern[index + 1..]
+                        );
+                        variants.extend(expand_prompt_braces(&next)?);
+                        if variants.len() > 256 {
+                            return None;
+                        }
+                        begin = end + 1;
+                    }
+                    return Some(variants);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(vec![pattern.to_owned()])
+}
+
+fn expand_prompt_glob_variant(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    let root = dunce::simplified(root);
+    let input = dunce::simplified(Path::new(pattern));
+    let mut literal_prefix = if input.is_absolute() {
+        PathBuf::new()
+    } else {
+        root.to_path_buf()
+    };
+    let mut pattern_path = if input.is_absolute() {
+        PathBuf::new()
+    } else {
+        root.to_path_buf()
+    };
+    let mut saw_wildcard = false;
+    for component in input.components() {
+        if matches!(component, std::path::Component::CurDir) {
+            continue;
+        }
+        if matches!(component, std::path::Component::ParentDir) {
+            // Resolving a parent after a wildcard would widen the search unpredictably.
+            if saw_wildcard || !pattern_path.pop() {
+                return Vec::new();
+            }
+            if literal_prefix.starts_with(&pattern_path) {
+                literal_prefix = pattern_path.clone();
+            }
+        } else {
+            saw_wildcard |= component
+                .as_os_str()
+                .to_string_lossy()
+                .contains(['*', '?', '[', '{']);
+            pattern_path.push(component.as_os_str());
+        }
+    }
+    let literal_count = literal_prefix
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count();
+    let suffix = pattern_path
+        .strip_prefix(&literal_prefix)
+        .unwrap_or(&pattern_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut normalized = globset::escape(&literal_prefix.to_string_lossy().replace('\\', "/"));
+    if !normalized.is_empty() && !normalized.ends_with('/') && !suffix.is_empty() {
+        normalized.push('/');
+    }
+    normalized.push_str(&suffix);
+    let Ok(glob) = globset::GlobBuilder::new(&normalized)
+        .literal_separator(true)
+        .backslash_escape(false)
+        .build()
+    else {
+        return Vec::new();
+    };
+    let matcher = glob.compile_matcher();
+    let mut base = PathBuf::new();
+    let mut normal_count = 0;
+    for component in pattern_path.components() {
+        let part = component.as_os_str();
+        let literal =
+            matches!(component, std::path::Component::Normal(_)) && normal_count < literal_count;
+        if !literal && part.to_string_lossy().contains(['*', '?', '[', '{']) {
+            break;
+        }
+        if matches!(component, std::path::Component::Normal(_)) {
+            normal_count += 1;
+        }
+        base.push(part);
+    }
+    // A wildcard directly under a filesystem root must not cause a root-wide scan.
+    if base.parent().is_none() {
+        if root.starts_with(&base) {
+            base = root.to_path_buf();
+        } else {
+            return Vec::new();
+        }
+    }
+    let Some(prefix) = PromptGlobPrefix::new(&pattern_path, literal_count) else {
+        return Vec::new();
+    };
+    let depth = prefix.max_depth(&base);
+    let mut matches: Vec<_> = ignore::WalkBuilder::new(base)
+        .max_depth(depth)
+        .hidden(true)
+        .parents(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .follow_links(false)
+        .filter_entry(move |entry| entry.depth() == 0 || prefix.can_match(entry.path()))
+        .build()
+        .flatten()
+        .filter(|entry| {
+            let entry_components: Vec<_> = entry.path().components().collect();
+            let root_components: Vec<_> = root.components().collect();
+            let common = entry_components.iter().zip(&root_components).take_while(|(a, b)| a == b).count();
+            entry_components[common..].iter().all(|c| {
+                !matches!(c, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+            }) && matcher.is_match(entry.path())
+        })
+        .map(|entry| entry.into_path())
+        .collect();
+    matches.sort();
+    matches
+}
+
+// A component NFA lets the walker discard subtrees that cannot match, including
+// patterns with **, without traversing every descendant of the fixed prefix.
+struct PromptGlobPrefix {
+    components: Vec<Option<globset::GlobMatcher>>,
+}
+
+impl PromptGlobPrefix {
+    fn new(pattern: &Path, literal_count: usize) -> Option<Self> {
+        let mut components = Vec::new();
+        for component in pattern.components() {
+            if let std::path::Component::Normal(name) = component {
+                let name = name.to_string_lossy();
+                if components.len() >= literal_count && name == "**" {
+                    components.push(None);
+                } else {
+                    let escaped;
+                    let name = if components.len() < literal_count {
+                        escaped = globset::escape(&name);
+                        escaped.as_str()
+                    } else {
+                        name.as_ref()
+                    };
+                    let glob = globset::GlobBuilder::new(name)
+                        .literal_separator(true)
+                        .backslash_escape(false)
+                        .build()
+                        .ok()?;
+                    components.push(Some(glob.compile_matcher()));
+                }
+            }
+        }
+        Some(Self { components })
+    }
+
+    fn max_depth(&self, base: &Path) -> Option<usize> {
+        if self.components.iter().any(Option::is_none) {
+            None
+        } else {
+            let count = base
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count();
+            Some(self.components.len().saturating_sub(count))
+        }
+    }
+
+    fn can_match(&self, path: &Path) -> bool {
+        let mut states = vec![false; self.components.len() + 1];
+        states[0] = true;
+        for component in path.components().filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        }) {
+            self.expand_globstars(&mut states);
+            let mut next = vec![false; states.len()];
+            for (index, matcher) in self.components.iter().enumerate() {
+                if states[index] {
+                    match matcher {
+                        None => next[index] = true,
+                        Some(matcher) if matcher.is_match(component) => next[index + 1] = true,
+                        _ => {}
+                    }
+                }
+            }
+            states = next;
+        }
+        self.expand_globstars(&mut states);
+        states.iter().any(|state| *state)
+    }
+
+    fn expand_globstars(&self, states: &mut [bool]) {
+        for (index, matcher) in self.components.iter().enumerate() {
+            if states[index] && matcher.is_none() {
+                states[index + 1] = true;
+            }
+        }
+    }
 }
 fn snapshot_registry_source(source: &Path, cache: &Path) -> Result<PathBuf> {
     use std::io::{Read, Write};
@@ -1137,6 +1515,583 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn package_prompts_follow_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("package");
+        let external = directory.path().join("external");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("file.md"), "file").unwrap();
+        std::fs::write(external.join("ignored.md"), "ignored").unwrap();
+        std::fs::write(external.join(".ignore"), "ignored.md\n").unwrap();
+        symlink(external.join("file.md"), root.join("prompts/linked.md")).unwrap();
+        symlink(&external, root.join("prompts/linked-dir")).unwrap();
+        symlink(external.join("missing"), root.join("prompts/broken.md")).unwrap();
+        symlink(root.join("prompts"), external.join("cycle")).unwrap();
+
+        let mut prompts = collect_package_resources(&root, &json!({}), Vec::new())
+            .unwrap()
+            .prompts;
+        prompts.sort();
+        assert_eq!(
+            prompts,
+            vec![
+                root.join("prompts/linked-dir/file.md"),
+                root.join("prompts/linked.md"),
+            ]
+        );
+        let selected = collect_package_resources(
+            &root,
+            &json!({"prompts": ["prompts/linked.md"]}),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(selected.prompts, vec![root.join("prompts/linked.md")]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_selection_bounds_symlink_traversal_and_globs() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(root.join("prompts/visible.md"), "visible").unwrap();
+        std::fs::write(external.join("linked.md"), "linked").unwrap();
+        symlink(&external, root.join("prompts/link")).unwrap();
+        symlink("/", root.join("unrelated")).unwrap();
+
+        let discover = |patterns: serde_json::Value| {
+            collect_package_resources(&root, &json!({"prompts": patterns}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        assert!(discover(json!([])).is_empty());
+        assert_eq!(
+            discover(json!(["!prompts/missing.md"])),
+            vec![root.join("prompts/visible.md")]
+        );
+        assert_eq!(
+            discover(json!(["prompts/visible.md"])),
+            vec![root.join("prompts/visible.md")]
+        );
+        assert_eq!(
+            discover(json!(["prompts/**/*.md"])),
+            vec![root.join("prompts/visible.md")]
+        );
+        assert_eq!(
+            discover(json!(["prompts/link/*.md"])),
+            vec![root.join("prompts/link/linked.md")]
+        );
+        assert_eq!(
+            discover(json!(["./prompts/link/*.md"])),
+            vec![root.join("prompts/link/linked.md")]
+        );
+        assert_eq!(
+            discover(json!(["prompts/link"])),
+            vec![root.join("prompts/link/linked.md")]
+        );
+    }
+
+    #[test]
+    fn package_prompt_manifest_preserves_source_order_and_sorts_each_glob() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for directory in ["z", "a"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+            std::fs::write(root.join(directory).join("review.md"), "review").unwrap();
+        }
+        std::fs::write(root.join("z/another.md"), "another").unwrap();
+        let prompts = collect_package_resources(
+            root,
+            &json!({"prompts": ["z/review.md", "a/review.md", "z/*.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(
+            prompts,
+            vec![
+                root.join("z/review.md"),
+                root.join("a/review.md"),
+                root.join("z/another.md")
+            ]
+        );
+        let globbed =
+            collect_package_resources(root, &json!({"prompts": ["./z/*.md"]}), Vec::new())
+                .unwrap()
+                .prompts;
+        assert_eq!(
+            globbed,
+            vec![root.join("z/another.md"), root.join("z/review.md")]
+        );
+    }
+
+    #[test]
+    fn package_prompt_manifest_override_only_and_force_include() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("prompts")).unwrap();
+        for name in ["public.md", "private.md", "extra.md"] {
+            std::fs::write(root.join("prompts").join(name), "fixture").unwrap();
+        }
+        let discover = |patterns| {
+            collect_package_resources(root, &json!({"prompts": patterns}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        let mut excluded = discover(json!(["!prompts/private.md"]));
+        excluded.sort();
+        assert_eq!(
+            excluded,
+            vec![
+                root.join("prompts/extra.md"),
+                root.join("prompts/public.md")
+            ]
+        );
+        assert_eq!(
+            discover(json!(["prompts/public.md", "+prompts/extra.md"])),
+            vec![
+                root.join("prompts/public.md"),
+                root.join("prompts/extra.md")
+            ]
+        );
+        assert_eq!(
+            discover(json!([
+                "prompts/public.md",
+                "+prompts/extra.md",
+                "-prompts/extra.md"
+            ])),
+            vec![root.join("prompts/public.md")]
+        );
+    }
+
+    #[test]
+    fn package_prompt_overrides_respect_legacy_candidates_and_markdown_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for directory in ["prompts", "prompts/pruned", "node_modules"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        for file in [
+            "prompts/visible.md",
+            "prompts/.hidden.md",
+            "prompts/git.md",
+            "prompts/private.md",
+            "prompts/pruned/secret.md",
+            "prompts/not-prompt.txt",
+            "node_modules/module.md",
+        ] {
+            std::fs::write(root.join(file), "fixture").unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "prompts/git.md\n").unwrap();
+        std::fs::write(
+            root.join(".ignore"),
+            "prompts/private.md\nprompts/pruned/\n",
+        )
+        .unwrap();
+        let discover = |patterns| {
+            collect_package_resources(root, &json!({"prompts": patterns}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        let mut implicit = discover(json!(["!prompts/visible.md"]));
+        implicit.sort();
+        assert_eq!(
+            implicit,
+            vec![root.join("prompts/.hidden.md"), root.join("prompts/git.md")]
+        );
+        assert_eq!(
+            discover(json!([
+                "prompts/visible.md",
+                "+prompts/private.md",
+                "+prompts/pruned/secret.md",
+                "+node_modules/module.md",
+                "+prompts/not-prompt.txt"
+            ])),
+            vec![root.join("prompts/visible.md")]
+        );
+        assert_eq!(
+            discover(json!(["prompts/not-prompt.txt"])),
+            vec![root.join("prompts/not-prompt.txt")]
+        );
+        assert_eq!(
+            discover(json!(["prompts/*.txt"])),
+            vec![root.join("prompts/not-prompt.txt")]
+        );
+        assert!(!discover(json!(["prompts"])).contains(&root.join("prompts/not-prompt.txt")));
+    }
+
+    #[test]
+    fn package_prompt_globs_expand_brackets_and_braces() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("prompts")).unwrap();
+        for name in ["a.md", "b.md", "review.md", "deploy.md"] {
+            std::fs::write(root.join("prompts").join(name), "fixture").unwrap();
+        }
+        std::fs::create_dir(root.join("prompts/a")).unwrap();
+        std::fs::write(root.join("prompts/a/nested.md"), "fixture").unwrap();
+        let discover = |pattern| {
+            collect_package_resources(root, &json!({"prompts": [pattern]}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        assert_eq!(
+            discover("./prompts/[ab].md"),
+            vec![root.join("prompts/a.md"), root.join("prompts/b.md")]
+        );
+        assert_eq!(
+            discover("prompts/{review,deploy}.md"),
+            vec![
+                root.join("prompts/deploy.md"),
+                root.join("prompts/review.md")
+            ]
+        );
+        assert_eq!(
+            discover("./prompts/[ab]/*.md"),
+            vec![root.join("prompts/a/nested.md")]
+        );
+    }
+
+    #[test]
+    fn package_prompt_glob_expands_cross_component_braces_under_literal_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("pkg[1]");
+        for directory in ["prompts/team/a", "prompts/team/b/nested", "prompts/team/c"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("prompts/team/a/review.md"), "a").unwrap();
+        std::fs::write(root.join("prompts/team/b/nested/review.md"), "b").unwrap();
+        std::fs::write(root.join("prompts/team/c/review.md"), "c").unwrap();
+        let prompts = collect_package_resources(
+            &root,
+            &json!({"prompts": ["prompts/{team/a,team/b}/**/*.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(
+            prompts,
+            vec![
+                root.join("prompts/team/a/review.md"),
+                root.join("prompts/team/b/nested/review.md")
+            ]
+        );
+        let simple = collect_package_resources(
+            &root,
+            &json!({"prompts": ["prompts/team/a/*.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(simple, vec![root.join("prompts/team/a/review.md")]);
+    }
+
+    #[test]
+    fn package_prompt_globs_match_explicit_external_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::create_dir_all(outside.join("prompts")).unwrap();
+        std::fs::write(root.join("prompts/review.md"), "fixture").unwrap();
+        std::fs::write(root.join("prompts/.hidden.md"), "hidden").unwrap();
+        std::fs::write(outside.join("prompts/outside.md"), "outside").unwrap();
+        std::fs::write(outside.join("prompts/.hidden.md"), "hidden").unwrap();
+        let discover = |pattern: String| {
+            collect_package_resources(&root, &json!({"prompts": [pattern]}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        let absolute = format!("{}/prompts/*.md", root.display());
+        assert_eq!(
+            discover(absolute.clone()),
+            vec![root.join("prompts/review.md")]
+        );
+        assert_eq!(
+            discover(absolute.replace('/', "\\")),
+            vec![root.join("prompts/review.md")]
+        );
+        assert_eq!(
+            discover(format!("{}/*/prompts/*.md", temp.path().display())),
+            vec![
+                outside.join("prompts/outside.md"),
+                root.join("prompts/review.md")
+            ]
+        );
+        assert_eq!(
+            discover(format!("{}/prompts/*.md", outside.display())),
+            vec![outside.join("prompts/outside.md")]
+        );
+        assert_eq!(
+            discover("../outside/prompts/*.md".into()),
+            vec![outside.join("prompts/outside.md")]
+        );
+        assert!(discover("*/../outside/prompts/*.md".into()).is_empty());
+    }
+
+    #[test]
+    fn package_prompt_glob_prunes_unrelated_subtrees_and_limits_depth() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("users");
+        let root = base.join("owner");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        let deep = base.join("other/unrelated/a/b/c/prompts");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("unexpected.md"), "fixture").unwrap();
+        std::fs::write(root.join("prompts/visible.md"), "fixture").unwrap();
+        let pattern = base.join("*/prompts/*.md");
+        let prefix = PromptGlobPrefix::new(&pattern, 0).unwrap();
+        assert_eq!(prefix.max_depth(&base), Some(3));
+        assert!(prefix.can_match(&base.join("other")));
+        assert!(!prefix.can_match(&base.join("other/unrelated")));
+        assert!(!prefix.can_match(&deep));
+        let prompts = collect_package_resources(
+            &root,
+            &json!({"prompts": [pattern.to_string_lossy()]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(prompts, vec![root.join("prompts/visible.md")]);
+        let recursive = PromptGlobPrefix::new(&base.join("*/**/prompts/*.md"), 0).unwrap();
+        assert_eq!(recursive.max_depth(&base), None);
+        assert!(recursive.can_match(&deep));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_prompt_absolute_glob_matches_verbatim_package_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::write(root.join("prompts/review.md"), "fixture").unwrap();
+        let canonical = root.canonicalize().unwrap();
+        let ordinary = dunce::simplified(&canonical);
+        let pattern = format!("{}/prompts/*.md", ordinary.display());
+        let prompts =
+            collect_package_resources(&canonical, &json!({"prompts": [pattern]}), Vec::new())
+                .unwrap()
+                .prompts;
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            prompts[0].canonicalize().unwrap(),
+            canonical.join("prompts/review.md")
+        );
+        let excluded = collect_package_resources(
+            &canonical,
+            &json!({"prompts": [pattern, "!prompts/review.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert!(excluded.is_empty());
+        let pattern = format!("{}/prompts/*.md", ordinary.display());
+        let excluded = collect_package_resources(
+            &canonical,
+            &json!({"prompts": [pattern, "-prompts/review.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert!(excluded.is_empty());
+        let pattern = format!("{}/prompts/*.md", ordinary.display());
+        let included = collect_package_resources(
+            &canonical,
+            &json!({"prompts": [pattern, "!prompts/review.md", "+prompts/review.md"]}),
+            Vec::new(),
+        )
+        .unwrap()
+        .prompts;
+        assert_eq!(included.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_legacy_basename_and_backslash_patterns_are_bounded() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(root.join("prompts/nested")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for file in [
+            "root.md",
+            "prompts/nested/review.md",
+            "prompts/nested/.hidden.md",
+            "prompts/nested/ignored.md",
+        ] {
+            std::fs::write(root.join(file), "fixture").unwrap();
+        }
+        std::fs::write(root.join(".ignore"), "ignored.md\n").unwrap();
+        std::fs::write(outside.join("external.md"), "outside").unwrap();
+        symlink(&outside, root.join("prompts/link")).unwrap();
+        symlink("/", root.join("unrelated.md")).unwrap();
+        let discover = |patterns| {
+            collect_package_resources(&root, &json!({"prompts": patterns}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        let mut basename = discover(json!(["*.md"]));
+        basename.sort();
+        assert_eq!(
+            basename,
+            vec![
+                root.join("prompts/nested/.hidden.md"),
+                root.join("prompts/nested/review.md"),
+                root.join("root.md")
+            ]
+        );
+        assert_eq!(
+            discover(json!([r"prompts\nested\*.md"])),
+            vec![
+                root.join("prompts/nested/ignored.md"),
+                root.join("prompts/nested/review.md")
+            ]
+        );
+        assert_eq!(
+            discover(json!([r"prompts\nested\review.md"])),
+            vec![root.join("prompts/nested/review.md")]
+        );
+        assert_eq!(
+            discover(json!(["root.md", r"+prompts\nested\review.md"])),
+            vec![root.join("root.md"), root.join("prompts/nested/review.md")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_literal_basename_matches_nested_legacy_candidates() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("prompts")).unwrap();
+        std::fs::create_dir(root.join("private")).unwrap();
+        std::fs::write(root.join("review.md"), "root").unwrap();
+        std::fs::write(root.join("prompts/review.md"), "nested").unwrap();
+        std::fs::write(root.join("private/review.md"), "ignored").unwrap();
+        std::fs::write(root.join(".ignore"), "private/\n").unwrap();
+        symlink("/", root.join("escape")).unwrap();
+        let discover = || {
+            collect_package_resources(root, &json!({"prompts": ["review.md"]}), Vec::new())
+                .unwrap()
+                .prompts
+        };
+        assert_eq!(
+            discover(),
+            vec![root.join("review.md"), root.join("prompts/review.md")]
+        );
+        std::fs::remove_file(root.join("review.md")).unwrap();
+        assert_eq!(discover(), vec![root.join("prompts/review.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_basename_glob_uses_only_unignored_files() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("archive.md")).unwrap();
+        std::fs::write(root.join("archive.md/inside.md"), "inside").unwrap();
+        symlink("/", root.join("archive.md/escape")).unwrap();
+        std::fs::write(root.join("private.md"), "private").unwrap();
+        std::fs::write(root.join("visible.md"), "visible").unwrap();
+        std::fs::write(root.join(".ignore"), "private.md\n").unwrap();
+        let prompts = collect_package_resources(root, &json!({"prompts": ["*.md"]}), Vec::new())
+            .unwrap()
+            .prompts;
+        assert_eq!(
+            prompts,
+            vec![root.join("archive.md/inside.md"), root.join("visible.md")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_basename_glob_includes_unignored_symlink_files() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("content.txt"), "prompt content").unwrap();
+        std::fs::write(root.join(".ignore"), "ignored.md\n").unwrap();
+        symlink("content.txt", root.join("alias.md")).unwrap();
+        symlink("content.txt", root.join("ignored.md")).unwrap();
+        symlink("missing", root.join("broken.md")).unwrap();
+        symlink("/", root.join("directory.md")).unwrap();
+        let prompts = collect_package_resources(root, &json!({"prompts": ["*.md"]}), Vec::new())
+            .unwrap()
+            .prompts;
+        assert_eq!(prompts, vec![root.join("alias.md")]);
+        assert_eq!(
+            std::fs::read_to_string(&prompts[0]).unwrap(),
+            "prompt content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_path_glob_collects_selected_symlink_directory() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("review.md"), "fixture").unwrap();
+        symlink(&external, root.join("prompts/linked")).unwrap();
+        let prompts =
+            collect_package_resources(&root, &json!({"prompts": ["prompts/*"]}), Vec::new())
+                .unwrap()
+                .prompts;
+        assert_eq!(prompts, vec![root.join("prompts/linked/review.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_symlink_targets_respect_local_ignores_and_hidden_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("package");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(external.join(".hidden-dir")).unwrap();
+        for name in [
+            "visible.md",
+            "git.md",
+            "fd.md",
+            ".hidden.md",
+            ".hidden-dir/nested.md",
+        ] {
+            std::fs::write(external.join(name), "fixture").unwrap();
+        }
+        std::fs::write(external.join(".gitignore"), "git.md\n").unwrap();
+        std::fs::write(external.join(".fdignore"), "fd.md\n").unwrap();
+        symlink(&external, root.join("prompts")).unwrap();
+        for manifest in [json!({}), json!({"prompts": ["prompts"]})] {
+            let prompts = collect_package_resources(&root, &manifest, Vec::new())
+                .unwrap()
+                .prompts;
+            assert_eq!(prompts, vec![root.join("prompts/visible.md")]);
+        }
+        let explicit = collect_package_resources(
+            &root,
+            &json!({"prompts": ["prompts/.hidden.md", "prompts/git.md"]}),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.prompts,
+            vec![root.join("prompts/.hidden.md"), root.join("prompts/git.md")]
+        );
+    }
     #[test]
     fn explicit_manifest_excludes_undeclared_resource_types() {
         let directory = tempfile::tempdir().unwrap();
