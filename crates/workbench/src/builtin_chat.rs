@@ -106,6 +106,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({"thinkingFormat":"together", "supportsReasoningEffort":false}),
     },
     Builtin {
+        id: "xai",
+        endpoint: "https://api.x.ai/v1/responses",
+        env: "XAI_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "zai",
         endpoint: "https://api.z.ai/api/coding/paas/v4/chat/completions",
         env: "ZAI_API_KEY",
@@ -142,7 +148,7 @@ impl Builtin {
         Provider::Custom {
             id: Arc::from(self.id),
             adapter: match self.id {
-                "openai" => Adapter::OpenAiResponses,
+                "openai" | "xai" => Adapter::OpenAiResponses,
                 "minimax" | "minimax-cn" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
             },
@@ -155,9 +161,9 @@ impl Builtin {
 
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
-            (Adapter::OpenAiResponses, "openai") => Some(self.endpoint),
+            (Adapter::OpenAiResponses, "openai" | "xai") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
-                if !matches!(id, "openai" | "minimax" | "minimax-cn") =>
+                if !matches!(id, "openai" | "xai" | "minimax" | "minimax-cn") =>
             {
                 Some(self.endpoint)
             }

@@ -62,6 +62,11 @@ fn openai_api_key_provider_streams_through_the_cli() {
 }
 
 #[test]
+fn xai_provider_streams_through_the_cli() {
+    responses_provider_streams_through_the_cli("xai");
+}
+
+#[test]
 fn minimax_regional_providers_use_the_messages_adapter() {
     for provider in ["minimax", "minimax-cn"] {
         let root = tempfile::tempdir().unwrap();

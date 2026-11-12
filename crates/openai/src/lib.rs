@@ -56,6 +56,16 @@ impl OpenAiResponses {
         Self::create(endpoint, token, false)
     }
 
+    /// Connect to an API-key Responses provider with its own model identity.
+    pub fn new_api_provider(endpoint: &str, token: String, provider: &str) -> Result<Self> {
+        if provider.is_empty() || provider == "openai-chatgpt" {
+            return Err(Error::Config("invalid Responses provider identity".into()));
+        }
+        let mut client = Self::create(endpoint, token, false)?;
+        client.provider = provider.to_owned();
+        Ok(client)
+    }
+
     fn create(endpoint: &str, token: String, plan: bool) -> Result<Self> {
         let endpoint = Url::parse(endpoint)
             .map_err(|_| Error::Config("invalid OpenAI Responses endpoint".into()))?;
@@ -134,7 +144,7 @@ impl OpenAiResponses {
         }
         let body: Value = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Model("invalid OpenAI model listing".into()))?;
-        let models = body[if self.provider == "openai" {
+        let models = body[if self.provider != "openai-chatgpt" {
             "data"
         } else {
             "models"
@@ -143,9 +153,9 @@ impl OpenAiResponses {
         .ok_or_else(|| Error::Model("invalid OpenAI model listing".into()))?;
         Ok(models
             .iter()
-            .filter(|entry| self.provider == "openai" || entry["visibility"] == "list")
+            .filter(|entry| self.provider != "openai-chatgpt" || entry["visibility"] == "list")
             .filter_map(|entry| {
-                entry[if self.provider == "openai" {
+                entry[if self.provider != "openai-chatgpt" {
                     "id"
                 } else {
                     "slug"
@@ -477,6 +487,24 @@ mod tests {
         assert!(
             matches!(events.last(), Some(ModelEvent::Complete { calls, .. }) if calls[0].name == "read")
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn named_api_provider_keeps_its_identity() {
+        let (fixture, server) = fixture("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n").await;
+        let client =
+            OpenAiResponses::new_api_provider(fixture.endpoint.as_str(), "fixture".into(), "xai")
+                .unwrap();
+        let events: Vec<_> = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(event, ModelEvent::Metadata(metadata)
+            if metadata.resolved_model.as_ref().is_some_and(|identity| identity.provider == "xai"))));
         server.await.unwrap();
     }
 
