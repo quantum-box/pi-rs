@@ -1861,7 +1861,8 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         )
         .unwrap();
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            // Parallel CLI tests can delay process startup on hosted runners.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
                 let (mut socket, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -1930,7 +1931,13 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
             command.env("http_proxy", &proxy);
         }
         let output = command.output().unwrap();
-        let (request, headers) = server.join().unwrap();
+        let (request, headers) = server.join().unwrap_or_else(|_| {
+            panic!(
+                "{provider}: proxy server failed; status: {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
         assert!(
             request.starts_with("POST http://127.0.0.1:1/"),
             "{provider}: {request}"
