@@ -596,6 +596,20 @@ pub trait Extension: Send + Sync {
         self.context(request, state)
     }
 
+    /// Opt in to transforming the complete message list after context hooks.
+    fn handles_context_with_system(&self) -> bool {
+        false
+    }
+
+    /// Transform the provider-visible messages, including system messages.
+    async fn context_with_system(
+        &self,
+        _messages: &mut Vec<crate::Message>,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
+    }
+
     async fn before_tool(
         &self,
         _name: &str,

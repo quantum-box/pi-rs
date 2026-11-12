@@ -133,6 +133,13 @@ event; the existing synchronous `set_model` does not invoke asynchronous hooks.
 Pi v1.5.0 declares a `restore` source but its session restoration path does not
 emit a model selection event.
 
+Before a model request, an extension may opt into `context_with_system` to
+transform the complete message list, including system messages. All ordinary
+`before_request` hooks run first; these hooks then run in registration order.
+Changes apply only to the current request and do not rewrite the session.
+Executable extensions opt in through the same Rust trait and receive the
+`context_with_system` protocol request with `messages` and branch-local `state`.
+
 An extension can also add temporary skills, prompt templates, and themes:
 
 ```rust,ignore
