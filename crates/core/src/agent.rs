@@ -1273,6 +1273,18 @@ impl Agent<'_> {
                     outcome
                 }
             }
+            outcome @ Outcome::TextResult { .. } => {
+                let size = serde_json::to_vec(&outcome)?.len();
+                if size > max_output_bytes {
+                    Outcome::TextResult {
+                        output: format!("Tool output omitted ({size} bytes exceeded the limit)."),
+                        details: None,
+                        is_error: outcome.is_error(),
+                    }
+                } else {
+                    outcome
+                }
+            }
             outcome @ Outcome::Structured { .. } => {
                 let size = outcome.tool_content().len();
                 if size > max_output_bytes {
@@ -2782,7 +2794,9 @@ fn branch_excerpt(entry: Message) -> String {
             excerpt
         }
         Message::System { content } => format!("System: {content}"),
-        Message::Tool { call_id, content } => format!("Tool {call_id}: {content}"),
+        Message::Tool {
+            call_id, content, ..
+        } => format!("Tool {call_id}: {content}"),
     }
 }
 
@@ -3405,10 +3419,146 @@ mod tree_tests {
                 details: serde_json::json!({"updated": true})
             }
         );
-        assert!(
+        assert_eq!(
             crate::ToolResultPatch::default()
                 .apply(&Outcome::Failed("error".into()))
-                .is_err()
+                .unwrap(),
+            Outcome::Failed("error".into())
+        );
+        let patched = crate::ToolResultPatch {
+            output: Some("redacted".into()),
+            details: Some(serde_json::json!({"code": 1})),
+        }
+        .apply(&Outcome::Failed("error".into()))
+        .unwrap();
+        assert_eq!(
+            patched,
+            Outcome::TextResult {
+                output: "redacted".into(),
+                details: Some(serde_json::json!({"code": 1})),
+                is_error: true
+            }
+        );
+        assert_eq!(patched.tool_content(), "redacted");
+        let metadata_only = crate::ToolResultPatch {
+            output: None,
+            details: Some(serde_json::json!({"code": 1})),
+        }
+        .apply(&Outcome::Failed("error".into()))
+        .unwrap();
+        assert_eq!(metadata_only.tool_content(), "Tool failed: error");
+        let marked_error = crate::ToolResultPatchV2 {
+            is_error: Some(true),
+            ..Default::default()
+        }
+        .apply(&Outcome::SucceededWithDetails {
+            output: "unchanged".into(),
+            details: serde_json::json!({"source":"tool"}),
+        })
+        .unwrap();
+        assert!(marked_error.is_error());
+        assert_eq!(marked_error.tool_content(), "unchanged");
+        assert!(
+            matches!(marked_error, Outcome::TextResult { details: Some(details), .. } if details["source"] == "tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_result_patches_chain_and_preserve_failure() {
+        struct Patch(u8);
+        #[async_trait::async_trait]
+        impl crate::Extension for Patch {
+            fn id(&self) -> &str {
+                match self.0 {
+                    0 => "first",
+                    1 => "second",
+                    _ => "third",
+                }
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &crate::ToolCall,
+                outcome: &Outcome,
+                _: &crate::ToolContext,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<Option<crate::ToolResultPatchV2>> {
+                let patch = match self.0 {
+                    0 => {
+                        assert!(outcome.is_error());
+                        crate::ToolResultPatchV2 {
+                            output: Some("exact".into()),
+                            details: Some(serde_json::json!({"code": 1})),
+                            is_error: None,
+                        }
+                    }
+                    1 => {
+                        assert_eq!(outcome.tool_content(), "exact");
+                        assert!(outcome.is_error());
+                        crate::ToolResultPatchV2 {
+                            is_error: Some(false),
+                            ..Default::default()
+                        }
+                    }
+                    _ => {
+                        assert!(!outcome.is_error());
+                        assert!(
+                            matches!(outcome, Outcome::TextResult { details: Some(value), .. } if value["code"] == 1)
+                        );
+                        crate::ToolResultPatchV2 {
+                            output: Some("final".into()),
+                            is_error: Some(true),
+                            ..Default::default()
+                        }
+                    }
+                };
+                Ok(Some(patch))
+            }
+        }
+        let mut registry = Registry::default();
+        for index in 0..3 {
+            registry.register(Arc::new(Patch(index))).unwrap();
+        }
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut reply = ToolReply::from(Outcome::Failed("original".into()));
+        agent
+            .transform_tool_result(
+                &invocation,
+                &mut reply,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(
+            reply.outcome,
+            Outcome::TextResult {
+                output: "final".into(),
+                details: Some(serde_json::json!({"code": 1})),
+                is_error: true
+            }
+        );
+        assert_eq!(reply.outcome.tool_content(), "final");
+        let serialized = serde_json::to_string(&reply.outcome).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Outcome>(&serialized).unwrap(),
+            reply.outcome
         );
     }
 

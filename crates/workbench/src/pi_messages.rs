@@ -333,15 +333,18 @@ impl PiMessages {
                         "usage":super::rpc_events::usage_value(Usage::default(), &ModelMetadata::default())
                     })
                 }
-                Message::Tool { call_id, content } => {
-                    let error = serde_json::from_str::<Value>(&content)
-                        .ok()
-                        .is_some_and(|value| value["data"]["isError"] == true);
-                    let mut value = super::rpc_events::tool_result_value(&content, None);
+                Message::Tool {
+                    call_id,
+                    content,
+                    is_error,
+                    is_structured,
+                } => {
+                    let mut value =
+                        super::rpc_events::tool_result_value(&content, None, is_structured);
                     value["role"] = json!("toolResult");
                     value["toolCallId"] = json!(call_id);
                     value["toolName"] = json!(tool_names.get(&call_id).map_or("", String::as_str));
-                    value["isError"] = json!(error);
+                    value["isError"] = json!(is_error);
                     value["timestamp"] = json!(0);
                     value
                 }
@@ -699,4 +702,90 @@ fn terminal_metadata(
         ..ModelMetadata::default()
     };
     (usage, metadata)
+}
+
+#[cfg(test)]
+mod tool_status_tests {
+    use super::*;
+
+    #[test]
+    fn structured_tool_content_is_still_extracted_by_pi_messages() {
+        let text = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        let client = PiMessages::new("fixture", "http://127.0.0.1/", "token".into()).unwrap();
+        let body = client.encode(ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::Tool {
+                call_id: "call".into(),
+                content: text.into(),
+                is_error: false,
+                is_structured: Some(true),
+            }],
+            tools: vec![],
+            max_output_tokens: 10,
+        });
+        let blocks = &body["context"]["messages"][0]["content"];
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["data"], "aW1hZ2U=");
+        assert!(!blocks[0]["text"].as_str().unwrap().contains("aW1hZ2U="));
+        let legacy =
+            serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
+        let body = client.encode(ModelRequest {
+            model: "fixture".into(),
+            messages: vec![legacy],
+            tools: vec![],
+            max_output_tokens: 10,
+        });
+        assert_eq!(
+            body["context"]["messages"][0]["content"][1]["data"],
+            "aW1hZ2U="
+        );
+    }
+
+    #[test]
+    fn imported_tool_status_survives_journal_and_pi_messages_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pi.jsonl");
+        let plain = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"one","name":"read","arguments":{}},{"type":"toolCall","id":"two","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"t1","parentId":"a","message":{"role":"toolResult","toolCallId":"one","content":[{"type":"text","text":plain}],"isError":true,"details":{"private":"metadata"}}}),
+            json!({"type":"message","id":"t2","parentId":"t1","message":{"role":"toolResult","toolCallId":"two","content":[{"type":"text","text":plain}],"isError":false}}),
+        ];
+        std::fs::write(
+            &path,
+            entries
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let session = super::super::session_import::read(&path).unwrap();
+        let saved = dir.path().join("native.jsonl");
+        session.export_jsonl(&saved).unwrap();
+        let reopened = super::super::session_import::read(&saved).unwrap();
+        assert!(reopened.records().iter().any(|record| matches!(&record.event, pi_rs::Event::ToolFinished { outcome: pi_rs::Outcome::TextResult { output, details: Some(details), is_error: true }, .. } if output == plain && details["private"] == "metadata")));
+        let messages = reopened.current_messages();
+        assert!(messages.iter().any(|message| matches!(message, Message::Tool { content, is_error: true, .. } if content == plain)));
+        let client = PiMessages::new("fixture", "http://127.0.0.1/", "token".into()).unwrap();
+        let body = client.encode(ModelRequest {
+            model: "fixture".into(),
+            messages,
+            tools: vec![],
+            max_output_tokens: 256,
+        });
+        let results = body["context"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value["role"] == "toolResult")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["isError"], true);
+        assert_eq!(results[0]["content"][0]["text"], plain);
+        assert_eq!(results[1]["isError"], false);
+        assert_eq!(results[1]["content"][0]["text"], plain);
+        assert!(!body.to_string().contains("metadata"));
+    }
 }

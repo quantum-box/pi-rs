@@ -1300,16 +1300,24 @@ impl View {
         {
             *parts = rendered_parts;
             let diff = match outcome {
-                pi_rs::Outcome::SucceededWithDetails { details, .. } if name == "edit" => {
-                    details["diff"].as_str().filter(|diff| !diff.is_empty())
-                }
+                pi_rs::Outcome::SucceededWithDetails { details, .. }
+                | pi_rs::Outcome::TextResult {
+                    details: Some(details),
+                    is_error: false,
+                    ..
+                } if name == "edit" => details["diff"].as_str().filter(|diff| !diff.is_empty()),
                 _ => None,
             };
             *numbered_diff = diff.is_some();
             *output = diff.map_or_else(|| display_tool_result(outcome), str::to_owned);
             *failed = !matches!(
                 outcome,
-                pi_rs::Outcome::Succeeded(_) | pi_rs::Outcome::SucceededWithDetails { .. }
+                pi_rs::Outcome::Succeeded(_)
+                    | pi_rs::Outcome::SucceededWithDetails { .. }
+                    | pi_rs::Outcome::TextResult {
+                        is_error: false,
+                        ..
+                    }
             ) && !matches!(outcome, pi_rs::Outcome::Structured { data, .. } | pi_rs::Outcome::StructuredWithDetails { data, .. } if data["isError"] != true);
             *finished = true;
         }
@@ -2412,7 +2420,12 @@ impl View {
 }
 
 fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
-    if let pi_rs::Outcome::SucceededWithDetails { output, details } = outcome
+    if let pi_rs::Outcome::SucceededWithDetails { output, details }
+    | pi_rs::Outcome::TextResult {
+        output,
+        details: Some(details),
+        is_error: false,
+    } = outcome
         && let Some(patch) = details["patch"].as_str().filter(|patch| !patch.is_empty())
     {
         return format!("{output}\n{patch}");
@@ -6501,6 +6514,22 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn patched_results_render_status_and_details_from_record_events() {
+        use super::*;
+        let mut view = View::default();
+        for (id, is_error) in [("one", false), ("two", true)] {
+            view.receive(&json!({"type":"record","record":{"event":{"type":"assistant","content":"","invocations":[{"operation_id":id,"call":{"name":"edit","arguments":"{}"}}]}}}));
+            view.receive(&json!({"type":"record","record":{"event":{"type":"tool_finished","operation_id":id,"outcome":{"status":"text_result","detail":{"output":"exact", "details":{"diff":"diff output"}, "is_error":is_error}}}}}));
+        }
+        assert!(
+            matches!(&view.lines[0], Entry::Tool { failed: false, finished: true, output, numbered_diff: true, .. } if output == "diff output")
+        );
+        assert!(
+            matches!(&view.lines[1], Entry::Tool { failed: true, finished: true, output, numbered_diff: false, .. } if output == "exact")
+        );
+    }
+
     #[test]
     fn clear_requires_two_presses_within_500_ms_even_when_empty() {
         let mut view = super::View::default();

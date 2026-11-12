@@ -1038,7 +1038,7 @@ impl Agent<'_> {
                         futures.push(async move {
                             let mut errors = Vec::new();
                             if notify_end {
-                                let is_error = matches!(&outcome, Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)) || matches!(&outcome, Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } if data["isError"] == true);
+                                let is_error = outcome.is_error();
                                 let event = crate::LifecycleEvent::ToolExecutionEnd { tool_call_id: invocation.call.id, tool_name: invocation.call.name, result: outcome.clone(), is_error, duration_ms: duration, parent_tool_call_id: parent };
                                 let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(),event,message.to_owned())); };
                                 crate::lifecycle::notify(&registry,event,&snapshot,timeout,&mut collect).await;

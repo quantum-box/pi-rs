@@ -117,8 +117,14 @@ fn remove_images(messages: &mut [Message], user_placeholder: &str, tool_placehol
                 content.push_str(user_placeholder);
                 *message = Message::User { content };
             }
-            Message::Tool { content, .. } => {
-                if let Some(filtered) = remove_tool_images(content, tool_placeholder) {
+            Message::Tool {
+                content,
+                is_structured,
+                ..
+            } => {
+                if pi_rs::tool_content_is_structured(content, *is_structured)
+                    && let Some(filtered) = remove_tool_images(content, tool_placeholder)
+                {
                     *content = filtered;
                 }
             }
@@ -167,6 +173,8 @@ mod tests {
                 }],
             },
             Message::Tool {
+                is_structured: Some(true),
+                is_error: false,
                 call_id: "call".into(),
                 content: original.to_string(),
             },
@@ -188,6 +196,34 @@ mod tests {
     }
 
     #[test]
+    fn plain_json_tool_text_is_not_changed_by_image_policy() {
+        let content = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"private"}] } }"#;
+        let mut messages = vec![Message::Tool {
+            call_id: "id".into(),
+            content: content.into(),
+            is_error: false,
+            is_structured: Some(false),
+        }];
+        remove_images(&mut messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
+        assert!(matches!(&messages[0], Message::Tool { content: actual, .. } if actual == content));
+        let legacy =
+            serde_json::from_value(json!({"role":"tool", "call_id":"id", "content":content}))
+                .unwrap();
+        let mut messages = vec![legacy];
+        remove_images(&mut messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
+        let Message::Tool {
+            content: filtered,
+            is_structured: None,
+            ..
+        } = &messages[0]
+        else {
+            panic!("legacy tool message missing")
+        };
+        assert!(!filtered.contains("private"));
+        assert!(filtered.contains(BLOCKED_IMAGE));
+    }
+
+    #[test]
     fn non_vision_models_receive_reference_placeholders_for_user_and_tool_images() {
         let mut messages = vec![
             Message::UserWithImages {
@@ -195,7 +231,8 @@ mod tests {
                 images: vec![pi_rs::ImageContent { data: "private".into(), mime_type: "image/png".into() }],
             },
             Message::Tool {
-                call_id: "call".into(),
+                is_structured: Some(true),
+                is_error: false, call_id: "call".into(),
                 content: json!({"data":{"content":[{"type":"text","text":"before"},{"type":"image","data":"private"},{"type":"image","data":"private"},{"type":"text","text":"after"}]}}).to_string(),
             },
         ];

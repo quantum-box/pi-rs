@@ -2004,10 +2004,14 @@ async fn parallel_read_results_keep_their_original_call_ids() {
         .unwrap();
     let requests = model.requests.lock().unwrap();
     assert!(requests[1].messages.contains(&Message::Tool {
+        is_structured: Some(false),
+        is_error: false,
         call_id: "call-0".into(),
         content: "slow".into()
     }));
     assert!(requests[1].messages.contains(&Message::Tool {
+        is_structured: Some(false),
+        is_error: false,
         call_id: "call-1".into(),
         content: "fast".into()
     }));
