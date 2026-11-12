@@ -27,6 +27,7 @@ fn normalize(
     let mut command = root;
     let mut remaining = 0;
     let mut hyphen_values = false;
+    let mut trust_flag_index = None;
     while let Some(arg) = input.next() {
         if arg == "--" {
             output.push(arg);
@@ -100,6 +101,15 @@ fn normalize(
         }
         (remaining, hyphen_values) = option_values(command, canonical);
         let print = matches!(canonical, "--print" | "-p");
+        if matches!(
+            canonical,
+            "-a" | "--approve" | "--trust" | "--no-approve" | "--no-trust"
+        ) {
+            if let Some(index) = trust_flag_index {
+                output.remove(index);
+            }
+            trust_flag_index = Some(output.len());
+        }
         output.push(if canonical == value {
             arg
         } else {
@@ -289,6 +299,21 @@ mod tests {
         assert!(cli(&["pi", "--approve"]).trust);
         assert!(cli(&["pi", "--no-approve"]).no_trust);
         assert!(cli(&["pi", "inspect", "-na"]).no_trust);
+    }
+
+    #[test]
+    fn last_project_approval_flag_wins() {
+        for positive in ["-a", "--approve", "--trust"] {
+            for negative in ["-na", "--no-approve", "--no-trust"] {
+                let denied = cli(&["pi", positive, negative]);
+                assert!(!denied.trust && denied.no_trust);
+                let allowed = cli(&["pi", negative, positive]);
+                assert!(allowed.trust && !allowed.no_trust);
+            }
+        }
+        let args = cli(&["pi", "--approve", "--", "--no-approve"]);
+        assert!(args.trust && !args.no_trust);
+        assert_eq!(args.prompt, ["--no-approve"]);
     }
 
     #[test]

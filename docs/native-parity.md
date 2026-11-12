@@ -539,6 +539,8 @@ Non-chat model APIs and remaining execution-limit differences remain open.
 available. Skills accept file or directory paths without `--project`; the
 existing named project-skill mode remains supported. Native built-ins can be
 selected with `builtin:codemode`, `builtin:tool-search` and `builtin:mcp`.
+Repeated project-approval flags follow Pi's last-option-wins behavior, including
+the `-a` and `-na` aliases; flags after `--` remain prompt text.
 These selections propagate to persistent CLI workers. The settings editor,
 remaining CLI aliases still require parity work.
 
