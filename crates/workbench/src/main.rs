@@ -74,6 +74,8 @@ struct Cli {
     #[arg(skip)]
     cli_thinking: Option<String>,
     #[arg(skip)]
+    selection_workspace: Option<PathBuf>,
+    #[arg(skip)]
     discovered_models: Vec<(String, String)>,
     #[arg(skip)]
     complete_catalogs: Vec<(String, String)>,
@@ -880,6 +882,7 @@ impl Cli {
     }
 
     fn remember_initial_selection(&mut self) {
+        self.selection_workspace = Some(self.workspace.clone());
         self.initial_selection = Some(InitialSelection {
             provider: self.provider.clone(),
             endpoint: self.endpoint.clone(),
@@ -898,12 +901,100 @@ impl Cli {
     /// Recreate the new-session defaults from the current workspace while
     /// retaining the original command-line overrides across session changes.
     fn refresh_workspace_selection(&mut self) {
-        let catalogs = model_selection::cached_catalogs(self);
         let patterns: Vec<String> = self
             .models
             .as_deref()
             .map(|value| value.split(',').map(str::to_owned).collect())
             .unwrap_or_else(|| self.settings.strings("enabledModels"));
+        let mut catalogs = model_selection::cached_catalogs(self);
+        if self
+            .selection_workspace
+            .as_ref()
+            .is_some_and(|cwd| cwd != &self.workspace)
+        {
+            // A previous runtime's negative catalog is not authoritative for
+            // this workspace, especially when rediscovery is unavailable.
+            self.complete_catalogs.clear();
+            let args = self.clone();
+            let patterns = patterns.clone();
+            if let Ok(discovered) = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let providers = std::iter::once(args.provider.clone())
+                        .chain(args.model_profiles.providers());
+                    let mut selected = Vec::new();
+                    for provider in providers {
+                        let in_scope =
+                            patterns
+                                .iter()
+                                .any(|pattern| match pattern.split_once('/') {
+                                    Some((prefix, _))
+                                        if args.model_profiles.provider(prefix).is_some() =>
+                                    {
+                                        prefix.eq_ignore_ascii_case(provider.id())
+                                    }
+                                    _ => true,
+                                });
+                        let needs_default = args.settings.string("defaultModel").is_none()
+                            && args
+                                .settings
+                                .string("defaultProvider")
+                                .is_some_and(|id| id.eq_ignore_ascii_case(provider.id()));
+                        if (in_scope || needs_default)
+                            && !selected.contains(&provider)
+                            && args.allow_endpoint_probes(args.endpoint_for(&provider))
+                        {
+                            selected.push(provider);
+                        }
+                    }
+                    let discovery = futures_util::future::join_all(
+                        selected
+                            .into_iter()
+                            .map(|provider| model_selection::catalog(&args, provider, true)),
+                    );
+                    tokio::time::timeout(Duration::from_secs(15), discovery)
+                        .await
+                        .map(|results| {
+                            results
+                                .into_iter()
+                                .filter_map(Result::ok)
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(|_| Error::Config("model discovery timed out".into()))
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| Err(Error::Config("model discovery worker stopped".into())))
+            {
+                for catalog in discovered {
+                    if catalog.complete {
+                        self.complete_catalogs.push((
+                            catalog.provider.id().to_owned(),
+                            self.endpoint_for(&catalog.provider).to_owned(),
+                        ));
+                        catalogs.retain(|cached| cached.provider != catalog.provider);
+                    } else if catalogs
+                        .iter()
+                        .any(|cached| cached.provider == catalog.provider)
+                    {
+                        continue;
+                    }
+                    catalogs.push(catalog);
+                }
+            }
+        }
+        self.selection_workspace = Some(self.workspace.clone());
+        self.discovered_models = catalogs
+            .iter()
+            .flat_map(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .map(|model| (catalog.provider.id().to_owned(), model.clone()))
+            })
+            .collect();
         self.model_scope =
             model_selection::scoped_choices(patterns.iter().map(String::as_str), &catalogs).0;
 
@@ -932,7 +1023,18 @@ impl Cli {
                     .map_or(value, |(_, id)| *id)
                     .to_owned()
             })
-            .unwrap_or_else(|| fallback.model.clone());
+            .or_else(|| (provider == fallback.provider).then(|| fallback.model.clone()))
+            .or_else(|| {
+                catalogs
+                    .iter()
+                    .find(|catalog| catalog.provider == provider)
+                    .and_then(|catalog| catalog.models.first())
+                    .cloned()
+            });
+        let (provider, model) = model.map_or_else(
+            || (fallback.provider.clone(), fallback.model.clone()),
+            |model| (provider, model),
+        );
         let chosen = self
             .model_scope
             .iter()

@@ -1693,6 +1693,117 @@ mod tests {
     }
 
     #[test]
+    fn workspace_switch_discovers_dynamic_scope_models() {
+        use std::io::Read;
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(launch.join(".pi")).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"enabledModels":["ollama/dynamic:high"]}).to_string(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let n = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /v1/models "));
+            let body = r#"{"data":[{"id":"dynamic"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let target_session = root.path().join("target.jsonl");
+        Session::open(&target_session)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.session = root.path().join("launch.jsonl");
+        args.session_dir = Some(root.path().into());
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(
+            &json!({"providers":{"ollama":{"baseUrl":endpoint, "models":[{"id":"alpha"}]}}}),
+        )
+        .unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        switch_session(&mut args, &target_session).unwrap();
+        server.join().unwrap();
+        assert_eq!(args.model, "dynamic");
+        assert_eq!(
+            args.model_scope
+                .iter()
+                .map(|c| c.model.as_str())
+                .collect::<Vec<_>>(),
+            ["dynamic"]
+        );
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(args.model, "dynamic");
+    }
+
+    #[test]
+    fn workspace_provider_only_default_never_uses_previous_provider_model() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"defaultProvider":"target"}).to_string(),
+        )
+        .unwrap();
+        let target_session = root.path().join("target.jsonl");
+        Session::open(&target_session)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.session = root.path().join("launch.jsonl");
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha"}]},
+            "target":{"baseUrl":"https://example.invalid/v1", "api":"openai-completions", "models":[{"id":"beta"}]}
+        }})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        let mut unavailable = args.clone();
+        unavailable.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha"}]},
+            "target":{"baseUrl":"https://example.invalid/v1", "api":"openai-completions", "models":[]}
+        }})).unwrap();
+        switch_session(&mut unavailable, &target_session).unwrap();
+        assert_eq!(
+            (unavailable.provider.id(), unavailable.model.as_str()),
+            ("ollama", "alpha")
+        );
+        switch_session(&mut args, &target_session).unwrap();
+        assert_eq!(
+            (args.provider.id(), args.model.as_str()),
+            ("target", "beta")
+        );
+    }
+
+    #[test]
     fn switching_workspace_rebuilds_defaults_and_scope_for_new_session() {
         let root = tempfile::tempdir().unwrap();
         let launch = root.path().join("launch");
