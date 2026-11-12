@@ -25,6 +25,7 @@ pub struct OpenAiResponses {
     thinking: Option<String>,
     provider: String,
     headers: reqwest::header::HeaderMap,
+    sampling: BTreeMap<String, Value>,
 }
 
 impl OpenAiResponses {
@@ -100,6 +101,7 @@ impl OpenAiResponses {
             thinking: None,
             provider: if plan { "openai-chatgpt" } else { "openai" }.into(),
             headers: reqwest::header::HeaderMap::new(),
+            sampling: BTreeMap::new(),
         })
     }
 
@@ -110,6 +112,12 @@ impl OpenAiResponses {
 
     pub fn with_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
         self.headers = headers;
+        self
+    }
+
+    /// Set request body defaults from the selected model's sampling parameters.
+    pub fn with_sampling(mut self, sampling: BTreeMap<String, Value>) -> Self {
+        self.sampling = sampling;
         self
     }
 
@@ -278,6 +286,13 @@ impl Model for OpenAiResponses {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
+        body.as_object_mut()
+            .expect("Responses request object")
+            .extend(
+                self.sampling
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
         let mut response = self
             .client
             .post(self.endpoint.clone())
