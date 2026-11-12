@@ -60,6 +60,18 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: standard,
     },
     Builtin {
+        id: "minimax",
+        endpoint: "https://api.minimax.io/anthropic/v1/messages",
+        env: "MINIMAX_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
+        id: "minimax-cn",
+        endpoint: "https://api.minimaxi.com/anthropic/v1/messages",
+        env: "MINIMAX_CN_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "moonshotai",
         endpoint: "https://api.moonshot.ai/v1/chat/completions",
         env: "MOONSHOT_API_KEY",
@@ -129,10 +141,10 @@ impl Builtin {
     pub fn provider(&self) -> Provider {
         Provider::Custom {
             id: Arc::from(self.id),
-            adapter: if self.id == "openai" {
-                Adapter::OpenAiResponses
-            } else {
-                Adapter::ChatCompletions
+            adapter: match self.id {
+                "openai" => Adapter::OpenAiResponses,
+                "minimax" | "minimax-cn" => Adapter::Anthropic,
+                _ => Adapter::ChatCompletions,
             },
         }
     }
@@ -144,7 +156,12 @@ impl Builtin {
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
             (Adapter::OpenAiResponses, "openai") => Some(self.endpoint),
-            (Adapter::ChatCompletions, id) if id != "openai" => Some(self.endpoint),
+            (Adapter::ChatCompletions, id)
+                if !matches!(id, "openai" | "minimax" | "minimax-cn") =>
+            {
+                Some(self.endpoint)
+            }
+            (Adapter::Anthropic, "minimax" | "minimax-cn") => Some(self.endpoint),
             (Adapter::Anthropic, "fireworks") => {
                 Some("https://api.fireworks.ai/inference/v1/messages")
             }
