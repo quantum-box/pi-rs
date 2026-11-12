@@ -1244,7 +1244,7 @@ enum Control {
 
 fn main() {
     #[cfg(windows)]
-    {
+    let code = {
         // Windows executables start with a smaller stack than Unix binaries.
         std::thread::Builder::new()
             .name("pi".into())
@@ -1252,14 +1252,17 @@ fn main() {
             .spawn(run_cli)
             .expect("start Pi runtime thread")
             .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    }
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    };
     #[cfg(not(windows))]
-    run_cli();
+    let code = run_cli();
+    if code != 0 {
+        std::process::exit(code);
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn run_cli() {
+async fn run_cli() -> i32 {
     let argv: Vec<_> = std::env::args_os().collect();
     let (matches, extension_flags) = match cli_compat::parse(argv.iter().cloned()) {
         Ok(parsed) => parsed,
@@ -1268,11 +1271,12 @@ async fn run_cli() {
             if let Some(help) = cli_compat::extension_help(&argv) {
                 print!("{help}");
             }
-            return;
+            return 0;
         }
         Err(error) => error.exit(),
     };
     let mut output_truncated = false;
+    let mut cli_exit_code = 0;
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
@@ -1321,7 +1325,9 @@ async fn run_cli() {
                 ));
             }
             let command = command.clone();
-            return auth_cli::run(args, command).await;
+            return auth_cli::run(args, command).await.map(|code| {
+                cli_exit_code = code;
+            });
         }
         let decision = config::project_trust(
             &args.workspace,
@@ -1407,16 +1413,17 @@ async fn run_cli() {
     .await;
     if let Err(err) = result {
         eprintln!("{err}");
-        std::process::exit(if matches!(err, Error::Cancelled) {
+        return if matches!(err, Error::Cancelled) {
             130
         } else {
             1
-        });
+        };
     }
     if output_truncated {
         eprintln!("Response was truncated: the model reached its output token limit.");
-        std::process::exit(1);
+        return 1;
     }
+    cli_exit_code
 }
 
 fn export_from_file(paths: &[PathBuf]) -> Result<()> {

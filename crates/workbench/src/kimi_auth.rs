@@ -239,7 +239,7 @@ fn auth_path() -> std::path::PathBuf {
     super::config::agent_dir().join("auth.json")
 }
 fn load(path: &std::path::Path) -> Result<Option<Credential>> {
-    let value = super::config::read_object(path)?;
+    let value = super::config::read_object_unlocked(path)?;
     let Some(entry) = value.get("kimi-coding").filter(|e| e["type"] == "oauth") else {
         return Ok(None);
     };
@@ -294,19 +294,21 @@ async fn access_at(
     no_refresh: bool,
 ) -> Result<String> {
     let required = minimum.unwrap_or_default().max(NORMAL_MINIMUM);
+    let guard = super::auth_lock::acquire_async(&path).await?;
     let value = load(&path)?.ok_or_else(|| error("credentials not configured"))?;
+    guard.check()?;
     if no_refresh || !expires_soon(&value, required) {
         return Ok(value.access);
     }
-    let guard = super::auth_lock::acquire_async(&path).await?;
-    // Once refresh can rotate a token, dropping the caller must not discard it.
-    tokio::spawn(async move {
-        let value = load(&path)?.ok_or_else(|| error("credentials not configured"))?;
-        if !expires_soon(&value, required) {
-            return Ok(value.access);
-        }
+    // Tokio waits for started blocking tasks on runtime shutdown. The separate
+    // runtime keeps the exchange alive even when the caller's runtime stops.
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| error("cannot start refresh runtime"))?;
         let previous = serde_json::to_value(&value)?;
-        let value = service.refresh(&value.refresh).await?;
+        let value = runtime.block_on(service.refresh(&value.refresh))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
             let unchanged = data.get("kimi-coding").is_some_and(|current| {
                 ["type", "access", "refresh", "expires"]
@@ -573,5 +575,100 @@ mod tests {
             super::super::config::read_object(&path).unwrap()["kimi-coding"]["key"],
             "new-key"
         );
+    }
+    #[test]
+    fn runtime_shutdown_waits_for_rotated_token_persistence() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fixture(&path, now());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            assert!(stream.read(&mut bytes).unwrap() > 0);
+            started_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let service = Service {
+            host,
+            client: Client::builder().no_proxy().build().unwrap(),
+        };
+        runtime.block_on(async {
+            let request = tokio::spawn(access_at(path.clone(), service, None, false));
+            started_rx.await.unwrap();
+            request.abort();
+        });
+        let start = std::time::Instant::now();
+        drop(runtime);
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        assert_eq!(load(&path).unwrap().unwrap().refresh, "rotated");
+        server.join().unwrap();
+    }
+    #[test]
+    fn readers_wait_for_pi_in_place_auth_write() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fixture(&path, now());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let guard = super::super::auth_lock::acquire(&writer_path).unwrap();
+            std::fs::write(&writer_path, b"{\"kimi-coding\":").unwrap();
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            fixture(&writer_path, now() + 3_600_000);
+            drop(guard);
+        });
+        started_rx.recv().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let keys_path = path.clone();
+        let keys_done = done_tx.clone();
+        let keys = std::thread::spawn(move || {
+            let keys = super::super::model_auth::Keys::load_path(&keys_path).unwrap();
+            let provider = super::super::Provider::named("kimi-coding").unwrap();
+            assert!(keys.has(&provider));
+            keys_done.send(()).unwrap();
+        });
+        let access_path = path.clone();
+        let access = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let service = Service {
+                host: Url::parse("http://127.0.0.1:1/").unwrap(),
+                client: Client::builder().no_proxy().build().unwrap(),
+            };
+            assert_eq!(
+                runtime
+                    .block_on(access_at(access_path, service, None, false))
+                    .unwrap(),
+                "old"
+            );
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        writer.join().unwrap();
+        keys.join().unwrap();
+        access.join().unwrap();
     }
 }

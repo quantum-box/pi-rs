@@ -166,7 +166,7 @@ fn emit(line: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
+pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
     // Auth commands are dispatched before normal interactive configuration is loaded.
     // Honor existing trust decisions without prompting in this noninteractive command.
     let explicit = if args.no_trust {
@@ -206,7 +206,7 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
                 } else {
                     emit("invalid")?;
                 }
-                std::process::exit(2);
+                return Ok(2);
             }
             return Err(error);
         }
@@ -264,9 +264,9 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
             emit(output_credential.as_deref().unwrap_or(status))?;
         }
         match status {
-            "ready" => return Ok(()),
-            "not_ready" => std::process::exit(1),
-            _ => std::process::exit(2),
+            "ready" => return Ok(0),
+            "not_ready" => return Ok(1),
+            _ => return Ok(2),
         }
     }
 
@@ -286,7 +286,7 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<()> {
         }
     }
     match matches.as_slice() {
-        [(_, credential)] => emit(credential),
+        [(_, credential)] => emit(credential).map(|()| 0),
         [] => Err(Error::Config(format!(
             "No usable {description} is configured for {name}"
         ))),

@@ -472,7 +472,7 @@ pub(super) fn update_object_locked(
         .write(true)
         .open(path.with_extension("lock"))?;
     lock.lock()?;
-    let mut value = read_object(path)?;
+    let mut value = read_object_unlocked(path)?;
     update(value.as_object_mut().expect("object"))?;
     if let Some(guard) = shared {
         guard.check()?;
@@ -481,6 +481,19 @@ pub(super) fn update_object_locked(
 }
 
 pub fn read_object(path: &Path) -> Result<Value> {
+    let shared = if path.file_name().is_some_and(|name| name == "auth.json") {
+        Some(super::auth_lock::acquire(path)?)
+    } else {
+        None
+    };
+    let value = read_object_unlocked(path)?;
+    if let Some(guard) = shared {
+        guard.check()?;
+    }
+    Ok(value)
+}
+
+pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let value: Value = serde_json::from_slice(&bytes)

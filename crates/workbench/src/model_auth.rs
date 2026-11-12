@@ -119,7 +119,11 @@ struct SavedKey {
 
 impl Keys {
     pub fn load() -> Result<Self> {
-        let value = config::read_object(&config::agent_dir().join("auth.json"))?;
+        Self::load_path(&config::agent_dir().join("auth.json"))
+    }
+
+    pub(super) fn load_path(path: &std::path::Path) -> Result<Self> {
+        let value = config::read_object(path)?;
         Ok(Self::parse(&value))
     }
 
