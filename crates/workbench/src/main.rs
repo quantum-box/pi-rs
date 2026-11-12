@@ -1678,7 +1678,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                     output(event);
                 }
             }
-            observe(event, args.trace);
+            observe_with_stream(event, args.trace, stream.is_some());
         };
         if let Some(prompt) = &mut input {
             if index == 0 && skip_initial_prompt {
@@ -1786,7 +1786,19 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     result.and(cleanup)
 }
 
+fn trace_tool_progress(
+    event: &pi_rs::LifecycleEvent,
+    trace: bool,
+    json_stream: bool,
+) -> Option<Value> {
+    (trace && !json_stream).then(|| serde_json::to_value(event).expect("tool progress"))
+}
+
 fn observe(event: Notification<'_>, trace: bool) {
+    observe_with_stream(event, trace, false);
+}
+
+fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) {
     match event {
         Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
         Notification::SummaryRequest if trace => output(json!({"type":"summary_request_start"})),
@@ -1806,6 +1818,11 @@ fn observe(event: Notification<'_>, trace: bool) {
         Notification::Text(delta) if trace => output(json!({"type": "text_delta", "delta": delta})),
         Notification::Reasoning(delta) if trace => {
             output(json!({"type":"reasoning_delta","delta":delta}))
+        }
+        Notification::ToolProgress(event) => {
+            if let Some(event) = trace_tool_progress(event, trace, json_stream) {
+                output(event);
+            }
         }
         Notification::ToolCallDelta(delta) if trace => {
             output(json!({"type":"tool_call_delta","toolCallDelta":delta}))

@@ -96,6 +96,9 @@ impl Stream {
             Notification::Reasoning(delta) if !self.assistant.is_null() => {
                 self.delta("thinking", delta, &mut events);
             }
+            Notification::ToolProgress(event) => {
+                events.push(serde_json::to_value(event).expect("tool progress"));
+            }
             Notification::ToolCallDelta(delta) if !self.assistant.is_null() && !self.ended => {
                 self.tool_delta((*delta).clone(), &mut events);
             }
@@ -549,6 +552,49 @@ fn timestamp() -> u64 {
 #[cfg(test)]
 mod streaming_tool_tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn tool_progress_is_forwarded_as_pi_event_in_json_mode() {
+        let event = pi_rs::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: "child".into(),
+            tool_name: "bash".into(),
+            args: json!({"command":"echo hi"}),
+            partial_result: json!({"content":[{"type":"text","text":"hi"}]}),
+            parent_tool_call_id: Some("parent".into()),
+        };
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi-rs"]);
+        let events = stream.notify(&Notification::ToolProgress(&event), &args);
+        assert_eq!(
+            events,
+            vec![
+                json!({"type":"tool_execution_update", "toolCallId":"child", "toolName":"bash", "args":{"command":"echo hi"}, "partialResult":{"content":[{"type":"text","text":"hi"}]}, "parentToolCallId":"parent"})
+            ]
+        );
+    }
+
+    #[test]
+    fn json_trace_emits_progress_once_and_worker_trace_still_forwards() {
+        let event = pi_rs::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: "call".into(),
+            tool_name: "bash".into(),
+            args: json!({}),
+            partial_result: json!({"content":[]}),
+            parent_tool_call_id: None,
+        };
+        let args = Cli::parse_from(["pi"]);
+        for trace in [false, true] {
+            let mut stream = Stream::default();
+            let mut output = stream.notify(&Notification::ToolProgress(&event), &args);
+            output.extend(super::super::trace_tool_progress(&event, trace, true));
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0]["type"], "tool_execution_update");
+        }
+        let worker_event = super::super::trace_tool_progress(&event, true, false).unwrap();
+        assert_eq!(worker_event["type"], "tool_execution_update");
+        assert!(super::super::trace_tool_progress(&event, false, false).is_none());
+    }
 
     #[test]
     fn completed_tool_call_reports_repaired_and_invalid_arguments() {

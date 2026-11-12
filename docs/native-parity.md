@@ -3304,6 +3304,10 @@ the provider still receive its transformed context, matching Pi v1.5.0. A
 handler that restores and then removes the leading system message is reported
 again.
 
+RPC and JSON modes forward transient `tool_execution_update` events, including
+the tool arguments, partial result, and parent call ID when present. Updates
+are delivered during execution even when no extension subscribes to progress.
+
 ### Legacy session compaction import
 
 Pi v1 session imports translate `firstKeptEntryIndex` compaction boundaries
