@@ -2630,7 +2630,10 @@ async fn retryable_model_preparation_uses_session_retry_policy() {
     }
     #[async_trait::async_trait]
     impl Model for Preparing {
-        async fn prepare_context(&self, _: &ModelRequest) -> Result<Option<Arc<dyn Model>>> {
+        async fn prepare_context<'a>(
+            &'a self,
+            _: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err(Error::RetryableModel("temporary resolution failure".into()))
             } else {
@@ -2681,7 +2684,10 @@ async fn prepared_model_is_used_for_capacity_and_dispatch() {
     }
     #[async_trait::async_trait]
     impl Model for Original {
-        async fn prepare_context(&self, _: &ModelRequest) -> Result<Option<Arc<dyn Model>>> {
+        async fn prepare_context<'a>(
+            &'a self,
+            _: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
             Ok(Some(Arc::new(Prepared {
                 streams: self.streams.clone(),
                 large: self.large,

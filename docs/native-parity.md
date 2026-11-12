@@ -1750,7 +1750,8 @@ with the request so it remains effective after reopening. A fingerprint also
 requires the effective adapter identity, image policy, model, system messages
 and tool schemas to match the measured request. Deferred workbench providers
 resolve credentials and headers before the capacity check and use the same
-resolved adapter for dispatch. Radius also freezes the catalog-selected route
+resolved adapter for dispatch; the AIP budget wrapper preserves preparation and
+its budget settlement. Radius also freezes the catalog-selected route
 for that request, so replay is counted only when that route will replay it.
 Adapters that cannot prove a stable identity and older requests without the
 markers use a fresh estimate. The estimator remains a heuristic rather than a

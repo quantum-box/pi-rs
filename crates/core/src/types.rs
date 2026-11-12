@@ -615,10 +615,10 @@ pub type ModelStream = futures_util::stream::BoxStream<'static, Result<ModelEven
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
     /// Resolve a request-specific adapter once for estimation and dispatch.
-    async fn prepare_context(
-        &self,
+    async fn prepare_context<'a>(
+        &'a self,
         _request: &ModelRequest,
-    ) -> Result<Option<std::sync::Arc<dyn Model>>> {
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
         Ok(None)
     }
 

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pi_rs_core::{
     Error, Event, Model, ModelMetadata, ModelRequest, ModelStream, Record, Result, UsageReport,
@@ -31,6 +31,18 @@ pub(crate) struct BudgetedModel<'a> {
 
 #[async_trait::async_trait]
 impl Model for BudgetedModel<'_> {
+    async fn prepare_context<'a>(
+        &'a self,
+        request: &ModelRequest,
+    ) -> Result<Option<Arc<dyn Model + 'a>>> {
+        Ok(self.inner.prepare_context(request).await?.map(|inner| {
+            Arc::new(PreparedBudgetedModel {
+                parent: self,
+                inner,
+            }) as Arc<dyn Model + 'a>
+        }))
+    }
+
     fn context_identity(&self) -> Option<String> {
         self.inner.context_identity()
     }
@@ -112,6 +124,103 @@ impl Model for BudgetedModel<'_> {
             .record_usage_with_metadata(request_id, usage, metadata)
             .await?;
         self.recorded_usage
+            .lock()
+            .expect("usage lock poisoned")
+            .insert(request_id);
+        Ok(())
+    }
+}
+
+struct PreparedBudgetedModel<'a, 'b> {
+    parent: &'a BudgetedModel<'b>,
+    inner: Arc<dyn Model + 'a>,
+}
+
+#[async_trait::async_trait]
+impl Model for PreparedBudgetedModel<'_, '_> {
+    fn context_identity(&self) -> Option<String> {
+        self.inner.context_identity()
+    }
+    fn estimate_message_tokens(
+        &self,
+        request: &ModelRequest,
+        message: &pi_rs_core::Message,
+    ) -> u64 {
+        self.inner.estimate_message_tokens(request, message)
+    }
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        self.inner.estimate_request_tokens(request)
+    }
+    async fn context_window(&self, model: &str) -> Option<u32> {
+        self.inner.context_window(model).await
+    }
+    async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+        Err(Error::Config(
+            "AIP model requests require a durable request ID".into(),
+        ))
+    }
+    async fn stream_with_id(&self, request_id: Uuid, request: ModelRequest) -> Result<ModelStream> {
+        self.parent
+            .budget
+            .reserve(self.parent.scope, request_id, &request)
+            .await?;
+        self.inner.stream_with_id(request_id, request).await
+    }
+    async fn stream_in_session(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.parent
+            .budget
+            .reserve(self.parent.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_in_session(request_id, session_id, request)
+            .await
+    }
+    async fn stream_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.parent
+            .budget
+            .reserve(self.parent.scope, request_id, &request)
+            .await?;
+        self.inner
+            .stream_for_summary(request_id, session_id, request)
+            .await
+    }
+    async fn record_usage(&self, request_id: Uuid, usage: &UsageReport) -> Result<()> {
+        self.parent
+            .budget
+            .settle(self.parent.scope, request_id, usage)
+            .await
+    }
+    async fn record_usage_with_metadata(
+        &self,
+        request_id: Uuid,
+        usage: &UsageReport,
+        metadata: &ModelMetadata,
+    ) -> Result<()> {
+        self.record_usage(request_id, usage).await?;
+        if self
+            .parent
+            .recorded_usage
+            .lock()
+            .expect("usage lock poisoned")
+            .contains(&request_id)
+        {
+            return Ok(());
+        }
+        self.inner
+            .record_usage_with_metadata(request_id, usage, metadata)
+            .await?;
+        self.parent
+            .recorded_usage
             .lock()
             .expect("usage lock poisoned")
             .insert(request_id);

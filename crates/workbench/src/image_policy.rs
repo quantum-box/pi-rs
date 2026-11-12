@@ -21,10 +21,10 @@ pub(super) struct WorkbenchModel {
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
-    async fn prepare_context(
-        &self,
+    async fn prepare_context<'a>(
+        &'a self,
         request: &ModelRequest,
-    ) -> Result<Option<std::sync::Arc<dyn Model>>> {
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
         let Some((client, identity)) = self.client.prepare_for_context(&request.model).await?
         else {
             return Ok(None);
