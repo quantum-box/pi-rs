@@ -669,7 +669,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
         let live_controls = if args.stdin_control {
             std::env::var(super::process::LIVE_CONTROLS_ENV)
                 .ok()
-                .map(|value| serde_json::from_str::<(bool, bool)>(&value))
+                .map(|value| serde_json::from_str::<(Option<bool>, Option<bool>)>(&value))
                 .transpose()
                 .map_err(|error| {
                     pi_rs::Error::Config(format!("invalid worker live controls: {error}"))
@@ -678,15 +678,16 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             None
         };
         let mut retry_settings = args.settings.retry_settings();
-        if let Some((_, enabled)) = live_controls {
+        if let Some((_, Some(enabled))) = live_controls {
             retry_settings.enabled = enabled;
         }
         Ok(Runtime {
             retry: pi_rs::RetryControl::new(retry_settings),
-            auto_compaction: pi_rs::AutoCompactionControl::new(live_controls.map_or_else(
-                || args.settings.auto_compaction_enabled(),
-                |(enabled, _)| enabled,
-            )),
+            auto_compaction: pi_rs::AutoCompactionControl::new(
+                live_controls
+                    .and_then(|(enabled, _)| enabled)
+                    .unwrap_or_else(|| args.settings.auto_compaction_enabled()),
+            ),
             provider,
             registry,
             shell,

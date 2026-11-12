@@ -17,6 +17,9 @@ pub struct Settings {
     live_auto_compaction: Option<bool>,
 }
 impl Settings {
+    pub fn live_controls(&self) -> (Option<bool>, Option<bool>) {
+        (self.live_auto_compaction, self.live_auto_retry)
+    }
     pub fn set_user_values(&mut self, values: &[(String, Value)]) -> Result<()> {
         self.set_user_values_at(&agent_dir().join("settings.json"), values)
     }

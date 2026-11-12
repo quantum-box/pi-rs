@@ -55,10 +55,7 @@ impl Worker {
         command.env_remove(SESSION_TRANSITION_ENV);
         command.env(
             LIVE_CONTROLS_ENV,
-            serde_json::to_string(&(
-                args.settings.auto_compaction_enabled(),
-                args.settings.retry_settings().enabled,
-            ))?,
+            serde_json::to_string(&args.settings.live_controls())?,
         );
         if let Some(transition) = transition {
             command.env(SESSION_TRANSITION_ENV, serde_json::to_string(&transition)?);

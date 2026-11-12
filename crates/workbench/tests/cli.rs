@@ -1769,7 +1769,136 @@ fn rpc_live_toggles_override_project_settings_for_the_session() {
 }
 
 #[test]
+fn rpc_replacement_worker_reads_external_compaction_edit_with_retry_override() {
+    rpc_replacement_compaction_edit_case(true);
+}
+
+#[test]
+fn rpc_replacement_worker_reads_external_edit_without_live_overrides() {
+    rpc_replacement_compaction_edit_case(false);
+}
+
+fn rpc_replacement_compaction_edit_case(live_retry: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+    std::fs::write(
+        root.path().join(".pi/settings.json"),
+        r#"{"compaction":{"enabled":true},"retry":{"enabled":true}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        r#"{"providers":{"openai":{"models":[{"id":"second"}]}}}"#,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture",
+            "--no-session",
+            "--context-window",
+            "32",
+            "--max-output-tokens",
+            "128",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for command in [
+        if live_retry {
+            json!({"id":"startup","type":"set_auto_retry","enabled":false})
+        } else {
+            json!({"id":"startup","type":"get_commands"})
+        },
+        json!({"id":"switch","type":"set_model","provider":"openai","modelId":"second"}),
+    ] {
+        writeln!(input, "{command}").unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["id"] == command["id"] && event["type"] == "response" {
+                assert_eq!(event["success"], true, "{event}");
+                break;
+            }
+        }
+        if command["id"] == "startup" {
+            std::fs::write(
+                root.path().join(".pi/settings.json"),
+                r#"{"compaction":{"enabled":false},"retry":{"enabled":true}}"#,
+            )
+            .unwrap();
+        }
+    }
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"prompt","type":"prompt","message":"test"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut disabled = false;
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        disabled |= event
+            .to_string()
+            .contains("automatic compaction is disabled");
+        if event["type"] == "agent_settled"
+            || (event["id"] == "prompt" && event["success"] == false)
+        {
+            break;
+        }
+    }
+    assert!(
+        disabled,
+        "replacement worker ignored externally disabled compaction"
+    );
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn rpc_replacement_worker_keeps_retry_disabled() {
+    rpc_replacement_retry_case(true);
+}
+
+#[test]
+fn rpc_replacement_worker_reads_external_retry_edit_with_compaction_override() {
+    rpc_replacement_retry_case(false);
+}
+
+fn rpc_replacement_retry_case(live_retry: bool) {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -1854,7 +1983,11 @@ fn rpc_replacement_worker_keeps_retry_disabled() {
         }
     });
     for command in [
-        json!({"id":"retry","type":"set_auto_retry","enabled":false}),
+        if live_retry {
+            json!({"id":"retry","type":"set_auto_retry","enabled":false})
+        } else {
+            json!({"id":"compaction","type":"set_auto_compaction","enabled":false})
+        },
         json!({"id":"switch","type":"set_model","provider":"openai","modelId":"second"}),
     ] {
         writeln!(input, "{command}").unwrap();
@@ -1865,6 +1998,13 @@ fn rpc_replacement_worker_keeps_retry_disabled() {
                 assert_eq!(event["success"], true, "{event}");
                 break;
             }
+        }
+        if !live_retry && command["id"] == "compaction" {
+            std::fs::write(
+                root.path().join(".pi/settings.json"),
+                r#"{"retry":{"enabled":false,"maxRetries":1,"baseDelayMs":0}}"#,
+            )
+            .unwrap();
         }
     }
     writeln!(
