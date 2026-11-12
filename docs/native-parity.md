@@ -953,6 +953,11 @@ finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
 
+The interactive `/debug` command writes `pi-debug.log` in the agent directory,
+including styled transcript and widget lines, terminal dimensions, and the
+current Pi-format session messages. It is available while a response is
+streaming, and the slash-command completion includes it.
+
 A real PTY fixture covered both modes while a model response was outstanding,
 then exercised invalid input, correction, cancellation and preservation of an
 extension-owned setting. The existing native-dialog and resource fixtures also
