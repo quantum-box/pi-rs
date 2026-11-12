@@ -6,11 +6,12 @@ use aws_sdk_bedrockruntime::{
         ConverseStreamOutput,
     },
 };
-use aws_smithy_types::{Document, Number};
+use aws_smithy_types::{Blob, Document, Number};
 use aws_types::request_id::RequestId;
+use base64::Engine;
 use pi_rs_core::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, Result, ToolCall,
-    ToolCallDelta, Usage,
+    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
+    ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct Bedrock {
     client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
     unsupported: Option<String>,
+    bearer: Option<String>,
+    model_name: Option<(String, String)>,
 }
 impl Bedrock {
     /// Resolve the region and standard AWS credential chain lazily.
@@ -27,6 +30,8 @@ impl Bedrock {
         Self {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             unsupported: None,
+            bearer: None,
+            model_name: None,
         }
     }
     /// Use a caller-configured SDK client, including custom profile or endpoint settings.
@@ -34,7 +39,32 @@ impl Bedrock {
         Self {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
             unsupported: None,
+            bearer: None,
+            model_name: None,
         }
+    }
+    /// Prefer bearer authentication over the AWS credential chain.
+    pub fn with_bearer_token(mut self, token: String) -> Result<Self> {
+        if token.is_empty() || !token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            return Err(Error::Config("invalid Bedrock bearer token".into()));
+        }
+        if let Some(client) = self.client.get() {
+            let client = bearer_client(client.config().to_builder(), &token);
+            self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client)));
+        }
+        self.bearer = Some(token);
+        Ok(self)
+    }
+    /// Bind a configured model name to its ID for model-specific Converse behavior.
+    pub fn with_model_name(mut self, model: &str, name: Option<&str>) -> Self {
+        self.model_name = name.map(|name| (model.to_owned(), name.to_owned()));
+        self
+    }
+    fn is_claude(&self, model: &str) -> bool {
+        model.to_ascii_lowercase().contains("claude")
+            || self.model_name.as_ref().is_some_and(|(id, name)| {
+                id == model && name.to_ascii_lowercase().contains("claude")
+            })
     }
     /// Mark unsupported host settings so they fail explicitly when used.
     pub fn unsupported(mut self, reason: impl Into<String>) -> Self {
@@ -118,6 +148,145 @@ fn diagnostic(
     }
     parts.join(": ")
 }
+fn bearer_client(builder: aws_sdk_bedrockruntime::config::Builder, token: &str) -> Client {
+    let config = builder
+        .bearer_token(aws_sdk_bedrockruntime::config::Token::new(
+            token.to_owned(),
+            None,
+        ))
+        .auth_scheme_preference([
+            aws_smithy_runtime_api::client::auth::http::HTTP_BEARER_AUTH_SCHEME_ID,
+        ])
+        .build();
+    Client::from_conf(config)
+}
+fn image_block(image: pi_rs_core::ImageContent) -> Result<types::ImageBlock> {
+    image.validate()?;
+    let format = match image.mime_type.as_str() {
+        "image/png" => types::ImageFormat::Png,
+        "image/jpeg" => types::ImageFormat::Jpeg,
+        "image/gif" => types::ImageFormat::Gif,
+        "image/webp" => types::ImageFormat::Webp,
+        _ => return Err(Error::Config("unsupported Bedrock image format".into())),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image.data)
+        .map_err(build_error)?;
+    types::ImageBlock::builder()
+        .format(format)
+        .source(types::ImageSource::Bytes(Blob::new(bytes)))
+        .build()
+        .map_err(build_error)
+}
+#[derive(Default)]
+struct ReasoningBlock {
+    text: String,
+    signature: String,
+    redacted: Vec<u8>,
+}
+
+fn replay_blocks(
+    replay: &ProviderReplay,
+    model: &str,
+    is_claude: bool,
+    text: &str,
+    calls: &[ToolCall],
+    ids: &mut ToolIds,
+) -> Option<Vec<ContentBlock>> {
+    if replay.identity.provider != "amazon-bedrock" || replay.identity.model != model {
+        return None;
+    }
+    let rendered: String = replay
+        .blocks
+        .iter()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    if rendered != text {
+        return None;
+    }
+    let replay_calls: Vec<_> = replay
+        .blocks
+        .iter()
+        .filter(|b| b["type"] == "tool_use")
+        .collect();
+    if replay_calls.len() != calls.len()
+        || replay_calls.iter().zip(calls).any(|(b, c)| {
+            b["id"] != c.id
+                || b["name"] != c.name
+                || b.get("raw_arguments")
+                    .and_then(Value::as_str)
+                    .is_some_and(|raw| !matches_journal_arguments(raw, &c.arguments))
+                || history_tool_input(&c.arguments) != b["input"]
+        })
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    for b in &replay.blocks {
+        match b["type"].as_str()? {
+            "text" => out.push(ContentBlock::Text(b["text"].as_str()?.to_owned())),
+            "tool_use" => out.push(ContentBlock::ToolUse(
+                types::ToolUseBlock::builder()
+                    .tool_use_id(ids.get(b["id"].as_str()?))
+                    .name(b["name"].as_str()?)
+                    .input(doc(b["input"].clone()))
+                    .build()
+                    .ok()?,
+            )),
+            "reasoning" => {
+                let reasoning = if let Some(encoded) = b["redacted"].as_str() {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()?;
+                    if bytes.is_empty() {
+                        return None;
+                    }
+                    types::ReasoningContentBlock::RedactedContent(Blob::new(bytes))
+                } else {
+                    let text = b["text"].as_str()?;
+                    let signature = b["signature"].as_str().filter(|s| !s.is_empty());
+                    if text.is_empty() {
+                        return None;
+                    }
+                    if is_claude && signature.is_none() {
+                        out.push(ContentBlock::Text(text.to_owned()));
+                        continue;
+                    }
+                    let sig = if is_claude {
+                        signature.map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    types::ReasoningContentBlock::ReasoningText(
+                        types::ReasoningTextBlock::builder()
+                            .text(text)
+                            .set_signature(sig)
+                            .build()
+                            .ok()?,
+                    )
+                };
+                out.push(ContentBlock::ReasoningContent(reasoning));
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+fn matches_journal_arguments(raw: &str, current: &str) -> bool {
+    if raw == current {
+        return true;
+    }
+    if serde_json::from_str::<Value>(raw).is_ok_and(|value| value.is_object()) {
+        return false;
+    }
+    let projected = pi_rs_core::parse_tool_arguments(raw)
+        .map_or_else(|_| "{}".to_owned(), |value| value.to_string());
+    current == projected
+}
+fn history_tool_input(raw: &str) -> Value {
+    pi_rs_core::parse_tool_arguments(raw).unwrap_or_else(|_| serde_json::json!({}))
+}
 fn doc(v: Value) -> Document {
     match v {
         Value::Null => Document::Null,
@@ -178,10 +347,17 @@ impl Model for Bedrock {
             return Err(Error::Config("Bedrock requires a positive max output token limit and does not support managed prompt ARNs".into()));
         }
         let tool_free = request.tools.is_empty();
+        let is_claude = self.is_claude(&request.model);
         let mut ids = ToolIds::default();
         let mut system = Vec::new();
         let mut messages: Vec<types::Message> = Vec::new();
+        let mut pending_error_images = Vec::new();
         for message in request.messages {
+            if !matches!(&message, Message::Tool { .. })
+                && let Some(last) = messages.last_mut()
+            {
+                last.content.append(&mut pending_error_images);
+            }
             let (role, blocks) = match message {
                 Message::System { content } => {
                     if !content.trim().is_empty() {
@@ -193,67 +369,116 @@ impl Model for Bedrock {
                     ConversationRole::User,
                     vec![ContentBlock::Text(required_text(content))],
                 ),
-                Message::UserWithImages { .. } => {
-                    return Err(Error::Config(
-                        "Bedrock image input is not supported yet".into(),
-                    ));
-                }
-                Message::Assistant { content, calls, .. } => {
+                Message::UserWithImages { content, images } => {
                     let mut blocks = Vec::new();
                     if !content.trim().is_empty() {
                         blocks.push(ContentBlock::Text(content));
                     }
-                    for call in calls {
-                        if tool_free {
-                            blocks.push(ContentBlock::Text(format!(
-                                "Historical tool call ({}; {}):\n{}",
-                                call.id, call.name, call.arguments
-                            )));
-                            continue;
-                        }
-                        let input = pi_rs_core::parse_tool_arguments(&call.arguments)
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        blocks.push(ContentBlock::ToolUse(
-                            types::ToolUseBlock::builder()
-                                .tool_use_id(ids.get(&call.id))
-                                .name(call.name)
-                                .input(doc(input))
-                                .build()
-                                .map_err(build_error)?,
-                        ));
+                    for image in images {
+                        blocks.push(ContentBlock::Image(image_block(image)?));
                     }
-                    (ConversationRole::Assistant, blocks)
+                    if blocks.is_empty() {
+                        blocks.push(ContentBlock::Text("<empty>".into()));
+                    }
+                    (ConversationRole::User, blocks)
+                }
+                Message::Assistant {
+                    content,
+                    calls,
+                    replay,
+                } => {
+                    if let Some(blocks) = replay
+                        .as_deref()
+                        .filter(|_| !tool_free || calls.is_empty())
+                        .and_then(|r| {
+                            replay_blocks(r, &request.model, is_claude, &content, &calls, &mut ids)
+                        })
+                    {
+                        (ConversationRole::Assistant, blocks)
+                    } else {
+                        let mut blocks = Vec::new();
+                        if !content.trim().is_empty() {
+                            blocks.push(ContentBlock::Text(content));
+                        }
+                        for call in calls {
+                            if tool_free {
+                                blocks.push(ContentBlock::Text(format!(
+                                    "Historical tool call ({}; {}):\n{}",
+                                    call.id, call.name, call.arguments
+                                )));
+                                continue;
+                            }
+                            let input = history_tool_input(&call.arguments);
+                            blocks.push(ContentBlock::ToolUse(
+                                types::ToolUseBlock::builder()
+                                    .tool_use_id(ids.get(&call.id))
+                                    .name(call.name)
+                                    .input(doc(input))
+                                    .build()
+                                    .map_err(build_error)?,
+                            ));
+                        }
+                        (ConversationRole::Assistant, blocks)
+                    }
                 }
                 Message::Tool {
                     call_id,
                     content,
                     is_error,
-                    ..
+                    is_structured,
                 } => {
-                    let block = if tool_free {
-                        ContentBlock::Text(format!(
+                    if tool_free {
+                        let (content, images) =
+                            if pi_rs_core::tool_content_is_structured(&content, is_structured) {
+                                pi_rs_core::extract_tool_images(content)
+                            } else {
+                                (content, Vec::new())
+                            };
+                        let mut blocks = vec![ContentBlock::Text(format!(
                             "Historical tool result ({}; {}):\n{}",
                             call_id,
                             if is_error { "error" } else { "success" },
                             content
-                        ))
+                        ))];
+                        for image in images {
+                            blocks.push(ContentBlock::Image(image_block(image)?));
+                        }
+                        (ConversationRole::User, blocks)
                     } else {
-                        ContentBlock::ToolResult(
-                            types::ToolResultBlock::builder()
-                                .tool_use_id(ids.get(&call_id))
-                                .content(types::ToolResultContentBlock::Text(required_text(
-                                    content,
-                                )))
-                                .status(if is_error {
-                                    types::ToolResultStatus::Error
-                                } else {
-                                    types::ToolResultStatus::Success
-                                })
-                                .build()
-                                .map_err(build_error)?,
-                        )
-                    };
-                    (ConversationRole::User, vec![block])
+                        let (content, images) =
+                            if pi_rs_core::tool_content_is_structured(&content, is_structured) {
+                                pi_rs_core::extract_tool_images(content)
+                            } else {
+                                (content, Vec::new())
+                            };
+                        let mut tool = types::ToolResultBlock::builder()
+                            .tool_use_id(ids.get(&call_id))
+                            .content(types::ToolResultContentBlock::Text(required_text(content)))
+                            .status(if is_error {
+                                types::ToolResultStatus::Error
+                            } else {
+                                types::ToolResultStatus::Success
+                            });
+                        let mut trailing = Vec::new();
+                        let claude_error = is_error && is_claude;
+                        for image in images {
+                            let image = image_block(image)?;
+                            if claude_error {
+                                trailing.push(ContentBlock::Image(image));
+                            } else {
+                                tool = tool.content(types::ToolResultContentBlock::Image(image));
+                            }
+                        }
+                        let blocks =
+                            vec![ContentBlock::ToolResult(tool.build().map_err(build_error)?)];
+                        if !trailing.is_empty() {
+                            pending_error_images.push(ContentBlock::Text(
+                                "Images from the tool error result:".into(),
+                            ));
+                            pending_error_images.extend(trailing);
+                        }
+                        (ConversationRole::User, blocks)
+                    }
                 }
             };
             if blocks.is_empty() {
@@ -273,6 +498,9 @@ impl Model for Bedrock {
                     .map_err(build_error)?,
             );
         }
+        if let Some(last) = messages.last_mut() {
+            last.content.append(&mut pending_error_images);
+        }
         let tools: Vec<_> = request
             .tools
             .into_iter()
@@ -290,12 +518,24 @@ impl Model for Bedrock {
         let client = self
             .client
             .get_or_init(|| async {
-                Client::new(&aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await)
+                {
+                    let config =
+                        aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                    if let Some(token) = &self.bearer {
+                        bearer_client(
+                            aws_sdk_bedrockruntime::config::Builder::from(&config),
+                            token,
+                        )
+                    } else {
+                        Client::new(&config)
+                    }
+                }
             })
             .await;
         if client.config().region().is_none() {
             return Err(Error::Config("Bedrock requires an AWS region; set AWS_REGION or configure a region in the selected AWS profile".into()));
         }
+        let requested_model = request.model.clone();
         let mut command = client
             .converse_stream()
             .model_id(request.model)
@@ -320,6 +560,9 @@ impl Model for Bedrock {
             let mut calls: BTreeMap<i32, ToolCall> = BTreeMap::new();
             let mut usage=None; let mut stop=None; let mut cache_read=None; let mut cache_write=None; let mut received=0usize;
             let mut open_tools = std::collections::BTreeSet::new();
+            let mut text_blocks: BTreeMap<i32, String> = BTreeMap::new();
+            let mut reasoning: BTreeMap<i32, ReasoningBlock> = BTreeMap::new();
+            let mut stopped_blocks = BTreeSet::new();
             while let Some(event)=response.stream.recv().await.map_err(|e| {
                 if let Some(service) = e.as_service_error() {
                     let mut message=diagnostic(service.meta(), request_id.as_deref());
@@ -333,13 +576,25 @@ impl Model for Bedrock {
                 match event {
                     ConverseStreamOutput::ContentBlockStart(event) => if let Some(ContentBlockStart::ToolUse(tool))=event.start {
                         let index=event.content_block_index;
-                        if index < 0 || calls.contains_key(&index) { Err(Error::Model("invalid Bedrock tool index".into()))?; }
+                        if index < 0 || calls.contains_key(&index) || text_blocks.contains_key(&index) || reasoning.contains_key(&index) || stopped_blocks.contains(&index) { Err(Error::Model("invalid Bedrock tool index".into()))?; }
                         open_tools.insert(index);
                         let call=ToolCall {id:tool.tool_use_id().into(), name:tool.name().into(), arguments:String::new()};
                         yield ModelEvent::ToolCallDelta(ToolCallDelta {index:index as u64,id:call.id.clone(),name:call.name.clone(),arguments:String::new()}); calls.insert(index,call);
                     },
                     ConverseStreamOutput::ContentBlockDelta(event) => match event.delta {
-                        Some(ContentBlockDelta::Text(text)) => { received=received.saturating_add(text.len()); if received > 4 * 1024 * 1024 { Err(Error::Model("Bedrock stream exceeds size limit".into()))?; } yield ModelEvent::Text(text); },
+                        Some(ContentBlockDelta::Text(text)) => { let index=event.content_block_index; if index < 0 || stopped_blocks.contains(&index) || reasoning.contains_key(&index) || calls.contains_key(&index) { Err(Error::Model("invalid Bedrock text block".into()))?; } received=received.saturating_add(text.len()); if received > 4 * 1024 * 1024 { Err(Error::Model("Bedrock stream exceeds size limit".into()))?; } text_blocks.entry(index).or_default().push_str(&text); yield ModelEvent::Text(text); },
+                        Some(ContentBlockDelta::ReasoningContent(delta)) => {
+                            let index=event.content_block_index;
+                            if index < 0 || stopped_blocks.contains(&index) || text_blocks.contains_key(&index) || calls.contains_key(&index) { Err(Error::Model("invalid Bedrock reasoning block".into()))?; }
+                            let block=reasoning.entry(index).or_default();
+                            match delta {
+                                types::ReasoningContentBlockDelta::Text(text) => { if !block.redacted.is_empty() { Err(Error::Model("mixed Bedrock reasoning block".into()))?; } received=received.saturating_add(text.len()); block.text.push_str(&text); yield ModelEvent::Reasoning(text); },
+                                types::ReasoningContentBlockDelta::Signature(signature) => { if !block.redacted.is_empty() { Err(Error::Model("mixed Bedrock reasoning block".into()))?; } received=received.saturating_add(signature.len()); block.signature.push_str(&signature); },
+                                types::ReasoningContentBlockDelta::RedactedContent(blob) => { if !block.text.is_empty() || !block.signature.is_empty() { Err(Error::Model("mixed Bedrock reasoning block".into()))?; } received=received.saturating_add(blob.as_ref().len()); block.redacted.extend_from_slice(blob.as_ref()); },
+                                _ => Err(Error::Model("unsupported Bedrock reasoning delta".into()))?,
+                            }
+                            if received > 4 * 1024 * 1024 { Err(Error::Model("Bedrock stream exceeds size limit".into()))?; }
+                        },
                         Some(ContentBlockDelta::ToolUse(delta)) => { let index=event.content_block_index; if !open_tools.contains(&index) { Err(Error::Model("Bedrock tool delta without open block".into()))?; } received=received.saturating_add(delta.input().len()); if received > 4 * 1024 * 1024 { Err(Error::Model("Bedrock stream exceeds size limit".into()))?; } let call=calls.get_mut(&index).ok_or_else(|| Error::Model("Bedrock tool delta without start".into()))?; call.arguments.push_str(delta.input()); yield ModelEvent::ToolCallDelta(ToolCallDelta {index:index as u64,id:String::new(),name:String::new(),arguments:delta.input().into()}); },
                         _ => Err(Error::Model("unsupported Bedrock content delta".into()))?,
                     },
@@ -348,15 +603,25 @@ impl Model for Bedrock {
                         cache_read=u.cache_read_input_tokens().map(|n| n.max(0) as u64); cache_write=u.cache_write_input_tokens().map(|n| n.max(0) as u64);
                         usage=Some(Usage {input_tokens:(u.input_tokens().max(0) as u64).saturating_add(cache_read.unwrap_or(0)).saturating_add(cache_write.unwrap_or(0)),output_tokens:u.output_tokens().max(0) as u64});
                     },
-                    ConverseStreamOutput::ContentBlockStop(event) => { open_tools.remove(&event.content_block_index); },
+                    ConverseStreamOutput::ContentBlockStop(event) => { open_tools.remove(&event.content_block_index); stopped_blocks.insert(event.content_block_index); },
                     ConverseStreamOutput::MessageStart(_) => {},
                     _ => Err(Error::Model("unsupported Bedrock stream event".into()))?,
                 }
             }
             let reason=stop.ok_or_else(|| Error::RetryableModel("Bedrock stream ended before messageStop".into()))?;
             if !open_tools.is_empty() || (!calls.is_empty() && reason != "tool_use") || (calls.is_empty() && reason == "tool_use") { Err(Error::Model("incomplete Bedrock tool response".into()))?; }
+            if reasoning.keys().any(|i| !stopped_blocks.contains(i)) { Err(Error::Model("incomplete Bedrock reasoning block".into()))?; }
+            let reasoning_text: String = reasoning.values().map(|b| b.text.as_str()).collect();
+            let mut ordered = BTreeMap::new();
+            for (i,text) in text_blocks { ordered.insert(i, serde_json::json!({"type":"text", "text":text})); }
+            for (i,call) in &calls { let input=history_tool_input(&call.arguments); ordered.insert(*i, serde_json::json!({"type":"tool_use", "id":call.id,"name":call.name,"input":input,"raw_arguments":call.arguments})); }
+            for (i,block) in &reasoning {
+                let value=if block.redacted.is_empty() { serde_json::json!({"type":"reasoning", "text":block.text, "signature":block.signature}) } else { serde_json::json!({"type":"reasoning", "redacted":base64::engine::general_purpose::STANDARD.encode(&block.redacted)}) };
+                ordered.insert(*i,value);
+            }
+            let replay=(!reasoning.is_empty() && reason != "max_tokens" && reason != "model_context_window_exceeded").then(|| Box::new(ProviderReplay { identity:ResolvedModelIdentity {provider:"amazon-bedrock".into(),model:requested_model},blocks:ordered.into_values().collect() }));
             let finish_reason = match reason.as_str() { "end_turn" | "stop_sequence" => "stop", "tool_use" => "tool_calls", "max_tokens" | "model_context_window_exceeded" => "length", _ => unreachable!() };
-            yield ModelEvent::Metadata(ModelMetadata {finish_reason:Some(finish_reason.into()), cached_input_tokens:cache_read, cache_creation_input_tokens:cache_write, provider_api:Some(pi_rs_core::ModelApi::BedrockConverseStream), ..Default::default()});
+            yield ModelEvent::Metadata(ModelMetadata {finish_reason:Some(finish_reason.into()), cached_input_tokens:cache_read, cache_creation_input_tokens:cache_write, provider_api:Some(pi_rs_core::ModelApi::BedrockConverseStream), reasoning:(!reasoning_text.is_empty()).then_some(reasoning_text), replay, ..Default::default()});
             yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
         }))
     }
@@ -365,6 +630,179 @@ impl Model for Bedrock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replay_requires_unchanged_model_text_and_tool_calls() {
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "amazon-bedrock".into(),
+                model: "anthropic.claude-test".into(),
+            },
+            blocks: vec![
+                serde_json::json!({"type":"reasoning","text":"thought","signature":"sig"}),
+                serde_json::json!({"type":"text","text":"answer"}),
+                serde_json::json!({"type":"tool_use","id":"id!","name":"lookup","input":{"x":1}}),
+            ],
+        };
+        let call = ToolCall {
+            id: "id!".into(),
+            name: "lookup".into(),
+            arguments: "{\"x\":1}".into(),
+        };
+        assert!(
+            replay_blocks(
+                &replay,
+                "anthropic.claude-test",
+                true,
+                "answer",
+                std::slice::from_ref(&call),
+                &mut ToolIds::default()
+            )
+            .is_some()
+        );
+        assert!(
+            replay_blocks(
+                &replay,
+                "other-model",
+                false,
+                "answer",
+                std::slice::from_ref(&call),
+                &mut ToolIds::default()
+            )
+            .is_none()
+        );
+        assert!(
+            replay_blocks(
+                &replay,
+                "anthropic.claude-test",
+                true,
+                "edited",
+                std::slice::from_ref(&call),
+                &mut ToolIds::default()
+            )
+            .is_none()
+        );
+        let changed = ToolCall {
+            arguments: "{\"x\":2}".into(),
+            ..call
+        };
+        assert!(
+            replay_blocks(
+                &replay,
+                "anthropic.claude-test",
+                true,
+                "answer",
+                &[changed],
+                &mut ToolIds::default()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_replayed_arguments_must_remain_unchanged() {
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "amazon-bedrock".into(),
+                model: "model".into(),
+            },
+            blocks: vec![
+                serde_json::json!({"type":"tool_use","id":"id","name":"tool","input":{},"raw_arguments":"{bad"}),
+            ],
+        };
+        let call = ToolCall {
+            id: "id".into(),
+            name: "tool".into(),
+            arguments: "{bad".into(),
+        };
+        assert!(
+            replay_blocks(
+                &replay,
+                "model",
+                false,
+                "",
+                std::slice::from_ref(&call),
+                &mut ToolIds::default()
+            )
+            .is_some()
+        );
+        let changed = ToolCall {
+            arguments: "{different".into(),
+            ..call
+        };
+        assert!(
+            replay_blocks(
+                &replay,
+                "model",
+                false,
+                "",
+                &[changed],
+                &mut ToolIds::default()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn journal_projection_preserves_reasoning_and_detects_changed_arguments() {
+        for raw in ["", "{broken", "[1]", r#"{"path":"C:\work"}"#] {
+            let input = history_tool_input(raw);
+            let replay = ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "amazon-bedrock".into(),
+                    model: "model".into(),
+                },
+                blocks: vec![
+                    serde_json::json!({"type":"reasoning","text":"think","signature":"sig"}),
+                    serde_json::json!({"type":"tool_use","id":"id","name":"tool","input":input,"raw_arguments":raw}),
+                ],
+            };
+            let normalized = pi_rs_core::parse_tool_arguments(raw)
+                .map_or_else(|_| "{}".to_owned(), |value| value.to_string());
+            let call = ToolCall {
+                id: "id".into(),
+                name: "tool".into(),
+                arguments: normalized,
+            };
+            let blocks = replay_blocks(
+                &replay,
+                "model",
+                true,
+                "",
+                std::slice::from_ref(&call),
+                &mut ToolIds::default(),
+            )
+            .expect("journal-normalized arguments should replay");
+            assert!(
+                matches!(&blocks[0], ContentBlock::ReasoningContent(types::ReasoningContentBlock::ReasoningText(text)) if text.signature()==Some("sig"))
+            );
+            let edited = ToolCall {
+                arguments: "{\"edited\":true}".into(),
+                ..call
+            };
+            assert!(
+                replay_blocks(
+                    &replay,
+                    "model",
+                    true,
+                    "",
+                    &[edited],
+                    &mut ToolIds::default()
+                )
+                .is_none()
+            );
+        }
+        assert!(!matches_journal_arguments("{broken", "{different"));
+        assert!(!matches_journal_arguments("{\"x\":1}", "{\"x\": 1}"));
+    }
+
+    #[test]
+    fn configured_model_name_is_scoped_to_its_id() {
+        let model = Bedrock::from_env().with_model_name("opaque-profile", Some("Claude Sonnet"));
+        assert!(model.is_claude("opaque-profile"));
+        assert!(!model.is_claude("another-profile"));
+        assert!(model.is_claude("anthropic.claude-sonnet"));
+    }
+
     #[test]
     fn dispatch_retry_classification_respects_smithy_transient_kind() {
         use aws_sdk_bedrockruntime::error::{ConnectorError, SdkError};

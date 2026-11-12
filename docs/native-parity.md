@@ -3341,22 +3341,32 @@ to the session import limitations above.
 ### Amazon Bedrock ConverseStream
 
 The `amazon-bedrock` provider uses the AWS SDK's standard region and credential
-chain, including `AWS_PROFILE` and shared AWS configuration, temporary role
-credentials, and credential refresh. Select a model ID explicitly, for example
-`--provider amazon-bedrock --model <bedrock-model-id>`; the provider does not
-list Bedrock models. The optional library feature is `bedrock`.
+chain, including `AWS_PROFILE`, shared AWS configuration, temporary role
+credentials, and credential refresh. It also accepts `AWS_BEARER_TOKEN_BEDROCK`
+or a configured API key as a Bedrock bearer token. The optional library feature
+is `bedrock`.
 
-Text messages, tool definitions and results, streamed text and tool calls,
-stop reasons, and input/output/cache usage are supported. The adapter uses
-ConverseStream and sends an explicit output token limit. Streaming failures and
-incomplete tool calls do not produce a completed tool invocation. The SDK
-selects the regional endpoint and signs requests; no AWS resources are created.
+The bundled Pi 1.5.0 chat model catalog provides offline model selection and
+metadata, including pricing. It is a static snapshot, not an account-specific
+list of enabled models. The runtime uses the configured AWS region rather than
+pinning the catalog's default endpoint.
 
-Not yet supported: Bedrock bearer tokens, Pi's login/profile storage, image or
-other multimodal content, reasoning configuration and signed reasoning replay,
-prompt cache checkpoints, tool choice/strict sampling, guardrails, prompt
-management ARNs, model discovery and pricing, custom request headers, and
-workbench proxy/idle-timeout settings. Explicit API keys and custom endpoints
-in model configuration are rejected; configure the SDK credential chain and
-region instead. A caller embedding the adapter may pass a configured AWS SDK
+Text, user images, structured tool-result images, tool calls and results,
+streamed reasoning, stop reasons, and input/output/cache usage are supported.
+Signed and redacted reasoning is replayed in its original order only when the
+provider, model, text and tool calls still match, including the journal's
+normalization of malformed arguments. For application inference profile ARNs
+without a model family in the ID, set the model `name` in `models.json` (for
+example, `Claude Sonnet`) to enable Claude-specific signature and error-image
+handling. Images from Claude error results follow the grouped tool results.
+Tool-free summary requests retain tool history as text and pass structured
+images as image blocks. The SDK chooses the endpoint and signs requests or uses the
+bearer token. No AWS resources are created.
+
+Not yet supported: Pi's interactive AWS profile login/storage, non-image
+multimodal inputs, reasoning configuration controls, prompt cache checkpoints,
+tool choice/strict sampling, guardrails, prompt management ARNs, live
+account-specific model discovery, custom request headers, and workbench
+proxy/idle-timeout settings. Custom model endpoints in workbench configuration
+are rejected; callers embedding the adapter can pass a configured AWS SDK
 client, including a test endpoint, through `Bedrock::new`.
