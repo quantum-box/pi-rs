@@ -73,6 +73,22 @@ fn saved_session(id: &str) -> Result<Option<pi_rs::openai::oauth::Credential>> {
         })
         .transpose()
 }
+fn clear_session(id: &str) -> Result<()> {
+    super::config::update_object(&sessions_path(), |sessions| {
+        sessions.remove(id);
+        Ok(())
+    })?;
+    super::config::update_object(&auth_path(), |data| {
+        if data
+            .get(PROVIDER)
+            .and_then(|entry| entry["credential"]["client_id"].as_str())
+            == Some(id)
+        {
+            data.remove(PROVIDER);
+        }
+        Ok(())
+    })
+}
 fn load() -> Result<Option<pi_rs::openai::oauth::Credential>> {
     let value = super::config::read_object(&auth_path())?;
     value
@@ -190,29 +206,38 @@ pub(super) async fn login(
             .and_then(|id| store.accounts.iter().find(|saved| saved.client_id == id))
             .cloned()
     };
+    let mut needs_consent = false;
     if let Some(account) = registered.as_ref()
-        && let Some(mut credential) = saved_session(&account.client_id)?
+        && let Some(credential) = saved_session(&account.client_id)?
     {
         if credential.subject != account.subject || credential.client_id != account.client_id {
             return Err(Error::Config("ChatGPT account identity mismatch".into()));
         }
-        if !credential
-            .scopes
-            .iter()
-            .any(|scope| scope == "chatgpt.tokens.use.direct")
-        {
-            return Err(Error::Config(
-                "ChatGPT plan permission is not granted".into(),
-            ));
+        if !credential.has_plan_access() {
+            needs_consent = true;
+        } else {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| Error::Config("invalid system clock".into()))?
+                .as_secs();
+            if credential.expires_at <= now.saturating_add(180) {
+                match credential.refresh(&client(settings)?).await {
+                    Ok(refreshed) => {
+                        save(&refreshed)?;
+                        if refreshed.has_plan_access() {
+                            return Ok(());
+                        }
+                        needs_consent = true;
+                    }
+                    Err(Error::AuthorizationRequired { .. }) => {
+                        clear_session(&account.client_id)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                return save(&credential);
+            }
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| Error::Config("invalid system clock".into()))?
-            .as_secs();
-        if credential.expires_at <= now.saturating_add(180) {
-            credential = credential.refresh(&client(settings)?).await?;
-        }
-        return save(&credential);
     }
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let callback = Url::parse(&format!(
@@ -225,6 +250,11 @@ pub(super) async fn login(
         host_id()?,
         registered.as_ref().map(|account| account.client_id.clone()),
     )?;
+    let auth = if needs_consent {
+        auth.request_consent()
+    } else {
+        auth
+    };
     let url = auth.url();
     announce(&url);
     let _ = pi_rs_workbench::oauth_callback::open_browser(url.as_str()).await;
@@ -245,11 +275,19 @@ pub(super) async fn login(
                 "ChatGPT account changed during sign-in".into(),
             ));
         }
-        save(&credential)
+        let allowed = credential.has_plan_access();
+        save(&credential)?;
+        Ok(allowed)
     }
     .await;
     redirect.reply(result.is_ok()).await;
-    result
+    if result? {
+        Ok(())
+    } else {
+        Err(Error::Config(
+            "ChatGPT sign-in succeeded, but plan usage permission was not granted".into(),
+        ))
+    }
 }
 
 pub(super) async fn access(settings: &super::config::Settings) -> Result<String> {
@@ -262,11 +300,7 @@ pub(super) async fn access(settings: &super::config::Settings) -> Result<String>
     {
         credential = saved;
     }
-    if !credential
-        .scopes
-        .iter()
-        .any(|scope| scope == "chatgpt.tokens.use.direct")
-    {
+    if !credential.has_plan_access() {
         return Err(Error::Config(
             "ChatGPT plan permission is not granted".into(),
         ));
@@ -277,8 +311,20 @@ pub(super) async fn access(settings: &super::config::Settings) -> Result<String>
         .as_secs();
     if credential.expires_at <= now.saturating_add(180) {
         let client = client(settings)?;
-        credential = credential.refresh(&client).await?;
+        credential = match credential.refresh(&client).await {
+            Ok(refreshed) => refreshed,
+            Err(error @ Error::AuthorizationRequired { .. }) => {
+                clear_session(&credential.client_id)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         save(&credential)?;
+    }
+    if !credential.has_plan_access() {
+        return Err(Error::Config(
+            "ChatGPT plan permission is not granted".into(),
+        ));
     }
     Ok(credential.access_token)
 }
@@ -292,14 +338,7 @@ pub(super) async fn logout(settings: &super::config::Settings) -> Result<bool> {
         Ok(client) => credential.revoke(&client).await,
         Err(error) => Err(error),
     };
-    super::config::update_object(&auth_path(), |data| {
-        data.remove(PROVIDER);
-        Ok(())
-    })?;
-    super::config::update_object(&sessions_path(), |sessions| {
-        sessions.remove(&credential.client_id);
-        Ok(())
-    })?;
+    clear_session(&credential.client_id)?;
     revoked.map(|()| true).map_err(|_| {
         Error::Config(
             "ChatGPT local credentials removed; remote revocation was not confirmed".into(),

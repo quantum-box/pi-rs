@@ -31,6 +31,7 @@ pub struct Authorization {
     verifier: String,
     client_id: Option<String>,
     host_id: String,
+    consent: bool,
 }
 
 /// Tokens for one issued dynamic registration. Never log or expose this value.
@@ -47,6 +48,9 @@ pub struct Credential {
 }
 
 impl Credential {
+    pub fn has_plan_access(&self) -> bool {
+        self.scopes.iter().any(|scope| scope == PLAN_SCOPE)
+    }
     pub async fn revoke(&self, client: &Client) -> Result<()> {
         let response = client
             .post("https://auth.openai.com/api/accounts/oauth/revoke")
@@ -85,9 +89,7 @@ impl Credential {
             .send()
             .await
             .map_err(|_| failed("token refresh failed"))?;
-        if !response.status().is_success() {
-            return Err(failed("token refresh was rejected"));
-        }
+        let status = response.status();
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -98,6 +100,9 @@ impl Credential {
                 return Err(failed("token response too large"));
             }
             bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(refresh_error(status, &bytes));
         }
         let refreshed: Refreshed =
             serde_json::from_slice(&bytes).map_err(|_| failed("invalid token response"))?;
@@ -113,9 +118,6 @@ impl Credential {
             .as_deref()
             .map(|scope| scope.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_else(|| self.scopes.clone());
-        if !scopes.iter().any(|scope| scope == PLAN_SCOPE) {
-            return Err(failed("ChatGPT plan permission was not granted"));
-        }
         let expires_at = now()?
             .checked_add(refreshed.expires_in)
             .ok_or_else(|| failed("invalid token expiry"))?;
@@ -129,7 +131,38 @@ impl Credential {
     }
 }
 
+fn refresh_error(status: reqwest::StatusCode, body: &[u8]) -> Error {
+    let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let code = value["error"]
+        .as_str()
+        .or_else(|| value["error"]["code"].as_str());
+    if matches!(
+        code,
+        Some(
+            "invalid_grant"
+                | "invalid_refresh_token"
+                | "token_expired"
+                | "refresh_token_expired"
+                | "refresh_token_invalidated"
+                | "refresh_token_reused"
+        )
+    ) {
+        Error::AuthorizationRequired {
+            message: "ChatGPT session expired; sign in again".into(),
+            challenge: None,
+        }
+    } else if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        Error::RetryableModel("ChatGPT token refresh is temporarily unavailable".into())
+    } else {
+        failed("token refresh was rejected")
+    }
+}
+
 impl Authorization {
+    pub fn request_consent(mut self) -> Self {
+        self.consent = true;
+        self
+    }
     pub fn state(&self) -> &str {
         &self.state
     }
@@ -167,6 +200,7 @@ impl Authorization {
             verifier: random(),
             client_id,
             host_id,
+            consent: false,
         })
     }
 
@@ -179,6 +213,9 @@ impl Authorization {
         );
         if self.client_id.is_none() {
             query.append_pair("agent_name_hint", "pi-rs");
+        }
+        if self.consent {
+            query.append_pair("prompt", "consent");
         }
         query
             .append_pair("ext_agent_host_id", &self.host_id)
@@ -286,9 +323,6 @@ impl TokenResponse {
             return Err(failed("invalid token response"));
         }
         let scopes: Vec<String> = self.scope.split_whitespace().map(str::to_owned).collect();
-        if !scopes.iter().any(|scope| scope == PLAN_SCOPE) {
-            return Err(failed("ChatGPT plan permission was not granted"));
-        }
         let expires_at = now()?
             .checked_add(self.expires_in)
             .ok_or_else(|| failed("invalid token expiry"))?;
@@ -488,6 +522,7 @@ mod tests {
         assert_eq!(query["resource"], RESOURCE);
         assert_eq!(query["code_challenge_method"], "S256");
         assert!(!url.as_str().contains(&auth.verifier));
+        assert!(url.query_pairs().all(|(key, _)| key != "prompt"));
         let redirect = auth
             .callback
             .join(&format!(
@@ -518,6 +553,12 @@ mod tests {
                 .is_err()
             );
         }
+        let consent = auth.request_consent().url();
+        assert!(
+            consent
+                .query_pairs()
+                .any(|(key, value)| key == "prompt" && value == "consent")
+        );
     }
 
     #[test]
@@ -584,12 +625,40 @@ mod tests {
             email: None,
         };
         assert!(
-            token()
+            !token()
                 .into_credential("client".into(), identity())
-                .is_err()
+                .unwrap()
+                .has_plan_access()
         );
         let mut granted = token();
         granted.scope.push_str(" chatgpt.tokens.use.direct");
-        assert!(granted.into_credential("client".into(), identity()).is_ok());
+        assert!(
+            granted
+                .into_credential("client".into(), identity())
+                .unwrap()
+                .has_plan_access()
+        );
+    }
+
+    #[test]
+    fn refresh_errors_distinguish_revocation_from_temporary_failure() {
+        assert!(matches!(
+            refresh_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                br#"{"error":"invalid_grant"}"#
+            ),
+            Error::AuthorizationRequired { .. }
+        ));
+        assert!(matches!(
+            refresh_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, br#"{}"#),
+            Error::RetryableModel(_)
+        ));
+        assert!(matches!(
+            refresh_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                br#"{"error":"invalid_client"}"#
+            ),
+            Error::Config(_)
+        ));
     }
 }
