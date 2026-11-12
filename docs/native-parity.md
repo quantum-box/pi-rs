@@ -232,8 +232,9 @@ Markdown links use OSC 8 on terminals that advertise support, with a text-and-UR
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
 automatic detection; tmux is probed for its `hyperlinks` terminal feature.
 Wrapped link fragments are closed on every rendered line, and control characters
-in destinations cannot enter terminal escape sequences. Opening links through
-the fullscreen application's own mouse handling remains open.
+in destinations cannot enter terminal escape sequences. Fullscreen clicks on
+visible links launch the platform handler without a shell; dragging selects text
+instead, and clipped or scrolled link positions are not activated.
 
 The terminal now uses Pi v1.5.0 theme assets and schema, with attribution in
 `crates/workbench/assets/NOTICE`. It renders Markdown, highlighted code, shaded

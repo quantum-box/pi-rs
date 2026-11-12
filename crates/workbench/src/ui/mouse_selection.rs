@@ -112,13 +112,13 @@ impl MouseSelection {
         Some(Point { row, byte })
     }
 
-    pub fn press(&mut self, column: u16, row: u16, now: Instant) {
+    pub fn press(&mut self, column: u16, row: u16, now: Instant) -> bool {
         if !self.contains_row(row) {
             self.clear();
-            return;
+            return false;
         }
         let Some(point) = self.point(column, row) else {
-            return;
+            return false;
         };
         let count = self
             .last_click
@@ -139,6 +139,7 @@ impl MouseSelection {
             dragging: true,
             moved: false,
         });
+        count == 1
     }
 
     pub fn drag(&mut self, column: u16, row: u16) {
