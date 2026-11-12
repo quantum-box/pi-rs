@@ -532,6 +532,10 @@ fn install_globals(
     Ok(())
 }
 fn tool_value(outcome: Outcome) -> Value {
+    if matches!(&outcome, Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } if data["isError"] == true)
+    {
+        return json!({"ok":false,"error":outcome.tool_content()});
+    }
     match outcome {
         Outcome::Succeeded(value) | Outcome::SucceededWithDetails { output: value, .. } => {
             json!({"ok":true,"value":value})
@@ -847,6 +851,89 @@ fn save_output(prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_tool_error_flags_propagate_without_exposing_details() {
+        for with_details in [false, true] {
+            for flag in [Some(true), Some(false), None] {
+                let mut data = json!({"content":[{"type":"text","text":"tool output"}]});
+                if let Some(flag) = flag {
+                    data["isError"] = json!(flag);
+                }
+                let outcome = if with_details {
+                    Outcome::StructuredWithDetails {
+                        data: data.clone(),
+                        attachments: vec![],
+                        details: json!({"secret":"private metadata"}),
+                    }
+                } else {
+                    Outcome::Structured {
+                        data: data.clone(),
+                        attachments: vec![],
+                    }
+                };
+                let result = tool_value(outcome);
+                if flag == Some(true) {
+                    assert_eq!(result["ok"], false);
+                    assert!(result["error"].as_str().unwrap().contains("tool output"));
+                    assert!(!result.to_string().contains("private metadata"));
+                } else {
+                    assert_eq!(result, json!({"ok":true,"value":data}));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_tool_errors_throw_in_scripts() {
+        struct ErrorHost(bool);
+        #[async_trait::async_trait]
+        impl ToolHost for ErrorHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: "broken".into(),
+                    description: "Fail".into(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                let data = json!({"isError":true,"content":[{"type":"text","text":"tool failed"}]});
+                if self.0 {
+                    Outcome::StructuredWithDetails {
+                        data,
+                        attachments: vec![],
+                        details: json!({"secret":"private metadata"}),
+                    }
+                } else {
+                    Outcome::Structured {
+                        data,
+                        attachments: vec![],
+                    }
+                }
+            }
+        }
+        for with_details in [false, true] {
+            let reply = ScriptTool {
+                timeout: Some(Duration::from_secs(2)),
+            }
+            .invoke_transaction(
+                json!({"code":"await tools.broken({}); text('unexpected success')"}),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: Default::default(),
+                },
+                None,
+                Arc::new(ErrorHost(with_details)),
+            )
+            .await;
+            let Outcome::Failed(error) = reply.outcome else {
+                panic!("expected script failure")
+            };
+            assert!(error.contains("tool failed"));
+            assert!(!error.contains("unexpected success"));
+            assert!(!error.contains("private metadata"));
+        }
+    }
     struct Host;
     #[async_trait::async_trait]
     impl ToolHost for Host {
