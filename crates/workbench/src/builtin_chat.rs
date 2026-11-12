@@ -60,6 +60,19 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: standard,
     },
     Builtin {
+        id: "kimi-coding",
+        endpoint: "https://api.kimi.com/coding/v1/chat/completions",
+        env: "KIMI_API_KEY",
+        compatibility: || {
+            json!({
+                "supportsStrictMode":false, "supportsStore":false,
+                "supportsDeveloperRole":false, "supportsReasoningEffort":true,
+                "maxTokensField":"max_tokens", "thinkingFormat":"openai",
+                "requiresReasoningContentOnAssistantMessages":true
+            })
+        },
+    },
+    Builtin {
         id: "minimax",
         endpoint: "https://api.minimax.io/anthropic/v1/messages",
         env: "MINIMAX_API_KEY",
