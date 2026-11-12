@@ -27,6 +27,7 @@ pub struct Span {
     pub underline: bool,
     pub inverse: bool,
     pub strikethrough: bool,
+    pub hyperlink: Option<String>,
 }
 impl Span {
     pub(super) fn new(text: impl Into<String>, color: Color) -> Self {
@@ -40,6 +41,7 @@ impl Span {
             underline: false,
             inverse: false,
             strikethrough: false,
+            hyperlink: None,
         }
     }
     pub(super) fn themed(text: impl Into<String>, theme: &Theme, role: &str) -> Self {
@@ -139,6 +141,9 @@ impl Line {
         )?;
         let mut used = 0;
         for span in &self.spans {
+            if let Some(url) = &span.hyperlink {
+                queue!(out, Print(format!("\x1b]8;;{url}\x1b\\")))?;
+            }
             queue!(
                 out,
                 SetForegroundColor(span.color),
@@ -184,6 +189,9 @@ impl Line {
                 }
                 queue!(out, Print(grapheme))?;
                 used += size;
+            }
+            if span.hyperlink.is_some() {
+                queue!(out, Print("\x1b]8;;\x1b\\"))?;
             }
         }
         queue!(
@@ -284,7 +292,8 @@ impl Entry {
                 if expanded.unwrap_or(expand_tools) {
                     lines.extend(wrap(&[label], inner));
                     let markdown = format!("**{name}**\n\n{body}");
-                    let mut body = markdown_at_depth(&markdown, theme, inner, 0, options.mermaid);
+                    let mut body =
+                        markdown_at_depth(&markdown, theme, inner, 0, options.mermaid, *HYPERLINKS);
                     for span in body.iter_mut().flat_map(|line| &mut line.spans) {
                         if span.color == theme.color("text") && !span.dim {
                             span.color = color;
@@ -314,7 +323,8 @@ impl Entry {
                 lines
             }
             Self::Assistant(text) => {
-                let mut lines = markdown_at_depth(text, theme, inner, 0, options.mermaid);
+                let mut lines =
+                    markdown_at_depth(text, theme, inner, 0, options.mermaid, *HYPERLINKS);
                 lines.push(Line::default());
                 lines
             }
@@ -344,7 +354,8 @@ impl Entry {
                 lines.push(Line::default());
                 if expanded.unwrap_or(expand_tools) {
                     let markdown = format!("**{title}**\n\n{text}");
-                    let mut body = markdown_at_depth(&markdown, theme, inner, 0, options.mermaid);
+                    let mut body =
+                        markdown_at_depth(&markdown, theme, inner, 0, options.mermaid, *HYPERLINKS);
                     for span in body.iter_mut().flat_map(|line| &mut line.spans) {
                         if span.color == theme.color("text") && !span.dim {
                             span.color = color;
@@ -521,6 +532,93 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static SYNTAX_THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
+fn detect_hyperlinks(get: impl Fn(&str) -> Option<String>, tmux: impl Fn() -> bool) -> bool {
+    match get("PI_HYPERLINKS").as_deref() {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    let term = get("TERM").unwrap_or_default().to_lowercase();
+    if get("TMUX").is_some() || term.starts_with("tmux") {
+        return tmux();
+    }
+    if term.starts_with("screen") {
+        return false;
+    }
+    let program = get("TERM_PROGRAM").unwrap_or_default().to_lowercase();
+    if matches!(
+        program.as_str(),
+        "herdr"
+            | "rex"
+            | "kitty"
+            | "ghostty"
+            | "wezterm"
+            | "warpterminal"
+            | "iterm.app"
+            | "alacritty"
+            | "vscode"
+            | "zed"
+    ) {
+        return true;
+    }
+    if program == "orca" && get("ORCA_IMAGE_PROTOCOL").as_deref() == Some("kitty") {
+        return true;
+    }
+    term.contains("ghostty")
+        || [
+            "KITTY_WINDOW_ID",
+            "GHOSTTY_RESOURCES_DIR",
+            "WEZTERM_PANE",
+            "WARP_SESSION_ID",
+            "WARP_TERMINAL_SESSION_UUID",
+            "ITERM_SESSION_ID",
+            "WT_SESSION",
+        ]
+        .iter()
+        .any(|name| get(name).is_some())
+}
+
+fn tmux_hyperlinks() -> bool {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let Ok(mut child) = Command::new("tmux")
+        .args(["display-message", "-p", "#{client_termfeatures}"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut value = String::new();
+                if status.success()
+                    && let Some(mut output) = child.stdout.take()
+                    && output.read_to_string(&mut value).is_ok()
+                {
+                    return value
+                        .split(',')
+                        .any(|feature| feature.trim() == "hyperlinks");
+                }
+                return false;
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+static HYPERLINKS: LazyLock<bool> =
+    LazyLock::new(|| detect_hyperlinks(|name| std::env::var(name).ok(), tmux_hyperlinks));
+
 #[derive(Default)]
 struct Table {
     alignments: Vec<Alignment>,
@@ -661,7 +759,11 @@ fn user_lines(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
 
 #[cfg(test)]
 fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
-    markdown_at_depth(text, theme, width, 0, super::mermaid::Mermaid::Off)
+    markdown_at_depth(text, theme, width, 0, super::mermaid::Mermaid::Off, false)
+}
+
+fn safe_hyperlink(url: &str) -> bool {
+    !url.is_empty() && !url.chars().any(char::is_control)
 }
 
 fn markdown_at_depth(
@@ -670,6 +772,7 @@ fn markdown_at_depth(
     width: usize,
     depth: usize,
     mermaid: super::mermaid::Mermaid,
+    hyperlinks: bool,
 ) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut spans = Vec::new();
@@ -727,7 +830,10 @@ fn markdown_at_depth(
             Event::End(TagEnd::Link) => {
                 if let Some((url, label)) = links.pop() {
                     let comparable_url = url.strip_prefix("mailto:").unwrap_or(&url);
-                    if label != url && label != comparable_url {
+                    if (!hyperlinks || !safe_hyperlink(&url))
+                        && label != url
+                        && label != comparable_url
+                    {
                         spans.push(Span::themed(format!(" ({url})"), theme, "mdLinkUrl"));
                     }
                 }
@@ -868,7 +974,7 @@ fn markdown_at_depth(
                 let bordered = width >= 3;
                 let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
                 let quoted = if depth < 32 {
-                    markdown_at_depth(&body, theme, content_width, depth + 1, mermaid)
+                    markdown_at_depth(&body, theme, content_width, depth + 1, mermaid, hyperlinks)
                 } else {
                     wrap(&[Span::themed(body, theme, "mdQuote")], content_width)
                 };
@@ -908,6 +1014,9 @@ fn markdown_at_depth(
                     );
                     span.bold = bold > 0 || heading > 0;
                     span.underline = heading == 1 || !links.is_empty();
+                    span.hyperlink = links.last().and_then(|(url, _)| {
+                        (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
+                    });
                     span.italic = italic > 0;
                     span.strikethrough = strikethrough > 0;
                     spans.push(span);
@@ -919,6 +1028,9 @@ fn markdown_at_depth(
                 }
                 let mut span = Span::themed(text, theme, "mdCode");
                 span.underline = heading == 1 || !links.is_empty();
+                span.hyperlink = links
+                    .last()
+                    .and_then(|(url, _)| (hyperlinks && safe_hyperlink(url)).then(|| url.clone()));
                 span.bold = heading > 0;
                 spans.push(span);
             }
@@ -926,7 +1038,11 @@ fn markdown_at_depth(
                 if let Some((_, label)) = links.last_mut() {
                     label.push(' ');
                 }
-                spans.push(Span::themed(" ", theme, "text"));
+                let mut span = Span::themed(" ", theme, "text");
+                span.hyperlink = links
+                    .last()
+                    .and_then(|(url, _)| (hyperlinks && safe_hyperlink(url)).then(|| url.clone()));
+                spans.push(span);
             }
             Event::End(TagEnd::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
@@ -1284,6 +1400,70 @@ mod tests {
             );
             assert!(spans[0].underline, "{source}");
         }
+    }
+
+    #[test]
+    fn osc8_links_wrap_and_close_before_padding() {
+        let lines = markdown_at_depth(
+            "[**documentation**](https://example.com)",
+            &Theme::system(),
+            6,
+            0,
+            super::super::mermaid::Mermaid::Off,
+            true,
+        );
+        assert!(lines.len() >= 2);
+        assert_eq!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            "documentation"
+        );
+        for line in lines
+            .iter()
+            .filter(|line| line.spans.iter().any(|span| !span.text.is_empty()))
+        {
+            let mut bytes = Vec::new();
+            line.draw(&mut bytes, 6).unwrap();
+            let output = String::from_utf8(bytes).unwrap();
+            assert!(output.contains("\x1b]8;;https://example.com\x1b\\"));
+            assert!(output.contains("\x1b]8;;\x1b\\"));
+            assert!(!output.contains(" (https://example.com)"));
+        }
+        assert!(!safe_hyperlink("https://example.com/\x1b]0;bad"));
+    }
+
+    #[test]
+    fn detects_hyperlinks_conservatively_with_explicit_override() {
+        let detect = |values: &[(&str, &str)], tmux: bool| {
+            detect_hyperlinks(
+                |key| {
+                    values
+                        .iter()
+                        .find(|(name, _)| *name == key)
+                        .map(|(_, value)| (*value).to_owned())
+                },
+                || tmux,
+            )
+        };
+        assert!(detect(&[("TERM_PROGRAM", "iTerm.app")], false));
+        assert!(!detect(
+            &[("TERM", "screen-256color"), ("TERM_PROGRAM", "iTerm.app")],
+            true
+        ));
+        assert!(!detect(
+            &[("TMUX", "1"), ("TERM_PROGRAM", "iTerm.app")],
+            false
+        ));
+        assert!(detect(&[("TMUX", "1")], true));
+        assert!(detect(&[("TERM", "screen"), ("PI_HYPERLINKS", "1")], false));
+        assert!(!detect(
+            &[("TERM_PROGRAM", "kitty"), ("PI_HYPERLINKS", "0")],
+            true
+        ));
+        assert!(!detect(&[], false));
     }
     #[test]
     fn wraps_styles_without_splitting_graphemes_or_allowing_escapes() {
