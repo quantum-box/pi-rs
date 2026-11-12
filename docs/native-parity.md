@@ -101,6 +101,8 @@ mouse interaction preserves theme previews and keyboard remapping.
 
 Input hooks identify command-line print and JSON prompts as `interactive`, as
 Pi does, while RPC and extension-originated submissions retain their own source.
+Pi-style `--mode json` emits the session header and agent events without an
+additional native `answer` record; native `run` output retains that record.
 An input hook failure is reported without discarding earlier transformations or
 preventing later hooks from processing the input. Invalid replacement images
 still fail validation before submission.

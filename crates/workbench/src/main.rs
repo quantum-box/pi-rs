@@ -1026,6 +1026,7 @@ fn export_from_file(paths: &[PathBuf]) -> Result<()> {
 }
 
 async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
+    let pi_style_invocation = args.command.is_none();
     let patterns: Vec<_> = if let Some(patterns) = &args.models {
         patterns.split(',').collect()
     } else if matches!(
@@ -1746,7 +1747,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         let answer = answer?;
         if TEXT_OUTPUT.load(Ordering::Relaxed) {
             last_answer = Some((answer, truncated));
-        } else {
+        } else if !pi_style_invocation || args.mode != Some(OutputMode::Json) {
             output(json!({"type":"answer","content":answer}));
         }
     }
