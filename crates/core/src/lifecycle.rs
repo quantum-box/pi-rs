@@ -177,6 +177,10 @@ pub enum LifecycleEvent {
         state: RunState,
         messages: Vec<LifecycleMessage>,
     },
+    /// The run is idle after retries, compaction and queued continuations.
+    AgentSettled {
+        aborted: bool,
+    },
     TurnStart {
         run_id: Uuid,
         turn_index: u32,
@@ -214,6 +218,7 @@ impl LifecycleEvent {
             Self::SessionShutdown { .. } => "session_shutdown",
             Self::AgentStart { .. } => "agent_start",
             Self::AgentEnd { .. } => "agent_end",
+            Self::AgentSettled { .. } => "agent_settled",
             Self::TurnStart { .. } => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
             Self::SessionTree { .. } => "session_tree",

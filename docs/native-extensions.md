@@ -133,6 +133,10 @@ event; the existing synchronous `set_model` does not invoke asynchronous hooks.
 Pi v1.5.0 declares a `restore` source but its session restoration path does not
 emit a model selection event.
 
+Extensions that implement `handles_lifecycle` also receive `agent_settled`
+after `agent_end` when a run has finished its retries and automatic compaction.
+Its `aborted` field distinguishes cancellation from completion or failure.
+
 Before a model request, an extension may opt into `context_with_system` to
 transform the complete message list, including system messages. All ordinary
 `before_request` hooks run first; these hooks then run in registration order.
