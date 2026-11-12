@@ -44,7 +44,7 @@ fn thinking_command_notifies_native_extension_from_terminal() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("models.json"),
-        br#"{"providers":{"ollama":{"models":[{"id":"fixture","reasoning":true}]}}}"#,
+        br#"{"providers":{"ollama":{"models":[{"id":"fixture","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}}]}}}"#,
     )
     .unwrap();
     let extension = root.path().join("selection.py");
