@@ -266,17 +266,19 @@ impl Agent<'_> {
         )?;
         let lifecycle = crate::lifecycle::enabled(self.registry);
         if lifecycle {
-            self.observe_lifecycle(
+            let states = session.extension_states();
+            self.observe_active_lifecycle(
+                session,
                 crate::LifecycleEvent::AgentStart {
                     session_id: session.session_id(),
                     run_id,
                     model: self.model_name.into(),
                 },
-                &session.extension_states(),
-                Some(cancel),
+                &states,
+                cancel,
                 observer,
             )
-            .await;
+            .await?;
         }
         let mut retry_attempt = 0;
         let mut retry_observer = |event: Notification<'_>| {
@@ -397,6 +399,61 @@ impl Agent<'_> {
         }
     }
 
+    async fn observe_active_lifecycle(
+        &self,
+        session: &mut Session,
+        event: crate::LifecycleEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let (sender, mut incoming) = mpsc::channel(32);
+        let host = Arc::new(LifecycleMessageHost { sender });
+        let mut errors = Vec::new();
+        let mut collect = |event: Notification<'_>| {
+            if let Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            } = event
+            {
+                errors.push((extension.to_owned(), event, message.to_owned()));
+            }
+        };
+        {
+            let notify = crate::lifecycle::notify_with_host(
+                self.registry,
+                event,
+                states,
+                self.limits.model_timeout,
+                &mut collect,
+                host,
+            );
+            tokio::pin!(notify);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some((message, reply)) = incoming.recv() => {
+                        match queue_custom_message(session, message, observer) {
+                            Ok(()) => { let _ = reply.send(Ok(())); }
+                            Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                        }
+                    }
+                    _ = cancel.cancelled() => break,
+                    _ = &mut notify => break,
+                }
+            }
+        }
+        for (extension, event, message) in &errors {
+            observer(Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            });
+        }
+        Ok(())
+    }
+
     async fn drive<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -477,6 +534,7 @@ impl Agent<'_> {
         {
             for (queued_at, input) in session.queued_custom_messages() {
                 if queued_at < initial_id
+                    && session.records()[(queued_at - 1) as usize].run_id != Some(run_id)
                     && input.delivery == crate::CustomMessageDelivery::NextTurn
                 {
                     commit(
@@ -580,8 +638,14 @@ impl Agent<'_> {
             {
                 if lifecycle {
                     active
-                        .observe_lifecycle(turn_start(true), &states, Some(cancel), observer)
-                        .await;
+                        .observe_active_lifecycle(
+                            session,
+                            turn_start(true),
+                            &states,
+                            cancel,
+                            observer,
+                        )
+                        .await?;
                 }
                 active.settle_usage(request, &usage, &metadata).await?;
                 let allowance = recorded
@@ -698,8 +762,14 @@ impl Agent<'_> {
                 let allowance = request.max_output_tokens;
                 if lifecycle && retry_attempt == 0 {
                     active
-                        .observe_lifecycle(turn_start(false), &states, Some(cancel), observer)
-                        .await;
+                        .observe_active_lifecycle(
+                            session,
+                            turn_start(false),
+                            &states,
+                            cancel,
+                            observer,
+                        )
+                        .await?;
                 }
                 let result = active
                     .reply(session, request, true, cancel, observer, Some(followups))
@@ -826,17 +896,18 @@ impl Agent<'_> {
             if lifecycle {
                 let messages = crate::lifecycle::messages(session, |id| id >= assistant_record);
                 dispatcher
-                    .observe_lifecycle(
+                    .observe_active_lifecycle(
+                        session,
                         crate::LifecycleEvent::TurnEnd {
                             run_id,
                             turn_index,
                             messages,
                         },
                         &states,
-                        Some(cancel),
+                        cancel,
                         observer,
                     )
-                    .await;
+                    .await?;
             }
             // Context-only messages must follow every tool result in the turn,
             // but do not themselves cause another model request.
@@ -2641,6 +2712,47 @@ fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> 
             (invocation.operation_id == parent).then_some(invocation.call.id)
         })
 }
+struct LifecycleMessageHost {
+    sender: mpsc::Sender<(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    )>,
+}
+#[async_trait::async_trait]
+impl ToolHost for LifecycleMessageHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("tool calls are unavailable in lifecycle hooks".into())
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send((
+                crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    delivery,
+                    message,
+                },
+                reply,
+            ))
+            .await
+            .map_err(|_| "lifecycle hook has finished".to_owned())?;
+        result
+            .await
+            .map_err(|_| "lifecycle message response was lost".to_owned())?
+    }
+}
+
 struct NestedHost {
     ui: Option<Arc<dyn crate::ExtensionUi>>,
     requests: mpsc::Sender<Vec<NestedRequest>>,

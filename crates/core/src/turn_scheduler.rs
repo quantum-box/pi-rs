@@ -524,6 +524,10 @@ impl Agent<'_> {
                 && extension.handles_tool_execution_updates()
         });
         let (progress_output, mut progress) = mpsc::channel::<TurnProgress>(32);
+        let (lifecycle_sender, mut lifecycle_messages) = mpsc::channel(32);
+        let lifecycle_host = Arc::new(LifecycleMessageHost {
+            sender: lifecycle_sender,
+        });
         let mut futures = FuturesUnordered::<TurnFuture>::new();
         let mut calls = Vec::<TurnCall>::new();
         let mut positions = HashMap::<Uuid, usize>::new();
@@ -701,6 +705,7 @@ impl Agent<'_> {
                     let cancel = calls[index].cancellation.clone();
                     let model_timeout = self.limits.model_timeout;
                     let tool_timeout = self.limits.tool_timeout;
+                    let hook_host = lifecycle_host.clone();
                     futures.push(async move {
                         let mut errors = Vec::new();
                         if observe_tools {
@@ -710,7 +715,7 @@ impl Agent<'_> {
                                 parent_tool_call_id: parent,
                             };
                             let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(), event, message.to_owned())); };
-                            tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify(&registry, event, &state_snapshot, model_timeout, &mut collect) => {} }
+                            tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify_with_host(&registry, event, &state_snapshot, model_timeout, &mut collect, hook_host) => {} }
                         }
                         let result = Self::turn_normalize(&registry, tool_timeout, &invocation, &advertised, &cancel).await;
                         TurnEvent::Normalized(index, result, errors)
@@ -968,6 +973,7 @@ impl Agent<'_> {
                                 let progress_cancel = calls[index].cancellation.clone();
                                 let progress_states = states.clone();
                                 let progress_timeout = self.limits.model_timeout;
+                                let hook_host = lifecycle_host.clone();
                                 let progress_worker = tokio::spawn(async move {
                                     let mut errors = Vec::new();
                                     let mut closing = false;
@@ -985,7 +991,7 @@ impl Agent<'_> {
                                                             errors.push((extension.to_owned(), event, message.to_owned()));
                                                         }
                                                     };
-                                                    tokio::select! { biased; _ = progress_cancel.cancelled() => {}, _ = crate::lifecycle::notify(&progress_registry, *event, &progress_states, progress_timeout, &mut collect) => {} }
+                                                    tokio::select! { biased; _ = progress_cancel.cancelled() => {}, _ = crate::lifecycle::notify_with_host(&progress_registry, *event, &progress_states, progress_timeout, &mut collect, hook_host.clone()) => {} }
                                                 }
                                             }
                                             TurnProgress::Custom(input, reply) => { let _ = progress_output.send(TurnProgress::Custom(input, reply)).await; }
@@ -1016,6 +1022,7 @@ impl Agent<'_> {
                             let timeout = self.limits.tool_timeout; let model_timeout = self.limits.model_timeout; let reference = reference.clone();
                             let parent = calls[index].parent.clone();
                             let pending_outcome = outcome.clone();
+                            let hook_host = lifecycle_host.clone();
                             calls[index].phase = TurnPhase::Polling;
                             calls[index].polled = true;
                             let future = async move {
@@ -1023,7 +1030,7 @@ impl Agent<'_> {
                                 if observe_tools {
                                     let event = crate::LifecycleEvent::ToolExecutionEnd { tool_call_id: invocation.call.id.clone(), tool_name: invocation.call.name.clone(), result: pending_outcome, is_error: false, duration_ms: duration, parent_tool_call_id: parent };
                                     let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(), event, message.to_owned())); };
-                                    tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify(&registry, event, &snapshot, model_timeout, &mut collect) => {} }
+                                    tokio::select! { biased; _ = cancel.cancelled() => {}, _ = crate::lifecycle::notify_with_host(&registry, event, &snapshot, model_timeout, &mut collect, hook_host) => {} }
                                 }
                                 let result = Self::turn_poll_normalize(&registry, timeout, &invocation, &cancel).await;
                                 TurnEvent::PollPrepared(index, result, reference, duration, errors)
@@ -1036,13 +1043,14 @@ impl Agent<'_> {
                         let registry = self.registry.clone(); let snapshot = states.clone(); let timeout = self.limits.model_timeout;
                         let invocation = calls[index].invocation.clone(); let parent = calls[index].parent.clone();
                         let notify_end = observe_tools && !calls[index].polled;
+                        let hook_host = lifecycle_host.clone();
                         futures.push(async move {
                             let mut errors = Vec::new();
                             if notify_end {
                                 let is_error = outcome.is_error();
                                 let event = crate::LifecycleEvent::ToolExecutionEnd { tool_call_id: invocation.call.id, tool_name: invocation.call.name, result: outcome.clone(), is_error, duration_ms: duration, parent_tool_call_id: parent };
                                 let mut collect = |event: Notification<'_>| if let Notification::ExtensionLifecycleError { extension, event, message } = event { errors.push((extension.to_owned(),event,message.to_owned())); };
-                                crate::lifecycle::notify(&registry,event,&snapshot,timeout,&mut collect).await;
+                                crate::lifecycle::notify_with_host(&registry,event,&snapshot,timeout,&mut collect,hook_host).await;
                             }
                             TurnEvent::Notified(index,outcome,errors)
                         }.boxed());
@@ -1084,6 +1092,10 @@ impl Agent<'_> {
                     },
                 },
                 Some(message) = progress.recv() => match message { TurnProgress::Event(event) => observer(Notification::ToolProgress(&event)), TurnProgress::Custom(input, reply) => { let result = queue_custom_message(session, input, observer).map_err(|error| error.to_string()); let _ = reply.send(result); }, TurnProgress::Flush(reply) => { let _ = reply.send(()); } },
+                Some((message, reply)) = lifecycle_messages.recv() => {
+                    let result = queue_custom_message(session, message, observer).map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                },
                 Some(input) = receive_input(&mut inputs) => queue_input(session,input.into(),observer)?,
                 else => return Err(Error::Config("turn scheduler lost its active work".into())),
             }

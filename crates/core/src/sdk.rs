@@ -2642,6 +2642,125 @@ mod tests {
         assert!(session.journal().queued_custom_messages().is_empty());
     }
 
+    struct LifecycleMessageExtension;
+    struct LifecycleMessageTool;
+    #[async_trait::async_trait]
+    impl crate::Tool for LifecycleMessageTool {
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: "send_messages".into(),
+                description: "test".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> crate::Outcome {
+            crate::Outcome::Succeeded("tool result".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Extension for LifecycleMessageExtension {
+        fn id(&self) -> &str {
+            "lifecycle-messages"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(LifecycleMessageTool)]
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            let (text, delivery) = match event {
+                crate::LifecycleEvent::AgentStart { .. } => {
+                    ("agent start", crate::CustomMessageDelivery::Steer)
+                }
+                crate::LifecycleEvent::ToolExecutionStart { .. } => {
+                    ("tool start", crate::CustomMessageDelivery::Steer)
+                }
+                crate::LifecycleEvent::ToolExecutionEnd { .. } => {
+                    ("tool end", crate::CustomMessageDelivery::Steer)
+                }
+                crate::LifecycleEvent::TurnEnd { turn_index: 0, .. } => {
+                    ("turn end", crate::CustomMessageDelivery::AfterTurn)
+                }
+                _ => return Ok(()),
+            };
+            if matches!(event, crate::LifecycleEvent::AgentStart { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "lifecycle".into(),
+                        content: crate::ContextContent::Text("next run".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+            }
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "lifecycle".into(),
+                    content: crate::ContextContent::Text(text.into()),
+                    display: false,
+                    details: None,
+                },
+                delivery,
+            )
+            .await
+        }
+    }
+    #[tokio::test]
+    async fn lifecycle_host_calls_are_reentrant_and_ordered_at_turn_boundaries() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut session =
+            SessionBuilder::new(Arc::new(MessageDeliveryModel(requests.clone())), "fixture")
+                .extension(Arc::new(LifecycleMessageExtension))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+            .await
+            .expect("lifecycle host call deadlocked")
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let text = |messages: &[Message]| {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::User { content } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(&requests[0]), ["first", "agent start"]);
+        assert_eq!(
+            text(&requests[1]),
+            ["first", "agent start", "turn end", "tool start", "tool end"]
+        );
+        let tool = requests[1]
+            .iter()
+            .position(|m| matches!(m, Message::Tool { .. }))
+            .unwrap();
+        let turn_end = requests[1]
+            .iter()
+            .position(|m| matches!(m, Message::User { content } if content == "turn end"))
+            .unwrap();
+        assert!(tool < turn_end);
+        assert_eq!(session.journal().queued_custom_messages().len(), 1);
+        assert_eq!(
+            session.journal().queued_custom_messages()[0].1.delivery,
+            crate::CustomMessageDelivery::NextTurn
+        );
+    }
+
     struct NestedModel;
     #[async_trait::async_trait]
     impl Model for NestedModel {

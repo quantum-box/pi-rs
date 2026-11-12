@@ -319,6 +319,8 @@ struct Description {
     #[serde(default)]
     lifecycle_hook: bool,
     #[serde(default)]
+    lifecycle_host_calls: bool,
+    #[serde(default)]
     tool_execution_lifecycle_hook: bool,
     #[serde(default)]
     tool_execution_update_hook: bool,
@@ -662,6 +664,29 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn lifecycle_with_host(
+        &self,
+        event: &LifecycleEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        if !self.description.lifecycle_host_calls {
+            return self.lifecycle(event, state).await;
+        }
+        let request = ProtocolRequest::Lifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancellation = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancellation, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
     fn handles_cache_warming(&self) -> bool {
         self.description.cache_warming_hook
@@ -1332,13 +1357,13 @@ fn serve_bash_stream(extension: Arc<dyn Extension>) -> Result<()> {
     })
 }
 
-fn call_duplex(
+fn call_duplex<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
     request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
     cancellation: &CancellationToken,
     runtime: &tokio::runtime::Handle,
-) -> ExtensionResult<ToolReply> {
+) -> ExtensionResult<T> {
     let command = endpoint.command("--pi-rs-extension-v2");
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
     let mut input = child.stdin().take().expect("piped stdin");
@@ -1907,6 +1932,7 @@ async fn dispatch_with_host(
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
+            lifecycle_host_calls: true,
             tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
             tool_execution_update_hook: extension.handles_tool_execution_updates(),
             model_selection_hook: extension.handles_model_selection(),
@@ -1954,7 +1980,15 @@ async fn dispatch_with_host(
             encode(extension.user_bash_operations(&event, state.as_ref()).await)
         }
         ProtocolRequest::Lifecycle { event, state } => {
-            encode(extension.lifecycle(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .lifecycle_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.lifecycle(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::DiscoverResources { event, state } => {
             encode(extension.discover_resources(&event, state.as_ref()).await)
@@ -2761,6 +2795,60 @@ else:
                 .await,
             Outcome::Succeeded("done".into())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_lifecycle_callback_uses_negotiated_message_host() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message(
+                &self,
+                message: pi_rs_core::CustomMessage,
+                delivery: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                assert_eq!(message.custom_type, "from-hook");
+                assert_eq!(delivery, pi_rs_core::CustomMessageDelivery::Steer);
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    r=json.load(sys.stdin)
+    d={'id':'hook-test','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'lifecycle_host_calls':True,'pi_lifecycle_fields':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    r=json.loads(sys.stdin.readline())
+    assert r['request']['type']=='lifecycle' and r['has_custom_messages'] is True
+    print(json.dumps({'type':'send_message','delivery':'steer','message':{'customType':'from-hook','content':'hello','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook-test");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        extension
+            .lifecycle_with_host(
+                &LifecycleEvent::AgentSettled { aborted: false },
+                None,
+                Arc::new(Host),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

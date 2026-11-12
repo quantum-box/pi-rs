@@ -324,6 +324,28 @@ pub async fn notify(
     timeout: Duration,
     observer: &mut Observer<'_>,
 ) {
+    notify_inner(registry, event, states, timeout, observer, None).await;
+}
+
+pub(crate) async fn notify_with_host(
+    registry: &Registry,
+    event: LifecycleEvent,
+    states: &ExtensionStates,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    host: std::sync::Arc<dyn crate::ToolHost>,
+) {
+    notify_inner(registry, event, states, timeout, observer, Some(host)).await;
+}
+
+async fn notify_inner(
+    registry: &Registry,
+    event: LifecycleEvent,
+    states: &ExtensionStates,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    host: Option<std::sync::Arc<dyn crate::ToolHost>>,
+) {
     let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(10));
     for extension in registry.extensions.iter().filter(|extension| {
         extension.handles_lifecycle()
@@ -350,10 +372,20 @@ pub async fn notify(
                 _ => true,
             }
     }) {
-        let error = match tokio::time::timeout_at(
-            deadline,
-            extension.lifecycle(&event, states.get(extension.id())),
-        )
+        let error = match tokio::time::timeout_at(deadline, async {
+            match &host {
+                Some(host) => {
+                    extension
+                        .lifecycle_with_host(&event, states.get(extension.id()), host.clone())
+                        .await
+                }
+                None => {
+                    extension
+                        .lifecycle(&event, states.get(extension.id()))
+                        .await
+                }
+            }
+        })
         .await
         {
             Ok(Ok(())) => continue,

@@ -2763,7 +2763,7 @@ clearing the resulting queue.
 
 ### Active-run native custom messages
 
-A native tool can call `ToolHost::send_message` with `Steer`, `FollowUp`,
+A native tool or active-run lifecycle callback can call `ToolHost::send_message` with `Steer`, `FollowUp`,
 `NextTurn`, or `AfterTurn`. These correspond to Pi's default steering,
 `deliverAs: "followUp"`, `deliverAs: "nextTurn"`, and
 `triggerTurn: false`, respectively. The last mode adds context after the
@@ -2780,8 +2780,18 @@ host-call capability and report it unavailable with older hosts.
 
 The focused tests cover mixed user/custom queue ordering, branch-local clearing,
 tool-result ordering, all four delivery boundaries, process protocol metadata,
-and reopening a session before the next prompt. Host calls from other extension
-callbacks and custom message renderers remain outside this support.
+and reopening a session before the next prompt. Lifecycle callbacks receive an
+acknowledged host during `agent_start`, `turn_start`, `turn_end`, and ordinary
+scheduler `tool_execution_start`, `tool_execution_update`, and
+`tool_execution_end` events. Reentrant sends are serviced by the journal owner
+while the callback waits; separately built extensions negotiate this support.
+
+Host calls are not yet provided to `agent_end`, `agent_settled`, session and
+selection lifecycle callbacks, truncated-tool-result lifecycle notifications,
+input, context, provider-request, tool-call or tool-result hooks, user-bash,
+resource discovery, compaction, tree, and transition callbacks. Command effects
+still use their existing return-value mechanism. Custom message renderers are
+also unsupported.
 
 ### Rust extension lifecycle observation
 

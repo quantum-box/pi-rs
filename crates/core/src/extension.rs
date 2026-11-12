@@ -657,6 +657,17 @@ pub trait Extension: Send + Sync {
         Ok(())
     }
 
+    /// Observe an active-run lifecycle event with access to its message host.
+    /// Existing extensions continue to use `lifecycle` by default.
+    async fn lifecycle_with_host(
+        &self,
+        event: &crate::LifecycleEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        self.lifecycle(event, state).await
+    }
+
     fn handles_cache_warming(&self) -> bool {
         false
     }
