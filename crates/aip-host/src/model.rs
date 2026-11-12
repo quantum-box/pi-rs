@@ -31,6 +31,17 @@ pub(crate) struct BudgetedModel<'a> {
 
 #[async_trait::async_trait]
 impl Model for BudgetedModel<'_> {
+    fn estimate_message_tokens(
+        &self,
+        request: &ModelRequest,
+        message: &pi_rs_core::Message,
+    ) -> u64 {
+        self.inner.estimate_message_tokens(request, message)
+    }
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        self.inner.estimate_request_tokens(request)
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         self.inner.context_window(model).await
     }

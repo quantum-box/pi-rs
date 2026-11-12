@@ -324,6 +324,21 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        match message {
+            Message::Assistant {
+                replay: Some(replay),
+                ..
+            } if replay.identity.provider == self.provider
+                && replay.identity.model == request.model =>
+            {
+                pi_rs_core::estimate_replay_tokens(&replay.blocks)
+                    .max(pi_rs_core::estimate_message_tokens(message))
+            }
+            _ => pi_rs_core::estimate_message_tokens(message),
+        }
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         let model = request.model.clone();
         let mut body = payload(&request, &self.provider);
@@ -431,6 +446,57 @@ impl Model for OpenAiResponses {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_estimate_matches_image_and_replay_serialization() {
+        let model = OpenAiResponses::new_api("https://example.com", "key".into()).unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let tool = |n| {
+            Message::Tool { call_id: "c".into(), content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(n)}]}}).to_string(), is_error: false, is_structured: Some(true) }
+        };
+        let small = model.estimate_message_tokens(&request, &tool(4));
+        let large = model.estimate_message_tokens(&request, &tool(20000));
+        assert_eq!(small, large);
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "openai".into(),
+                model: "fixture".into(),
+            },
+            blocks: vec![
+                json!({"type":"message","content":"answer"}),
+                json!({"type":"reasoning","encrypted_content":"x".repeat(5000)}),
+            ],
+        };
+        let assistant = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(replay)),
+        };
+        assert!(model.estimate_message_tokens(&request, &assistant) > 1000);
+        let mismatch = if let Message::Assistant {
+            replay: Some(mut replay),
+            ..
+        } = assistant.clone()
+        {
+            replay.identity.model = "different".into();
+            Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(replay),
+            }
+        } else {
+            unreachable!()
+        };
+        assert_eq!(
+            model.estimate_message_tokens(&request, &mismatch),
+            pi_rs_core::estimate_message_tokens(&mismatch)
+        );
+    }
     use futures_util::TryStreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

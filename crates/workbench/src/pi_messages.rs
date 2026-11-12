@@ -437,6 +437,24 @@ pub(super) fn is_pi_messages_replay(replay: &ProviderReplay) -> bool {
 
 #[async_trait::async_trait]
 impl Model for PiMessages {
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        match message {
+            Message::Assistant {
+                replay: Some(replay),
+                ..
+            } if replay.identity.provider == self.identity
+                && replay.identity.model == request.model
+                && replay.blocks.first().is_some_and(|marker| {
+                    marker["type"] == REPLAY_ORIGIN && marker["endpoint"] == self.origin_hash
+                }) =>
+            {
+                pi_rs::estimate_replay_tokens(&replay.blocks[1..])
+                    .max(pi_rs::estimate_message_tokens(message))
+            }
+            _ => pi_rs::estimate_message_tokens(message),
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         self.model_details(&[model.into()])
             .await

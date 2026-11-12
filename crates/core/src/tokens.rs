@@ -100,6 +100,53 @@ pub fn estimate_request_tokens(request: &ModelRequest) -> u64 {
     tokens.saturating_add(system_chars.div_ceil(4))
 }
 
+/// Estimate serialized replay blocks, replacing recognized inline image bytes
+/// with the same fixed image allowance used for ordinary image messages.
+pub fn estimate_replay_tokens(blocks: &[serde_json::Value]) -> u64 {
+    fn strip_images(value: &mut serde_json::Value) -> u64 {
+        match value {
+            serde_json::Value::String(text)
+                if text.starts_with("data:image/") && text.contains(";base64,") =>
+            {
+                text.clear();
+                1
+            }
+            serde_json::Value::Array(items) => items
+                .iter_mut()
+                .map(strip_images)
+                .fold(0, u64::saturating_add),
+            serde_json::Value::Object(object) => {
+                let inline_image = object
+                    .get("mimeType")
+                    .or_else(|| object.get("media_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|mime| mime.starts_with("image/"));
+                let image_block =
+                    object.get("type").and_then(serde_json::Value::as_str) == Some("image");
+                let mut images: u64 = 0;
+                if (inline_image || image_block)
+                    && object.get("data").is_some_and(serde_json::Value::is_string)
+                {
+                    object.insert("data".into(), serde_json::Value::String(String::new()));
+                    images = 1;
+                }
+                images.saturating_add(
+                    object
+                        .values_mut()
+                        .map(strip_images)
+                        .fold(0, u64::saturating_add),
+                )
+            }
+            _ => 0,
+        }
+    }
+    let mut blocks = serde_json::Value::Array(blocks.to_vec());
+    let images = strip_images(&mut blocks);
+    text_chars(&blocks.to_string())
+        .saturating_add(images.saturating_mul(ESTIMATED_IMAGE_CHARS))
+        .div_ceil(4)
+}
+
 pub(crate) fn estimate_source_tokens(
     session: &crate::Session,
     source: u64,
@@ -373,6 +420,18 @@ pub(crate) fn non_additive_native_system_checkpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_inline_images_use_fixed_allowance_but_signatures_remain_text() {
+        let block =
+            |n| serde_json::json!({"inlineData":{"mimeType":"image/png","data":"A".repeat(n)}});
+        assert_eq!(
+            estimate_replay_tokens(&[block(4)]),
+            estimate_replay_tokens(&[block(20000)])
+        );
+        let signature = serde_json::json!({"thoughtSignature":"x".repeat(5000)});
+        assert!(estimate_replay_tokens(&[signature]) > 1200);
+    }
 
     #[test]
     fn text_uses_utf16_units_and_ignores_role_envelopes() {

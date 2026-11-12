@@ -558,7 +558,7 @@ impl Agent<'_> {
                 if max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
-                let mut request = active
+                let (mut request, transformed) = active
                     .request(
                         session,
                         &states,
@@ -576,11 +576,8 @@ impl Agent<'_> {
                 }
                 let capacity = active.context_capacity(&request, cancel).await?;
                 let estimate = session.context_budget_estimate();
-                let input_tokens = if estimate.last_usage_record.is_some() {
-                    estimate.tokens
-                } else {
-                    crate::estimate_request_tokens(&request)
-                };
+                let input_tokens =
+                    active.request_budget_tokens(session, &request, estimate, transformed);
                 let exceeds = capacity.is_some_and(|window| {
                     input_tokens.saturating_add(u64::from(request.max_output_tokens))
                         > u64::from(window)
@@ -646,7 +643,15 @@ impl Agent<'_> {
                         .await;
                 }
                 let result = active
-                    .reply(session, request, true, cancel, observer, Some(followups))
+                    .reply(
+                        session,
+                        request,
+                        true,
+                        transformed,
+                        cancel,
+                        observer,
+                        Some(followups),
+                    )
                     .await?
                     .outcome;
                 let control = session.retry_control();
@@ -842,7 +847,7 @@ impl Agent<'_> {
         purpose: RequestPurpose,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
-    ) -> Result<ModelRequest> {
+    ) -> Result<(ModelRequest, bool)> {
         let branch = session.branch();
         let summary = branch.iter().rev().find_map(|record| match &record.event {
             Event::Compacted { summary, .. } => Some(summary.as_str()),
@@ -894,6 +899,7 @@ impl Agent<'_> {
             tools,
             max_output_tokens,
         };
+        let original = request.clone();
         for extension in &self.registry.extensions {
             let result = tokio::select! {
                 biased;
@@ -929,14 +935,69 @@ impl Agent<'_> {
         request
             .tools
             .retain(|spec| self.registry.has_tool(&spec.name));
-        Ok(request)
+        let transformed = request.model != original.model
+            || request.messages != original.messages
+            || request.tools != original.tools;
+        Ok((request, transformed))
     }
 
+    fn request_budget_tokens(
+        &self,
+        session: &Session,
+        request: &ModelRequest,
+        estimate: crate::ContextUsageEstimate,
+        transformed: bool,
+    ) -> u64 {
+        let Some(anchor) = estimate.last_usage_record.filter(|_| !transformed) else {
+            return self.model.estimate_request_tokens(request);
+        };
+        let branch = session.branch();
+        let (request_id, output_tokens) = branch
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Assistant {
+                    request_id,
+                    usage: Some(usage),
+                    ..
+                } if record.id == anchor => Some((*request_id, usage.output_tokens)),
+                _ => None,
+            })
+            .unwrap_or((None, 0));
+        let safe = request_id.is_some_and(|id| branch.iter().any(|record| matches!(&record.event,
+            Event::ModelRequested { request_id: Some(request_id), context_transformed: Some(false), .. } if *request_id == id)));
+        if !safe {
+            return self.model.estimate_request_tokens(request);
+        }
+        let entries = model_conversation_entries(&branch, session.operations());
+        // The measured output already includes generated reasoning on providers
+        // such as Google. Only replay beyond that measurement is additional.
+        let anchor_extra =
+            entries
+                .iter()
+                .find(|(source, _)| *source == anchor)
+                .map_or(0, |(_, message)| {
+                    self.model
+                        .estimate_message_tokens(request, message)
+                        .saturating_sub(crate::estimate_message_tokens(message).max(output_tokens))
+                });
+        let trailing = entries
+            .into_iter()
+            .filter(|(source, _)| *source > anchor)
+            .map(|(_, message)| self.model.estimate_message_tokens(request, &message))
+            .fold(0_u64, u64::saturating_add);
+        estimate
+            .usage_tokens
+            .saturating_add(anchor_extra)
+            .saturating_add(trailing)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn reply<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         request: ModelRequest,
         retain_reply: bool,
+        transformed: bool,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
@@ -960,6 +1021,7 @@ impl Agent<'_> {
                 request_id: Some(request_id),
                 context_head: Some(context_head),
                 context_sha256: Some(context_sha256),
+                context_transformed: Some(transformed),
             },
             observer,
         )?;
@@ -1910,7 +1972,7 @@ impl Agent<'_> {
         }
         let mut remaining = capacity
             .saturating_sub(reserve)
-            .saturating_sub(crate::estimate_request_tokens(&request))
+            .saturating_sub(self.model.estimate_request_tokens(&request))
             .saturating_sub(crate::estimate_message_tokens(&Message::User {
                 content: prompt.clone(),
             }))
@@ -2004,6 +2066,7 @@ impl Agent<'_> {
             let attempt = match Box::pin(self.reply::<AgentInput>(
                 session,
                 request.clone(),
+                false,
                 false,
                 cancel,
                 observer,
@@ -2155,7 +2218,7 @@ impl Agent<'_> {
                 "Nothing to compact (session too small)".into(),
             ));
         }
-        let mut request = self
+        let (mut request, transformed) = self
             .request(
                 session,
                 states,
@@ -2190,7 +2253,15 @@ impl Agent<'_> {
         }
         let allowance = request.max_output_tokens;
         let reply = self
-            .reply(session, request, false, cancel, observer, inputs)
+            .reply(
+                session,
+                request,
+                false,
+                transformed,
+                cancel,
+                observer,
+                inputs,
+            )
             .await?
             .outcome?;
         if reply.truncated {
@@ -2253,7 +2324,9 @@ impl Agent<'_> {
         let Some(window) = self.context_capacity(request, cancel).await? else {
             return Ok(false);
         };
-        Ok(crate::estimate_request_tokens(request)
+        Ok(self
+            .model
+            .estimate_request_tokens(request)
             .saturating_add(u64::from(request.max_output_tokens))
             > u64::from(window))
     }

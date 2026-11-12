@@ -1239,6 +1239,7 @@ mod tests {
                 request_id: Some(request_id),
                 context_head: None,
                 context_sha256: None,
+                context_transformed: None,
             },
             Event::ModelFinished {
                 request_id,
@@ -1318,6 +1319,7 @@ mod tests {
                 request_id: Some(request_id),
                 context_head: None,
                 context_sha256: None,
+                context_transformed: None,
             },
             Event::ModelFinished {
                 request_id,

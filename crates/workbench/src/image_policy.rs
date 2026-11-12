@@ -21,6 +21,21 @@ pub(super) struct WorkbenchModel {
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        self.client
+            .estimate_request_tokens(&self.filtered(request.clone()))
+    }
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        let mut one = request.clone();
+        one.messages = vec![message.clone()];
+        let filtered = self.filtered(one);
+        filtered
+            .messages
+            .iter()
+            .map(|m| self.client.estimate_message_tokens(&filtered, m))
+            .fold(0_u64, u64::saturating_add)
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         self.client.context_window(model).await
     }

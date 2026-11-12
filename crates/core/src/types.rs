@@ -611,6 +611,23 @@ pub type ModelStream = futures_util::stream::BoxStream<'static, Result<ModelEven
 
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
+    /// Estimate a message in the form this adapter sends to its provider.
+    fn estimate_message_tokens(&self, _request: &ModelRequest, message: &Message) -> u64 {
+        crate::estimate_message_tokens(message)
+    }
+
+    /// Estimate the complete request, including provider-specific message serialization.
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let mut base = request.clone();
+        base.messages.clear();
+        let messages = request
+            .messages
+            .iter()
+            .map(|message| self.estimate_message_tokens(request, message))
+            .fold(0_u64, u64::saturating_add);
+        crate::estimate_request_tokens(&base).saturating_add(messages)
+    }
+
     /// Effective context capacity, when the provider can discover it.
     async fn context_window(&self, _model: &str) -> Option<u32> {
         None

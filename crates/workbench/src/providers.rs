@@ -646,6 +646,29 @@ impl Client {
 
 #[async_trait::async_trait]
 impl Model for Client {
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &pi_rs::Message) -> u64 {
+        match self {
+            Self::Ollama(c) => c.estimate_message_tokens(request, message),
+            Self::Anthropic(c) => c.estimate_message_tokens(request, message),
+            Self::Google(c) => c.estimate_message_tokens(request, message),
+            Self::PiMessages(c) => c.estimate_message_tokens(request, message),
+            Self::OpenAi(c) => c.estimate_message_tokens(request, message),
+            Self::Deferred(c) => {
+                let client = c
+                    .provider
+                    .connect(c.adapter, &c.endpoint, Some("estimate".into()), false)
+                    .and_then(|client| match &c.options {
+                        Some((args, reported)) => client.with_model_options(args, *reported),
+                        None => Ok(client),
+                    });
+                client.map_or_else(
+                    |_| pi_rs::estimate_message_tokens(message),
+                    |client| client.estimate_message_tokens(request, message),
+                )
+            }
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         match self {
             Self::Ollama(client) => client.context_window(model).await,

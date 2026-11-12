@@ -2144,6 +2144,191 @@ async fn zero_reported_usage_falls_back_to_visible_content() {
 }
 
 #[tokio::test]
+async fn transformed_requests_invalidate_current_and_prior_measured_baselines() {
+    use std::sync::atomic::AtomicBool;
+    struct Shrink(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl Extension for Shrink {
+        fn id(&self) -> &str {
+            "shrink"
+        }
+        async fn before_request(
+            &self,
+            request: &mut ModelRequest,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            if self.0.load(Ordering::SeqCst) {
+                request
+                    .messages
+                    .retain(|m| matches!(m, Message::System { .. }));
+                request.messages.push(Message::User {
+                    content: "short".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+    for initially_transformed in [false, true] {
+        let enabled = Arc::new(AtomicBool::new(initially_transformed));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(Shrink(enabled.clone())))
+            .unwrap();
+        let mut first = answer("short");
+        if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+            *usage = Some(Usage {
+                input_tokens: 5000,
+                output_tokens: 20,
+            });
+        }
+        let model = Script::new(vec![first, answer("done")]);
+        let mut harness = agent(&model, &registry);
+        harness.limits.output_tokens_per_request = 64;
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        harness
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        enabled.store(!initially_transformed, Ordering::SeqCst);
+        harness.limits.context_window = Some(1000);
+        harness
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn measured_baseline_adds_provider_specific_trailing_tool_cost() {
+    struct CostlyToolResult(Script);
+    #[async_trait::async_trait]
+    impl Model for CostlyToolResult {
+        fn estimate_message_tokens(&self, _: &ModelRequest, message: &Message) -> u64 {
+            estimate_message_tokens(message)
+                + if matches!(message, Message::Tool { .. }) {
+                    300
+                } else {
+                    0
+                }
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.0.stream(request).await
+        }
+    }
+    let mut first = tool_reply(&[r#"{"id":"ok"}"#]);
+    if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+        *usage = Some(Usage {
+            input_tokens: 750,
+            output_tokens: 20,
+        });
+    }
+    let model = CostlyToolResult(Script::new(vec![first]));
+    let fixture = Arc::new(Fixture {
+        called: AtomicUsize::new(0),
+        hold: false,
+        effects: Mutex::new(BTreeMap::new()),
+    });
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Tools(fixture))).unwrap();
+    let mut harness = agent(&model, &registry);
+    harness.limits.context_window = Some(1000);
+    harness.limits.output_tokens_per_request = 64;
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    session.auto_compaction_control().set_enabled(false);
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let result = harness
+        .run(
+            &mut session,
+            Some("go".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Model(message)) if message.contains("automatic compaction is disabled"))
+    );
+    assert_eq!(model.0.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn measured_output_covers_replayed_reasoning_without_double_counting() {
+    struct ReplayCost(Script);
+    #[async_trait::async_trait]
+    impl Model for ReplayCost {
+        fn estimate_message_tokens(&self, _: &ModelRequest, message: &Message) -> u64 {
+            if matches!(message, Message::Assistant { .. }) {
+                1000
+            } else {
+                estimate_message_tokens(message)
+            }
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.0.stream(request).await
+        }
+    }
+    for (output_tokens, window, should_fit) in [(1000, 1500, true), (10, 700, false)] {
+        let mut first = answer("answer");
+        if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+            *usage = Some(Usage {
+                input_tokens: 20,
+                output_tokens,
+            });
+        }
+        let model = ReplayCost(Script::new(vec![first, answer("done")]));
+        let registry = Registry::default();
+        let mut harness = agent(&model, &registry);
+        harness.limits.output_tokens_per_request = 1100;
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        harness
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        harness.limits.output_tokens_per_request = 64;
+        harness.limits.context_window = Some(window);
+        let result = harness
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await;
+        assert_eq!(result.is_ok(), should_fit);
+        if !should_fit {
+            assert!(
+                matches!(result, Err(Error::Model(message)) if message.contains("automatic compaction is disabled"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn measured_context_triggers_reserve_even_when_text_estimate_is_small() {
     let mut first = answer("short");
     if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {

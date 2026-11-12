@@ -610,6 +610,19 @@ fn wire_request(
 
 #[async_trait::async_trait]
 impl Model for Google {
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        match message {
+            Message::Assistant {
+                replay: Some(replay),
+                ..
+            } if replay.identity == identity(&self.replay_scope, model_id(&request.model)) => {
+                pi_rs_core::estimate_replay_tokens(&replay.blocks)
+                    .max(pi_rs_core::estimate_message_tokens(message))
+            }
+            _ => pi_rs_core::estimate_message_tokens(message),
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         if self.probe_context {
             self.model(model).await?.context_window
@@ -812,6 +825,54 @@ fn report_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_estimate_matches_image_and_replay_serialization() {
+        let model = Google::new("https://example.com", "key").unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let tool = |n| {
+            Message::Tool { call_id: "c".into(), content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(n)}]}}).to_string(), is_error: false, is_structured: Some(true) }
+        };
+        let small = model.estimate_message_tokens(&request, &tool(4));
+        let large = model.estimate_message_tokens(&request, &tool(20000));
+        assert_eq!(small, large);
+        let replay = ProviderReplay {
+            identity: identity("google", "fixture"),
+            blocks: vec![
+                json!({"text":"answer"}),
+                json!({"text":"x".repeat(5000),"thought":true}),
+            ],
+        };
+        let assistant = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(replay)),
+        };
+        assert!(model.estimate_message_tokens(&request, &assistant) > 1000);
+        let mismatch = if let Message::Assistant {
+            replay: Some(mut replay),
+            ..
+        } = assistant.clone()
+        {
+            replay.identity.model = "different".into();
+            Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(replay),
+            }
+        } else {
+            unreachable!()
+        };
+        assert_eq!(
+            model.estimate_message_tokens(&request, &mismatch),
+            pi_rs_core::estimate_message_tokens(&mismatch)
+        );
+    }
 
     #[test]
     fn plain_json_tool_output_is_not_extracted_as_an_image() {

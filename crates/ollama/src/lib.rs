@@ -532,6 +532,28 @@ fn running_context_window(value: &Value, model: &str) -> Option<u32> {
 
 #[async_trait::async_trait]
 impl Model for Ollama {
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        let base = pi_rs_core::estimate_message_tokens(message);
+        if matches!(message, Message::Assistant { .. }) {
+            let encoded =
+                self.compatible_message(message.clone(), &self.replay_identity(&request.model));
+            let extra = encoded.iter().fold(0_u64, |sum, item| {
+                ["reasoning_content", "reasoning_details"]
+                    .iter()
+                    .filter_map(|key| item.get(*key))
+                    .filter(|value| !value.as_str().is_some_and(str::is_empty))
+                    .fold(sum, |sum, value| {
+                        sum.saturating_add(pi_rs_core::estimate_replay_tokens(
+                            std::slice::from_ref(value),
+                        ))
+                    })
+            });
+            base.saturating_add(extra)
+        } else {
+            base
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         let value = self.running_models().await?;
         running_context_window(&value, model)
@@ -961,6 +983,54 @@ struct CallDelta {
 #[cfg(test)]
 mod content_tests {
     use super::*;
+
+    #[test]
+    fn capacity_estimate_matches_image_and_replay_serialization() {
+        let model = Ollama::new("https://example.com", None)
+            .unwrap()
+            .with_chat_compatibility(
+                serde_json::from_value(json!({"requiresReasoningContentOnAssistantMessages":true}))
+                    .unwrap(),
+                Some(true),
+                true,
+                false,
+            );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let tool = |n| {
+            Message::Tool { call_id: "c".into(), content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(n)}]}}).to_string(), is_error: false, is_structured: Some(true) }
+        };
+        assert_eq!(
+            model.estimate_message_tokens(&request, &tool(4)),
+            model.estimate_message_tokens(&request, &tool(20000))
+        );
+        let replay = ProviderReplay {
+            identity: model.replay_identity("fixture"),
+            blocks: vec![json!({"type":"reasoning_content","text":"x".repeat(5000)})],
+        };
+        let assistant = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(replay)),
+        };
+        assert!(model.estimate_message_tokens(&request, &assistant) > 1000);
+        let mut mismatch = assistant.clone();
+        if let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &mut mismatch
+        {
+            replay.identity.model = "other".into();
+        }
+        assert_eq!(
+            model.estimate_message_tokens(&request, &mismatch),
+            pi_rs_core::estimate_message_tokens(&mismatch)
+        );
+    }
     #[test]
     fn context_capacity_uses_matching_running_models_and_rejects_invalid_sizes() {
         let value = json!({"models": [

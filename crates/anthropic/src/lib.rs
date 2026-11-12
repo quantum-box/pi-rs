@@ -799,6 +799,21 @@ impl StreamUsage {
 
 #[async_trait::async_trait]
 impl Model for Anthropic {
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        match message {
+            Message::Tool { content, .. } => content.encode_utf16().count().div_ceil(4) as u64,
+            Message::Assistant {
+                content,
+                calls,
+                replay: Some(replay),
+            } if replay_matches(replay, &self.replay_scope, &request.model, content, calls) => {
+                pi_rs_core::estimate_replay_tokens(&replay.blocks)
+                    .max(pi_rs_core::estimate_message_tokens(message))
+            }
+            _ => pi_rs_core::estimate_message_tokens(message),
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         self.model(model).await?.context_window
     }
@@ -1095,6 +1110,57 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_estimate_matches_image_and_replay_serialization() {
+        let model = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let tool = |n| {
+            Message::Tool { call_id: "c".into(), content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(n)}]}}).to_string(), is_error: false, is_structured: Some(true) }
+        };
+        let small = model.estimate_message_tokens(&request, &tool(4));
+        let large = model.estimate_message_tokens(&request, &tool(20000));
+        assert!(large > small + 4000);
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "anthropic".into(),
+                model: "fixture".into(),
+            },
+            blocks: vec![
+                json!({"type":"text","text":"answer"}),
+                json!({"type":"thinking","thinking":"x".repeat(5000),"signature":"sig"}),
+            ],
+        };
+        let assistant = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(replay)),
+        };
+        assert!(model.estimate_message_tokens(&request, &assistant) > 1000);
+        let mismatch = if let Message::Assistant {
+            replay: Some(mut replay),
+            ..
+        } = assistant.clone()
+        {
+            replay.identity.model = "different".into();
+            Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(replay),
+            }
+        } else {
+            unreachable!()
+        };
+        assert_eq!(
+            model.estimate_message_tokens(&request, &mismatch),
+            pi_rs_core::estimate_message_tokens(&mismatch)
+        );
+    }
 
     #[test]
     fn tool_result_error_status_is_encoded_independently_of_text() {
