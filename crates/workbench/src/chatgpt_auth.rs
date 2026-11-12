@@ -19,14 +19,16 @@ struct Registrations {
 }
 
 fn registrations() -> Result<Registrations> {
-    let path = super::config::agent_dir().join("chatgpt-registrations.json");
+    registrations_at(&super::config::agent_dir())
+}
+fn registrations_at(directory: &std::path::Path) -> Result<Registrations> {
+    let path = directory.join("chatgpt-registrations.json");
     let value = super::config::read_object(&path)?;
     if !value.as_object().is_some_and(|data| data.is_empty()) {
         return serde_json::from_value(value)
             .map_err(|_| Error::Config("invalid ChatGPT registrations".into()));
     }
-    let value =
-        super::config::read_object(&super::config::agent_dir().join("chatgpt-registration.json"))?;
+    let value = super::config::read_object(&directory.join("chatgpt-registration.json"))?;
     if value.as_object().is_some_and(|data| data.is_empty()) {
         return Ok(Registrations::default());
     }
@@ -73,12 +75,16 @@ fn saved_session(id: &str) -> Result<Option<pi_rs::openai::oauth::Credential>> {
         })
         .transpose()
 }
-fn clear_session(id: &str) -> Result<()> {
-    super::config::update_object(&sessions_path(), |sessions| {
+fn clear_session_locked(
+    directory: &std::path::Path,
+    guard: &super::auth_lock::Guard,
+    id: &str,
+) -> Result<()> {
+    super::config::update_object(&directory.join("chatgpt-sessions.json"), |sessions| {
         sessions.remove(id);
         Ok(())
     })?;
-    super::config::update_object(&auth_path(), |data| {
+    super::config::update_object_locked(&directory.join("auth.json"), Some(guard), |data| {
         if data
             .get(PROVIDER)
             .and_then(|entry| entry["credential"]["client_id"].as_str())
@@ -89,8 +95,12 @@ fn clear_session(id: &str) -> Result<()> {
         Ok(())
     })
 }
-fn load() -> Result<Option<pi_rs::openai::oauth::Credential>> {
-    let value = super::config::read_object(&auth_path())?;
+async fn clear_session(id: &str) -> Result<()> {
+    let directory = super::config::agent_dir();
+    let guard = super::auth_lock::acquire_async(&directory.join("auth.json")).await?;
+    clear_session_locked(&directory, &guard, id)
+}
+fn parse_credential(value: &serde_json::Value) -> Result<Option<pi_rs::openai::oauth::Credential>> {
     value
         .get(PROVIDER)
         .filter(|value| value["type"] == "oauth")
@@ -100,6 +110,13 @@ fn load() -> Result<Option<pi_rs::openai::oauth::Credential>> {
         })
         .transpose()
 }
+async fn load() -> Result<Option<pi_rs::openai::oauth::Credential>> {
+    load_at(&auth_path()).await
+}
+async fn load_at(path: &std::path::Path) -> Result<Option<pi_rs::openai::oauth::Credential>> {
+    parse_credential(&super::config::read_auth_object(path).await?)
+}
+
 async fn lock() -> Result<std::fs::File> {
     lock_path(super::config::agent_dir().join("chatgpt-refresh.lock")).await
 }
@@ -139,13 +156,17 @@ fn host_id() -> Result<String> {
     )?;
     Ok(result)
 }
-fn save(credential: &pi_rs::openai::oauth::Credential) -> Result<()> {
+fn save_locked(
+    directory: &std::path::Path,
+    guard: &super::auth_lock::Guard,
+    credential: &pi_rs::openai::oauth::Credential,
+) -> Result<()> {
     let registration = Registration {
         client_id: credential.client_id.clone(),
         subject: credential.subject.clone(),
         email: credential.email.clone(),
     };
-    let mut store = registrations()?;
+    let mut store = registrations_at(directory)?;
     if let Some(existing) = store
         .accounts
         .iter_mut()
@@ -156,14 +177,14 @@ fn save(credential: &pi_rs::openai::oauth::Credential) -> Result<()> {
         store.accounts.push(registration);
     }
     store.active = Some(credential.client_id.clone());
-    super::config::update_object(&sessions_path(), |sessions| {
+    super::config::update_object(&directory.join("chatgpt-sessions.json"), |sessions| {
         sessions.insert(
             credential.client_id.clone(),
             serde_json::to_value(credential)?,
         );
         Ok(())
     })?;
-    super::config::update_object(&auth_path(), |data| {
+    super::config::update_object_locked(&directory.join("auth.json"), Some(guard), |data| {
         data.insert(
             PROVIDER.into(),
             serde_json::json!({"type":"oauth","credential":credential}),
@@ -171,9 +192,62 @@ fn save(credential: &pi_rs::openai::oauth::Credential) -> Result<()> {
         Ok(())
     })?;
     super::config::write_json(
-        &super::config::agent_dir().join("chatgpt-registrations.json"),
+        &directory.join("chatgpt-registrations.json"),
         &serde_json::to_value(store)?,
     )
+}
+
+async fn save(credential: &pi_rs::openai::oauth::Credential) -> Result<()> {
+    let directory = super::config::agent_dir();
+    let guard = super::auth_lock::acquire_async(&directory.join("auth.json")).await?;
+    save_locked(&directory, &guard, credential)
+}
+
+// Once token rotation starts, a blocking worker owns both locks through
+// persistence, even if the caller or its runtime is cancelled.
+async fn refresh_with<F, Fut>(
+    directory: std::path::PathBuf,
+    previous: pi_rs::openai::oauth::Credential,
+    expected_active: Option<pi_rs::openai::oauth::Credential>,
+    chat_lock: std::fs::File,
+    exchange: F,
+) -> Result<pi_rs::openai::oauth::Credential>
+where
+    F: FnOnce(pi_rs::openai::oauth::Credential) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<pi_rs::openai::oauth::Credential>> + Send + 'static,
+{
+    let auth = directory.join("auth.json");
+    let guard = super::auth_lock::acquire_async(&auth).await?;
+    if let Some(expected) = expected_active {
+        let current = parse_credential(&super::config::read_object_unlocked(&auth)?)?;
+        guard.check()?;
+        if current.map(serde_json::to_value).transpose()? != Some(serde_json::to_value(expected)?) {
+            return Err(Error::Config(
+                "ChatGPT credentials changed during refresh".into(),
+            ));
+        }
+    }
+    tokio::task::spawn_blocking(move || {
+        let _chat_lock = chat_lock;
+        let _barrier = super::process::refresh_barrier()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| Error::Config("could not start ChatGPT refresh runtime".into()))?;
+        match runtime.block_on(exchange(previous.clone())) {
+            Ok(refreshed) => {
+                save_locked(&directory, &guard, &refreshed)?;
+                Ok(refreshed)
+            }
+            Err(error @ Error::AuthorizationRequired { .. }) => {
+                clear_session_locked(&directory, &guard, &previous.client_id)?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .await
+    .map_err(|_| Error::Config("ChatGPT refresh task failed".into()))?
 }
 
 fn client(settings: &super::config::Settings) -> Result<reqwest::Client> {
@@ -189,7 +263,7 @@ pub(super) async fn login(
     account: Option<&str>,
     announce: impl FnOnce(&Url),
 ) -> Result<()> {
-    let _lock = lock().await?;
+    let mut chat_lock = Some(lock().await?);
     let store = registrations()?;
     let registered = if new_account {
         None
@@ -226,24 +300,28 @@ pub(super) async fn login(
                 .map_err(|_| Error::Config("invalid system clock".into()))?
                 .as_secs();
             if credential.expires_at <= now.saturating_add(180) {
-                match credential.refresh(&client(settings)?).await {
-                    Ok(refreshed) => {
-                        save(&refreshed)?;
-                        if refreshed.has_plan_access() {
-                            return Ok(());
-                        }
-                        needs_consent = true;
-                    }
-                    Err(Error::AuthorizationRequired { .. }) => {
-                        clear_session(&account.client_id)?;
-                    }
+                let http = client(settings)?;
+                let result = refresh_with(
+                    super::config::agent_dir(),
+                    credential,
+                    None,
+                    chat_lock.take().expect("ChatGPT lock"),
+                    move |previous| async move { previous.refresh(&http).await },
+                )
+                .await;
+                match result {
+                    Ok(refreshed) if refreshed.has_plan_access() => return Ok(()),
+                    Ok(_) => needs_consent = true,
+                    Err(Error::AuthorizationRequired { .. }) => (),
                     Err(error) => return Err(error),
                 }
+                chat_lock = Some(lock().await?);
             } else {
-                return save(&credential);
+                return save(&credential).await;
             }
         }
     }
+    let _chat_lock = chat_lock;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let callback = Url::parse(&format!(
         "http://127.0.0.1:{}/auth/callback",
@@ -281,7 +359,7 @@ pub(super) async fn login(
             ));
         }
         let allowed = credential.has_plan_access();
-        save(&credential)?;
+        save(&credential).await?;
         Ok(allowed)
     }
     .await;
@@ -296,9 +374,11 @@ pub(super) async fn login(
 }
 
 pub(super) async fn access(settings: &super::config::Settings) -> Result<String> {
-    let _lock = lock().await?;
-    let mut credential =
-        load()?.ok_or_else(|| Error::Config("sign in with pi login openai-chatgpt".into()))?;
+    let chat_lock = lock().await?;
+    let active = load()
+        .await?
+        .ok_or_else(|| Error::Config("sign in with pi login openai-chatgpt".into()))?;
+    let mut credential = active.clone();
     if let Some(saved) = saved_session(&credential.client_id)?
         && saved.subject == credential.subject
         && saved.expires_at >= credential.expires_at
@@ -315,16 +395,15 @@ pub(super) async fn access(settings: &super::config::Settings) -> Result<String>
         .map_err(|_| Error::Config("invalid system clock".into()))?
         .as_secs();
     if credential.expires_at <= now.saturating_add(180) {
-        let client = client(settings)?;
-        credential = match credential.refresh(&client).await {
-            Ok(refreshed) => refreshed,
-            Err(error @ Error::AuthorizationRequired { .. }) => {
-                clear_session(&credential.client_id)?;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-        save(&credential)?;
+        let http = client(settings)?;
+        credential = refresh_with(
+            super::config::agent_dir(),
+            credential,
+            Some(active),
+            chat_lock,
+            move |previous| async move { previous.refresh(&http).await },
+        )
+        .await?;
     }
     if !credential.has_plan_access() {
         return Err(Error::Config(
@@ -336,17 +415,163 @@ pub(super) async fn access(settings: &super::config::Settings) -> Result<String>
 
 pub(super) async fn logout(settings: &super::config::Settings) -> Result<bool> {
     let _lock = lock().await?;
-    let Some(credential) = load()? else {
+    let Some(credential) = load().await? else {
         return Ok(false);
     };
     let revoked = match client(settings) {
         Ok(client) => credential.revoke(&client).await,
         Err(error) => Err(error),
     };
-    clear_session(&credential.client_id)?;
+    clear_session(&credential.client_id).await?;
     revoked.map(|()| true).map_err(|_| {
         Error::Config(
             "ChatGPT local credentials removed; remote revocation was not confirmed".into(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture(directory: &std::path::Path) -> pi_rs::openai::oauth::Credential {
+        let value = pi_rs::openai::oauth::Credential {
+            client_id: "client".into(),
+            subject: "subject".into(),
+            email: None,
+            id_token: "id".into(),
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            expires_at: 1,
+            scopes: vec!["chatgpt.tokens.use.direct".into()],
+        };
+        std::fs::write(directory.join("auth.json"), serde_json::json!({"openai-chatgpt":{"type":"oauth","credential":value},"kimi-coding":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+        value
+    }
+    #[tokio::test]
+    async fn reads_and_pre_refresh_lock_wait_are_cancellable() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = fixture(dir.path());
+        let auth = dir.path().join("auth.json");
+        let shared = super::super::auth_lock::acquire_async(&auth).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), load_at(&auth))
+                .await
+                .is_err()
+        );
+        let chat_lock = lock_path(dir.path().join("chatgpt-refresh.lock"))
+            .await
+            .unwrap();
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let path = dir.path().to_owned();
+        let task = tokio::spawn(refresh_with(
+            path,
+            previous.clone(),
+            Some(previous),
+            chat_lock,
+            move |value| async move {
+                let _ = entered_tx.send(());
+                Ok(value)
+            },
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut entered_rx)
+                .await
+                .is_err()
+        );
+        task.abort();
+        let _ = task.await;
+        drop(shared);
+        let loaded = load_at(&auth).await.unwrap().unwrap();
+        assert_eq!(loaded.refresh_token, "old-refresh");
+        assert!(entered_rx.await.is_err());
+        let _reacquired = tokio::time::timeout(
+            Duration::from_secs(2),
+            lock_path(dir.path().join("chatgpt-refresh.lock")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn changed_active_account_is_not_refreshed_or_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = fixture(dir.path());
+        let auth = dir.path().join("auth.json");
+        let shared = super::super::auth_lock::acquire_async(&auth).await.unwrap();
+        let chat_lock = lock_path(dir.path().join("chatgpt-refresh.lock"))
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(refresh_with(
+            dir.path().to_owned(),
+            previous.clone(),
+            Some(previous),
+            chat_lock,
+            move |value| async move {
+                let _ = entered_tx.send(());
+                Ok(value)
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut changed = super::super::config::read_object_unlocked(&auth).unwrap();
+        changed["openai-chatgpt"]["credential"]["access_token"] = serde_json::json!("different");
+        std::fs::write(&auth, changed.to_string()).unwrap();
+        drop(shared);
+        assert!(task.await.unwrap().is_err());
+        assert!(entered_rx.await.is_err());
+        assert_eq!(
+            super::super::config::read_object(&auth).unwrap()["openai-chatgpt"]["credential"]["access_token"],
+            "different"
+        );
+    }
+
+    #[test]
+    fn cancelled_refresh_survives_runtime_shutdown_and_persists_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = fixture(dir.path());
+        let directory = dir.path().to_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        runtime.block_on(async {
+            let chat_lock = lock_path(directory.join("chatgpt-refresh.lock"))
+                .await
+                .unwrap();
+            let task = tokio::spawn(refresh_with(
+                directory.clone(),
+                previous.clone(),
+                Some(previous),
+                chat_lock,
+                move |mut value| async move {
+                    started_tx.send(()).unwrap();
+                    reply_rx.await.unwrap();
+                    value.access_token = "new-access".into();
+                    value.refresh_token = "rotated".into();
+                    value.expires_at = 4_000_000_000;
+                    Ok(value)
+                },
+            ));
+            started_rx.await.unwrap();
+            task.abort();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                reply_tx.send(()).unwrap();
+            });
+        });
+        let start = std::time::Instant::now();
+        drop(runtime);
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        let auth = super::super::config::read_object(&directory.join("auth.json")).unwrap();
+        assert_eq!(
+            auth["openai-chatgpt"]["credential"]["refresh_token"],
+            "rotated"
+        );
+        assert_eq!(auth["kimi-coding"]["key"], "keep");
+        let sessions =
+            super::super::config::read_object(&directory.join("chatgpt-sessions.json")).unwrap();
+        assert_eq!(sessions["client"]["refresh_token"], "rotated");
+    }
 }

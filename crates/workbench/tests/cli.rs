@@ -5094,3 +5094,63 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn chatgpt_access_and_account_login_wait_for_shared_auth_lock() {
+    for login in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let credential = json!({"client_id":"client","subject":"subject","email":null,"id_token":"id","access_token":"cached","refresh_token":"refresh","expires_at":4_000_000_000u64,"scopes":["chatgpt.tokens.use.direct"]});
+        std::fs::write(root.path().join("auth.json"), json!({"openai-chatgpt":{"type":"oauth","credential":credential},"kimi-coding":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+        std::fs::write(
+            root.path().join("chatgpt-sessions.json"),
+            json!({"client":credential}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("chatgpt-registrations.json"), json!({"active":"client","accounts":[{"client_id":"client","subject":"subject","email":null}]}).to_string()).unwrap();
+        let chat_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.path().join("chatgpt-refresh.lock"))
+            .unwrap();
+        chat_lock.lock().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if login {
+            command.args(["login", "openai-chatgpt", "--account", "client"]);
+        } else {
+            command.args(["--provider", "openai-chatgpt", "auth", "check", "--json"]);
+        }
+        let mut child = command.spawn().unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_none());
+        let shared = root.path().join("auth.json.lock");
+        std::fs::create_dir(&shared).unwrap();
+        chat_lock.unlock().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let waited = child.try_wait().unwrap().is_none();
+        std::fs::remove_dir(shared).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            waited,
+            "ChatGPT exited instead of waiting for the shared auth lock"
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(value["kimi-coding"]["key"], "keep");
+        assert_eq!(
+            value["openai-chatgpt"]["credential"]["refresh_token"],
+            "refresh"
+        );
+    }
+}
