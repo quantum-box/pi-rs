@@ -27,6 +27,7 @@ mod extension_ui;
 mod http_proxy;
 mod image_policy;
 mod interactive;
+mod kimi_auth;
 mod mcp_config;
 mod model_auth;
 mod model_listing;
@@ -1134,7 +1135,7 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
@@ -1150,7 +1151,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding"])]
         provider: String,
     },
     Run {
@@ -1629,6 +1630,11 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                         eprintln!("Continue with ChatGPT in your browser: {url}")
                     })
                     .await
+                } else if provider == "kimi-coding" {
+                    kimi_auth::login(&args.settings, |url, code| {
+                        eprintln!("Enter code {code} at {url}")
+                    })
+                    .await
                 } else if provider == "openrouter" {
                     if *device_code {
                         return Err(Error::Config(
@@ -1664,6 +1670,8 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         Some(Command::Logout { provider }) => {
             let removed = if provider == "openai-chatgpt" {
                 chatgpt_auth::logout(&args.settings).await?
+            } else if provider == "kimi-coding" {
+                kimi_auth::logout().await?
             } else if provider == "openrouter" {
                 model_auth::remove(
                     &Provider::named(provider).expect("built-in OpenRouter provider"),

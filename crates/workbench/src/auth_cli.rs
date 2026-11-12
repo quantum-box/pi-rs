@@ -127,7 +127,11 @@ async fn resolve(
         if wanted.is_some_and(|wanted| wanted != kind) {
             return Ok(None);
         }
-        let value = credential.resolve().await?;
+        let value = if matches!(credential, super::model_auth::Credential::Kimi) {
+            super::kimi_auth::access(&args.settings, minimum, no_refresh).await?
+        } else {
+            credential.resolve().await?
+        };
         if !super::model_auth::valid_key(&value) {
             return Err(Error::Config("invalid provider credential".into()));
         }

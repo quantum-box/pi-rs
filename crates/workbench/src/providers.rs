@@ -244,6 +244,14 @@ impl Deferred {
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
             ),
+            Some(Credential::Kimi) if self.http_settings.is_some() => Some(
+                super::kimi_auth::access(
+                    self.http_settings.as_ref().expect("settings checked"),
+                    std::time::Duration::ZERO,
+                    false,
+                )
+                .await?,
+            ),
             Some(credential) => Some(credential.resolve().await?),
             None => None,
         };

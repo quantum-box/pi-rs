@@ -16,6 +16,7 @@ pub(super) enum Credential {
     StoredCommand(String),
     Invalid,
     ChatGpt,
+    Kimi,
 }
 
 type CommandResult = std::result::Result<String, &'static str>;
@@ -44,12 +45,16 @@ impl Credential {
     pub fn literal(&self) -> Option<&str> {
         match self {
             Self::Literal(value) | Self::Bearer(value) => Some(value),
-            Self::Command(_) | Self::StoredCommand(_) | Self::Invalid | Self::ChatGpt => None,
+            Self::Command(_)
+            | Self::StoredCommand(_)
+            | Self::Invalid
+            | Self::ChatGpt
+            | Self::Kimi => None,
         }
     }
 
     pub fn is_bearer(&self) -> bool {
-        matches!(self, Self::Bearer(_) | Self::ChatGpt)
+        matches!(self, Self::Bearer(_) | Self::ChatGpt | Self::Kimi)
     }
 
     pub fn is_command(&self) -> bool {
@@ -57,7 +62,7 @@ impl Credential {
     }
 
     pub fn requires_resolution(&self) -> bool {
-        self.is_command() || matches!(self, Self::ChatGpt | Self::Invalid)
+        self.is_command() || matches!(self, Self::ChatGpt | Self::Kimi | Self::Invalid)
     }
 
     pub async fn resolve(&self) -> Result<String> {
@@ -67,6 +72,10 @@ impl Credential {
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
+            }
+            Self::Kimi => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::kimi_auth::access(&settings, std::time::Duration::ZERO, false).await;
             }
             Self::Command(command) => resolve_command(command).await,
             Self::StoredCommand(command) => {
@@ -122,7 +131,8 @@ impl Keys {
             .filter_map(|(name, entry)| {
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
-                let oauth = (name.eq_ignore_ascii_case("openrouter") || chatgpt)
+                let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";
+                let oauth = (name.eq_ignore_ascii_case("openrouter") || chatgpt || kimi)
                     && entry["type"] == "oauth";
                 let key = if chatgpt {
                     serde_json::from_value::<pi_rs::openai::oauth::Credential>(
@@ -130,6 +140,13 @@ impl Keys {
                     )
                     .ok()?;
                     Some(Credential::ChatGpt)
+                } else if kimi {
+                    let credential: super::kimi_auth::Credential =
+                        serde_json::from_value(entry.clone()).ok()?;
+                    if !valid_key(&credential.access) || !valid_key(&credential.refresh) {
+                        return None;
+                    }
+                    Some(Credential::Kimi)
                 } else if oauth {
                     let access = entry["access"].as_str()?;
                     Some(valid_key(access).then(|| Credential::Literal(access.into()))?)
@@ -168,7 +185,7 @@ impl Keys {
                 };
                 if oauth
                     && !chatgpt
-                    && super::builtin_chat::find("openrouter")
+                    && super::builtin_chat::find(if kimi { "kimi-coding" } else { "openrouter" })
                         .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
                 {
                     return None;
@@ -350,7 +367,9 @@ pub(super) fn remove(provider: &Provider) -> Result<bool> {
         let kind = data
             .get(provider.id())
             .and_then(|value| value["type"].as_str());
-        if kind == Some("api_key") || (provider.id() == "openrouter" && kind == Some("oauth")) {
+        if kind == Some("api_key")
+            || (matches!(provider.id(), "openrouter" | "kimi-coding") && kind == Some("oauth"))
+        {
             data.remove(provider.id());
             removed = true;
         }
@@ -513,6 +532,32 @@ mod tests {
         );
         assert!(
             keys.get(&Provider::Anthropic, "http://127.0.0.1:8001/v1/messages")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn kimi_pi_oauth_is_endpoint_bound_and_bearer() {
+        let provider = Provider::named("kimi-coding").unwrap();
+        let keys = Keys::parse(
+            &json!({"kimi-coding":{"type":"oauth","access":"access","refresh":"refresh","expires":123}}),
+        );
+        let credential = keys
+            .credential(&provider, provider.default_endpoint())
+            .unwrap();
+        assert!(matches!(credential, Credential::Kimi));
+        assert!(credential.is_bearer());
+        assert!(keys.oauth(&provider, provider.default_endpoint()));
+        assert!(
+            keys.credential(&provider, "http://localhost:1234/v1/messages")
+                .is_none()
+        );
+        let invalid = Keys::parse(
+            &json!({"kimi-coding":{"type":"oauth","access":"access","refresh":"refresh","expires":123,"endpoint":"http://localhost:1234/v1/messages"}}),
+        );
+        assert!(
+            invalid
+                .credential(&provider, provider.default_endpoint())
                 .is_none()
         );
     }

@@ -2667,6 +2667,14 @@ fn slash(
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
         }
+        "/login" if rest.eq_ignore_ascii_case("kimi-coding") => {
+            start_kimi_login(view, &args.settings)
+        }
+        "/logout" if rest.eq_ignore_ascii_case("kimi-coding") => start_kimi_logout(view),
+        "/login" if rest.eq_ignore_ascii_case("kimi-coding api-key") => edit_provider_key(
+            super::Provider::named("kimi-coding").expect("Kimi provider"),
+            view,
+        ),
         "/login" if rest.eq_ignore_ascii_case("radius") => show_radius_methods(view),
         "/login" if rest.eq_ignore_ascii_case("radius browser") => {
             start_radius_login(view, &args.settings, radius_auth::Method::Browser)?;
@@ -2734,6 +2742,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "kimi-coding · Subscription OAuth".into(),
+                            selection: Selection::LoginKimi,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -5136,6 +5151,41 @@ fn show_radius_methods(view: &mut View) {
     ));
 }
 
+fn start_kimi_logout(view: &mut View) {
+    view.remote_task = Some(RemoteTask::start(
+        "Signing out of Kimi Code",
+        "Kimi Code logout cancelled",
+        move |sender| async move {
+            let removed = super::kimi_auth::logout().await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec![
+                if removed {
+                    "Signed out of Kimi Code"
+                } else {
+                    "No saved Kimi Code credential"
+                }
+                .into(),
+            ])
+        },
+    ));
+}
+
+fn start_kimi_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    view.remote_task = Some(RemoteTask::start(
+        "Signing in to Kimi Code",
+        "Kimi Code login cancelled",
+        move |sender| async move {
+            super::kimi_auth::login(&settings, |url, code| {
+                let _ = sender.send(RemoteEvent::Notice(format!("Enter code {code} at {url}")));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to Kimi Code".into()])
+        },
+    ));
+}
+
 fn start_openrouter_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     view.remote_task = Some(RemoteTask::start(
@@ -6123,6 +6173,7 @@ fn select(
         }
         Selection::Completion { range, text } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
+        Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
         Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings, false, None),
         Selection::LoginChatGptNew => start_chatgpt_login(view, &args.settings, true, None),
@@ -6130,6 +6181,9 @@ fn select(
             start_chatgpt_login(view, &args.settings, false, Some(id))
         }
         Selection::LogoutChatGpt => start_chatgpt_logout(view, &args.settings),
+        Selection::LogoutProvider(provider) if provider.id() == "kimi-coding" => {
+            start_kimi_logout(view)
+        }
         Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
         Selection::RadiusMethods => show_radius_methods(view),
         Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,
