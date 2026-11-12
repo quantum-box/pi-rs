@@ -1032,6 +1032,143 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn imported_assistant_total_tokens_survive_projection_and_edits() {
+        let entries = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[],"stopReason":"stop","usage":{"totalTokens":234}}}),
+            json!({"type":"model_change","id":"m","parentId":"a","provider":"ollama","modelId":"new"}),
+        ];
+        let session = import_pi(entries).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 234);
+        assert_eq!(session.context_usage(1000).unwrap().tokens, Some(234));
+    }
+
+    #[test]
+    fn imported_total_only_usage_keeps_post_compaction_estimate_available() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"compaction","id":"c","parentId":"u","summary":"summary","firstKeptEntryId":"u","tokensBefore":10}),
+            json!({"type":"message","id":"a","parentId":"c","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning"}],"stopReason":"stop","usage":{"totalTokens":234}}}),
+            json!({"type":"context_edit","id":"e","parentId":"a","targetId":"u","replacement":{"content":"changed"}}),
+        ]).unwrap();
+        assert!(session.context_usage_estimate().last_usage_record.is_none());
+        assert!(session.context_usage(1000).unwrap().tokens.is_some());
+    }
+
+    #[test]
+    fn imported_assistant_edit_counts_replacement_thinking() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"old thinking"},{"type":"text","text":"old"}],"stopReason":"stop","usage":{"totalTokens":100}}}),
+            json!({"type":"context_edit","id":"e","parentId":"a","targetId":"a","replacement":{"content":[{"type":"text","text":"a"},{"type":"thinking","thinking":"🦀bc"}]}}),
+        ]).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 2);
+    }
+
+    #[test]
+    fn retained_tool_result_is_estimated_without_its_compacted_assistant() {
+        let mut entries = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","stopReason":"toolUse","content":[{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"t","parentId":"a","message":{"role":"toolResult","toolCallId":"call","content":[{"type":"text","text":"12345678"}],"isError":false}}),
+            json!({"type":"compaction","id":"c","parentId":"t","firstKeptEntryId":"t","summary":"sum","tokensBefore":100}),
+        ];
+        let session = import_pi(entries.clone()).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 3);
+        entries.push(json!({"type":"context_edit","id":"e","parentId":"c","targetId":"t","replacement":{"content":"abcd"}}));
+        assert_eq!(
+            import_pi(entries).unwrap().context_usage_estimate().tokens,
+            2
+        );
+    }
+
+    #[test]
+    fn imported_summary_messages_count_raw_summary_in_fresh_and_trailing_estimates() {
+        let base = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"b","parentId":null,"message":{"role":"branchSummary","summary":"abcd"}}),
+            json!({"type":"message","id":"c","parentId":"b","message":{"role":"compactionSummary","summary":"12345678","tokensBefore":100}}),
+        ];
+        assert_eq!(
+            import_pi(base.clone())
+                .unwrap()
+                .context_usage_estimate()
+                .tokens,
+            3
+        );
+        let mut trailing = vec![
+            base[0].clone(),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stopReason":"stop","usage":{"totalTokens":100}}}),
+        ];
+        let mut b = base[1].clone();
+        b["parentId"] = json!("a");
+        trailing.push(b);
+        trailing.push(base[2].clone());
+        assert_eq!(
+            import_pi(trailing).unwrap().context_usage_estimate().tokens,
+            103
+        );
+    }
+
+    #[test]
+    fn imported_system_images_are_counted_in_trailing_system_delta() {
+        let system = json!({"type":"message","id":"s","parentId":"a","message":{"role":"system","content":[{"type":"text","text":"ab"},{"type":"image","data":"AA==","mimeType":"image/png"},{"type":"text","text":"cd"}]}});
+        let mut fresh_system = system.clone();
+        fresh_system["parentId"] = serde_json::Value::Null;
+        // Pi's fallback resolves current system content to text first.
+        assert_eq!(
+            import_pi(vec![json!({"type":"session","version":3}), fresh_system])
+                .unwrap()
+                .context_usage_estimate()
+                .tokens,
+            2
+        );
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stopReason":"stop","usage":{"totalTokens":100}}}),
+            system,
+        ]).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 1301);
+    }
+
+    #[test]
+    fn imported_system_section_replacement_uses_pi_trailing_delta() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"s1","parentId":null,"message":{"role":"system","content":"","sections":{"rules":"12345678"}}}),
+            json!({"type":"message","id":"a","parentId":"s1","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stopReason":"stop","usage":{"totalTokens":100}}}),
+            json!({"type":"message","id":"s2","parentId":"a","message":{"role":"system","content":"","sections":{"rules":"abcd"}}}),
+        ]).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 101);
+    }
+
+    #[test]
+    fn imported_compaction_without_system_snapshot_discards_old_system_from_estimate() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"s","parentId":null,"message":{"role":"system","content":"12345678"}}),
+            json!({"type":"message","id":"u","parentId":"s","message":{"role":"user","content":"abcd"}}),
+            json!({"type":"compaction","id":"c","parentId":"u","firstKeptEntryId":"u","summary":"sum","tokensBefore":100}),
+        ]).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 2);
+    }
+
+    #[test]
+    fn failed_imported_assistant_estimates_partial_tool_calls_without_executing_them() {
+        for stop in ["error", "aborted"] {
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","stopReason":stop,"usage":{"totalTokens":100},"content":[{"type":"text","text":"a"},{"type":"thinking","thinking":"bc"},{"type":"toolCall","id":"call","name":"read","arguments":{"path":"x"}}]}}),
+            ]).unwrap();
+            // 3 text/thinking + 4 tool name + 12 compact JSON characters = 19.
+            assert_eq!(session.context_usage_estimate().tokens, 5);
+            assert!(session.operations().is_empty());
+        }
+    }
+
+    #[test]
     fn continuation_counts_empty_assistants_and_respects_omissions() {
         use clap::Parser;
         for reason in ["error", "aborted", "stop"] {

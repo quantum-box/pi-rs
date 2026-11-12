@@ -1699,8 +1699,9 @@ length. Assistant calls include their names and normalized JSON arguments.
 System prompts and advertised tool schemas are included in request estimates.
 Shell entries count their command and output, excluding presentation wrappers.
 
-The same estimators drive context checks, configured retention boundaries and
-RPC `tokensBefore`. Native structured tool images use the same extraction
+Native request budgeting and configured retention retain the original estimator;
+Pi-compatible session reporting uses a separate projection-based estimate.
+Native structured tool images in request estimates use the same extraction
 routine as the Ollama encoder, so inline image bytes do not become text-token
 estimates. The encoder retains its existing text and image output shape.
 
@@ -1722,17 +1723,25 @@ added again. A nonzero raw provider prompt total takes precedence when supplied.
 The public `ContextUsageEstimate` reports the measured portion, trailing portion
 and source record as well as the total.
 
-Later context edits, compaction, system checkpoints or model-selection changes
-invalidate an older measurement. Estimation then uses the visible journal until
-a new measured assistant response becomes available. Branch checkout and file
+For native budgeting, later context edits, compaction, system checkpoints or
+model-selection changes invalidate an older measurement. The Pi-compatible
+session report instead follows the Pi projection and its invalidation rules.
+Branch checkout and file
 reopening reconstruct the appropriate measurement from that branch. Estimated,
 zero-usage and failed responses do not create measured anchors.
 
-Automatic compaction uses measured context when available, including cases
-where a short text response consumed a large provider context. RPC
-`tokensBefore` uses the same estimate. Summary requests themselves retain
+Automatic compaction uses the native measured estimate when available, including
+cases where a short text response consumed a large provider context. Summary requests retain
 prefix-specific character estimates rather than borrowing usage for the whole
-conversation.
+conversation. The compaction record and RPC response report Pi-compatible
+`tokensBefore`, independently of the native retention budget.
+
+Native budgeting remains a provider-independent heuristic, not a strict bound:
+it does not count provider-specific assistant replay blocks, it extracts tool
+images even for adapters that may serialize the original envelope, and a request
+hook can shrink the actual prompt while an older measured baseline remains in
+use. Provider-aware budgeting and reconciliation with transformed requests are
+separate work.
 
 Tests cover trailing input, edits, compaction, model changes, checkout, reopening,
 zero usage and cached-input accounting. Loopback Ollama checks verify early

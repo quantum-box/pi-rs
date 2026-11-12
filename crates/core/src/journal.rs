@@ -682,6 +682,117 @@ impl Session {
 
     pub fn context_usage_estimate(&self) -> crate::ContextUsageEstimate {
         let branch = self.branch();
+        let entries = conversation_entries_unrepaired(&branch, self.operations());
+        let system_invalidations = crate::tokens::non_additive_native_system_checkpoints(&branch);
+        let invalidated_at = branch
+            .iter()
+            .rev()
+            .find_map(|record| {
+                (matches!(
+                    record.event,
+                    Event::ContextEdited { .. } | Event::Compacted { .. }
+                ) || system_invalidations.contains(&record.id))
+                .then_some(record.id)
+            })
+            .unwrap_or(0);
+        let completions: BTreeMap<_, _> = branch
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::ModelFinished {
+                    request_id,
+                    metadata,
+                    failure,
+                    ..
+                } => Some((*request_id, (metadata, failure))),
+                _ => None,
+            })
+            .collect();
+        for (index, (source, message)) in entries.iter().enumerate().rev() {
+            if !matches!(message, Message::Assistant { .. }) || *source <= invalidated_at {
+                continue;
+            }
+            let Some(record) = self.records.get(source.saturating_sub(1) as usize) else {
+                continue;
+            };
+            let Event::Assistant {
+                usage: Some(usage),
+                request_id,
+                ..
+            } = &record.event
+            else {
+                continue;
+            };
+            let completion =
+                request_id.and_then(|request_id| completions.get(&request_id).copied());
+            if completion.is_some_and(|(metadata, failure)| {
+                failure.is_some()
+                    || matches!(
+                        metadata.finish_reason.as_deref(),
+                        Some("error" | "aborted" | "cancelled")
+                    )
+            }) {
+                continue;
+            }
+            let input = completion
+                .and_then(|(metadata, _)| metadata.provider_prompt_tokens)
+                .filter(|tokens| *tokens > 0)
+                .unwrap_or(usage.input_tokens);
+            let usage_tokens = self
+                .imported_context_total(*source)
+                .unwrap_or_else(|| input.saturating_add(usage.output_tokens));
+            if usage_tokens == 0 {
+                continue;
+            }
+            let trailing_tokens =
+                entries[index + 1..]
+                    .iter()
+                    .fold(0_u64, |tokens, (source, message)| {
+                        tokens.saturating_add(crate::tokens::estimate_source_tokens(
+                            self, *source, message,
+                        ))
+                    });
+            // Pi estimates each system delta that follows the measured reply.
+            let trailing_tokens = branch
+                .iter()
+                .filter(|record| {
+                    record.id > *source && matches!(record.event, Event::SystemCheckpoint { .. })
+                })
+                .fold(trailing_tokens, |tokens, record| {
+                    tokens.saturating_add(crate::tokens::estimate_system_delta(self, record))
+                });
+            return crate::ContextUsageEstimate {
+                tokens: usage_tokens.saturating_add(trailing_tokens),
+                usage_tokens,
+                trailing_tokens,
+                last_usage_record: Some(*source),
+            };
+        }
+        let summary = branch.iter().rev().find_map(|record| match &record.event {
+            Event::Compacted { summary, .. } => Some(summary),
+            _ => None,
+        });
+        let initial = summary
+            .map_or(0, |summary| {
+                crate::estimate_message_tokens(&Message::User {
+                    content: summary.clone(),
+                })
+            })
+            .saturating_add(crate::tokens::estimate_system_tokens(&branch));
+        let tokens = entries.iter().fold(initial, |tokens, (source, message)| {
+            tokens.saturating_add(crate::tokens::estimate_source_tokens(
+                self, *source, message,
+            ))
+        });
+        crate::ContextUsageEstimate {
+            tokens,
+            usage_tokens: 0,
+            trailing_tokens: tokens,
+            last_usage_record: None,
+        }
+    }
+
+    pub(crate) fn context_budget_estimate(&self) -> crate::ContextUsageEstimate {
+        let branch = self.branch();
         let entries = conversation_entries(&branch, self.operations());
         let invalidated_at = branch
             .iter()
@@ -747,7 +858,7 @@ impl Session {
                 entries[index + 1..]
                     .iter()
                     .fold(0_u64, |tokens, (source, message)| {
-                        tokens.saturating_add(crate::tokens::estimate_source_tokens(
+                        tokens.saturating_add(crate::tokens::estimate_budget_source_tokens(
                             self, *source, message,
                         ))
                     });
@@ -768,7 +879,7 @@ impl Session {
             })
         });
         let tokens = entries.iter().fold(initial, |tokens, (source, message)| {
-            tokens.saturating_add(crate::tokens::estimate_source_tokens(
+            tokens.saturating_add(crate::tokens::estimate_budget_source_tokens(
                 self, *source, message,
             ))
         });
@@ -778,6 +889,38 @@ impl Session {
             trailing_tokens: tokens,
             last_usage_record: None,
         }
+    }
+
+    pub(crate) fn imported_context_total(&self, source: u64) -> Option<u64> {
+        self.imported_assistant_message(source)?["usage"]["totalTokens"]
+            .as_u64()
+            .filter(|total| *total > 0)
+    }
+
+    pub(crate) fn imported_assistant_message(&self, source: u64) -> Option<&serde_json::Value> {
+        let assistant = self.records.get(source.checked_sub(1)? as usize)?;
+        let Event::Assistant {
+            request_id: Some(request_id),
+            ..
+        } = &assistant.event
+        else {
+            return None;
+        };
+        let completion = self
+            .records
+            .get(assistant.parent?.checked_sub(1)? as usize)?;
+        if !matches!(&completion.event, Event::ModelFinished { request_id: id, .. } if id == request_id)
+        {
+            return None;
+        }
+        let original = self
+            .records
+            .get(completion.parent?.checked_sub(1)? as usize)?;
+        let Event::SourceEntry { format, entry } = &original.event else {
+            return None;
+        };
+        (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
+            .then_some(&entry["message"])
     }
 
     pub fn operations(&self) -> Vec<(Invocation, OperationState)> {
@@ -2073,11 +2216,54 @@ pub(crate) fn conversation_entries(
     conversation_entries_since(path, operations, retain_from)
 }
 
+pub(crate) fn conversation_entries_unrepaired(
+    path: &[&Record],
+    operations: Vec<(Invocation, OperationState)>,
+) -> Vec<(u64, Message)> {
+    let retain_from = path
+        .iter()
+        .rev()
+        .find_map(|record| match record.event {
+            Event::Compacted { retain_from, .. } => Some(retain_from.unwrap_or(record.id)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    conversation_entries_since_inner(path, operations, retain_from, false)
+}
+
 fn conversation_entries_since(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
     retain_from: u64,
 ) -> Vec<(u64, Message)> {
+    conversation_entries_since_inner(path, operations, retain_from, true)
+}
+
+fn conversation_entries_since_inner(
+    path: &[&Record],
+    operations: Vec<(Invocation, OperationState)>,
+    retain_from: u64,
+    repair: bool,
+) -> Vec<(u64, Message)> {
+    let repair_operations = if !repair {
+        let assistants: BTreeSet<_> = path
+            .iter()
+            .filter_map(|record| {
+                matches!(record.event, Event::Assistant { .. }).then_some(record.id)
+            })
+            .collect();
+        path.iter().any(|record| matches!(&record.event, Event::ContextEdited { target, replacement: Some(_), .. } if assistants.contains(target))).then(|| operations.clone())
+    } else {
+        None
+    };
+    let invocations: BTreeMap<_, _> = path
+        .iter()
+        .flat_map(|record| match &record.event {
+            Event::Assistant { invocations, .. } => invocations.as_slice(),
+            _ => &[],
+        })
+        .map(|invocation| (invocation.operation_id, &invocation.call.id))
+        .collect();
     let results: BTreeMap<_, _> = operations
         .into_iter()
         .filter_map(|(inv, state)| match state {
@@ -2115,6 +2301,76 @@ fn conversation_entries_since(
             _ => None,
         })
         .collect();
+    // Replacement blocks may introduce calls with no corresponding result.
+    // Compare those calls with the actual repaired model projection, while
+    // keeping an otherwise empty assistant for its thinking and usage.
+    let replacement_calls: BTreeMap<u64, BTreeSet<String>> = if !repair {
+        let mut allowed: BTreeMap<_, BTreeSet<String>> = path
+            .iter()
+            .filter_map(|record| {
+                (matches!(record.event, Event::Assistant { .. })
+                    && matches!(edits.get(&record.id), Some(Some(_))))
+                .then_some((record.id, BTreeSet::new()))
+            })
+            .collect();
+        if !allowed.is_empty() {
+            for (source, message) in conversation_entries_since_inner(
+                path,
+                repair_operations.expect("unrepaired projection"),
+                retain_from,
+                true,
+            ) {
+                if let (
+                    Some(calls),
+                    Message::Assistant {
+                        calls: repaired, ..
+                    },
+                ) = (allowed.get_mut(&source), message)
+                {
+                    calls.extend(repaired.into_iter().map(|call| call.id));
+                }
+            }
+        }
+        allowed
+    } else {
+        BTreeMap::new()
+    };
+    // An explicit edit to an assistant can remove its tool calls. Keep
+    // independently retained results, but exclude results orphaned by that edit.
+    let removed_tool_sources: BTreeSet<_> = if repair {
+        BTreeSet::new()
+    } else {
+        path.iter().flat_map(|record| {
+            let Event::Assistant { invocations, .. } = &record.event else { return Vec::new(); };
+            let Some(replacement) = edits.get(&record.id) else { return Vec::new(); };
+            invocations.iter().filter_map(|invocation| {
+                let retained = matches!(replacement, Some(crate::ContextContent::Blocks(blocks)) if blocks.iter().any(|block| matches!(block, crate::ContentBlock::ToolCall { id, .. } if id == &invocation.call.id)));
+                (!retained).then(|| result_sources.get(&invocation.operation_id).copied()).flatten()
+            }).collect::<Vec<_>>()
+        }).collect()
+    };
+    // Preserve assistant messages for estimation (including thinking-only
+    // messages), but mirror the repair that drops calls whose results were
+    // explicitly omitted from context.
+    let omitted_calls: BTreeMap<_, BTreeSet<_>> = if repair {
+        BTreeMap::new()
+    } else {
+        path.iter()
+            .filter_map(|record| {
+                let Event::Assistant { invocations, .. } = &record.event else {
+                    return None;
+                };
+                let calls: BTreeSet<_> = invocations
+                    .iter()
+                    .filter_map(|invocation| {
+                        let result = result_sources.get(&invocation.operation_id)?;
+                        matches!(edits.get(result), Some(None)).then(|| invocation.call.id.clone())
+                    })
+                    .collect();
+                (!calls.is_empty()).then_some((record.id, calls))
+            })
+            .collect()
+    };
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
@@ -2190,7 +2446,7 @@ fn conversation_entries_since(
                             .collect(),
                     },
                 ));
-                for inv in invocations {
+                for inv in invocations.iter().filter(|_| repair) {
                     if let Some(outcome) = results.get(&inv.operation_id) {
                         messages.push((
                             *result_sources.get(&inv.operation_id).unwrap_or(&record.id),
@@ -2204,18 +2460,49 @@ fn conversation_entries_since(
                     }
                 }
             }
+            Event::ToolFinished { operation_id, .. } | Event::ToolReconciled { operation_id, .. } if !repair => {
+                if result_sources.get(operation_id) == Some(&record.id)
+                    && let (Some(call_id), Some(outcome)) = (invocations.get(operation_id), results.get(operation_id)) {
+                    messages.push((record.id, Message::Tool {
+                        call_id: (*call_id).clone(), content: outcome.tool_content(),
+                        is_error: outcome.is_error(), is_structured: Some(outcome.is_structured()),
+                    }));
+                }
+            }
             _ => {}
         }
     }
     let mut messages: Vec<_> = messages
         .into_iter()
+        .filter(|(source, _)| !removed_tool_sources.contains(source))
         .filter_map(|(source, message)| match edits.get(&source) {
             Some(Some(replacement)) => Some((source, project_content(message, replacement))),
             Some(None) => None,
             None => Some((source, message)),
         })
+        .map(|(source, mut message)| {
+            if let (Some(omitted), Message::Assistant { calls, replay, .. }) =
+                (omitted_calls.get(&source), &mut message)
+            {
+                let count = calls.len();
+                calls.retain(|call| !omitted.contains(&call.id));
+                if calls.len() != count {
+                    *replay = None;
+                }
+            }
+            if let (Some(allowed), Message::Assistant { calls, replay, .. }) =
+                (replacement_calls.get(&source), &mut message)
+            {
+                let count = calls.len();
+                calls.retain(|call| allowed.contains(&call.id));
+                if calls.len() != count {
+                    *replay = None;
+                }
+            }
+            (source, message)
+        })
         .collect();
-    if !edits.is_empty() {
+    if repair && !edits.is_empty() {
         messages = repair_tool_pairs(messages);
     }
     messages
