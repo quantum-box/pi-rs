@@ -82,6 +82,9 @@ mouse interaction preserves theme previews and keyboard remapping.
 
 Input hooks identify command-line print and JSON prompts as `interactive`, as
 Pi does, while RPC and extension-originated submissions retain their own source.
+An input hook failure is reported without discarding earlier transformations or
+preventing later hooks from processing the input. Invalid replacement images
+still fail validation before submission.
 
 Known text-only chat models receive Pi's image-omission placeholders for user
 and tool images. Unknown model capabilities leave image handling to the
