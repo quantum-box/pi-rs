@@ -309,14 +309,18 @@ are delivered to extensions that opt into session lifecycle notifications.
 Direct SDK compaction with a supplied summary remains synchronous and does not
 emit these asynchronous lifecycle notifications.
 
-Extensions may also opt into `tool_execution_start` and `tool_execution_end`
+Extensions may also opt into `tool_execution_start`, `tool_execution_update`, and `tool_execution_end`
 with both `handles_lifecycle` and `handles_tool_execution_lifecycle`. Events
 include the tool call ID, name and arguments or the final native outcome;
 end events indicate errors and include execution duration when the tool ran.
 Nested tool calls include their parent tool-call ID. Executable extensions
-advertise this capability with `tool_execution_lifecycle_hook`.
-Parallel calls currently emit end notifications in journal order after the
-batch settles; streaming updates and completion-order notifications remain open.
+advertise this capability with `tool_execution_lifecycle_hook`. A tool using
+`invoke_with_host` may call `host.report_progress(partial_result).await` to emit
+ephemeral update events during execution. Progress is limited to 1 MiB per
+update and is not journaled. The v2 executable protocol negotiates support;
+new executables work with old hosts, where progress is ignored. Parallel calls
+currently emit end notifications in journal order after the batch settles;
+completion-order notifications and progress from built-in tools remain open.
 
 Executable extensions built with the current SDK advertise
 `pi_lifecycle_fields` and receive Pi's camelCase lifecycle and tree fields,

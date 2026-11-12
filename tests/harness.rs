@@ -339,6 +339,118 @@ fn answer(value: &str) -> Vec<ModelEvent> {
 fn ignore(_: Notification<'_>) {}
 
 #[tokio::test]
+async fn extensions_receive_tool_progress_before_tool_completion() {
+    struct ProgressTool(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Tool for ProgressTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "progress fixture".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            host.report_progress(json!({"content":[{"type":"text","text":"halfway"}]}))
+                .await
+                .unwrap();
+            if tokio::time::timeout(Duration::from_secs(3), self.0.notified())
+                .await
+                .is_err()
+            {
+                return Outcome::Failed(
+                    "progress hook did not run while the tool was active".into(),
+                );
+            }
+            Outcome::Succeeded("done".into())
+        }
+    }
+    struct ProgressExtension {
+        tool: Arc<ProgressTool>,
+        events: Arc<Mutex<Vec<Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ProgressExtension {
+        fn id(&self) -> &str {
+            "progress"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![self.tool.clone()]
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &LifecycleEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            if let LifecycleEvent::ToolExecutionUpdate { .. } = event {
+                self.tool.0.notify_one();
+            }
+            self.events
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+            Ok(())
+        }
+    }
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(ProgressExtension {
+            tool: Arc::new(ProgressTool(Arc::new(tokio::sync::Notify::new()))),
+            events: events.clone(),
+        }))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&[r#"{"id":"x"}"#]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let events = events.lock().unwrap();
+    let tool_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("tool_execution_"))
+        })
+        .collect();
+    assert_eq!(tool_events.len(), 3);
+    assert_eq!(tool_events[0]["type"], "tool_execution_start");
+    assert_eq!(tool_events[1]["type"], "tool_execution_update");
+    assert_eq!(tool_events[1]["toolCallId"], "call-0");
+    assert_eq!(tool_events[1]["args"]["id"], "x");
+    assert_eq!(
+        tool_events[1]["partialResult"]["content"][0]["text"],
+        "halfway"
+    );
+    assert_eq!(tool_events[2]["type"], "tool_execution_end");
+    assert_eq!(tool_events[2]["isError"], false);
+}
+
+#[tokio::test]
 async fn extension_observes_tool_start_and_transformed_end_including_denials() {
     struct ToolObserver(Arc<Mutex<Vec<Value>>>);
     #[async_trait::async_trait]

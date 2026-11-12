@@ -84,9 +84,10 @@ may request the tools again. Other incomplete reasons remain errors.
 Truncated compaction and branch summaries are rejected before changing the
 conversation branch.
 
-Native extensions can opt into tool execution start and end events, including
-nested call ancestry, final outcomes, and elapsed execution time. Streaming
-tool execution updates remain a separate parity item.
+Native extensions can opt into tool execution start, update and end events,
+including nested call ancestry, partial results, final outcomes and elapsed
+execution time. Rust tools with a host can emit bounded progress while running;
+progress from built-in tools and completion-order notifications remain open.
 
 ### xAI Responses checkpoint
 

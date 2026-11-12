@@ -1024,10 +1024,15 @@ struct DuplexRequest {
     tools: Vec<ToolSpec>,
     #[serde(default)]
     has_ui: bool,
+    #[serde(default)]
+    has_progress: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DuplexFrame {
+    Progress {
+        partial_result: Value,
+    },
     Ui {
         request: pi_rs_core::UiRequest,
     },
@@ -1194,7 +1199,12 @@ fn call_duplex(
         let mut output = std::io::BufReader::new(output);
         loop {
             let frame = read_line::<DuplexFrame>(&mut output);
-            let terminal = !matches!(frame, Ok(DuplexFrame::Call { .. } | DuplexFrame::Ui { .. }));
+            let terminal = !matches!(
+                frame,
+                Ok(DuplexFrame::Call { .. }
+                    | DuplexFrame::Ui { .. }
+                    | DuplexFrame::Progress { .. })
+            );
             if sender.send(frame).is_err() || terminal {
                 break;
             }
@@ -1206,6 +1216,7 @@ fn call_duplex(
                 request,
                 tools: host.tools(),
                 has_ui: host.has_ui(),
+                has_progress: host.supports_progress(),
             })
             .map_err(|error| error.to_string())?,
         )
@@ -1220,6 +1231,12 @@ fn call_duplex(
             return Err(error);
         }
         match frames.recv_timeout(Duration::from_millis(5)) {
+            Ok(Ok(DuplexFrame::Progress { partial_result })) => {
+                let response = runtime.block_on(host.report_progress(partial_result));
+                writer
+                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
+                    .map_err(|_| "native extension input closed")?;
+            }
             Ok(Ok(DuplexFrame::Call { calls })) => {
                 if calls.len() > 4096 {
                     return Err("native extension batch exceeds execution limit".into());
@@ -1265,10 +1282,29 @@ fn call_duplex(
 struct RemoteHost {
     tools: Vec<ToolSpec>,
     has_ui: bool,
+    has_progress: bool,
     io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
 }
 #[async_trait::async_trait]
 impl ToolHost for RemoteHost {
+    fn supports_progress(&self) -> bool {
+        self.has_progress
+    }
+    async fn report_progress(&self, partial_result: Value) -> ExtensionResult<()> {
+        if !self.has_progress {
+            return Ok(());
+        }
+        let io = self.io.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            write_line(&mut io.1, &DuplexFrame::Progress { partial_result })?;
+            read_line::<ExtensionResult<()>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
     fn has_ui(&self) -> bool {
         self.has_ui
     }
@@ -1322,6 +1358,7 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
     let host = Arc::new(RemoteHost {
         tools: request.tools,
         has_ui: request.has_ui,
+        has_progress: request.has_progress,
         io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1961,6 +1998,25 @@ mod tests {
         let decoded: TreeDecision = serde_json::from_value(legacy_response).unwrap();
         assert_eq!(decoded.custom_instructions.as_deref(), Some("custom"));
         assert_eq!(decoded.replace_instructions, Some(true));
+    }
+
+    #[tokio::test]
+    async fn progress_protocol_is_optional_for_older_hosts() {
+        let request: DuplexRequest = serde_json::from_value(serde_json::json!({
+            "request":{"type":"describe"}, "tools":[], "has_ui":false
+        }))
+        .unwrap();
+        assert!(!request.has_progress);
+        let frame = DuplexFrame::Progress {
+            partial_result: serde_json::json!({"text":"halfway"}),
+        };
+        let encoded = serde_json::to_value(frame).unwrap();
+        assert_eq!(encoded["type"], "progress");
+        assert_eq!(encoded["partial_result"]["text"], "halfway");
+        assert!(matches!(
+            serde_json::from_value::<DuplexFrame>(encoded).unwrap(),
+            DuplexFrame::Progress { .. }
+        ));
     }
 
     #[tokio::test]

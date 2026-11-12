@@ -1247,30 +1247,45 @@ impl Agent<'_> {
                 }
             }
             let (requests, mut incoming) = mpsc::channel(32);
+            let (updates, mut progress) = mpsc::channel(32);
             let specs = Arc::new(self.registry.tool_specs());
-            let invocations = group.iter().zip(prepared).map(|(invocation, prepared)| {
-                let cancellation = match &prepared {
-                    Preparation::Ready { context, .. } => context.cancellation.clone(),
-                    Preparation::Skipped(_) => cancel.child_token(),
-                };
-                let host = Arc::new(NestedHost {
-                    requests: requests.clone(),
-                    specs: specs.clone(),
-                    parent_operation: invocation.operation_id,
-                    cancellation,
-                    depth: scope.depth,
-                    call_count: scope.call_count.clone(),
-                    ui: self.registry.ui.clone(),
-                });
-                let ran = matches!(&prepared, Preparation::Ready { .. });
-                async move {
-                    let started = std::time::Instant::now();
-                    let reply = self.invoke(prepared, cancel, host, scope.depth > 0).await;
-                    let duration =
-                        ran.then(|| started.elapsed().as_millis().min(u64::MAX as u128) as u64);
-                    (reply, duration)
-                }
-            });
+            let invocations =
+                group
+                    .iter()
+                    .zip(prepared)
+                    .zip(&parents)
+                    .map(|((invocation, prepared), parent)| {
+                        let cancellation = match &prepared {
+                            Preparation::Ready { context, .. } => context.cancellation.clone(),
+                            Preparation::Skipped(_) => cancel.child_token(),
+                        };
+                        let host = Arc::new(NestedHost {
+                            requests: requests.clone(),
+                            specs: specs.clone(),
+                            parent_operation: invocation.operation_id,
+                            cancellation,
+                            depth: scope.depth,
+                            call_count: scope.call_count.clone(),
+                            ui: self.registry.ui.clone(),
+                            progress: observe_tools.then(|| ProgressReporter {
+                                sender: updates.clone(),
+                                tool_call_id: invocation.call.id.clone(),
+                                tool_name: invocation.call.name.clone(),
+                                args: crate::parse_tool_arguments(&invocation.call.arguments)
+                                    .unwrap_or(serde_json::Value::Null),
+                                parent_tool_call_id: parent.clone(),
+                            }),
+                        });
+                        let ran = matches!(&prepared, Preparation::Ready { .. });
+                        async move {
+                            let started = std::time::Instant::now();
+                            let reply = self.invoke(prepared, cancel, host, scope.depth > 0).await;
+                            let duration = ran.then(|| {
+                                started.elapsed().as_millis().min(u64::MAX as u128) as u64
+                            });
+                            (reply, duration)
+                        }
+                    });
             let outcomes = futures_util::future::join_all(invocations);
             tokio::pin!(outcomes);
             let mut nested_error = None;
@@ -1278,6 +1293,9 @@ impl Agent<'_> {
             let outcomes = loop {
                 tokio::select! {
                     completed = &mut outcomes => break completed,
+                    Some(event) = progress.recv() => {
+                        self.observe_lifecycle(event, states, Some(cancel), observer).await;
+                    }
                     Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
                     Some(request) = async {
                         if pending_requests.is_empty() {
@@ -1315,6 +1333,10 @@ impl Agent<'_> {
                     }
                 }
             };
+            while let Ok(event) = progress.try_recv() {
+                self.observe_lifecycle(event, states, Some(cancel), observer)
+                    .await;
+            }
             let mut first_error = None;
             // All started outcomes are recorded even if one parallel member failed.
             for ((invocation, (mut outcome, duration)), parent) in
@@ -3045,9 +3067,47 @@ struct NestedHost {
     cancellation: CancellationToken,
     depth: usize,
     call_count: Arc<AtomicUsize>,
+    progress: Option<ProgressReporter>,
+}
+struct ProgressReporter {
+    sender: mpsc::Sender<crate::LifecycleEvent>,
+    tool_call_id: String,
+    tool_name: String,
+    args: serde_json::Value,
+    parent_tool_call_id: Option<String>,
 }
 #[async_trait::async_trait]
 impl ToolHost for NestedHost {
+    fn supports_progress(&self) -> bool {
+        self.progress.is_some()
+    }
+    async fn report_progress(
+        &self,
+        partial_result: serde_json::Value,
+    ) -> crate::ExtensionResult<()> {
+        let Some(progress) = &self.progress else {
+            return Ok(());
+        };
+        if serde_json::to_vec(&partial_result)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 1024 * 1024
+        {
+            return Err("tool progress exceeds size limit".into());
+        }
+        let event = crate::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: progress.tool_call_id.clone(),
+            tool_name: progress.tool_name.clone(),
+            args: progress.args.clone(),
+            partial_result,
+            parent_tool_call_id: progress.parent_tool_call_id.clone(),
+        };
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Err("tool progress cancelled".into()),
+            sent = progress.sender.send(event) => sent.map_err(|_| "tool has finished".into()),
+        }
+    }
     fn has_ui(&self) -> bool {
         self.ui.is_some()
     }
@@ -3751,6 +3811,7 @@ mod nested_host_tests {
         let (requests, mut incoming) = mpsc::channel(1);
         let host = NestedHost {
             ui: None,
+            progress: None,
             requests,
             specs: Arc::new(vec![]),
             parent_operation: Uuid::new_v4(),

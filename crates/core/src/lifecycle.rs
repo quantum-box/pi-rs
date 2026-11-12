@@ -222,6 +222,17 @@ pub enum LifecycleEvent {
         #[serde(rename = "parentToolCallId", skip_serializing_if = "Option::is_none")]
         parent_tool_call_id: Option<String>,
     },
+    ToolExecutionUpdate {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        args: serde_json::Value,
+        #[serde(rename = "partialResult")]
+        partial_result: serde_json::Value,
+        #[serde(rename = "parentToolCallId", skip_serializing_if = "Option::is_none")]
+        parent_tool_call_id: Option<String>,
+    },
     ToolExecutionEnd {
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
@@ -271,6 +282,7 @@ impl LifecycleEvent {
             Self::TurnStart { .. } => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
             Self::ToolExecutionStart { .. } => "tool_execution_start",
+            Self::ToolExecutionUpdate { .. } => "tool_execution_update",
             Self::ToolExecutionEnd { .. } => "tool_execution_end",
             Self::SessionTree { .. } => "session_tree",
         }
@@ -328,6 +340,7 @@ pub async fn notify(
                 }
                 LifecycleEvent::SessionTree { .. } => extension.handles_tree_navigation(),
                 LifecycleEvent::ToolExecutionStart { .. }
+                | LifecycleEvent::ToolExecutionUpdate { .. }
                 | LifecycleEvent::ToolExecutionEnd { .. } => {
                     extension.handles_tool_execution_lifecycle()
                 }
