@@ -876,7 +876,7 @@ fn collect_package_resources(
             .filter(|path| {
                 names.iter().any(|name| {
                     path.file_stem().is_some_and(|file| file == name.as_str())
-                        || manifest_selected(path, &root, std::slice::from_ref(name))
+                        || manifest_selected(path, root, std::slice::from_ref(name))
                 })
             })
             .collect()
@@ -908,7 +908,7 @@ fn collect_package_resources(
                 }
             });
         validate_patterns(&patterns)?;
-        for entry in ignore::WalkBuilder::new(&root)
+        for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
             .git_ignore(false)
             .filter_entry(|entry| {
@@ -922,7 +922,7 @@ fn collect_package_resources(
         {
             if entry.file_type().is_some_and(|kind| kind.is_file())
                 && entry.file_name().to_string_lossy().ends_with(suffix)
-                && manifest_selected(entry.path(), &root, &patterns)
+                && manifest_selected(entry.path(), root, &patterns)
             {
                 target.push(entry.into_path());
             }
