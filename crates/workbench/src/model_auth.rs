@@ -92,7 +92,7 @@ pub(super) struct Keys {
 
 #[derive(Clone)]
 struct SavedKey {
-    endpoint: String,
+    endpoint: Option<String>,
     official_routes: bool,
     oauth: bool,
     key: Credential,
@@ -104,7 +104,7 @@ impl Keys {
         Ok(Self::parse(&value))
     }
 
-    fn parse(value: &Value) -> Self {
+    pub(super) fn parse(value: &Value) -> Self {
         let entries = value
             .as_object()
             .into_iter()
@@ -145,20 +145,20 @@ impl Keys {
                         .map(|provider| provider.default_endpoint())
                         .or_else(|| {
                             super::operation_models::official_base(&name.to_ascii_lowercase())
-                        })?,
-                    Some(value) => value.as_str()?,
+                        }),
+                    Some(value) => Some(value.as_str()?),
                 };
                 if oauth
                     && !chatgpt
                     && super::builtin_chat::find("openrouter")
-                        .is_none_or(|builtin| builtin.endpoint() != endpoint)
+                        .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
                 {
                     return None;
                 }
                 Some((
                     name.to_ascii_lowercase(),
                     SavedKey {
-                        endpoint: endpoint.to_owned(),
+                        endpoint: endpoint.map(str::to_owned),
                         official_routes: oauth || entry.get("endpoint").is_none(),
                         oauth,
                         key,
@@ -180,11 +180,23 @@ impl Keys {
         let entry = self.entries.get(provider.id())?;
         let legacy_radius = provider == &Provider::Radius
             && endpoint == super::radius_auth::DEFAULT_MODEL_ENDPOINT
-            && entry.endpoint == "https://radius.pi.dev/messages";
+            && entry.endpoint.as_deref() == Some("https://radius.pi.dev/messages");
         let builtin_route = entry.official_routes
             && super::builtin_chat::find(provider.id())
                 .is_some_and(|builtin| builtin.is_official_endpoint(endpoint));
-        (entry.endpoint == endpoint || legacy_radius || builtin_route).then_some(&entry.key)
+        (entry.endpoint.as_deref() == Some(endpoint) || legacy_radius || builtin_route)
+            .then_some(&entry.key)
+    }
+
+    pub fn custom_credential(
+        &self,
+        provider: &Provider,
+        endpoint: &str,
+        profiles: &super::model_profiles::Profiles,
+    ) -> Option<&Credential> {
+        let entry = self.entries.get(provider.id())?;
+        (entry.endpoint.is_none() && profiles.has_endpoint(provider, endpoint))
+            .then_some(&entry.key)
     }
 
     pub fn oauth(&self, provider: &Provider, endpoint: &str) -> bool {
@@ -202,10 +214,11 @@ impl Keys {
         official: bool,
     ) -> Option<&Credential> {
         let entry = self.entries.get(provider)?;
-        (entry.endpoint == endpoint
+        (entry.endpoint.as_deref() == Some(endpoint)
             || (official
-                && (super::operation_models::official_base(provider)
-                    == Some(entry.endpoint.as_str())
+                && ((entry.endpoint.is_some()
+                    && super::operation_models::official_base(provider)
+                        == entry.endpoint.as_deref())
                     || (entry.official_routes && super::builtin_chat::find(provider).is_some()))))
         .then_some(&entry.key)
     }

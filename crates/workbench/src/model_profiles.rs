@@ -895,6 +895,16 @@ impl Profiles {
         Credential::configured(profile.api_key.as_deref()?)
     }
 
+    pub fn has_endpoint(&self, provider: &Provider, endpoint: &str) -> bool {
+        self.entries.get(provider.id()).is_some_and(|profile| {
+            profile.endpoint == endpoint
+                || profile
+                    .model_endpoints
+                    .values()
+                    .any(|value| value == endpoint)
+        })
+    }
+
     pub fn header_settings(
         &self,
         provider: &Provider,
@@ -1551,6 +1561,40 @@ mod tests {
             .remove("api");
         assert!(
             matches!(Profiles::parse(&missing), Err(Error::Config(message)) if message.contains("mixed/message requires an API"))
+        );
+    }
+
+    #[test]
+    fn custom_provider_uses_endpointless_saved_key_only_for_configured_routes() {
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = Profiles::parse(&json!({"providers":{"relay":{
+            "api":"openai-completions", "baseUrl":"https://relay.example/v1",
+            "apiKey":"profile-key", "models":[{"id":"model"}]
+        }}}))
+        .unwrap();
+        args.model_keys = super::super::model_auth::Keys::parse(
+            &json!({"relay":{"type":"api_key","key":"saved-key"}}),
+        );
+        let provider = args.model_profiles.provider("relay").unwrap();
+        let endpoint = "https://relay.example/v1/chat/completions";
+        assert_eq!(
+            args.model_credential_for(&provider, endpoint)
+                .unwrap()
+                .literal(),
+            Some("saved-key")
+        );
+        assert!(
+            args.model_credential_for(&provider, "https://other.example/v1/chat/completions")
+                .is_none()
+        );
+        args.model_keys = super::super::model_auth::Keys::parse(
+            &json!({"relay":{"type":"api_key","key":"bound-key","endpoint":"https://other.example/v1/chat/completions"}}),
+        );
+        assert_eq!(
+            args.model_credential_for(&provider, endpoint)
+                .unwrap()
+                .literal(),
+            Some("profile-key")
         );
     }
 

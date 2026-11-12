@@ -11,6 +11,11 @@ The requested compatibility is equivalent functionality implemented in Rust.
 Full parity is in progress. Each row lists the implemented surface and the
 remaining acceptance work for that surface.
 
+Endpointless API keys in Pi's `auth.json` are accepted for custom providers
+declared in `models.json`. The saved key takes precedence over the profile key
+and is used only for endpoints declared by that profile; keys with an explicit
+endpoint remain bound to that endpoint.
+
 `--resume` and `-r` open the session selector without consuming a following
 prompt. The picker uses the controlling terminal, keeping standard input and
 output available to print, JSON, and RPC modes. The native `--resume=PATH`
