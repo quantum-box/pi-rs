@@ -2573,12 +2573,17 @@ actual request limits, and updated configuration in a real terminal picker.
 
 ### Compatible model sampling
 
-The chat-completions adapter applies `samplingParams` and the effective
+The chat-completions and OpenAI Responses adapters apply `samplingParams` and the effective
 thinking level's `samplingParamsByThinkingLevel`. Model overrides merge
 per level and per field. `thinkingLevelMap` can disable unsupported levels
 and send an explicit value for a supported level. Request fields owned by the
 agent, including the conversation, tool definitions, streaming and token
 limits, are protected from sampling overrides.
+This is a deliberate difference from Pi v1.5.0, which permits arbitrary sampling
+fields to replace managed request fields. Pi-rs rejects such fields when configuring
+the affected Responses model, preserving its streaming, conversation, tool, and
+output-limit guarantees without blocking other models from loading. Responses
+sampling can still set `tool_choice`, `parallel_tool_calls`, and `max_tool_calls`.
 
 The loopback fixture exercised level clamping, the actual request payload,
 and clearing the previous model's sampling configuration when switching

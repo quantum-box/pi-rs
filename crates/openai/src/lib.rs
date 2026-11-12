@@ -25,6 +25,7 @@ pub struct OpenAiResponses {
     thinking: Option<String>,
     provider: String,
     headers: reqwest::header::HeaderMap,
+    sampling: BTreeMap<String, Value>,
 }
 
 impl OpenAiResponses {
@@ -100,6 +101,7 @@ impl OpenAiResponses {
             thinking: None,
             provider: if plan { "openai-chatgpt" } else { "openai" }.into(),
             headers: reqwest::header::HeaderMap::new(),
+            sampling: BTreeMap::new(),
         })
     }
 
@@ -111,6 +113,13 @@ impl OpenAiResponses {
     pub fn with_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
         self.headers = headers;
         self
+    }
+
+    /// Set request body defaults from the selected model's sampling parameters.
+    pub fn with_sampling(mut self, sampling: BTreeMap<String, Value>) -> Result<Self> {
+        validate_sampling(&sampling)?;
+        self.sampling = sampling;
+        Ok(self)
     }
 
     /// Return the signed-in account's displayable models in server order.
@@ -166,6 +175,41 @@ impl OpenAiResponses {
             })
             .collect())
     }
+}
+
+/// Protect fields that control the agent's conversation, tools, and transport.
+pub fn validate_sampling(sampling: &BTreeMap<String, Value>) -> Result<()> {
+    if let Some(key) = sampling.keys().find(|key| {
+        matches!(
+            key.as_str(),
+            "model"
+                | "input"
+                | "messages"
+                | "instructions"
+                | "previous_response_id"
+                | "conversation"
+                | "prompt"
+                | "tools"
+                | "functions"
+                | "function_call"
+                | "stream"
+                | "stream_options"
+                | "background"
+                | "store"
+                | "max_output_tokens"
+                | "max_tokens"
+                | "max_completion_tokens"
+                | "n"
+                | "reasoning"
+                | "reasoning_effort"
+                | "include"
+        )
+    }) {
+        return Err(Error::Config(format!(
+            "sampling parameter {key:?} is managed by the agent"
+        )));
+    }
+    Ok(())
 }
 
 /// Supported reasoning levels for known models. Unknown models use their default.
@@ -278,6 +322,13 @@ impl Model for OpenAiResponses {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
+        body.as_object_mut()
+            .expect("Responses request object")
+            .extend(
+                self.sampling
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
         let mut response = self
             .client
             .post(self.endpoint.clone())
@@ -391,6 +442,56 @@ mod tests {
             }],
             max_output_tokens: 100,
         }
+    }
+
+    #[test]
+    fn sampling_rejects_responses_fields_managed_by_the_agent() {
+        let client =
+            OpenAiResponses::new_api("https://example.com/v1/responses", "token".into()).unwrap();
+        for key in [
+            "model",
+            "input",
+            "messages",
+            "instructions",
+            "previous_response_id",
+            "conversation",
+            "prompt",
+            "tools",
+            "functions",
+            "function_call",
+            "stream",
+            "stream_options",
+            "background",
+            "store",
+            "max_output_tokens",
+            "max_tokens",
+            "max_completion_tokens",
+            "n",
+            "reasoning",
+            "reasoning_effort",
+            "include",
+        ] {
+            let error = match client
+                .clone()
+                .with_sampling(BTreeMap::from([(key.into(), json!(null))]))
+            {
+                Ok(_) => panic!("accepted managed field {key}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(key));
+        }
+        assert!(
+            client
+                .with_sampling(BTreeMap::from([
+                    ("temperature".into(), json!(0.5)),
+                    ("top_p".into(), json!(0.9)),
+                    ("custom_sampling".into(), json!({"value": 1})),
+                    ("parallel_tool_calls".into(), json!(false)),
+                    ("max_tool_calls".into(), json!(3)),
+                    ("tool_choice".into(), json!("required")),
+                ]))
+                .is_ok()
+        );
     }
 
     #[test]

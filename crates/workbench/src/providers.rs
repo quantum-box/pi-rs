@@ -558,6 +558,10 @@ impl Client {
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
             Self::OpenAi(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let sampling = metadata
+                    .as_ref()
+                    .map(|model| model.sampling(thinking.unwrap_or("off")))
+                    .unwrap_or_default();
                 let levels = metadata
                     .as_ref()
                     .and_then(|model| model.levels(Adapter::OpenAiResponses))
@@ -578,7 +582,17 @@ impl Client {
                                 .unwrap_or(Some(level))
                         })
                 };
-                Self::OpenAi(client.with_thinking(thinking))
+                let client = client
+                    .with_thinking(thinking)
+                    .with_sampling(sampling)
+                    .map_err(|error| {
+                        pi_rs::Error::Config(format!(
+                            "invalid sampling for {}/{}: {error}",
+                            args.provider.id(),
+                            args.model
+                        ))
+                    })?;
+                Self::OpenAi(client)
             }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));
