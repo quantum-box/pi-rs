@@ -357,17 +357,9 @@ fn render_context(
     }
     events.sort_unstable();
     let mut reader = BufReader::new(std::fs::File::open(path)?);
-    // Decode UTF-16 context at raw line boundaries. Preserve a UTF-8 BOM:
-    // Pi's context path reads the file as text and includes it in line one.
-    let bom = reader.fill_buf()?;
-    let (encoding, bom_len) = if bom.starts_with(&[0xff, 0xfe]) {
-        (UTF_16LE, 2)
-    } else if bom.starts_with(&[0xfe, 0xff]) {
-        (UTF_16BE, 2)
-    } else {
-        (UTF_8, 0)
-    };
-    reader.consume(bom_len);
+    // Pi reads context with readFile(path, "utf-8"), even when ripgrep
+    // detected a UTF-16 BOM while finding the match.
+    let encoding = UTF_8;
     let mut prefix = Prefix::default();
     let mut event = 0;
     let mut number = 1u64;
@@ -643,23 +635,17 @@ mod tests {
     }
 
     #[test]
-    fn bom_encoded_context_matches_searcher_and_preserves_overlaps() {
+    fn utf8_context_preserves_overlaps() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let text = "\u{0a01} first 🦀\r\nneedle one\nneedle two\nafter\n";
-        for bytes in [
-            text.as_bytes().to_vec(),
-            utf16_bytes(text, true),
-            utf16_bytes(text, false),
-        ] {
-            std::fs::write(file.path(), bytes).unwrap();
-            let mut grep = Grep::new(&json!({"pattern":"needle", "context":1}), 100).unwrap();
-            grep.search(file.path(), "f", &CancellationToken::new())
-                .unwrap();
-            assert_eq!(
-                grep.finish().tool_content(),
-                "f-1- \u{0a01} first 🦀\nf:2: needle one\nf-3- needle two\nf-2- needle one\nf:3: needle two\nf-4- after"
-            );
-        }
+        std::fs::write(file.path(), text).unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"needle", "context":1}), 100).unwrap();
+        grep.search(file.path(), "f", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(
+            grep.finish().tool_content(),
+            "f-1- \u{0a01} first 🦀\nf:2: needle one\nf-3- needle two\nf-2- needle one\nf:3: needle two\nf-4- after"
+        );
     }
 
     #[test]
@@ -736,53 +722,43 @@ mod tests {
     fn context_keeps_nul_and_following_lines_for_a_reported_match() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let text = "needle\0tail\nafter\n";
-        for bytes in [
-            text.as_bytes().to_vec(),
-            utf16_bytes(text, true),
-            utf16_bytes(text, false),
-        ] {
-            std::fs::write(file.path(), bytes).unwrap();
-            let mut output = Output {
-                matches: 1,
-                limit: 100,
-                ..Output::default()
-            };
-            render_context(
-                file.path(),
-                "f",
-                &[1],
-                2,
-                &mut output,
-                &CancellationToken::new(),
-            )
-            .unwrap();
-            let expected = "f:1: needle\0tail\nf-2- after\nf-3- ";
-            assert_eq!(output.lines.join("\n"), expected);
-            assert_eq!(output.total_lines, 3);
-            assert_eq!(output.total_bytes, expected.len() as u64);
-        }
+        let bytes = text.as_bytes().to_vec();
+        std::fs::write(file.path(), bytes).unwrap();
+        let mut output = Output {
+            matches: 1,
+            limit: 100,
+            ..Output::default()
+        };
+        render_context(
+            file.path(),
+            "f",
+            &[1],
+            2,
+            &mut output,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let expected = "f:1: needle\0tail\nf-2- after\nf-3- ";
+        assert_eq!(output.lines.join("\n"), expected);
+        assert_eq!(output.total_lines, 3);
+        assert_eq!(output.total_bytes, expected.len() as u64);
     }
 
     #[test]
     fn grep_context_includes_nul_and_later_lines_but_matcher_stops() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let text = format!("needle\n{}\n\0binary\nneedle after\n", "p".repeat(150_000));
-        for bytes in [
-            text.as_bytes().to_vec(),
-            utf16_bytes(&text, true),
-            utf16_bytes(&text, false),
-        ] {
-            std::fs::write(file.path(), bytes).unwrap();
-            for limit in [1, 100] {
-                let mut grep = Grep::new(&json!({"pattern":"needle", "context":5}), limit).unwrap();
-                grep.search(file.path(), "f", &CancellationToken::new())
-                    .unwrap();
-                let outcome = grep.finish();
-                let output = outcome.tool_content();
-                assert!(output.starts_with("f:1: needle\nf-2- "));
-                assert!(output.contains("f-3- \0binary\nf-4- needle after\nf-5- "));
-                assert!(!output.contains("f:4:"));
-            }
+        let bytes = text.as_bytes().to_vec();
+        std::fs::write(file.path(), bytes).unwrap();
+        for limit in [1, 100] {
+            let mut grep = Grep::new(&json!({"pattern":"needle", "context":5}), limit).unwrap();
+            grep.search(file.path(), "f", &CancellationToken::new())
+                .unwrap();
+            let outcome = grep.finish();
+            let output = outcome.tool_content();
+            assert!(output.starts_with("f:1: needle\nf-2- "));
+            assert!(output.contains("f-3- \0binary\nf-4- needle after\nf-5- "));
+            assert!(!output.contains("f:4:"));
         }
     }
 
@@ -794,57 +770,47 @@ mod tests {
             "padding\n".repeat(15000),
             "z".repeat(700)
         );
-        for bytes in [
-            text.as_bytes().to_vec(),
-            utf16_bytes(&text, true),
-            utf16_bytes(&text, false),
-        ] {
-            std::fs::write(file.path(), bytes).unwrap();
-            let mut grep = Grep::new(&json!({"pattern":"needle", "context":1e20}), 1).unwrap();
-            grep.search(file.path(), "f", &CancellationToken::new())
-                .unwrap();
-            match grep.finish() {
-                Outcome::SucceededWithDetails { output, details } => {
-                    let mut rows = std::iter::once("f:1: needle".to_owned())
-                        .chain((2..=15001).map(|number| format!("f-{number}- padding")))
-                        .collect::<Vec<_>>();
-                    rows.push("f-15002- \0binary".into());
-                    rows.push(format!("f-15003- {}... [truncated]", "z".repeat(500)));
-                    rows.push("f-15004- ".into());
-                    let raw = rows.join("\n");
-                    assert_eq!(details["truncation"]["totalLines"], 15004);
-                    assert_eq!(details["truncation"]["totalBytes"], raw.len());
-                    assert_eq!(details["linesTruncated"], true);
-                    assert!(output.contains("50.0KB limit reached"));
-                }
-                other => panic!("expected byte truncation, got {other:?}"),
+        let bytes = text.as_bytes().to_vec();
+        std::fs::write(file.path(), bytes).unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"needle", "context":1e20}), 1).unwrap();
+        grep.search(file.path(), "f", &CancellationToken::new())
+            .unwrap();
+        match grep.finish() {
+            Outcome::SucceededWithDetails { output, details } => {
+                let mut rows = std::iter::once("f:1: needle".to_owned())
+                    .chain((2..=15001).map(|number| format!("f-{number}- padding")))
+                    .collect::<Vec<_>>();
+                rows.push("f-15002- \0binary".into());
+                rows.push(format!("f-15003- {}... [truncated]", "z".repeat(500)));
+                rows.push("f-15004- ".into());
+                let raw = rows.join("\n");
+                assert_eq!(details["truncation"]["totalLines"], 15004);
+                assert_eq!(details["truncation"]["totalBytes"], raw.len());
+                assert_eq!(details["linesTruncated"], true);
+                assert!(output.contains("50.0KB limit reached"));
             }
+            other => panic!("expected byte truncation, got {other:?}"),
         }
     }
 
     #[test]
-    fn utf16_context_truncation_matches_utf8() {
+    fn utf16_matches_use_node_utf8_context_decoding() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let text = format!(
-            "{}needle\n{}",
-            "before 🦀\n".repeat(2500),
-            "after\n".repeat(2500)
-        );
-        let mut outcomes = Vec::new();
-        for bytes in [
-            text.as_bytes().to_vec(),
-            utf16_bytes(&text, true),
-            utf16_bytes(&text, false),
+        for (little, expected) in [
+            (true, "f:1: ��n\0e\0e\0d\0l\0e\0\nf-2- \0n\0e\0x\0t\0"),
+            (false, "f:1: ��\0n\0e\0e\0d\0l\0e\0\nf-2- \0n\0e\0x\0t\0"),
         ] {
-            std::fs::write(file.path(), bytes).unwrap();
-            let mut grep = Grep::new(&json!({"pattern":"needle", "context":1e20}), 100).unwrap();
+            std::fs::write(file.path(), utf16_bytes("needle\nnext\n", little)).unwrap();
+            let mut direct = Grep::new(&json!({"pattern":"needle"}), 100).unwrap();
+            direct
+                .search(file.path(), "f", &CancellationToken::new())
+                .unwrap();
+            assert_eq!(direct.finish().tool_content(), "f:1: needle");
+            let mut grep = Grep::new(&json!({"pattern":"needle", "context":1}), 100).unwrap();
             grep.search(file.path(), "f", &CancellationToken::new())
                 .unwrap();
-            outcomes.push(grep.finish());
+            assert_eq!(grep.finish().tool_content(), expected);
         }
-        assert!(matches!(outcomes[0], Outcome::SucceededWithDetails { .. }));
-        assert_eq!(outcomes[0], outcomes[1]);
-        assert_eq!(outcomes[0], outcomes[2]);
     }
 
     #[test]
