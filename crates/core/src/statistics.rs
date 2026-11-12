@@ -471,6 +471,120 @@ mod tests {
     }
 
     #[test]
+    fn omitted_tool_result_removes_only_its_call_from_estimate() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let request_id = uuid::Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: crate::ModelMetadata {
+                    reasoning: Some("abcd".into()),
+                    ..Default::default()
+                },
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        let omitted = uuid::Uuid::new_v4();
+        let retained = uuid::Uuid::new_v4();
+        let call = |operation_id, id: &str, name: &str, arguments: String| crate::Invocation {
+            operation_id,
+            call: crate::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+            },
+        };
+        session
+            .append(Event::Assistant {
+                content: "ok".into(),
+                request_id: Some(request_id),
+                usage: None,
+                invocations: vec![
+                    call(
+                        omitted,
+                        "drop",
+                        "large",
+                        format!("{{\"x\":\"{}\"}}", "x".repeat(4000)),
+                    ),
+                    call(retained, "keep", "read", "{}".into()),
+                ],
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: omitted,
+                outcome: crate::Outcome::Succeeded("discard".into()),
+                states: Default::default(),
+            })
+            .unwrap();
+        let omitted_result = session.head();
+        session
+            .append(Event::ToolFinished {
+                operation_id: retained,
+                outcome: crate::Outcome::Succeeded("yes".into()),
+                states: Default::default(),
+            })
+            .unwrap();
+        session.edit_context(omitted_result, None).unwrap();
+        let messages = session.current_messages();
+        assert!(
+            matches!(&messages[0], crate::Message::Assistant { calls, .. } if calls.len() == 1 && calls[0].id == "keep")
+        );
+        assert_eq!(messages.len(), 2);
+        // Assistant text + thinking + retained call = 3; retained result = 1.
+        assert_eq!(session.context_usage_estimate().tokens, 4);
+    }
+
+    #[test]
+    fn omitted_only_tool_result_keeps_assistant_thinking_for_estimation() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let request_id = uuid::Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: crate::ModelMetadata {
+                    reasoning: Some("thinking".into()),
+                    ..Default::default()
+                },
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        let operation_id = uuid::Uuid::new_v4();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                request_id: Some(request_id),
+                usage: None,
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id,
+                outcome: crate::Outcome::Succeeded("result".into()),
+                states: Default::default(),
+            })
+            .unwrap();
+        let result = session.head();
+        session.edit_context(result, None).unwrap();
+        assert!(session.current_messages().is_empty());
+        assert_eq!(session.context_usage_estimate().tokens, 2);
+    }
+
+    #[test]
     fn removing_a_native_system_tool_invalidates_old_usage() {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
         session

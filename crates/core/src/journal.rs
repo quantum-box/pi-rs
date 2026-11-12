@@ -2204,6 +2204,28 @@ fn conversation_entries_since_inner(
             }).collect::<Vec<_>>()
         }).collect()
     };
+    // Preserve assistant messages for estimation (including thinking-only
+    // messages), but mirror the repair that drops calls whose results were
+    // explicitly omitted from context.
+    let omitted_calls: BTreeMap<_, BTreeSet<_>> = if repair {
+        BTreeMap::new()
+    } else {
+        path.iter()
+            .filter_map(|record| {
+                let Event::Assistant { invocations, .. } = &record.event else {
+                    return None;
+                };
+                let calls: BTreeSet<_> = invocations
+                    .iter()
+                    .filter_map(|invocation| {
+                        let result = result_sources.get(&invocation.operation_id)?;
+                        matches!(edits.get(result), Some(None)).then(|| invocation.call.id.clone())
+                    })
+                    .collect();
+                (!calls.is_empty()).then_some((record.id, calls))
+            })
+            .collect()
+    };
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
@@ -2312,6 +2334,18 @@ fn conversation_entries_since_inner(
             Some(Some(replacement)) => Some((source, project_content(message, replacement))),
             Some(None) => None,
             None => Some((source, message)),
+        })
+        .map(|(source, mut message)| {
+            if let (Some(omitted), Message::Assistant { calls, replay, .. }) =
+                (omitted_calls.get(&source), &mut message)
+            {
+                let count = calls.len();
+                calls.retain(|call| !omitted.contains(&call.id));
+                if calls.len() != count {
+                    *replay = None;
+                }
+            }
+            (source, message)
         })
         .collect();
     if repair && !edits.is_empty() {
