@@ -204,13 +204,57 @@ impl Resources {
             &explicit_skills,
             &mut resources.warnings,
         )?;
-        let prompt_roots = resource_paths::resolve(
+        // Resolve each explicit source independently so its selected filename survives
+        // canonicalization and a non-Markdown alias cannot hide a Markdown alias.
+        let mut prompt_roots = Vec::new();
+        let mut seen_prompt_paths = std::collections::HashSet::new();
+        let mut explicit_args = args.clone();
+        explicit_args.no_prompt_templates = true;
+        for selected in &explicit_prompts {
+            let absolute = resource_path(&workspace, &selected.to_string_lossy());
+            let resolved = resource_paths::resolve(
+                &explicit_args,
+                Kind::Prompt,
+                &[],
+                std::slice::from_ref(selected),
+                &mut resources.warnings,
+            )?;
+            let selected_file = absolute.is_file();
+            if selected_file
+                && !absolute
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".md"))
+            {
+                continue;
+            }
+            for path in resolved {
+                if seen_prompt_paths.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
+                    prompt_roots.push(if selected_file {
+                        absolute.clone()
+                    } else {
+                        path
+                    });
+                }
+            }
+        }
+        for path in resource_paths::resolve(
             args,
             Kind::Prompt,
             &resources.packages.prompts,
-            &explicit_prompts,
+            &[],
             &mut resources.warnings,
-        )?;
+        )? {
+            if path.is_file()
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".md"))
+            {
+                continue;
+            }
+            if seen_prompt_paths.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
+                prompt_roots.push(path);
+            }
+        }
         let explicit_extensions: Vec<_> = args
             .extensions
             .iter()
@@ -984,6 +1028,46 @@ mod tests {
         let resources = Resources::load(&args).unwrap();
         assert!(resources.prompts.contains_key("review"));
         assert!(!resources.prompts.contains_key("note"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_prompt_alias_uses_selected_name_and_extension() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("content.txt"), "text target").unwrap();
+        std::fs::write(root.join("content.md"), "markdown target").unwrap();
+        symlink("content.txt", root.join("alias.md")).unwrap();
+        symlink("content.md", root.join("alias.txt")).unwrap();
+        symlink("content.txt", root.join("second.md")).unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--prompt-template",
+            "alias.txt",
+            "--prompt-template",
+            "alias.md",
+            "--prompt-template",
+            "second.md",
+            "--prompt-template",
+            "content.md",
+        ])
+        .unwrap();
+        args.workspace = root.to_path_buf();
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(
+            resources
+                .prompts
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["alias", "content"]
+        );
+        assert_eq!(resources.prompts["alias"].body, "text target");
+        assert_eq!(resources.prompts["content"].body, "markdown target");
     }
 
     #[test]
