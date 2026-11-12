@@ -950,7 +950,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     // Do not follow symlinks while gathering that implicit candidate set.
     let implicit = plain.is_empty() && !overrides.is_empty();
     let sources: Vec<PathBuf> = if implicit {
-        paths.extend(legacy_prompt_candidates(root, None));
+        paths.extend(legacy_prompt_candidates(root, None, false));
         Vec::new()
     } else {
         plain
@@ -959,7 +959,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
                 let pattern = pattern.replace('\\', "/");
                 if pattern.contains(['*', '?', '[', '{']) {
                     if !pattern.trim_start_matches("./").contains('/') {
-                        let mut legacy = legacy_prompt_candidates(root, None);
+                        let mut legacy = legacy_prompt_candidates(root, None, true);
                         legacy.retain(|path| resource_matches(path, root, &pattern, false, true));
                         legacy.sort();
                         legacy
@@ -1001,7 +1001,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     // Exact force-includes may select a file outside the plain source entries.
     for path in overrides.iter().filter_map(|p| p.strip_prefix('+')) {
         let path = root.join(path.replace('\\', "/"));
-        paths.extend(legacy_prompt_candidates(root, Some(&path)));
+        paths.extend(legacy_prompt_candidates(root, Some(&path), false));
     }
     if !overrides.is_empty() {
         paths.retain(|path| manifest_selected(path, root, &overrides));
@@ -1011,9 +1011,13 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     paths
 }
 
-// Match the previous package-wide candidate rules, without following links.
+// Match package-wide candidate rules without traversing directory links.
 // An exact target prunes traversal to its ancestors and cannot escape the root.
-fn legacy_prompt_candidates(root: &Path, target: Option<&Path>) -> Vec<PathBuf> {
+fn legacy_prompt_candidates(
+    root: &Path,
+    target: Option<&Path>,
+    include_file_links: bool,
+) -> Vec<PathBuf> {
     if let Some(target) = target {
         let Ok(relative) = target.strip_prefix(root) else {
             return Vec::new();
@@ -1041,8 +1045,10 @@ fn legacy_prompt_candidates(root: &Path, target: Option<&Path>) -> Vec<PathBuf> 
         .build()
         .flatten()
         .filter(|entry| {
-            entry.file_type().is_some_and(|kind| kind.is_file())
-                && entry.file_name().to_string_lossy().ends_with(".md")
+            entry.file_type().is_some_and(|kind| {
+                kind.is_file()
+                    || (include_file_links && kind.is_symlink() && entry.path().is_file())
+            }) && entry.file_name().to_string_lossy().ends_with(".md")
                 && target.is_none_or(|target| entry.path() == target)
         })
         .map(|entry| entry.into_path())
@@ -1615,6 +1621,28 @@ mod tests {
         assert_eq!(
             prompts,
             vec![root.join("archive.md/inside.md"), root.join("visible.md")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_prompt_basename_glob_includes_unignored_symlink_files() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("content.txt"), "prompt content").unwrap();
+        std::fs::write(root.join(".ignore"), "ignored.md\n").unwrap();
+        symlink("content.txt", root.join("alias.md")).unwrap();
+        symlink("content.txt", root.join("ignored.md")).unwrap();
+        symlink("missing", root.join("broken.md")).unwrap();
+        symlink("/", root.join("directory.md")).unwrap();
+        let prompts = collect_package_resources(root, &json!({"prompts": ["*.md"]}), Vec::new())
+            .unwrap()
+            .prompts;
+        assert_eq!(prompts, vec![root.join("alias.md")]);
+        assert_eq!(
+            std::fs::read_to_string(&prompts[0]).unwrap(),
+            "prompt content"
         );
     }
 
