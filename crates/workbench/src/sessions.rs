@@ -341,8 +341,47 @@ pub fn html(session: &Session) -> String {
                 content, images, ..
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
-            Event::CustomMessage { message } if message.display => {
+            Event::CustomMessage { message } => {
+                // Older unmarked journals are ambiguous when a native message
+                // exactly matches the legacy source. Prefer hiding that content.
+                let legacy = {
+                    record
+                        .parent
+                        .and_then(|id| id.checked_sub(1))
+                        .and_then(|index| usize::try_from(index).ok())
+                        .and_then(|index| session.records().get(index))
+                        .is_some_and(|parent| match &parent.event {
+                            Event::SourceEntry { format, entry }
+                                if format == "pi"
+                                    && entry["type"] == "message"
+                                    && matches!(
+                                        entry["message"]["role"].as_str(),
+                                        Some("custom" | "hookMessage")
+                                    ) =>
+                            {
+                                super::session_import::imported_custom_message(
+                                    &entry["message"],
+                                    true,
+                                )
+                                .ok()
+                                .is_some_and(|original| {
+                                    serde_json::to_value(original)
+                                        .ok()
+                                        .zip(serde_json::to_value(message).ok())
+                                        .is_some_and(|(original, message)| original == message)
+                                })
+                            }
+                            _ => false,
+                        })
+                };
+                let show = message.display || !legacy;
+                if !show {
+                    continue;
+                }
                 html.push_str(&format!("<article><b>{}</b>", escape(&message.custom_type)));
+                if !message.display {
+                    html.push_str(" <span>Hidden in terminal</span>");
+                }
                 match &message.content {
                     pi_rs::ContextContent::Text(text) => render_export_markdown(&mut html, text),
                     pi_rs::ContextContent::Blocks(blocks) => {
@@ -1217,13 +1256,180 @@ mod tests {
             serde_json::json!({"type":"session","version":3}),
             serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"custom","customType":"private","content":"secret context","display":false}}),
             serde_json::json!({"type":"message","id":"b","parentId":"a","message":{"role":"custom","customType":"note","content":"visible **note**","display":true}}),
+            serde_json::json!({"type":"message","id":"c","parentId":"b","message":{"role":"hookMessage","content":"hidden hook explicit","display":false}}),
+            serde_json::json!({"type":"message","id":"d","parentId":"c","message":{"role":"hookMessage","content":"hidden hook default"}}),
+            serde_json::json!({"type":"message","id":"e","parentId":"d","message":{"role":"hookMessage","content":"visible hook","display":true}}),
         ] {
             writeln!(fixture, "{entry}").unwrap();
         }
         let session = super::super::session_import::read(fixture.path()).unwrap();
         let document = html(&session);
         assert!(!document.contains("secret context"));
+        assert!(!document.contains("hidden hook explicit"));
+        assert!(!document.contains("hidden hook default"));
+        assert!(document.contains("visible hook"));
         assert!(document.contains("visible <strong>note</strong>"));
+    }
+
+    #[test]
+    fn html_exports_hidden_custom_entries_with_terminal_visibility_label() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"custom_message","id":"a","parentId":null,"customType":"<note>","content":"hidden **context**", "display":false}),
+            serde_json::json!({"type":"custom_message","id":"b","parentId":"a","customType":"visible","content":"shown", "display":true}),
+            serde_json::json!({"type":"message","id":"c","parentId":"b","message":{"role":"custom","customType":"private","content":"private role", "display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(fixture.path()).unwrap();
+        let document = html(&session);
+        assert!(document.contains("<b>&lt;note&gt;</b> <span>Hidden in terminal</span>"));
+        assert!(document.contains("hidden <strong>context</strong>"));
+        assert!(document.contains("<b>visible</b>"));
+        assert_eq!(document.matches("Hidden in terminal").count(), 1);
+        assert!(!document.contains("private role"));
+    }
+
+    #[test]
+    fn html_exports_native_hidden_custom_messages() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        for (custom_type, content, display) in [
+            ("<native>", "hidden **native**", false),
+            ("visible", "visible native", true),
+        ] {
+            session
+                .append_custom_message(pi_rs::CustomMessage {
+                    custom_type: custom_type.into(),
+                    content: pi_rs::ContextContent::Text(content.into()),
+                    display,
+                    details: None,
+                })
+                .unwrap();
+        }
+        let document = html(&session);
+        assert!(document.contains("<b>&lt;native&gt;</b> <span>Hidden in terminal</span>"));
+        assert!(document.contains("hidden <strong>native</strong>"));
+        assert!(document.contains("visible native"));
+        assert_eq!(document.matches("Hidden in terminal").count(), 1);
+    }
+
+    #[test]
+    fn html_exports_native_hidden_message_after_checkout_to_legacy_source() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"legacy hidden","display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let mut session = super::super::session_import::read(fixture.path()).unwrap();
+        let source = session
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event,
+                    Event::SourceEntry { entry, .. } if entry["id"] == "a"
+                )
+            })
+            .unwrap()
+            .id;
+        session.checkout(source).unwrap();
+        session
+            .append_custom_message(pi_rs::CustomMessage {
+                custom_type: "native".into(),
+                content: pi_rs::ContextContent::Text("native after checkout".into()),
+                display: false,
+                details: None,
+            })
+            .unwrap();
+        let document = html(&session);
+        assert!(document.contains("<b>native</b> <span>Hidden in terminal</span>"));
+        assert!(document.contains("native after checkout"));
+        assert!(!document.contains("legacy hidden"));
+    }
+
+    #[test]
+    fn html_exports_native_message_after_fork_at_legacy_source_even_if_content_matches() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"same content","display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let imported = super::super::session_import::read(fixture.path()).unwrap();
+        let source = imported
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a"
+                )
+            })
+            .unwrap()
+            .id;
+        let mut fork = Session::from_records(imported.fork_records(source).unwrap()).unwrap();
+        fork.append_custom_message(pi_rs::CustomMessage {
+            custom_type: String::new(),
+            content: pi_rs::ContextContent::Text("same content".into()),
+            display: false,
+            details: None,
+        })
+        .unwrap();
+        let records = serde_json::to_string(fork.records()).unwrap();
+        let reopened = Session::from_records(serde_json::from_str(&records).unwrap()).unwrap();
+        let document = html(&reopened);
+        assert!(document.contains("Hidden in terminal"));
+        assert!(document.contains("same content"));
+    }
+
+    #[test]
+    fn html_hides_ambiguous_unmarked_native_message_matching_legacy_source() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"ambiguous private content","display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let imported = super::super::session_import::read(fixture.path()).unwrap();
+        let source = imported
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a"
+                )
+            })
+            .unwrap()
+            .id;
+        let mut records = imported.fork_records(source).unwrap();
+        let parent = records.last().unwrap().id;
+        // Simulate an old native append without the new associated source marker.
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: 2,
+            id: parent + 1,
+            parent: Some(parent),
+            event: Event::CustomMessage {
+                message: pi_rs::CustomMessage {
+                    custom_type: String::new(),
+                    content: pi_rs::ContextContent::Text("ambiguous private content".into()),
+                    display: false,
+                    details: None,
+                },
+            },
+        });
+        let mut wire = serde_json::to_value(&records).unwrap();
+        // Journals produced by the interim optional-field format remain readable.
+        wire.as_array_mut().unwrap().last_mut().unwrap()["event"]["legacy_source"] =
+            serde_json::json!(false);
+        let decoded: Vec<pi_rs::Record> = serde_json::from_value(wire).unwrap();
+        let old = Session::from_records(decoded).unwrap();
+        assert!(!html(&old).contains("ambiguous private content"));
     }
 
     #[test]

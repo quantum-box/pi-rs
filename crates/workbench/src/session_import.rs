@@ -354,7 +354,7 @@ fn push_user(events: &mut Vec<Event>, value: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn imported_custom_message(entry: &Value, legacy: bool) -> Result<pi_rs::CustomMessage> {
+pub(super) fn imported_custom_message(entry: &Value, legacy: bool) -> Result<pi_rs::CustomMessage> {
     let value = entry
         .get("content")
         .ok_or_else(|| Error::Session("imported custom message is missing content".into()))?;
