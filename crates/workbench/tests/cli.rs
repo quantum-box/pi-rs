@@ -890,6 +890,9 @@ fn rpc_model_discovery_does_not_block_other_commands() {
     ready.recv_timeout(Duration::from_secs(30)).unwrap();
     writeln!(input, "{}", json!({"type":"get_state","id":"state"})).unwrap();
     let event = received.recv_timeout(Duration::from_secs(10));
+    drop(input);
+    // Allow the child to observe EOF while discovery is still held open.
+    std::thread::sleep(Duration::from_millis(150));
     let _ = release.send(());
     let event = event.expect("state request blocked behind model discovery");
     assert_eq!(event["id"], "state", "{event}");
@@ -904,8 +907,6 @@ fn rpc_model_discovery_does_not_block_other_commands() {
             .iter()
             .any(|model| model["id"] == "fixture-model")
     );
-    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
-    drop(input);
     let status = child.wait().unwrap();
     reader.join().unwrap();
     server.join().unwrap();

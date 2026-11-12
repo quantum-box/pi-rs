@@ -162,7 +162,13 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         let line = match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(line) => line?,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) if model_queries.is_empty() => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Do not drop accepted model-list requests when a batch client
+                // closes stdin before discovery finishes.
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
         };
         let request = match parse_request(&line) {
             Ok(request) => request,
