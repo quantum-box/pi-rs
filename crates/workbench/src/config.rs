@@ -15,12 +15,14 @@ pub struct Settings {
 }
 impl Settings {
     pub fn set_user_values(&mut self, values: &[(String, Value)]) -> Result<()> {
-        let path = agent_dir().join("settings.json");
-        update_object(&path, |settings| {
+        self.set_user_values_at(&agent_dir().join("settings.json"), values)
+    }
+    fn set_user_values_at(&mut self, path: &Path, values: &[(String, Value)]) -> Result<()> {
+        update_object(path, |settings| {
             for (key, value) in values {
                 settings.insert(key.clone(), value.clone());
             }
-            validate_settings(&Value::Object(settings.clone()), &path)
+            validate_settings(&Value::Object(settings.clone()), path)
         })?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
@@ -37,7 +39,18 @@ impl Settings {
                     .insert(key.clone(), value.clone());
             }
         }
+        self.refresh_effective();
         Ok(())
+    }
+    fn refresh_effective(&mut self) {
+        let mut layers = self.resource_layers.iter();
+        if let Some((_, user)) = layers.next() {
+            let mut value = user.clone();
+            for (_, project) in layers {
+                merge(&mut value, project.clone());
+            }
+            self.value = value;
+        }
     }
     pub fn load(workspace: &Path, trusted: bool) -> Result<Self> {
         let user_path = agent_dir().join("settings.json");
@@ -225,7 +238,15 @@ impl Settings {
     }
 
     pub fn set_user_member(&mut self, key: &str, member: &str, value: Value) -> Result<()> {
-        let path = agent_dir().join("settings.json");
+        self.set_user_member_at(&agent_dir().join("settings.json"), key, member, value)
+    }
+    fn set_user_member_at(
+        &mut self,
+        path: &Path,
+        key: &str,
+        member: &str,
+        value: Value,
+    ) -> Result<()> {
         let update = |settings: &mut Map<String, Value>| -> Result<()> {
             settings
                 .entry(key)
@@ -235,9 +256,9 @@ impl Settings {
                 .insert(member.into(), value.clone());
             Ok(())
         };
-        update_object(&path, |settings| {
+        update_object(path, |settings| {
             update(settings)?;
-            validate_settings(&Value::Object(settings.clone()), &path)
+            validate_settings(&Value::Object(settings.clone()), path)
         })?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
@@ -246,6 +267,7 @@ impl Settings {
         if let Some((_, layer)) = self.resource_layers.first_mut() {
             update(layer.as_object_mut().expect("settings layer"))?;
         }
+        self.refresh_effective();
         Ok(())
     }
 
@@ -294,7 +316,9 @@ impl Settings {
         Ok(())
     }
     pub fn set_user(&mut self, key: &str, value: Value) -> Result<()> {
-        let path = agent_dir().join("settings.json");
+        self.set_user_at(&agent_dir().join("settings.json"), key, value)
+    }
+    fn set_user_at(&mut self, path: &Path, key: &str, value: Value) -> Result<()> {
         std::fs::create_dir_all(path.parent().expect("agent directory"))?;
         let lock = std::fs::OpenOptions::new()
             .create(true)
@@ -323,6 +347,7 @@ impl Settings {
                 .expect("settings layer")
                 .insert(key.into(), value);
         }
+        self.refresh_effective();
         Ok(())
     }
 }
@@ -494,6 +519,63 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn global_updates_preserve_project_precedence_in_memory_and_on_disk() {
+        use super::*;
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let user = json!({"theme":"dark", "compaction":{"enabled":true,"reserveTokens":100}, "defaultModel":"old"});
+        let project = json!({"theme":"project", "compaction":{"enabled":false}, "defaultModel":"project-model"});
+        write_json(&path, &user).unwrap();
+        let mut effective = user.clone();
+        merge(&mut effective, project.clone());
+        let mut settings = Settings {
+            value: effective,
+            resource_layers: vec![
+                (dir.path().to_owned(), user),
+                (dir.path().join("project"), project),
+            ],
+        };
+
+        settings
+            .set_user_at(&path, "theme", json!("light"))
+            .unwrap();
+        assert_eq!(settings.string("theme"), Some("project"));
+        settings
+            .set_user_member_at(&path, "compaction", "enabled", json!(true))
+            .unwrap();
+        assert!(!settings.auto_compaction_enabled());
+        settings
+            .set_user_member_at(&path, "compaction", "reserveTokens", json!(200))
+            .unwrap();
+        settings
+            .set_user_values_at(
+                &path,
+                &[
+                    ("defaultModel".into(), json!("new")),
+                    ("defaultProvider".into(), json!("ollama")),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(settings.string("theme"), Some("project"));
+        assert!(!settings.auto_compaction_enabled());
+        assert_eq!(settings.value()["compaction"]["reserveTokens"], 200);
+        assert_eq!(settings.string("defaultModel"), Some("project-model"));
+        assert_eq!(settings.string("defaultProvider"), Some("ollama"));
+        let saved = read_object(&path).unwrap();
+        assert_eq!(saved["theme"], "light");
+        assert_eq!(
+            saved["compaction"],
+            json!({"enabled":true,"reserveTokens":200})
+        );
+        assert_eq!(saved["defaultModel"], "new");
+        let mut reloaded = saved;
+        merge(&mut reloaded, settings.resource_layers[1].1.clone());
+        assert_eq!(settings.value(), &reloaded);
+    }
+
     #[test]
     fn default_tools_project_modifiers_extend_user_selection() {
         use super::*;
