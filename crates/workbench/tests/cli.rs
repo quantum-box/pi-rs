@@ -76,7 +76,7 @@ fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
             "baseUrl":base,
             "models":[{"id":"fixture-model","reasoning":true,
                 "thinkingLevelMap":{"high":"strong"},
-                "samplingParams":{"temperature":0.7,"top_p":0.9,"top_k":10,"parallel_tool_calls":false,"max_tool_calls":3},
+                "samplingParams":{"temperature":0.7,"top_p":0.9,"top_k":10,"parallel_tool_calls":false,"max_tool_calls":3,"tool_choice":"required"},
                 "samplingParamsByThinkingLevel":{"high":{"temperature":0.5,"top_k":40}}}],
             "modelOverrides":{"fixture-model":{"samplingParamsByThinkingLevel":{"high":{"temperature":0.2}}}}
         }}}).to_string()).unwrap();
@@ -102,6 +102,7 @@ fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
             assert_eq!(body["top_k"], top_k);
             assert_eq!(body["parallel_tool_calls"], false);
             assert_eq!(body["max_tool_calls"], 3);
+            assert_eq!(body["tool_choice"], "required");
             if level == "high" {
                 assert_eq!(body["reasoning"]["effort"], "strong");
             }

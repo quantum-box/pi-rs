@@ -192,7 +192,6 @@ pub fn validate_sampling(sampling: &BTreeMap<String, Value>) -> Result<()> {
                 | "tools"
                 | "functions"
                 | "function_call"
-                | "tool_choice"
                 | "stream"
                 | "stream_options"
                 | "background"
@@ -460,7 +459,6 @@ mod tests {
             "tools",
             "functions",
             "function_call",
-            "tool_choice",
             "stream",
             "stream_options",
             "background",
@@ -490,6 +488,7 @@ mod tests {
                     ("custom_sampling".into(), json!({"value": 1})),
                     ("parallel_tool_calls".into(), json!(false)),
                     ("max_tool_calls".into(), json!(3)),
+                    ("tool_choice".into(), json!("required")),
                 ]))
                 .is_ok()
         );

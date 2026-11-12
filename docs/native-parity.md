@@ -2583,7 +2583,7 @@ This is a deliberate difference from Pi v1.5.0, which permits arbitrary sampling
 fields to replace managed request fields. Pi-rs rejects such fields when configuring
 the affected Responses model, preserving its streaming, conversation, tool, and
 output-limit guarantees without blocking other models from loading. Responses
-sampling can still set `parallel_tool_calls` and `max_tool_calls`.
+sampling can still set `tool_choice`, `parallel_tool_calls`, and `max_tool_calls`.
 
 The loopback fixture exercised level clamping, the actual request payload,
 and clearing the previous model's sampling configuration when switching
