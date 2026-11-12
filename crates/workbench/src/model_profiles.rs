@@ -1288,6 +1288,37 @@ mod tests {
     }
 
     #[test]
+    fn kimi_coding_catalog_preserves_models_and_reasoning_levels() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        let provider = profiles.provider("kimi-coding").unwrap();
+        assert_eq!(provider.adapter(), Adapter::ChatCompletions);
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://api.kimi.com/coding/v1/chat/completions"
+        );
+        assert_eq!(
+            builtin_chat::find("kimi-coding").unwrap().env(),
+            "KIMI_API_KEY"
+        );
+        assert_eq!(profiles.model_ids(&provider).len(), 6);
+        let model = profiles.model(&provider, "k3.1-pro").unwrap();
+        assert_eq!(
+            model.levels(Adapter::ChatCompletions).unwrap(),
+            ["low", "high", "max"]
+        );
+        assert_eq!(model.supports_images(), Some(true));
+        let fast = profiles
+            .model(&provider, "kimi-for-coding-highspeed")
+            .unwrap();
+        assert!(
+            !fast
+                .levels(Adapter::ChatCompletions)
+                .unwrap()
+                .contains(&"off".into())
+        );
+    }
+
+    #[test]
     fn xiaomi_regional_catalogs_preserve_reasoning_and_credentials() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         for (name, endpoint, variable, count) in [

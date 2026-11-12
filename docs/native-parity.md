@@ -79,6 +79,8 @@ without `defaultProvider` are still accepted.
 Known text-only chat models receive Pi's image-omission placeholders for user
 and tool images. Unknown model capabilities leave image handling to the
 provider, and the explicit image-blocking setting retains precedence.
+Local image reads also report when the selected model cannot receive images;
+the saved tool result retains the image for later use with a compatible model.
 
 OpenAI Responses `max_output_tokens` incomplete events preserve the streamed
 partial response and report the `length` finish reason. Across model providers,
@@ -107,6 +109,14 @@ Xiaomi's pay-as-you-go endpoint and its China, Amsterdam and Singapore token
 plan endpoints use distinct Pi v1.5.0 catalogs and credentials. Their chat
 requests use enabled/disabled thinking and replay reasoning content through
 tool turns. Loopback CLI coverage does not replace live Xiaomi acceptance.
+
+### Kimi Code API key checkpoint
+
+The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,
+and the six pinned Kimi chat models. Their image limits, prices, context windows,
+and per-model reasoning settings remain distinct; the high-speed coding model
+uses its DeepSeek-style thinking switch. Subscription OAuth and live Kimi
+acceptance remain open.
 
 Markdown links use the reference's non-hyperlink terminal fallback: link text
 is underlined and destinations appear in parentheses only when they differ from

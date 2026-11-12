@@ -67,6 +67,88 @@ fn xai_provider_streams_through_the_cli() {
 }
 
 #[test]
+fn kimi_coding_models_send_their_specific_reasoning_options() {
+    for (model, deepseek) in [("k3.1-pro", false), ("kimi-for-coding-highspeed", true)] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut length = 0;
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                let line = line.to_ascii_lowercase();
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.contains("authorization: bearer fixture"));
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], model);
+            assert!(body["max_tokens"].is_number());
+            assert!(body.get("max_completion_tokens").is_none());
+            if deepseek {
+                assert_eq!(body["thinking"]["type"], "enabled");
+                assert!(body.get("reasoning_effort").is_none());
+            } else {
+                assert_eq!(body["reasoning_effort"], "high");
+                assert!(body.get("thinking").is_none());
+            }
+            let events = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "kimi-coding",
+                "--model",
+                model,
+                "--thinking",
+                "high",
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{model}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn xiaomi_providers_send_thinking_and_bearer_credentials() {
     for provider in [
         "xiaomi",

@@ -639,7 +639,12 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             CodingTools::local(&args.workspace)?
                 .with_shell_config(shell.clone())
                 .with_image_resize(args.settings.resize_model_images())
-                .with_image_profile(args.model_image_resize()),
+                .with_image_profile(args.model_image_resize())
+                .with_model_image_support(
+                    args.model_profiles
+                        .model(&args.provider, &args.model)
+                        .and_then(|model| model.supports_images()),
+                ),
         ))?;
         let system_prompt = select_tools(
             &mut registry,
