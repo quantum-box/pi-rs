@@ -491,6 +491,8 @@ struct StreamingTool {
     preview: Value,
 }
 
+type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
+
 #[derive(Default)]
 struct View {
     regular: RegularState,
@@ -519,6 +521,8 @@ struct View {
     expand_key: Option<crossterm::event::KeyEvent>,
     panel_rows: Vec<(std::ops::Range<usize>, TranscriptPanel)>,
     panel_press: Option<(TranscriptPanel, u16, u16)>,
+    link_rows: Vec<LinkRow>,
+    link_press: Option<(String, u16, u16)>,
     summarizing: bool,
     hide_thinking: bool,
     streaming: String,
@@ -1046,6 +1050,8 @@ impl View {
         self.mouse.clear();
         self.panel_rows.clear();
         self.panel_press = None;
+        self.link_rows.clear();
+        self.link_press = None;
         self.summarizing = false;
         self.scrollbar_dragging = false;
         self.scrollbar_activity = None;
@@ -1540,6 +1546,7 @@ impl View {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 if self.mouse.contains_row(event.row) =>
             {
+                self.link_press = None;
                 let direction = if event.kind == MouseEventKind::ScrollUp {
                     -1
                 } else {
@@ -1559,6 +1566,7 @@ impl View {
                 self.scrollbar_activity = Some(now);
             }
             MouseEventKind::Down(MouseButton::Left) if on_scrollbar => {
+                self.link_press = None;
                 self.mouse.clear();
                 self.scrollbar_dragging = true;
                 self.viewport
@@ -1578,6 +1586,7 @@ impl View {
                 self.scrollbar_activity = Some(now);
             }
             MouseEventKind::Down(MouseButton::Right) if self.search.is_none() => {
+                self.link_press = None;
                 self.paste_clipboard(args);
             }
             MouseEventKind::Down(MouseButton::Left) if self.search.is_none() => {
@@ -1587,15 +1596,29 @@ impl View {
                     .then(|| self.panel_at(event.row))
                     .flatten()
                     .map(|id| (id, event.column, event.row));
-                self.mouse.press(event.column, event.row, now);
+                let single = self.mouse.press(event.column, event.row, now);
+                if self.hyperlink_at(event.column, event.row).is_some() {
+                    self.panel_press = None;
+                }
+                self.link_press = (single && event.modifiers.is_empty())
+                    .then(|| self.hyperlink_at(event.column, event.row))
+                    .flatten()
+                    .map(|url| (url.to_owned(), event.column, event.row));
             }
             MouseEventKind::Drag(MouseButton::Left) if self.search.is_none() => {
                 self.panel_press = None;
+                self.link_press = None;
                 self.mouse.drag(event.column, event.row);
             }
             MouseEventKind::Up(MouseButton::Left) if self.search.is_none() => {
                 let default_expanded = self.expand_tools;
-                if let Some((panel, column, row)) = self.panel_press.take()
+                if let Some(url) = self.released_link(event.column, event.row) {
+                    self.panel_press = None;
+                    self.mouse.clear_gesture();
+                    tokio::spawn(async move {
+                        let _ = pi_rs_workbench::oauth_callback::open_browser(&url).await;
+                    });
+                } else if let Some((panel, column, row)) = self.panel_press.take()
                     && (column, row) == (event.column, event.row)
                     && self.panel_at(row) == Some(panel)
                     && let Some(expanded) = self.panel_expansion(panel)
@@ -1611,6 +1634,51 @@ impl View {
             _ => return false,
         }
         true
+    }
+
+    fn hyperlink_at(&self, column: u16, row: u16) -> Option<&str> {
+        self.link_rows
+            .iter()
+            .find(|(y, _)| *y == row)?
+            .1
+            .iter()
+            .find(|(columns, _)| columns.contains(&usize::from(column)))
+            .map(|(_, url)| url.as_str())
+    }
+
+    fn released_link(&mut self, column: u16, row: u16) -> Option<String> {
+        let (url, pressed_column, pressed_row) = self.link_press.take()?;
+        ((column, row) == (pressed_column, pressed_row)
+            && self.hyperlink_at(column, row) == Some(url.as_str()))
+        .then_some(url)
+    }
+
+    fn cache_links(&mut self, lines: &[Line], start_row: usize, width: usize) {
+        self.link_rows.clear();
+        for (row, line) in lines.iter().enumerate() {
+            let mut col = 0;
+            let mut links = Vec::new();
+            for span in &line.spans {
+                let mut end = col;
+                for grapheme in span.text.graphemes(true) {
+                    let cells = UnicodeWidthStr::width(grapheme);
+                    if end + cells > width {
+                        break;
+                    }
+                    end += cells;
+                }
+                if let Some(url) = &span.hyperlink
+                    && !url.starts_with('-')
+                    && col < end
+                {
+                    links.push((col..end, url.clone()));
+                }
+                col = end;
+            }
+            if !links.is_empty() {
+                self.link_rows.push(((row + start_row) as u16, links));
+            }
+        }
     }
 
     fn prompt_rows(
@@ -1750,8 +1818,10 @@ impl View {
         };
         let end = (start + body_height).min(lines.len());
         self.panel_rows.clear();
+        self.link_rows.clear();
         if modal {
             self.panel_press = None;
+            self.link_press = None;
             self.mouse.clear();
         } else {
             self.panel_rows
@@ -1763,6 +1833,7 @@ impl View {
                 }));
             self.mouse
                 .update(&lines, start, header_rows..header_rows + body_height);
+            self.cache_links(&lines[start..end], header_rows, body_width);
             if let Some(search) = &self.search {
                 search.highlight(&mut lines, start..end, theme);
             } else {
@@ -3802,6 +3873,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             }
             Event::FocusLost if args.tui_mode != Some(TuiMode::Regular) => {
                 view.panel_press = None;
+                view.link_press = None;
                 view.mouse.focus_lost();
                 view.scrollbar_dragging = false;
                 dirty = true;
@@ -6334,6 +6406,32 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn link_clicks_use_visible_cells_and_require_the_original_target() {
+        let mut view = super::View::default();
+        let mut line = super::Line::plain("あ", crossterm::style::Color::Reset);
+        let mut link = super::Line::plain("link", crossterm::style::Color::Reset)
+            .spans
+            .remove(0);
+        link.hyperlink = Some("https://example.test".into());
+        line.spans.push(link);
+        view.cache_links(&[line], 2, 5);
+        assert_eq!(view.hyperlink_at(1, 2), None);
+        assert_eq!(view.hyperlink_at(2, 2), Some("https://example.test"));
+        assert_eq!(view.hyperlink_at(4, 2), Some("https://example.test"));
+        assert_eq!(view.hyperlink_at(5, 2), None);
+        view.link_press = Some(("https://example.test".into(), 2, 2));
+        assert_eq!(
+            view.released_link(2, 2).as_deref(),
+            Some("https://example.test")
+        );
+        view.link_press = Some(("https://example.test".into(), 2, 2));
+        assert_eq!(view.released_link(3, 2), None);
+        view.link_press = Some(("https://example.test".into(), 2, 2));
+        view.link_rows.clear();
+        assert_eq!(view.released_link(2, 2), None);
+    }
+
     #[test]
     fn copy_shortcut_prefers_selected_text_when_auto_copy_is_disabled() {
         let mut view = super::View::default();
