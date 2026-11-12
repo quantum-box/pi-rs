@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 // Some hosted runners open idle connections to local listeners. Read each
 // connection independently so one idle peer cannot block the real request.
 fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStream>, String) {
+    // Windows duplicates may not retain the original listener’s nonblocking mode.
+    // Without this, accept can block after a reader has received the request.
+    listener.set_nonblocking(true).unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
