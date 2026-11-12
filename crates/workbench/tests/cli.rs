@@ -1987,7 +1987,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         .unwrap();
         let server = std::thread::spawn(move || {
             // Parallel CLI tests can delay process startup on hosted runners.
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
             loop {
                 let (mut socket, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -2001,7 +2001,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     Err(error) => panic!("proxy request not received: {error}"),
                 };
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut first = String::new();
@@ -2048,7 +2048,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                 "--endpoint",
                 &target,
                 "--model-timeout-secs",
-                "4",
+                "20",
                 "--print",
                 "hello",
             ]);

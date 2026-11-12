@@ -5,6 +5,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const PROVIDER: &str = "openai-chatgpt";
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Registration {
+    client_id: String,
+    subject: String,
+    email: Option<String>,
+}
+
+fn registration() -> Result<Option<Registration>> {
+    let value =
+        super::config::read_object(&super::config::agent_dir().join("chatgpt-registration.json"))?;
+    if value.as_object().is_some_and(|data| data.is_empty()) {
+        return Ok(None);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|_| Error::Config("invalid ChatGPT registration".into()))
+}
 fn auth_path() -> std::path::PathBuf {
     super::config::agent_dir().join("auth.json")
 }
@@ -54,6 +71,15 @@ fn host_id() -> Result<String> {
     Ok(result)
 }
 fn save(credential: &pi_rs::openai::oauth::Credential) -> Result<()> {
+    let registration = Registration {
+        client_id: credential.client_id.clone(),
+        subject: credential.subject.clone(),
+        email: credential.email.clone(),
+    };
+    super::config::write_json(
+        &super::config::agent_dir().join("chatgpt-registration.json"),
+        &serde_json::to_value(registration)?,
+    )?;
     super::config::update_object(&auth_path(), |data| {
         data.insert(
             PROVIDER.into(),
@@ -76,6 +102,7 @@ pub(super) async fn login(
 ) -> Result<()> {
     let _lock = lock().await?;
     let existing = load()?;
+    let registered = registration()?;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let callback = Url::parse(&format!(
         "http://127.0.0.1:{}/auth/callback",
@@ -87,7 +114,8 @@ pub(super) async fn login(
         host_id()?,
         existing
             .as_ref()
-            .map(|credential| credential.client_id.clone()),
+            .map(|credential| credential.client_id.clone())
+            .or_else(|| registered.as_ref().map(|account| account.client_id.clone())),
     )?;
     let url = auth.url();
     announce(&url);
@@ -104,6 +132,9 @@ pub(super) async fn login(
         if existing
             .as_ref()
             .is_some_and(|previous| previous.subject != credential.subject)
+            || registered
+                .as_ref()
+                .is_some_and(|previous| previous.subject != credential.subject)
         {
             return Err(Error::Config(
                 "ChatGPT account changed during sign-in".into(),

@@ -130,6 +130,18 @@ impl OpenAiResponses {
     }
 }
 
+/// Supported reasoning levels for known models. Unknown models use their default.
+pub fn thinking_levels(model: &str) -> Vec<String> {
+    let levels: &[&str] = if matches!(model, "gpt-6.1-sol" | "gpt-6-astra") {
+        &["low", "medium", "high", "xhigh", "max"]
+    } else if matches!(model, "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-terra") {
+        &["off", "low", "medium", "high", "xhigh", "max"]
+    } else {
+        &["off"]
+    };
+    levels.iter().map(|level| (*level).into()).collect()
+}
+
 fn payload(request: &ModelRequest) -> Value {
     let mut input = Vec::new();
     for message in &request.messages {
@@ -249,7 +261,7 @@ impl Model for OpenAiResponses {
                 if item.data == "[DONE]" { continue; }
                 let event: Value = serde_json::from_str(&item.data).map_err(|_| Error::Model("invalid OpenAI stream event".into()))?;
                 match field(&event, "type")? {
-                    "response.output_text.delta" => yield ModelEvent::Text(field(&event,"delta")?.into()),
+                    "response.output_text.delta" | "response.refusal.delta" => yield ModelEvent::Text(field(&event,"delta")?.into()),
                     "response.reasoning_summary_text.delta" => { let text = field(&event,"delta")?; reasoning.push_str(text); yield ModelEvent::Reasoning(text.into()); },
                     "response.output_item.added" if event["item"]["type"] == "function_call" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
@@ -436,5 +448,29 @@ mod tests {
             ),
             Error::Model(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn refusal_text_is_visible() {
+        let events = "data: {\"type\":\"response.refusal.delta\",\"delta\":\"Cannot comply\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        let (client, server) = fixture(events).await;
+        let events: Vec<_> = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(matches!(&events[0], ModelEvent::Text(text) if text == "Cannot comply"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn known_reasoning_models_only_expose_supported_levels() {
+        let levels = thinking_levels("gpt-6.1-sol");
+        assert!(levels.contains(&"low".into()));
+        assert!(!levels.contains(&"off".into()));
+        assert!(!levels.contains(&"minimal".into()));
+        assert_eq!(thinking_levels("unknown-model"), vec!["off"]);
     }
 }

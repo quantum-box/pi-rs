@@ -540,7 +540,15 @@ impl Client {
             }
             Self::Google(client) => Self::Google(client.with_thinking(thinking)),
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
-            Self::OpenAi(client) => Self::OpenAi(client.with_thinking(thinking)),
+            Self::OpenAi(client) => {
+                let levels = pi_rs::openai::thinking_levels(&args.model);
+                let thinking = if levels.len() == 1 {
+                    None
+                } else {
+                    thinking.filter(|level| levels.iter().any(|item| item == level))
+                };
+                Self::OpenAi(client.with_thinking(thinking))
+            }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));
                 Self::Deferred(client)
@@ -566,7 +574,7 @@ impl Client {
                     .remove(model)?
                     .thinking_levels
             }
-            Self::OpenAi(_) => None,
+            Self::OpenAi(_) => Some(pi_rs::openai::thinking_levels(model)),
             Self::Deferred(client) => {
                 Box::pin(client.resolve().await.ok()?.thinking_levels(model)).await
             }

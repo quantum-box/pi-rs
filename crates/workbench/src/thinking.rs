@@ -28,11 +28,10 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         return levels;
     }
     let fallback = || match adapter {
-        super::providers::Adapter::ChatCompletions
-        | super::providers::Adapter::PiMessages
-        | super::providers::Adapter::OpenAiResponses => {
+        super::providers::Adapter::ChatCompletions | super::providers::Adapter::PiMessages => {
             LEVELS.iter().map(|level| (*level).into()).collect()
         }
+        super::providers::Adapter::OpenAiResponses => pi_rs::openai::thinking_levels(&args.model),
         super::providers::Adapter::Anthropic
             if matches!(args.provider.id(), "fireworks" | "openrouter")
                 && args
