@@ -462,6 +462,7 @@ fn wire_request(
 ) -> Result<Value> {
     let identity = identity(replay_scope, model_id(&request.model));
     let gemini_v3 = gemini_major(&identity.model).is_some_and(|version| version >= 3);
+    let multimodal_tool_response = gemini_major(&identity.model).is_none_or(|version| version >= 3);
     let explicit_tool_ids = uses_tool_call_ids(&identity.model);
     let mut contents = Vec::new();
     let mut system = Vec::new();
@@ -547,7 +548,7 @@ fn wire_request(
                 if let Some(id) = id {
                     response["id"] = json!(id);
                 }
-                if gemini_v3 {
+                if multimodal_tool_response {
                     if !images.is_empty() {
                         response["parts"] = json!(images.iter().map(|image| json!({"inlineData":{"mimeType":image.mime_type,"data":image.data}})).collect::<Vec<_>>());
                     }
@@ -786,6 +787,90 @@ fn report_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_images_follow_model_multimodal_response_support() {
+        let image_result = json!({"data":{"content":[
+            {"type":"text","text":"picture"},
+            {"type":"image","mimeType":"image/png","data":"YWJj"},
+            {"type":"image","mimeType":"image/jpeg","data":"ZGVm"}
+        ]}})
+        .to_string();
+        for (model, nested) in [
+            ("gemini-2.5-flash", false),
+            ("gemini-3-pro-preview", true),
+            ("claude-sonnet-4", true),
+            ("other-model", true),
+        ] {
+            let request = ModelRequest {
+                model: model.into(),
+                messages: vec![
+                    Message::Assistant {
+                        content: String::new(),
+                        calls: ["a", "b"]
+                            .into_iter()
+                            .map(|id| ToolCall {
+                                id: id.into(),
+                                name: "read".into(),
+                                arguments: "{}".into(),
+                            })
+                            .collect(),
+                        replay: None,
+                    },
+                    Message::Tool {
+                        call_id: "a".into(),
+                        content: image_result.clone(),
+                    },
+                    Message::Tool {
+                        call_id: "b".into(),
+                        content: "second result".into(),
+                    },
+                    Message::User {
+                        content: "follow up".into(),
+                    },
+                ],
+                tools: vec![],
+                max_output_tokens: 32,
+            };
+            let body = wire_request(&request, None, "google").unwrap();
+            let contents = body["contents"].as_array().unwrap();
+            let responses = contents[1]["parts"].as_array().unwrap();
+            assert_eq!(responses.len(), 2, "{model}");
+            assert_eq!(
+                responses[1]["functionResponse"]["response"]["output"],
+                "second result"
+            );
+            let images = json!([
+                {"inlineData":{"mimeType":"image/png","data":"YWJj"}},
+                {"inlineData":{"mimeType":"image/jpeg","data":"ZGVm"}}
+            ]);
+            if nested {
+                assert_eq!(contents.len(), 3, "{model}");
+                assert_eq!(responses[0]["functionResponse"]["parts"], images, "{model}");
+            } else {
+                assert_eq!(contents.len(), 3, "{model}");
+                assert!(responses[0]["functionResponse"].get("parts").is_none());
+                assert_eq!(contents[2]["parts"][0]["text"], "Tool result image:");
+                assert_eq!(
+                    &contents[2]["parts"].as_array().unwrap()[1..3],
+                    images.as_array().unwrap()
+                );
+            }
+            assert_eq!(
+                contents.last().unwrap()["parts"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()["text"],
+                "follow up"
+            );
+            let output = responses[0]["functionResponse"]["response"]["output"]
+                .as_str()
+                .unwrap();
+            assert!(!output.contains("YWJj"));
+            assert!(!output.contains("ZGVm"));
+        }
+    }
 
     #[tokio::test]
     async fn streamed_parts_replay_with_original_signature_boundaries() {
