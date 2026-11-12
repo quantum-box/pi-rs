@@ -1219,6 +1219,42 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn vercel_gateway_catalog_and_endpoint() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        let provider = profiles.provider("vercel-ai-gateway").unwrap();
+        assert_eq!(provider.adapter(), Adapter::Anthropic);
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://ai-gateway.vercel.sh/v1/messages"
+        );
+        assert_eq!(
+            builtin_chat::find(provider.id()).unwrap().env(),
+            "AI_GATEWAY_API_KEY"
+        );
+        assert_eq!(profiles.model_ids(&provider).len(), 303);
+        let model = profiles
+            .model(&provider, "anthropic/claude-sonnet-4.6")
+            .unwrap();
+        assert!(model.allows_empty_signature());
+        assert_eq!(model.adaptive_thinking(), Some(true));
+        assert_eq!(model.context_window, Some(1_000_000));
+        let profiles = Profiles::parse(
+            &json!({"providers":{"vercel-ai-gateway":{"baseUrl":"http://localhost:4321"}}}),
+        )
+        .unwrap();
+        let provider = profiles.provider("vercel-ai-gateway").unwrap();
+        assert_eq!(
+            profiles.model_endpoint(&provider, "anthropic/claude-sonnet-4.6"),
+            Some("http://localhost:4321/v1/messages")
+        );
+        assert!(
+            !builtin_chat::find(provider.id())
+                .unwrap()
+                .is_official_endpoint("http://localhost:4321/v1/messages")
+        );
+    }
+
+    #[test]
     fn xai_catalog_uses_responses_and_model_specific_thinking_levels() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let provider = profiles.provider("xai").unwrap();

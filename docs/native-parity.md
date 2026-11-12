@@ -144,6 +144,13 @@ Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
 mapped high or xhigh effort in the provider's nested `reasoning` field.
 Live acceptance with an Ant Ling account remains open.
 
+### Vercel AI Gateway checkpoint
+
+Vercel AI Gateway exposes the 303 chat models from the pinned Pi v1.5.0
+catalog through its Messages endpoint and `AI_GATEWAY_API_KEY`. Model-specific
+reasoning and empty-signature compatibility are retained. Classifier models
+and live acceptance with a Vercel account remain open.
+
 ### Kimi Code API key checkpoint
 
 The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,

@@ -326,6 +326,78 @@ fn xiaomi_providers_send_thinking_and_bearer_credentials() {
 }
 
 #[test]
+fn vercel_gateway_streams_messages_with_api_key() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(first.starts_with("POST /v1/messages "), "{first}");
+        let mut length = 0;
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            let line = line.to_ascii_lowercase();
+            if let Some(value) = line.strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+            headers.push_str(&line);
+        }
+        assert!(headers.contains("x-api-key: fixture"));
+        assert!(!headers.contains("authorization: bearer"));
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], "anthropic/claude-sonnet-4.6");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        let events = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"anthropic/claude-sonnet-4.6\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fixture answer\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "vercel-ai-gateway",
+            "--model",
+            "anthropic/claude-sonnet-4.6",
+            "--thinking",
+            "high",
+            "--api-key",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+    server.join().unwrap();
+}
+
+#[test]
 fn minimax_regional_providers_use_the_messages_adapter() {
     for provider in ["minimax", "minimax-cn"] {
         let root = tempfile::tempdir().unwrap();

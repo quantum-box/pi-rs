@@ -518,7 +518,10 @@ impl Client {
                     .model_profiles
                     .messages_cache_support(&args.provider, metadata.as_ref());
                 let retention = cache_retention(supports_long);
-                let gateway = matches!(args.provider.id(), "fireworks" | "openrouter");
+                let gateway = matches!(
+                    args.provider.id(),
+                    "fireworks" | "openrouter" | "vercel-ai-gateway"
+                );
                 let mut client = client
                     .with_thinking(thinking)
                     .with_cache_retention(retention, cache_tools);

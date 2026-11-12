@@ -143,6 +143,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({"thinkingFormat":"together", "supportsReasoningEffort":false}),
     },
     Builtin {
+        id: "vercel-ai-gateway",
+        endpoint: "https://ai-gateway.vercel.sh/v1/messages",
+        env: "AI_GATEWAY_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "xai",
         endpoint: "https://api.x.ai/v1/responses",
         env: "XAI_API_KEY",
@@ -220,7 +226,7 @@ impl Builtin {
             id: Arc::from(self.id),
             adapter: match self.id {
                 "openai" | "xai" => Adapter::OpenAiResponses,
-                "minimax" | "minimax-cn" => Adapter::Anthropic,
+                "minimax" | "minimax-cn" | "vercel-ai-gateway" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
             },
         }
@@ -234,11 +240,16 @@ impl Builtin {
         match (adapter, self.id) {
             (Adapter::OpenAiResponses, "openai" | "xai") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
-                if !matches!(id, "openai" | "xai" | "minimax" | "minimax-cn") =>
+                if !matches!(
+                    id,
+                    "openai" | "xai" | "minimax" | "minimax-cn" | "vercel-ai-gateway"
+                ) =>
             {
                 Some(self.endpoint)
             }
-            (Adapter::Anthropic, "minimax" | "minimax-cn") => Some(self.endpoint),
+            (Adapter::Anthropic, "minimax" | "minimax-cn" | "vercel-ai-gateway") => {
+                Some(self.endpoint)
+            }
             (Adapter::Anthropic, "fireworks") => {
                 Some("https://api.fireworks.ai/inference/v1/messages")
             }
