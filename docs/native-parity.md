@@ -127,6 +127,13 @@ plan endpoints use distinct Pi v1.5.0 catalogs and credentials. Their chat
 requests use enabled/disabled thinking and replay reasoning content through
 tool turns. Loopback CLI coverage does not replace live Xiaomi acceptance.
 
+### Ant Ling API key checkpoint
+
+Ant Ling uses the pinned Pi catalog of two Ling models and the reasoning
+Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
+mapped high or xhigh effort in the provider's nested `reasoning` field.
+Live acceptance with an Ant Ling account remains open.
+
 ### Kimi Code API key checkpoint
 
 The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,
@@ -2920,7 +2927,7 @@ sessions, and header overrides.
 
 ### Chat catalog pricing checkpoint
 
-The 584 bundled chat entries retain the input, output, cache-read, and
+The 587 bundled chat entries retain the input, output, cache-read, and
 cache-write prices from Pi v1.5.0. JSON listings, RPC, and Codemode expose
 these rates. A measured response without a provider total gets an
 estimate in the journal and session statistics. An explicit provider
