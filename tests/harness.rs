@@ -339,6 +339,153 @@ fn answer(value: &str) -> Vec<ModelEvent> {
 fn ignore(_: Notification<'_>) {}
 
 #[tokio::test]
+async fn sibling_progress_is_delivered_while_nested_tool_runs() {
+    struct Parent {
+        started: Arc<tokio::sync::Notify>,
+        observed: Arc<tokio::sync::Notify>,
+    }
+    struct Slow {
+        started: Arc<tokio::sync::Notify>,
+        observed: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            args: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            if args["id"] == "nested" {
+                host.call("slow", json!({})).await
+            } else {
+                if tokio::time::timeout(Duration::from_secs(5), self.started.notified())
+                    .await
+                    .is_err()
+                {
+                    return Outcome::Failed("nested tool did not start".into());
+                }
+                host.report_progress(json!({"text":"working"}))
+                    .await
+                    .unwrap();
+                Outcome::Succeeded("sibling done".into())
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Slow {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "slow".into(),
+                description: "nested".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.started.notify_one();
+            if tokio::time::timeout(Duration::from_secs(5), self.observed.notified())
+                .await
+                .is_err()
+            {
+                return Outcome::Failed("sibling progress was not delivered".into());
+            }
+            Outcome::Succeeded("nested done".into())
+        }
+    }
+    struct Hooks {
+        parent: Arc<Parent>,
+        slow: Arc<Slow>,
+        events: Arc<Mutex<Vec<Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for Hooks {
+        fn id(&self) -> &str {
+            "progress-nested"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![self.parent.clone(), self.slow.clone()]
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_tool_execution_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &LifecycleEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            if let LifecycleEvent::ToolExecutionUpdate { .. } = event {
+                self.parent.observed.notify_one();
+            }
+            self.events
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+            Ok(())
+        }
+    }
+    let started = Arc::new(tokio::sync::Notify::new());
+    let observed = Arc::new(tokio::sync::Notify::new());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Hooks {
+            parent: Arc::new(Parent {
+                started: started.clone(),
+                observed: observed.clone(),
+            }),
+            slow: Arc::new(Slow { started, observed }),
+            events: events.clone(),
+        }))
+        .unwrap();
+    let model = Script::new(vec![
+        tool_reply(&[r#"{"id":"nested"}"#, r#"{"id":"sibling"}"#]),
+        answer("done"),
+    ]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    let events = events.lock().unwrap();
+    assert!(
+        events.iter().any(
+            |event| event["type"] == "tool_execution_update" && event["toolCallId"] == "call-1"
+        )
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "tool_execution_end"
+                && event["toolName"] == "slow"
+                && event["isError"] == false)
+    );
+}
+
+#[tokio::test]
 async fn extensions_receive_tool_progress_before_tool_completion() {
     struct ProgressTool(Arc<tokio::sync::Notify>);
     #[async_trait::async_trait]

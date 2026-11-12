@@ -1319,16 +1319,37 @@ impl Agent<'_> {
                             }
                             batch.push(request);
                         }
-                        let nested = self.nested_tools(session, batch, states, observer, inputs.as_deref_mut());
-                        tokio::pin!(nested);
-                        tokio::select! {
-                            result = &mut nested => {
-                                if let Err(error) = result { nested_error.get_or_insert(error); }
-                            },
-                            completed = &mut outcomes => {
-                                if let Err(error) = nested.await { nested_error.get_or_insert(error); }
-                                break completed;
+                        let snapshot = states.clone();
+                        let mut progress_errors = Vec::new();
+                        let mut completed_batch = None;
+                        {
+                            let nested = self.nested_tools(session, batch, states, observer, inputs.as_deref_mut());
+                            tokio::pin!(nested);
+                            loop {
+                                tokio::select! {
+                                    result = &mut nested => {
+                                        if let Err(error) = result { nested_error.get_or_insert(error); }
+                                        break;
+                                    },
+                                    completed = &mut outcomes, if completed_batch.is_none() => {
+                                        completed_batch = Some(completed);
+                                    },
+                                    Some(event) = progress.recv() => {
+                                        let mut collect = |notification: Notification<'_>| {
+                                            if let Notification::ExtensionLifecycleError { extension, event, message } = notification {
+                                                progress_errors.push((extension.to_owned(), event, message.to_owned()));
+                                            }
+                                        };
+                                        self.observe_lifecycle(event, &snapshot, Some(cancel), &mut collect).await;
+                                    }
+                                }
                             }
+                        }
+                        for (extension, event, message) in &progress_errors {
+                            observer(Notification::ExtensionLifecycleError { extension, event: *event, message });
+                        }
+                        if let Some(completed) = completed_batch {
+                            break completed;
                         }
                     }
                 }
