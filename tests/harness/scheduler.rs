@@ -4758,3 +4758,686 @@ async fn progress_hook_in_one_branch_does_not_block_another_branch_commit() {
     .expect("progress hook blocked another branch")
     .unwrap();
 }
+
+async fn uncertain_peer_case(pending: bool) {
+    struct Parent(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Notify>, bool);
+    struct Write(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            args: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            self.0.wait().await;
+            if args["id"] == 1 {
+                if self.2 {
+                    Outcome::Pending {
+                        reference: "job".into(),
+                    }
+                } else {
+                    Outcome::Unknown("uncertain".into())
+                }
+            } else {
+                self.1.notified().await;
+                host.call("mutation", json!({})).await
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Write {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "mutation".into(),
+                description: "write".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Succeeded("wrote".into())
+        }
+    }
+    struct Fixture(
+        Arc<tokio::sync::Barrier>,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicUsize>,
+        bool,
+    );
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "uncertain-descendant"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone(), self.1.clone(), self.3)),
+                Arc::new(Write(self.2.clone())),
+            ]
+        }
+    }
+    let release = Arc::new(tokio::sync::Notify::new());
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Barrier::new(2)),
+            release.clone(),
+            writes.clone(),
+            pending,
+        )))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&[r#"{"id":1}"#, r#"{"id":2}"#])]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    let mut observer = |notification: Notification<'_>| {
+        if matches!(notification, Notification::Committed(record) if matches!(record.event, Event::ToolFinished { outcome: Outcome::Unknown(_) | Outcome::Pending { .. }, .. }))
+        {
+            release.notify_one();
+        }
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("test".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut observer,
+        ),
+    )
+    .await
+    .expect("peer stranded");
+    assert!(if pending {
+        matches!(result, Err(Error::PendingOperation(_)))
+    } else {
+        matches!(result, Err(Error::Reconciliation(_)))
+    });
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    assert!(
+        session
+            .operations()
+            .iter()
+            .any(|(call, state)| call.call.name == "mutation"
+                && matches!(state, OperationState::Finished(Outcome::Skipped(_))))
+    );
+}
+
+#[tokio::test]
+async fn uncertain_peer_rejects_new_descendant_mutation() {
+    uncertain_peer_case(false).await;
+}
+
+#[tokio::test]
+async fn pending_peer_rejects_new_descendant_mutation() {
+    uncertain_peer_case(true).await;
+}
+
+#[tokio::test]
+async fn writes_in_sibling_branches_do_not_overlap() {
+    struct Parent(Arc<tokio::sync::Barrier>);
+    struct Write(
+        Arc<tokio::sync::Semaphore>,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    );
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            self.0.wait().await;
+            host.call("write", json!({})).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Write {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write".into(),
+                description: "write".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            let active = self.2.fetch_add(1, Ordering::SeqCst) + 1;
+            self.3.fetch_max(active, Ordering::SeqCst);
+            self.0.add_permits(1);
+            self.1.notified().await;
+            self.2.fetch_sub(1, Ordering::SeqCst);
+            Outcome::Succeeded("done".into())
+        }
+    }
+    struct Fixture(
+        Arc<tokio::sync::Barrier>,
+        Arc<tokio::sync::Semaphore>,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    );
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "cross-branch-writes"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone())),
+                Arc::new(Write(
+                    self.1.clone(),
+                    self.2.clone(),
+                    self.3.clone(),
+                    self.4.clone(),
+                )),
+            ]
+        }
+    }
+    let starts = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Barrier::new(2)),
+            starts.clone(),
+            release.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            maximum.clone(),
+        )))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}", "{}"]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    let planned = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut observer = |notification: Notification<'_>| {
+        if matches!(notification, Notification::Committed(record) if matches!(&record.event, Event::ToolPlanned { invocation, .. } if invocation.call.name == "write"))
+        {
+            planned.add_permits(1);
+        }
+    };
+    let control = async {
+        starts.acquire().await.unwrap().forget();
+        planned.acquire_many(2).await.unwrap().forget();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), starts.acquire())
+                .await
+                .is_err(),
+            "second write started while first was active"
+        );
+        release.notify_one();
+        starts.acquire().await.unwrap().forget();
+        release.notify_one();
+    };
+    let runner = async {
+        agent(&model, &registry)
+            .run(
+                &mut session,
+                Some("test".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut observer,
+            )
+            .await
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(runner, control)
+    })
+    .await
+    .expect("writes stalled");
+    assert_eq!(result.unwrap(), "done");
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn result_hook_keeps_snapshot_when_foreign_commit_occurs_during_hook() {
+    struct Parent(Arc<tokio::sync::Barrier>);
+    struct Child;
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            args: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            self.0.wait().await;
+            host.call("child", args).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Child {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "child".into(),
+                description: "child".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            Outcome::Succeeded("child".into())
+        }
+    }
+    struct Fixture(
+        Arc<tokio::sync::Barrier>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    );
+    #[async_trait::async_trait]
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "result-state"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(Parent(self.0.clone())), Arc::new(Child)]
+        }
+        fn handles_tool_result(&self) -> bool {
+            true
+        }
+        async fn tool_result(
+            &self,
+            call: &ToolCall,
+            _: &Outcome,
+            _: &ToolContext,
+            state: Option<&ExtensionState>,
+        ) -> ExtensionResult<Option<Outcome>> {
+            if call.name != "child" {
+                return Ok(None);
+            }
+            let args: Value = serde_json::from_str(&call.arguments).unwrap();
+            if args["id"] == 1 {
+                self.1.notified().await;
+                Ok(None)
+            } else {
+                self.1.notify_one();
+                self.2.notified().await;
+                Ok(Some(Outcome::Succeeded(
+                    state.map_or("missing", |_| "updated").into(),
+                )))
+            }
+        }
+        fn after_tool(
+            &self,
+            name: &str,
+            outcome: &Outcome,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<Option<ExtensionState>> {
+            if name == "child" && matches!(outcome, Outcome::Succeeded(value) if value == "child") {
+                Ok(Some(ExtensionState {
+                    version: 1,
+                    data: json!({"updated":true}),
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Barrier::new(2)),
+            Arc::new(tokio::sync::Notify::new()),
+            release.clone(),
+        )))
+        .unwrap();
+    let model = Script::new(vec![
+        tool_reply(&[r#"{"id":1}"#, r#"{"id":2}"#]),
+        answer("done"),
+    ]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    let mut first_id = None;
+    let mut observer = |notification: Notification<'_>| {
+        if let Notification::Committed(record) = notification {
+            match &record.event {
+                Event::ToolPlanned { invocation, .. }
+                    if invocation.call.name == "child"
+                        && invocation.call.arguments.contains("1") =>
+                {
+                    first_id = Some(invocation.operation_id)
+                }
+                Event::ToolFinished { operation_id, .. } if Some(*operation_id) == first_id => {
+                    release.notify_one()
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("test".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut observer,
+        ),
+    )
+    .await
+    .expect("stateful hooks stalled")
+    .unwrap();
+    let result = session
+        .operations()
+        .into_iter()
+        .find(|(call, _)| call.call.name == "child" && call.call.arguments.contains("2"))
+        .unwrap();
+    assert!(
+        matches!(result.1, OperationState::Finished(Outcome::Succeeded(value)) if value == "missing")
+    );
+}
+
+#[tokio::test]
+async fn result_hooks_see_state_committed_before_they_start() {
+    struct Parent(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Notify>);
+    struct Child;
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            args: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            self.0.wait().await;
+            if args["id"] == 1 {
+                let replies = host
+                    .call_batch(vec![
+                        ("child".into(), json!({"id":1})),
+                        ("child".into(), json!({"id":2})),
+                    ])
+                    .await;
+                assert!(
+                    replies
+                        .iter()
+                        .all(|reply| matches!(reply, Outcome::Succeeded(_)))
+                );
+            } else {
+                self.1.notified().await;
+                assert!(matches!(
+                    host.call("child", json!({"id":3})).await,
+                    Outcome::Succeeded(_)
+                ));
+            }
+            Outcome::Succeeded("parent".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Child {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "child".into(),
+                description: "child".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            Outcome::Succeeded("child".into())
+        }
+    }
+    struct Fixture(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "state-at-start"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone(), self.1.clone())),
+                Arc::new(Child),
+            ]
+        }
+        fn handles_tool_result(&self) -> bool {
+            true
+        }
+        async fn tool_result(
+            &self,
+            call: &ToolCall,
+            _: &Outcome,
+            _: &ToolContext,
+            state: Option<&ExtensionState>,
+        ) -> ExtensionResult<Option<Outcome>> {
+            if call.name != "child" {
+                return Ok(None);
+            }
+            let args: Value = serde_json::from_str(&call.arguments).unwrap();
+            if args["id"] == 1 {
+                Ok(None)
+            } else {
+                Ok(Some(Outcome::Succeeded(
+                    state
+                        .and_then(|state| state.data["count"].as_u64())
+                        .unwrap_or(0)
+                        .to_string(),
+                )))
+            }
+        }
+        fn after_tool(
+            &self,
+            name: &str,
+            _: &Outcome,
+            state: Option<&ExtensionState>,
+        ) -> ExtensionResult<Option<ExtensionState>> {
+            if name != "child" {
+                return Ok(None);
+            }
+            let count = state
+                .and_then(|state| state.data["count"].as_u64())
+                .unwrap_or(0);
+            Ok(Some(ExtensionState {
+                version: 1,
+                data: json!({"count":count + 1}),
+            }))
+        }
+    }
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Barrier::new(2)),
+            release.clone(),
+        )))
+        .unwrap();
+    let model = Script::new(vec![
+        tool_reply(&[r#"{"id":1}"#, r#"{"id":2}"#]),
+        answer("done"),
+    ]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    let mut first_id = None;
+    let mut observer = |notification: Notification<'_>| {
+        if let Notification::Committed(record) = notification {
+            match &record.event {
+                Event::ToolPlanned { invocation, .. }
+                    if invocation.call.name == "child"
+                        && invocation.call.arguments.contains("1") =>
+                {
+                    first_id = Some(invocation.operation_id)
+                }
+                Event::ToolFinished { operation_id, .. } if Some(*operation_id) == first_id => {
+                    release.notify_one()
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("test".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut observer,
+        ),
+    )
+    .await
+    .expect("state hooks stalled")
+    .unwrap();
+    let operations = session.operations();
+    for id in [2, 3] {
+        let (_, state) = operations
+            .iter()
+            .find(|(call, _)| {
+                call.call.name == "child"
+                    && serde_json::from_str::<Value>(&call.call.arguments).unwrap()["id"] == id
+            })
+            .unwrap();
+        assert!(
+            matches!(state, OperationState::Finished(Outcome::Succeeded(value)) if value.parse::<u64>().unwrap() >= 1),
+            "child {id} did not see earlier commit: {state:?}"
+        );
+    }
+    assert_eq!(
+        session.extension_states()["state-at-start"].data["count"],
+        3
+    );
+}
+
+async fn failed_group_preparation_case(failed_id: u64) {
+    struct Read(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for Read {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Succeeded("read".into())
+        }
+    }
+    struct Fixture(Arc<AtomicUsize>, u64);
+    #[async_trait::async_trait]
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "prepare-order"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(Read(self.0.clone()))]
+        }
+        async fn before_tool(
+            &self,
+            _: &str,
+            args: &Value,
+            _: &ToolContext,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<Decision> {
+            if args["id"] == self.1 {
+                tokio::task::yield_now().await;
+                Err("failed policy".into())
+            } else {
+                Ok(Decision::Allow)
+            }
+        }
+    }
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(started.clone(), failed_id)))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&[r#"{"id":1}"#, r#"{"id":2}"#])]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("test".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("consecutive unstarted operations stalled");
+    assert!(result.is_err());
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+    let operations = session.operations();
+    assert_eq!(operations.len(), 2);
+    assert!(
+        operations
+            .iter()
+            .all(|(_, state)| matches!(state, OperationState::Finished(Outcome::Skipped(_))))
+    );
+}
+
+#[tokio::test]
+async fn failed_earlier_pre_tool_hook_prevents_later_read_start() {
+    failed_group_preparation_case(1).await;
+}
+
+#[tokio::test]
+async fn failed_later_pre_tool_hook_prevents_earlier_group_dispatch() {
+    failed_group_preparation_case(2).await;
+}

@@ -277,6 +277,8 @@ struct TurnCall {
 enum TurnPhase {
     Queued,
     Preparing,
+    Prepared(TurnPreparation),
+    Starting,
     Running,
     Polling,
     NotStarted(String),
@@ -297,6 +299,7 @@ enum TurnEvent {
         Result<TurnPreparation>,
         Vec<(String, &'static str, String)>,
     ),
+    Begin(usize, TurnPreparation),
     Ran(
         usize,
         ToolReply,
@@ -336,6 +339,11 @@ fn turn_write_barrier(
             parent = positions
                 .get(&operation)
                 .and_then(|&index| calls[index].lane);
+        }
+        // Mutations on unrelated branches must not overlap. Descendants of
+        // the active write were handled above and may run on its behalf.
+        if !calls[index].parallel {
+            return true;
         }
         let Some(candidate_parent) = calls[index].lane else {
             return true;
@@ -454,8 +462,38 @@ impl Agent<'_> {
             });
             lanes.entry(None).or_default().calls.push_back(index);
         }
+        // Root calls are a fixed model-provided list. Match the original
+        // dispatch contract by preparing each fixed group before starting any
+        // member; dynamically arriving nested calls are never batched here.
+        let mut root_groups = VecDeque::<Vec<usize>>::new();
+        let mut start = 0;
+        while start < invocations.len() {
+            let mut end = start + 1;
+            if calls[start].parallel {
+                while end < invocations.len() && end - start < 8 && calls[end].parallel {
+                    end += 1;
+                }
+            }
+            root_groups.push_back((start..end).collect());
+            start = end;
+        }
         loop {
+            while root_groups.front().is_some_and(|group| {
+                group
+                    .iter()
+                    .all(|&index| matches!(calls[index].phase, TurnPhase::Finished))
+            }) {
+                root_groups.pop_front();
+            }
             let fatal = first_error.is_some();
+            if fatal && let Some(group) = root_groups.front() {
+                for &index in group {
+                    if matches!(calls[index].phase, TurnPhase::Prepared(_)) {
+                        calls[index].phase =
+                            TurnPhase::NotStarted("group preparation failed".into());
+                    }
+                }
+            }
             if fatal {
                 let failed_lane = error_origin.map(|index: usize| calls[index].lane);
                 if failed_lane
@@ -479,7 +517,7 @@ impl Agent<'_> {
             }
             // A lane admits at most eight consecutive reads. A write closes the
             // current lane epoch until all earlier calls have settled.
-            for lane in lanes.values_mut() {
+            for (lane_id, lane) in &mut lanes {
                 if lane
                     .calls
                     .iter()
@@ -487,8 +525,28 @@ impl Agent<'_> {
                 {
                     continue;
                 }
+                let mut preparing = lane
+                    .calls
+                    .iter()
+                    .any(|&index| matches!(calls[index].phase, TurnPhase::Preparing));
                 for &index in &lane.calls {
                     if !matches!(calls[index].phase, TurnPhase::Queued) {
+                        continue;
+                    }
+                    if preparing {
+                        break;
+                    }
+                    if lane_id.is_none()
+                        && !root_groups
+                            .front()
+                            .is_some_and(|group| group.contains(&index))
+                    {
+                        break;
+                    }
+                    if fatal && !calls[index].parallel {
+                        lane.active += 1;
+                        calls[index].phase =
+                            TurnPhase::NotStarted("turn requires reconciliation".into());
                         continue;
                     }
                     if fatal
@@ -513,6 +571,7 @@ impl Agent<'_> {
                     }
                     lane.active += 1;
                     calls[index].phase = TurnPhase::Preparing;
+                    preparing = true;
                     if !parallel {
                         writes.insert(index);
                     }
@@ -547,11 +606,29 @@ impl Agent<'_> {
                     }
                 }
             }
+            if !fatal
+                && let Some(group) = root_groups.front()
+                && group
+                    .iter()
+                    .all(|&index| matches!(calls[index].phase, TurnPhase::Prepared(_)))
+            {
+                for &index in group {
+                    let TurnPhase::Prepared(prepared) =
+                        std::mem::replace(&mut calls[index].phase, TurnPhase::Starting)
+                    else {
+                        unreachable!()
+                    };
+                    futures.push(
+                        futures_util::future::ready(TurnEvent::Begin(index, prepared)).boxed(),
+                    );
+                }
+            }
             let skipped = lanes
                 .values()
                 .filter_map(|lane| lane.calls.front().copied())
                 .filter(|&index| matches!(calls[index].phase, TurnPhase::NotStarted(_)))
                 .collect::<Vec<_>>();
+            let skipped_any = !skipped.is_empty();
             for index in skipped {
                 let TurnPhase::NotStarted(reason) =
                     std::mem::replace(&mut calls[index].phase, TurnPhase::Finished)
@@ -581,6 +658,12 @@ impl Agent<'_> {
             if fatal && lanes.values().all(|lane| lane.active == 0) {
                 break;
             }
+            if skipped_any {
+                continue;
+            }
+            // The lane head alone transforms against the state committed at
+            // hook start. Other lanes can commit while this hook is suspended;
+            // its snapshot remains unchanged and the hook is never replayed.
             for lane in lanes.values() {
                 let Some(&index) = lane.calls.front() else {
                     continue;
@@ -648,9 +731,23 @@ impl Agent<'_> {
                         match prepared {
                             Err(error) => { let reason = error.to_string(); record_turn_error(&mut first_error, &mut error_origin, index, error); calls[index].phase = TurnPhase::NotStarted(reason); }
                             Ok(prepared) => {
+                                if calls[index].lane.is_none() {
+                                    calls[index].phase = TurnPhase::Prepared(prepared);
+                                } else {
+                                    calls[index].phase = TurnPhase::Starting;
+                                    futures.push(futures_util::future::ready(TurnEvent::Begin(index, prepared)).boxed());
+                                }
+                            }
+                        }
+                    }
+                    TurnEvent::Begin(index, prepared) => {
                                 if calls[index].cancellation.is_cancelled() {
                                     record_turn_error(&mut first_error, &mut error_origin, index, Error::Cancelled);
                                     calls[index].phase = TurnPhase::NotStarted("cancelled before dispatch".into());
+                                    continue;
+                                }
+                                if first_error.is_some() && (!calls[index].parallel || !error_origin.is_some_and(|origin| turn_is_started_peer_descendant(&calls, &positions, origin, index))) {
+                                    calls[index].phase = TurnPhase::NotStarted("turn stopped before dispatch".into());
                                     continue;
                                 }
                                 let ran = matches!(&prepared, TurnPreparation::Ready { .. });
@@ -694,8 +791,6 @@ impl Agent<'_> {
                                 calls[index].phase = TurnPhase::Running;
                                 let flush = updates.clone();
                                 futures.push(async move { let start = std::time::Instant::now(); let reply = Self::turn_invoke(prepared, &cancel, host, programmatic, omit, timeout).await; let duration = ran.then(|| start.elapsed().as_millis().min(u64::MAX as u128) as u64); let (send, receive) = oneshot::channel(); if flush.send(TurnProgress::Flush(send)).await.is_ok() { let _ = receive.await; } let _ = finish_progress.send(()); let errors = progress_worker.await.unwrap_or_else(|error| vec![("tool-progress".into(), "tool_execution_update", error.to_string())]); TurnEvent::Ran(index, reply, duration, errors) }.boxed());
-                            }
-                        }
                     }
                     TurnEvent::Ran(index, reply, duration, errors) => { for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); } calls[index].phase = TurnPhase::Done(Box::new(reply), duration); }
                     TurnEvent::Transformed(index, reply, duration, errors) => {

@@ -58,6 +58,15 @@ outputs, model text, and summaries as data from their respective trust levels.
 4. `after_tool` receives the outcome and can return a new state. The tool
    result and successful state changes are saved in one journal record. On
    a hook error the known result is still saved and the run stops.
+   Each `tool_result` hook receives a snapshot of its extension's committed
+   state when that operation's result processing starts. Results from the same
+   parent are processed in call order, so a later sibling sees earlier sibling
+   commits. Hooks for different parents may overlap: a foreign commit while a
+   hook is suspended does not change its snapshot. `after_tool` and the journal
+   append run together against the latest committed state. A state returned by
+   a tool is a whole replacement, not a merge, and is passed to its owner's
+   `after_tool` before that commit. Concurrent tools must account for the fact
+   that a replacement based on an older snapshot can overwrite a foreign update.
 5. Compaction preserves complete turns. `before_compaction` can change the
    candidate summary or retention count, or deny the change.
    `after_compaction` prepares state changes for the same commit as the
