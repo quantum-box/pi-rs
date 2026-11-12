@@ -106,11 +106,7 @@ pub fn resolve(
     for path in explicit {
         let path = absolute(&workspace, &path.to_string_lossy());
         if kind == Kind::Prompt && path.is_dir() {
-            for found in expand(&path, kind, true, warnings)? {
-                if !paths.contains(&found) {
-                    paths.push(found);
-                }
-            }
+            append(&mut paths, vec![path]);
             continue;
         }
         append(&mut paths, expand(&path, kind, true, warnings)?);
@@ -128,6 +124,7 @@ pub fn resolve(
     {
         layers.push((project, Vec::new()));
     }
+    let mut seen_prompts = Vec::new();
     for (layer_index, (base, entries)) in layers.into_iter().enumerate().rev() {
         let base = base.canonicalize().unwrap_or(base);
         let entries: Vec<_> = entries
@@ -155,7 +152,14 @@ pub fn resolve(
             }
             configured.extend(found);
         }
-        if !patterns.is_empty() {
+        if kind == Kind::Prompt {
+            configured.retain(|path| {
+                let previous = seen_prompts.len();
+                append(&mut seen_prompts, vec![path.clone()]);
+                seen_prompts.len() != previous
+                    && (patterns.is_empty() || packages::selected(path, &base, &patterns))
+            });
+        } else if !patterns.is_empty() {
             configured.retain(|path| packages::selected(path, &base, &patterns));
         }
         append(&mut paths, configured);
@@ -196,7 +200,16 @@ pub fn resolve(
             } else {
                 collect(&root, kind, false, warnings)?
             };
-            discovered.retain(|path| packages::selected(path, &scope, &overrides));
+            discovered.retain(|path| {
+                if kind == Kind::Prompt {
+                    let previous = seen_prompts.len();
+                    append(&mut seen_prompts, vec![path.clone()]);
+                    if seen_prompts.len() == previous {
+                        return false;
+                    }
+                }
+                packages::selected(path, &scope, &overrides)
+            });
             append(&mut paths, discovered);
         }
     }

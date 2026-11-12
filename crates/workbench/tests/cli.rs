@@ -10,14 +10,17 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
-fn explicit_prompt_directory_loads_nested_templates_in_rpc() {
+fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     let root = tempfile::tempdir().unwrap();
     let prompts = root.path().join("custom");
     std::fs::create_dir_all(prompts.join("nested")).unwrap();
-    std::fs::write(prompts.join("nested/review.md"), "Review this").unwrap();
+    std::fs::write(prompts.join("nested/deep.md"), "Nested").unwrap();
     std::fs::write(prompts.join("top.md"), "Top level").unwrap();
+    std::fs::write(prompts.join(".hidden.md"), "Hidden").unwrap();
+    std::fs::write(prompts.join("ignored.md"), "Ignored").unwrap();
+    std::fs::write(prompts.join(".gitignore"), "ignored.md\n").unwrap();
     #[cfg(unix)]
-    std::os::unix::fs::symlink("review.md", prompts.join("nested/audit.md")).unwrap();
+    std::os::unix::fs::symlink("top.md", prompts.join("audit.md")).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(root.path())
         .env("PI_RS_HOME", root.path().join("home"))
@@ -59,7 +62,7 @@ fn explicit_prompt_directory_loads_nested_templates_in_rpc() {
     let commands = response["data"]["commands"]
         .as_array()
         .expect("command list");
-    for name in ["review", "top"] {
+    for name in ["top", ".hidden", "ignored"] {
         assert!(
             commands
                 .iter()
@@ -67,6 +70,10 @@ fn explicit_prompt_directory_loads_nested_templates_in_rpc() {
             "{response}"
         );
     }
+    assert!(
+        !commands.iter().any(|command| command["name"] == "deep"),
+        "{response}"
+    );
     #[cfg(unix)]
     assert!(
         commands

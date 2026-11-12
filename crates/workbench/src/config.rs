@@ -770,7 +770,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prompt_directory_aliases_and_excluded_aliases_remain_usable() {
+    fn prompt_directory_aliases_and_configured_alias_deduplication() {
         use clap::Parser;
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
@@ -804,14 +804,48 @@ mod tests {
             resources.expand("/review two").as_deref(),
             Some("Shared two")
         );
+        args.prompt_template = vec![custom.join("audit.md"), custom.join("review.md")];
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.prompts.contains_key("audit"));
+        assert!(!resources.prompts.contains_key("review"));
         args.prompt_template.clear();
         args.no_prompt_templates = false;
         let resources = super::super::resources::Resources::load(&args).unwrap();
         assert!(!resources.prompts.contains_key("audit"));
-        assert_eq!(
-            resources.expand("/review two").as_deref(),
-            Some("Shared two")
-        );
+        assert!(!resources.prompts.contains_key("review"));
+        args.settings.resource_layers[1].1 = json!({"prompts": ["custom"]});
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.prompts.contains_key("audit"));
+        assert!(!resources.prompts.contains_key("review"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_prompt_aliases_deduplicate_before_disabled_filtering() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("work/.pi");
+        let prompts = project.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        let target = dir.path().join("template.md");
+        std::fs::write(&target, "Shared").unwrap();
+        symlink(&target, prompts.join("audit.md")).unwrap();
+        symlink(&target, prompts.join("review.md")).unwrap();
+        let mut args = super::super::Cli::try_parse_from(["pi", "--no-skills"]).unwrap();
+        args.workspace = dir.path().join("work");
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![(dir.path().join("agent"), json!({})), (project, json!({}))],
+        };
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(resources.prompts.contains_key("audit"));
+        assert!(!resources.prompts.contains_key("review"));
+        args.settings.resource_layers[1].1 = json!({"prompts": ["-prompts/audit.md"]});
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(!resources.prompts.contains_key("audit"));
+        assert!(!resources.prompts.contains_key("review"));
     }
 
     #[test]
