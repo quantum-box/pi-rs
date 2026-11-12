@@ -43,6 +43,7 @@ pub(super) struct PiMessages {
     progress: Option<ProgressObserver>,
     radius: Option<Radius>,
     probe_catalog: bool,
+    identity_safe_transport: bool,
 }
 
 #[derive(Clone)]
@@ -105,6 +106,7 @@ impl PiMessages {
             progress: None,
             radius: None,
             probe_catalog: true,
+            identity_safe_transport: true,
         })
     }
 
@@ -246,6 +248,7 @@ impl PiMessages {
         if let Some(timeout) = timeout {
             builder = builder.read_timeout(timeout);
         }
+        self.identity_safe_transport = proxies.is_empty();
         self.client = builder
             .build()
             .map_err(|_| Error::Config("Could not initialize the Pi Messages client".into()))?;
@@ -437,7 +440,28 @@ pub(super) fn is_pi_messages_replay(replay: &ProviderReplay) -> bool {
 
 #[async_trait::async_trait]
 impl Model for PiMessages {
+    fn context_identity(&self) -> Option<String> {
+        // Radius discovers its route and credentials dynamically.
+        if self.identity == "radius"
+            || self.radius.is_some()
+            || !self.headers.is_empty()
+            || !self.identity_safe_transport
+        {
+            return None;
+        }
+        pi_rs::fingerprint_model_context(&(
+            "pi-messages-v1",
+            self.endpoint.as_str(),
+            &self.identity,
+            &self.token,
+            &self.thinking,
+            self.cache_disabled,
+        ))
+    }
+
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        // Radius may select a different endpoint from its catalog after this
+        // estimator was cached. Count any Radius-origin replay for this model.
         match message {
             Message::Assistant {
                 replay: Some(replay),
@@ -445,7 +469,8 @@ impl Model for PiMessages {
             } if replay.identity.provider == self.identity
                 && replay.identity.model == request.model
                 && replay.blocks.first().is_some_and(|marker| {
-                    marker["type"] == REPLAY_ORIGIN && marker["endpoint"] == self.origin_hash
+                    marker["type"] == REPLAY_ORIGIN
+                        && (self.identity == "radius" || marker["endpoint"] == self.origin_hash)
                 }) =>
             {
                 pi_rs::estimate_replay_tokens(&replay.blocks[1..])

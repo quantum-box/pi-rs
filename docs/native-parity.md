@@ -1746,8 +1746,11 @@ model, messages or tools invalidate the measured baseline; that fact is recorded
 with the request so it remains effective after reopening. A fingerprint also
 requires the effective adapter identity, image policy, model, system messages
 and tool schemas to match the measured request. Adapters that cannot prove a
-stable identity, including deferred clients, and older requests without these
-markers conservatively use a fresh estimate. The estimator remains a
+stable identity, including deferred clients with dynamic credentials or routing,
+and older requests without these markers conservatively use a fresh estimate.
+Static Anthropic and deferred provider configurations retain measured baselines.
+Radius replay estimates count matching provider/model blocks across catalog
+route changes without embedding a route in the cached estimator. The estimator remains a
 heuristic rather than a provider tokenizer or a strict upper bound.
 
 Tests cover trailing input, edits, compaction, model changes, checkout, reopening,

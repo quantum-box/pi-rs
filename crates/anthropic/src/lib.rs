@@ -799,6 +799,29 @@ impl StreamUsage {
 
 #[async_trait::async_trait]
 impl Model for Anthropic {
+    fn context_identity(&self) -> Option<String> {
+        // Unconfigured thinking can consult a changing remote model catalog.
+        if !self.headers.is_empty()
+            || !self.http_proxies.is_empty()
+            || (self.thinking_level.is_some() && self.configured_thinking.is_none())
+        {
+            return None;
+        }
+        pi_rs_core::fingerprint_model_context(&(
+            "anthropic-v1",
+            self.endpoint.as_str(),
+            self.provider.as_ref(),
+            self.replay_scope.as_ref(),
+            self.auth.0.as_str(),
+            self.auth.1.as_bytes(),
+            &self.thinking_level,
+            format!("{:?}", self.configured_thinking),
+            self.allow_empty_signature,
+            self.cache_retention.anthropic_control(),
+            self.cache_tools,
+        ))
+    }
+
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         match message {
             Message::Tool { content, .. } => content.encode_utf16().count().div_ceil(4) as u64,
@@ -1110,6 +1133,35 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_identity_tracks_static_route_and_configuration() {
+        let make = |endpoint: &str, key: &str| Anthropic::new(endpoint, key).unwrap();
+        let first = make(DEFAULT_ENDPOINT, "key-a");
+        assert!(first.context_identity().is_some());
+        assert_eq!(first.context_identity(), first.clone().context_identity());
+        assert_ne!(
+            first.context_identity(),
+            make(DEFAULT_ENDPOINT, "key-b").context_identity()
+        );
+        assert_ne!(
+            first.context_identity(),
+            make("https://example.com/v1/messages", "key-a").context_identity()
+        );
+        assert_ne!(
+            first.context_identity(),
+            first
+                .clone()
+                .with_configured_thinking("high", true, true)
+                .context_identity()
+        );
+        assert!(
+            first
+                .with_thinking(Some("high"))
+                .context_identity()
+                .is_none()
+        );
+    }
 
     #[test]
     fn capacity_estimate_matches_image_and_replay_serialization() {

@@ -256,6 +256,47 @@ impl Deferred {
             .as_deref()
     }
 
+    fn context_identity(&self) -> Option<String> {
+        // Dynamic credential commands and headers may change on each request.
+        if self
+            .credential
+            .as_ref()
+            .is_some_and(Credential::requires_resolution)
+            || self.headers.has_command()
+        {
+            return None;
+        }
+        let token = self.credential.as_ref().and_then(Credential::literal);
+        if token.is_none() && self.adapter != Adapter::ChatCompletions {
+            return None;
+        }
+        if !self
+            .headers
+            .static_headers(&self.provider, token)
+            .ok()?
+            .is_empty()
+        {
+            return None;
+        }
+        if let Some(settings) = &self.http_settings
+            && !super::http_proxy::configured(settings).ok()?.is_empty()
+        {
+            return None;
+        }
+        let bearer = self.credential.as_ref().is_some_and(Credential::is_bearer);
+        pi_rs::fingerprint_model_context(&(
+            "deferred-context-v1",
+            self.provider.id(),
+            self.adapter.api(),
+            &self.endpoint,
+            token,
+            bearer,
+            self.estimation_client()?.context_identity()?,
+            std::env::var_os("PI_CACHE_RETENTION")
+                .map(|value| value.to_string_lossy().into_owned()),
+        ))
+    }
+
     async fn resolve(&self) -> Result<Client> {
         let token = match &self.credential {
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
@@ -673,7 +714,7 @@ impl Model for Client {
             Self::Google(c) => c.context_identity(),
             Self::PiMessages(c) => c.context_identity(),
             Self::OpenAi(c) => c.context_identity(),
-            Self::Deferred(_) => None,
+            Self::Deferred(client) => client.context_identity(),
         }
     }
 
@@ -721,6 +762,204 @@ impl Model for Client {
 mod estimation_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn deferred_static_credentials_have_stable_route_bound_identity() {
+        let client = |provider, adapter, endpoint: &str, credential| {
+            Client::deferred(
+                provider,
+                adapter,
+                endpoint,
+                credential,
+                RequestHeaders::default(),
+            )
+        };
+        let anthropic = client(
+            Provider::Anthropic,
+            Adapter::Anthropic,
+            "https://api.anthropic.com/v1/messages",
+            Some(Credential::Literal("key-a".into())),
+        );
+        let clone = anthropic.clone();
+        assert!(anthropic.context_identity().is_some());
+        assert_eq!(anthropic.context_identity(), clone.context_identity());
+        let other_key = client(
+            Provider::Anthropic,
+            Adapter::Anthropic,
+            "https://api.anthropic.com/v1/messages",
+            Some(Credential::Literal("key-b".into())),
+        );
+        let other_route = client(
+            Provider::Anthropic,
+            Adapter::Anthropic,
+            "https://example.com/v1/messages",
+            Some(Credential::Literal("key-a".into())),
+        );
+        assert_ne!(anthropic.context_identity(), other_key.context_identity());
+        assert_ne!(anthropic.context_identity(), other_route.context_identity());
+        let dynamic = client(
+            Provider::Anthropic,
+            Adapter::Anthropic,
+            "https://api.anthropic.com/v1/messages",
+            Some(Credential::Command("!read-key".into())),
+        );
+        assert!(dynamic.context_identity().is_none());
+        let google = client(
+            Provider::Google,
+            Adapter::Google,
+            "https://example.com/v1",
+            Some(Credential::Literal("key-a".into())),
+        );
+        assert!(google.context_identity().is_some());
+        assert_ne!(anthropic.context_identity(), google.context_identity());
+    }
+
+    #[tokio::test]
+    async fn anthropic_direct_and_deferred_reuse_measured_baselines() {
+        struct MeasuredFixture {
+            wrapped: super::super::image_policy::WorkbenchModel,
+        }
+        #[async_trait::async_trait]
+        impl Model for MeasuredFixture {
+            fn context_identity(&self) -> Option<String> {
+                self.wrapped.context_identity()
+            }
+            fn estimate_message_tokens(
+                &self,
+                request: &ModelRequest,
+                message: &pi_rs::Message,
+            ) -> u64 {
+                self.wrapped.estimate_message_tokens(request, message)
+            }
+            fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+                self.wrapped.estimate_request_tokens(request)
+            }
+            async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(pi_rs::ModelEvent::Text("reply".into())),
+                    Ok(pi_rs::ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(pi_rs::Usage {
+                            input_tokens: 3000,
+                            output_tokens: 8,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        for deferred in [false, true] {
+            let client = if deferred {
+                Client::deferred(
+                    Provider::Anthropic,
+                    Adapter::Anthropic,
+                    "https://api.anthropic.com/v1/messages",
+                    Some(Credential::Literal("key".into())),
+                    RequestHeaders::default(),
+                )
+            } else {
+                Client::Anthropic(
+                    Anthropic::new("https://api.anthropic.com/v1/messages", "key").unwrap(),
+                )
+            };
+            let model = MeasuredFixture {
+                wrapped: super::super::image_policy::WorkbenchModel {
+                    client,
+                    block_images: false,
+                    supports_images: Some(true),
+                    session_affinity: &[],
+                    price: None,
+                },
+            };
+            assert!(model.context_identity().is_some());
+            let registry = pi_rs::Registry::default();
+            let mut agent = pi_rs::Agent {
+                registry: &registry,
+                system_prompt: "short",
+                model: &model,
+                model_name: "fixture",
+                limits: pi_rs::Limits::default(),
+            };
+            agent.limits.output_tokens_per_request = 64;
+            let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            session.auto_compaction_control().set_enabled(false);
+            let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+            agent
+                .run(
+                    &mut session,
+                    Some("first".into()),
+                    &mut inputs,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            agent.limits.context_window = Some(1000);
+            let result = agent
+                .run(
+                    &mut session,
+                    Some("next".into()),
+                    &mut inputs,
+                    &pi_rs::CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await;
+            assert!(
+                matches!(result, Err(pi_rs::Error::Model(message)) if message.contains("automatic compaction is disabled")),
+                "deferred={deferred}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_radius_estimator_covers_replay_from_catalog_route_changes() {
+        let client = Client::deferred(
+            Provider::Radius,
+            Adapter::PiMessages,
+            "https://example.com/pi",
+            Some(Credential::Literal("key".into())),
+            RequestHeaders::default(),
+        );
+        let Client::Deferred(deferred) = &client else {
+            unreachable!()
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let replay = |route: &str| pi_rs::Message::Assistant {
+            content: "ok".into(),
+            calls: vec![],
+            replay: Some(Box::new(pi_rs::ProviderReplay {
+                identity: pi_rs::ResolvedModelIdentity {
+                    provider: "radius".into(),
+                    model: "fixture".into(),
+                },
+                blocks: vec![
+                    json!({"type":"pi-rs:pi-messages-origin","endpoint":route}),
+                    json!({"type":"thinking","thinking":"x".repeat(8000)}),
+                ],
+            })),
+        };
+        let first = client.estimate_message_tokens(&request, &replay("catalog-route-a"));
+        let cached = deferred.estimation_client().unwrap();
+        let second = client.estimate_message_tokens(&request, &replay("catalog-route-b"));
+        assert!(first > 1900 && second > 1900);
+        assert!(std::ptr::eq(cached, deferred.estimation_client().unwrap()));
+        let mut wrong = replay("catalog-route-b");
+        if let pi_rs::Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &mut wrong
+        {
+            replay.identity.provider = "other".into();
+        }
+        assert_eq!(
+            client.estimate_message_tokens(&request, &wrong),
+            pi_rs::estimate_message_tokens(&wrong)
+        );
+    }
 
     #[test]
     fn deferred_estimator_is_reused_and_options_invalidate_cache() {
