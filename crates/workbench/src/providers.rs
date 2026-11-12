@@ -298,6 +298,10 @@ impl Deferred {
     }
 
     async fn resolve(&self) -> Result<Client> {
+        self.resolve_with_headers().await.map(|(client, _)| client)
+    }
+
+    async fn resolve_with_headers(&self) -> Result<(Client, HeaderMap)> {
         let token = match &self.credential {
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
@@ -314,7 +318,7 @@ impl Deferred {
         let mut client = self
             .provider
             .connect(self.adapter, &self.endpoint, token, bearer)?
-            .with_headers(headers)
+            .with_headers(headers.clone())
             .with_context_probes(self.probe_context);
         if let Some(settings) = &self.http_settings {
             client = client.with_http_settings(settings)?;
@@ -322,11 +326,14 @@ impl Deferred {
         if let Some((args, reported)) = &self.options {
             client = client.with_model_options(args, *reported)?;
         }
-        Ok(if self.observed {
-            client.observe()
-        } else {
-            client
-        })
+        Ok((
+            if self.observed {
+                client.observe()
+            } else {
+                client
+            },
+            headers,
+        ))
     }
 }
 
@@ -370,6 +377,38 @@ impl Client {
                 Self::Deferred(client)
             }
         })
+    }
+
+    /// Resolve dynamic credentials and freeze any catalog route before estimating.
+    pub(super) async fn prepare_for_context(
+        &self,
+        model: &str,
+    ) -> Result<Option<(Client, Option<String>)>> {
+        let (client, headers) = match self {
+            Self::Deferred(deferred) => deferred.resolve_with_headers().await?,
+            Self::PiMessages(client) if client.needs_context_preparation() => {
+                (Self::PiMessages(client.clone()), client.context_headers())
+            }
+            _ => return Ok(None),
+        };
+        let client = match client {
+            Self::PiMessages(client) => Self::PiMessages(client.prepare_context(model).await?),
+            other => other,
+        };
+        // Hash effective headers separately; adapter identities omit custom headers.
+        let base = client
+            .clone()
+            .with_headers(HeaderMap::new())
+            .context_identity();
+        let mut header_values: Vec<_> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        header_values.sort();
+        let identity = base.and_then(|base| {
+            pi_rs::fingerprint_model_context(&("resolved-client-v1", base, header_values))
+        });
+        Ok(Some((client, identity)))
     }
 
     pub async fn stream_with_headers(
@@ -910,55 +949,157 @@ mod estimation_tests {
         }
     }
 
-    #[test]
-    fn cached_radius_estimator_covers_replay_from_catalog_route_changes() {
+    #[tokio::test]
+    async fn dynamic_credentials_and_headers_reuse_measured_usage_after_dispatch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let calls = directory.path().join("credential-calls");
+        let command = format!("!echo called >> \"{}\" && echo key-one", calls.display());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let request = String::from_utf8_lossy(&bytes[..header_end]).to_lowercase();
+            let length = request
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while bytes.len() < header_end + length {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            assert!(request.contains("x-routing: route-one"));
+            assert!(request.contains("x-goog-api-key: key-one"));
+            let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"reply\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3000,\"candidatesTokenCount\":8}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
         let client = Client::deferred(
-            Provider::Radius,
-            Adapter::PiMessages,
-            "https://example.com/pi",
-            Some(Credential::Literal("key".into())),
-            RequestHeaders::default(),
+            Provider::Google,
+            Adapter::Google,
+            &endpoint,
+            Some(Credential::Command(command)),
+            RequestHeaders::for_test("x-routing", "!echo route-one"),
+        )
+        .with_context_probes(false);
+        let model = super::super::image_policy::WorkbenchModel {
+            client,
+            block_images: false,
+            supports_images: Some(true),
+            session_affinity: &[],
+            price: None,
+        };
+        let registry = pi_rs::Registry::default();
+        let mut agent = pi_rs::Agent {
+            registry: &registry,
+            system_prompt: "short",
+            model: &model,
+            model_name: "fixture",
+            limits: pi_rs::Limits::default(),
+        };
+        agent.limits.context_window = Some(5000);
+        agent.limits.output_tokens_per_request = 64;
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        agent
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        agent.limits.context_window = Some(1000);
+        let result = agent
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert!(
+            matches!(result, Err(pi_rs::Error::Model(message)) if message.contains("automatic compaction is disabled"))
         );
-        let Client::Deferred(deferred) = &client else {
-            unreachable!()
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolved_dynamic_headers_are_included_in_prepared_identity() {
+        let make = |header: &str| {
+            Client::deferred(
+                Provider::Google,
+                Adapter::Google,
+                "https://example.com/v1",
+                Some(Credential::Literal("key".into())),
+                RequestHeaders::for_test("x-routing", header),
+            )
         };
-        let request = ModelRequest {
-            model: "fixture".into(),
-            messages: vec![],
-            tools: vec![],
-            max_output_tokens: 1,
+        let first = make("!echo route-one");
+        let second = make("!echo route-two");
+        let (_, a) = first.prepare_for_context("fixture").await.unwrap().unwrap();
+        let (_, same) = first.prepare_for_context("fixture").await.unwrap().unwrap();
+        let (_, b) = second
+            .prepare_for_context("fixture")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(a.is_some());
+        assert_eq!(a, same);
+        assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn dynamic_credentials_are_resolved_once_for_each_prepared_client() {
+        let make = |command: &str| {
+            Client::deferred(
+                Provider::Google,
+                Adapter::Google,
+                "https://example.com/v1",
+                Some(Credential::Command(command.into())),
+                RequestHeaders::default(),
+            )
         };
-        let replay = |route: &str| pi_rs::Message::Assistant {
-            content: "ok".into(),
-            calls: vec![],
-            replay: Some(Box::new(pi_rs::ProviderReplay {
-                identity: pi_rs::ResolvedModelIdentity {
-                    provider: "radius".into(),
-                    model: "fixture".into(),
-                },
-                blocks: vec![
-                    json!({"type":"pi-rs:pi-messages-origin","endpoint":route}),
-                    json!({"type":"thinking","thinking":"x".repeat(8000)}),
-                ],
-            })),
-        };
-        let first = client.estimate_message_tokens(&request, &replay("catalog-route-a"));
-        let cached = deferred.estimation_client().unwrap();
-        let second = client.estimate_message_tokens(&request, &replay("catalog-route-b"));
-        assert!(first > 1900 && second > 1900);
-        assert!(std::ptr::eq(cached, deferred.estimation_client().unwrap()));
-        let mut wrong = replay("catalog-route-b");
-        if let pi_rs::Message::Assistant {
-            replay: Some(replay),
-            ..
-        } = &mut wrong
-        {
-            replay.identity.provider = "other".into();
-        }
-        assert_eq!(
-            client.estimate_message_tokens(&request, &wrong),
-            pi_rs::estimate_message_tokens(&wrong)
-        );
+        let first = make("!echo key-one");
+        let second = make("!echo key-two");
+        assert!(first.context_identity().is_none());
+        let (prepared, first_identity) =
+            first.prepare_for_context("fixture").await.unwrap().unwrap();
+        let (_, repeated_identity) = first.prepare_for_context("fixture").await.unwrap().unwrap();
+        let (_, second_identity) = second
+            .prepare_for_context("fixture")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first_identity.is_some());
+        assert_eq!(first_identity, repeated_identity);
+        assert_ne!(first_identity, second_identity);
+        assert!(prepared.context_identity().is_some());
     }
 
     #[test]

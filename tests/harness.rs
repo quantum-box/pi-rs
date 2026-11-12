@@ -2623,6 +2623,115 @@ async fn measured_baseline_requires_stable_adapter_identity() {
 }
 
 #[tokio::test]
+async fn retryable_model_preparation_uses_session_retry_policy() {
+    struct Preparing {
+        attempts: AtomicUsize,
+        script: Script,
+    }
+    #[async_trait::async_trait]
+    impl Model for Preparing {
+        async fn prepare_context(&self, _: &ModelRequest) -> Result<Option<Arc<dyn Model>>> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Error::RetryableModel("temporary resolution failure".into()))
+            } else {
+                Ok(None)
+            }
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.script.stream(request).await
+        }
+    }
+    let model = Preparing {
+        attempts: AtomicUsize::new(0),
+        script: Script::new(vec![answer("done")]),
+    };
+    let registry = Registry::default();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    session.retry_control().configure(RetrySettings {
+        enabled: true,
+        max_retries: 1,
+        base_delay_ms: 0,
+        max_agent_delay_ms: 0,
+    });
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let result = agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("go".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "done");
+    assert_eq!(model.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(model.script.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn prepared_model_is_used_for_capacity_and_dispatch() {
+    struct Original {
+        streams: Arc<AtomicUsize>,
+        large: bool,
+    }
+    struct Prepared {
+        streams: Arc<AtomicUsize>,
+        large: bool,
+    }
+    #[async_trait::async_trait]
+    impl Model for Original {
+        async fn prepare_context(&self, _: &ModelRequest) -> Result<Option<Arc<dyn Model>>> {
+            Ok(Some(Arc::new(Prepared {
+                streams: self.streams.clone(),
+                large: self.large,
+            })))
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            panic!("unprepared client dispatched")
+        }
+    }
+    #[async_trait::async_trait]
+    impl Model for Prepared {
+        fn context_identity(&self) -> Option<String> {
+            Some("prepared-route".into())
+        }
+        fn estimate_request_tokens(&self, _: &ModelRequest) -> u64 {
+            if self.large { 2000 } else { 10 }
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            self.streams.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(answer("done").into_iter().map(Ok))))
+        }
+    }
+    for large in [false, true] {
+        let streams = Arc::new(AtomicUsize::new(0));
+        let model = Original {
+            streams: streams.clone(),
+            large,
+        };
+        let registry = Registry::default();
+        let mut harness = agent(&model, &registry);
+        harness.limits.context_window = Some(1000);
+        harness.limits.output_tokens_per_request = 64;
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        let result = harness
+            .run(
+                &mut session,
+                Some("go".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await;
+        assert_eq!(result.is_ok(), !large);
+        assert_eq!(streams.load(Ordering::SeqCst), usize::from(!large));
+    }
+}
+
+#[tokio::test]
 async fn unknown_capacity_skips_request_estimation() {
     struct CountEstimates {
         script: Script,

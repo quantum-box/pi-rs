@@ -574,6 +574,64 @@ impl Agent<'_> {
                 if request.max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
+                let preparation = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = tokio::time::timeout(active.limits.model_timeout, active.model.prepare_context(&request)) =>
+                        result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
+                };
+                let prepared = match preparation {
+                    Ok(prepared) => prepared,
+                    Err(Error::RetryableModel(message))
+                        if session.retry_control().settings().enabled
+                            && retry_attempt < session.retry_control().settings().max_retries
+                            && request_index + 1 < active.limits.model_requests =>
+                    {
+                        if lifecycle && retry_attempt == 0 {
+                            active
+                                .observe_lifecycle(
+                                    turn_start(false),
+                                    &states,
+                                    Some(cancel),
+                                    observer,
+                                )
+                                .await;
+                        }
+                        let control = session.retry_control();
+                        let settings = control.settings();
+                        retry_attempt += 1;
+                        let delay_ms = settings.delay_ms(retry_attempt);
+                        let retry_wait = control.begin_wait();
+                        observer(Notification::Retry(crate::RetryEvent::Start {
+                            attempt: retry_attempt,
+                            max_attempts: settings.max_retries,
+                            delay_ms,
+                            error_message: message,
+                        }));
+                        let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                        tokio::pin!(sleep);
+                        let waited = loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = retry_wait.cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = &mut sleep => break Ok(()),
+                                Some(input) = followups.recv() => {
+                                    if let Err(error) = queue_input(session, input.into(), observer) { break Err(error); }
+                                }
+                            }
+                        };
+                        drop(retry_wait);
+                        waited?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let active = Agent {
+                    model: prepared.as_deref().unwrap_or(active.model),
+                    limits: active.limits.clone(),
+                    ..active
+                };
                 let capacity = active.context_capacity(&request, cancel).await?;
                 let input_tokens = capacity.map_or(0, |_| {
                     let estimate = session.context_budget_estimate();
@@ -1956,8 +2014,20 @@ impl Agent<'_> {
         if request.max_output_tokens == 0 || self.limits.model_requests == 0 {
             return Err(Error::Budget);
         }
+        let prepared = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            result = tokio::time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+                result.map_err(|_| Error::Config("model preparation timed out".into()))??,
+        };
+        let active = Agent {
+            model: prepared.as_deref().unwrap_or(self.model),
+            limits: self.limits.clone(),
+            ..*self
+        };
         let capacity = u64::from(
-            self.context_capacity(&request, cancel)
+            active
+                .context_capacity(&request, cancel)
                 .await?
                 .unwrap_or(128_000),
         );
@@ -1978,7 +2048,7 @@ impl Agent<'_> {
         }
         let mut remaining = capacity
             .saturating_sub(reserve)
-            .saturating_sub(self.model.estimate_request_tokens(&request))
+            .saturating_sub(active.model.estimate_request_tokens(&request))
             .saturating_sub(crate::estimate_message_tokens(&Message::User {
                 content: prompt.clone(),
             }))
@@ -2008,7 +2078,7 @@ impl Agent<'_> {
             ),
         });
         let allowance = request.max_output_tokens;
-        let reply = self
+        let reply = active
             .reply_for_branch_summary(session, request, cancel, observer)
             .await?;
         if reply.truncated {
@@ -2252,13 +2322,24 @@ impl Agent<'_> {
             content.push_str("\n\nAdditional focus: ");
             content.push_str(instructions);
         }
-        if self.exceeds_context(&request, cancel).await? {
+        let prepared = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            result = tokio::time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+                result.map_err(|_| Error::Config("model preparation timed out".into()))??,
+        };
+        let active = Agent {
+            model: prepared.as_deref().unwrap_or(self.model),
+            limits: self.limits.clone(),
+            ..*self
+        };
+        if active.exceeds_context(&request, cancel).await? {
             return Err(Error::Model(
                 "older context does not fit the summary request".into(),
             ));
         }
         let allowance = request.max_output_tokens;
-        let reply = self
+        let reply = active
             .reply(
                 session,
                 request,

@@ -44,6 +44,7 @@ pub(super) struct PiMessages {
     radius: Option<Radius>,
     probe_catalog: bool,
     identity_safe_transport: bool,
+    prepared_limits: Option<(Option<u32>, Option<u32>)>,
 }
 
 #[derive(Clone)]
@@ -107,6 +108,7 @@ impl PiMessages {
             radius: None,
             probe_catalog: true,
             identity_safe_transport: true,
+            prepared_limits: None,
         })
     }
 
@@ -186,6 +188,46 @@ impl PiMessages {
             value: value.clone(),
         });
         Ok(value)
+    }
+
+    pub(super) fn context_headers(&self) -> HeaderMap {
+        self.headers.clone()
+    }
+
+    pub(super) fn needs_context_preparation(&self) -> bool {
+        self.radius.is_some()
+    }
+
+    /// Freeze credentials and the catalog-selected route for one request.
+    pub(super) async fn prepare_context(&self, model: &str) -> Result<Self> {
+        if self.radius.is_none() {
+            return Ok(self.clone());
+        }
+        let (token, binding) = self.access().await?;
+        let catalog = match self
+            .catalog_for(&binding, self.probe_catalog.then_some(token.as_str()))
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(Error::RetryableModel(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let mut prepared = self.clone();
+        let details = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.models.iter().find(|item| item.id == model))
+            .map(|item| item.details());
+        if let Some(catalog) = catalog {
+            prepared.endpoint = catalog.endpoint.clone();
+            prepared.origin_hash = format!("{:x}", Sha256::digest(prepared.endpoint.as_str()));
+        }
+        prepared.prepared_limits = Some((
+            details.as_ref().and_then(|d| d.context_window),
+            details.as_ref().and_then(|d| d.max_output_tokens),
+        ));
+        prepared.token = Some(token);
+        prepared.radius = None;
+        Ok(prepared)
     }
 
     pub(super) async fn models(&self) -> Result<Vec<String>> {
@@ -442,7 +484,7 @@ pub(super) fn is_pi_messages_replay(replay: &ProviderReplay) -> bool {
 impl Model for PiMessages {
     fn context_identity(&self) -> Option<String> {
         // Radius discovers its route and credentials dynamically.
-        if self.identity == "radius"
+        if (self.identity == "radius" && self.prepared_limits.is_none())
             || self.radius.is_some()
             || !self.headers.is_empty()
             || !self.identity_safe_transport
@@ -460,8 +502,6 @@ impl Model for PiMessages {
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
-        // Radius may select a different endpoint from its catalog after this
-        // estimator was cached. Count any Radius-origin replay for this model.
         match message {
             Message::Assistant {
                 replay: Some(replay),
@@ -469,8 +509,7 @@ impl Model for PiMessages {
             } if replay.identity.provider == self.identity
                 && replay.identity.model == request.model
                 && replay.blocks.first().is_some_and(|marker| {
-                    marker["type"] == REPLAY_ORIGIN
-                        && (self.identity == "radius" || marker["endpoint"] == self.origin_hash)
+                    marker["type"] == REPLAY_ORIGIN && marker["endpoint"] == self.origin_hash
                 }) =>
             {
                 pi_rs::estimate_replay_tokens(&replay.blocks[1..])
@@ -481,6 +520,9 @@ impl Model for PiMessages {
     }
 
     async fn context_window(&self, model: &str) -> Option<u32> {
+        if let Some((window, _)) = self.prepared_limits {
+            return window;
+        }
         self.model_details(&[model.into()])
             .await
             .remove(model)?
@@ -492,6 +534,9 @@ impl Model for PiMessages {
             progress(Progress::WaitingForModel);
         }
         let mut client = self.clone();
+        if let Some((_, Some(limit))) = self.prepared_limits {
+            request.max_output_tokens = request.max_output_tokens.min(limit);
+        }
         let (token, binding) = self.access().await?;
         let catalog = match self
             .catalog_for(&binding, self.probe_catalog.then_some(token.as_str()))
@@ -750,6 +795,63 @@ fn terminal_metadata(
 #[cfg(test)]
 mod tool_status_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn radius_estimation_matches_replay_origin_after_route_change() {
+        let client = PiMessages::radius(
+            "https://gateway.example/v1",
+            Some("token".into()),
+            Gateway::configured().unwrap(),
+        )
+        .unwrap();
+        let cache = &client.radius.as_ref().unwrap().catalog;
+        let update = |endpoint: &str| CachedCatalog {
+            binding: key_binding("token"),
+            token_hash: Some(Sha256::digest(b"token").into()),
+            value: Arc::new(radius_catalog::Catalog {
+                endpoint: Url::parse(endpoint).unwrap(),
+                models: vec![],
+            }),
+        };
+        *cache.lock().await = Some(update("https://one.example/v1"));
+        let first = client.prepare_context("fixture").await.unwrap();
+        *cache.lock().await = Some(update("https://two.example/v1"));
+        let second = client.prepare_context("fixture").await.unwrap();
+        let replay = Message::Assistant {
+            content: "ok".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "radius".into(),
+                    model: "fixture".into(),
+                },
+                blocks: vec![
+                    json!({"type":REPLAY_ORIGIN,"endpoint":first.origin_hash}),
+                    json!({"type":"thinking","thinking":"x".repeat(8000)}),
+                ],
+            })),
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![replay.clone()],
+            tools: vec![],
+            max_output_tokens: 10,
+        };
+        assert!(first.estimate_message_tokens(&request, &replay) > 1900);
+        assert_eq!(
+            second.estimate_message_tokens(&request, &replay),
+            pi_rs::estimate_message_tokens(&replay)
+        );
+        assert_eq!(
+            first.encode(request.clone())["context"]["messages"][0]["content"][0]["type"],
+            "thinking"
+        );
+        assert_eq!(
+            second.encode(request)["context"]["messages"][0]["content"][0]["type"],
+            "text"
+        );
+        assert_ne!(first.context_identity(), second.context_identity());
+    }
 
     #[test]
     fn structured_tool_content_is_still_extracted_by_pi_messages() {

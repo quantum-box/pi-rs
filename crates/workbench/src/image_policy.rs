@@ -21,12 +21,41 @@ pub(super) struct WorkbenchModel {
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    async fn prepare_context(
+        &self,
+        request: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model>>> {
+        let Some((client, identity)) = self.client.prepare_for_context(&request.model).await?
+        else {
+            return Ok(None);
+        };
+        let identity = identity.and_then(|identity| {
+            pi_rs::fingerprint_model_context(&(
+                "workbench-policy-v2",
+                identity,
+                self.block_images,
+                self.supports_images,
+                self.session_affinity,
+            ))
+        });
+        Ok(Some(std::sync::Arc::new(PreparedWorkbenchModel {
+            inner: WorkbenchModel {
+                client,
+                block_images: self.block_images,
+                supports_images: self.supports_images,
+                session_affinity: self.session_affinity,
+                price: self.price.clone(),
+            },
+            identity,
+        })))
+    }
     fn context_identity(&self) -> Option<String> {
         pi_rs::fingerprint_model_context(&(
-            "workbench-policy-v1",
+            "workbench-policy-v2",
             self.client.context_identity()?,
             self.block_images,
             self.supports_images,
+            self.session_affinity,
         ))
     }
 
@@ -84,6 +113,50 @@ impl Model for WorkbenchModel {
             .stream_with_headers(self.filtered(request), &HeaderMap::new(), true)
             .await?;
         Ok(self.estimate_usage(stream))
+    }
+}
+
+struct PreparedWorkbenchModel {
+    inner: WorkbenchModel,
+    identity: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl Model for PreparedWorkbenchModel {
+    fn context_identity(&self) -> Option<String> {
+        self.identity.clone()
+    }
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        self.inner.estimate_request_tokens(request)
+    }
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        self.inner.estimate_message_tokens(request, message)
+    }
+    async fn context_window(&self, model: &str) -> Option<u32> {
+        self.inner.context_window(model).await
+    }
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        self.inner.stream(request).await
+    }
+    async fn stream_in_session(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.inner
+            .stream_in_session(request_id, session_id, request)
+            .await
+    }
+    async fn stream_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.inner
+            .stream_for_summary(request_id, session_id, request)
+            .await
     }
 }
 

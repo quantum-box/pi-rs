@@ -611,6 +611,14 @@ pub type ModelStream = futures_util::stream::BoxStream<'static, Result<ModelEven
 
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
+    /// Resolve a request-specific adapter once for estimation and dispatch.
+    async fn prepare_context(
+        &self,
+        _request: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model>>> {
+        Ok(None)
+    }
+
     /// Stable identity of all configuration affecting the effective request.
     /// Return None when the adapter cannot prove that identity across requests.
     /// Implementations must not return credentials or other secrets in plaintext.
