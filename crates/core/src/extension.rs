@@ -909,6 +909,7 @@ impl Registry {
     }
 
     /// Run opted-in extensions in registration order. A handled input is not submitted.
+    /// Handler errors are reported and do not prevent later handlers from running.
     pub async fn prepare_input(
         &self,
         event: InputEvent,
@@ -1172,10 +1173,14 @@ pub(crate) async fn prepare_input(
         .iter()
         .filter(|extension| extension.handles_input())
     {
-        match hook(
-            extension.as_ref(),
-            extension.input(&event, states.get(extension.id())).await,
-        )? {
+        let action = match extension.input(&event, states.get(extension.id())).await {
+            Ok(action) => action,
+            Err(error) => {
+                eprintln!("Extension {} (input): {error}", extension.id());
+                continue;
+            }
+        };
+        match action {
             InputAction::Continue => {}
             InputAction::Handled => return Ok(None),
             InputAction::Transform { text, images } => {
@@ -1203,6 +1208,57 @@ pub(crate) fn hook<T>(extension: &dyn Extension, result: ExtensionResult<T>) -> 
 mod replacement_tests {
     use super::*;
     use serde_json::json;
+
+    struct InputHook(&'static str);
+
+    #[async_trait::async_trait]
+    impl Extension for InputHook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input(
+            &self,
+            event: &InputEvent,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<InputAction> {
+            match self.0 {
+                "first" => Ok(InputAction::Transform {
+                    text: format!("{} first", event.text),
+                    images: None,
+                }),
+                "failure" => Err("input hook failed".into()),
+                "last" => Ok(InputAction::Transform {
+                    text: format!("{} last", event.text),
+                    images: None,
+                }),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn input_hook_failure_preserves_prior_transform_and_runs_later_hooks() {
+        let mut registry = Registry::default();
+        for id in ["first", "failure", "last"] {
+            registry.register(Arc::new(InputHook(id))).unwrap();
+        }
+        let event = InputEvent {
+            text: "hello".into(),
+            images: vec![],
+            source: InputSource::Rpc,
+            streaming_behavior: None,
+        };
+        let result = registry
+            .prepare_input(event, &ExtensionStates::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.text, "hello first last");
+        assert_eq!(result.source, InputSource::Rpc);
+    }
 
     #[test]
     fn custom_entry_distinguishes_missing_data_from_json_null() {
