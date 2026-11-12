@@ -189,18 +189,12 @@ pub(super) fn branch_selection(
                 }
                 _ => None,
             });
-        if let Some(change) = change {
-            let (Some(provider), Some(model)) =
+        if let Some(change) = change
+            && let (Some(provider), Some(model)) =
                 (change["provider"].as_str(), change["modelId"].as_str())
-            else {
-                return BranchSelection::Unresolved { thinking };
-            };
-            match catalog(provider, model) {
-                Some(true) => {
-                    return selected(&change["provider"], &change["modelId"], thinking);
-                }
-                None | Some(false) => {}
-            }
+            && catalog(provider, model) == Some(true)
+        {
+            return selected(&change["provider"], &change["modelId"], thinking);
         }
         return selected(&message["provider"], &message["model"], thinking);
     }
@@ -1169,6 +1163,99 @@ mod tests {
         let path = directory.path().join("shared.jsonl");
         std::fs::write(&path, shared).unwrap();
         assert!(read(&path).is_ok());
+    }
+
+    #[test]
+    fn reselecting_explicit_model_after_routed_response_survives_share() {
+        for selected_thinking in ["low", "high"] {
+            let mut session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"model_change","id":"change","parentId":null,"provider":"anthropic","modelId":"a"}),
+                json!({"type":"thinking_level_change","id":"think","parentId":"change","thinkingLevel":"low"}),
+                json!({"type":"message","id":"assistant","parentId":"think","message":{"role":"assistant","provider":"anthropic","model":"b","content":[]}}),
+            ]).unwrap();
+            assert_eq!(
+                session.model_selection(),
+                Some(("a".into(), Some("low".into())))
+            );
+            assert_eq!(session.model_provider(), Some("anthropic"));
+            let before = session.records().len();
+            session
+                .select_provider_model(Some("anthropic"), "a", Some(selected_thinking))
+                .unwrap();
+            assert!(session.records().len() > before);
+            assert_eq!(
+                branch_selection(&session, |_, _| None),
+                BranchSelection::Native
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let bytes = super::super::rpc_entries::Entries::new(&session)
+                .write_share_branch(&session, directory.path())
+                .unwrap();
+            let entries: Vec<Value> = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let last_change = entries
+                .iter()
+                .rev()
+                .find(|entry| entry["type"] == "model_change")
+                .unwrap();
+            assert_eq!(last_change["modelId"], "a");
+            let path = directory.path().join("share.jsonl");
+            std::fs::write(&path, bytes).unwrap();
+            let reopened = read(&path).unwrap();
+            assert_eq!(
+                branch_selection(&reopened, |_, _| None),
+                BranchSelection::Selected {
+                    provider: "anthropic".into(),
+                    model: "a".into(),
+                    thinking: Some(selected_thinking.into())
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_prior_model_change_does_not_hide_complete_response() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"modelId":"a"}),
+            json!({"type":"message","id":"assistant","parentId":"change","message":{"role":"assistant","provider":"ollama","model":"b","content":[]}}),
+        ]).unwrap();
+        assert_eq!(
+            branch_selection(&session, |_, _| None),
+            BranchSelection::Selected {
+                provider: "ollama".into(),
+                model: "b".into(),
+                thinking: None
+            }
+        );
+    }
+
+    #[test]
+    fn unavailable_provider_and_failed_activation_restore_initial_and_branch_thinking() {
+        use clap::Parser;
+        for provider in ["unknown-provider", "google"] {
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"thinking_level_change","id":"think","parentId":null,"thinkingLevel":"high"}),
+                json!({"type":"message","id":"assistant","parentId":"think","message":{"role":"assistant","provider":provider,"model":"b","content":[]}}),
+            ]).unwrap();
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model = "initial".into();
+            args.thinking = Some("low".into());
+            args.remember_initial_selection();
+            args.model = "previous".into();
+            args.initial_connection =
+                Some((super::super::Provider::Google, "invalid endpoint".into()));
+            args.endpoint_explicit = true;
+            args.restore_session_model(&session);
+            assert_eq!(args.provider.id(), "ollama");
+            assert_eq!(args.model, "initial");
+            assert_eq!(args.thinking.as_deref(), Some("high"));
+        }
     }
     #[test]
     fn imports_v1_compaction_index_and_preserves_original_entry() {

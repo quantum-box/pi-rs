@@ -649,9 +649,9 @@ impl Cli {
         model: String,
         thinking: Option<String>,
         provider: Option<&str>,
-    ) {
+    ) -> bool {
         let Some(provider) = self.model_profiles.provider(provider.unwrap_or("ollama")) else {
-            return;
+            return false;
         };
         let in_scope = self.model_scope.is_empty()
             || self
@@ -664,7 +664,10 @@ impl Cli {
                 || !in_scope
                 || self.activate_provider(provider, Some(&model)).is_err())
         {
-            return;
+            return false;
+        }
+        if !in_scope && !self.model_explicit {
+            return false;
         }
         if !self.model_explicit && in_scope {
             self.model = model.clone();
@@ -683,6 +686,36 @@ impl Cli {
                 })
                 .or_else(|| self.thinking.clone());
         }
+        true
+    }
+
+    fn restore_initial_selection(&mut self, thinking: Option<String>) {
+        if let Some(initial) = &self.initial_selection {
+            if !self.model_explicit {
+                self.provider = initial.provider.clone();
+                self.endpoint = initial.endpoint.clone();
+                self.model = initial.model.clone();
+                self.thinking_profile = None;
+            }
+            if !self.thinking_explicit {
+                self.thinking = thinking.or_else(|| initial.thinking.clone());
+            }
+        } else if !self.thinking_explicit && thinking.is_some() {
+            self.thinking = thinking;
+        }
+    }
+
+    fn restore_branch_selection(
+        &mut self,
+        model: String,
+        thinking: Option<String>,
+        provider: Option<&str>,
+    ) {
+        if !self.restore_model_selection(model, thinking.clone(), provider) {
+            self.restore_initial_selection(thinking);
+        } else if !self.thinking_explicit && thinking.is_some() {
+            self.thinking = thinking;
+        }
     }
 
     fn restore_session_model(&mut self, session: &Session) {
@@ -691,7 +724,7 @@ impl Cli {
         match session_import::branch_selection(session, |_, _| None) {
             session_import::BranchSelection::Native => {
                 if let Some((model, thinking)) = session.model_selection() {
-                    self.restore_model_selection(model, thinking, session.model_provider());
+                    self.restore_branch_selection(model, thinking, session.model_provider());
                 }
             }
             session_import::BranchSelection::Selected {
@@ -699,22 +732,10 @@ impl Cli {
                 model,
                 thinking,
             } => {
-                self.restore_model_selection(model, thinking, Some(&provider));
+                self.restore_branch_selection(model, thinking, Some(&provider));
             }
             session_import::BranchSelection::Unresolved { thinking } => {
-                if let Some(initial) = &self.initial_selection {
-                    if !self.model_explicit {
-                        self.provider = initial.provider.clone();
-                        self.endpoint = initial.endpoint.clone();
-                        self.model = initial.model.clone();
-                        self.thinking_profile = None;
-                    }
-                    if !self.thinking_explicit {
-                        self.thinking = thinking.or_else(|| initial.thinking.clone());
-                    }
-                } else if !self.thinking_explicit && thinking.is_some() {
-                    self.thinking = thinking;
-                }
+                self.restore_initial_selection(thinking);
             }
         }
     }

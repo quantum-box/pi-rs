@@ -842,6 +842,7 @@ impl Session {
         }
         if self.model_selection() != Some((model.into(), thinking.map(str::to_owned)))
             || self.model_provider() != provider
+            || self.has_imported_response_since_selection()
         {
             self.append(Event::ModelSelected {
                 model: model.into(),
@@ -850,6 +851,38 @@ impl Session {
             })?;
         }
         Ok(())
+    }
+
+    // A Pi assistant may have been routed to another model after the last
+    // explicit selection. Without the host catalog we cannot resolve virtual
+    // models here, so persist an explicit user selection instead of deduping it.
+    fn has_imported_response_since_selection(&self) -> bool {
+        let branch = self.branch();
+        for (index, record) in branch.iter().enumerate().rev() {
+            match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi" => {
+                    if entry["type"] == "model_change" {
+                        return false;
+                    }
+                    if entry["type"] == "message"
+                        && entry["message"]["role"] == "assistant"
+                        && entry["message"]["api"] != "pi-virtual"
+                    {
+                        return true;
+                    }
+                }
+                Event::ModelSelected { .. } => {
+                    let imported = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
+                        parent.timestamp == record.timestamp && record.run_id.is_none() && matches!(&parent.event, Event::SourceEntry { format, entry } if format == "pi" && matches!(entry["type"].as_str(), Some("model_change" | "thinking_level_change" | "message")))
+                    });
+                    if !imported {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     pub fn name(&self) -> Option<&str> {

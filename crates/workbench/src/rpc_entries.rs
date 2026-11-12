@@ -21,6 +21,7 @@ struct Position {
     visible: Option<u64>,
     imported: Option<u64>,
     model: Option<u64>,
+    response_model: Option<u64>,
 }
 
 pub(super) struct Entries {
@@ -267,6 +268,14 @@ impl Cursor {
         let mut position = parent;
         let entry = match &record.event {
             Event::SourceEntry { format, entry } if format == "pi" => {
+                if entry["type"] == "model_change" {
+                    position.response_model = None;
+                } else if entry["type"] == "message"
+                    && entry["message"]["role"] == "assistant"
+                    && entry["message"]["api"] != "pi-virtual"
+                {
+                    position.response_model = Some(record.id);
+                }
                 position.imported = (entry["type"] != "session").then_some(record.id);
                 if position.imported.is_some() {
                     if let Some(source_id) = entry["id"].as_str() {
@@ -331,6 +340,7 @@ impl Cursor {
             } => {
                 let current = selection(model, provider.as_deref(), thinking.as_deref());
                 position.model = Some(record.id);
+                position.response_model = None;
                 let previous = parent.model.and_then(|id| {
                     let Event::ModelSelected {
                         model,
@@ -342,8 +352,16 @@ impl Cursor {
                     };
                     Some(selection(model, provider.as_deref(), thinking.as_deref()))
                 });
-                let model_changed =
-                    previous.is_none_or(|old| (old.0, old.1) != (current.0, current.1));
+                let model_changed = if let Some(id) = parent.response_model {
+                    let Event::SourceEntry { entry, .. } = &records[id as usize - 1].event else {
+                        unreachable!()
+                    };
+                    let message = &entry["message"];
+                    message["provider"].as_str() != Some(current.0)
+                        || message["model"].as_str() != Some(current.1)
+                } else {
+                    previous.is_none_or(|old| (old.0, old.1) != (current.0, current.1))
+                };
                 let thinking_changed = previous.is_none_or(|old| old.2 != current.2);
                 let model_entry =
                     || json!({"type":"model_change","provider":current.0,"modelId":current.1});
