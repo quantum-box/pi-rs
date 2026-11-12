@@ -1423,7 +1423,31 @@ mod tests {
                 });
             }
             let mut session = builder.in_memory().unwrap();
-            assert_eq!(session.prompt("test").await.unwrap(), "done");
+            match session.prompt("test").await {
+                Ok(answer) => assert_eq!(answer, "done"),
+                // The host deadline can win the race with the worker's interrupt.
+                // Until the worker reports back, its outcome is safely unknown.
+                Err(pi_rs_core::Error::Reconciliation(operation_id)) if explicit_limits => {
+                    assert!(
+                        session
+                            .journal()
+                            .operations()
+                            .iter()
+                            .any(|(invocation, state)| {
+                                invocation.operation_id == operation_id
+                                    && matches!(
+                                        state,
+                                        pi_rs_core::OperationState::Finished(Outcome::Unknown(reason)) if reason == "tool timed out"
+                                    )
+                            })
+                    );
+                    assert!(matches!(
+                        session.resume().await,
+                        Err(pi_rs_core::Error::Reconciliation(_))
+                    ));
+                }
+                result => panic!("unexpected timeout result: {result:?}"),
+            }
             session.close().await.unwrap();
         }
     }
