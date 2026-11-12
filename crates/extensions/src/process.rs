@@ -255,6 +255,8 @@ struct Description {
     #[serde(default)]
     lifecycle_hook: bool,
     #[serde(default)]
+    tool_execution_lifecycle_hook: bool,
+    #[serde(default)]
     model_selection_hook: bool,
     #[serde(default)]
     session_lifecycle_hook: bool,
@@ -524,6 +526,9 @@ impl Extension for ExecutableExtension {
     }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
+    }
+    fn handles_tool_execution_lifecycle(&self) -> bool {
+        self.description.tool_execution_lifecycle_hook
     }
     fn handles_model_selection(&self) -> bool {
         self.description.model_selection_hook
@@ -1532,6 +1537,7 @@ async fn dispatch_with_host(
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
+            tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
             model_selection_hook: extension.handles_model_selection(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
@@ -1762,6 +1768,50 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tool_execution_lifecycle_capability_and_events_round_trip() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "tool-lifecycle"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_tool_execution_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle(
+                &self,
+                event: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert!(
+                    matches!(event, LifecycleEvent::ToolExecutionStart { tool_call_id, args, .. } if tool_call_id == "call" && args["path"] == "test")
+                );
+                Ok(())
+            }
+        }
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["tool_execution_lifecycle_hook"], true);
+        let request = ProtocolRequest::Lifecycle {
+            event: LifecycleEvent::ToolExecutionStart {
+                tool_call_id: "call".into(),
+                tool_name: "read".into(),
+                args: serde_json::json!({"path":"test"}),
+                parent_tool_call_id: None,
+            },
+            state: None,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        dispatch(extension, decoded).await.unwrap();
+    }
 
     #[tokio::test]
     async fn tool_result_hook_is_advertised_and_dispatched() {

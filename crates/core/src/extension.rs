@@ -496,6 +496,11 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to observing tool execution start and end events.
+    fn handles_tool_execution_lifecycle(&self) -> bool {
+        false
+    }
+
     /// Opt in to model and thinking-level selection events.
     fn handles_model_selection(&self) -> bool {
         false

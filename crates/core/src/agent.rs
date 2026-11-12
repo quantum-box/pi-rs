@@ -1110,7 +1110,23 @@ impl Agent<'_> {
             };
             let (group, next) = remaining.split_at(count);
             let mut prepared = Vec::with_capacity(count);
+            let mut parents = Vec::with_capacity(count);
             for invocation in group {
+                let parent = tool_parent_call_id(session, invocation.operation_id);
+                self.observe_lifecycle(
+                    crate::LifecycleEvent::ToolExecutionStart {
+                        tool_call_id: invocation.call.id.clone(),
+                        tool_name: invocation.call.name.clone(),
+                        args: crate::parse_tool_arguments(&invocation.call.arguments)
+                            .unwrap_or(serde_json::Value::Null),
+                        parent_tool_call_id: parent.clone(),
+                    },
+                    states,
+                    Some(cancel),
+                    observer,
+                )
+                .await;
+                parents.push(parent);
                 let preparation = self.prepare_tool(invocation, scope.advertised, states, cancel);
                 tokio::pin!(preparation);
                 let preparation = loop {
@@ -1169,7 +1185,14 @@ impl Agent<'_> {
                     call_count: scope.call_count.clone(),
                     ui: self.registry.ui.clone(),
                 });
-                self.invoke(prepared, cancel, host, scope.depth > 0)
+                let ran = matches!(&prepared, Preparation::Ready { .. });
+                async move {
+                    let started = std::time::Instant::now();
+                    let reply = self.invoke(prepared, cancel, host, scope.depth > 0).await;
+                    let duration =
+                        ran.then(|| started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                    (reply, duration)
+                }
             });
             let outcomes = futures_util::future::join_all(invocations);
             tokio::pin!(outcomes);
@@ -1217,10 +1240,32 @@ impl Agent<'_> {
             };
             let mut first_error = None;
             // All started outcomes are recorded even if one parallel member failed.
-            for (invocation, mut outcome) in group.iter().zip(outcomes) {
+            for ((invocation, (mut outcome, duration)), parent) in
+                group.iter().zip(outcomes).zip(parents)
+            {
                 self.transform_tool_result(invocation, &mut outcome, states, cancel, observer)
                     .await;
-                if let Err(error) = self.finish_tool(session, invocation, outcome, states, observer)
+                let result = outcome.outcome.clone();
+                let is_error = matches!(
+                    &result,
+                    Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
+                ) || matches!(&result, Outcome::Structured { data, .. } if data["isError"] == true);
+                let finished = self.finish_tool(session, invocation, outcome, states, observer);
+                self.observe_lifecycle(
+                    crate::LifecycleEvent::ToolExecutionEnd {
+                        tool_call_id: invocation.call.id.clone(),
+                        tool_name: invocation.call.name.clone(),
+                        result,
+                        is_error,
+                        duration_ms: duration,
+                        parent_tool_call_id: parent,
+                    },
+                    states,
+                    None,
+                    observer,
+                )
+                .await;
+                if let Err(error) = finished
                     && (first_error.is_none()
                         || (matches!(first_error, Some(Error::PendingOperation(_)))
                             && !matches!(error, Error::PendingOperation(_))))
@@ -2868,6 +2913,25 @@ struct NestedRequest {
     depth: usize,
     call_count: Arc<AtomicUsize>,
     reply: oneshot::Sender<Outcome>,
+}
+
+fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> {
+    let parent = session
+        .records()
+        .iter()
+        .find_map(|record| match &record.event {
+            Event::ToolPlanned {
+                invocation,
+                parent_operation,
+            } if invocation.operation_id == operation_id => Some(*parent_operation),
+            _ => None,
+        })?;
+    session
+        .operations()
+        .into_iter()
+        .find_map(|(invocation, _)| {
+            (invocation.operation_id == parent).then_some(invocation.call.id)
+        })
 }
 struct NestedHost {
     ui: Option<Arc<dyn crate::ExtensionUi>>,
