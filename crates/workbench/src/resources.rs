@@ -294,7 +294,14 @@ impl Resources {
         }
         for root in prompt_roots {
             let mut files = if root.is_file() {
-                vec![root]
+                if root
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".md"))
+                {
+                    vec![root]
+                } else {
+                    Vec::new()
+                }
             } else {
                 std::fs::read_dir(root)
                     .into_iter()
@@ -954,6 +961,29 @@ mod tests {
         let resources = Resources::load(&args).unwrap();
         assert_eq!(resources.system.as_deref(), Some("explicit base"));
         assert_eq!(resources.append_system, "first\n\nsecond");
+    }
+
+    #[test]
+    fn explicit_prompt_files_only_load_markdown() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("note.txt"), "text prompt").unwrap();
+        std::fs::write(root.join("review.md"), "markdown prompt").unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--prompt-template",
+            "note.txt",
+            "--prompt-template",
+            "review.md",
+        ])
+        .unwrap();
+        args.workspace = root.to_path_buf();
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.prompts.contains_key("review"));
+        assert!(!resources.prompts.contains_key("note"));
     }
 
     #[test]

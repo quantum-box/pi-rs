@@ -967,12 +967,7 @@ fn collect_package_prompts(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
     };
     for source in sources {
         if source.is_file() {
-            if source
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with(".md"))
-            {
-                paths.push(source);
-            }
+            paths.push(source);
         } else if source.is_dir() {
             // A selected directory is the ignore root, including when it is a symlink.
             for entry in ignore::WalkBuilder::new(&source)
@@ -1499,8 +1494,15 @@ mod tests {
             ])),
             vec![root.join("prompts/visible.md")]
         );
-        assert!(discover(json!(["prompts/not-prompt.txt"])).is_empty());
-        assert!(discover(json!(["prompts/*.txt"])).is_empty());
+        assert_eq!(
+            discover(json!(["prompts/not-prompt.txt"])),
+            vec![root.join("prompts/not-prompt.txt")]
+        );
+        assert_eq!(
+            discover(json!(["prompts/*.txt"])),
+            vec![root.join("prompts/not-prompt.txt")]
+        );
+        assert!(!discover(json!(["prompts"])).contains(&root.join("prompts/not-prompt.txt")));
     }
 
     #[test]
