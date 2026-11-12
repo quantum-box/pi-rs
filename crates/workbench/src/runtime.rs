@@ -693,6 +693,10 @@ pub(super) fn model_client(
     Ok(super::image_policy::WorkbenchModel {
         client: if observe { client.observe() } else { client },
         block_images: args.settings.block_model_images(),
+        supports_images: args
+            .model_profiles
+            .model(&args.provider, &args.model)
+            .and_then(|model| model.supports_images()),
         price: args
             .model_profiles
             .model(&args.provider, &args.model)

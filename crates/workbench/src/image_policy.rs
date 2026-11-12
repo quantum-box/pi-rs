@@ -8,10 +8,13 @@ use uuid::Uuid;
 use super::{model_profiles::ChatPrice, providers::Client};
 
 pub(super) const BLOCKED_IMAGE: &str = "Image reading is disabled.";
+const NON_VISION_USER_IMAGE: &str = "(image omitted: model does not support images)";
+const NON_VISION_TOOL_IMAGE: &str = "(tool image omitted: model does not support images)";
 
 pub(super) struct WorkbenchModel {
     pub client: Client,
     pub block_images: bool,
+    pub supports_images: Option<bool>,
     pub session_affinity: &'static [&'static str],
     pub price: Option<ChatPrice>,
 }
@@ -91,13 +94,19 @@ impl WorkbenchModel {
 
     fn filtered(&self, mut request: ModelRequest) -> ModelRequest {
         if self.block_images {
-            remove_images(&mut request.messages);
+            remove_images(&mut request.messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
+        } else if self.supports_images == Some(false) {
+            remove_images(
+                &mut request.messages,
+                NON_VISION_USER_IMAGE,
+                NON_VISION_TOOL_IMAGE,
+            );
         }
         request
     }
 }
 
-fn remove_images(messages: &mut [Message]) {
+fn remove_images(messages: &mut [Message], user_placeholder: &str, tool_placeholder: &str) {
     for message in messages {
         match message {
             Message::UserWithImages { content, images } if !images.is_empty() => {
@@ -105,11 +114,11 @@ fn remove_images(messages: &mut [Message]) {
                 if !content.is_empty() {
                     content.push_str("\n\n");
                 }
-                content.push_str(BLOCKED_IMAGE);
+                content.push_str(user_placeholder);
                 *message = Message::User { content };
             }
             Message::Tool { content, .. } => {
-                if let Some(filtered) = remove_tool_images(content) {
+                if let Some(filtered) = remove_tool_images(content, tool_placeholder) {
                     *content = filtered;
                 }
             }
@@ -118,7 +127,7 @@ fn remove_images(messages: &mut [Message]) {
     }
 }
 
-fn remove_tool_images(content: &str) -> Option<String> {
+fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
     let mut result: Value = serde_json::from_str(content).ok()?;
     let blocks = result.get_mut("data")?.get_mut("content")?.as_array_mut()?;
     let mut previous_placeholder = false;
@@ -129,9 +138,9 @@ fn remove_tool_images(content: &str) -> Option<String> {
             if previous_placeholder {
                 return false;
             }
-            *block = json!({"type":"text","text":BLOCKED_IMAGE});
+            *block = json!({"type":"text","text":placeholder});
         }
-        previous_placeholder = block["type"] == "text" && block["text"] == BLOCKED_IMAGE;
+        previous_placeholder = block["type"] == "text" && block["text"] == placeholder;
         true
     });
     changed.then(|| result.to_string())
@@ -162,7 +171,7 @@ mod tests {
                 content: original.to_string(),
             },
         ];
-        remove_images(&mut messages);
+        remove_images(&mut messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
         assert_eq!(
             messages[0],
             Message::User {
@@ -175,6 +184,38 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(content).unwrap()["data"]["content"],
             json!([{"type":"text","text":"before"},{"type":"text","text":BLOCKED_IMAGE},{"type":"text","text":"after"}]),
+        );
+    }
+
+    #[test]
+    fn non_vision_models_receive_reference_placeholders_for_user_and_tool_images() {
+        let mut messages = vec![
+            Message::UserWithImages {
+                content: "look".into(),
+                images: vec![pi_rs::ImageContent { data: "private".into(), mime_type: "image/png".into() }],
+            },
+            Message::Tool {
+                call_id: "call".into(),
+                content: json!({"data":{"content":[{"type":"text","text":"before"},{"type":"image","data":"private"},{"type":"image","data":"private"},{"type":"text","text":"after"}]}}).to_string(),
+            },
+        ];
+        remove_images(&mut messages, NON_VISION_USER_IMAGE, NON_VISION_TOOL_IMAGE);
+        assert_eq!(
+            messages[0],
+            Message::User {
+                content: format!("look\n\n{NON_VISION_USER_IMAGE}")
+            }
+        );
+        let Message::Tool { content, .. } = &messages[1] else {
+            panic!("expected tool result")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(content).unwrap()["data"]["content"],
+            json!([
+                {"type":"text","text":"before"},
+                {"type":"text","text":NON_VISION_TOOL_IMAGE},
+                {"type":"text","text":"after"}
+            ])
         );
     }
 }
