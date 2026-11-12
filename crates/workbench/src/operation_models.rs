@@ -155,6 +155,12 @@ impl Catalogue {
         let mut seen = BTreeSet::new();
         for (name, provider) in &combined {
             let name = name.to_ascii_lowercase();
+            let inferred_base =
+                if provider["baseUrl"].as_str().is_none() && official_base(&name).is_none() {
+                    unambiguous_model_base(provider)
+                } else {
+                    None
+                };
             for model in provider["models"].as_array().into_iter().flatten() {
                 let kind = match model["type"].as_str() {
                     Some("classifier") => Kind::Classifier,
@@ -216,6 +222,13 @@ impl Catalogue {
                         Error::Config(format!("operation provider {name} requires baseUrl"))
                     })?;
                 let (base, endpoint) = endpoints(base, api.route())?;
+                let key_endpoint = provider["baseUrl"]
+                    .as_str()
+                    .or_else(|| official_base(&name))
+                    .or(inferred_base.as_deref())
+                    .map(|base| endpoints(base, api.route()))
+                    .transpose()?
+                    .map(|(_, endpoint)| endpoint);
                 let inherited: BTreeMap<String, String> = if provider["headers"].is_null() {
                     BTreeMap::new()
                 } else {
@@ -244,13 +257,16 @@ impl Catalogue {
                     .compat
                     .send_image_opt_in_header
                     .or(inherited.send_image_opt_in_header);
+                let api_key = (key_endpoint.as_ref() == Some(&endpoint))
+                    .then(|| provider["apiKey"].as_str().map(str::to_owned))
+                    .flatten();
                 result.push(Entry {
                     provider: name.clone(),
                     model: configured,
                     api,
                     base,
                     endpoint,
-                    api_key: provider["apiKey"].as_str().map(str::to_owned),
+                    api_key,
                 });
             }
         }
@@ -296,6 +312,21 @@ impl Catalogue {
     }
 }
 
+fn unambiguous_model_base(provider: &Value) -> Option<String> {
+    let models = provider["models"].as_array()?;
+    let mut bases = BTreeSet::new();
+    for model in models {
+        let raw = model["baseUrl"].as_str()?;
+        let mut base = Url::parse(raw).ok()?;
+        let path = base.path().trim_end_matches('/').to_owned();
+        base.set_path(&path);
+        bases.insert(base.to_string());
+    }
+    (bases.len() == 1)
+        .then(|| bases.into_iter().next())
+        .flatten()
+}
+
 pub(super) fn official_base(provider: &str) -> Option<&'static str> {
     match provider {
         "typesafe" => Some("https://api.typesafe.ai/v1"),
@@ -305,7 +336,7 @@ pub(super) fn official_base(provider: &str) -> Option<&'static str> {
 }
 
 fn endpoints(value: &str, route: &str) -> Result<(Url, Url)> {
-    let base =
+    let mut base =
         Url::parse(value).map_err(|_| Error::Config("invalid operation model baseUrl".into()))?;
     let loopback = matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if !(base.scheme() == "https" || (base.scheme() == "http" && loopback))
@@ -317,6 +348,8 @@ fn endpoints(value: &str, route: &str) -> Result<(Url, Url)> {
     {
         return Err(Error::Config("invalid operation model baseUrl".into()));
     }
+    let path = base.path().trim_end_matches('/').to_owned();
+    base.set_path(&path);
     let endpoint = if base
         .path()
         .trim_end_matches('/')
@@ -330,7 +363,21 @@ fn endpoints(value: &str, route: &str) -> Result<(Url, Url)> {
     Ok((base, endpoint))
 }
 
+async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option<String> {
+    if value.starts_with('!') {
+        pi_rs_workbench::mcp::resolve_value(value).await.ok()
+    } else {
+        super::model_profiles::expand_value_with_env(value, env)
+    }
+}
+
 impl Entry {
+    fn is_official(&self) -> bool {
+        official_base(&self.provider)
+            .and_then(|base| endpoints(base, self.api.route()).ok())
+            .is_some_and(|(_, endpoint)| endpoint == self.endpoint)
+    }
+
     fn descriptor(&self) -> Value {
         let mut value = json!({
             "type": self.api.kind(),
@@ -356,23 +403,39 @@ impl Entry {
     }
 
     fn credential(&self, keys: &Keys) -> Option<Credential> {
-        let official = official_base(&self.provider)
-            .and_then(|base| endpoints(base, self.api.route()).ok())
-            .is_some_and(|(_, endpoint)| endpoint == self.endpoint);
-        keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
-            .cloned()
-            .or_else(|| {
-                let key = match (self.provider.as_str(), official) {
-                    ("typesafe", true) => "TYPESAFE_API_KEY",
-                    ("openrouter", true) => "OPENROUTER_API_KEY",
-                    _ => return None,
-                };
-                std::env::var(key)
-                    .ok()
-                    .filter(|key| super::model_auth::valid_key(key))
-                    .map(Credential::Literal)
-            })
-            .or_else(|| self.api_key.as_deref().and_then(Credential::configured))
+        self.credential_with_env(keys, |name| std::env::var(name).ok())
+    }
+
+    fn credential_with_env(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Credential> {
+        let official = self.is_official();
+        if let Some(key) =
+            keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
+        {
+            return Some(key.clone());
+        }
+        if let Some(key) = self.api_key.as_deref() {
+            return Some(match Credential::configured(key) {
+                Some(Credential::Literal(value)) if super::model_auth::valid_key(&value) => {
+                    Credential::Literal(value)
+                }
+                Some(credential @ Credential::Command(_)) => credential,
+                _ => Credential::Invalid,
+            });
+        }
+        {
+            let key = match (self.provider.as_str(), official) {
+                ("typesafe", true) => "TYPESAFE_API_KEY",
+                ("openrouter", true) => "OPENROUTER_API_KEY",
+                _ => return None,
+            };
+            env(key)
+                .filter(|key| super::model_auth::valid_key(key))
+                .map(Credential::Literal)
+        }
     }
 
     fn accepts_images(&self) -> bool {
@@ -611,6 +674,11 @@ impl Operations {
             .credential(keys)
             .ok_or_else(|| Error::Config(format!("No API key for provider: {}", entry.provider)))?;
         let key = credential.resolve().await?;
+        let credential_env = keys.operation_environment(
+            &entry.provider,
+            entry.endpoint.as_str(),
+            entry.is_official(),
+        );
         let mut headers = HeaderMap::new();
         let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
             .map_err(|_| Error::Config("invalid model operation credential".into()))?;
@@ -623,12 +691,7 @@ impl Operations {
             );
         }
         for (name, value) in &entry.model.headers {
-            let value = if value.starts_with('!') {
-                pi_rs_workbench::mcp::resolve_value(value).await.ok()
-            } else {
-                super::model_profiles::expand_value(value)
-            }
-            .ok_or_else(|| {
+            let value = resolve_header(value, credential_env).await.ok_or_else(|| {
                 Error::Config(format!("could not resolve operation model header {name}"))
             })?;
             let mut value = HeaderValue::from_str(&value)
@@ -714,6 +777,316 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn operation_credentials_prefer_stored_then_configured_then_environment() {
+        for (provider, variable) in [
+            ("typesafe", "TYPESAFE_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+        ] {
+            let config = json!({provider: {"apiKey":"configured-key"}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider)
+                .unwrap();
+            let env = |name: &str| (name == variable).then(|| "environment-key".to_owned());
+            let empty = Keys::parse(&json!({}));
+            assert_eq!(
+                entry
+                    .credential_with_env(&empty, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("configured-key")
+            );
+            let saved = Keys::parse(&json!({provider: {"type":"api_key", "key":"stored-key"}}));
+            assert_eq!(
+                entry
+                    .credential_with_env(&saved, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("stored-key")
+            );
+            let mut no_config = entry.clone();
+            no_config.api_key = None;
+            assert_eq!(
+                no_config
+                    .credential_with_env(&empty, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("environment-key")
+            );
+            no_config.endpoint = Url::parse("https://proxy.example/v1/systemone").unwrap();
+            assert!(no_config.credential_with_env(&empty, env).is_none());
+            let mut invalid = entry.clone();
+            invalid.api_key = Some("${PI_RS_MISSING_OPERATION_KEY_TEST_8E43B}".into());
+            assert!(
+                invalid
+                    .credential_with_env(&empty, env)
+                    .unwrap()
+                    .resolve()
+                    .await
+                    .is_err()
+            );
+            invalid.api_key = Some(String::new());
+            assert!(
+                invalid
+                    .credential_with_env(&empty, env)
+                    .unwrap()
+                    .resolve()
+                    .await
+                    .is_err()
+            );
+            for key in ["", "${PI_RS_MISSING_OPERATION_KEY_TEST_8E43B}"] {
+                let saved = Keys::parse(&json!({provider: {"type":"api_key", "key":key}}));
+                assert!(
+                    entry
+                        .credential_with_env(&saved, env)
+                        .unwrap()
+                        .resolve()
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_stored_key_falls_back_and_stored_env_resolves_headers() {
+        let catalogue = Catalogue::parse(json!({}).as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "typesafe")
+            .unwrap();
+        let keys = Keys::parse(
+            &json!({"typesafe":{"type":"api_key", "env":{"HEADER_SECRET":"local-header"}}}),
+        );
+        let env = |name: &str| (name == "TYPESAFE_API_KEY").then(|| "environment-key".to_owned());
+        assert_eq!(
+            entry
+                .credential_with_env(&keys, env)
+                .unwrap()
+                .resolve()
+                .await
+                .unwrap(),
+            "environment-key"
+        );
+        let stored_env =
+            keys.operation_environment("typesafe", entry.endpoint.as_str(), entry.is_official());
+        assert_eq!(
+            resolve_header("$HEADER_SECRET", stored_env)
+                .await
+                .as_deref(),
+            Some("local-header")
+        );
+        assert!(
+            keys.operation_environment("typesafe", "https://other.example/v1/systemone", false)
+                .is_none()
+        );
+        let invalid = Keys::parse(
+            &json!({"typesafe":{"type":"api_key", "key":"$PI_RS_MISSING_KEY_TEST_3F64"}}),
+        );
+        assert!(
+            entry
+                .credential_with_env(&invalid, env)
+                .unwrap()
+                .resolve()
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn operation_endpoints_normalize_complete_route_trailing_slashes() {
+        let (_, plain) = endpoints("https://proxy.example/v1/systemone", "systemone").unwrap();
+        let (_, slash) = endpoints("https://proxy.example/v1/systemone/", "systemone").unwrap();
+        assert_eq!(plain, slash);
+        let config = json!({"relay":{"apiKey":"secret", "models":[
+            {"type":"classifier", "id":"one", "api":"typesafe-system-one", "baseUrl":"https://proxy.example/v1/systemone/"},
+            {"type":"classifier", "id":"two", "api":"typesafe-system-one", "baseUrl":"https://proxy.example/v1/systemone"}
+        ]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        for entry in catalogue.0.iter().filter(|entry| entry.provider == "relay") {
+            assert_eq!(entry.endpoint, plain);
+            assert_eq!(entry.api_key.as_deref(), Some("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_uses_slash_terminated_saved_endpoint_before_configured_key() {
+        let config = json!({"proxy":{
+            "baseUrl":"https://proxy.example/v1", "apiKey":"configured-key",
+            "models":[{"type":"classifier", "id":"classifier", "api":"typesafe-system-one"}]
+        }});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "proxy")
+            .unwrap();
+        let keys = Keys::parse(&json!({"proxy":{
+            "type":"api_key", "key":"stored-key", "endpoint":"https://proxy.example/v1/systemone/",
+            "env":{"HEADER":"saved-header"}
+        }}));
+        assert_eq!(
+            entry.credential(&keys).unwrap().resolve().await.unwrap(),
+            "stored-key"
+        );
+        let env = keys.operation_environment("proxy", entry.endpoint.as_str(), entry.is_official());
+        assert_eq!(
+            resolve_header("$HEADER", env).await.as_deref(),
+            Some("saved-header")
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_terminated_official_saved_bases_keep_key_precedence() {
+        for (provider, base, variable) in [
+            ("typesafe", "https://api.typesafe.ai/v1", "TYPESAFE_API_KEY"),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "OPENROUTER_API_KEY",
+            ),
+        ] {
+            let config = json!({provider:{"apiKey":"configured-key"}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entries: Vec<_> = catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == provider && entry.is_official())
+                .collect();
+            assert!(!entries.is_empty());
+            let env = |name: &str| (name == variable).then(|| "ambient-key".to_owned());
+            for saved_base in [base.to_owned(), format!("{base}/")] {
+                let keys = Keys::parse(
+                    &json!({provider:{"type":"api_key", "key":"stored-key", "endpoint":saved_base, "env":{"HEADER":"stored-header"}}}),
+                );
+                for entry in &entries {
+                    assert_eq!(
+                        entry
+                            .credential_with_env(&keys, env)
+                            .unwrap()
+                            .resolve()
+                            .await
+                            .unwrap(),
+                        "stored-key"
+                    );
+                    let header_env =
+                        keys.operation_environment(provider, entry.endpoint.as_str(), true);
+                    assert_eq!(
+                        resolve_header("$HEADER", header_env).await.as_deref(),
+                        Some("stored-header")
+                    );
+                    assert!(
+                        keys.operation_credential(
+                            provider,
+                            "https://other.example/v1/systemone",
+                            false
+                        )
+                        .is_none()
+                    );
+                }
+            }
+            let other = Keys::parse(
+                &json!({provider:{"type":"api_key", "key":"wrong-key", "endpoint":"https://other.example/v1/"}}),
+            );
+            for entry in entries {
+                assert_eq!(
+                    entry
+                        .credential_with_env(&other, env)
+                        .unwrap()
+                        .resolve()
+                        .await
+                        .unwrap(),
+                    "configured-key"
+                );
+                assert!(
+                    other
+                        .operation_environment(provider, entry.endpoint.as_str(), true)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_key_is_bound_to_provider_endpoint_not_model_override() {
+        for (base, override_base) in [
+            ("https://api.typesafe.ai/v1", "https://proxy.example/v1"),
+            ("https://proxy.example/v1", "https://api.typesafe.ai/v1"),
+        ] {
+            let config = json!({"typesafe": {
+                "baseUrl": base, "apiKey": "provider-key",
+                "models": [
+                    {"type":"classifier", "id":"same", "api":"typesafe-system-one"},
+                    {"type":"classifier", "id":"override", "api":"typesafe-system-one", "baseUrl":override_base}
+                ]
+            }});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let find = |id| {
+                catalogue
+                    .0
+                    .iter()
+                    .find(|entry| entry.provider == "typesafe" && entry.model.id == id)
+                    .unwrap()
+            };
+            assert_eq!(find("same").api_key.as_deref(), Some("provider-key"));
+            assert!(find("override").api_key.is_none());
+            let keys = Keys::parse(&json!({}));
+            let env = |name: &str| (name == "TYPESAFE_API_KEY").then(|| "ambient-key".to_owned());
+            assert_eq!(
+                find("same")
+                    .credential_with_env(&keys, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("provider-key")
+            );
+            assert_eq!(
+                find("override")
+                    .credential_with_env(&keys, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                (override_base == "https://api.typesafe.ai/v1").then_some("ambient-key")
+            );
+        }
+    }
+
+    #[test]
+    fn configured_key_uses_unambiguous_model_base_when_provider_has_none() {
+        let model = |id, base| json!({"type":"classifier", "id":id, "api":"typesafe-system-one", "baseUrl":base});
+        for (models, expected) in [
+            (vec![model("one", "https://proxy.example/v1")], true),
+            (
+                vec![
+                    model("one", "https://proxy.example/v1"),
+                    model("two", "https://proxy.example/v1/"),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    model("one", "https://proxy.example/v1"),
+                    model("two", "https://other.example/v1"),
+                ],
+                false,
+            ),
+        ] {
+            let config = json!({"relay":{"apiKey":"provider-key", "models":models}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entries: Vec<_> = catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "relay")
+                .collect();
+            assert!(!entries.is_empty());
+            for entry in entries {
+                assert_eq!(entry.api_key.as_deref(), expected.then_some("provider-key"));
+            }
+        }
+    }
 
     #[test]
     fn model_operations_use_distinct_routes_for_equal_model_ids() {

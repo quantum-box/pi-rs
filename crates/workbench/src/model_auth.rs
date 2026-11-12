@@ -14,6 +14,7 @@ pub(super) enum Credential {
     Bearer(String),
     Command(String),
     StoredCommand(String),
+    Invalid,
     ChatGpt,
 }
 
@@ -24,11 +25,18 @@ static STORED_COMMANDS: LazyLock<Mutex<BTreeMap<String, CachedCommand>>> =
 
 impl Credential {
     pub fn configured(value: &str) -> Option<Self> {
+        Self::configured_with_env(value, None)
+    }
+
+    fn configured_with_env(
+        value: &str,
+        env: Option<&serde_json::Map<String, Value>>,
+    ) -> Option<Self> {
         if let Some(command) = value.strip_prefix('!') {
             return (!command.trim().is_empty() && value.len() <= 16 * 1024)
                 .then(|| Self::Command(value.into()));
         }
-        super::model_profiles::expand_value(value)
+        super::model_profiles::expand_value_with_env(value, env)
             .filter(|value| !value.trim().is_empty())
             .map(Self::Literal)
     }
@@ -36,7 +44,7 @@ impl Credential {
     pub fn literal(&self) -> Option<&str> {
         match self {
             Self::Literal(value) | Self::Bearer(value) => Some(value),
-            Self::Command(_) | Self::StoredCommand(_) | Self::ChatGpt => None,
+            Self::Command(_) | Self::StoredCommand(_) | Self::Invalid | Self::ChatGpt => None,
         }
     }
 
@@ -49,12 +57,13 @@ impl Credential {
     }
 
     pub fn requires_resolution(&self) -> bool {
-        self.is_command() || matches!(self, Self::ChatGpt)
+        self.is_command() || matches!(self, Self::ChatGpt | Self::Invalid)
     }
 
     pub async fn resolve(&self) -> Result<String> {
         let value = match self {
             Self::Literal(value) | Self::Bearer(value) => return Ok(value.clone()),
+            Self::Invalid => return Err(Error::Config("Invalid model credential".into())),
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
@@ -95,7 +104,8 @@ struct SavedKey {
     endpoint: Option<String>,
     official_routes: bool,
     oauth: bool,
-    key: Credential,
+    key: Option<Credential>,
+    env: Option<serde_json::Map<String, Value>>,
 }
 
 impl Keys {
@@ -119,26 +129,34 @@ impl Keys {
                         entry["credential"].clone(),
                     )
                     .ok()?;
-                    Credential::ChatGpt
+                    Some(Credential::ChatGpt)
                 } else if oauth {
                     let access = entry["access"].as_str()?;
-                    valid_key(access).then(|| Credential::Literal(access.into()))?
+                    Some(valid_key(access).then(|| Credential::Literal(access.into()))?)
                 } else {
                     if entry["type"] != "api_key" {
                         return None;
                     }
-                    let value = entry["key"].as_str()?;
-                    if entry["literal"] == true {
-                        valid_key(value).then(|| Credential::Literal(value.into()))?
-                    } else {
-                        match Credential::configured(value)? {
-                            Credential::Command(command) => Credential::StoredCommand(command),
-                            Credential::Literal(value) if valid_key(&value) => {
-                                Credential::Literal(value)
+                    entry.get("key").map(|key| {
+                        key.as_str().map_or(Credential::Invalid, |value| {
+                            if entry["literal"] == true {
+                                return if valid_key(value) {
+                                    Credential::Literal(value.into())
+                                } else {
+                                    Credential::Invalid
+                                };
                             }
-                            _ => return None,
-                        }
-                    }
+                            match Credential::configured_with_env(value, entry["env"].as_object()) {
+                                Some(Credential::Command(command)) => {
+                                    Credential::StoredCommand(command)
+                                }
+                                Some(Credential::Literal(value)) if valid_key(&value) => {
+                                    Credential::Literal(value)
+                                }
+                                _ => Credential::Invalid,
+                            }
+                        })
+                    })
                 };
                 let endpoint = match entry.get("endpoint") {
                     None => Provider::named(name)
@@ -162,6 +180,7 @@ impl Keys {
                         official_routes: oauth || entry.get("endpoint").is_none(),
                         oauth,
                         key,
+                        env: entry["env"].as_object().cloned(),
                     },
                 ))
             })
@@ -177,6 +196,10 @@ impl Keys {
     }
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<&Credential> {
+        self.entry_for(provider, endpoint)?.key.as_ref()
+    }
+
+    fn entry_for(&self, provider: &Provider, endpoint: &str) -> Option<&SavedKey> {
         let entry = self.entries.get(provider.id())?;
         let legacy_radius = provider == &Provider::Radius
             && endpoint == super::radius_auth::DEFAULT_MODEL_ENDPOINT
@@ -185,7 +208,7 @@ impl Keys {
             && super::builtin_chat::find(provider.id())
                 .is_some_and(|builtin| builtin.is_official_endpoint(endpoint));
         (entry.endpoint.as_deref() == Some(endpoint) || legacy_radius || builtin_route)
-            .then_some(&entry.key)
+            .then_some(entry)
     }
 
     pub fn custom_credential(
@@ -195,8 +218,25 @@ impl Keys {
         profiles: &super::model_profiles::Profiles,
     ) -> Option<&Credential> {
         let entry = self.entries.get(provider.id())?;
-        (entry.endpoint.is_none() && profiles.has_endpoint(provider, endpoint))
-            .then_some(&entry.key)
+        (entry.endpoint.is_none() && profiles.has_provider_endpoint(provider, endpoint))
+            .then_some(entry.key.as_ref())
+            .flatten()
+    }
+
+    pub fn environment(
+        &self,
+        provider: &Provider,
+        endpoint: &str,
+        profiles: &super::model_profiles::Profiles,
+    ) -> Option<&serde_json::Map<String, Value>> {
+        self.entry_for(provider, endpoint)
+            .or_else(|| {
+                self.entries.get(provider.id()).filter(|entry| {
+                    entry.endpoint.is_none() && profiles.has_provider_endpoint(provider, endpoint)
+                })
+            })?
+            .env
+            .as_ref()
     }
 
     pub fn oauth(&self, provider: &Provider, endpoint: &str) -> bool {
@@ -213,14 +253,36 @@ impl Keys {
         endpoint: &str,
         official: bool,
     ) -> Option<&Credential> {
+        self.operation_entry(provider, endpoint, official)?
+            .key
+            .as_ref()
+    }
+
+    pub fn operation_environment(
+        &self,
+        provider: &str,
+        endpoint: &str,
+        official: bool,
+    ) -> Option<&serde_json::Map<String, Value>> {
+        self.operation_entry(provider, endpoint, official)?
+            .env
+            .as_ref()
+    }
+
+    fn operation_entry(&self, provider: &str, endpoint: &str, official: bool) -> Option<&SavedKey> {
         let entry = self.entries.get(provider)?;
-        (entry.endpoint.as_deref() == Some(endpoint)
+        (entry
+            .endpoint
+            .as_deref()
+            .is_some_and(|saved| same_operation_endpoint(saved, endpoint))
             || (official
-                && ((entry.endpoint.is_some()
-                    && super::operation_models::official_base(provider)
-                        == entry.endpoint.as_deref())
+                && ((entry
+                    .endpoint
+                    .as_deref()
+                    .zip(super::operation_models::official_base(provider))
+                    .is_some_and(|(saved, base)| same_operation_endpoint(saved, base)))
                     || (entry.official_routes && super::builtin_chat::find(provider).is_some()))))
-        .then_some(&entry.key)
+        .then_some(entry)
     }
 
     #[cfg(test)]
@@ -231,6 +293,25 @@ impl Keys {
     pub fn has(&self, provider: &Provider) -> bool {
         self.entries.contains_key(provider.id())
     }
+}
+
+fn same_operation_endpoint(left: &str, right: &str) -> bool {
+    fn normalize(value: &str) -> Option<reqwest::Url> {
+        let mut url = reqwest::Url::parse(value).ok()?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        let path = url.path().trim_end_matches('/').to_owned();
+        url.set_path(&path);
+        Some(url)
+    }
+    normalize(left)
+        .zip(normalize(right))
+        .is_some_and(|(a, b)| a == b)
 }
 
 pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()> {
@@ -285,6 +366,84 @@ pub(super) fn valid_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_operation_endpoint_ignores_trailing_slashes_only() {
+        for (saved, requested) in [
+            (
+                "https://proxy.example/v1/systemone/",
+                "https://proxy.example/v1/systemone",
+            ),
+            (
+                "https://proxy.example/v1/systemone",
+                "https://proxy.example/v1/systemone/",
+            ),
+        ] {
+            let keys = Keys::parse(&json!({"proxy":{
+                "type":"api_key", "key":"stored-key", "endpoint":saved,
+                "env":{"HEADER":"secret"}
+            }}));
+            assert_eq!(
+                keys.operation_credential("proxy", requested, false)
+                    .and_then(Credential::literal),
+                Some("stored-key")
+            );
+            assert_eq!(
+                keys.operation_environment("proxy", requested, false)
+                    .unwrap()["HEADER"],
+                "secret"
+            );
+            for other in [
+                "https://other.example/v1/systemone",
+                "https://proxy.example:8443/v1/systemone",
+                "http://proxy.example/v1/systemone",
+                "https://proxy.example/v1/other",
+                "https://proxy.example/v1/systemone?x=1",
+                "https://proxy.example/v1/systemone#fragment",
+                "https://user@proxy.example/v1/systemone",
+            ] {
+                assert!(keys.operation_credential("proxy", other, false).is_none());
+                assert!(keys.operation_environment("proxy", other, false).is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_api_key_interpolates_credential_environment() {
+        let keys = Keys::parse(&json!({
+            "anthropic": {"type":"api_key", "key":"prefix-${TOKEN}-$$", "env":{"TOKEN":"credential-secret"}},
+            "typesafe": {"type":"api_key", "key":"$TOKEN", "env":{"TOKEN":"operation-secret"}},
+            "openai": {"type":"api_key", "key":"$TOKEN", "literal":true, "env":{"TOKEN":"ignored"}}
+        }));
+        let key = keys
+            .credential(&Provider::Anthropic, Provider::Anthropic.default_endpoint())
+            .unwrap();
+        assert_eq!(key.resolve().await.unwrap(), "prefix-credential-secret-$");
+        let key = keys
+            .operation_credential("typesafe", "https://api.typesafe.ai/v1/systemone", true)
+            .unwrap();
+        assert_eq!(key.resolve().await.unwrap(), "operation-secret");
+        let openai = Provider::named("openai").unwrap();
+        assert_eq!(
+            keys.credential(&openai, openai.default_endpoint())
+                .unwrap()
+                .resolve()
+                .await
+                .unwrap(),
+            "$TOKEN"
+        );
+        let local = json!({"PATH":"credential-path"});
+        assert_eq!(
+            super::super::model_profiles::expand_value_with_env("$PATH", local.as_object())
+                .as_deref(),
+            Some("credential-path")
+        );
+        let empty = json!({"PATH":""});
+        assert_eq!(
+            super::super::model_profiles::expand_value_with_env("$PATH", empty.as_object()),
+            std::env::var("PATH").ok().filter(|v| !v.is_empty())
+        );
+    }
 
     #[test]
     fn chatgpt_oauth_credentials_are_bound_to_the_official_endpoint() {
