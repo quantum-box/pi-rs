@@ -1531,3 +1531,125 @@ fn save_default_model_persists_provider_and_extends_scope() {
     assert_eq!(state["data"]["model"]["provider"], "ollama");
     assert_eq!(state["data"]["model"]["id"], "second");
 }
+
+#[test]
+fn exit_during_shell_restores_terminal_and_drains_late_key_release() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 30,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    assert_eq!(
+        unsafe { libc::tcgetattr(slave.as_raw_fd(), original.as_mut_ptr()) },
+        0
+    );
+    let original = unsafe { original.assume_init() };
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--offline",
+                "--model",
+                "fixture",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master
+        .write_all(b"!echo shell-$(printf running); sleep 10\r")
+        .unwrap();
+    output_until(&mut master, |text| text.contains("shell-running"));
+    master.write_all(b"\x03\x03").unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[<u"));
+    master.write_all(b"\x1b[99;5:3u").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut state = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), state.as_mut_ptr()) },
+            0
+        );
+        if unsafe { state.assume_init() }.c_lflag & libc::ICANON == original.c_lflag & libc::ICANON
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal remained in raw mode during worker shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    // Canonical input is released only after a newline, so complete the line
+    // to reveal any escape bytes that the shutdown left for the parent shell.
+    master.write_all(b"\n").unwrap();
+    let mut remaining = [0; 64];
+    let mut slave = slave;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match slave.read(&mut remaining) {
+            Ok(count) if count > 0 => {
+                assert_eq!(
+                    &remaining[..count],
+                    b"\n",
+                    "late key release leaked to terminal input"
+                );
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            other => panic!("terminal input read failed: {other:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "canonical newline was not delivered"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            assert!(status.success(), "interactive process failed: {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "worker shutdown did not finish");
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

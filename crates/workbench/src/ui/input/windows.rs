@@ -36,6 +36,14 @@ impl Reader {
         })
     }
 
+    pub fn drain(&mut self, max: Duration, idle: Duration) -> io::Result<()> {
+        super::drain_console_records(max, idle, wait_for_console, || {
+            // Discard raw records rather than decoding them: partial VT replies,
+            // key releases, and ignored records all extend the quiet period.
+            self.console.read_single_input_event().map(|_| ())
+        })
+    }
+
     pub fn next(&mut self, timeout: Duration) -> io::Result<Option<InputEvent>> {
         let started = Instant::now();
         loop {
@@ -52,21 +60,11 @@ impl Reader {
             {
                 remaining = remaining.min(escape_delay().saturating_sub(started.elapsed()));
             }
-            let handle = Handle::current_in_handle()?;
-            // Round up sub-millisecond waits and keep INFINITE reserved.
-            let millis =
-                remaining.as_millis() + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
-            let status = unsafe {
-                WaitForSingleObject(*handle, millis.min(u128::from(u32::MAX - 1)) as u32)
-            };
-            match status {
-                WAIT_OBJECT_0 => self.read_record()?,
-                WAIT_TIMEOUT => {
-                    self.decoder.flush_escape();
-                    return Ok(self.decoder.next());
-                }
-                WAIT_FAILED => return Err(io::Error::last_os_error()),
-                _ => return Err(io::Error::other("unexpected console wait result")),
+            if wait_for_console(remaining)? {
+                self.read_record()?;
+            } else {
+                self.decoder.flush_escape();
+                return Ok(self.decoder.next());
             }
             if started.elapsed() >= timeout {
                 self.decoder.flush_escape();
@@ -109,6 +107,18 @@ impl Reader {
             self.decoder.events.push_back(InputEvent::Event(event));
         }
         Ok(())
+    }
+}
+
+fn wait_for_console(timeout: Duration) -> io::Result<bool> {
+    let handle = Handle::current_in_handle()?;
+    // Round up sub-millisecond waits and keep INFINITE reserved.
+    let millis = timeout.as_millis() + u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+    match unsafe { WaitForSingleObject(*handle, millis.min(u128::from(u32::MAX - 1)) as u32) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        _ => Err(io::Error::other("unexpected console wait result")),
     }
 }
 
