@@ -356,23 +356,35 @@ impl Entry {
     }
 
     fn credential(&self, keys: &Keys) -> Option<Credential> {
+        self.credential_with_env(keys, |name| std::env::var(name).ok())
+    }
+
+    fn credential_with_env(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Credential> {
         let official = official_base(&self.provider)
             .and_then(|base| endpoints(base, self.api.route()).ok())
             .is_some_and(|(_, endpoint)| endpoint == self.endpoint);
-        keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
-            .cloned()
-            .or_else(|| {
-                let key = match (self.provider.as_str(), official) {
-                    ("typesafe", true) => "TYPESAFE_API_KEY",
-                    ("openrouter", true) => "OPENROUTER_API_KEY",
-                    _ => return None,
-                };
-                std::env::var(key)
-                    .ok()
-                    .filter(|key| super::model_auth::valid_key(key))
-                    .map(Credential::Literal)
-            })
-            .or_else(|| self.api_key.as_deref().and_then(Credential::configured))
+        if let Some(key) =
+            keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
+        {
+            return Some(key.clone());
+        }
+        if let Some(key) = self.api_key.as_deref().filter(|key| !key.is_empty()) {
+            return Credential::configured(key);
+        }
+        {
+            let key = match (self.provider.as_str(), official) {
+                ("typesafe", true) => "TYPESAFE_API_KEY",
+                ("openrouter", true) => "OPENROUTER_API_KEY",
+                _ => return None,
+            };
+            env(key)
+                .filter(|key| super::model_auth::valid_key(key))
+                .map(Credential::Literal)
+        }
     }
 
     fn accepts_images(&self) -> bool {
@@ -714,6 +726,53 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_credentials_prefer_stored_then_configured_then_environment() {
+        for (provider, variable) in [
+            ("typesafe", "TYPESAFE_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+        ] {
+            let config = json!({provider: {"apiKey":"configured-key"}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider)
+                .unwrap();
+            let env = |name: &str| (name == variable).then(|| "environment-key".to_owned());
+            let empty = Keys::parse(&json!({}));
+            assert_eq!(
+                entry
+                    .credential_with_env(&empty, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("configured-key")
+            );
+            let saved = Keys::parse(&json!({provider: {"type":"api_key", "key":"stored-key"}}));
+            assert_eq!(
+                entry
+                    .credential_with_env(&saved, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("stored-key")
+            );
+            let mut no_config = entry.clone();
+            no_config.api_key = None;
+            assert_eq!(
+                no_config
+                    .credential_with_env(&empty, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("environment-key")
+            );
+            no_config.endpoint = Url::parse("https://proxy.example/v1/systemone").unwrap();
+            assert!(no_config.credential_with_env(&empty, env).is_none());
+            let mut invalid = entry.clone();
+            invalid.api_key = Some("${PI_RS_MISSING_OPERATION_KEY_TEST_8E43B}".into());
+            assert!(invalid.credential_with_env(&empty, env).is_none());
+        }
+    }
 
     #[test]
     fn model_operations_use_distinct_routes_for_equal_model_ids() {
