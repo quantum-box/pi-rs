@@ -827,66 +827,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         .get("pi")
         .filter(|value| value.is_object())
         .unwrap_or(&manifest);
-    if installed_binaries.is_empty() {
-        installed_binaries = executable_files(&root.join("extensions"))?;
-    }
-    let extensions = if let Some(names) = pi.get("extensions") {
-        let names: Vec<String> = serde_json::from_value(names.clone())?;
-        for name in &names {
-            let path = root.join(name);
-            if path.is_file() && !installed_binaries.contains(&path) {
-                installed_binaries.push(path);
-            }
-        }
-        installed_binaries
-            .into_iter()
-            .filter(|path| {
-                names.iter().any(|name| {
-                    path.file_stem().is_some_and(|file| file == name.as_str())
-                        || manifest_selected(path, &root, std::slice::from_ref(name))
-                })
-            })
-            .collect()
-    } else if !installed_binaries.is_empty() {
-        installed_binaries
-    } else {
-        executable_files(&root.join("extensions"))?
-    };
-    let mut resources = PackageResources {
-        extensions,
-        ..PackageResources::default()
-    };
-    for (name, target, suffix) in [
-        ("skills", &mut resources.skills, "SKILL.md"),
-        ("prompts", &mut resources.prompts, ".md"),
-        ("themes", &mut resources.themes, ".json"),
-    ] {
-        let patterns = pi
-            .get(name)
-            .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
-            .transpose()?
-            .unwrap_or_else(|| vec![name.into()]);
-        validate_patterns(&patterns)?;
-        for entry in ignore::WalkBuilder::new(&root)
-            .hidden(false)
-            .git_ignore(false)
-            .filter_entry(|entry| {
-                !matches!(
-                    entry.file_name().to_str(),
-                    Some(".git" | "target" | "node_modules")
-                )
-            })
-            .build()
-            .flatten()
-        {
-            if entry.file_type().is_some_and(|kind| kind.is_file())
-                && entry.file_name().to_string_lossy().ends_with(suffix)
-                && manifest_selected(entry.path(), &root, &patterns)
-            {
-                target.push(entry.into_path());
-            }
-        }
-    }
+    let resources = collect_package_resources(&root, pi, installed_binaries)?;
     for executable in &resources.extensions {
         pi_rs_extensions::ExecutableExtension::load(executable.to_string_lossy().as_ref())?;
     }
@@ -909,6 +850,85 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         Ok(())
     })?;
     Ok(package)
+}
+
+fn collect_package_resources(
+    root: &Path,
+    pi: &Value,
+    mut installed_binaries: Vec<PathBuf>,
+) -> Result<PackageResources> {
+    let explicit = ["extensions", "skills", "prompts", "themes"]
+        .iter()
+        .any(|name| pi.get(name).is_some());
+    if installed_binaries.is_empty() {
+        installed_binaries = executable_files(&root.join("extensions"))?;
+    }
+    let extensions = if let Some(names) = pi.get("extensions") {
+        let names: Vec<String> = serde_json::from_value(names.clone())?;
+        for name in &names {
+            let path = root.join(name);
+            if path.is_file() && !installed_binaries.contains(&path) {
+                installed_binaries.push(path);
+            }
+        }
+        installed_binaries
+            .into_iter()
+            .filter(|path| {
+                names.iter().any(|name| {
+                    path.file_stem().is_some_and(|file| file == name.as_str())
+                        || manifest_selected(path, &root, std::slice::from_ref(name))
+                })
+            })
+            .collect()
+    } else if explicit {
+        Vec::new()
+    } else if !installed_binaries.is_empty() {
+        installed_binaries
+    } else {
+        executable_files(&root.join("extensions"))?
+    };
+    let mut resources = PackageResources {
+        extensions,
+        ..PackageResources::default()
+    };
+    for (name, target, suffix) in [
+        ("skills", &mut resources.skills, "SKILL.md"),
+        ("prompts", &mut resources.prompts, ".md"),
+        ("themes", &mut resources.themes, ".json"),
+    ] {
+        let patterns = pi
+            .get(name)
+            .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+            .transpose()?
+            .unwrap_or_else(|| {
+                if explicit {
+                    Vec::new()
+                } else {
+                    vec![name.into()]
+                }
+            });
+        validate_patterns(&patterns)?;
+        for entry in ignore::WalkBuilder::new(&root)
+            .hidden(false)
+            .git_ignore(false)
+            .filter_entry(|entry| {
+                !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "target" | "node_modules")
+                )
+            })
+            .build()
+            .flatten()
+        {
+            if entry.file_type().is_some_and(|kind| kind.is_file())
+                && entry.file_name().to_string_lossy().ends_with(suffix)
+                && manifest_selected(entry.path(), &root, &patterns)
+            {
+                target.push(entry.into_path());
+            }
+        }
+    }
+    Ok(resources)
 }
 fn snapshot_registry_source(source: &Path, cache: &Path) -> Result<PathBuf> {
     use std::io::{Read, Write};
@@ -1117,6 +1137,39 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_manifest_excludes_undeclared_resource_types() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for name in ["prompts", "themes", "skills/demo"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        for name in [
+            "prompts/example.md",
+            "themes/example.json",
+            "skills/demo/SKILL.md",
+        ] {
+            std::fs::write(root.join(name), "fixture").unwrap();
+        }
+        let binary = root.join("native-extension");
+        std::fs::write(&binary, "fixture").unwrap();
+        let discover =
+            |manifest| collect_package_resources(root, &manifest, vec![binary.clone()]).unwrap();
+
+        let explicit = discover(json!({"prompts": ["prompts"]}));
+        assert_eq!(explicit.prompts, vec![root.join("prompts/example.md")]);
+        assert!(explicit.extensions.is_empty());
+        assert!(explicit.skills.is_empty());
+        assert!(explicit.themes.is_empty());
+
+        let empty = discover(json!({"prompts": []}));
+        assert!(empty.prompts.is_empty() && empty.skills.is_empty() && empty.extensions.is_empty());
+        let metadata_only = discover(json!({"changelogPath": "NEWS.md"}));
+        assert_eq!(metadata_only.extensions, vec![binary]);
+        assert_eq!(metadata_only.skills.len(), 1);
+        assert_eq!(metadata_only.prompts.len(), 1);
+        assert_eq!(metadata_only.themes.len(), 1);
+    }
     #[test]
     fn update_reconciles_shadowed_revisions_without_transient_sources() {
         let root = tempfile::tempdir().unwrap();
