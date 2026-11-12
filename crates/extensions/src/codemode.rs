@@ -168,31 +168,55 @@ impl Tool for ScriptTool {
             }
             .map_err(|_| "Codemode worker pool closed")
         };
-        let _permit = tokio::select! {
+        let permit = tokio::select! {
             _ = context.cancellation.cancelled() => return Outcome::Failed("Script cancelled while waiting for a worker".into()).into(),
             permit = acquire => match permit {
                 Ok(permit) => permit,
                 Err(error) => return Outcome::Failed(error.into()).into(),
             }
         };
-        let remaining = match options.timeout {
-            Some(timeout) => match timeout
-                .checked_sub(started.elapsed())
-                .filter(|time| !time.is_zero())
-            {
-                Some(remaining) => Some(remaining),
-                None => {
-                    return Outcome::Failed("Script deadline elapsed before execution".into())
-                        .into();
-                }
-            },
-            None => None,
-        };
         let store = previous
             .map(|state| state.data.clone())
             .unwrap_or_else(|| json!({}));
         let sink = Arc::new(Mutex::new(Output::default()));
-        let result = evaluate(source, store, host, context, remaining, sink.clone()).await;
+        let worker_sink = sink.clone();
+        let worker_cancel = context.cancellation.child_token();
+        // The caller may drop this future on timeout or cancellation. Keep the
+        // permit in the worker until QuickJS has actually stopped, and wake its
+        // interrupt handler even when nobody remains to await the join handle.
+        let _cancel_on_drop = worker_cancel.clone().drop_guard();
+        let worker_context = ToolContext {
+            operation_id: context.operation_id,
+            cancellation: worker_cancel,
+        };
+        let source = source.to_owned();
+        let handle = tokio::runtime::Handle::current();
+        let timeout = options.timeout;
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let remaining = match timeout {
+                Some(timeout) => {
+                    match timeout
+                        .checked_sub(started.elapsed())
+                        .filter(|time| !time.is_zero())
+                    {
+                        Some(remaining) => Some(remaining),
+                        None => return Err("Script deadline elapsed before execution".into()),
+                    }
+                }
+                None => None,
+            };
+            handle.block_on(evaluate(
+                &source,
+                store,
+                host,
+                worker_context,
+                remaining,
+                worker_sink,
+            ))
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("Codemode worker failed: {error}")));
         let (success, changed, store, error) = match result {
             Ok(result) => (result.ok, result.changed, result.store, result.error),
             Err(error) => (false, false, json!({}), Some(error)),
@@ -396,7 +420,11 @@ async fn evaluate(
                 None => operation.await,
             }
         } => result,
-    }?;
+    };
+    if context.cancellation.is_cancelled() {
+        return Err("Script cancelled".into());
+    }
+    let result = result?;
     serde_json::from_str(&result).map_err(|error| error.to_string())
 }
 fn install_globals(
@@ -930,6 +958,110 @@ mod tests {
         .unwrap();
         task.await.unwrap();
         assert!(matches!(reply.outcome, Outcome::Failed(message) if message.contains("cancelled")));
+    }
+    struct StartedHost(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl ToolHost for StartedHost {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "started".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }]
+        }
+        async fn call(&self, _: &str, _: Value) -> Outcome {
+            self.0.notify_one();
+            Outcome::Succeeded("ready".into())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_cancels_unbounded_cpu_loop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (stop_watchdog, watchdog_stopped) = std::sync::mpsc::channel::<()>();
+        let watchdog_fired = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let cancellation = cancellation.clone();
+            let watchdog_fired = watchdog_fired.clone();
+            std::thread::spawn(move || {
+                if watchdog_stopped
+                    .recv_timeout(Duration::from_secs(3))
+                    .is_err()
+                {
+                    watchdog_fired.store(true, Ordering::SeqCst);
+                    cancellation.cancel();
+                }
+            })
+        };
+        let script_cancel = cancellation.clone();
+        let host = Arc::new(StartedHost(started.clone()));
+        let script = tokio::spawn(async move {
+            ScriptTool { timeout: None }.invoke_transaction(
+                json!({"code":"await tools.started({}); store('uncommitted', true); while (true) {}"}),
+                ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: script_cancel },
+                None, host,
+            ).await
+        });
+        started.notified().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation.cancel();
+        let reply = tokio::time::timeout(Duration::from_secs(1), script)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = stop_watchdog.send(());
+        watchdog.join().unwrap();
+        assert!(
+            !watchdog_fired.load(Ordering::SeqCst),
+            "current-thread executor was blocked"
+        );
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message.contains("cancelled")));
+        assert!(reply.state.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_invocation_stops_busy_worker() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let host = Arc::new(StartedHost(started.clone()));
+        let weak_host = Arc::downgrade(&host);
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let watchdog_cancel = cancellation.clone();
+        let (stop_watchdog, watchdog_stopped) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if watchdog_stopped
+                .recv_timeout(Duration::from_secs(3))
+                .is_err()
+            {
+                watchdog_cancel.cancel();
+            }
+        });
+        let script = tokio::spawn(async move {
+            ScriptTool { timeout: None }
+                .invoke_transaction(
+                    json!({"code":"await tools.started({}); while (true) {}"}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation,
+                    },
+                    None,
+                    host,
+                )
+                .await
+        });
+        started.notified().await;
+        script.abort();
+        let _ = script.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak_host.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker kept running after invocation was dropped");
+        let _ = stop_watchdog.send(());
+        watchdog.join().unwrap();
     }
     #[tokio::test]
     async fn explicit_host_deadline_interrupts_busy_script() {
