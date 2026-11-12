@@ -963,8 +963,12 @@ impl Agent<'_> {
                 _ => None,
             })
             .unwrap_or((None, 0));
-        let safe = request_id.is_some_and(|id| branch.iter().any(|record| matches!(&record.event,
-            Event::ModelRequested { request_id: Some(request_id), context_transformed: Some(false), .. } if *request_id == id)));
+        let configuration = request_configuration_hash(request);
+        let safe = configuration.as_ref().is_some_and(|configuration| {
+            request_id.is_some_and(|id| branch.iter().any(|record| matches!(&record.event,
+                Event::ModelRequested { request_id: Some(request_id), context_transformed: Some(false), context_configuration_sha256: Some(previous), .. }
+                    if *request_id == id && previous == configuration)))
+        });
         if !safe {
             return self.model.estimate_request_tokens(request);
         }
@@ -1022,6 +1026,7 @@ impl Agent<'_> {
                 context_head: Some(context_head),
                 context_sha256: Some(context_sha256),
                 context_transformed: Some(transformed),
+                context_configuration_sha256: request_configuration_hash(&request),
             },
             observer,
         )?;
@@ -3145,6 +3150,22 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
         }
     }
     ensure_settled(session.operations())
+}
+
+// Fingerprint only stable request configuration, excluding conversation and
+// output allowance, which legitimately change between turns.
+fn request_configuration_hash(request: &ModelRequest) -> Option<String> {
+    let systems: Vec<_> = request
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::System { content } => Some(content),
+            _ => None,
+        })
+        .collect();
+    serde_json::to_vec(&(&request.model, systems, &request.tools))
+        .ok()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
 }
 
 #[cfg(test)]

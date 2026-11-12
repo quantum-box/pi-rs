@@ -2329,6 +2329,209 @@ async fn measured_output_covers_replayed_reasoning_without_double_counting() {
 }
 
 #[tokio::test]
+async fn measured_baseline_is_invalidated_by_runtime_catalog_refresh() {
+    struct DynamicTool {
+        description: String,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for DynamicTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: self.description.clone(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Outcome::Succeeded("ok".into())
+        }
+    }
+    struct DynamicExtension {
+        description: String,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Extension for DynamicExtension {
+        fn id(&self) -> &str {
+            "dynamic"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(DynamicTool {
+                description: self.description.clone(),
+                calls: self.calls.clone(),
+            })]
+        }
+    }
+    struct Refresh {
+        calls: Arc<AtomicUsize>,
+        target: String,
+        schema: bool,
+        done: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl RegistryRefresher for Refresh {
+        async fn refresh(&self, current: &Registry) -> Result<Option<RegistryUpdate>> {
+            if self.calls.load(Ordering::SeqCst) == 0 || self.done.swap(true, Ordering::SeqCst) {
+                return Ok(None);
+            }
+            let mut registry = current.clone();
+            if self.schema {
+                registry.replace(Arc::new(DynamicExtension {
+                    description: self.target.clone(),
+                    calls: self.calls.clone(),
+                }))?;
+            }
+            Ok(Some(RegistryUpdate {
+                registry,
+                system_prompt: (!self.schema).then(|| self.target.clone()),
+            }))
+        }
+    }
+    struct DiscoverAfterTool {
+        script: Script,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Model for DiscoverAfterTool {
+        async fn context_window(&self, _: &str) -> Option<u32> {
+            (self.calls.load(Ordering::SeqCst) > 0).then_some(1000)
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.script.stream(request).await
+        }
+    }
+    for schema in [false, true] {
+        for grows in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (initial, target) = if grows {
+                ("short".to_owned(), "x".repeat(8000))
+            } else {
+                ("x".repeat(8000), "short".to_owned())
+            };
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(DynamicExtension {
+                    description: if schema {
+                        initial.clone()
+                    } else {
+                        "short".into()
+                    },
+                    calls: calls.clone(),
+                }))
+                .unwrap();
+            registry.set_refresher(Arc::new(Refresh {
+                calls: calls.clone(),
+                target,
+                schema,
+                done: std::sync::atomic::AtomicBool::new(false),
+            }));
+            let mut first = tool_reply(&["{}"]);
+            if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+                *usage = Some(Usage {
+                    input_tokens: if grows { 20 } else { 3000 },
+                    output_tokens: 8,
+                });
+            }
+            let model = DiscoverAfterTool {
+                script: Script::new(vec![first, answer("done")]),
+                calls,
+            };
+            let mut harness = agent(&model, &registry);
+            harness.system_prompt = if schema { "short" } else { &initial };
+            harness.limits.output_tokens_per_request = 64;
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            session.auto_compaction_control().set_enabled(false);
+            let (_, mut inputs) = mpsc::channel::<String>(1);
+            let result = harness
+                .run(
+                    &mut session,
+                    Some("go".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut ignore,
+                )
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                !grows,
+                "schema={schema}, grows={grows}, result={result:?}"
+            );
+            assert_eq!(
+                model.script.requests.lock().unwrap().len(),
+                if grows { 1 } else { 2 }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn measured_baseline_requires_matching_configuration_after_reopen() {
+    for (initial_large, change) in [(false, true), (true, true), (false, false)] {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("configuration.jsonl");
+        let initial = if initial_large {
+            "x".repeat(8000)
+        } else {
+            "short".into()
+        };
+        let target = if change {
+            if initial_large {
+                "short".into()
+            } else {
+                "x".repeat(8000)
+            }
+        } else {
+            initial.clone()
+        };
+        let mut first = answer("reply");
+        if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+            *usage = Some(Usage {
+                input_tokens: if initial_large || !change { 3000 } else { 20 },
+                output_tokens: 8,
+            });
+        }
+        let model = Script::new(vec![first, answer("done")]);
+        let registry = Registry::default();
+        let mut harness = agent(&model, &registry);
+        harness.system_prompt = &initial;
+        harness.limits.output_tokens_per_request = 64;
+        let mut session = Session::open(&path).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        harness
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        harness.system_prompt = &target;
+        harness.limits.context_window = Some(1000);
+        let result = harness
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            initial_large && change,
+            "initial_large={initial_large}, change={change}, result={result:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn measured_context_triggers_reserve_even_when_text_estimate_is_small() {
     let mut first = answer("short");
     if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {

@@ -253,6 +253,9 @@ pub enum Event {
         /// Whether request hooks changed model-visible input (unknown in older journals).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_transformed: Option<bool>,
+        /// Fingerprint of the effective model, system messages and tool schemas.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_configuration_sha256: Option<String>,
     },
     ModelFinished {
         request_id: Uuid,
