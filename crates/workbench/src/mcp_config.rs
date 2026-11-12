@@ -237,7 +237,7 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
             }) as futures_util::future::BoxFuture<'static, Result<Option<String>>>
         }) as TokenResolver
     });
-    McpExtension::connect_with_http_options(
+    McpExtension::connect_with_proxy_hosts(
         name,
         server,
         &args.workspace,

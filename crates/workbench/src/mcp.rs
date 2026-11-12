@@ -290,7 +290,7 @@ struct Connection {
     config: ServerConfig,
     workspace: PathBuf,
     provider_token: Option<TokenResolver>,
-    http_options: Option<HttpOptions>,
+    http_options: Option<HttpOptionsWithProxyHosts>,
     closed: AtomicBool,
 }
 impl Connection {
@@ -312,7 +312,7 @@ impl Connection {
             return Err(Error::Config("MCP connection is closed".into()));
         }
         if service.is_closed() || service.peer().is_transport_closed() {
-            let replacement = McpExtension::connect_with_http_options(
+            let replacement = McpExtension::connect_with_proxy_hosts(
                 &self.name,
                 &self.config,
                 &self.workspace,
@@ -344,7 +344,7 @@ impl Connection {
                 "MCP connection changed during reauthorization".into(),
             ));
         }
-        let replacement = McpExtension::connect_with_http_options(
+        let replacement = McpExtension::connect_with_proxy_hosts(
             &self.name,
             &self.config,
             &self.workspace,
@@ -427,8 +427,21 @@ pub struct McpExtension {
 #[derive(Clone)]
 pub struct HttpOptions {
     pub proxies: Vec<reqwest_mcp::Proxy>,
-    pub proxy_hosts: Vec<String>,
     pub idle_timeout: Option<Duration>,
+}
+
+/// HTTP settings with proxy host names for OAuth DNS validation.
+#[derive(Clone)]
+pub struct HttpOptionsWithProxyHosts {
+    pub http: HttpOptions,
+    pub proxy_hosts: Vec<String>,
+}
+
+impl std::ops::Deref for HttpOptionsWithProxyHosts {
+    type Target = HttpOptions;
+    fn deref(&self) -> &HttpOptions {
+        &self.http
+    }
 }
 
 impl McpExtension {
@@ -451,6 +464,26 @@ impl McpExtension {
         workspace: &Path,
         provider_token: Option<TokenResolver>,
         http_options: Option<HttpOptions>,
+    ) -> Result<Self> {
+        Self::connect_with_proxy_hosts(
+            name,
+            config,
+            workspace,
+            provider_token,
+            http_options.map(|http| HttpOptionsWithProxyHosts {
+                http,
+                proxy_hosts: Vec::new(),
+            }),
+        )
+        .await
+    }
+
+    pub async fn connect_with_proxy_hosts(
+        name: &str,
+        config: &ServerConfig,
+        workspace: &Path,
+        provider_token: Option<TokenResolver>,
+        http_options: Option<HttpOptionsWithProxyHosts>,
     ) -> Result<Self> {
         if name.is_empty()
             || !name
@@ -1501,7 +1534,6 @@ mod tests {
             root.path(),
             None,
             Some(HttpOptions {
-                proxy_hosts: Vec::new(),
                 proxies: vec![proxy],
                 idle_timeout: None,
             }),

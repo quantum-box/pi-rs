@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-// Match rmcp's address policy for custom OAuth clients. Proxy hosts are exempt:
-// as with rmcp's default client, the proxy resolves proxied destinations.
+// Match rmcp's address policy, but never exempt an OAuth destination that is
+// also a proxy host. A resolver cannot distinguish a proxy lookup from a
+// NO_PROXY direct destination lookup with the same name.
 #[derive(Clone)]
 struct OAuthResolver {
     base_ip: Option<std::net::IpAddr>,
@@ -77,9 +78,17 @@ impl OAuthResolver {
         class == 0 || (class != 3 && self.base_class == Some(class))
     }
     fn allows_url(&self, url: &reqwest_mcp::Url) -> bool {
-        url.host_str()
-            .and_then(|host| host.trim_matches(['[', ']']).parse().ok())
-            .is_none_or(|ip| self.base_ip == Some(ip) || self.allowed(ip))
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
+            return self.base_ip == Some(ip) || self.allowed(ip);
+        }
+        !self.proxy_hosts.iter().any(|proxy| {
+            proxy
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(host.trim_end_matches('.'))
+        })
     }
 }
 impl reqwest_mcp::dns::Resolve for OAuthResolver {
@@ -92,10 +101,11 @@ impl reqwest_mcp::dns::Resolve for OAuthResolver {
             let addresses =
                 tokio::task::spawn_blocking(move || (lookup.as_str(), 0).to_socket_addrs())
                     .await??;
-            let exempt = this
-                .proxy_hosts
-                .iter()
-                .any(|proxy| proxy.eq_ignore_ascii_case(&host));
+            let exempt = this.proxy_hosts.iter().any(|proxy| {
+                proxy
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(host.trim_end_matches('.'))
+            });
             let allowed: Vec<_> = addresses
                 .filter(|addr| exempt || this.allowed(addr.ip()))
                 .collect();
@@ -145,7 +155,10 @@ impl rmcp::transport::auth::OAuthHttpClient for OAuthHttp {
     }
 }
 
-fn oauth_http(url: &str, options: Option<&crate::mcp::HttpOptions>) -> Result<OAuthHttp> {
+fn oauth_http(
+    url: &str,
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+) -> Result<OAuthHttp> {
     let base =
         reqwest_mcp::Url::parse(url).map_err(|_| Error::Config("invalid MCP OAuth URL".into()))?;
     let base_ip = base
@@ -170,7 +183,14 @@ fn oauth_http(url: &str, options: Option<&crate::mcp::HttpOptions>) -> Result<OA
             ]
             .into_iter()
             .filter_map(|name| std::env::var(name).ok())
-            .filter_map(|value| reqwest_mcp::Url::parse(&value).ok())
+            .filter_map(|value| {
+                let value = if value.contains("://") {
+                    value
+                } else {
+                    format!("http://{value}")
+                };
+                reqwest_mcp::Url::parse(&value).ok()
+            })
             .filter_map(|url| url.host_str().map(str::to_owned))
             .collect()
         }),
@@ -197,8 +217,8 @@ fn oauth_http(url: &str, options: Option<&crate::mcp::HttpOptions>) -> Result<OA
         follow: build(reqwest_mcp::redirect::Policy::custom({
             let resolver = resolver.clone();
             move |attempt| {
-                if !resolver.allows_url(attempt.url()) || attempt.previous().len() >= 10 {
-                    attempt.stop()
+                if !resolver.allows_url(attempt.url()) || attempt.previous().len() > 10 {
+                    attempt.error(std::io::Error::other("MCP OAuth redirect rejected"))
                 } else {
                     attempt.follow()
                 }
@@ -211,11 +231,8 @@ fn oauth_http(url: &str, options: Option<&crate::mcp::HttpOptions>) -> Result<OA
 
 async fn oauth_manager(
     url: &str,
-    options: Option<&crate::mcp::HttpOptions>,
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
 ) -> Result<AuthorizationManager> {
-    if options.is_none() {
-        return AuthorizationManager::new(url).await.map_err(auth_error);
-    }
     AuthorizationManager::new_with_oauth_http_client(url, Arc::new(oauth_http(url, options)?))
         .await
         .map_err(auth_error)
@@ -528,7 +545,7 @@ pub async fn client_with_http_options(
     name: &str,
     url: &str,
     client: reqwest_mcp::Client,
-    options: Option<&crate::mcp::HttpOptions>,
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
 ) -> Result<(AuthClient<reqwest_mcp::Client>, String)> {
     let mut store = FileCredentials::new(name, url)?;
     let guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
@@ -545,7 +562,7 @@ pub async fn client_with_http_options(
         .as_ref()
         .and_then(|registration| registration.auth_server_metadata_url.as_deref())
     {
-        manager.set_metadata(configured_metadata_with_client(metadata_url, &client).await?);
+        manager.set_metadata(configured_metadata(metadata_url, url, options).await?);
     }
     if !manager.initialize_from_store().await.map_err(auth_error)? {
         return Err(auth_error(AuthError::AuthorizationRequired));
@@ -608,7 +625,7 @@ pub async fn login_with_secret_with_http_options(
     client_id: Option<&str>,
     client_secret: Option<&str>,
     scopes: &[String],
-    options: Option<&crate::mcp::HttpOptions>,
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
     announce: impl Fn(&str),
 ) -> Result<()> {
     authorize(
@@ -644,7 +661,7 @@ pub async fn login_with_metadata_with_http_options(
     url: &str,
     client_metadata_url: &str,
     scopes: &[String],
-    options: Option<&crate::mcp::HttpOptions>,
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
     announce: impl Fn(&str),
 ) -> Result<()> {
     authorize(
@@ -679,7 +696,7 @@ pub async fn login_configured_with_http_options(
     settings: Option<&OAuthClientSettings>,
     challenge: Option<&str>,
     scopes: &[String],
-    options: Option<&crate::mcp::HttpOptions>,
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
     announce: impl Fn(&str),
 ) -> Result<()> {
     let default = OAuthClientSettings::default();
@@ -728,7 +745,7 @@ pub(crate) async fn upgrade(
     url: &str,
     previous: Uuid,
     requested: &[String],
-    options: Option<&crate::mcp::HttpOptions>,
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
     announce: impl Fn(&str),
 ) -> Result<Uuid> {
     let store = FileCredentials::new(name, url)?;
@@ -888,6 +905,19 @@ async fn callback_listener(
     Ok((listener, callback))
 }
 
+async fn configured_metadata(
+    value: &str,
+    resource: &str,
+    options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
+) -> Result<AuthorizationMetadata> {
+    let http = oauth_http(resource, options)?;
+    let target = safe_http_url(value)?;
+    if !http.resolver.allows_url(&target) {
+        return Err(Error::Config("MCP OAuth metadata address rejected".into()));
+    }
+    configured_metadata_with_client(value, &http.stop).await
+}
+
 async fn configured_metadata_with_client(
     value: &str,
     client: &reqwest_mcp::Client,
@@ -935,7 +965,7 @@ async fn authorize(
     url: &str,
     registration: Registration<'_>,
     scopes: &[String],
-    http_options: Option<&crate::mcp::HttpOptions>,
+    http_options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
     announce: impl Fn(&str),
 ) -> Result<Uuid> {
     use rmcp::transport::auth::{AuthorizationRequest, AuthorizationSession};
@@ -1010,7 +1040,7 @@ async fn authorize(
     let mut manager = oauth_manager(url, http_options).await?;
     manager.set_credential_store(store.clone());
     let metadata = if let Some(metadata_url) = options.auth_server_metadata_url {
-        configured_metadata_with_client(metadata_url, &oauth_http(url, http_options)?.stop).await?
+        configured_metadata(metadata_url, url, http_options).await?
     } else {
         let metadata = manager
             .resolve_metadata_from_challenge(options.challenge)
@@ -1143,13 +1173,18 @@ mod tests {
     async fn oauth_manager_uses_proxy_for_registration_and_refresh() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let options = crate::mcp::HttpOptions {
-            proxies: vec![
-                reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap()))
+        let options = crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: vec![
+                    reqwest_mcp::Proxy::all(format!(
+                        "http://localhost:{}",
+                        listener.local_addr().unwrap().port()
+                    ))
                     .unwrap(),
-            ],
-            proxy_hosts: vec!["127.0.0.1".into()],
-            idle_timeout: None,
+                ],
+                idle_timeout: None,
+            },
+            proxy_hosts: vec!["localhost".into()],
         };
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
@@ -1214,13 +1249,15 @@ mod tests {
     async fn oauth_discovery_uses_configured_proxy() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let options = crate::mcp::HttpOptions {
-            proxies: vec![
-                reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap()))
-                    .unwrap(),
-            ],
+        let options = crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: vec![
+                    reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap()))
+                        .unwrap(),
+                ],
+                idle_timeout: None,
+            },
             proxy_hosts: vec!["127.0.0.1".into()],
-            idle_timeout: None,
         };
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let server = tokio::spawn(async move {
@@ -1256,6 +1293,106 @@ mod tests {
         let first = receiver.recv().await.unwrap();
         assert!(first.starts_with("GET http://127.0.0.1:1/"), "{first}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn no_proxy_cannot_use_proxy_name_as_direct_metadata_destination() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let options = crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                // Simulate NO_PROXY choosing direct access for every request.
+                proxies: vec![reqwest_mcp::Proxy::custom(|_| None::<reqwest_mcp::Url>)],
+                idle_timeout: None,
+            },
+            proxy_hosts: vec!["LOCALHOST.".into()],
+        };
+        let target = format!(
+            "http://localhost:{}/metadata",
+            listener.local_addr().unwrap().port()
+        );
+        assert!(
+            configured_metadata(&target, "https://public.example/mcp", Some(&options))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_redirect_to_proxy_hostname_is_rejected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        let target_port = destination.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            let _ = socket.read(&mut buffer).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{target_port}/register\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let options = crate::mcp::HttpOptionsWithProxyHosts {
+            http: crate::mcp::HttpOptions {
+                proxies: vec![],
+                idle_timeout: None,
+            },
+            proxy_hosts: vec!["localhost".into()],
+        };
+        let base = format!("http://127.0.0.1:{port}");
+        let mut manager = oauth_manager(&base, Some(&options)).await.unwrap();
+        manager.set_metadata(serde_json::from_value(serde_json::json!({
+            "issuer":base, "authorization_endpoint":format!("{base}/authorize"),
+            "token_endpoint":format!("{base}/token"), "registration_endpoint":format!("{base}/register"),
+            "response_types_supported":["code"]
+        })).unwrap());
+        assert!(
+            manager
+                .register_client("fixture", "http://127.0.0.1/callback", &[])
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), destination.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_filters_direct_dns_and_only_exempts_proxy_lookup() {
+        use reqwest_mcp::dns::Resolve;
+        let mut resolver = OAuthResolver {
+            base_ip: None,
+            base_class: None,
+            proxy_hosts: vec![],
+        };
+        assert!(
+            resolver
+                .resolve("localhost".parse().unwrap())
+                .await
+                .is_err()
+        );
+        resolver.proxy_hosts.push("LOCALHOST.".into());
+        let addresses: Vec<_> = resolver
+            .resolve("localhost".parse().unwrap())
+            .await
+            .unwrap()
+            .collect();
+        assert!(!addresses.is_empty());
+        assert!(!resolver.allows_url(&reqwest_mcp::Url::parse("http://localhost/").unwrap()));
+    }
+
+    #[test]
+    fn http_options_original_struct_literal_remains_valid() {
+        let _ = crate::mcp::HttpOptions {
+            proxies: Vec::new(),
+            idle_timeout: None,
+        };
     }
 
     #[test]

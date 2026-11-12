@@ -348,7 +348,7 @@ impl Runtime {
                         "MCP configuration changed during sign-in".into(),
                     ));
                 }
-                pi_rs_workbench::mcp::McpExtension::connect_with_http_options(
+                pi_rs_workbench::mcp::McpExtension::connect_with_proxy_hosts(
                     &name,
                     &config,
                     &args.workspace,

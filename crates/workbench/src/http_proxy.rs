@@ -64,7 +64,7 @@ fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Ve
 
 pub(super) fn configured_mcp(
     settings: &crate::config::Settings,
-) -> Result<pi_rs_workbench::mcp::HttpOptions> {
+) -> Result<pi_rs_workbench::mcp::HttpOptionsWithProxyHosts> {
     let (http, https, excluded) = settings_values(settings);
     let http = parse_proxy(http.as_deref())?;
     let https = parse_proxy(https.as_deref())?;
@@ -86,10 +86,12 @@ pub(super) fn configured_mcp(
             }
         }));
     }
-    Ok(pi_rs_workbench::mcp::HttpOptions {
-        proxies,
+    Ok(pi_rs_workbench::mcp::HttpOptionsWithProxyHosts {
+        http: pi_rs_workbench::mcp::HttpOptions {
+            proxies,
+            idle_timeout: settings.http_idle_timeout(),
+        },
         proxy_hosts,
-        idle_timeout: settings.http_idle_timeout(),
     })
 }
 
