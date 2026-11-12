@@ -427,6 +427,7 @@ pub struct McpExtension {
 #[derive(Clone)]
 pub struct HttpOptions {
     pub proxies: Vec<reqwest_mcp::Proxy>,
+    pub proxy_hosts: Vec<String>,
     pub idle_timeout: Option<Duration>,
 }
 
@@ -622,7 +623,13 @@ impl McpExtension {
                             "MCP OAuth cannot be combined with an Authorization header".into(),
                         ));
                     }
-                    let (client, generation) = crate::mcp_auth::client(name, url, client).await?;
+                    let (client, generation) = crate::mcp_auth::client_with_http_options(
+                        name,
+                        url,
+                        client,
+                        http_options.as_ref(),
+                    )
+                    .await?;
                     identity.update(generation.as_bytes());
                     oauth_generation =
                         Some(Uuid::parse_str(&generation).map_err(|_| {
@@ -1105,8 +1112,15 @@ impl McpTool {
         if confirmation != pi_rs::UiResponse::Confirmed(true) {
             return Err(Error::Config("MCP scope upgrade declined".into()));
         }
-        let generation =
-            crate::mcp_auth::upgrade(&connection.name, url, previous, scopes, |_| {}).await?;
+        let generation = crate::mcp_auth::upgrade(
+            &connection.name,
+            url,
+            previous,
+            scopes,
+            connection.http_options.as_ref(),
+            |_| {},
+        )
+        .await?;
         connection.rebind_after_upgrade(previous, generation).await
     }
 
@@ -1487,6 +1501,7 @@ mod tests {
             root.path(),
             None,
             Some(HttpOptions {
+                proxy_hosts: Vec::new(),
                 proxies: vec![proxy],
                 idle_timeout: None,
             }),

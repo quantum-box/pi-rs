@@ -378,32 +378,36 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             let announce =
                 |url: &str| output(json!({"type":"mcp_authorization","name":name,"url":url}));
             let server_oauth = server.oauth.clone();
+            let http_options = super::http_proxy::configured_mcp(&args.settings)?;
             if let Some(metadata_url) = client_metadata_url {
-                pi_rs_workbench::mcp_auth::login_with_metadata(
+                pi_rs_workbench::mcp_auth::login_with_metadata_with_http_options(
                     &name,
                     url,
                     &metadata_url,
                     &scopes,
+                    Some(&http_options),
                     announce,
                 )
                 .await?;
             } else if client_id.is_none() && server.oauth_client().is_some() {
-                pi_rs_workbench::mcp_auth::login_configured(
+                pi_rs_workbench::mcp_auth::login_configured_with_http_options(
                     &name,
                     url,
                     server.oauth_client(),
                     None,
                     &scopes,
+                    Some(&http_options),
                     announce,
                 )
                 .await?;
             } else {
-                pi_rs_workbench::mcp_auth::login_with_secret(
+                pi_rs_workbench::mcp_auth::login_with_secret_with_http_options(
                     &name,
                     url,
                     client_id.as_deref(),
                     client_secret.as_deref(),
                     &scopes,
+                    Some(&http_options),
                     announce,
                 )
                 .await?;

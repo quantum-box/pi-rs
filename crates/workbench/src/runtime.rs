@@ -333,12 +333,13 @@ impl Runtime {
                         "MCP configuration changed before sign-in".into(),
                     ));
                 }
-                pi_rs_workbench::mcp_auth::login_configured(
+                pi_rs_workbench::mcp_auth::login_configured_with_http_options(
                     &name,
                     url,
                     config.oauth_client(),
                     challenge.as_deref(),
                     &[],
+                    Some(&super::http_proxy::configured_mcp(&args.settings)?),
                     |_| {},
                 )
                 .await?;

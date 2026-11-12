@@ -27,13 +27,11 @@ the entire model operation and defaults to 2,147,483 seconds.
 Model discovery and model/codemode HTTP clients, Radius OAuth and session
 sharing, OpenRouter OAuth, and MCP HTTP connections honor `httpProxy`, the
 HTTP(S) proxy environment variables, and `no_proxy`/`NO_PROXY` domain, wildcard,
-and port exclusions. MCP reconnects and restored clients' explicit OAuth
-metadata fetches retain the transport settings.
-Lowercase environment variables take precedence, and explicit environment
-values take precedence over the setting. Proxy URL credentials are not displayed
-in the settings list. MCP OAuth discovery, registration, and token requests
-still use the OAuth library's own environment-based proxy handling and do not
-yet inherit the `httpProxy` setting. Other network surfaces need integration;
+and port exclusions. MCP OAuth discovery, explicit metadata, dynamic registration,
+authorization-code exchange, refresh, login, scope upgrades, and reconnects use
+the same settings. Lowercase environment variables take precedence, and explicit
+environment values take precedence over the setting. Proxy URL credentials are
+not displayed in the settings list. Other network surfaces need integration;
 for plain HTTP origins reqwest uses forward-proxy requests, while upstream Pi
 uses CONNECT tunneling.
 
