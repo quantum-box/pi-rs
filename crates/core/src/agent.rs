@@ -133,6 +133,8 @@ pub enum Notification<'a> {
     Reasoning(&'a str),
     /// Transient tool call fragments. Tool dispatch uses only the completed response.
     ToolCallDelta(&'a crate::ToolCallDelta),
+    /// A transient partial result from a running tool.
+    ToolProgress(&'a crate::LifecycleEvent),
     /// A non-fatal failure in an observing extension hook.
     ExtensionLifecycleError {
         extension: &'a str,
@@ -1207,11 +1209,7 @@ impl Agent<'_> {
             let mut prepared = Vec::with_capacity(count);
             let mut parents = Vec::with_capacity(count);
             for invocation in group {
-                let parent = if observe_tools {
-                    tool_parent_call_id(session, invocation.operation_id)
-                } else {
-                    None
-                };
+                let parent = tool_parent_call_id(session, invocation.operation_id);
                 if observe_tools {
                     self.observe_lifecycle(
                         crate::LifecycleEvent::ToolExecutionStart {
@@ -1271,13 +1269,14 @@ impl Agent<'_> {
                 }
             }
             let (requests, mut incoming) = mpsc::channel(32);
-            let (updates, mut progress) = mpsc::channel(32);
+            let (updates, mut progress) = mpsc::channel::<crate::LifecycleEvent>(32);
             let (finish_progress, mut finish_signal) = oneshot::channel();
+            let (progress_events, mut observed_progress) = mpsc::unbounded_channel();
             let progress_registry = self.registry.clone();
             let progress_states = states.clone();
             let progress_cancel = cancel.clone();
             let progress_timeout = self.limits.model_timeout;
-            let progress_worker = observe_progress.then(|| tokio::spawn(async move {
+            let progress_worker = tokio::spawn(async move {
                 let mut errors = Vec::new();
                 let mut closing = false;
                 loop {
@@ -1289,8 +1288,17 @@ impl Agent<'_> {
                         }
                         event = progress.recv() => match event { Some(event) => event, None => break },
                     };
+                    let _ = progress_events.send(event.clone());
+                    if !observe_progress {
+                        continue;
+                    }
                     let mut collect = |notification: Notification<'_>| {
-                        if let Notification::ExtensionLifecycleError { extension, event, message } = notification {
+                        if let Notification::ExtensionLifecycleError {
+                            extension,
+                            event,
+                            message,
+                        } = notification
+                        {
                             errors.push((extension.to_owned(), event, message.to_owned()));
                         }
                     };
@@ -1301,7 +1309,7 @@ impl Agent<'_> {
                     }
                 }
                 errors
-            }));
+            });
             let specs = Arc::new(self.registry.tool_specs());
             let invocations =
                 group
@@ -1321,7 +1329,7 @@ impl Agent<'_> {
                             depth: scope.depth,
                             call_count: scope.call_count.clone(),
                             ui: self.registry.ui.clone(),
-                            progress: observe_progress.then(|| ProgressReporter {
+                            progress: Some(ProgressReporter {
                                 sender: updates.clone(),
                                 tool_call_id: invocation.call.id.clone(),
                                 tool_name: invocation.call.name.clone(),
@@ -1348,6 +1356,7 @@ impl Agent<'_> {
                 tokio::select! {
                     completed = &mut outcomes => break completed,
                     Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
+                    Some(event) = observed_progress.recv() => observer(Notification::ToolProgress(&event)),
                     Some(request) = async {
                         if pending_requests.is_empty() {
                             pending_requests.extend(incoming.recv().await?);
@@ -1385,8 +1394,8 @@ impl Agent<'_> {
                 }
             };
             let _ = finish_progress.send(());
-            if let Some(worker) = progress_worker {
-                match worker.await {
+            {
+                match progress_worker.await {
                     Ok(errors) => {
                         for (extension, event, message) in &errors {
                             observer(Notification::ExtensionLifecycleError {
@@ -1402,6 +1411,9 @@ impl Agent<'_> {
                         message: &error.to_string(),
                     }),
                 }
+            }
+            while let Ok(event) = observed_progress.try_recv() {
+                observer(Notification::ToolProgress(&event));
             }
             let mut first_error = None;
             // All started outcomes are recorded even if one parallel member failed.

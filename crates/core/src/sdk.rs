@@ -1193,7 +1193,7 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
             message: (*message).into(),
         },
         Notification::Retry(event) => SessionEvent::Retry(event.clone()),
-        Notification::SummaryRequest => return,
+        Notification::SummaryRequest | Notification::ToolProgress(_) => return,
         Notification::QueueUpdated {
             steering,
             follow_up,

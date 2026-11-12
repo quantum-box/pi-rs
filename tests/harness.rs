@@ -3274,3 +3274,88 @@ async fn cancelled_catalog_refresh_settles_unstarted_tools() {
             .all(|(_, state)| matches!(state, OperationState::Finished(Outcome::Skipped(_))))
     );
 }
+
+#[tokio::test]
+async fn tool_progress_reaches_observer_without_extension_hooks_before_completion() {
+    struct ProgressTool(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Tool for ProgressTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "progress".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            assert!(host.supports_progress());
+            host.report_progress(json!({"content":[{"type":"text","text":"halfway"}]}))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), self.0.notified())
+                .await
+                .expect("observer must receive progress before completion");
+            Outcome::Succeeded("done".into())
+        }
+    }
+    struct ToolExtension(Arc<ProgressTool>);
+    #[async_trait::async_trait]
+    impl Extension for ToolExtension {
+        fn id(&self) -> &str {
+            "tool-only"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![self.0.clone()]
+        }
+    }
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(ToolExtension(Arc::new(ProgressTool(
+            signal.clone(),
+        )))))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&[r#"{"id":"x"}"#]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let mut events = Vec::new();
+    let mut observer = |event: Notification<'_>| match event {
+        Notification::Committed(record) if matches!(record.event, Event::ToolStarted { .. }) => {
+            events.push(json!({"type":"start"}))
+        }
+        Notification::Committed(record) if matches!(record.event, Event::ToolFinished { .. }) => {
+            events.push(json!({"type":"end"}))
+        }
+        Notification::ToolProgress(event) => {
+            events.push(serde_json::to_value(event).unwrap());
+            signal.notify_one();
+        }
+        _ => {}
+    };
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["type"], "start");
+    assert_eq!(
+        events[1],
+        json!({"type":"tool_execution_update","toolCallId":"call-0","toolName":"lookup","args":{"id":"x"},"partialResult":{"content":[{"type":"text","text":"halfway"}]}})
+    );
+    assert_eq!(events[2]["type"], "end");
+}

@@ -1803,6 +1803,9 @@ fn observe(event: Notification<'_>, trace: bool) {
         Notification::Reasoning(delta) if trace => {
             output(json!({"type":"reasoning_delta","delta":delta}))
         }
+        Notification::ToolProgress(event) if trace => {
+            output(serde_json::to_value(event).expect("tool progress"))
+        }
         Notification::ToolCallDelta(delta) if trace => {
             output(json!({"type":"tool_call_delta","toolCallDelta":delta}))
         }
