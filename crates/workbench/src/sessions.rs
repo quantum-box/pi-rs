@@ -334,7 +334,10 @@ pub fn html(session: &Session) -> String {
             Event::SourceEntry { format, entry } => {
                 imported_legacy_custom = format == "pi"
                     && entry["type"] == "message"
-                    && entry["message"]["role"] == "custom";
+                    && matches!(
+                        entry["message"]["role"].as_str(),
+                        Some("custom" | "hookMessage")
+                    );
                 imported_assistant = (format == "pi"
                     && entry["type"] == "message"
                     && entry["message"]["role"] == "assistant")
@@ -1229,12 +1232,18 @@ mod tests {
             serde_json::json!({"type":"session","version":3}),
             serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"custom","customType":"private","content":"secret context","display":false}}),
             serde_json::json!({"type":"message","id":"b","parentId":"a","message":{"role":"custom","customType":"note","content":"visible **note**","display":true}}),
+            serde_json::json!({"type":"message","id":"c","parentId":"b","message":{"role":"hookMessage","content":"hidden hook explicit","display":false}}),
+            serde_json::json!({"type":"message","id":"d","parentId":"c","message":{"role":"hookMessage","content":"hidden hook default"}}),
+            serde_json::json!({"type":"message","id":"e","parentId":"d","message":{"role":"hookMessage","content":"visible hook","display":true}}),
         ] {
             writeln!(fixture, "{entry}").unwrap();
         }
         let session = super::super::session_import::read(fixture.path()).unwrap();
         let document = html(&session);
         assert!(!document.contains("secret context"));
+        assert!(!document.contains("hidden hook explicit"));
+        assert!(!document.contains("hidden hook default"));
+        assert!(document.contains("visible hook"));
         assert!(document.contains("visible <strong>note</strong>"));
     }
 
