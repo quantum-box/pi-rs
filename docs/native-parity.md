@@ -1733,7 +1733,8 @@ zero-usage and failed responses do not create measured anchors.
 Automatic compaction uses the native measured estimate when available, including
 cases where a short text response consumed a large provider context. Summary requests retain
 prefix-specific character estimates rather than borrowing usage for the whole
-conversation.
+conversation. The compaction record and RPC response report Pi-compatible
+`tokensBefore`, independently of the native retention budget.
 
 Native budgeting remains a provider-independent heuristic, not a strict bound:
 it does not count provider-specific assistant replay blocks, it extracts tool

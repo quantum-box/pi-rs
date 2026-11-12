@@ -767,13 +767,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                         && let pi_rs::Event::Compacted {
                             summary,
                             retain_from,
+                            tokens_before: recorded_tokens,
                             ..
                         } = &record.event
                     {
                         compact_result = json!({
                             "summary": summary,
                             "firstKeptEntryId": retain_from.unwrap_or(record.id).to_string(),
-                            "tokensBefore": tokens_before,
+                            "tokensBefore": recorded_tokens.unwrap_or(tokens_before),
                         });
                     }
                 }

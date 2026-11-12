@@ -2304,7 +2304,7 @@ impl Agent<'_> {
         }
         let (usage, usage_metadata) =
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
-        let tokens_before = session.context_budget_estimate().tokens;
+        let tokens_before = session.context_usage_estimate().tokens;
         let from_extension = original_summary != compaction.summary;
         commit(
             session,

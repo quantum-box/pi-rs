@@ -2090,6 +2090,23 @@ async fn measured_context_tracks_trailing_input_edits_compaction_and_checkout() 
     session.select_model("other", None).unwrap();
     assert!(session.context_usage_estimate().last_usage_record.is_some());
     assert_eq!(session.context_usage_estimate().tokens, 28);
+    harness
+        .compact(
+            &mut session,
+            Compaction {
+                summary: "summary".into(),
+                keep_turns: 0,
+            },
+            &mut ignore,
+        )
+        .unwrap();
+    assert!(matches!(
+        &session.records().last().unwrap().event,
+        Event::Compacted {
+            tokens_before: Some(28),
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
