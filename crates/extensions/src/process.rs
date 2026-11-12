@@ -1930,7 +1930,7 @@ async fn dispatch_with_host(
             state,
         } => encode(
             extension
-                .tool_result(&call, &outcome, &context(&operation_id)?, state.as_ref())
+                .tool_result_update(&call, &outcome, &context(&operation_id)?, state.as_ref())
                 .await,
         ),
         ProtocolRequest::BeforeCompaction {
@@ -2210,6 +2210,57 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Option<Outcome>>(result).unwrap(),
             Some(Outcome::Succeeded("changed".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn result_patch_dispatch_preserves_details() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "patch"
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatch>> {
+                Ok(Some(pi_rs_core::ToolResultPatch {
+                    output: Some("changed".into()),
+                    details: None,
+                }))
+            }
+        }
+        let result = dispatch(
+            Arc::new(Hook),
+            ProtocolRequest::ToolResult {
+                call: pi_rs_core::ToolCall {
+                    id: "call".into(),
+                    name: "fixture".into(),
+                    arguments: "{}".into(),
+                },
+                outcome: Outcome::SucceededWithDetails {
+                    output: "original".into(),
+                    details: serde_json::json!({"retained": true}),
+                },
+                operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Option<Outcome>>(result).unwrap(),
+            Some(Outcome::SucceededWithDetails {
+                output: "changed".into(),
+                details: serde_json::json!({"retained": true})
+            })
         );
     }
 
