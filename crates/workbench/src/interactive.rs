@@ -2961,6 +2961,10 @@ fn slash(
                             "Branch summary: {}",
                             summary.chars().take(56).collect::<String>()
                         ),
+                        pi_rs::Event::CompactionSummaryMessage { summary, .. } => format!(
+                            "Compaction: {}",
+                            summary.chars().take(58).collect::<String>()
+                        ),
                         _ => super::metadata(record)["event"]
                             .as_str()
                             .unwrap_or("record")
@@ -2998,6 +3002,7 @@ fn slash(
                         pi_rs::Event::Assistant { .. }
                         | pi_rs::Event::BashExecution { .. }
                         | pi_rs::Event::Compacted { .. }
+                        | pi_rs::Event::CompactionSummaryMessage { .. }
                         | pi_rs::Event::BranchSummary { .. } => TreeEntryKind::Message,
                         pi_rs::Event::ModelFinished {
                             failure: Some(_), ..
