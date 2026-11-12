@@ -2844,12 +2844,12 @@ fn slash(
             if view.async_transitions {
                 let (sender, receiver) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let result = (|| {
+                    let result = {
                         next.refresh_workspace_selection();
                         next.session = session_path(&next.workspace, next.session_dir.as_deref());
                         next.session_transition = Some(pi_rs::SessionStartReason::New);
                         Ok(next)
-                    })();
+                    };
                     let _ = sender.send(result);
                 });
                 view.pending_transition = Some(receiver);
