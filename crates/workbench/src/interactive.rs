@@ -6264,18 +6264,14 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking, session.model_provider());
-    }
+    args.restore_session_model(&session);
     super::thinking::adjust(args);
     args.record_model_selection(&mut session)?;
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = Session::open(&args.session)?;
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking, session.model_provider());
-    }
+    args.restore_session_model(&session);
     if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
         if !path.is_dir() {

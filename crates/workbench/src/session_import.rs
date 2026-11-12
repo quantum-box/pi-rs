@@ -108,6 +108,115 @@ struct Importer {
     records: Vec<Record>,
     timestamp: Option<String>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BranchSelection {
+    Native,
+    Unresolved,
+    Selected {
+        provider: String,
+        model: String,
+        thinking: Option<String>,
+    },
+}
+
+/// Resolve Pi source entries only when restoring a branch, with the current catalog.
+/// A native selection made after import takes precedence over the imported history.
+/// The catalog returns whether a selected model is virtual, or None if unknown.
+pub(super) fn branch_selection(
+    session: &Session,
+    catalog: impl Fn(&str, &str) -> Option<bool>,
+) -> BranchSelection {
+    let branch = session.branch();
+    let thinking = branch
+        .iter()
+        .rev()
+        .find_map(|record| match &record.event {
+            Event::ModelSelected { thinking, .. } => Some(thinking.clone()),
+            Event::SourceEntry { format, entry }
+                if format == "pi" && entry["type"] == "thinking_level_change" =>
+            {
+                Some(entry["thinkingLevel"].as_str().map(str::to_owned))
+            }
+            _ => None,
+        })
+        .flatten();
+    let mut saw_pi = false;
+    for (index, record) in branch.iter().enumerate().rev() {
+        if matches!(record.event, Event::ModelSelected { .. }) {
+            let imported = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
+                matches!(&parent.event, Event::SourceEntry { format, entry } if format == "pi" &&
+                    (entry["type"] == "model_change" || entry["type"] == "thinking_level_change" ||
+                     (entry["type"] == "message" && entry["message"]["role"] == "assistant")))
+            });
+            if !imported {
+                return BranchSelection::Native;
+            }
+        }
+        let Event::SourceEntry { format, entry } = &record.event else {
+            continue;
+        };
+        if format != "pi" {
+            continue;
+        }
+        saw_pi = true;
+        if entry["type"] == "model_change" {
+            return selected(&entry["provider"], &entry["modelId"], thinking);
+        }
+        let message = &entry["message"];
+        if entry["type"] != "message"
+            || message["role"] != "assistant"
+            || message["api"] == "pi-virtual"
+        {
+            continue;
+        }
+        let change = branch[..index]
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry }
+                    if format == "pi" && entry["type"] == "model_change" =>
+                {
+                    Some(entry)
+                }
+                _ => None,
+            });
+        if let Some(change) = change {
+            let (Some(provider), Some(model)) =
+                (change["provider"].as_str(), change["modelId"].as_str())
+            else {
+                return BranchSelection::Unresolved;
+            };
+            match catalog(provider, model) {
+                Some(true) => {
+                    return selected(&change["provider"], &change["modelId"], thinking);
+                }
+                None => return BranchSelection::Unresolved,
+                Some(false) => {}
+            }
+        }
+        return selected(&message["provider"], &message["model"], thinking);
+    }
+    if saw_pi {
+        BranchSelection::Unresolved
+    } else {
+        BranchSelection::Native
+    }
+}
+
+fn selected(provider: &Value, model: &Value, thinking: Option<String>) -> BranchSelection {
+    match (
+        provider.as_str().filter(|s| !s.is_empty()),
+        model.as_str().filter(|s| !s.is_empty()),
+    ) {
+        (Some(provider), Some(model)) => BranchSelection::Selected {
+            provider: provider.into(),
+            model: model.into(),
+            thinking,
+        },
+        _ => BranchSelection::Unresolved,
+    }
+}
 impl Importer {
     fn append(&mut self, branch: &mut Branch, event: Event) -> u64 {
         let current_head = self
@@ -509,21 +618,6 @@ fn convert(
             match required(message, "role")? {
                 "user" => push_user(&mut events, &message["content"])?,
                 "assistant" => {
-                    // Pi derives the session's model from the latest assistant
-                    // message as well as explicit model_change entries.
-                    if let Some(model) = message["model"].as_str().filter(|model| !model.is_empty())
-                    {
-                        let provider = message["provider"].as_str().map(str::to_owned);
-                        if branch.model != model || branch.provider != provider {
-                            branch.model = model.to_owned();
-                            branch.provider = provider;
-                            events.push(Event::ModelSelected {
-                                model: branch.model.clone(),
-                                thinking: branch.thinking.clone(),
-                                provider: branch.provider.clone(),
-                            });
-                        }
-                    }
                     let failure = match message["stopReason"].as_str() {
                         Some("error") => Some(pi_rs::ModelFailure::Failed),
                         Some("aborted") => Some(pi_rs::ModelFailure::Cancelled),
@@ -890,45 +984,94 @@ mod tests {
     use pi_rs::Message;
     use serde_json::json;
     #[test]
-    fn assistant_model_selection_follows_branches_and_survives_export() {
+    fn branch_selection_uses_live_catalog_and_survives_round_trip() {
         let mut session = import_pi(vec![
             json!({"type":"session","version":3}),
             json!({"type":"thinking_level_change","id":"think","parentId":null,"thinkingLevel":"high"}),
-            json!({"type":"message","id":"first","parentId":"think","message":{"role":"assistant","provider":"first-provider","model":"first-model","content":[{"type":"text","text":"first"}]}}),
-            json!({"type":"model_change","id":"change","parentId":"first","provider":"explicit","modelId":"explicit-model"}),
-            json!({"type":"message","id":"second","parentId":"change","message":{"role":"assistant","provider":"second-provider","model":"second-model","content":[{"type":"text","text":"second"}]}}),
-            json!({"type":"message","id":"other","parentId":"first","message":{"role":"user","content":"other branch"}}),
+            json!({"type":"model_change","id":"change","parentId":"think","provider":"router","modelId":"virtual"}),
+            json!({"type":"message","id":"physical","parentId":"change","message":{"role":"assistant","provider":"physical","model":"actual","content":[]}}),
+            json!({"type":"message","id":"failed-route","parentId":"physical","message":{"role":"assistant","provider":"router","model":"virtual","api":"pi-virtual","stopReason":"error","content":[]}}),
+            json!({"type":"message","id":"other","parentId":"think","message":{"role":"assistant","provider":"other","model":"model","content":[]}}),
         ]).unwrap();
         assert_eq!(
-            session.model_selection(),
-            Some(("first-model".into(), Some("high".into())))
+            branch_selection(&session, |_, _| None),
+            BranchSelection::Selected {
+                provider: "other".into(),
+                model: "model".into(),
+                thinking: Some("high".into())
+            }
         );
-        assert_eq!(session.model_provider(), Some("first-provider"));
-        let second = session.records().iter().find(|record| matches!(&record.event, Event::Assistant { content, .. } if content == "second")).unwrap().id;
-        session.checkout(second).unwrap();
+        let target = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "failed-route")).unwrap().id;
+        session.checkout(target).unwrap();
+        let virtual_selection = BranchSelection::Selected {
+            provider: "router".into(),
+            model: "virtual".into(),
+            thinking: Some("high".into()),
+        };
         assert_eq!(
-            session.model_selection(),
-            Some(("second-model".into(), Some("high".into())))
+            branch_selection(&session, |_, _| Some(true)),
+            virtual_selection
         );
-        assert_eq!(session.model_provider(), Some("second-provider"));
-
+        assert_eq!(
+            branch_selection(&session, |_, _| Some(false)),
+            BranchSelection::Selected {
+                provider: "physical".into(),
+                model: "actual".into(),
+                thinking: Some("high".into())
+            }
+        );
+        assert_eq!(
+            branch_selection(&session, |_, _| None),
+            BranchSelection::Unresolved
+        );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("export.jsonl");
         session.export_jsonl(&path).unwrap();
         let reopened = read(&path).unwrap();
-        assert_eq!(reopened.model_selection(), session.model_selection());
-        assert_eq!(reopened.model_provider(), session.model_provider());
+        assert_eq!(
+            branch_selection(&reopened, |_, _| Some(true)),
+            virtual_selection
+        );
     }
 
     #[test]
-    fn assistant_without_model_does_not_erase_explicit_selection() {
-        let session = import_pi(vec![
+    fn incomplete_latest_assistant_is_unresolved_and_uses_initial_selection() {
+        use clap::Parser;
+        for message in [
+            json!({"role":"assistant","provider":"anthropic","content":[]}),
+            json!({"role":"assistant","model":"new","content":[]}),
+        ] {
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"model_change","id":"change","parentId":null,"provider":"anthropic","modelId":"old"}),
+                json!({"type":"message","id":"assistant","parentId":"change","message":message}),
+            ]).unwrap();
+            assert_eq!(
+                branch_selection(&session, |_, _| Some(false)),
+                BranchSelection::Unresolved
+            );
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model = "initial".into();
+            args.provider = super::super::Provider::Google;
+            args.restore_session_model(&session);
+            assert_eq!(args.provider.id(), "google");
+            assert_eq!(args.model, "initial");
+        }
+    }
+
+    #[test]
+    fn native_selection_after_import_takes_precedence() {
+        let mut session = import_pi(vec![
             json!({"type":"session","version":3}),
-            json!({"type":"model_change","id":"change","parentId":null,"provider":"p","modelId":"m"}),
-            json!({"type":"message","id":"assistant","parentId":"change","message":{"role":"assistant","content":[]}}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","provider":"p","model":"m","content":[]}}),
         ]).unwrap();
-        assert_eq!(session.model_selection(), Some(("m".into(), None)));
-        assert_eq!(session.model_provider(), Some("p"));
+        session
+            .select_provider_model(Some("google"), "chosen", Some("low"))
+            .unwrap();
+        assert_eq!(
+            branch_selection(&session, |_, _| None),
+            BranchSelection::Native
+        );
     }
     #[test]
     fn imports_v1_compaction_index_and_preserves_original_entry() {

@@ -674,6 +674,26 @@ impl Cli {
                 .or_else(|| self.thinking.clone());
         }
     }
+
+    fn restore_session_model(&mut self, session: &Session) {
+        // The current catalog does not include extension-registered Pi virtual
+        // models. Do not guess whether a previous selection routed a response.
+        match session_import::branch_selection(session, |_, _| None) {
+            session_import::BranchSelection::Native => {
+                if let Some((model, thinking)) = session.model_selection() {
+                    self.restore_model_selection(model, thinking, session.model_provider());
+                }
+            }
+            session_import::BranchSelection::Selected {
+                provider,
+                model,
+                thinking,
+            } => {
+                self.restore_model_selection(model, thinking, Some(&provider));
+            }
+            session_import::BranchSelection::Unresolved => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1506,9 +1526,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         }
         _ => {}
     }
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking, session.model_provider());
-    }
+    args.restore_session_model(&session);
     if !args.model.is_empty() {
         thinking::adjust(&mut args);
         args.record_model_selection(&mut session)?;
