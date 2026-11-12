@@ -167,7 +167,15 @@ fn qwen_token_plans_use_model_specific_thinking_and_tool_format() {
             listener.local_addr().unwrap()
         );
         let server = std::thread::spawn(move || {
-            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            let (mut socket, mut reader, first) = loop {
+                let (mut socket, reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                if first.starts_with("GET ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                break (socket, reader, first);
+            };
             assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
             let mut length = 0;
             let mut headers = String::new();
