@@ -890,8 +890,9 @@ impl Profiles {
         }) else {
             let values = builtin_chat::find(provider.id())
                 .filter(|builtin| builtin.is_official_endpoint(endpoint))
-                .and_then(|_| model.and_then(|id| self.model(provider, id)))
-                .map_or_else(BTreeMap::new, |metadata| metadata.headers);
+                .and_then(|_| BUILTIN_MODELS.get(provider.id()))
+                .and_then(|models| models.iter().find(|item| Some(item.id.as_str()) == model))
+                .map_or_else(BTreeMap::new, |item| item.metadata.headers.clone());
             return RequestHeaders {
                 values,
                 ..RequestHeaders::default()
@@ -1224,6 +1225,29 @@ mod tests {
             )
             .unwrap();
         assert!(untrusted.get("nvcf-poll-seconds").is_none());
+        let configured = Profiles::parse(&json!({"providers":{"nvidia":{
+            "baseUrl":"https://relay.example/v1",
+            "modelOverrides":{"deepseek-ai/deepseek-v4.1-flash":{"headers":{"X-Relay-Secret":"private"}}}
+        }}})).unwrap();
+        let official = configured
+            .request_headers(
+                &nvidia,
+                endpoint,
+                Some("deepseek-ai/deepseek-v4.1-flash"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(official["nvcf-poll-seconds"], "3600");
+        assert!(official.get("x-relay-secret").is_none());
+        let relay = configured
+            .request_headers(
+                &nvidia,
+                "https://relay.example/v1/chat/completions",
+                Some("deepseek-ai/deepseek-v4.1-flash"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(relay["x-relay-secret"], "private");
     }
 
     #[test]
