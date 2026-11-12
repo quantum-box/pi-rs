@@ -76,6 +76,10 @@ without `defaultProvider` are still accepted.
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+The interactive `/hotkeys` view groups navigation, editing, application and
+fullscreen actions. It displays effective user-configured bindings in readable
+form, including multiple keys and explicitly unbound actions.
+
 ## RPC support
 
 The native JSONL interface supports `prompt`, `steer`, `follow_up`, `abort`,

@@ -2348,7 +2348,8 @@ fn slash(
     let (name, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
     let rest = rest.trim();
     match name {
-        "/help" | "/hotkeys" => view.append(HELP),
+        "/help" => view.append(HELP),
+        "/hotkeys" => view.append(&Keys::load()?.describe()),
         "/session" => {
             let session = Session::snapshot(&args.session)?;
             view.append(&serde_json::to_string_pretty(&sessions::summary(
