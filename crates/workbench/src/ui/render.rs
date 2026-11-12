@@ -280,7 +280,7 @@ impl Entry {
             Self::Warning(text) => {
                 return wrap(&[Span::themed(text, theme, "warning")], width);
             }
-            Self::User(text) => user_lines(text, theme, inner),
+            Self::User(text) => user_lines(text, theme, inner, options),
             Self::Skill { text, expanded } => {
                 let (name, body, message) =
                     crate::resources::skill_invocation(text).expect("skill invocation");
@@ -292,8 +292,15 @@ impl Entry {
                 if expanded.unwrap_or(expand_tools) {
                     lines.extend(wrap(&[label], inner));
                     let markdown = format!("**{name}**\n\n{body}");
-                    let mut body =
-                        markdown_at_depth(&markdown, theme, inner, 0, options.mermaid, *HYPERLINKS);
+                    let mut body = markdown_at_depth(
+                        &markdown,
+                        theme,
+                        inner,
+                        0,
+                        options.mermaid,
+                        *HYPERLINKS,
+                        false,
+                    );
                     for span in body.iter_mut().flat_map(|line| &mut line.spans) {
                         if span.color == theme.color("text") && !span.dim {
                             span.color = color;
@@ -318,13 +325,13 @@ impl Entry {
                 }
                 lines.push(Line::default());
                 if let Some(message) = message {
-                    lines.extend(user_lines(message, theme, inner));
+                    lines.extend(user_lines(message, theme, inner, options));
                 }
                 lines
             }
             Self::Assistant(text) => {
                 let mut lines =
-                    markdown_at_depth(text, theme, inner, 0, options.mermaid, *HYPERLINKS);
+                    markdown_at_depth(text, theme, inner, 0, options.mermaid, *HYPERLINKS, false);
                 lines.push(Line::default());
                 lines
             }
@@ -354,8 +361,15 @@ impl Entry {
                 lines.push(Line::default());
                 if expanded.unwrap_or(expand_tools) {
                     let markdown = format!("**{title}**\n\n{text}");
-                    let mut body =
-                        markdown_at_depth(&markdown, theme, inner, 0, options.mermaid, *HYPERLINKS);
+                    let mut body = markdown_at_depth(
+                        &markdown,
+                        theme,
+                        inner,
+                        0,
+                        options.mermaid,
+                        *HYPERLINKS,
+                        false,
+                    );
                     for span in body.iter_mut().flat_map(|line| &mut line.spans) {
                         if span.color == theme.color("text") && !span.dim {
                             span.color = color;
@@ -748,10 +762,16 @@ impl Table {
     }
 }
 
-fn user_lines(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
-    let mut lines = wrap(&[Span::themed(text, theme, "userMessageText")], width);
+fn user_lines(text: &str, theme: &Theme, width: usize, options: TranscriptOptions) -> Vec<Line> {
+    let mut lines = markdown_at_depth(text, theme, width, 0, options.mermaid, *HYPERLINKS, true);
     for line in &mut lines {
         line.background = Some(theme.color("userMessageBg"));
+        for span in &mut line.spans {
+            if span.color == theme.color("text") && !span.dim {
+                span.color = theme.color("userMessageText");
+                span.dim = theme.is_dim("userMessageText");
+            }
+        }
     }
     lines.push(Line::default());
     lines
@@ -759,11 +779,45 @@ fn user_lines(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
 
 #[cfg(test)]
 fn markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
-    markdown_at_depth(text, theme, width, 0, super::mermaid::Mermaid::Off, false)
+    markdown_at_depth(
+        text,
+        theme,
+        width,
+        0,
+        super::mermaid::Mermaid::Off,
+        false,
+        false,
+    )
 }
 
 fn safe_hyperlink(url: &str) -> bool {
     !url.is_empty() && !url.chars().any(char::is_control)
+}
+
+fn original_list_marker(source: &str, ordered: bool) -> Option<String> {
+    let line = source.trim_start_matches(' ');
+    let bytes = line.as_bytes();
+    let end = if ordered {
+        let digits = bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 || digits > 9 || !matches!(bytes.get(digits), Some(b'.' | b')')) {
+            return None;
+        }
+        digits + 1
+    } else if matches!(bytes.first(), Some(b'-' | b'+' | b'*')) {
+        1
+    } else {
+        return None;
+    };
+    if bytes
+        .get(end)
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(format!("{} ", &line[..end]))
 }
 
 fn markdown_at_depth(
@@ -773,6 +827,7 @@ fn markdown_at_depth(
     depth: usize,
     mermaid: super::mermaid::Mermaid,
     hyperlinks: bool,
+    preserve_source: bool,
 ) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut spans = Vec::new();
@@ -938,16 +993,22 @@ fn markdown_at_depth(
             }
             Event::Start(Tag::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
-                let prefix = match lists.last_mut() {
+                let ordered = matches!(lists.last(), Some(Some(_)));
+                let default_prefix = match lists.last_mut() {
                     Some(Some(index)) => {
                         let prefix = format!("{index}. ");
                         *index += 1;
                         prefix
                     }
-                    _ => "• ".into(),
+                    _ => "- ".into(),
+                };
+                let prefix = if preserve_source {
+                    original_list_marker(&text[range.clone()], ordered).unwrap_or(default_prefix)
+                } else {
+                    default_prefix
                 };
                 let prefix = Span::themed(
-                    format!("{}{prefix}", "  ".repeat(lists.len().saturating_sub(1))),
+                    format!("{}{prefix}", "    ".repeat(lists.len().saturating_sub(1))),
                     theme,
                     "mdListBullet",
                 );
@@ -974,7 +1035,15 @@ fn markdown_at_depth(
                 let bordered = width >= 3;
                 let content_width = width.saturating_sub(if bordered { 2 } else { 0 });
                 let quoted = if depth < 32 {
-                    markdown_at_depth(&body, theme, content_width, depth + 1, mermaid, hyperlinks)
+                    markdown_at_depth(
+                        &body,
+                        theme,
+                        content_width,
+                        depth + 1,
+                        mermaid,
+                        hyperlinks,
+                        preserve_source,
+                    )
                 } else {
                     wrap(&[Span::themed(body, theme, "mdQuote")], content_width)
                 };
@@ -994,15 +1063,27 @@ fn markdown_at_depth(
                 }
                 quote_skip = 1;
             }
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
+            Event::Text(content) | Event::Html(content) | Event::InlineHtml(content) => {
                 if code.is_some() {
-                    code_text.push_str(&text);
+                    code_text.push_str(&content);
                 } else {
+                    let preceding = text.as_bytes()[..range.start]
+                        .iter()
+                        .rev()
+                        .take_while(|byte| **byte == b'\\')
+                        .count();
+                    let displayed = if preserve_source && preceding % 2 == 1 {
+                        &text[range.start - 1..range.end]
+                    } else if preserve_source && text[range.clone()].starts_with('\\') {
+                        &text[range]
+                    } else {
+                        content.as_ref()
+                    };
                     if let Some((_, label)) = links.last_mut() {
-                        label.push_str(&text);
+                        label.push_str(displayed);
                     }
                     let mut span = Span::themed(
-                        text,
+                        displayed,
                         theme,
                         if heading > 0 {
                             "mdHeading"
@@ -1055,11 +1136,17 @@ fn markdown_at_depth(
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 lines.push(Line::themed(&"─".repeat(width.min(80)), theme, "mdHr"));
             }
-            Event::TaskListMarker(checked) => spans.push(Span::themed(
-                if checked { "☑ " } else { "☐ " },
-                theme,
-                "mdListBullet",
-            )),
+            Event::TaskListMarker(checked) => {
+                let marker = if checked { "[x] " } else { "[ ] " };
+                if let Some(prefix) = item_prefixes.last_mut() {
+                    if spans.first() == Some(prefix) {
+                        spans[0].text.push_str(marker);
+                    }
+                    prefix.text.push_str(marker);
+                } else {
+                    spans.push(Span::themed(marker, theme, "mdListBullet"));
+                }
+            }
             _ => {}
         }
     }
@@ -1211,7 +1298,7 @@ mod tests {
                 .map(|span| span.text.as_str())
                 .collect::<String>()
         };
-        assert_eq!(text(&lines[0]), "• abcdef");
+        assert_eq!(text(&lines[0]), "- abcdef");
         assert_eq!(text(&lines[1]), "  ghijkl");
         let deep = format!("{}text", "> ".repeat(128));
         let lines = markdown(&deep, &theme, 1);
@@ -1222,6 +1309,44 @@ mod tests {
                 .iter()
                 .all(|line| UnicodeWidthStr::width(text(line).as_str()) <= 1)
         );
+    }
+
+    #[test]
+    fn user_markdown_preserves_list_markers_and_wraps_tasks() {
+        let theme = Theme::system();
+        let options = TranscriptOptions::default();
+        let lines = user_lines("+ **bold**\n+ [x] abcdefgh", &theme, 10, options);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert_eq!(rendered[0], "+ bold");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.text == "bold" && span.bold)
+        );
+        assert_eq!(rendered[1], "+ [x] abcd");
+        assert_eq!(rendered[2], "      efgh");
+        assert!(
+            lines[..3]
+                .iter()
+                .all(|line| line.background == Some(theme.color("userMessageBg")))
+        );
+        let assistant = markdown("- [ ] pending\n  - child", &theme, 40);
+        let rendered: Vec<String> = assistant
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert_eq!(rendered, ["- [ ] pending", "    - child"]);
+        let escaped = user_lines(r"\*literal\*", &theme, 40, options);
+        let text: String = escaped
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(text, r"\*literal\*");
     }
 
     #[test]
@@ -1411,6 +1536,7 @@ mod tests {
             0,
             super::super::mermaid::Mermaid::Off,
             true,
+            false,
         );
         assert!(lines.len() >= 2);
         assert_eq!(
@@ -1489,12 +1615,7 @@ mod tests {
                 .flat_map(|l| &l.spans)
                 .any(|s| s.bold && s.text == "Title")
         );
-        assert!(
-            lines
-                .iter()
-                .flat_map(|l| &l.spans)
-                .any(|s| s.text.contains('•'))
-        );
+        assert!(lines.iter().flat_map(|l| &l.spans).any(|s| s.text == "- "));
         assert!(
             lines
                 .iter()
