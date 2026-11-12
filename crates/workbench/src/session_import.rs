@@ -1563,6 +1563,42 @@ mod tests {
     }
 
     #[test]
+    fn startup_thinking_override_does_not_select_physical_response_model() {
+        use clap::Parser;
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+            json!({"type":"message","id":"assistant","parentId":"change","message":{"role":"assistant","provider":"ollama","model":"physical","content":[]}}),
+        ]).unwrap();
+        let mut args = super::super::Cli::parse_from(["pi", "--thinking", "high"]);
+        args.model = "physical".into();
+        args.model_explicit = false;
+        args.thinking_explicit = true;
+        args.thinking = Some("high".into());
+        args.record_automatic_model_selection(&mut session).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("share.jsonl");
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let shared = read(&path).unwrap();
+        assert!(
+            matches!(branch_selection(&shared, |_, _| Some(true)), BranchSelection::Selected { model, thinking: Some(level), .. } if model == "virtual" && level == "high")
+        );
+        args.model_explicit = true;
+        args.record_automatic_model_selection(&mut session).unwrap();
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let shared = read(&path).unwrap();
+        assert!(
+            matches!(branch_selection(&shared, |_, _| Some(true)), BranchSelection::Selected { model, .. } if model == "physical")
+        );
+    }
+
+    #[test]
     fn incomplete_prior_model_change_does_not_hide_complete_response() {
         let session = import_pi(vec![
             json!({"type":"session","version":3}),

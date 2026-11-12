@@ -319,6 +319,13 @@ impl Projection {
             model,
             provider: recorded_provider
                 .or_else(|| {
+                    self.selected(records, request)
+                        .filter(|selected| {
+                            selected.model == model && Provider::named(selected.provider).is_none()
+                        })
+                        .map(|selected| selected.provider)
+                })
+                .or_else(|| {
                     self.finished(records, id)
                         .and_then(|finished| finished.metadata.resolved_model.as_ref())
                         .map(|identity| identity.provider.as_str())
@@ -729,6 +736,66 @@ pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn markerless_custom_provider_keeps_logical_identity() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .select_provider_model(Some("relay"), "selected-model", None)
+            .unwrap();
+        let mut records = session.records().to_vec();
+        let request_id = Uuid::new_v4();
+        for event in [
+            Event::ModelRequested {
+                model: "selected-model".into(),
+                messages: 0,
+                tools: 0,
+                max_output_tokens: 128,
+                request_id: Some(request_id),
+                context_head: None,
+                context_sha256: None,
+            },
+            Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    resolved_model: Some(pi_rs::ResolvedModelIdentity {
+                        provider: "anthropic".into(),
+                        model: "physical-model".into(),
+                    }),
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            },
+            Event::Assistant {
+                content: "answer".into(),
+                invocations: Vec::new(),
+                usage: None,
+                request_id: Some(request_id),
+            },
+        ] {
+            let parent = records.last().unwrap().id;
+            records.push(Record {
+                id: parent + 1,
+                parent: Some(parent),
+                version: 2,
+                timestamp: None,
+                run_id: None,
+                event,
+            });
+        }
+        let session = Session::from_records(records).unwrap();
+        let messages = snapshot(&session).0;
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        assert_eq!(assistant["provider"], "relay");
+        assert_eq!(assistant["model"], "selected-model");
+        assert_eq!(assistant["responseModel"], "physical-model");
+    }
 
     #[test]
     fn rpc_projects_system_updates_and_the_active_compaction_snapshot() {

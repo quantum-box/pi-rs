@@ -650,6 +650,12 @@ impl Cli {
     fn record_automatic_model_selection(&self, session: &mut Session) -> Result<()> {
         session.record_request_identity(self.provider.id(), &self.model)?;
         if !self.model_explicit
+            && self.thinking_explicit
+            && let Some(thinking) = self.thinking.as_deref()
+        {
+            return session.select_thinking_level(self.recorded_provider(), &self.model, thinking);
+        }
+        if !self.model_explicit
             && !self.thinking_explicit
             && !matches!(
                 session_import::branch_selection(session, |_, _| None),
