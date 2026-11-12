@@ -1612,6 +1612,9 @@ mod tests {
         let mut session = Session::open(&path).unwrap();
         session.set_working_directory(&workspace).unwrap();
         session.select_model("other-model", None).unwrap();
+        session
+            .append_user_with_images("existing conversation".into(), Vec::new(), None)
+            .unwrap();
         drop(session);
         let mut args = Cli::try_parse_from(["pi", "--no-trust"]).unwrap();
         switch_session(&mut args, &path).unwrap();
@@ -1631,6 +1634,23 @@ mod tests {
         assert_eq!(args.workspace, workspace.canonicalize().unwrap());
         assert_eq!(args.session, previous);
         assert_eq!(args.model, "other-model");
+    }
+
+    #[test]
+    fn switching_to_empty_saved_session_uses_initial_model() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("empty.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session.set_working_directory(root.path()).unwrap();
+        session.select_model("old-model", Some("low")).unwrap();
+        drop(session);
+        let mut args = Cli::try_parse_from(["pi", "--no-trust"]).unwrap();
+        args.workspace = root.path().into();
+        args.model = "initial-model".into();
+        args.remember_initial_selection();
+        args.model = "current-model".into();
+        switch_session(&mut args, &path).unwrap();
+        assert_eq!(args.model, "initial-model");
     }
 
     #[test]

@@ -2830,7 +2830,7 @@ fn slash(
             if let Some(directory) = next.session.parent() {
                 std::fs::create_dir_all(directory)?;
             }
-            initialize_session(&mut next)?;
+            initialize_session(&mut next, false)?;
             view.restore(&next)?;
             next.session_transition = Some(pi_rs::SessionStartReason::New);
             *args = next;
@@ -6254,10 +6254,10 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
 
 fn prepare_initial_session(args: &mut Cli) -> Result<()> {
     restore_workspace(args)?;
-    initialize_session(args)
+    initialize_session(args, true)
 }
 
-fn initialize_session(args: &mut Cli) -> Result<()> {
+fn initialize_session(args: &mut Cli, restore_selection: bool) -> Result<()> {
     let mut session = Session::open(&args.session)?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
@@ -6270,7 +6270,9 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
-    args.restore_session_model(&session);
+    if restore_selection {
+        args.restore_session_model(&session);
+    }
     super::thinking::adjust(args);
     args.record_automatic_model_selection(&mut session)?;
     Ok(())
@@ -6895,6 +6897,44 @@ mod tests {
             args.session_transition,
             Some(pi_rs::SessionStartReason::New)
         ));
+    }
+
+    #[test]
+    fn new_session_keeps_current_model_while_resuming_empty_session_uses_initial_model() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = directory.path().to_owned();
+        args.session_dir = Some(directory.path().to_owned());
+        args.session = directory.path().join("current.jsonl");
+        args.endpoint = "https://example.invalid/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        args.model = "alpha".into();
+        args.thinking = Some("low".into());
+        args.no_trust = true;
+        args.remember_initial_selection();
+        let empty_path = directory.path().join("saved-empty.jsonl");
+        drop(pi_rs::Session::open(&empty_path).unwrap());
+        let mut view = super::View {
+            available_models: vec!["ollama/alpha".into(), "ollama/beta".into()],
+            ..Default::default()
+        };
+        super::slash("/model beta:high", &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "beta");
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        super::slash("/new", &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "beta");
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        let session = pi_rs::Session::open(&args.session).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("beta".into(), Some("high".into())))
+        );
+        assert_eq!(session.model_provider(), None);
+        drop(session);
+        super::switch_session(&mut args, &mut view, empty_path).unwrap();
+        assert_eq!(args.model, "alpha");
     }
 
     #[test]
