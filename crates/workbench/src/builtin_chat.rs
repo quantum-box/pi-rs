@@ -14,6 +14,12 @@ pub(super) struct Builtin {
 
 pub(super) const PROVIDERS: &[Builtin] = &[
     Builtin {
+        id: "baseten",
+        endpoint: "https://inference.baseten.co/v1/chat/completions",
+        env: "BASETEN_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "cerebras",
         endpoint: "https://api.cerebras.ai/v1/chat/completions",
         env: "CEREBRAS_API_KEY",
@@ -58,6 +64,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         endpoint: "https://api.moonshot.cn/v1/chat/completions",
         env: "MOONSHOT_API_KEY",
         compatibility: moonshot,
+    },
+    Builtin {
+        id: "nvidia",
+        endpoint: "https://integrate.api.nvidia.com/v1/chat/completions",
+        env: "NVIDIA_API_KEY",
+        compatibility: || json!({}),
     },
     Builtin {
         id: "openrouter",
