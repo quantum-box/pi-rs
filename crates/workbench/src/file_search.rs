@@ -241,12 +241,13 @@ fn read_context_line(
     number: u64,
     encoding: &'static Encoding,
     cancellation: &CancellationToken,
-) -> Result<(ContextLine, bool, bool)> {
+) -> Result<(ContextLine, bool, bool, bool)> {
     let mut decoder = encoding.new_decoder_without_bom_handling();
     let mut decoded = [0u8; 8192];
     let mut units = Vec::with_capacity(501);
     let mut has_bytes = false;
     let mut pending_byte = None;
+    let mut binary = false;
     loop {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
@@ -277,6 +278,10 @@ fn read_context_line(
         let mut input = &buf[..count];
         loop {
             let (status, consumed, written, _) = decoder.decode_to_utf8(input, &mut decoded, last);
+            if decoded[..written].contains(&0) {
+                binary = true;
+                break;
+            }
             if units.len() < 501 {
                 let text = std::str::from_utf8(&decoded[..written]).expect("decoded UTF-8");
                 for ch in text.chars().filter(|&ch| ch != '\r' && ch != '\n') {
@@ -297,7 +302,7 @@ fn read_context_line(
             input = &input[consumed..];
         }
         reader.consume(count);
-        if last {
+        if last || binary {
             let truncated = units.len() > 500;
             units.truncate(500);
             let mut text = String::from_utf16_lossy(&units);
@@ -312,6 +317,7 @@ fn read_context_line(
                 },
                 has_bytes,
                 newline.is_some(),
+                binary,
             ));
         }
     }
@@ -386,8 +392,13 @@ fn render_context(
         if event == events.len() {
             break;
         }
-        let (line, has_bytes, newline) =
+        let (line, has_bytes, newline, binary) =
             read_context_line(&mut reader, number, encoding, cancellation)?;
+        // Search treats decoded NUL as binary. Discard its entire line and
+        // everything after it, even if the match limit stopped search early.
+        if binary {
+            break;
+        }
         if !has_bytes && number > 1 && !previous_newline {
             break;
         }
@@ -431,7 +442,11 @@ fn render_context(
         reader.seek(SeekFrom::Start(block.offset))?;
         for index in 0..lines {
             let number = block.start + index;
-            let (line, _, _) = read_context_line(&mut reader, number, encoding, cancellation)?;
+            let (line, _, _, binary) =
+                read_context_line(&mut reader, number, encoding, cancellation)?;
+            if binary {
+                break;
+            }
             output.render(display, &line, number == center);
             if output.prefix_full {
                 break;
@@ -732,6 +747,90 @@ mod tests {
     }
 
     #[test]
+    fn grep_context_stops_before_nul_in_utf8_and_utf16() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let text = format!(
+            "needle\n{}\nvisible\n\0binary\nafter\n",
+            "p".repeat(150_000)
+        );
+        for bytes in [
+            text.as_bytes().to_vec(),
+            utf16_bytes(&text, true),
+            utf16_bytes(&text, false),
+        ] {
+            std::fs::write(file.path(), bytes).unwrap();
+            // The match limit may stop the searcher before it reaches the NUL.
+            for limit in [1, 100] {
+                let mut grep =
+                    Grep::new(&json!({"pattern":"needle", "context":10}), limit).unwrap();
+                grep.search(file.path(), "f", &CancellationToken::new())
+                    .unwrap();
+                let outcome = grep.finish();
+                let output = outcome.tool_content();
+                assert!(output.starts_with("f:1: needle\nf-2- "));
+                assert!(output.contains("f-3- visible"));
+                assert!(!output.contains('\0'));
+                assert!(!output.contains("binary"));
+                assert!(!output.contains("after"));
+            }
+        }
+    }
+
+    #[test]
+    fn grep_context_excludes_nul_containing_line_even_after_a_long_prefix() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let text = format!("needle\n{}\0binary\nafter\n", "p".repeat(150_000));
+        for bytes in [
+            text.as_bytes().to_vec(),
+            utf16_bytes(&text, true),
+            utf16_bytes(&text, false),
+        ] {
+            std::fs::write(file.path(), bytes).unwrap();
+            let mut grep = Grep::new(&json!({"pattern":"needle", "context":2}), 1).unwrap();
+            grep.search(file.path(), "f", &CancellationToken::new())
+                .unwrap();
+            match grep.finish() {
+                Outcome::SucceededWithDetails { output, details } => {
+                    assert!(output.starts_with("f:1: needle\n\n[1 matches limit reached"));
+                    assert!(!output.contains("truncated"));
+                    assert!(details.get("linesTruncated").is_none());
+                }
+                other => panic!("expected match limit, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn binary_boundary_excludes_later_lines_from_byte_truncation_metadata() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let prefix = format!("needle\n{}", "padding\n".repeat(15000));
+        let text = format!("{prefix}\0binary\n{}\n", "z".repeat(700));
+        for bytes in [
+            text.as_bytes().to_vec(),
+            utf16_bytes(&text, true),
+            utf16_bytes(&text, false),
+        ] {
+            std::fs::write(file.path(), bytes).unwrap();
+            let mut grep = Grep::new(&json!({"pattern":"needle", "context":1e20}), 1).unwrap();
+            grep.search(file.path(), "f", &CancellationToken::new())
+                .unwrap();
+            match grep.finish() {
+                Outcome::SucceededWithDetails { output, details } => {
+                    let rows = std::iter::once("f:1: needle".to_owned())
+                        .chain((2..=15001).map(|number| format!("f-{number}- padding")))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert_eq!(details["truncation"]["totalLines"], 15001);
+                    assert_eq!(details["truncation"]["totalBytes"], rows.len());
+                    assert!(details.get("linesTruncated").is_none());
+                    assert!(output.ends_with("50.0KB limit reached]"));
+                }
+                other => panic!("expected byte truncation, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn utf16_context_truncation_matches_utf8() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let text = format!(
@@ -762,14 +861,20 @@ mod tests {
         for (encoding, little_endian) in [(UTF_16LE, true), (UTF_16BE, false)] {
             let bytes = utf16_bytes(text, little_endian);
             let mut reader = BufReader::with_capacity(3, &bytes[2..]);
-            let (first, _, newline) =
+            let (first, _, newline, _) =
                 read_context_line(&mut reader, 1, encoding, &CancellationToken::new()).unwrap();
             assert!(newline);
             assert_eq!(first.text, "\u{0a01}🦀");
-            let (second, _, newline) =
+            let (second, _, newline, _) =
                 read_context_line(&mut reader, 2, encoding, &CancellationToken::new()).unwrap();
             assert!(newline);
             assert_eq!(second.text, "second");
+
+            let bytes = utf16_bytes("a\0binary\n", little_endian);
+            let mut reader = BufReader::with_capacity(3, &bytes[2..]);
+            let (_, _, _, binary) =
+                read_context_line(&mut reader, 1, encoding, &CancellationToken::new()).unwrap();
+            assert!(binary);
         }
     }
 
@@ -777,7 +882,7 @@ mod tests {
     fn context_decoding_skips_arbitrarily_long_carriage_return_runs() {
         let input = format!("{}visible\n", "\r".repeat(100_000));
         let mut reader = BufReader::new(input.as_bytes());
-        let (line, _, _) =
+        let (line, _, _, _) =
             read_context_line(&mut reader, 1, UTF_8, &CancellationToken::new()).unwrap();
         assert_eq!(line.text, "visible");
         assert!(!line.truncated);
