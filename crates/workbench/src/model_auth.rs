@@ -271,7 +271,10 @@ impl Keys {
 
     fn operation_entry(&self, provider: &str, endpoint: &str, official: bool) -> Option<&SavedKey> {
         let entry = self.entries.get(provider)?;
-        (entry.endpoint.as_deref() == Some(endpoint)
+        (entry
+            .endpoint
+            .as_deref()
+            .is_some_and(|saved| same_operation_endpoint(saved, endpoint))
             || (official
                 && ((entry.endpoint.is_some()
                     && super::operation_models::official_base(provider)
@@ -288,6 +291,25 @@ impl Keys {
     pub fn has(&self, provider: &Provider) -> bool {
         self.entries.contains_key(provider.id())
     }
+}
+
+fn same_operation_endpoint(left: &str, right: &str) -> bool {
+    fn normalize(value: &str) -> Option<reqwest::Url> {
+        let mut url = reqwest::Url::parse(value).ok()?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        let path = url.path().trim_end_matches('/').to_owned();
+        url.set_path(&path);
+        Some(url)
+    }
+    normalize(left)
+        .zip(normalize(right))
+        .is_some_and(|(a, b)| a == b)
 }
 
 pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()> {
@@ -342,6 +364,47 @@ pub(super) fn valid_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_operation_endpoint_ignores_trailing_slashes_only() {
+        for (saved, requested) in [
+            (
+                "https://proxy.example/v1/systemone/",
+                "https://proxy.example/v1/systemone",
+            ),
+            (
+                "https://proxy.example/v1/systemone",
+                "https://proxy.example/v1/systemone/",
+            ),
+        ] {
+            let keys = Keys::parse(&json!({"proxy":{
+                "type":"api_key", "key":"stored-key", "endpoint":saved,
+                "env":{"HEADER":"secret"}
+            }}));
+            assert_eq!(
+                keys.operation_credential("proxy", requested, false)
+                    .and_then(Credential::literal),
+                Some("stored-key")
+            );
+            assert_eq!(
+                keys.operation_environment("proxy", requested, false)
+                    .unwrap()["HEADER"],
+                "secret"
+            );
+            for other in [
+                "https://other.example/v1/systemone",
+                "https://proxy.example:8443/v1/systemone",
+                "http://proxy.example/v1/systemone",
+                "https://proxy.example/v1/other",
+                "https://proxy.example/v1/systemone?x=1",
+                "https://proxy.example/v1/systemone#fragment",
+                "https://user@proxy.example/v1/systemone",
+            ] {
+                assert!(keys.operation_credential("proxy", other, false).is_none());
+                assert!(keys.operation_environment("proxy", other, false).is_none());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn stored_api_key_interpolates_credential_environment() {

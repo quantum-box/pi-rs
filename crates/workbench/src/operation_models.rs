@@ -914,6 +914,33 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn operation_uses_slash_terminated_saved_endpoint_before_configured_key() {
+        let config = json!({"proxy":{
+            "baseUrl":"https://proxy.example/v1", "apiKey":"configured-key",
+            "models":[{"type":"classifier", "id":"classifier", "api":"typesafe-system-one"}]
+        }});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "proxy")
+            .unwrap();
+        let keys = Keys::parse(&json!({"proxy":{
+            "type":"api_key", "key":"stored-key", "endpoint":"https://proxy.example/v1/systemone/",
+            "env":{"HEADER":"saved-header"}
+        }}));
+        assert_eq!(
+            entry.credential(&keys).unwrap().resolve().await.unwrap(),
+            "stored-key"
+        );
+        let env = keys.operation_environment("proxy", entry.endpoint.as_str(), entry.is_official());
+        assert_eq!(
+            resolve_header("$HEADER", env).await.as_deref(),
+            Some("saved-header")
+        );
+    }
+
     #[test]
     fn configured_key_is_bound_to_provider_endpoint_not_model_override() {
         for (base, override_base) in [
