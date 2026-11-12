@@ -534,7 +534,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
                     .as_u64()
                     .unwrap_or(3000)
                     .min(100_000) as usize,
-                timeout: args.tool_timeout(),
+                timeout: Duration::MAX,
             }));
         }
         if let Some(project) = &args.project
@@ -627,6 +627,7 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
             extensions,
             &args.disable_extension.iter().cloned().collect(),
         )?;
+        registry.omit_default_tool_timeout(args.tool_timeout_secs.is_none());
         registry.register(Arc::new(LocalCommandPolicy(CommandPolicy {
             allow_commands: args.allow_commands,
         })))?;

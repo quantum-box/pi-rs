@@ -820,6 +820,34 @@ fn original_list_marker(source: &str, ordered: bool) -> Option<String> {
     Some(format!("{} ", &line[..end]))
 }
 
+// Pulldown-cmark emits paragraph events inside loose list items, but does not
+// expose the list's looseness directly. Record it before rendering so every
+// pair of items receives the same spacing, including the first pair.
+fn loose_list_offsets(text: &str, options: Options) -> std::collections::HashSet<usize> {
+    let mut loose = std::collections::HashSet::new();
+    let mut lists = Vec::new();
+    let mut quote_depth = 0usize;
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        match event {
+            Event::Start(Tag::List(_)) => lists.push((range.start, quote_depth)),
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::BlockQuote(_)) => quote_depth += 1,
+            Event::End(TagEnd::BlockQuote(_)) => quote_depth -= 1,
+            Event::Start(Tag::Paragraph) => {
+                if let Some(&(offset, list_quote_depth)) = lists.last()
+                    && quote_depth == list_quote_depth
+                {
+                    loose.insert(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    loose
+}
+
 fn markdown_at_depth(
     text: &str,
     theme: &Theme,
@@ -838,17 +866,15 @@ fn markdown_at_depth(
     let mut quote_skip = 0usize;
     let mut code: Option<String> = None;
     let mut code_text = String::new();
-    let mut lists: Vec<Option<u64>> = Vec::new();
+    let mut lists: Vec<(Option<u64>, bool, bool)> = Vec::new();
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let loose_lists = loose_list_offsets(text, options);
     let mut item_prefixes = Vec::new();
     let mut table: Option<Table> = None;
     let mut links = Vec::new();
     let mut previous_paragraph_end = None;
-    for (event, range) in Parser::new_ext(
-        text,
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
-    )
-    .into_offset_iter()
-    {
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
         if quote_skip > 0 {
             match event {
                 Event::Start(Tag::BlockQuote(_)) => quote_skip += 1,
@@ -1000,15 +1026,23 @@ fn markdown_at_depth(
                     code_text.clear();
                 }
             }
-            Event::Start(Tag::List(start)) => lists.push(start),
+            Event::Start(Tag::List(start)) => {
+                lists.push((start, loose_lists.contains(&range.start), false));
+            }
             Event::End(TagEnd::List(_)) => {
                 lists.pop();
             }
             Event::Start(Tag::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
-                let ordered = matches!(lists.last(), Some(Some(_)));
+                let ordered = matches!(lists.last(), Some((Some(_), _, _)));
+                if let Some((_, loose, seen)) = lists.last_mut() {
+                    if *loose && *seen {
+                        lines.push(Line::default());
+                    }
+                    *seen = true;
+                }
                 let default_prefix = match lists.last_mut() {
-                    Some(Some(index)) => {
+                    Some((Some(index), _, _)) => {
                         let prefix = format!("{index}. ");
                         *index += 1;
                         prefix
@@ -1241,6 +1275,29 @@ mod tests {
         let lines = markdown("first  \nsecond", &theme, 80);
         assert_eq!(lines.len(), 2);
     }
+    #[test]
+    fn markdown_spaces_loose_list_items_at_each_depth() {
+        let theme = Theme::system();
+        for (source, expected) in [
+            (
+                "- first\n\n- second\n- third",
+                vec!["- first", "", "- second", "", "- third"],
+            ),
+            ("- first\n- second", vec!["- first", "- second"]),
+            (
+                "- outer\n  - one\n\n  - two\n- next",
+                vec!["- outer", "    - one", "", "    - two", "- next"],
+            ),
+            ("- > quote\n- next", vec!["- ", "│ quote", "- next"]),
+        ] {
+            let actual: Vec<String> = markdown(source, &theme, 80)
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            assert_eq!(actual, expected, "{source}");
+        }
+    }
+
     #[test]
     fn system_dim_roles_survive_wrapping_and_emit_dim_attributes() {
         let system = Theme::system();

@@ -298,6 +298,10 @@ remaining feature rows above still need their own acceptance checks.
 
 ### Faithful terminal checkpoint
 
+Markdown lists preserve the reference spacing between items in loose lists
+with direct text paragraphs, including nested lists, while tight lists remain
+compact. Lists containing only block elements still need comparison.
+
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
 automatic detection; tmux is probed for its `hyperlinks` terminal feature.
@@ -627,8 +631,16 @@ fresh QuickJS context. Scripts can call registered tools through `tools`, use
 and retain JSON values with `store` / `load`. Store changes commit with a
 successful tool result and follow journal branches. Failed scripts retain
 partial output without committing their store. Filesystem, network and Node
-APIs are absent from the script context. Memory, stack, execution time and
-output have explicit bounds. Large text output is saved to a local file.
+APIs are absent from the script context. Memory, stack and output have explicit
+bounds. Execution has no default deadline; a first-line `timeout_ms`, an
+explicit CLI/SDK tool timeout, or cancellation can stop it, including while
+waiting for a worker. In the Rust SDK, `Codemode.timeout` remains a `Duration`;
+its default `Duration::MAX` means no deadline, while other values set a limit.
+`Limits::default().tool_timeout` remains 30 seconds; passing `Limits` explicitly
+to `SessionBuilder::limits` enforces that timeout for Codemode too. Direct
+`Agent` users retain their configured timeout unless they explicitly opt out
+through the registry. Nested tools retain their own limits. Large text output
+is saved to a local file.
 
 MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 `codemode` and `hidden` select another mode when adding a server. The root

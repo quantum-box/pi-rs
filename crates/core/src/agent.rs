@@ -1910,6 +1910,12 @@ impl Agent<'_> {
             } => (tool, args, context, state, guard),
             Preparation::Skipped(reason) => return Outcome::Skipped(reason).into(),
         };
+        let timeout = if self.registry.omit_default_tool_timeout && !tool.tool.use_default_timeout()
+        {
+            None
+        } else {
+            Some(self.limits.tool_timeout)
+        };
         let invocation = async {
             if programmatic {
                 tool.tool
@@ -1917,15 +1923,20 @@ impl Agent<'_> {
                     .await
             } else {
                 tool.tool
-                    .invoke_transaction(args, context, state.as_ref(), host)
+                    .invoke_transaction_with_timeout(args, context, state.as_ref(), host, timeout)
                     .await
             }
         };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()).into(),
-            result = tokio::time::timeout(self.limits.tool_timeout, invocation) =>
-                result.unwrap_or_else(|_| Outcome::Unknown("tool timed out".into()).into()),
+            result = async {
+                match timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, invocation).await
+                        .unwrap_or_else(|_| Outcome::Unknown("tool timed out".into()).into()),
+                    None => invocation.await,
+                }
+            } => result,
         }
     }
 
