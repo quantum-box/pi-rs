@@ -104,15 +104,12 @@ pub fn resolve(
     let workspace = args.workspace.canonicalize()?;
     let mut paths = Vec::new();
     for path in explicit {
-        append(
-            &mut paths,
-            expand(
-                &absolute(&workspace, &path.to_string_lossy()),
-                kind,
-                true,
-                warnings,
-            )?,
-        );
+        let path = absolute(&workspace, &path.to_string_lossy());
+        if kind == Kind::Prompt && path.is_dir() {
+            append(&mut paths, vec![path]);
+            continue;
+        }
+        append(&mut paths, expand(&path, kind, true, warnings)?);
     }
     if kind.disabled(args) {
         return Ok(paths);
@@ -152,7 +149,7 @@ pub fn resolve(
             if found.is_empty() && !path.exists() {
                 warnings.push(format!("Resource {} was not found", path.display()));
             }
-            append(&mut configured, found);
+            configured.extend(found);
         }
         if !patterns.is_empty() {
             configured.retain(|path| packages::selected(path, &base, &patterns));
@@ -355,12 +352,16 @@ fn collect_matching(
     }
     for entry in walker
         .follow_links(true)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             entry.depth() == 0
-                || !matches!(
-                    entry.file_name().to_str(),
-                    Some(".git" | "target" | "node_modules")
-                )
+                || if kind == Kind::Prompt {
+                    entry.file_name() != "node_modules"
+                } else {
+                    !matches!(
+                        entry.file_name().to_str(),
+                        Some(".git" | "target" | "node_modules")
+                    )
+                }
         })
         .build()
     {

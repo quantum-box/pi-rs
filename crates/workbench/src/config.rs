@@ -724,12 +724,16 @@ mod tests {
         let project = dir.path().join("work/.pi");
         let root = project.join("custom");
         std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
         for file in [
             "visible.md",
             ".hidden.md",
             "ignored.md",
             "nested/child.md",
             "nested/skip.md",
+            "target/build.md",
+            "node_modules/skip.md",
         ] {
             std::fs::write(root.join(file), "prompt").unwrap();
         }
@@ -755,9 +759,59 @@ mod tests {
         let root = root.canonicalize().unwrap();
         assert_eq!(
             paths,
-            vec![root.join("alias.md"), root.join("nested/child.md")]
+            vec![
+                root.join("alias.md"),
+                root.join("nested/child.md"),
+                root.join("target/build.md")
+            ]
         );
         assert!(warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_directory_aliases_and_excluded_aliases_remain_usable() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        let project = workspace.join(".pi");
+        let custom = project.join("custom");
+        std::fs::create_dir_all(&custom).unwrap();
+        let target = dir.path().join("template.md");
+        std::fs::write(&target, "Shared $1").unwrap();
+        symlink(&target, custom.join("audit.md")).unwrap();
+        symlink(&target, custom.join("review.md")).unwrap();
+        let mut args =
+            super::super::Cli::try_parse_from(["pi", "--no-skills", "--no-prompt-templates"])
+                .unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.prompt_template.push(custom.clone());
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![
+                (dir.path().join("agent"), json!({})),
+                (project, json!({"prompts": ["custom", "-custom/audit.md"]})),
+            ],
+        };
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert_eq!(
+            resources.expand("/audit one").as_deref(),
+            Some("Shared one")
+        );
+        assert_eq!(
+            resources.expand("/review two").as_deref(),
+            Some("Shared two")
+        );
+        args.prompt_template.clear();
+        args.no_prompt_templates = false;
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert!(!resources.prompts.contains_key("audit"));
+        assert_eq!(
+            resources.expand("/review two").as_deref(),
+            Some("Shared two")
+        );
     }
 
     #[test]
