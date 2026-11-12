@@ -1357,7 +1357,10 @@ impl Session {
     pub fn reconcile(&mut self, operation_id: Uuid, outcome: Outcome) -> Result<()> {
         if !matches!(
             outcome,
-            Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. } | Outcome::Failed(_)
+            Outcome::Succeeded(_)
+                | Outcome::SucceededWithDetails { .. }
+                | Outcome::Failed(_)
+                | Outcome::TextResult { .. }
         ) || !self.operations().iter().any(|(inv, state)| {
             inv.operation_id == operation_id
                 && matches!(
@@ -2904,6 +2907,52 @@ mod snapshot_tests {
         let before = std::fs::read(&path).unwrap();
         assert!(Session::snapshot(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn reconcile_accepts_patched_known_text_results() {
+        for is_error in [false, true] {
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            session
+                .append_user_with_images("hello".into(), vec![], None)
+                .unwrap();
+            let operation_id = Uuid::new_v4();
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![Invocation {
+                        operation_id,
+                        call: crate::ToolCall {
+                            id: "call".into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session.append(Event::ToolStarted { operation_id }).unwrap();
+            session
+                .append(Event::ToolFinished {
+                    operation_id,
+                    outcome: Outcome::Unknown("uncertain".into()),
+                    states: Default::default(),
+                })
+                .unwrap();
+            let result = Outcome::TextResult {
+                output: "confirmed".into(),
+                details: Some(serde_json::json!({"evidence":true})),
+                is_error,
+            };
+            session.reconcile(operation_id, result.clone()).unwrap();
+            assert!(
+                matches!(&session.operations()[0].1, OperationState::Finished(outcome) if outcome == &result)
+            );
+            assert!(session.current_messages().iter().any(
+                |message| matches!(message, Message::Tool { content, .. } if content == "confirmed")
+            ));
+        }
     }
 
     #[test]

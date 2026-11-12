@@ -1336,6 +1336,14 @@ fn call_duplex(
                         results = host.call_batch(calls) => Ok(results),
                     }
                 })?;
+                let results: Vec<_> = if endpoint.text_result_v2 {
+                    results
+                } else {
+                    results
+                        .into_iter()
+                        .map(|result| result.legacy_text_result())
+                        .collect()
+                };
                 writer
                     .send(serde_json::to_value(results).map_err(|error| error.to_string())?)
                     .map_err(|_| "native extension input closed")?;
@@ -2379,6 +2387,69 @@ mod tests {
                 is_error: true
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nested_host_results_negotiate_outcome_variants_across_processes() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                Outcome::TextResult {
+                    output: format!("{name} output"),
+                    details: Some(serde_json::json!({"id": name})),
+                    is_error: name == "failure",
+                }
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys, os
+name=os.path.basename(sys.argv[0])
+if '--pi-rs-extension-v1' in sys.argv:
+    r=json.load(sys.stdin)
+    assert r['type']=='describe'
+    d={'id':name, 'dependencies':[], 'commands':[], 'host_calls':True, 'text_result_v2':name=='modern', 'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}]}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    request=json.loads(sys.stdin.readline())
+    assert request['request']['type']=='invoke'
+    print(json.dumps({'type':'call','calls':[['success',{}],['failure',{}]]}),flush=True)
+    results=json.loads(sys.stdin.readline())
+    if name=='modern':
+        assert results[0]['status']=='text_result' and results[0]['detail']['is_error'] is False
+        assert results[1]['status']=='text_result' and results[1]['detail']['is_error'] is True
+        assert results[1]['detail']['details']=={'id':'failure'}
+    else:
+        assert results[0]=={'status':'succeeded_with_details','detail':{'output':'success output','details':{'id':'success'}}}
+        assert results[1]=={'status':'failed','detail':'failure output'}
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'nested calls complete'}}}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["legacy", "modern"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let extension = ExecutableExtension::load(path).unwrap();
+            assert_eq!(extension.endpoint.text_result_v2, name == "modern");
+            let tool = extension.tools().pop().unwrap();
+            let context = ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: CancellationToken::new(),
+            };
+            let result = tool
+                .invoke_with_host(serde_json::json!({}), context, None, Arc::new(Host))
+                .await;
+            assert_eq!(
+                result,
+                Outcome::Succeeded("nested calls complete".into()),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
