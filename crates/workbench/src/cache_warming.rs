@@ -168,7 +168,9 @@ impl Policy {
                 .chat_cache_support(&args.provider, &args.model, Some(&model))
                 .ok_or("request disabled prompt caching")?,
             Adapter::PiMessages => true,
-            Adapter::Google | Adapter::OpenAiResponses => return Err("cache lifetime unavailable"),
+            Adapter::Google | Adapter::Bedrock | Adapter::OpenAiResponses => {
+                return Err("cache lifetime unavailable");
+            }
         };
         let retention = super::providers::cache_retention(long_supported);
         let ttl = model

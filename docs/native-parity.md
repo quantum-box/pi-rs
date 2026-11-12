@@ -3337,3 +3337,26 @@ is retained for inspection, while the imported context and forks retain the
 correct post-compaction messages. A boundary at the compaction itself, or at a
 later unassigned v1 entry, retains no earlier messages. Other legacy session variants remain subject
 to the session import limitations above.
+
+### Amazon Bedrock ConverseStream
+
+The `amazon-bedrock` provider uses the AWS SDK's standard region and credential
+chain, including `AWS_PROFILE` and shared AWS configuration, temporary role
+credentials, and credential refresh. Select a model ID explicitly, for example
+`--provider amazon-bedrock --model <bedrock-model-id>`; the provider does not
+list Bedrock models. The optional library feature is `bedrock`.
+
+Text messages, tool definitions and results, streamed text and tool calls,
+stop reasons, and input/output/cache usage are supported. The adapter uses
+ConverseStream and sends an explicit output token limit. Streaming failures and
+incomplete tool calls do not produce a completed tool invocation. The SDK
+selects the regional endpoint and signs requests; no AWS resources are created.
+
+Not yet supported: Bedrock bearer tokens, Pi's login/profile storage, image or
+other multimodal content, reasoning configuration and signed reasoning replay,
+prompt cache checkpoints, tool choice/strict sampling, guardrails, prompt
+management ARNs, model discovery and pricing, custom request headers, and
+workbench proxy/idle-timeout settings. Explicit API keys and custom endpoints
+in model configuration are rejected; configure the SDK credential chain and
+region instead. A caller embedding the adapter may pass a configured AWS SDK
+client, including a test endpoint, through `Bedrock::new`.
