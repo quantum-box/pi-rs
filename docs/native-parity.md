@@ -76,6 +76,10 @@ without `defaultProvider` are still accepted.
 | SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
+Pi JSONL imports retain a UUID session ID through native export and reopen,
+including for model request affinity. Pi also permits non-UUID custom IDs;
+those imports receive a new native UUID. Forks receive their own UUID.
+
 Fullscreen selector lists accept mouse wheel navigation and click selection,
 including settings and scoped models. Dragging does not activate an item and
 mouse interaction preserves theme previews and keyboard remapping.
