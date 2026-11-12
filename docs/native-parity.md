@@ -1131,6 +1131,11 @@ Installing a missing source fails before settings change. CLI fixtures cover
 version replacement, cross-scope revision overrides, inherited resource deltas,
 deleted-source cleanup and the existing transient/offline behaviors.
 
+Package updates reconcile both user and trusted-project declarations even when
+the project shadows a different revision of the same source. Exact duplicate
+sources share a cache and are updated once; transient command-line packages are
+refreshed through startup rather than persisted update.
+
 ### MCP reconnect checkpoint
 
 Closed MCP transports reconnect before the next tool or resource request. The
