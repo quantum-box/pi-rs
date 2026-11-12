@@ -1319,6 +1319,52 @@ mod tests {
     }
 
     #[test]
+    fn qwen_token_plan_catalogs_keep_region_and_model_capabilities() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        for (name, endpoint, key, count) in [
+            (
+                "qwen-token-plan",
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                21,
+            ),
+            (
+                "qwen-token-plan-cn",
+                "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+                "QWEN_TOKEN_PLAN_CN_API_KEY",
+                21,
+            ),
+            (
+                "qwen-token-plan-individual",
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                9,
+            ),
+        ] {
+            let provider = profiles.provider(name).unwrap();
+            assert_eq!(provider.adapter(), Adapter::ChatCompletions);
+            assert_eq!(profiles.endpoint(&provider), endpoint);
+            assert_eq!(builtin_chat::find(name).unwrap().env(), key);
+            assert_eq!(profiles.model_ids(&provider).len(), count);
+            let model = profiles.model(&provider, "qwen3.8-max").unwrap();
+            assert_eq!(model.supports_images(), Some(true));
+            assert_eq!(
+                model.levels(Adapter::ChatCompletions).unwrap(),
+                ["low", "medium", "xhigh"]
+            );
+            assert!(profiles.model(&provider, "qwen3.8-max-preview").is_none());
+        }
+        assert!(
+            profiles
+                .model(
+                    &profiles.provider("qwen-token-plan-individual").unwrap(),
+                    "deepseek-v3.2"
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn xiaomi_regional_catalogs_preserve_reasoning_and_credentials() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         for (name, endpoint, variable, count) in [

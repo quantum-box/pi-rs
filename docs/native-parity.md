@@ -80,6 +80,10 @@ Pi JSONL imports retain a UUID session ID through native export and reopen,
 including for model request affinity. Pi also permits non-UUID custom IDs;
 those imports receive a new native UUID. Forks receive their own UUID.
 
+Fullscreen selector lists accept mouse wheel navigation and click selection,
+including settings and scoped models. Dragging does not activate an item and
+mouse interaction preserves theme previews and keyboard remapping.
+
 Input hooks identify command-line print and JSON prompts as `interactive`, as
 Pi does, while RPC and extension-originated submissions retain their own source.
 
@@ -110,6 +114,15 @@ The native xAI provider uses the pinned Pi Responses catalog and
 separate from OpenAI and ChatGPT. The adapter supports streamed Responses
 events and tool calls through the shared Responses implementation. Loopback
 CLI coverage does not replace live acceptance with an xAI account.
+
+### Qwen Token Plan checkpoint
+
+The international, China, and individual Qwen Token Plan providers expose the
+pinned Pi model catalogs, regional credentials, per-model reasoning maps, and
+image limits. Their chat-completions requests use Qwen's `enable_thinking`
+switch, with `reasoning_effort` only where the selected model supports it.
+Explicit strict-mode support emits the reference `strict: false` tool setting.
+Loopback CLI coverage does not replace live Token Plan acceptance.
 
 ### Xiaomi MiMo checkpoint
 
@@ -819,8 +832,8 @@ same saved notes reached both requests.
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
 context lines, bounds long displayed lines at 500 characters, and reports match
-and byte limits. Large text files remain searchable. Adjacent context ranges
-are combined. Search memory is bounded at 64 MiB, and the configurable context
+and byte limits. Large text files remain searchable. Overlapping context ranges
+are repeated for each match. Search memory is bounded at 64 MiB, and the configurable context
 radius is limited to 1,000 lines.
 
 `find` uses a 1,000-result default and reports result limits. `ls` sorts names
@@ -828,6 +841,11 @@ case-insensitively, identifies linked directories, reports entry limits and
 labels empty directories. Head truncation preserves complete lines where they
 fit. Fixtures cover large-file search, Unicode and literal patterns, context,
 empty directory output and continuation notices.
+
+Single-file `grep` preserves the requested file name in its output when the
+path is a symbolic link, while workspace boundary checks still use the resolved
+target. Focused checks compare the output with Pi v1.5.0 for both linked and
+ordinary files, including context lines.
 
 ### Published native package checkpoint
 

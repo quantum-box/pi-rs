@@ -10,7 +10,9 @@ use crate::ui::{
     keys::Keys,
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
-    picker::{Input, Item, Picker, Selection, ThemeSettingsAction, TreeEntryKind, TreeFilter},
+    picker::{
+        Input, Item, MouseInput, Picker, Selection, ThemeSettingsAction, TreeEntryKind, TreeFilter,
+    },
     render::{Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
@@ -19,8 +21,8 @@ use crate::ui::{
 use crossterm::cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::style::{Print, ResetColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
@@ -3853,9 +3855,53 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             }
             _ => continue,
         };
+        let mut mouse_activate = false;
+        let event = match event {
+            Event::Mouse(mouse)
+                if args.tui_mode != Some(TuiMode::Regular)
+                    && view.dialog().is_none()
+                    && view.picker.is_some() =>
+            {
+                let mut picker = view.picker.take().expect("picker checked above");
+                let header_rows = usize::from(show_startup_header(&args));
+                let action = if usize::from(mouse.column) < view.fullscreen_width
+                    && let Some(row) = usize::from(mouse.row).checked_sub(header_rows)
+                {
+                    picker.mouse(mouse.kind, row)
+                } else {
+                    picker.clear_mouse_press();
+                    MouseInput::Ignored
+                };
+                if matches!(action, MouseInput::Changed)
+                    && let Some(settings) = &view.theme_settings
+                {
+                    match settings.preview(&picker, &args) {
+                        Ok(next) => theme = next,
+                        Err(error) => picker.show_feedback(Err(error.to_string())),
+                    }
+                }
+                view.picker = Some(picker);
+                match action {
+                    MouseInput::Activate => {
+                        mouse_activate = true;
+                        Event::Key(KeyEvent::new(KeyCode::F(255), KeyModifiers::NONE))
+                    }
+                    MouseInput::Changed => {
+                        last_idle_interrupt = None;
+                        dirty = true;
+                        continue;
+                    }
+                    MouseInput::Ignored => continue,
+                }
+            }
+            event => event,
+        };
         match event {
             Event::Resize(..) => {
                 view.mouse.clear();
+                if let Some(picker) = &mut view.picker {
+                    picker.clear_mouse_press();
+                }
                 view.scrollbar_dragging = false;
                 if view.graphics.enabled() {
                     images::query_cell_size()?;
@@ -3875,6 +3921,9 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 view.panel_press = None;
                 view.link_press = None;
                 view.mouse.focus_lost();
+                if let Some(picker) = &mut view.picker {
+                    picker.clear_mouse_press();
+                }
                 view.scrollbar_dragging = false;
                 dirty = true;
             }
@@ -3898,6 +3947,9 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
+                if !mouse_activate && let Some(picker) = &mut view.picker {
+                    picker.clear_mouse_press();
+                }
                 if let Some(task) = &view.remote_task {
                     if keys.action(key, true) == Some("app.interrupt") {
                         let message = task.cancelled;
@@ -3990,7 +4042,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     continue;
                 }
                 if let Some(mut picker) = view.picker.take() {
-                    match picker.input(key, &keys) {
+                    let input = if mouse_activate {
+                        picker.activate_mouse_selection(&keys)
+                    } else {
+                        picker.input(key, &keys)
+                    };
+                    match input {
                         Input::Continue => {
                             if let Some(settings) = &view.theme_settings {
                                 match settings.preview(&picker, &args) {

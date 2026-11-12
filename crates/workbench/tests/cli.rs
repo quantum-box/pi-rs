@@ -149,6 +149,101 @@ fn kimi_coding_models_send_their_specific_reasoning_options() {
 }
 
 #[test]
+fn qwen_token_plans_use_model_specific_thinking_and_tool_format() {
+    for (provider, model, level, effort) in [
+        ("qwen-token-plan", "deepseek-v3.2", "high", None),
+        ("qwen-token-plan-cn", "glm-5.2", "high", Some("high")),
+        (
+            "qwen-token-plan-individual",
+            "qwen3.8-max",
+            "medium",
+            Some("medium"),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = loop {
+                let (mut socket, reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                if first.starts_with("GET ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                break (socket, reader, first);
+            };
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut length = 0;
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                let line = line.to_ascii_lowercase();
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.contains("authorization: bearer fixture"));
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(body["enable_thinking"], true);
+            assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), effort);
+            assert!(body.get("store").is_none());
+            assert_eq!(body["messages"][0]["role"], "system");
+            assert_eq!(body["tools"][0]["function"]["strict"], false);
+            let events = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--offline",
+                "--tools",
+                "read",
+                "--provider",
+                provider,
+                "--model",
+                model,
+                "--thinking",
+                level,
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn xiaomi_providers_send_thinking_and_bearer_credentials() {
     for provider in [
         "xiaomi",
