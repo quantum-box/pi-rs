@@ -1901,6 +1901,13 @@ the pinned Pi statistics implementation and the native RPC. The complete
 workspace tests and all-target Clippy pass. Provider price
 catalogs, automatic native pricing and detailed cost provenance remain open.
 
+### Imported session names
+
+Session and owned SDK name reads trim ECMAScript whitespace from the latest
+stored name, as Pi does, including names imported from external JSONL. A
+whitespace-only name clears the title without falling back to an older name;
+reading preserves internal line breaks and does not rewrite the journal.
+
 ### SDK statistics checkpoint
 
 `Session::statistics` and `AgentSession::statistics` expose the same typed,
