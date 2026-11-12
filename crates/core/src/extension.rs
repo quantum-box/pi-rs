@@ -176,6 +176,13 @@ pub enum ToolExecution {
 #[async_trait::async_trait]
 pub trait ToolHost: Send + Sync {
     fn tools(&self) -> Vec<ToolSpec>;
+    fn supports_progress(&self) -> bool {
+        false
+    }
+    /// Publish an ephemeral partial result while this tool is executing.
+    async fn report_progress(&self, _partial_result: Value) -> ExtensionResult<()> {
+        Ok(())
+    }
     fn has_ui(&self) -> bool {
         false
     }
@@ -498,6 +505,11 @@ pub trait Extension: Send + Sync {
 
     /// Opt in to observing tool execution start and end events.
     fn handles_tool_execution_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Opt in separately to tool execution update events.
+    fn handles_tool_execution_updates(&self) -> bool {
         false
     }
 
