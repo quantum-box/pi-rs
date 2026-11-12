@@ -889,12 +889,7 @@ impl Profiles {
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<Credential> {
         let profile = self.entries.get(provider.id())?;
-        if profile.endpoint != endpoint
-            && !profile
-                .model_endpoints
-                .values()
-                .any(|value| value == endpoint)
-        {
+        if profile.endpoint != endpoint {
             return None;
         }
         Credential::configured(profile.api_key.as_deref()?)
@@ -1650,6 +1645,65 @@ mod tests {
                 .literal(),
             Some("profile-key")
         );
+    }
+
+    #[test]
+    fn configured_credential_never_follows_model_endpoint_override() {
+        for (provider_base, model_base) in [
+            ("https://trusted.example/v1", "https://other.example/v1"),
+            ("https://other.example/v1", "https://trusted.example/v1"),
+        ] {
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = Profiles::parse(&json!({"providers":{"relay":{
+                "api":"openai-completions", "baseUrl":provider_base,
+                "apiKey":"provider-key", "models":[{"id":"override", "baseUrl":model_base}]
+            }}}))
+            .unwrap();
+            let provider = args.model_profiles.provider("relay").unwrap();
+            let primary = args.model_profiles.endpoint(&provider).to_owned();
+            let overridden = args
+                .model_profiles
+                .model_endpoint(&provider, "override")
+                .unwrap()
+                .to_owned();
+            for saved in [
+                json!({}),
+                json!({"relay":{"type":"api_key", "key":"saved-key", "env":{"SECRET":"value"}}}),
+                json!({"relay":{"type":"api_key", "env":{"SECRET":"value"}}}),
+            ] {
+                args.model_keys = super::super::model_auth::Keys::parse(&saved);
+                let expected = if saved["relay"]["key"].is_string() {
+                    "saved-key"
+                } else {
+                    "provider-key"
+                };
+                assert_eq!(
+                    args.configured_model_credential(&provider, &primary)
+                        .unwrap()
+                        .literal(),
+                    Some(expected)
+                );
+                assert!(
+                    args.configured_model_credential(&provider, &overridden)
+                        .is_none()
+                );
+            }
+            args.model_keys = super::super::model_auth::Keys::parse(&json!({"relay":{
+                "type":"api_key", "key":"explicit-key", "endpoint":overridden
+            }}));
+            assert_eq!(
+                args.configured_model_credential(&provider, &primary)
+                    .unwrap()
+                    .literal(),
+                Some("provider-key")
+            );
+            assert_eq!(
+                args.configured_model_credential(&provider, &overridden)
+                    .unwrap()
+                    .literal(),
+                Some("explicit-key")
+            );
+        }
     }
 
     #[test]
