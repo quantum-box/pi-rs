@@ -621,9 +621,9 @@ fn convert(
                     read_files: Vec::new(),
                     modified_files: Vec::new(),
                 }),
-                "compactionSummary" => events.push(Event::User {
-                    content: required(message, "summary")?.into(),
-                    input_id: None,
+                "compactionSummary" => events.push(Event::CompactionSummaryMessage {
+                    summary: required(message, "summary")?.into(),
+                    tokens_before: message["tokensBefore"].as_u64().unwrap_or(0),
                 }),
                 "system" => {
                     let pi_rs::CompactedSystemPrompt {
@@ -1120,6 +1120,27 @@ mod tests {
             matches!(&messages[1], Message::UserWithImages { content, images } if content == "look" && images.len() == 1)
         );
     }
+    #[test]
+    fn imports_compaction_summary_message_without_compacting_the_branch() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"s","parentId":"u","message":{"role":"compactionSummary","summary":"earlier facts","tokensBefore":123,"timestamp":456}}),
+        ]).unwrap();
+        let messages = session.conversation_at(session.head()).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            matches!(&messages[1], Message::User { content } if content == "The conversation history before this point was compacted into the following summary:\n\n<summary>\nearlier facts\n</summary>")
+        );
+        let (visible, _) = super::super::rpc_messages::snapshot(&session);
+        assert_eq!(visible.last().unwrap()["role"], "compactionSummary");
+        assert_eq!(visible.last().unwrap()["tokensBefore"], 123);
+        let entries = super::super::rpc_entries::Entries::new(&session)
+            .after(None)
+            .unwrap();
+        assert_eq!(entries["entries"].as_array().unwrap().len(), 2);
+    }
+
     #[test]
     fn imports_branch_summary_message_with_reference_context() {
         let session = import_pi(vec![
