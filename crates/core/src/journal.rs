@@ -862,6 +862,7 @@ impl Session {
                 } => Some(name.as_str()),
                 _ => None,
             })
+            .map(|name| name.trim_matches(is_ecmascript_whitespace))
             .filter(|name| !name.is_empty())
     }
 
@@ -2674,19 +2675,21 @@ fn record_timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn is_ecmascript_whitespace(character: char) -> bool {
+    matches!(character,
+        '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' |
+        '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' |
+        '\u{205f}' | '\u{3000}' | '\u{feff}'
+    )
+}
+
 /// Normalize a display name using Pi's line-break and ECMAScript whitespace rules.
 pub fn sanitize_session_name(name: &str) -> String {
     name.split(['\r', '\n'])
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
-        .trim_matches(|character| {
-            matches!(character,
-                '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' |
-                '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' |
-                '\u{205f}' | '\u{3000}' | '\u{feff}'
-            )
-        })
+        .trim_matches(is_ecmascript_whitespace)
         .to_owned()
 }
 
@@ -2806,6 +2809,41 @@ mod snapshot_tests {
         assert!(session.name().is_none());
         let restored = Session::from_records(session.records().to_vec()).unwrap();
         assert!(restored.name().is_none());
+    }
+
+    #[test]
+    fn imported_display_names_are_trimmed_and_can_clear_earlier_names() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.set_name("earlier").unwrap();
+        session
+            .append(Event::SessionInfo {
+                name: Some("\u{feff}  imported\nname \u{3000}".into()),
+                cwd: None,
+            })
+            .unwrap();
+        assert_eq!(session.name(), Some("imported\nname"));
+        session
+            .append(Event::SessionInfo {
+                name: None,
+                cwd: Some("/tmp".into()),
+            })
+            .unwrap();
+        assert_eq!(session.name(), Some("imported\nname"));
+        session
+            .append(Event::SessionInfo {
+                name: Some("\u{feff} \t".into()),
+                cwd: None,
+            })
+            .unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(restored.name(), None);
+        session
+            .append(Event::SessionInfo {
+                name: Some("\u{0085}".into()),
+                cwd: None,
+            })
+            .unwrap();
+        assert_eq!(session.name(), Some("\u{0085}"));
     }
 
     #[test]
