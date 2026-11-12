@@ -730,32 +730,32 @@ fn convert(
                     data: entry.get("data").cloned(),
                 },
             });
-            if entry["customType"] == "codemode-store" {
-                if let (Some(set), Some(deleted)) = (
+            if entry["customType"] == "codemode-store"
+                && let (Some(set), Some(deleted)) = (
                     entry["data"]["set"].as_object(),
                     entry["data"]["delete"].as_array(),
-                ) && deleted.iter().all(Value::is_string)
-                {
-                    for key in deleted.iter().filter_map(Value::as_str) {
-                        branch.store.remove(key);
-                    }
-                    branch
-                        .store
-                        .extend(set.iter().map(|(key, value)| (key.clone(), value.clone())));
-                    let data = serde_json::to_value(&branch.store)?;
-                    if data.to_string().len() > 4 * 1024 * 1024 {
-                        return Err(Error::Session(
-                            "imported codemode store exceeds size limit".into(),
-                        ));
-                    }
-                    events.push(Event::ExtensionStates {
-                        states: [(
-                            "codemode".into(),
-                            pi_rs::ExtensionState { version: 1, data },
-                        )]
-                        .into(),
-                    });
+                )
+                && deleted.iter().all(Value::is_string)
+            {
+                for key in deleted.iter().filter_map(Value::as_str) {
+                    branch.store.remove(key);
                 }
+                branch
+                    .store
+                    .extend(set.iter().map(|(key, value)| (key.clone(), value.clone())));
+                let data = serde_json::to_value(&branch.store)?;
+                if data.to_string().len() > 4 * 1024 * 1024 {
+                    return Err(Error::Session(
+                        "imported codemode store exceeds size limit".into(),
+                    ));
+                }
+                events.push(Event::ExtensionStates {
+                    states: [(
+                        "codemode".into(),
+                        pi_rs::ExtensionState { version: 1, data },
+                    )]
+                    .into(),
+                });
             }
         }
         "usage" => {
