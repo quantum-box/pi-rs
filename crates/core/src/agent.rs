@@ -1271,7 +1271,7 @@ impl Agent<'_> {
             let (requests, mut incoming) = mpsc::channel(32);
             let (updates, mut progress) = mpsc::channel::<crate::LifecycleEvent>(32);
             let (finish_progress, mut finish_signal) = oneshot::channel();
-            let (progress_events, mut observed_progress) = mpsc::unbounded_channel();
+            let (progress_events, mut observed_progress) = mpsc::channel(32);
             let progress_registry = self.registry.clone();
             let progress_states = states.clone();
             let progress_cancel = cancel.clone();
@@ -1288,7 +1288,7 @@ impl Agent<'_> {
                         }
                         event = progress.recv() => match event { Some(event) => event, None => break },
                     };
-                    let _ = progress_events.send(event.clone());
+                    let _ = progress_events.send(event.clone()).await;
                     if !observe_progress {
                         continue;
                     }
@@ -1379,21 +1379,39 @@ impl Agent<'_> {
                             }
                             batch.push(request);
                         }
-                        let nested = self.nested_tools(session, batch, states, observer, inputs.as_deref_mut());
-                        tokio::pin!(nested);
-                        tokio::select! {
-                            result = &mut nested => {
-                                if let Err(error) = result { nested_error.get_or_insert(error); }
-                            },
-                            completed = &mut outcomes => {
-                                if let Err(error) = nested.await { nested_error.get_or_insert(error); }
-                                break completed;
+                        // The nested future also emits notifications. Share the observer so
+                        // sibling progress can be forwarded while that future is pending.
+                        let completed = {
+                            let shared = std::sync::Mutex::new(&mut *observer);
+                            let mut nested_observer = |event: Notification<'_>| {
+                                (shared.lock().expect("observer"))(event);
+                            };
+                            let nested = self.nested_tools(session, batch, states, &mut nested_observer, inputs.as_deref_mut());
+                            tokio::pin!(nested);
+                            let mut completed = None;
+                            loop {
+                                tokio::select! {
+                                    result = &mut nested => {
+                                        if let Err(error) = result { nested_error.get_or_insert(error); }
+                                        break completed;
+                                    },
+                                    result = &mut outcomes, if completed.is_none() => completed = Some(result),
+                                    Some(event) = observed_progress.recv() => {
+                                        (shared.lock().expect("observer"))(Notification::ToolProgress(&event));
+                                    }
+                                }
                             }
-                        }
+                        };
+                        if let Some(completed) = completed { break completed; }
                     }
                 }
             };
             let _ = finish_progress.send(());
+            // The worker may be blocked on the bounded forwarding queue. Drain
+            // it until the sender closes before joining the worker.
+            while let Some(event) = observed_progress.recv().await {
+                observer(Notification::ToolProgress(&event));
+            }
             {
                 match progress_worker.await {
                     Ok(errors) => {
@@ -1411,9 +1429,6 @@ impl Agent<'_> {
                         message: &error.to_string(),
                     }),
                 }
-            }
-            while let Ok(event) = observed_progress.try_recv() {
-                observer(Notification::ToolProgress(&event));
             }
             let mut first_error = None;
             // All started outcomes are recorded even if one parallel member failed.

@@ -524,7 +524,6 @@ async fn progress_hook_does_not_suspend_running_tool() {
 async fn sibling_progress_is_delivered_while_nested_tool_runs() {
     struct Parent {
         started: Arc<tokio::sync::Notify>,
-        observed: Arc<tokio::sync::Notify>,
     }
     struct Slow {
         observed: Arc<tokio::sync::Notify>,
@@ -620,9 +619,6 @@ async fn sibling_progress_is_delivered_while_nested_tool_runs() {
                 self.parent.started.notify_one();
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            if let LifecycleEvent::ToolExecutionUpdate { .. } = event {
-                self.parent.observed.notify_one();
-            }
             self.events
                 .lock()
                 .unwrap()
@@ -638,9 +634,10 @@ async fn sibling_progress_is_delivered_while_nested_tool_runs() {
         .register(Arc::new(Hooks {
             parent: Arc::new(Parent {
                 started: started.clone(),
+            }),
+            slow: Arc::new(Slow {
                 observed: observed.clone(),
             }),
-            slow: Arc::new(Slow { observed }),
             events: events.clone(),
             callback_lock: tokio::sync::Mutex::new(()),
         }))
@@ -651,16 +648,33 @@ async fn sibling_progress_is_delivered_while_nested_tool_runs() {
     ]);
     let mut session = Session::with_store(MemoryStore::default()).unwrap();
     let (_, mut inputs) = mpsc::channel::<String>(1);
+    let observed_events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = observed_events.clone();
+    let mut observer = |event: Notification<'_>| {
+        if let Notification::ToolProgress(event) = event {
+            let value = serde_json::to_value(event).unwrap();
+            if value["toolCallId"] == "call-1" {
+                recorded.lock().unwrap().push(value);
+                observed.notify_one();
+            }
+        }
+    };
     agent(&model, &registry)
         .run(
             &mut session,
             Some("hello".into()),
             &mut inputs,
             &CancellationToken::new(),
-            &mut ignore,
+            &mut observer,
         )
         .await
         .unwrap();
+    let observed_events = observed_events.lock().unwrap();
+    assert_eq!(observed_events.len(), 1);
+    assert_eq!(
+        observed_events[0]["partialResult"],
+        json!({"text":"working"})
+    );
     let events = events.lock().unwrap();
     assert!(
         events.iter().any(
@@ -3358,4 +3372,82 @@ async fn tool_progress_reaches_observer_without_extension_hooks_before_completio
         json!({"type":"tool_execution_update","toolCallId":"call-0","toolName":"lookup","args":{"id":"x"},"partialResult":{"content":[{"type":"text","text":"halfway"}]}})
     );
     assert_eq!(events[2]["type"], "end");
+}
+
+#[tokio::test]
+async fn bounded_tool_progress_queue_drains_before_worker_join() {
+    struct Burst;
+    #[async_trait::async_trait]
+    impl Tool for Burst {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "burst".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            for index in 0..100 {
+                loop {
+                    match host.report_progress(json!({"index":index})).await {
+                        Ok(()) => break,
+                        Err(error) if error.contains("queue is full") => {
+                            tokio::task::yield_now().await
+                        }
+                        Err(error) => panic!("unexpected progress failure: {error}"),
+                    }
+                }
+            }
+            Outcome::Succeeded("done".into())
+        }
+    }
+    struct BurstExtension;
+    #[async_trait::async_trait]
+    impl Extension for BurstExtension {
+        fn id(&self) -> &str {
+            "burst"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(Burst)]
+        }
+    }
+    let mut registry = Registry::default();
+    registry.register(Arc::new(BurstExtension)).unwrap();
+    let model = Script::new(vec![tool_reply(&[r#"{"id":"x"}"#]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let mut indices = Vec::new();
+    let mut observer = |event: Notification<'_>| {
+        if let Notification::ToolProgress(LifecycleEvent::ToolExecutionUpdate {
+            partial_result,
+            ..
+        }) = event
+        {
+            indices.push(partial_result["index"].as_u64().unwrap());
+        }
+    };
+    let cancellation = CancellationToken::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("hello".into()),
+            &mut inputs,
+            &cancellation,
+            &mut observer,
+        ),
+    )
+    .await
+    .expect("progress worker must finish")
+    .unwrap();
+    assert_eq!(indices, (0..100).collect::<Vec<_>>());
 }
