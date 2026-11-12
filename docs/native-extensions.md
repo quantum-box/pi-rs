@@ -317,3 +317,8 @@ Nested tool calls include their parent tool-call ID. Executable extensions
 advertise this capability with `tool_execution_lifecycle_hook`.
 Parallel calls currently emit end notifications in journal order after the
 batch settles; streaming updates and completion-order notifications remain open.
+
+Lifecycle and tree-navigation payload fields use Pi's camelCase names, such as
+`previousSessionFile`, `entryId`, `turnIndex`, and `customInstructions`.
+The Rust decoder also accepts the earlier snake_case names when reading
+executable extension responses and saved protocol payloads.

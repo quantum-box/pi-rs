@@ -11,25 +11,34 @@ use crate::{
 
 /// Branch navigation as selected by the user, before any session changes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TreePreparation {
+    #[serde(alias = "target_id")]
     pub target_id: u64,
+    #[serde(alias = "old_leaf_id")]
     pub old_leaf_id: u64,
+    #[serde(alias = "common_ancestor_id")]
     pub common_ancestor_id: Option<u64>,
+    #[serde(alias = "entries_to_summarize")]
     pub entries_to_summarize: Vec<Record>,
+    #[serde(alias = "user_wants_summary")]
     pub user_wants_summary: bool,
+    #[serde(alias = "custom_instructions")]
     pub custom_instructions: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "replace_instructions")]
     pub replace_instructions: bool,
     #[serde(default)]
     pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct TreeDecision {
     pub cancel: bool,
     pub summary: Option<TreeSummary>,
+    #[serde(alias = "custom_instructions")]
     pub custom_instructions: Option<String>,
+    #[serde(alias = "replace_instructions")]
     pub replace_instructions: Option<bool>,
     pub label: Option<String>,
 }
@@ -104,10 +113,12 @@ pub enum BeforeSessionTransition {
     #[serde(rename = "session_before_switch")]
     Switch {
         reason: SessionSwitchReason,
+        #[serde(rename = "targetSessionFile", alias = "target_session_file")]
         target_session_file: Option<PathBuf>,
     },
     #[serde(rename = "session_before_fork")]
     Fork {
+        #[serde(rename = "entryId", alias = "entry_id")]
         entry_id: u64,
         position: ForkPosition,
     },
@@ -160,19 +171,25 @@ pub enum LifecycleEvent {
     },
     SessionStart {
         reason: SessionStartReason,
+        #[serde(rename = "previousSessionFile", alias = "previous_session_file")]
         previous_session_file: Option<PathBuf>,
     },
     SessionShutdown {
         reason: SessionShutdownReason,
+        #[serde(rename = "targetSessionFile", alias = "target_session_file")]
         target_session_file: Option<PathBuf>,
     },
     AgentStart {
+        #[serde(rename = "sessionId", alias = "session_id")]
         session_id: Uuid,
+        #[serde(rename = "runId", alias = "run_id")]
         run_id: Uuid,
         model: String,
     },
     AgentEnd {
+        #[serde(rename = "sessionId", alias = "session_id")]
         session_id: Uuid,
+        #[serde(rename = "runId", alias = "run_id")]
         run_id: Uuid,
         state: RunState,
         messages: Vec<LifecycleMessage>,
@@ -182,13 +199,17 @@ pub enum LifecycleEvent {
         aborted: bool,
     },
     TurnStart {
+        #[serde(rename = "runId", alias = "run_id")]
         run_id: Uuid,
+        #[serde(rename = "turnIndex", alias = "turn_index")]
         turn_index: u32,
         timestamp: u64,
         recovered: bool,
     },
     TurnEnd {
+        #[serde(rename = "runId", alias = "run_id")]
         run_id: Uuid,
+        #[serde(rename = "turnIndex", alias = "turn_index")]
         turn_index: u32,
         messages: Vec<LifecycleMessage>,
     },
@@ -215,15 +236,21 @@ pub enum LifecycleEvent {
         parent_tool_call_id: Option<String>,
     },
     SessionTree {
+        #[serde(rename = "newLeafId", alias = "new_leaf_id")]
         new_leaf_id: u64,
+        #[serde(rename = "oldLeafId", alias = "old_leaf_id")]
         old_leaf_id: u64,
+        #[serde(rename = "summaryEntry", alias = "summary_entry")]
         summary_entry: Option<Box<Record>>,
+        #[serde(rename = "fromExtension", alias = "from_extension")]
         from_extension: Option<bool>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LifecycleMessage {
+    #[serde(alias = "record_id")]
     pub record_id: u64,
     pub message: Message,
 }
@@ -322,5 +349,79 @@ pub async fn notify(
             event: event.kind(),
             message: &error,
         });
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn transition_and_lifecycle_fields_use_pi_names() {
+        let fork = BeforeSessionTransition::Fork {
+            entry_id: 42,
+            position: ForkPosition::Before,
+        };
+        assert_eq!(
+            serde_json::to_value(&fork).unwrap(),
+            json!({"type":"session_before_fork","entryId":42,"position":"before"})
+        );
+        assert!(
+            serde_json::from_value::<BeforeSessionTransition>(
+                json!({"type":"session_before_fork","entry_id":42,"position":"before"})
+            )
+            .is_ok()
+        );
+        let start = LifecycleEvent::SessionStart {
+            reason: SessionStartReason::Resume,
+            previous_session_file: Some("previous.jsonl".into()),
+        };
+        let value = serde_json::to_value(&start).unwrap();
+        assert_eq!(value["previousSessionFile"], "previous.jsonl");
+        assert!(value.get("previous_session_file").is_none());
+        let tree = LifecycleEvent::SessionTree {
+            new_leaf_id: 4,
+            old_leaf_id: 2,
+            summary_entry: None,
+            from_extension: Some(true),
+        };
+        let value = serde_json::to_value(&tree).unwrap();
+        assert_eq!(value["newLeafId"], 4);
+        assert_eq!(value["oldLeafId"], 2);
+        assert_eq!(value["fromExtension"], true);
+        assert!(value.get("summary_entry").is_none());
+    }
+
+    #[test]
+    fn tree_decisions_accept_pi_and_previous_native_field_names() {
+        for value in [
+            json!({"customInstructions":"custom","replaceInstructions":true}),
+            json!({"custom_instructions":"custom","replace_instructions":true}),
+        ] {
+            let decision: TreeDecision = serde_json::from_value(value).unwrap();
+            assert_eq!(decision.custom_instructions.as_deref(), Some("custom"));
+            assert_eq!(decision.replace_instructions, Some(true));
+            let encoded = serde_json::to_value(decision).unwrap();
+            assert_eq!(encoded["customInstructions"], "custom");
+            assert_eq!(encoded["replaceInstructions"], true);
+        }
+        let preparation = TreePreparation {
+            target_id: 3,
+            old_leaf_id: 5,
+            common_ancestor_id: Some(2),
+            entries_to_summarize: Vec::new(),
+            user_wants_summary: true,
+            custom_instructions: Some("custom".into()),
+            replace_instructions: false,
+            label: None,
+        };
+        let encoded = serde_json::to_value(preparation).unwrap();
+        assert_eq!(encoded["targetId"], 3);
+        assert_eq!(encoded["oldLeafId"], 5);
+        assert_eq!(encoded["commonAncestorId"], 2);
+        assert_eq!(encoded["userWantsSummary"], true);
+        assert_eq!(encoded["customInstructions"], "custom");
+        assert!(encoded.get("target_id").is_none());
     }
 }
