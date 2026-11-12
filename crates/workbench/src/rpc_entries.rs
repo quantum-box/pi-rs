@@ -446,7 +446,7 @@ impl Cursor {
                 }
                 Some(value)
             }
-            Event::CustomMessage { message, .. } => {
+            Event::CustomMessage { message } => {
                 let mut value = json!({"type":"custom_message", "customType":message.custom_type, "content":message.content, "display":message.display});
                 if let Some(details) = &message.details {
                     value["details"] = details.clone();

@@ -184,9 +184,6 @@ pub enum Event {
     CustomMessage {
         #[serde(flatten)]
         message: crate::CustomMessage,
-        /// Distinguishes legacy imported message roles from native extension messages.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        legacy_source: Option<bool>,
     },
     ModelSelected {
         model: String,
@@ -1050,10 +1047,7 @@ impl Session {
     pub fn append_custom_message(&mut self, message: crate::CustomMessage) -> Result<()> {
         self.ensure_settled()?;
         validate_custom_message(&message)?;
-        self.append(Event::CustomMessage {
-            message,
-            legacy_source: Some(false),
-        })?;
+        self.append(Event::CustomMessage { message })?;
         Ok(())
     }
 
@@ -1399,6 +1393,20 @@ impl Session {
             return Err(Error::Session(
                 "journal write failed; reopen before continuing".into(),
             ));
+        }
+        // A native message branching directly from a legacy Pi source needs a
+        // distinct parent, even if its content is identical to the old message.
+        if matches!(&event, Event::CustomMessage { .. })
+            && self.records.get(self.head.saturating_sub(1) as usize).is_some_and(|record| {
+                matches!(&record.event, Event::SourceEntry { format, entry }
+                    if format == "pi" && entry["type"] == "message"
+                        && matches!(entry["message"]["role"].as_str(), Some("custom" | "hookMessage")))
+            })
+        {
+            self.append(Event::SourceEntry {
+                format: "pi-rs:native-custom-message".into(),
+                entry: serde_json::Value::Null,
+            })?;
         }
         let id = self.records.len() as u64 + 1;
         let next_head = match event {
@@ -1973,7 +1981,7 @@ fn conversation_entries_since(
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
-            Event::CustomMessage { message, .. } => messages.push((record.id, project_content(Message::User { content: String::new() }, &message.content))),
+            Event::CustomMessage { message } => messages.push((record.id, project_content(Message::User { content: String::new() }, &message.content))),
             Event::User { content, .. } => messages.push((
                 record.id,
                 Message::User {

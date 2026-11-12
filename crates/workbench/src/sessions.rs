@@ -341,13 +341,10 @@ pub fn html(session: &Session) -> String {
                 content, images, ..
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
-            Event::CustomMessage {
-                message,
-                legacy_source,
-            } => {
-                // Older journals have no provenance field; match their converted
-                // content against the immediately preceding source entry.
-                let legacy = legacy_source.unwrap_or_else(|| {
+            Event::CustomMessage { message } => {
+                // Older unmarked journals are ambiguous when a native message
+                // exactly matches the legacy source. Prefer hiding that content.
+                let legacy = {
                     record
                         .parent
                         .and_then(|id| id.checked_sub(1))
@@ -376,7 +373,7 @@ pub fn html(session: &Session) -> String {
                             }
                             _ => false,
                         })
-                });
+                };
                 let show = message.display || !legacy;
                 if !show {
                     continue;
@@ -1389,27 +1386,50 @@ mod tests {
     }
 
     #[test]
-    fn html_reads_legacy_journals_without_custom_message_provenance() {
+    fn html_hides_ambiguous_unmarked_native_message_matching_legacy_source() {
         let mut fixture = tempfile::NamedTempFile::new().unwrap();
         for entry in [
             serde_json::json!({"type":"session","version":3}),
-            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"old hidden","display":false}}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"ambiguous private content","display":false}}),
         ] {
             writeln!(fixture, "{entry}").unwrap();
         }
         let imported = super::super::session_import::read(fixture.path()).unwrap();
-        let mut values = serde_json::to_value(imported.records()).unwrap();
-        let removed = values.as_array_mut().unwrap().iter_mut().any(|record| {
-            record["event"]["type"] == "custom_message"
-                && record["event"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("legacy_source")
-                    .is_some()
+        let source = imported
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a"
+                )
+            })
+            .unwrap()
+            .id;
+        let mut records = imported.fork_records(source).unwrap();
+        let parent = records.last().unwrap().id;
+        // Simulate an old native append without the new associated source marker.
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: 2,
+            id: parent + 1,
+            parent: Some(parent),
+            event: Event::CustomMessage {
+                message: pi_rs::CustomMessage {
+                    custom_type: String::new(),
+                    content: pi_rs::ContextContent::Text("ambiguous private content".into()),
+                    display: false,
+                    details: None,
+                },
+            },
         });
-        assert!(removed);
-        let old = Session::from_records(serde_json::from_value(values).unwrap()).unwrap();
-        assert!(!html(&old).contains("old hidden"));
+        let mut wire = serde_json::to_value(&records).unwrap();
+        // Journals produced by the interim optional-field format remain readable.
+        wire.as_array_mut().unwrap().last_mut().unwrap()["event"]["legacy_source"] =
+            serde_json::json!(false);
+        let decoded: Vec<pi_rs::Record> = serde_json::from_value(wire).unwrap();
+        let old = Session::from_records(decoded).unwrap();
+        assert!(!html(&old).contains("ambiguous private content"));
     }
 
     #[test]

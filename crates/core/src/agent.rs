@@ -2161,10 +2161,7 @@ impl Agent<'_> {
                 crate::ExtensionCommandAction::Entry { entry } => Event::CustomEntry { entry },
                 crate::ExtensionCommandAction::Message { message }
                 | crate::ExtensionCommandAction::TriggerMessage { message } => {
-                    Event::CustomMessage {
-                        message,
-                        legacy_source: Some(false),
-                    }
+                    Event::CustomMessage { message }
                 }
             };
             commit(session, event, observer)?;
