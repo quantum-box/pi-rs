@@ -206,10 +206,16 @@ impl Provider {
                 Ok(Client::Google(client))
             }
             Adapter::Bedrock => {
-                if token.is_some() || !endpoint.is_empty() {
-                    return Err(Error::Config("Bedrock supports AWS credential chain authentication only; configure AWS_PROFILE and AWS_REGION".into()));
+                if !endpoint.is_empty() {
+                    return Err(Error::Config(
+                        "custom Bedrock model endpoints are not supported".into(),
+                    ));
                 }
-                Ok(Client::Bedrock(pi_rs::bedrock::Bedrock::from_env()))
+                let mut client = pi_rs::bedrock::Bedrock::from_env();
+                if let Some(token) = token {
+                    client = client.with_bearer_token(token)?;
+                }
+                Ok(Client::Bedrock(client))
             }
             Adapter::PiMessages => {
                 if self == &Self::Radius {
@@ -733,6 +739,11 @@ impl Client {
                 Self::OpenAi(client)
             }
             Self::Bedrock(client) => {
+                let name = args
+                    .model_profiles
+                    .model(&args.provider, &args.model)
+                    .and_then(|model| model.name);
+                let client = client.with_model_name(&args.model, name.as_deref());
                 Self::Bedrock(if thinking.is_some_and(|level| level != "off") {
                     client.unsupported("Bedrock thinking controls are not supported")
                 } else {

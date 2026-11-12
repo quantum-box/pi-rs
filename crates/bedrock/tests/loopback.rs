@@ -95,6 +95,10 @@ async fn converse_stream_sends_signed_request_and_collects_tool_and_usage() {
         assert_eq!(results[1]["toolResult"]["toolUseId"], id1);
         assert_eq!(results[0]["toolResult"]["content"][0]["text"], "<empty>");
         assert_eq!(
+            results[1]["toolResult"]["content"][1]["image"]["source"]["bytes"],
+            "aGVsbG8="
+        );
+        assert_eq!(
             body["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]["minimum"],
             -1
         );
@@ -189,9 +193,9 @@ async fn converse_stream_sends_signed_request_and_collects_tool_and_usage() {
             },
             Message::Tool {
                 call_id: format!("{}?", "a".repeat(70)),
-                content: "done".into(),
+                content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="}]}}).to_string(),
                 is_error: false,
-                is_structured: Some(false),
+                is_structured: Some(true),
             },
             Message::Tool {
                 call_id: "empty".into(),
