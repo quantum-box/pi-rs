@@ -1537,6 +1537,7 @@ impl View {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 if self.mouse.contains_row(event.row) =>
             {
+                self.link_press = None;
                 let direction = if event.kind == MouseEventKind::ScrollUp {
                     -1
                 } else {
@@ -1576,6 +1577,7 @@ impl View {
                 self.scrollbar_activity = Some(now);
             }
             MouseEventKind::Down(MouseButton::Right) if self.search.is_none() => {
+                self.link_press = None;
                 self.paste_clipboard(args);
             }
             MouseEventKind::Down(MouseButton::Left) if self.search.is_none() => {
@@ -1586,6 +1588,9 @@ impl View {
                     .flatten()
                     .map(|id| (id, event.column, event.row));
                 let single = self.mouse.press(event.column, event.row, now);
+                if self.hyperlink_at(event.column, event.row).is_some() {
+                    self.panel_press = None;
+                }
                 self.link_press = (single && event.modifiers.is_empty())
                     .then(|| self.hyperlink_at(event.column, event.row))
                     .flatten()
@@ -1600,7 +1605,7 @@ impl View {
                 let default_expanded = self.expand_tools;
                 if let Some(url) = self.released_link(event.column, event.row) {
                     self.panel_press = None;
-                    self.mouse.clear();
+                    self.mouse.clear_gesture();
                     tokio::spawn(async move {
                         let _ = pi_rs_workbench::oauth_callback::open_browser(&url).await;
                     });

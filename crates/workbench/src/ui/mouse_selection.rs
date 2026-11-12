@@ -73,6 +73,10 @@ impl MouseSelection {
         self.last_click = None;
     }
 
+    pub fn clear_gesture(&mut self) {
+        self.gesture = None;
+    }
+
     pub fn focus_lost(&mut self) {
         if self
             .gesture
@@ -251,6 +255,21 @@ impl MouseSelection {
 mod tests {
     use super::*;
     use crossterm::style::Color;
+
+    #[test]
+    fn clearing_link_gesture_keeps_multi_click_history() {
+        let mut selection = MouseSelection::default();
+        selection.update(&[Line::plain("linked text", Color::Reset)], 0, 0..1);
+        let now = Instant::now();
+        assert!(selection.press(1, 0, now));
+        selection.clear_gesture();
+        assert!(!selection.press(1, 0, now + Duration::from_millis(100)));
+        assert!(selection.release(1, 0));
+        assert_eq!(selection.text().as_deref(), Some("linked"));
+        assert!(!selection.press(1, 0, now + Duration::from_millis(200)));
+        assert!(selection.release(1, 0));
+        assert_eq!(selection.text().as_deref(), Some("linked text"));
+    }
 
     #[test]
     fn copies_wide_glyphs_and_multirow_selection_in_either_direction() {
