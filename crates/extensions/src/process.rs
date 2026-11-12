@@ -38,6 +38,7 @@ struct Endpoint {
     path: PathBuf,
     flags: Option<Arc<str>>,
     pi_lifecycle_fields: bool,
+    text_result_v2: bool,
 }
 
 impl Endpoint {
@@ -223,6 +224,8 @@ enum ProtocolRequest {
         outcome: Outcome,
         operation_id: String,
         state: Option<ExtensionState>,
+        #[serde(default)]
+        text_result_v2: bool,
     },
     BeforeCompaction {
         summary: String,
@@ -258,6 +261,8 @@ struct Description {
     input_hook: bool,
     #[serde(default)]
     tool_result_hook: bool,
+    #[serde(default)]
+    text_result_v2: bool,
     #[serde(default)]
     tool_call_hook: bool,
     #[serde(default)]
@@ -352,6 +357,7 @@ impl ExecutableExtension {
             path: executable,
             flags: None,
             pi_lifecycle_fields: false,
+            text_result_v2: false,
         };
         let description =
             call(&endpoint, ProtocolRequest::Describe, None).map_err(Error::Config)?;
@@ -360,6 +366,7 @@ impl ExecutableExtension {
             description,
         };
         extension.endpoint.pi_lifecycle_fields = extension.description.pi_lifecycle_fields;
+        extension.endpoint.text_result_v2 = extension.description.text_result_v2;
         extension.apply_flags(&mut BTreeMap::new())?;
         Ok(extension)
     }
@@ -841,19 +848,54 @@ impl Extension for ExecutableExtension {
         context: &ToolContext,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<Outcome>> {
+        let legacy = !self.endpoint.text_result_v2;
+        let sent = if legacy {
+            outcome.legacy_text_result()
+        } else {
+            outcome.clone()
+        };
         let request = ProtocolRequest::ToolResult {
             call: call_data.clone(),
-            outcome: outcome.clone(),
+            outcome: sent.clone(),
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
+            text_result_v2: !legacy,
         };
         let path = self.endpoint.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
         let cancelled = guard.0.clone();
-        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
-            .await
-            .map_err(|error| error.to_string())?
+        let updated: Option<Outcome> =
+            tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+                .await
+                .map_err(|error| error.to_string())??;
+        // An older executable cannot represent patched failure metadata. Preserve
+        // it when the old hook makes no change, or changes only the text.
+        if legacy
+            && let Outcome::TextResult {
+                output, details, ..
+            } = outcome
+        {
+            return Ok(updated.map(|result| {
+                if result == sent {
+                    return outcome.clone();
+                }
+                match result {
+                    Outcome::Failed(text) => Outcome::TextResult {
+                        output: if text == *output {
+                            output.clone()
+                        } else {
+                            text
+                        },
+                        details: details.clone(),
+                        is_error: true,
+                    },
+                    other => other,
+                }
+            }));
+        }
+        Ok(updated)
     }
+
     fn after_tool(
         &self,
         name: &str,
@@ -862,7 +904,11 @@ impl Extension for ExecutableExtension {
     ) -> ExtensionResult<Option<ExtensionState>> {
         self.request(ProtocolRequest::AfterTool {
             name: name.into(),
-            outcome: outcome.clone(),
+            outcome: if self.endpoint.text_result_v2 {
+                outcome.clone()
+            } else {
+                outcome.legacy_text_result()
+            },
             state: state.cloned(),
         })
     }
@@ -1502,8 +1548,18 @@ fn call<T: serde::de::DeserializeOwned>(
     request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
-    let bytes = serde_json::to_vec(&wire_request(&request, endpoint.pi_lifecycle_fields)?)
-        .map_err(|error| error.to_string())?;
+    let mut wire = wire_request(&request, endpoint.pi_lifecycle_fields)?;
+    if !endpoint.text_result_v2
+        && wire["type"] == "lifecycle"
+        && wire["event"]["type"] == "tool_execution_end"
+    {
+        let result = &mut wire["event"]["result"];
+        if let Ok(outcome) = serde_json::from_value::<Outcome>(result.clone()) {
+            *result = serde_json::to_value(outcome.legacy_text_result())
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let bytes = serde_json::to_vec(&wire).map_err(|error| error.to_string())?;
     if bytes.len() as u64 > MAX_REQUEST {
         return Err("extension request exceeds 64 MiB".into());
     }
@@ -1726,6 +1782,7 @@ async fn dispatch_with_host(
             command_effects: extension.supports_command_effects(),
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
+            text_result_v2: true,
             tool_call_hook: extension.handles_tool_call(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
@@ -1928,10 +1985,18 @@ async fn dispatch_with_host(
             outcome,
             operation_id,
             state,
+            text_result_v2,
         } => encode(
             extension
                 .tool_result_update(&call, &outcome, &context(&operation_id)?, state.as_ref())
-                .await,
+                .await
+                .map(|result| {
+                    if text_result_v2 {
+                        result
+                    } else {
+                        result.map(|outcome| outcome.legacy_text_result())
+                    }
+                }),
         ),
         ProtocolRequest::BeforeCompaction {
             summary,
@@ -2203,6 +2268,7 @@ mod tests {
                 outcome: Outcome::Succeeded("original".into()),
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
+                text_result_v2: true,
             },
         )
         .await
@@ -2251,6 +2317,7 @@ mod tests {
                 },
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
+                text_result_v2: true,
             },
         )
         .await
@@ -2299,13 +2366,106 @@ mod tests {
                 outcome: Outcome::Failed("original".into()),
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
+                text_result_v2: true,
             },
         )
         .await
         .unwrap();
         assert_eq!(
             serde_json::from_value::<Option<Outcome>>(result).unwrap(),
-            Some(Outcome::Failed("changed".into()))
+            Some(Outcome::TextResult {
+                output: "changed".into(),
+                details: None,
+                is_error: true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn older_host_receives_legacy_result_from_new_extension() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "hook"
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatchV2>> {
+                Ok(Some(pi_rs_core::ToolResultPatchV2 {
+                    output: Some("fixed".into()),
+                    details: Some(serde_json::json!({"code": 42})),
+                    is_error: Some(true),
+                }))
+            }
+        }
+        let raw = serde_json::json!({"type":"tool_result", "call":{"id":"id", "name":"tool", "arguments":"{}"}, "outcome":{"status":"failed","detail":"bad"}, "operation_id":"00000000-0000-4000-8000-000000000001", "state":null});
+        let request = serde_json::from_value(raw).unwrap();
+        let response = dispatch(Arc::new(Hook), request).await.unwrap();
+        assert_eq!(
+            serde_json::from_value::<Option<Outcome>>(response).unwrap(),
+            Some(Outcome::Failed("fixed".into()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_result_patch_chain_and_legacy_negotiation() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json, sys, os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':name!='legacy'}
+elif r['type']=='tool_result':
+    o=r['outcome']
+    if name=='first':
+        assert o['status']=='failed' and r['text_result_v2']
+        value={'status':'text_result','detail':{'output':'exact','details':{'code':42},'is_error':True}}
+    elif name=='second':
+        assert o['detail']=={'output':'legacy changed','details':{'code':42},'is_error':True}
+        value={'status':'text_result','detail':{'output':'legacy changed','details':{'code':42},'is_error':False}}
+    else:
+        assert o['status']=='failed' and o['detail']=='exact'
+        value={'status':'failed','detail':'legacy changed'}
+else:
+    raise RuntimeError(r['type'])
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let mut extensions = Vec::new();
+        for name in ["first", "legacy", "second"] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            extensions.push(ExecutableExtension::load(path).unwrap());
+        }
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let mut outcome = Outcome::Failed("original".into());
+        for ext in extensions {
+            outcome = ext
+                .tool_result_update(&call, &outcome, &context, None)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(outcome.tool_content(), "legacy changed");
+        assert!(!outcome.is_error());
+        assert!(
+            matches!(outcome, Outcome::TextResult { details: Some(details), .. } if details["code"] == 42)
         );
     }
 

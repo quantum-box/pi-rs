@@ -78,13 +78,14 @@ Use stable extension IDs and explicit state versions. Let the host select the
 allowed tools and register policy extensions before tools.
 
 For successful or failed text results, opt in with `handles_tool_result` and
-implement `tool_result_patch` to change output or details independently. Omitted fields
-retain their previous values, and handlers see earlier handlers' changes. This
-also works for executable extensions and preserves the existing full-outcome
-`tool_result` hook. Failure outcomes retain their status and cannot carry
-details in the native outcome representation.
-Patches to other outcome types are reported as hook errors;
-use the full-outcome hook for those results.
+implement `tool_result_patch` to change output or details. Implement
+`tool_result_patch_v2` to also change `is_error` independently. Omitted fields
+retain their previous values, and handlers see earlier handlers' changes.
+Patched output is passed verbatim to the model, while details stay outside model
+context. This works for executable extensions. Existing patch hooks continue to
+work; older executables receive a lossy legacy projection of patched failures,
+which cannot represent failure details. Patches to non-text outcomes are
+reported as hook errors; use the full-outcome hook for those results.
 
 Extensions can intercept user-entered `!` and `!!` shell commands by opting in
 with `handles_user_bash` and implementing `user_bash`. The event includes the

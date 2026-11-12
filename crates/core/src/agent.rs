@@ -1464,10 +1464,7 @@ impl Agent<'_> {
                                 _ => None,
                             })
                 {
-                    let is_error = matches!(
-                        &result,
-                        Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-                    ) || matches!(&result, Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } if data["isError"] == true);
+                    let is_error = result.is_error();
                     self.observe_lifecycle(
                         crate::LifecycleEvent::ToolExecutionEnd {
                             tool_call_id: invocation.call.id.clone(),
@@ -1826,6 +1823,18 @@ impl Agent<'_> {
                 if size > max_output_bytes {
                     Outcome::Truncated {
                         original_bytes: size,
+                    }
+                } else {
+                    outcome
+                }
+            }
+            outcome @ Outcome::TextResult { .. } => {
+                let size = serde_json::to_vec(&outcome)?.len();
+                if size > max_output_bytes {
+                    Outcome::TextResult {
+                        output: format!("Tool output omitted ({size} bytes exceeded the limit)."),
+                        details: None,
+                        is_error: outcome.is_error(),
                     }
                 } else {
                     outcome
@@ -4064,46 +4073,102 @@ mod tree_tests {
                 .unwrap(),
             Outcome::Failed("error".into())
         );
-        assert!(
-            crate::ToolResultPatch {
-                output: None,
-                details: Some(serde_json::json!({}))
+        let patched = crate::ToolResultPatch {
+            output: Some("redacted".into()),
+            details: Some(serde_json::json!({"code": 1})),
+        }
+        .apply(&Outcome::Failed("error".into()))
+        .unwrap();
+        assert_eq!(
+            patched,
+            Outcome::TextResult {
+                output: "redacted".into(),
+                details: Some(serde_json::json!({"code": 1})),
+                is_error: true
             }
-            .apply(&Outcome::Failed("error".into()))
-            .is_err()
+        );
+        assert_eq!(patched.tool_content(), "redacted");
+        let metadata_only = crate::ToolResultPatch {
+            output: None,
+            details: Some(serde_json::json!({"code": 1})),
+        }
+        .apply(&Outcome::Failed("error".into()))
+        .unwrap();
+        assert_eq!(metadata_only.tool_content(), "Tool failed: error");
+        let marked_error = crate::ToolResultPatchV2 {
+            is_error: Some(true),
+            ..Default::default()
+        }
+        .apply(&Outcome::SucceededWithDetails {
+            output: "unchanged".into(),
+            details: serde_json::json!({"source":"tool"}),
+        })
+        .unwrap();
+        assert!(marked_error.is_error());
+        assert_eq!(marked_error.tool_content(), "unchanged");
+        assert!(
+            matches!(marked_error, Outcome::TextResult { details: Some(details), .. } if details["source"] == "tool")
         );
     }
 
     #[tokio::test]
     async fn failed_result_patches_chain_and_preserve_failure() {
-        struct Patch(&'static str);
+        struct Patch(u8);
         #[async_trait::async_trait]
         impl crate::Extension for Patch {
             fn id(&self) -> &str {
-                self.0
+                match self.0 {
+                    0 => "first",
+                    1 => "second",
+                    _ => "third",
+                }
             }
             fn handles_tool_result(&self) -> bool {
                 true
             }
-            async fn tool_result_patch(
+            async fn tool_result_patch_v2(
                 &self,
                 _: &crate::ToolCall,
                 outcome: &Outcome,
                 _: &crate::ToolContext,
                 _: Option<&crate::ExtensionState>,
-            ) -> crate::ExtensionResult<Option<crate::ToolResultPatch>> {
-                let Outcome::Failed(reason) = outcome else {
-                    panic!("failure status lost")
+            ) -> crate::ExtensionResult<Option<crate::ToolResultPatchV2>> {
+                let patch = match self.0 {
+                    0 => {
+                        assert!(outcome.is_error());
+                        crate::ToolResultPatchV2 {
+                            output: Some("exact".into()),
+                            details: Some(serde_json::json!({"code": 1})),
+                            is_error: None,
+                        }
+                    }
+                    1 => {
+                        assert_eq!(outcome.tool_content(), "exact");
+                        assert!(outcome.is_error());
+                        crate::ToolResultPatchV2 {
+                            is_error: Some(false),
+                            ..Default::default()
+                        }
+                    }
+                    _ => {
+                        assert!(!outcome.is_error());
+                        assert!(
+                            matches!(outcome, Outcome::TextResult { details: Some(value), .. } if value["code"] == 1)
+                        );
+                        crate::ToolResultPatchV2 {
+                            output: Some("final".into()),
+                            is_error: Some(true),
+                            ..Default::default()
+                        }
+                    }
                 };
-                Ok(Some(crate::ToolResultPatch {
-                    output: Some(format!("{reason}:{}", self.0)),
-                    details: None,
-                }))
+                Ok(Some(patch))
             }
         }
         let mut registry = Registry::default();
-        registry.register(Arc::new(Patch("first"))).unwrap();
-        registry.register(Arc::new(Patch("second"))).unwrap();
+        for index in 0..3 {
+            registry.register(Arc::new(Patch(index))).unwrap();
+        }
         let agent = Agent {
             model: &NoModel,
             model_name: "fixture",
@@ -4131,7 +4196,17 @@ mod tree_tests {
             .await;
         assert_eq!(
             reply.outcome,
-            Outcome::Failed("original:first:second".into())
+            Outcome::TextResult {
+                output: "final".into(),
+                details: Some(serde_json::json!({"code": 1})),
+                is_error: true
+            }
+        );
+        assert_eq!(reply.outcome.tool_content(), "final");
+        let serialized = serde_json::to_string(&reply.outcome).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Outcome>(&serialized).unwrap(),
+            reply.outcome
         );
     }
 

@@ -2059,6 +2059,13 @@ fn outcome_status(outcome: &Outcome) -> &'static str {
     match outcome {
         Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. } => "succeeded",
         Outcome::Failed(_) => "failed",
+        Outcome::TextResult { is_error, .. } => {
+            if *is_error {
+                "failed"
+            } else {
+                "succeeded"
+            }
+        }
         Outcome::Skipped(_) => "skipped",
         Outcome::Unknown(_) => "unknown",
         Outcome::Pending { .. } => "pending",

@@ -498,10 +498,7 @@ pub(super) fn tool_call_value(call: &ToolCall) -> Value {
 }
 
 pub(super) fn tool_failed(outcome: &Outcome) -> bool {
-    matches!(
-        outcome,
-        Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-    ) || matches!(outcome, Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } if data["isError"] == true)
+    outcome.is_error()
 }
 
 pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value {
@@ -517,6 +514,13 @@ pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value 
         Outcome::SucceededWithDetails { details, .. }
         | Outcome::StructuredWithDetails { details, .. },
     ) = outcome
+    {
+        result["details"] = details.clone();
+    }
+    if let Some(Outcome::TextResult {
+        details: Some(details),
+        ..
+    }) = outcome
     {
         result["details"] = details.clone();
     }
@@ -557,6 +561,26 @@ fn timestamp() -> u64 {
 mod streaming_tool_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn patched_result_projects_verbatim_content_details_and_error() {
+        let result = Outcome::TextResult {
+            output: "exact".into(),
+            details: Some(json!({"code": 42})),
+            is_error: true,
+        };
+        assert!(tool_failed(&result));
+        assert_eq!(
+            tool_result_value(&result.tool_content(), Some(&result)),
+            json!({"content":[{"type":"text","text":"exact"}], "details":{"code":42}})
+        );
+        let success = Outcome::TextResult {
+            output: "recovered".into(),
+            details: None,
+            is_error: false,
+        };
+        assert!(!tool_failed(&success));
+    }
 
     #[test]
     fn tool_progress_is_forwarded_as_pi_event_in_json_mode() {

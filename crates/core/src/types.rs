@@ -658,6 +658,13 @@ pub enum Outcome {
         details: Value,
     },
     Failed(String),
+    /// A patched text result with independent model content, metadata and error status.
+    TextResult {
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        is_error: bool,
+    },
     Skipped(String),
     /// An effect may have occurred. Only an authoritative reconciliation can clear this state.
     Unknown(String),
@@ -688,10 +695,45 @@ pub struct AttachmentRef {
 }
 
 impl Outcome {
+    pub fn is_error(&self) -> bool {
+        match self {
+            Self::Failed(_) | Self::Skipped(_) | Self::Unknown(_) => true,
+            Self::TextResult { is_error, .. } => *is_error,
+            Self::Structured { data, .. } | Self::StructuredWithDetails { data, .. } => {
+                data["isError"] == true
+            }
+            _ => false,
+        }
+    }
+
+    /// Lossy projection for older native executable protocols.
+    pub fn legacy_text_result(&self) -> Self {
+        match self {
+            Self::TextResult {
+                output,
+                details,
+                is_error: false,
+            } => match details {
+                Some(details) => Self::SucceededWithDetails {
+                    output: output.clone(),
+                    details: details.clone(),
+                },
+                None => Self::Succeeded(output.clone()),
+            },
+            Self::TextResult {
+                output,
+                is_error: true,
+                ..
+            } => Self::Failed(output.clone()),
+            _ => self.clone(),
+        }
+    }
+
     pub fn tool_content(&self) -> String {
         match self {
             Self::Succeeded(output) | Self::SucceededWithDetails { output, .. } => output.clone(),
             Self::Failed(reason) => format!("Tool failed: {reason}"),
+            Self::TextResult { output, .. } => output.clone(),
             Self::Skipped(reason) => format!("Tool did not start: {reason}"),
             Self::Unknown(reason) => format!("Tool outcome unknown: {reason}"),
             Self::Pending { .. } => "Tool operation is still pending".into(),

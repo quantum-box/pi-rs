@@ -20,25 +20,58 @@ pub struct ToolResultPatch {
 
 impl ToolResultPatch {
     pub fn apply(self, outcome: &Outcome) -> ExtensionResult<Outcome> {
-        if let Outcome::Failed(reason) = outcome {
-            if self.details.is_some() {
-                return Err("failure outcomes cannot carry details".into());
-            }
-            return Ok(Outcome::Failed(
-                self.output.unwrap_or_else(|| reason.clone()),
-            ));
+        ToolResultPatchV2 {
+            output: self.output,
+            details: self.details,
+            is_error: None,
         }
-        let (output, details) = match outcome {
-            Outcome::Succeeded(output) => (output.clone(), None),
+        .apply(outcome)
+    }
+}
+
+/// Partial text result update with an independently adjustable error status.
+#[derive(Clone, Debug, Default)]
+pub struct ToolResultPatchV2 {
+    pub output: Option<String>,
+    pub details: Option<Value>,
+    pub is_error: Option<bool>,
+}
+
+impl ToolResultPatchV2 {
+    pub fn apply(self, outcome: &Outcome) -> ExtensionResult<Outcome> {
+        let (output, details, is_error) = match outcome {
+            Outcome::Succeeded(output) => (output.clone(), None, false),
             Outcome::SucceededWithDetails { output, details } => {
-                (output.clone(), Some(details.clone()))
+                (output.clone(), Some(details.clone()), false)
             }
-            _ => return Err("text result patch requires a successful text outcome".into()),
+            Outcome::Failed(_) => (outcome.tool_content(), None, true),
+            Outcome::TextResult {
+                output,
+                details,
+                is_error,
+            } => (output.clone(), details.clone(), *is_error),
+            _ => return Err("text result patch requires a text outcome".into()),
         };
+        if self.output.is_none() && self.details.is_none() && self.is_error.is_none() {
+            return Ok(outcome.clone());
+        }
         let output = self.output.unwrap_or(output);
-        Ok(match self.details.or(details) {
-            Some(details) => Outcome::SucceededWithDetails { output, details },
-            None => Outcome::Succeeded(output),
+        let details = self.details.or(details);
+        let is_error = self.is_error.unwrap_or(is_error);
+        if matches!(
+            outcome,
+            Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. }
+        ) && !is_error
+        {
+            return Ok(match details {
+                Some(details) => Outcome::SucceededWithDetails { output, details },
+                None => Outcome::Succeeded(output),
+            });
+        }
+        Ok(Outcome::TextResult {
+            output,
+            details,
+            is_error,
         })
     }
 }
@@ -728,6 +761,25 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
+    /// Patch text, metadata and error status independently. The default delegates
+    /// to the original partial-patch hook for source compatibility.
+    async fn tool_result_patch_v2(
+        &self,
+        call: &crate::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<ToolResultPatchV2>> {
+        Ok(self
+            .tool_result_patch(call, outcome, context, state)
+            .await?
+            .map(|patch| ToolResultPatchV2 {
+                output: patch.output,
+                details: patch.details,
+                is_error: None,
+            }))
+    }
+
     /// Dispatch legacy replacement and partial result hooks in order.
     async fn tool_result_update(
         &self,
@@ -739,7 +791,7 @@ pub trait Extension: Send + Sync {
         let replacement = self.tool_result(call, outcome, context, state).await?;
         let current = replacement.as_ref().unwrap_or(outcome);
         match self
-            .tool_result_patch(call, current, context, state)
+            .tool_result_patch_v2(call, current, context, state)
             .await?
         {
             Some(patch) => patch.apply(current).map(Some),
