@@ -647,7 +647,14 @@ impl Profiles {
         for (name, entry) in providers {
             let builtin = Provider::named(name);
             let provider = if let Some(provider) = &builtin {
-                provider.clone()
+                if provider.id() == "openai" && entry["api"] == "openai-completions" {
+                    Provider::Custom {
+                        id: Arc::from("openai"),
+                        adapter: Adapter::ChatCompletions,
+                    }
+                } else {
+                    provider.clone()
+                }
             } else {
                 let Some(adapter) = custom_adapter(entry) else {
                     continue;
@@ -745,6 +752,7 @@ impl Profiles {
                 }
             }
             if let Some(builtin) = builtin_chat::find(provider.id())
+                && !(provider.id() == "openai" && provider.adapter() != Adapter::OpenAiResponses)
                 && let Some(models) = BUILTIN_MODELS.get(provider.id())
             {
                 for model in models
@@ -814,11 +822,10 @@ impl Profiles {
     }
 
     pub fn provider(&self, name: &str) -> Option<Provider> {
-        Provider::named(name).or_else(|| {
-            self.entries
-                .get(&name.to_ascii_lowercase())
-                .map(|profile| profile.provider.clone())
-        })
+        self.entries
+            .get(&name.to_ascii_lowercase())
+            .map(|profile| profile.provider.clone())
+            .or_else(|| Provider::named(name))
     }
 
     pub fn providers(&self) -> impl Iterator<Item = Provider> + '_ {
@@ -827,11 +834,12 @@ impl Profiles {
             .chain(std::iter::once(
                 Provider::named("openai-chatgpt").expect("ChatGPT provider"),
             ))
-            .chain(
-                builtin_chat::PROVIDERS
-                    .iter()
-                    .map(|builtin| builtin.provider()),
-            )
+            .chain(builtin_chat::PROVIDERS.iter().map(|builtin| {
+                let provider = builtin.provider();
+                self.entries
+                    .get(provider.id())
+                    .map_or(provider.clone(), |profile| profile.provider.clone())
+            }))
             .chain(
                 self.entries
                     .values()
@@ -1051,7 +1059,9 @@ impl Profiles {
             .into_iter()
             .flat_map(|profile| profile.models.iter().map(|model| model.id.clone()))
             .collect();
-        if let Some(models) = BUILTIN_MODELS.get(provider.id()) {
+        if let Some(models) = BUILTIN_MODELS.get(provider.id())
+            && !(provider.id() == "openai" && provider.adapter() != Adapter::OpenAiResponses)
+        {
             let configured: std::collections::BTreeSet<_> = ids.iter().cloned().collect();
             ids.extend(
                 models
@@ -1068,6 +1078,9 @@ impl Profiles {
             .get(provider.id())
             .and_then(|profile| profile.models.iter().find(|model| model.id == id))
             .or_else(|| {
+                if provider.id() == "openai" && provider.adapter() != Adapter::OpenAiResponses {
+                    return None;
+                }
                 BUILTIN_MODELS
                     .get(provider.id())?
                     .iter()
@@ -1222,6 +1235,23 @@ mod tests {
         assert!(levels.contains(&"high".to_owned()));
         assert!(!levels.contains(&"off".to_owned()));
         assert_eq!(reasoning.mapped_effort("high"), Some(Some("high")));
+    }
+
+    #[test]
+    fn existing_openai_completions_profile_preserves_its_adapter_and_models() {
+        let profiles = Profiles::parse(&json!({"providers":{"openai":{
+            "api":"openai-completions", "baseUrl":"https://relay.example/v1",
+            "models":[{"id":"relay-model"}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("openai").unwrap();
+        assert_eq!(provider.adapter(), Adapter::ChatCompletions);
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://relay.example/v1/chat/completions"
+        );
+        assert_eq!(profiles.model_ids(&provider), vec!["relay-model"]);
+        assert!(profiles.providers().any(|candidate| candidate == provider));
     }
 
     #[test]
