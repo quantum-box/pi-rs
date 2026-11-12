@@ -1,7 +1,6 @@
 //! Context files, discoverable skills, and non-executable prompt templates.
 use super::Cli;
 use pi_rs::{Error, Result};
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -30,11 +29,10 @@ pub struct Resources {
     pub extensions: Vec<PathBuf>,
     pub themes: Vec<PathBuf>,
 }
-#[derive(Deserialize, Default)]
+#[derive(Default)]
 struct Frontmatter {
     name: Option<String>,
     description: Option<String>,
-    #[serde(default, rename = "disable-model-invocation")]
     manual: bool,
 }
 impl Resources {
@@ -529,9 +527,22 @@ fn frontmatter(text: &str) -> Result<(Frontmatter, String)> {
         return Ok((Frontmatter::default(), normalized));
     };
     let yaml = normalized.get(4..=end).unwrap_or_default();
-    let metadata = serde_yaml::from_str::<Option<Frontmatter>>(yaml)
-        .map_err(|error| Error::Config(error.to_string()))?
-        .unwrap_or_default();
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|error| Error::Config(error.to_string()))?;
+    let metadata = Frontmatter {
+        name: value
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        description: value
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        manual: value
+            .get("disable-model-invocation")
+            .and_then(|v| v.as_bool())
+            == Some(true),
+    };
     Ok((metadata, normalized[end + 4..].trim().into()))
 }
 fn context_file(
@@ -1118,5 +1129,42 @@ mod tests {
             Some("first line second line\n")
         );
         assert_eq!(body, "Instructions");
+    }
+
+    #[test]
+    fn skill_frontmatter_ignores_wrong_field_types() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill_dir = directory.path().join("fallback-name");
+        std::fs::create_dir(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: [invalid]\ndescription: A usable skill\ndisable-model-invocation: 'true'\n---\nBody",
+        )
+        .unwrap();
+        let (name, skill) = parse_skill(&path).unwrap();
+        assert_eq!(name, "fallback-name");
+        assert!(skill.automatic);
+
+        std::fs::write(
+            &path,
+            "---\nname: 42\ndescription: A usable skill\n---\nBody",
+        )
+        .unwrap();
+        assert_eq!(parse_skill(&path).unwrap().0, "fallback-name");
+        std::fs::write(
+            &path,
+            "---\ndescription: A usable skill\ndisable-model-invocation: true\n---\nBody",
+        )
+        .unwrap();
+        assert!(!parse_skill(&path).unwrap().1.automatic);
+        std::fs::write(&path, "---\ndescription: [invalid]\n---\nBody").unwrap();
+        assert!(
+            parse_skill(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("description is required")
+        );
     }
 }
