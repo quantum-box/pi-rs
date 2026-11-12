@@ -2,7 +2,7 @@
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use encoding_rs::{CoderResult, UTF_8};
+use encoding_rs::{CoderResult, Encoding, UTF_8, UTF_16BE, UTF_16LE};
 
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
@@ -239,18 +239,38 @@ impl Sink for MatchSink<'_> {
 fn read_context_line(
     reader: &mut impl BufRead,
     number: u64,
+    encoding: &'static Encoding,
     cancellation: &CancellationToken,
 ) -> Result<(ContextLine, bool, bool)> {
-    let mut decoder = UTF_8.new_decoder_without_bom_handling();
+    let mut decoder = encoding.new_decoder_without_bom_handling();
     let mut decoded = [0u8; 8192];
     let mut units = Vec::with_capacity(501);
     let mut has_bytes = false;
+    let mut pending_byte = None;
     loop {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let buf = reader.fill_buf()?;
-        let newline = buf.iter().position(|&byte| byte == b'\n');
+        let newline = if encoding == UTF_8 {
+            buf.iter().position(|&byte| byte == b'\n')
+        } else {
+            let mut end = None;
+            for (index, &byte) in buf.iter().enumerate() {
+                if let Some(first) = pending_byte.take() {
+                    let pair = [first, byte];
+                    if (encoding == UTF_16LE && pair == [b'\n', 0])
+                        || (encoding == UTF_16BE && pair == [0, b'\n'])
+                    {
+                        end = Some(index);
+                        break;
+                    }
+                } else {
+                    pending_byte = Some(byte);
+                }
+            }
+            end
+        };
         let count = newline.map_or(buf.len(), |index| index + 1);
         let last = buf.is_empty() || newline.is_some();
         has_bytes |= count != 0;
@@ -337,6 +357,19 @@ fn render_context(
     }
     events.sort_unstable();
     let mut reader = BufReader::new(std::fs::File::open(path)?);
+    // Match grep-searcher's default BOM sniffing and stripping. Subsequent
+    // block offsets are raw byte positions at decoded line boundaries.
+    let bom = reader.fill_buf()?;
+    let (encoding, bom_len) = if bom.starts_with(&[0xff, 0xfe]) {
+        (UTF_16LE, 2)
+    } else if bom.starts_with(&[0xfe, 0xff]) {
+        (UTF_16BE, 2)
+    } else if bom.starts_with(&[0xef, 0xbb, 0xbf]) {
+        (UTF_8, 3)
+    } else {
+        (UTF_8, 0)
+    };
+    reader.consume(bom_len);
     let mut prefix = Prefix::default();
     let mut event = 0;
     let mut number = 1u64;
@@ -355,7 +388,8 @@ fn render_context(
         if event == events.len() {
             break;
         }
-        let (line, has_bytes, newline) = read_context_line(&mut reader, number, cancellation)?;
+        let (line, has_bytes, newline) =
+            read_context_line(&mut reader, number, encoding, cancellation)?;
         if !has_bytes && number > 1 && !previous_newline {
             break;
         }
@@ -399,7 +433,7 @@ fn render_context(
         reader.seek(SeekFrom::Start(block.offset))?;
         for index in 0..lines {
             let number = block.start + index;
-            let (line, _, _) = read_context_line(&mut reader, number, cancellation)?;
+            let (line, _, _) = read_context_line(&mut reader, number, encoding, cancellation)?;
             output.render(display, &line, number == center);
             if output.prefix_full {
                 break;
@@ -593,11 +627,91 @@ mod tests {
         }
     }
 
+    fn utf16_bytes(text: &str, little_endian: bool) -> Vec<u8> {
+        let mut bytes = if little_endian {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&if little_endian {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        bytes
+    }
+
+    #[test]
+    fn bom_encoded_context_matches_searcher_and_preserves_overlaps() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let text = "\u{0a01} first 🦀\r\nneedle one\nneedle two\nafter\n";
+        for bytes in [
+            text.as_bytes().to_vec(),
+            [b"\xef\xbb\xbf".as_slice(), text.as_bytes()].concat(),
+            utf16_bytes(text, true),
+            utf16_bytes(text, false),
+        ] {
+            std::fs::write(file.path(), bytes).unwrap();
+            let mut grep = Grep::new(&json!({"pattern":"needle", "context":1}), 100).unwrap();
+            grep.search(file.path(), "f", &CancellationToken::new())
+                .unwrap();
+            assert_eq!(
+                grep.finish().tool_content(),
+                "f-1- \u{0a01} first 🦀\nf:2: needle one\nf-3- needle two\nf-2- needle one\nf:3: needle two\nf-4- after"
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_context_truncation_matches_utf8() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let text = format!(
+            "{}needle\n{}",
+            "before 🦀\n".repeat(2500),
+            "after\n".repeat(2500)
+        );
+        let mut outcomes = Vec::new();
+        for bytes in [
+            text.as_bytes().to_vec(),
+            utf16_bytes(&text, true),
+            utf16_bytes(&text, false),
+        ] {
+            std::fs::write(file.path(), bytes).unwrap();
+            let mut grep = Grep::new(&json!({"pattern":"needle", "context":1e20}), 100).unwrap();
+            grep.search(file.path(), "f", &CancellationToken::new())
+                .unwrap();
+            outcomes.push(grep.finish());
+        }
+        assert!(matches!(outcomes[0], Outcome::SucceededWithDetails { .. }));
+        assert_eq!(outcomes[0], outcomes[1]);
+        assert_eq!(outcomes[0], outcomes[2]);
+    }
+
+    #[test]
+    fn utf16_context_handles_odd_buffer_boundaries_and_embedded_newline_bytes() {
+        let text = "\u{0a01}🦀\nsecond\n";
+        for (encoding, little_endian) in [(UTF_16LE, true), (UTF_16BE, false)] {
+            let bytes = utf16_bytes(text, little_endian);
+            let mut reader = BufReader::with_capacity(3, &bytes[2..]);
+            let (first, _, newline) =
+                read_context_line(&mut reader, 1, encoding, &CancellationToken::new()).unwrap();
+            assert!(newline);
+            assert_eq!(first.text, "\u{0a01}🦀");
+            let (second, _, newline) =
+                read_context_line(&mut reader, 2, encoding, &CancellationToken::new()).unwrap();
+            assert!(newline);
+            assert_eq!(second.text, "second");
+        }
+    }
+
     #[test]
     fn context_decoding_skips_arbitrarily_long_carriage_return_runs() {
         let input = format!("{}visible\n", "\r".repeat(100_000));
         let mut reader = BufReader::new(input.as_bytes());
-        let (line, _, _) = read_context_line(&mut reader, 1, &CancellationToken::new()).unwrap();
+        let (line, _, _) =
+            read_context_line(&mut reader, 1, UTF_8, &CancellationToken::new()).unwrap();
         assert_eq!(line.text, "visible");
         assert!(!line.truncated);
     }
