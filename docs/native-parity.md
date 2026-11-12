@@ -218,6 +218,11 @@ User settings and keybindings use the existing `~/.pi-rs` agent directory (or
 theme. `/reload` reloads settings, context, skills, prompts, native extensions, MCP,
 keybindings and themes. Remaining application key actions are tracked above.
 
+In fullscreen mode with `fullscreenCopyOnSelect` disabled, the configured
+`app.message.copy` shortcut copies the active mouse selection before falling
+back to the last assistant message. The fallback reads a session snapshot, so
+it remains available while a model turn owns the journal lock.
+
 ### Session checkpoint
 
 Session names, labels and working directories are optional journal entries, so
