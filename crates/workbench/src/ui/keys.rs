@@ -259,20 +259,126 @@ impl Keys {
         binding_hint(self.first_binding(action))
     }
     pub fn describe(&self) -> String {
-        self.bindings
+        let sections: &[(&str, &[(&str, &str)])] = &[
+            (
+                "Navigation",
+                &[
+                    ("tui.editor.cursorUp", "Move up / browse previous history"),
+                    ("tui.editor.cursorDown", "Move down / browse next history"),
+                    ("tui.editor.cursorLeft", "Move left"),
+                    ("tui.editor.cursorRight", "Move right"),
+                    ("tui.editor.cursorWordLeft", "Move back a word"),
+                    ("tui.editor.cursorWordRight", "Move forward a word"),
+                    ("tui.editor.cursorLineStart", "Start of line"),
+                    ("tui.editor.cursorLineEnd", "End of line"),
+                    ("tui.editor.jumpForward", "Jump forward to character"),
+                    ("tui.editor.jumpBackward", "Jump backward to character"),
+                    ("tui.editor.pageUp", "Move editor up a page"),
+                    ("tui.editor.pageDown", "Move editor down a page"),
+                    ("tui.editor.historyPrevious", "Previous history entry"),
+                    ("tui.editor.historyNext", "Next history entry"),
+                ],
+            ),
+            (
+                "Editing",
+                &[
+                    ("tui.input.submit", "Send message"),
+                    ("tui.input.newLine", "New line"),
+                    ("tui.editor.deleteCharBackward", "Delete character backward"),
+                    ("tui.editor.deleteCharForward", "Delete character forward"),
+                    ("tui.editor.deleteWordBackward", "Delete word backward"),
+                    ("tui.editor.deleteWordForward", "Delete word forward"),
+                    ("tui.editor.deleteToLineStart", "Delete to start of line"),
+                    ("tui.editor.deleteToLineEnd", "Delete to end of line"),
+                    ("tui.editor.yank", "Paste last deleted text"),
+                    ("tui.editor.yankPop", "Cycle deleted text"),
+                    ("tui.editor.undo", "Undo"),
+                    ("tui.input.tab", "Complete path or accept autocomplete"),
+                ],
+            ),
+            (
+                "Application",
+                &[
+                    ("app.interrupt", "Cancel or abort"),
+                    ("app.clear", "Clear editor"),
+                    ("app.exit", "Exit when editor is empty"),
+                    ("app.suspend", "Suspend to background"),
+                    ("app.thinking.cycle", "Cycle thinking level"),
+                    ("app.thinking.save", "Save thinking level"),
+                    ("app.model.cycleForward", "Cycle to next model"),
+                    ("app.model.cycleBackward", "Cycle to previous model"),
+                    ("app.model.select", "Open model selector"),
+                    ("app.tools.expand", "Toggle tool output"),
+                    ("app.thinking.toggle", "Toggle thinking blocks"),
+                    ("app.editor.external", "Open external editor"),
+                    (
+                        "app.message.copy",
+                        "Copy selection or last assistant message",
+                    ),
+                    ("app.message.followUp", "Queue follow-up message"),
+                    ("app.message.dequeue", "Restore queued messages"),
+                    ("app.clipboard.pasteImage", "Paste files, images, or text"),
+                    ("app.session.new", "Start a new session"),
+                    ("app.session.tree", "Open session tree"),
+                    ("app.session.fork", "Fork current session"),
+                    ("app.session.resume", "Resume a session"),
+                ],
+            ),
+            (
+                "Fullscreen",
+                &[
+                    ("tui.altScreen.pageUp", "Scroll up a page"),
+                    ("tui.altScreen.pageDown", "Scroll down a page"),
+                    ("tui.altScreen.previousPrompt", "Previous prompt"),
+                    ("tui.altScreen.nextPrompt", "Next prompt"),
+                    ("tui.altScreen.search", "Search transcript"),
+                    ("tui.altScreen.top", "Scroll to top"),
+                    ("tui.altScreen.bottom", "Scroll to bottom"),
+                ],
+            ),
+        ];
+        let mut lines = vec!["Keyboard Shortcuts".to_owned()];
+        let mut included = std::collections::BTreeSet::new();
+        for (heading, actions) in sections {
+            lines.push(format!("\n{heading}"));
+            for (action, description) in *actions {
+                included.insert(*action);
+                let keys = self.bindings.get(*action).map_or_else(
+                    || "—".to_owned(),
+                    |keys| {
+                        if keys.is_empty() {
+                            "—".to_owned()
+                        } else {
+                            keys.iter()
+                                .map(|key| binding_hint(Some(*key)))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    },
+                );
+                lines.push(format!("{keys}  {description}"));
+            }
+        }
+        let other: Vec<_> = self
+            .bindings
             .iter()
-            .filter(|(_, keys)| !keys.is_empty())
-            .map(|(name, keys)| {
-                format!(
-                    "{name}  {}",
+            .filter(|(name, _)| !included.contains(name.as_str()))
+            .collect();
+        if !other.is_empty() {
+            lines.push("\nOther bindings".into());
+            for (name, keys) in other {
+                let keys = if keys.is_empty() {
+                    "—".to_owned()
+                } else {
                     keys.iter()
-                        .map(|key| format!("{key:?}"))
+                        .map(|key| binding_hint(Some(*key)))
                         .collect::<Vec<_>>()
                         .join(", ")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+                };
+                lines.push(format!("{keys}  {name}"));
+            }
+        }
+        lines.join("\n")
     }
 }
 pub(super) fn binding_hint(key: Option<KeyEvent>) -> String {
@@ -291,6 +397,7 @@ pub(super) fn binding_hint(key: Option<KeyEvent>) -> String {
         }
     }
     match key.code {
+        KeyCode::Char(' ') => label.push_str("Space"),
         KeyCode::Char(character) => label.push(character.to_ascii_uppercase()),
         KeyCode::Up => label.push('↑'),
         KeyCode::Down => label.push('↓'),
@@ -370,6 +477,22 @@ mod tests {
         );
         assert_eq!(parse("ctrl++").unwrap().code, KeyCode::Char('+'));
         assert!(parse("f99").is_err());
+    }
+
+    #[test]
+    fn hotkeys_show_readable_effective_bindings_and_unbound_actions() {
+        let mut keys = Keys::default();
+        keys.bindings.insert(
+            "app.model.select".into(),
+            vec![parse("alt+m").unwrap(), parse("ctrl+l").unwrap()],
+        );
+        keys.bindings.insert("app.message.copy".into(), Vec::new());
+        let text = keys.describe();
+        assert!(text.contains("Alt+M, Ctrl+L  Open model selector"));
+        assert!(text.contains("—  Copy selection or last assistant message"));
+        assert!(text.contains("Shift+Enter, Ctrl+J  New line"));
+        assert!(text.contains("Ctrl+T  app.tree.filter.noTools"));
+        assert!(!text.contains("KeyEvent"));
     }
 }
 
