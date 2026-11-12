@@ -1346,7 +1346,7 @@ impl Agent<'_> {
                             }
                         }
                         for (extension, event, message) in &progress_errors {
-                            observer(Notification::ExtensionLifecycleError { extension, event: *event, message });
+                            observer(Notification::ExtensionLifecycleError { extension, event, message });
                         }
                         if let Some(completed) = completed_batch {
                             break completed;
