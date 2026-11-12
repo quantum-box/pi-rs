@@ -627,9 +627,15 @@ impl CodingTool {
                 ));
             }
             if prepared.source != prepared.output {
-                let scale = prepared.source.0 as f64 / prepared.output.0 as f64;
+                let x_scale = format!("{:.2}", prepared.source.0 as f64 / prepared.output.0 as f64);
+                let y_scale = format!("{:.2}", prepared.source.1 as f64 / prepared.output.1 as f64);
+                let mapping = if x_scale == y_scale {
+                    format!("Multiply coordinates by {x_scale}")
+                } else {
+                    format!("Multiply x coordinates by {x_scale} and y coordinates by {y_scale}")
+                };
                 note.push_str(&format!(
-                    "\n[Image: original {}x{}, displayed at {}x{}. Multiply coordinates by {scale:.2} to map to original image.]",
+                    "\n[Image: original {}x{}, displayed at {}x{}. {mapping} to map to original image.]",
                     prepared.source.0, prepared.source.1, prepared.output.0, prepared.output.1
                 ));
             }
@@ -2127,6 +2133,16 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("Multiply coordinates by 1.05"), "{note}");
+        let tall = directory.path().join("tall.png");
+        image::RgbImage::from_pixel(1, 4000, image::Rgb([12, 34, 56]))
+            .save(&tall)
+            .unwrap();
+        let result = tool.read_image(&tall).unwrap().unwrap();
+        let note = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            note.contains("Multiply x coordinates by 1.00 and y coordinates by 2.00"),
+            "{note}"
+        );
         let result = CodingTool {
             kind: Kind::Read {
                 auto_resize: false,
