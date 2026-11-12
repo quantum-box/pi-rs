@@ -9,3 +9,6 @@ pub use pi_rs_anthropic as anthropic;
 
 #[cfg(feature = "google")]
 pub use pi_rs_google as google;
+
+#[cfg(feature = "openai")]
+pub use pi_rs_openai as openai;

@@ -1,0 +1,24 @@
+[package]
+name = "pi-rs-openai"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "OpenAI Responses adapter for pi-rs"
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
+eventsource-stream = "0.2"
+futures-util = "0.3"
+pi-rs-core = { path = "../core", version = "0.1.0" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "net", "io-util"] }
