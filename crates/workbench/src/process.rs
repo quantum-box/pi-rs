@@ -8,6 +8,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub(super) const LIVE_CONTROLS_ENV: &str = "PI_RS_WORKER_LIVE_CONTROLS";
 pub(super) const SESSION_TRANSITION_ENV: &str = "PI_RS_WORKER_SESSION_TRANSITION";
 
 fn shutdown_reason(reason: SessionStartReason) -> SessionShutdownReason {
@@ -52,6 +53,10 @@ impl Worker {
         let mut command = Command::new(std::env::current_exe()?);
         command.env_remove("PI_RS_MODEL_TOKEN");
         command.env_remove(SESSION_TRANSITION_ENV);
+        command.env(
+            LIVE_CONTROLS_ENV,
+            serde_json::to_string(&args.settings.live_controls())?,
+        );
         if let Some(transition) = transition {
             command.env(SESSION_TRANSITION_ENV, serde_json::to_string(&transition)?);
         }

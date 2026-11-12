@@ -664,10 +664,29 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
         registry.set_refresher(catalog.clone());
         let provider = model_client(args, super::thinking::reported(args).is_some(), true)?;
 
+        // Subprocesses must inherit the frontend's live controls rather than
+        // re-resolving them from project settings when a worker is replaced.
+        let live_controls = if args.stdin_control {
+            std::env::var(super::process::LIVE_CONTROLS_ENV)
+                .ok()
+                .map(|value| serde_json::from_str::<(Option<bool>, Option<bool>)>(&value))
+                .transpose()
+                .map_err(|error| {
+                    pi_rs::Error::Config(format!("invalid worker live controls: {error}"))
+                })?
+        } else {
+            None
+        };
+        let mut retry_settings = args.settings.retry_settings();
+        if let Some((_, Some(enabled))) = live_controls {
+            retry_settings.enabled = enabled;
+        }
         Ok(Runtime {
-            retry: pi_rs::RetryControl::new(args.settings.retry_settings()),
+            retry: pi_rs::RetryControl::new(retry_settings),
             auto_compaction: pi_rs::AutoCompactionControl::new(
-                args.settings.auto_compaction_enabled(),
+                live_controls
+                    .and_then(|(enabled, _)| enabled)
+                    .unwrap_or_else(|| args.settings.auto_compaction_enabled()),
             ),
             provider,
             registry,

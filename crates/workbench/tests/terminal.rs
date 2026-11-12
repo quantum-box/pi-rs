@@ -101,6 +101,111 @@ fn settings_picker_can_be_operated_with_the_mouse() {
 }
 
 #[test]
+fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        r#"{"providers":{"openai":{"models":[{"id":"second"}]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        r#"{"compaction":{"enabled":false},"retry":{"enabled":false}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".pi/settings.json"),
+        r#"{"compaction":{"enabled":true},"retry":{"enabled":true}}"#,
+    )
+    .unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("OPENAI_API_KEY", "test-key")
+            .env("TERM", "xterm-256color")
+            .args([
+                "--trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--context-window",
+                "32",
+                "--max-output-tokens",
+                "128",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    for (query, label, key) in [
+        ("Auto-compaction", "Auto-compaction", "compaction"),
+        ("Auto-retry", "Auto-retry", "retry"),
+    ] {
+        master.write_all(b"/settings\r").unwrap();
+        output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+        master.write_all(query.as_bytes()).unwrap();
+        output_until(&mut master, |text| text.contains(&format!("{label} · on")));
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains(&format!("{label} · off")));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved[key]["enabled"], false);
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains(&format!("{label} · on")));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved[key]["enabled"], true);
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains(&format!("{label} · off")));
+        master.write_all(b"\x1b").unwrap();
+        output_until(&mut master, |text| text.contains("Enter to send"));
+    }
+    master.write_all(b"/model openai/second\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model › openai/second"));
+    master.write_all(b"test worker restart\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("automatic compaction is disabled")
+    });
+}
+
+#[test]
 fn debug_command_writes_session_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -1104,6 +1209,20 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
 
 #[test]
 fn settings_choose_and_clear_per_model_thinking() {
+    check_per_model_thinking_settings(false, false);
+}
+
+#[test]
+fn project_per_model_thinking_preserves_live_edits_and_disk_precedence() {
+    check_per_model_thinking_settings(true, false);
+}
+
+#[test]
+fn clearing_per_model_thinking_uses_unqualified_model_fallback() {
+    check_per_model_thinking_settings(false, true);
+}
+
+fn check_per_model_thinking_settings(project_override: bool, model_fallback: bool) {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -1124,17 +1243,20 @@ else:
 print(json.dumps({'version':1, 'response':{'Ok':result}}))
 "##).unwrap();
     std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(
-        home.join("settings.json"),
-        br#"{"defaultThinkingLevel":"low"}"#,
-    )
-    .unwrap();
-    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
-    std::fs::write(
-        root.path().join(".pi/settings.json"),
-        br#"{"modelThinkingLevels":{"ollama/fixture-model":"low"}}"#,
-    )
-    .unwrap();
+    let initial_settings = if model_fallback {
+        serde_json::json!({"defaultThinkingLevel":"medium", "modelThinkingLevels":{"fixture-model":"low"}})
+    } else {
+        serde_json::json!({"defaultThinkingLevel":"low"})
+    };
+    std::fs::write(home.join("settings.json"), initial_settings.to_string()).unwrap();
+    if project_override {
+        std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+        std::fs::write(
+            root.path().join(".pi/settings.json"),
+            br#"{"modelThinkingLevels":{"ollama/fixture-model":"low"}}"#,
+        )
+        .unwrap();
+    }
     std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"models":[{"id":"fixture-model","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}},{"id":"plain-model","reasoning":false}]}}}"#).unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -1202,8 +1324,9 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         text.contains("Thinking level · ollama/fixture-model") && text.contains("high")
     });
     master.write_all(b"high\r").unwrap();
+    let displayed = "high";
     output_until(&mut master, |text| {
-        text.contains("ollama/fixture-model · high")
+        text.contains(&format!("ollama/fixture-model · {displayed}"))
     });
     let read_settings = || -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap()
@@ -1229,16 +1352,22 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    wait_level("high");
+    wait_level(displayed);
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Default thinking level per model") && text.contains("1 configured")
+        text.contains("Default thinking level per model")
+            && text.contains(if model_fallback {
+                "2 configured"
+            } else {
+                "1 configured"
+            })
     });
     master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| text.contains("Thinking: select model"));
     master.write_all(b"ollama/fixture-model").unwrap();
+    let reopened = if project_override { "low" } else { "high" };
     output_until(&mut master, |text| {
-        text.contains("ollama/fixture-model · high")
+        text.contains(&format!("ollama/fixture-model · {reopened}"))
     });
     master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| {
@@ -1246,7 +1375,14 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     });
     master.write_all(b"Clear\r").unwrap();
     output_until(&mut master, |text| text.contains("Thinking: select model"));
-    assert!(read_settings().get("modelThinkingLevels").is_none());
+    if model_fallback {
+        assert_eq!(
+            read_settings()["modelThinkingLevels"],
+            serde_json::json!({"fixture-model":"low"})
+        );
+    } else {
+        assert!(read_settings().get("modelThinkingLevels").is_none());
+    }
     wait_level("low");
     let deadline = Instant::now() + Duration::from_secs(10);
     let notifications = loop {
@@ -1294,7 +1430,12 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     wait_level("low");
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Default thinking level per model") && text.contains("2 configured")
+        text.contains("Default thinking level per model")
+            && text.contains(if project_override || model_fallback {
+                "2 configured"
+            } else {
+                "1 configured"
+            })
     });
 }
 
