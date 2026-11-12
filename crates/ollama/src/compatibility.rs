@@ -23,6 +23,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ant_ling_sends_only_explicit_reasoning_effort() {
+        let compat: ChatCompatibility =
+            serde_json::from_value(json!({"thinkingFormat":"ant-ling"})).unwrap();
+        let mut body = json!({});
+        compat.reasoning_options(&mut body, Some(true), true, Some("high"), false);
+        assert_eq!(body, json!({"reasoning":{"effort":"high"}}));
+        for (supported, enabled, effort) in [
+            (Some(true), true, None),
+            (Some(true), false, Some("high")),
+            (Some(false), true, Some("high")),
+        ] {
+            let mut body = json!({});
+            compat.reasoning_options(&mut body, supported, enabled, effort, false);
+            assert_eq!(body, json!({}));
+        }
+    }
+
+    #[test]
     fn baseten_template_tracks_reasoning_and_mapped_effort() {
         let compat: ChatCompatibility = serde_json::from_value(json!({
             "thinkingFormat":"baseten",
@@ -57,6 +75,7 @@ enum MaxTokensField {
 enum ThinkingFormat {
     #[serde(rename = "openai")]
     Standard,
+    AntLing,
     Deepseek,
     Openrouter,
     Zai,
@@ -133,6 +152,12 @@ impl ChatCompatibility {
         ));
         let effective = effort.unwrap_or(if enabled { "medium" } else { "none" });
         match self.thinking_format {
+            Some(ThinkingFormat::AntLing) => {
+                if enabled && let Some(level) = effort {
+                    body["reasoning"] = json!({"effort":level});
+                }
+                return;
+            }
             Some(ThinkingFormat::Deepseek) => {
                 if enabled || allow_off {
                     body["thinking"] = json!({"type":if enabled { "enabled" } else { "disabled" }});

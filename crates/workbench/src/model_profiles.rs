@@ -1288,6 +1288,35 @@ mod tests {
     }
 
     #[test]
+    fn ant_ling_catalog_and_credential_match_reference() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        let provider = profiles.provider("ant-ling").unwrap();
+        assert_eq!(provider.adapter(), Adapter::ChatCompletions);
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://api.ant-ling.com/v1/chat/completions"
+        );
+        assert_eq!(
+            builtin_chat::find("ant-ling").unwrap().env(),
+            "ANT_LING_API_KEY"
+        );
+        assert_eq!(profiles.model_ids(&provider).len(), 3);
+        let ring = profiles.model(&provider, "Ring-2.6-1T").unwrap();
+        assert_eq!(
+            ring.levels(Adapter::ChatCompletions).unwrap(),
+            ["high", "xhigh"]
+        );
+        assert_eq!(ring.mapped_effort("high"), Some(Some("high")));
+        assert_eq!(
+            profiles
+                .model(&provider, "Ling-2.6-flash")
+                .unwrap()
+                .reasoning,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn kimi_coding_catalog_preserves_models_and_reasoning_levels() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let provider = profiles.provider("kimi-coding").unwrap();

@@ -20,6 +20,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({}),
     },
     Builtin {
+        id: "ant-ling",
+        endpoint: "https://api.ant-ling.com/v1/chat/completions",
+        env: "ANT_LING_API_KEY",
+        compatibility: || json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","thinkingFormat":"ant-ling","supportsStrictMode":true}),
+    },
+    Builtin {
         id: "baseten",
         endpoint: "https://inference.baseten.co/v1/chat/completions",
         env: "BASETEN_API_KEY",
