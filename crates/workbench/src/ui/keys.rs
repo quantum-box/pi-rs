@@ -16,6 +16,10 @@ pub struct Keys {
 }
 impl Keys {
     fn defaults() -> Result<BTreeMap<String, Vec<KeyEvent>>> {
+        Self::defaults_for(cfg!(windows), windows_keybindings())
+    }
+
+    fn defaults_for(windows: bool, windows_keys: bool) -> Result<BTreeMap<String, Vec<KeyEvent>>> {
         let defaults: &[(&str, &[&str])] = &[
             ("tui.editor.cursorUp", &["up"]),
             ("tui.editor.cursorDown", &["down"]),
@@ -46,7 +50,16 @@ impl Keys {
             ("tui.editor.deleteToLineEnd", &["ctrl+k"]),
             ("tui.editor.yank", &["ctrl+y"]),
             ("tui.editor.yankPop", &["alt+y"]),
-            ("tui.editor.undo", &["ctrl+-"]),
+            (
+                "tui.editor.undo",
+                if windows {
+                    &["ctrl+z"]
+                } else if windows_keys {
+                    &["alt+z"]
+                } else {
+                    &["ctrl+-"]
+                },
+            ),
             ("tui.input.newLine", &["shift+enter", "ctrl+j"]),
             ("tui.input.submit", &["enter"]),
             ("tui.input.tab", &["tab"]),
@@ -65,13 +78,28 @@ impl Keys {
             ("tui.altScreen.lineDown", &[]),
             (
                 "tui.altScreen.previousPrompt",
-                &["ctrl+shift+up", "ctrl+up"],
+                if windows_keys {
+                    &["ctrl+up"]
+                } else {
+                    &["ctrl+shift+up", "ctrl+up"]
+                },
             ),
             (
                 "tui.altScreen.nextPrompt",
-                &["ctrl+shift+down", "ctrl+down"],
+                if windows_keys {
+                    &["ctrl+down"]
+                } else {
+                    &["ctrl+shift+down", "ctrl+down"]
+                },
             ),
-            ("tui.altScreen.search", &["ctrl+shift+f"]),
+            (
+                "tui.altScreen.search",
+                if windows_keys {
+                    &["ctrl+f"]
+                } else {
+                    &["ctrl+shift+f"]
+                },
+            ),
             ("tui.altScreen.searchNext", &["enter", "ctrl+g"]),
             (
                 "tui.altScreen.searchPrevious",
@@ -81,7 +109,7 @@ impl Keys {
             ("tui.altScreen.top", &["ctrl+home"]),
             ("tui.altScreen.bottom", &["ctrl+end"]),
             ("app.interrupt", &["escape"]),
-            ("app.suspend", if cfg!(windows) { &[] } else { &["ctrl+z"] }),
+            ("app.suspend", if windows { &[] } else { &["ctrl+z"] }),
             ("app.clear", &["ctrl+c"]),
             ("app.exit", &["ctrl+d"]),
             ("app.editor.external", &["ctrl+g"]),
@@ -91,7 +119,7 @@ impl Keys {
             ("app.thinking.save", &["ctrl+s"]),
             (
                 "app.message.followUp",
-                if windows_keybindings() {
+                if windows_keys {
                     &["ctrl+q"]
                 } else {
                     &["alt+enter"]
@@ -99,7 +127,7 @@ impl Keys {
             ),
             (
                 "app.message.dequeue",
-                if windows_keybindings() {
+                if windows_keys {
                     &["alt+q"]
                 } else {
                     &["alt+up"]
@@ -109,7 +137,7 @@ impl Keys {
             ("app.model.cycleForward", &["ctrl+p"]),
             (
                 "app.model.cycleBackward",
-                if windows_keybindings() {
+                if windows_keys {
                     &["alt+p"]
                 } else {
                     &["ctrl+shift+p"]
@@ -118,7 +146,7 @@ impl Keys {
             ("app.message.copy", &["ctrl+x"]),
             (
                 "app.clipboard.pasteImage",
-                if windows_keybindings() {
+                if windows_keys {
                     &["alt+v"]
                 } else {
                     &["ctrl+v"]
@@ -477,6 +505,33 @@ mod tests {
         );
         assert_eq!(parse("ctrl++").unwrap().code, KeyCode::Char('+'));
         assert!(parse("f99").is_err());
+    }
+
+    #[test]
+    fn platform_defaults_match_windows_wsl_and_other_terminals() {
+        for (windows, windows_keys, undo, search, suspend) in [
+            (true, true, "ctrl+z", "ctrl+f", None),
+            (false, true, "alt+z", "ctrl+f", Some("ctrl+z")),
+            (false, false, "ctrl+-", "ctrl+shift+f", Some("ctrl+z")),
+        ] {
+            let keys = Keys {
+                bindings: Keys::defaults_for(windows, windows_keys).unwrap(),
+            };
+            assert!(keys.matches("tui.editor.undo", parse(undo).unwrap()));
+            assert!(keys.matches("tui.altScreen.search", parse(search).unwrap()));
+            assert_eq!(
+                keys.first_binding("app.suspend"),
+                suspend.map(|key| parse(key).unwrap())
+            );
+            assert_eq!(
+                keys.bindings["tui.altScreen.previousPrompt"].len(),
+                if windows_keys { 1 } else { 2 }
+            );
+            assert_eq!(
+                keys.bindings["tui.altScreen.nextPrompt"].len(),
+                if windows_keys { 1 } else { 2 }
+            );
+        }
     }
 
     #[test]

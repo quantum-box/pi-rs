@@ -1081,6 +1081,9 @@ foreground process group. Continuing the job restores the TUI, draft and image
 rendering. The previous SIGINT disposition is restored after continuation.
 Windows and WSL use Pi's Ctrl+Q follow-up, Alt+P reverse-model and Alt+V paste
 bindings. Unix suspension remains available on WSL.
+Windows uses Ctrl+Z for undo; WSL uses Alt+Z so Ctrl+Z remains suspend.
+Both use Ctrl+F for fullscreen transcript search and their prompt-jump
+defaults omit the redundant Ctrl+Shift variants, matching Pi.
 
 A committed isolated-process-group PTY test covers resize input and suspension.
 A separate fixture covers both screen modes, SIGINT while suspended, resumed

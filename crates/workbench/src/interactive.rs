@@ -2426,7 +2426,7 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. Ctrl+Shift+F finds transcript text. Ctrl+Up/Down jumps between prompts.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. See /hotkeys for transcript search and navigation.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(
     input: &str,
