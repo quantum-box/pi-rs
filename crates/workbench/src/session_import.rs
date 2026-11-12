@@ -165,7 +165,10 @@ fn import_pi(entries: Vec<Value>) -> Result<Session> {
     importer.append(
         &mut root,
         Event::Created {
-            session_id: Uuid::new_v4(),
+            session_id: header["id"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .unwrap_or_else(Uuid::new_v4),
         },
     );
     importer.append(
@@ -828,6 +831,28 @@ mod tests {
     use super::*;
     use pi_rs::Message;
     use serde_json::json;
+    #[test]
+    fn imported_session_uuid_survives_export_and_fork_gets_a_new_id() {
+        let id = Uuid::new_v4();
+        let session = import_pi(vec![
+            json!({"type":"session","version":3,"id":id.to_string()}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+        ]).unwrap();
+        assert_eq!(session.session_id(), id);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("imported.jsonl");
+        session.export_jsonl(&path).unwrap();
+        assert_eq!(read(&path).unwrap().session_id(), id);
+        let fork = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+        assert_ne!(fork.session_id(), id);
+    }
+
+    #[test]
+    fn imported_non_uuid_session_id_remains_supported() {
+        let session =
+            import_pi(vec![json!({"type":"session","version":3,"id":"custom-id"})]).unwrap();
+        assert_ne!(session.session_id(), Uuid::nil());
+    }
     #[test]
     fn imported_tool_details_remain_in_history_outside_model_context() {
         let details = json!({"patch":"--- old\n+++ new", "firstChangedLine":1});
