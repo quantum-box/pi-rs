@@ -683,14 +683,15 @@ impl Session {
     pub fn context_usage_estimate(&self) -> crate::ContextUsageEstimate {
         let branch = self.branch();
         let entries = conversation_entries_unrepaired(&branch, self.operations());
+        let system_invalidations = crate::tokens::non_additive_native_system_checkpoints(&branch);
         let invalidated_at = branch
             .iter()
             .rev()
             .find_map(|record| {
-                matches!(
+                (matches!(
                     record.event,
                     Event::ContextEdited { .. } | Event::Compacted { .. }
-                )
+                ) || system_invalidations.contains(&record.id))
                 .then_some(record.id)
             })
             .unwrap_or(0);
@@ -791,6 +792,12 @@ impl Session {
     }
 
     pub(crate) fn imported_context_total(&self, source: u64) -> Option<u64> {
+        self.imported_assistant_message(source)?["usage"]["totalTokens"]
+            .as_u64()
+            .filter(|total| *total > 0)
+    }
+
+    pub(crate) fn imported_assistant_message(&self, source: u64) -> Option<&serde_json::Value> {
         let assistant = self.records.get(source.checked_sub(1)? as usize)?;
         let Event::Assistant {
             request_id: Some(request_id),
@@ -813,9 +820,7 @@ impl Session {
             return None;
         };
         (format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant")
-            .then(|| entry["message"]["usage"]["totalTokens"].as_u64())
-            .flatten()
-            .filter(|total| *total > 0)
+            .then_some(&entry["message"])
     }
 
     pub fn operations(&self) -> Vec<(Invocation, OperationState)> {
@@ -2185,6 +2190,20 @@ fn conversation_entries_since_inner(
             _ => None,
         })
         .collect();
+    // An explicit edit to an assistant can remove its tool calls. Keep
+    // independently retained results, but exclude results orphaned by that edit.
+    let removed_tool_sources: BTreeSet<_> = if repair {
+        BTreeSet::new()
+    } else {
+        path.iter().flat_map(|record| {
+            let Event::Assistant { invocations, .. } = &record.event else { return Vec::new(); };
+            let Some(replacement) = edits.get(&record.id) else { return Vec::new(); };
+            invocations.iter().filter_map(|invocation| {
+                let retained = matches!(replacement, Some(crate::ContextContent::Blocks(blocks)) if blocks.iter().any(|block| matches!(block, crate::ContentBlock::ToolCall { id, .. } if id == &invocation.call.id)));
+                (!retained).then(|| result_sources.get(&invocation.operation_id).copied()).flatten()
+            }).collect::<Vec<_>>()
+        }).collect()
+    };
     let mut messages = Vec::new();
     for record in path.iter().filter(|record| record.id >= retain_from) {
         match &record.event {
@@ -2288,6 +2307,7 @@ fn conversation_entries_since_inner(
     }
     let mut messages: Vec<_> = messages
         .into_iter()
+        .filter(|(source, _)| !removed_tool_sources.contains(source))
         .filter_map(|(source, message)| match edits.get(&source) {
             Some(Some(replacement)) => Some((source, project_content(message, replacement))),
             Some(None) => None,

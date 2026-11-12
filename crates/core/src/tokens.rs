@@ -1,5 +1,5 @@
 //! Character-based estimates for native model-visible content.
-use crate::{Event, Message, ModelRequest, extract_tool_images};
+use crate::{Event, Message, ModelRequest};
 
 /// Latest usable measured context plus estimates for messages that followed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,13 +41,24 @@ fn message_chars(message: &Message) -> u64 {
             is_structured,
             ..
         } => {
-            let (content, images) = if crate::tool_content_is_structured(content, *is_structured) {
-                extract_tool_images(content.clone())
-            } else {
-                (content.clone(), Vec::new())
-            };
-            text_chars(&content)
-                .saturating_add((images.len() as u64).saturating_mul(ESTIMATED_IMAGE_CHARS))
+            let blocks = crate::tool_content_is_structured(content, *is_structured)
+                .then(|| serde_json::from_str::<serde_json::Value>(content).ok())
+                .flatten();
+            blocks
+                .as_ref()
+                .and_then(|value| value["data"]["content"].as_array())
+                .map_or_else(
+                    || text_chars(content),
+                    |blocks| {
+                        blocks.iter().fold(0_u64, |chars, block| {
+                            chars.saturating_add(match block["type"].as_str() {
+                                Some("text") => block["text"].as_str().map(text_chars).unwrap_or(0),
+                                Some("image") => ESTIMATED_IMAGE_CHARS,
+                                _ => 0,
+                            })
+                        })
+                    },
+                )
         }
     }
 }
@@ -96,6 +107,25 @@ pub(crate) fn estimate_source_tokens(
                 } if *target == source => Some(replacement),
                 _ => None,
             });
+            if replacement.is_none()
+                && let Some(original) = session.imported_assistant_message(source)
+                && matches!(original["stopReason"].as_str(), Some("error" | "aborted"))
+                && let Some(blocks) = original["content"].as_array()
+            {
+                let chars = blocks.iter().fold(0_u64, |chars, block| {
+                    chars.saturating_add(match block["type"].as_str() {
+                        Some("text") => block["text"].as_str().map(text_chars).unwrap_or(0),
+                        Some("thinking") => block["thinking"].as_str().map(text_chars).unwrap_or(0),
+                        Some("toolCall") => block["name"]
+                            .as_str()
+                            .map(text_chars)
+                            .unwrap_or(0)
+                            .saturating_add(text_chars(&block["arguments"].to_string())),
+                        _ => 0,
+                    })
+                });
+                return chars.div_ceil(4);
+            }
             let reasoning = match replacement {
                 Some(Some(crate::ContextContent::Blocks(blocks))) => {
                     blocks.iter().fold(0_u64, |chars, block| match block {
@@ -168,8 +198,16 @@ pub(crate) fn estimate_system_tokens(branch: &[&crate::Record]) -> u64 {
     let mut contents = Vec::new();
     let mut sections = std::collections::BTreeMap::new();
     let mut tools: Vec<crate::ToolSpec> = Vec::new();
-    for record in branch {
-        if matches!(record.event, Event::Compacted { .. }) {
+    for (index, record) in branch.iter().enumerate() {
+        if matches!(
+            record.event,
+            Event::Compacted {
+                system_prompt: Some(_),
+                ..
+            }
+        ) || (matches!(record.event, Event::Compacted { .. })
+            && imported_entry(branch, index, "compaction"))
+        {
             contents.clear();
             sections.clear();
             tools.clear();
@@ -223,6 +261,78 @@ pub(crate) fn estimate_system_tokens(branch: &[&crate::Record]) -> u64 {
     chars.div_ceil(4)
 }
 
+fn imported_entry(branch: &[&crate::Record], index: usize, kind: &str) -> bool {
+    branch[..index]
+        .iter()
+        .rev()
+        .find_map(|record| match &record.event {
+            Event::ModelFinished { reply: None, .. } => None,
+            Event::SourceEntry { format, entry } => Some(format == "pi" && entry["type"] == kind),
+            _ => Some(false),
+        })
+        .unwrap_or(false)
+}
+
+/// Native system checkpoints update a single runtime prompt; changes that
+/// replace existing state make earlier measured usage unsuitable as a base.
+pub(crate) fn non_additive_native_system_checkpoints(
+    branch: &[&crate::Record],
+) -> std::collections::BTreeSet<u64> {
+    let mut sections = std::collections::BTreeSet::new();
+    let mut tools = std::collections::BTreeSet::new();
+    let mut invalidations = std::collections::BTreeSet::new();
+    for (index, record) in branch.iter().enumerate() {
+        let (changes, added, removed) = match &record.event {
+            Event::SystemCheckpoint {
+                sections,
+                tools_added,
+                tools_removed,
+                ..
+            } => (sections, tools_added, tools_removed.as_slice()),
+            Event::Compacted {
+                system_prompt: Some(snapshot),
+                ..
+            } => {
+                sections.clear();
+                tools.clear();
+                (&snapshot.sections, &snapshot.tools, &[][..])
+            }
+            Event::Compacted {
+                system_prompt: None,
+                ..
+            } if imported_entry(branch, index, "compaction") => {
+                sections.clear();
+                tools.clear();
+                continue;
+            }
+            _ => continue,
+        };
+        let non_additive = changes.iter().any(|(name, _)| sections.contains(name))
+            || removed.iter().any(|name| tools.contains(name))
+            || added.iter().any(|tool| tools.contains(&tool.name));
+        if non_additive
+            && matches!(record.event, Event::SystemCheckpoint { .. })
+            && !imported_entry(branch, index, "message")
+        {
+            invalidations.insert(record.id);
+        }
+        for (name, value) in changes {
+            if value.is_some() {
+                sections.insert(name.clone());
+            } else {
+                sections.remove(name);
+            }
+        }
+        for name in removed {
+            tools.remove(name);
+        }
+        for tool in added {
+            tools.insert(tool.name.clone());
+        }
+    }
+    invalidations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,10 +383,19 @@ mod tests {
             estimate_message_tokens(&short),
             estimate_message_tokens(&long)
         );
-        assert!(estimate_message_tokens(&short) >= 1200);
+        assert_eq!(estimate_message_tokens(&short), 1202);
         assert!(
             matches!(long, Message::Tool { content, .. } if content.contains(&"A".repeat(5000)))
         );
+    }
+
+    #[test]
+    fn structured_tool_text_and_images_ignore_envelope_and_metadata() {
+        let message = Message::Tool {
+            call_id: "id".into(), is_error: false, is_structured: Some(true),
+            content: serde_json::json!({"data":{"content":[{"type":"text","text":"a"},{"type":"image","data":"AA==","mimeType":"image/png"},{"type":"text","text":"🦀"}],"extra":"irrelevant"},"attachments":[]}).to_string(),
+        };
+        assert_eq!(estimate_message_tokens(&message), 1201);
     }
 
     #[test]

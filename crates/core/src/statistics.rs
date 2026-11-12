@@ -398,6 +398,116 @@ mod tests {
     }
 
     #[test]
+    fn native_system_replacements_invalidate_and_snapshotless_compaction_preserves_system() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let checkpoint = |value: Option<&str>| Event::SystemCheckpoint {
+            content: String::new(),
+            sections: vec![("rules".into(), value.map(str::to_owned))],
+            tools_added: vec![],
+            tools_removed: vec![],
+        };
+        session.append(checkpoint(Some("12345678"))).unwrap();
+        assistant(
+            &mut session,
+            "ok",
+            None,
+            Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+        );
+        session.append(checkpoint(Some("abcd"))).unwrap();
+        let estimate = session.context_usage_estimate();
+        assert_eq!(estimate.last_usage_record, None);
+        assert_eq!(estimate.tokens, 2); // one system token and one assistant token
+        session.append(checkpoint(None)).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 1);
+        session.append(checkpoint(Some("12345678"))).unwrap();
+        let before = session.head();
+        session
+            .append(Event::Compacted {
+                summary: "abcd".into(),
+                system_prompt: None,
+                retain_from: Some(before + 1),
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 3); // preserved system plus summary
+    }
+
+    #[test]
+    fn edited_away_assistant_does_not_leave_its_tool_result_in_estimate() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let op = uuid::Uuid::new_v4();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id: op,
+                    call: crate::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let assistant = session.head();
+        session
+            .append(Event::ToolFinished {
+                operation_id: op,
+                outcome: crate::Outcome::Succeeded("x".repeat(4000)),
+                states: Default::default(),
+            })
+            .unwrap();
+        session.edit_context(assistant, None).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 0);
+        assert!(session.current_messages().is_empty());
+    }
+
+    #[test]
+    fn removing_a_native_system_tool_invalidates_old_usage() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append(Event::SystemCheckpoint {
+                content: String::new(),
+                sections: vec![],
+                tools_added: vec![crate::ToolSpec {
+                    name: "read".into(),
+                    description: "a long schema".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }],
+                tools_removed: vec![],
+            })
+            .unwrap();
+        assistant(
+            &mut session,
+            "ok",
+            None,
+            Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+        );
+        session
+            .append(Event::SystemCheckpoint {
+                content: String::new(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec!["read".into()],
+            })
+            .unwrap();
+        let estimate = session.context_usage_estimate();
+        assert_eq!(estimate.last_usage_record, None);
+        assert_eq!(estimate.tokens, 1);
+    }
+
+    #[test]
     fn post_compaction_thinking_only_assistant_survives_unrelated_edit_for_usage() {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
         session

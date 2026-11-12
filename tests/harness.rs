@@ -2088,7 +2088,8 @@ async fn measured_context_tracks_trailing_input_edits_compaction_and_checkout() 
     let mut session = Session::open(&path).unwrap();
     assert_eq!(session.context_usage_estimate().tokens, 28);
     session.select_model("other", None).unwrap();
-    assert_eq!(session.context_usage_estimate().last_usage_record, None);
+    assert!(session.context_usage_estimate().last_usage_record.is_some());
+    assert_eq!(session.context_usage_estimate().tokens, 28);
 }
 
 #[tokio::test]
