@@ -501,7 +501,7 @@ pub(super) fn tool_failed(outcome: &Outcome) -> bool {
     matches!(
         outcome,
         Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-    ) || matches!(outcome, Outcome::Structured { data, .. } if data["isError"] == true)
+    ) || matches!(outcome, Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } if data["isError"] == true)
 }
 
 pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value {
@@ -513,7 +513,11 @@ pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value 
             .map(|image| json!({"type":"image","data":image.data,"mimeType":image.mime_type})),
     );
     let mut result = json!({"content":content});
-    if let Some(Outcome::SucceededWithDetails { details, .. }) = outcome {
+    if let Some(
+        Outcome::SucceededWithDetails { details, .. }
+        | Outcome::StructuredWithDetails { details, .. },
+    ) = outcome
+    {
         result["details"] = details.clone();
     }
     result

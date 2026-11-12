@@ -615,9 +615,20 @@ fn convert(
                     })?;
                     let (text, images) = user_content(&message["content"])?;
                     let outcome = if !images.is_empty() {
-                        Outcome::Structured {
-                            data: serde_json::json!({"content":message["content"],"isError":message["isError"] == true}),
-                            attachments: Vec::new(),
+                        let data = serde_json::json!({"content":message["content"],"isError":message["isError"] == true});
+                        if let Some(details) =
+                            message.get("details").filter(|details| !details.is_null())
+                        {
+                            Outcome::StructuredWithDetails {
+                                data,
+                                attachments: Vec::new(),
+                                details: details.clone(),
+                            }
+                        } else {
+                            Outcome::Structured {
+                                data,
+                                attachments: Vec::new(),
+                            }
                         }
                     } else if message["isError"] == true {
                         Outcome::Failed(text)
@@ -966,6 +977,42 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, Message::Tool {content, ..} if content == "done"))
         );
+    }
+
+    #[test]
+    fn imported_image_tool_details_survive_export_without_entering_model_context() {
+        for is_error in [false, true] {
+            let details = json!({"private_marker":"metadata", "nested":[1, 2]});
+            let blocks = json!([{"type":"text","text":"result"},{"type":"image","data":"aW1hZ2U=","mimeType":"image/png"}]);
+            let session = import_pi(vec![
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+                json!({"type":"message","id":"t","parentId":"a","message":{"role":"toolResult","toolCallId":"call","content":blocks,"isError":is_error,"details":details}}),
+            ]).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("export.jsonl");
+            session.export_jsonl(&path).unwrap();
+            let reopened = read(&path).unwrap();
+            let outcome = reopened
+                .records()
+                .iter()
+                .find_map(|record| match &record.event {
+                    Event::ToolFinished { outcome, .. } => Some(outcome),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                matches!(outcome, Outcome::StructuredWithDetails { data, details: stored, .. } if data["content"] == blocks && stored == &details)
+            );
+            assert_eq!(super::super::rpc_events::tool_failed(outcome), is_error);
+            let rpc =
+                super::super::rpc_events::tool_result_value(&outcome.tool_content(), Some(outcome));
+            assert_eq!(rpc["details"], details);
+            assert_eq!(rpc["content"][1]["data"], "aW1hZ2U=");
+            assert!(reopened.current_messages().iter().any(|message| matches!(message,
+                Message::Tool { content, .. } if !content.contains("private_marker") && content.contains("aW1hZ2U=")
+            )));
+        }
     }
 
     #[test]

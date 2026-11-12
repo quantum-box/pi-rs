@@ -1247,7 +1247,8 @@ impl View {
         }
         let rendered_parts = if self.graphics.enabled() {
             match outcome {
-                pi_rs::Outcome::Structured { data, .. } => data["content"]
+                pi_rs::Outcome::Structured { data, .. }
+                | pi_rs::Outcome::StructuredWithDetails { data, .. } => data["content"]
                     .as_array()
                     .filter(|blocks| blocks.iter().any(|block| block["type"] == "image"))
                     .into_iter()
@@ -1299,10 +1300,8 @@ impl View {
             *output = diff.map_or_else(|| display_tool_result(outcome), str::to_owned);
             *failed = !matches!(
                 outcome,
-                pi_rs::Outcome::Succeeded(_)
-                    | pi_rs::Outcome::SucceededWithDetails { .. }
-                    | pi_rs::Outcome::Structured { .. }
-            );
+                pi_rs::Outcome::Succeeded(_) | pi_rs::Outcome::SucceededWithDetails { .. }
+            ) && !matches!(outcome, pi_rs::Outcome::Structured { data, .. } | pi_rs::Outcome::StructuredWithDetails { data, .. } if data["isError"] != true);
             *finished = true;
         }
     }
@@ -2409,7 +2408,8 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     {
         return format!("{output}\n{patch}");
     }
-    if let pi_rs::Outcome::Structured { data, .. } = outcome
+    if let pi_rs::Outcome::Structured { data, .. }
+    | pi_rs::Outcome::StructuredWithDetails { data, .. } = outcome
         && let Some(blocks) = data["content"].as_array()
     {
         return blocks

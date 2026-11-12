@@ -727,11 +727,15 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
             | Event::Assistant { content, .. } => Some(Cow::Borrowed(content.as_str())),
             Event::BashExecution { execution } => Some(Cow::Borrowed(execution.command.as_str())),
             Event::ToolFinished {
-                outcome: pi_rs::Outcome::Structured { data, .. },
+                outcome:
+                    pi_rs::Outcome::Structured { data, .. }
+                    | pi_rs::Outcome::StructuredWithDetails { data, .. },
                 ..
             }
             | Event::ToolReconciled {
-                outcome: pi_rs::Outcome::Structured { data, .. },
+                outcome:
+                    pi_rs::Outcome::Structured { data, .. }
+                    | pi_rs::Outcome::StructuredWithDetails { data, .. },
                 ..
             } => data["content"]
                 .as_array()
