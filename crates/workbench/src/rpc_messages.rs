@@ -238,6 +238,7 @@ pub(super) struct Projection {
     requests: HashMap<Uuid, u64>,
     finished: HashMap<Uuid, u64>,
     models: HashMap<u64, u64>,
+    request_identities: HashMap<u64, u64>,
     tools: HashMap<Uuid, (u64, usize)>,
 }
 
@@ -251,6 +252,17 @@ impl Projection {
     }
 
     pub(super) fn record(&mut self, record: &Record) {
+        let identity = match &record.event {
+            Event::SourceEntry { format, .. } if format == "pi-rs:request-identity" => {
+                Some(record.id)
+            }
+            _ => record
+                .parent
+                .and_then(|parent| self.request_identities.get(&parent).copied()),
+        };
+        if let Some(identity) = identity {
+            self.request_identities.insert(record.id, identity);
+        }
         let selected = if matches!(record.event, Event::ModelSelected { .. }) {
             Some(record.id)
         } else {
@@ -302,12 +314,34 @@ impl Projection {
         let Event::ModelRequested { model, .. } = &records[request as usize - 1].event else {
             return None;
         };
+        let recorded_provider = self.request_provider(records, id);
         Some(ModelIdentity {
             model,
-            provider: self
-                .selected(records, request)
-                .map_or("ollama", |model| model.provider),
+            provider: recorded_provider
+                .or_else(|| {
+                    self.finished(records, id)
+                        .and_then(|finished| finished.metadata.resolved_model.as_ref())
+                        .map(|identity| identity.provider.as_str())
+                })
+                .or_else(|| self.selected(records, request).map(|model| model.provider))
+                .unwrap_or("ollama"),
         })
+    }
+
+    fn request_provider<'a>(&self, records: &'a [Record], id: Uuid) -> Option<&'a str> {
+        let request = *self.requests.get(&id)?;
+        let Event::ModelRequested { model, .. } = &records[request as usize - 1].event else {
+            return None;
+        };
+        self.request_identities
+            .get(&request)
+            .and_then(|id| records.get(*id as usize - 1))
+            .and_then(|record| match &record.event {
+                Event::SourceEntry { entry, .. } if entry["model"].as_str() == Some(model) => {
+                    entry["provider"].as_str()
+                }
+                _ => None,
+            })
     }
 
     fn finished<'a>(&self, records: &'a [Record], id: Uuid) -> Option<Finished<'a>> {
@@ -482,6 +516,9 @@ impl Projection {
                 let provider = model
                     .filter(|selected| Provider::named(selected.provider).is_none())
                     .map_or(provider, |selected| selected.provider);
+                let provider = request
+                    .and_then(|id| self.request_provider(records, id))
+                    .unwrap_or(provider);
                 let api = finalized
                     .and_then(|entry| entry.metadata.provider_api.map(pi_rs::ModelApi::as_str))
                     .or_else(|| replay_route.map(|(api, _)| api))

@@ -648,6 +648,7 @@ impl Cli {
     }
 
     fn record_automatic_model_selection(&self, session: &mut Session) -> Result<()> {
+        session.record_request_identity(self.provider.id(), &self.model)?;
         if !self.model_explicit
             && !self.thinking_explicit
             && !matches!(
@@ -715,13 +716,13 @@ impl Cli {
     }
 
     fn restore_initial_selection(&mut self, thinking: Option<String>) {
-        if let Some(initial) = &self.initial_selection {
-            if !self.model_explicit {
-                self.provider = initial.provider.clone();
-                self.endpoint = initial.endpoint.clone();
-                self.model = initial.model.clone();
-                self.thinking_profile = None;
-            }
+        if let Some(initial) = &self.initial_selection
+            && !self.model_explicit
+        {
+            self.provider = initial.provider.clone();
+            self.endpoint = initial.endpoint.clone();
+            self.model = initial.model.clone();
+            self.thinking_profile = None;
         }
         if !self.thinking_explicit {
             self.thinking = Some(thinking.unwrap_or_else(|| self.default_branch_thinking()));

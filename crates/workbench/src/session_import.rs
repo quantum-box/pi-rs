@@ -130,6 +130,7 @@ pub(super) fn branch_selection(
     catalog: impl Fn(&str, &str) -> Option<bool>,
 ) -> BranchSelection {
     let branch = session.branch();
+    let projection = super::rpc_messages::Projection::new(branch.iter().copied());
     let thinking = branch
         .iter()
         .rev()
@@ -145,7 +146,48 @@ pub(super) fn branch_selection(
         .flatten();
     let mut saw_pi = false;
     for (index, record) in branch.iter().enumerate().rev() {
+        if let Event::Assistant {
+            request_id: Some(request_id),
+            ..
+        } = &record.event
+        {
+            let prior = branch[..index].iter().rev().find(|prior| {
+                !matches!(
+                    prior.event,
+                    Event::ModelFinished { .. } | Event::ModelSelected { .. }
+                )
+            });
+            let imported = prior.is_some_and(|prior| prior.timestamp == record.timestamp && matches!(&prior.event, Event::SourceEntry { format, entry } if format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "assistant"));
+            if !imported && branch[..index].iter().any(|prior| matches!(&prior.event, Event::ModelRequested { request_id: Some(id), .. } if id == request_id)) {
+                let mut change = None;
+                for (i, prior) in branch[..index].iter().enumerate().rev() {
+                    if matches!(prior.event, Event::ModelSelected { .. }) {
+                        let derived = i.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi" || format == "pi-rs:thinking-selection"));
+                        if !derived {
+                            if let Event::ModelSelected { model, provider: Some(provider), .. } = &prior.event && catalog(provider, model) == Some(true) {
+                                return BranchSelection::Selected { provider: provider.clone(), model: model.clone(), thinking };
+                            }
+                            break;
+                        }
+                    }
+                    if let Event::SourceEntry { format, entry } = &prior.event && format == "pi" && entry["type"] == "model_change" {
+                        change = Some(entry);
+                        break;
+                    }
+                }
+                if let Some(change) = change && let (Some(provider), Some(model)) = (change["provider"].as_str(), change["modelId"].as_str()) && catalog(provider, model) == Some(true) {
+                    return selected(&change["provider"], &change["modelId"], thinking);
+                }
+                if let Some(message) = projection.raw_message(session.records(), record) {
+                    return selected(&message["provider"], &message["model"], thinking);
+                }
+            }
+        }
         if matches!(record.event, Event::ModelSelected { .. }) {
+            let thinking_only = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection"));
+            if thinking_only {
+                continue;
+            }
             let imported = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
                 if record.timestamp != parent.timestamp || record.run_id.is_some() { return false; }
                 let (Event::SourceEntry { format, entry }, Event::ModelSelected { model, provider, thinking }) = (&parent.event, &record.event) else { return false; };
@@ -984,6 +1026,159 @@ mod tests {
     use super::*;
     use pi_rs::Message;
     use serde_json::json;
+
+    fn native_completion(mut session: Session, provider: &str, model: &str) -> Session {
+        session.record_request_identity(provider, model).unwrap();
+        let mut records = session.records().to_vec();
+        let request_id = Uuid::new_v4();
+        for event in [
+            Event::ModelRequested {
+                model: model.into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 128,
+                request_id: Some(request_id),
+                context_head: None,
+                context_sha256: None,
+            },
+            Event::ModelFinished {
+                request_id,
+                metadata: pi_rs::ModelMetadata {
+                    resolved_model: Some(pi_rs::ResolvedModelIdentity {
+                        provider: "anthropic".into(),
+                        model: "reported-model".into(),
+                    }),
+                    ..Default::default()
+                },
+                usage: pi_rs::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            },
+            Event::Assistant {
+                content: "native response".into(),
+                invocations: Vec::new(),
+                usage: None,
+                request_id: Some(request_id),
+            },
+        ] {
+            let parent = records.last().unwrap().id;
+            records.push(Record {
+                id: parent + 1,
+                parent: Some(parent),
+                version: 2,
+                timestamp: None,
+                run_id: None,
+                event,
+            });
+        }
+        Session::from_records(records).unwrap()
+    }
+
+    #[test]
+    fn native_response_restores_actual_request_identity_after_import() {
+        use clap::Parser;
+        let imported = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"anthropic","modelId":"old"}),
+            json!({"type":"message","id":"a","parentId":"change","message":{"role":"assistant","model":"missing-provider","content":[]}}),
+        ]).unwrap();
+        let session = native_completion(imported, "ollama", "actual");
+        let messages = super::super::rpc_messages::snapshot(&session).0;
+        let message = messages
+            .iter()
+            .find(|message| message["content"][0]["text"] == "native response")
+            .unwrap();
+        assert_eq!(message["provider"], "ollama");
+        assert_eq!(message["model"], "actual");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let reopened = read(&path).unwrap();
+        assert!(
+            matches!(branch_selection(&reopened, |_, _| None), BranchSelection::Selected { provider, model, .. } if provider == "ollama" && model == "actual")
+        );
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model = "changed-default".into();
+        args.remember_initial_selection();
+        args.restore_session_model(&reopened);
+        assert_eq!(args.model, "actual");
+    }
+
+    #[test]
+    fn thinking_only_change_preserves_virtual_selection_in_shared_session() {
+        use clap::Parser;
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+            json!({"type":"message","id":"a","parentId":"change","message":{"role":"assistant","provider":"ollama","model":"physical","content":[]}}),
+        ]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let mut args = super::super::Cli::parse_from(["pi", "--offline"]);
+        args.session = path.clone();
+        args.model = "physical".into();
+        args.thinking = Some("low".into());
+        super::super::thinking::set(&mut args, "high").unwrap();
+        let mut session = Session::open(&path).unwrap();
+        assert!(
+            matches!(branch_selection(&session, |_, _| Some(true)), BranchSelection::Selected { model, thinking: Some(level), .. } if model == "virtual" && level == "high")
+        );
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        let entries: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["type"] == "model_change")
+                .count(),
+            1
+        );
+        let share = directory.path().join("share.jsonl");
+        std::fs::write(&share, bytes).unwrap();
+        let reopened = read(&share).unwrap();
+        assert!(
+            matches!(branch_selection(&reopened, |_, _| Some(true)), BranchSelection::Selected { model, thinking: Some(level), .. } if model == "virtual" && level == "high")
+        );
+        let before = session.records().len();
+        session
+            .select_provider_model(None, "physical", Some("high"))
+            .unwrap();
+        assert!(session.records().len() > before);
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        std::fs::write(&share, bytes).unwrap();
+        let reopened = read(&share).unwrap();
+        assert!(
+            matches!(branch_selection(&reopened, |_, _| Some(true)), BranchSelection::Selected { model, .. } if model == "physical")
+        );
+    }
+
+    #[test]
+    fn virtual_selection_survives_thinking_change_and_native_response() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+            json!({"type":"message","id":"a","parentId":"change","message":{"role":"assistant","provider":"ollama","model":"physical","content":[]}}),
+        ]).unwrap();
+        session
+            .select_thinking_level(None, "physical", "high")
+            .unwrap();
+        let session = native_completion(session, "ollama", "physical");
+        assert!(
+            matches!(branch_selection(&session, |_, _| Some(true)), BranchSelection::Selected { model, thinking: Some(level), .. } if model == "virtual" && level == "high")
+        );
+        assert!(
+            matches!(branch_selection(&session, |_, _| None), BranchSelection::Selected { model, thinking: Some(level), .. } if model == "physical" && level == "high")
+        );
+    }
     #[test]
     fn branch_selection_uses_live_catalog_and_survives_round_trip() {
         let mut session = import_pi(vec![
@@ -1341,7 +1536,11 @@ mod tests {
         args.model = "physical".into();
         let before = session.records().len();
         args.record_automatic_model_selection(&mut session).unwrap();
-        assert_eq!(session.records().len(), before);
+        assert!(
+            session.records()[before..]
+                .iter()
+                .all(|record| !matches!(record.event, Event::ModelSelected { .. }))
+        );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("share.jsonl");
         let bytes = super::super::rpc_entries::Entries::new(&session)

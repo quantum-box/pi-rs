@@ -4909,10 +4909,10 @@ fn is_busy(worker: &Option<Worker>) -> bool {
 }
 
 fn persist_pending_thinking(pending: &PendingThinking) -> Result<()> {
-    Session::open(&pending.session)?.select_provider_model(
+    Session::open(&pending.session)?.select_thinking_level(
         pending.provider.as_deref(),
         &pending.model,
-        Some(&pending.level),
+        &pending.level,
     )
 }
 

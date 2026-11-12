@@ -1634,6 +1634,64 @@ mod tests {
     }
 
     #[test]
+    fn thinking_rpc_does_not_emit_model_change_after_virtual_response() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+            json!({"type":"message","id":"assistant","parentId":"change","message":{"role":"assistant","provider":"ollama","model":"physical","content":[]}}),
+        ];
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let native = root.path().join("native.jsonl");
+        super::super::session_import::read(&source)
+            .unwrap()
+            .export_jsonl(&native)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = native.clone();
+        args.model = "physical".into();
+        args.thinking = Some("low".into());
+        command(
+            &json!({"type":"set_thinking_level","level":"high"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap();
+        let session = Session::open(&native).unwrap();
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, root.path())
+            .unwrap();
+        let entries: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["type"] == "model_change")
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .rev()
+                .find(|entry| entry["type"] == "thinking_level_change")
+                .unwrap()["thinkingLevel"],
+            "high"
+        );
+    }
+
+    #[test]
     fn thinking_commands_persist_and_reject_invalid_levels() {
         let root = tempfile::tempdir().unwrap();
         let mut args = Cli::try_parse_from(["pi"]).unwrap();

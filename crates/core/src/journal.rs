@@ -853,6 +853,58 @@ impl Session {
         Ok(())
     }
 
+    /// Persist a thinking-only change without implying a model selection.
+    pub fn select_thinking_level(
+        &mut self,
+        provider: Option<&str>,
+        model: &str,
+        thinking: &str,
+    ) -> Result<()> {
+        if model.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        if self
+            .model_selection()
+            .is_some_and(|(_, level)| level.as_deref() == Some(thinking))
+        {
+            return Ok(());
+        }
+        self.append(Event::SourceEntry {
+            format: "pi-rs:thinking-selection".into(),
+            entry: serde_json::Value::Null,
+        })?;
+        self.append(Event::ModelSelected {
+            model: model.into(),
+            provider: provider.map(str::to_owned),
+            thinking: Some(thinking.into()),
+        })?;
+        Ok(())
+    }
+
+    /// Record the host connection used for subsequent model requests.
+    pub fn record_request_identity(&mut self, provider: &str, model: &str) -> Result<()> {
+        let identity = serde_json::json!({"provider": provider, "model": model});
+        if self
+            .branch()
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:request-identity" => {
+                    Some(entry)
+                }
+                _ => None,
+            })
+            .is_some_and(|previous| previous == &identity)
+        {
+            return Ok(());
+        }
+        self.append(Event::SourceEntry {
+            format: "pi-rs:request-identity".into(),
+            entry: identity,
+        })?;
+        Ok(())
+    }
+
     // A Pi assistant may have been routed to another model after the last
     // explicit selection. Without the host catalog we cannot resolve virtual
     // models here, so persist an explicit user selection instead of deduping it.
@@ -873,7 +925,8 @@ impl Session {
                 }
                 Event::ModelSelected { .. } => {
                     let imported = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
-                        parent.timestamp == record.timestamp && record.run_id.is_none() && matches!(&parent.event, Event::SourceEntry { format, entry } if format == "pi" && matches!(entry["type"].as_str(), Some("model_change" | "thinking_level_change" | "message")))
+                        matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection") ||
+                        (parent.timestamp == record.timestamp && record.run_id.is_none() && matches!(&parent.event, Event::SourceEntry { format, entry } if format == "pi" && matches!(entry["type"].as_str(), Some("model_change" | "thinking_level_change" | "message"))))
                     });
                     if !imported {
                         return false;

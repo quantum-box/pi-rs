@@ -299,6 +299,15 @@ impl Cursor {
                 position.imported = None;
                 None
             }
+            Event::SourceEntry { format, .. }
+                if matches!(
+                    format.as_str(),
+                    "pi-rs:thinking-selection" | "pi-rs:request-identity"
+                ) =>
+            {
+                position.imported = None;
+                None
+            }
             Event::CacheWarm {
                 metadata,
                 usage,
@@ -340,6 +349,19 @@ impl Cursor {
             } => {
                 let current = selection(model, provider.as_deref(), thinking.as_deref());
                 position.model = Some(record.id);
+                let thinking_only = record.parent.and_then(|id| records.get(id as usize - 1)).is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection"));
+                if thinking_only {
+                    let entry = json!({"type":"thinking_level_change","thinkingLevel":current.2});
+                    entries.push(with_identity(
+                        entry,
+                        &record.id.to_string(),
+                        wire_id(parent.visible),
+                        record,
+                    ));
+                    position.visible = Some(record.id);
+                    self.positions.push(position);
+                    return entries;
+                }
                 position.response_model = None;
                 let previous = parent.model.and_then(|id| {
                     let Event::ModelSelected {
