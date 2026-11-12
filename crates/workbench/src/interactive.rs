@@ -1507,6 +1507,15 @@ impl View {
         true
     }
 
+    fn keyboard_copies_selection(
+        &self,
+        editor_copy: bool,
+        message_copy: bool,
+        copy_on_select: bool,
+    ) -> bool {
+        (editor_copy || (message_copy && !copy_on_select)) && self.mouse.text().is_some()
+    }
+
     fn fullscreen_mouse(&mut self, event: MouseEvent, args: &Cli) -> bool {
         if self.picker.is_some() || self.dialog().is_some() {
             return false;
@@ -4284,7 +4293,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         continue;
                     }
                 }
-                if keys.matches("tui.input.copy", key) && view.copy_selection() {
+                if view.keyboard_copies_selection(
+                    keys.matches("tui.input.copy", key),
+                    keys.matches("app.message.copy", key),
+                    args.settings.boolean("fullscreenCopyOnSelect") != Some(false),
+                ) && view.copy_selection()
+                {
                     continue;
                 }
                 view.mouse.clear();
@@ -4387,9 +4401,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             view.append(&error.to_string());
                         }
                     }
-                    "app.message.copy" if !is_busy(&worker) => {
-                        if let Err(error) = sessions::copy_last(&Session::open(&args.session)?) {
-                            view.append(&error.to_string());
+                    "app.message.copy" => {
+                        match Session::snapshot(&args.session)
+                            .and_then(|session| sessions::copy_last(&session))
+                        {
+                            Ok(()) => view.flash = Some(("Copied!".into(), Instant::now())),
+                            Err(error) => view.append(&error.to_string()),
                         }
                     }
                     "app.model.cycleForward" | "app.model.cycleBackward" if !is_busy(&worker) => {
@@ -6303,6 +6320,23 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copy_shortcut_prefers_selected_text_when_auto_copy_is_disabled() {
+        let mut view = super::View::default();
+        assert!(!view.keyboard_copies_selection(false, true, false));
+        let lines = [super::Line::plain(
+            "selected text",
+            crossterm::style::Color::Reset,
+        )];
+        view.mouse.update(&lines, 0, 0..1);
+        view.mouse.press(0, 0, std::time::Instant::now());
+        assert!(view.mouse.release(7, 0));
+        assert_eq!(view.mouse.text().as_deref(), Some("selected"));
+        assert!(view.keyboard_copies_selection(false, true, false));
+        assert!(!view.keyboard_copies_selection(false, true, true));
+        assert!(view.keyboard_copies_selection(true, false, true));
+    }
+
     #[test]
     fn credential_change_discards_cached_and_inflight_model_lists() {
         let mut view = super::View::default();
