@@ -327,6 +327,15 @@ impl Theme {
             )
     }
     pub fn system() -> Self {
+        let background = unpack_terminal_color(TERMINAL_BACKGROUND.load(Ordering::Relaxed));
+        let palette: Option<Vec<_>> = TERMINAL_PALETTE
+            .iter()
+            .map(|value| unpack_terminal_color(value.load(Ordering::Relaxed)))
+            .collect();
+        Self::system_with_palette(background, palette.as_deref())
+    }
+
+    fn system_with_palette(background: Option<[u8; 3]>, palette: Option<&[[u8; 3]]>) -> Self {
         // Pi uses the terminal's ANSI slots when no palette has been reported.
         let roles = [
             ("accent", 5),
@@ -357,10 +366,11 @@ impl Theme {
             ("thinkingXhigh", 13),
             ("thinkingMax", 1),
         ];
-        let palette: Option<Vec<_>> = TERMINAL_PALETTE
-            .iter()
-            .map(|value| unpack_terminal_color(value.load(Ordering::Relaxed)))
-            .collect();
+        // Without a reported background Pi leaves colors as ANSI indices, even if
+        // a palette was reported. The terminal can then render its own colors.
+        let palette = background
+            .and(palette)
+            .filter(|palette| palette.len() == 16);
         Self {
             name: "system".into(),
             path: None,
@@ -368,7 +378,6 @@ impl Theme {
                 .into_iter()
                 .map(|(key, index)| {
                     let color = palette
-                        .as_ref()
                         .map(|palette| {
                             let [r, g, b] = palette[index as usize];
                             Color::Rgb { r, g, b }
@@ -621,6 +630,27 @@ mod tests {
         for token in ["text", "toolTitle", "selectedBg", "toolErrorBg"] {
             assert_eq!(theme.color(token), Color::Reset, "{token}");
         }
+    }
+
+    #[test]
+    fn system_without_background_keeps_indexed_colors_even_with_palette() {
+        let palette = [[17, 34, 51]; 16];
+        let theme = Theme::system_with_palette(None, Some(&palette));
+        assert_eq!(theme.color("accent"), Color::AnsiValue(5));
+        assert_eq!(theme.color("text"), Color::Reset);
+        assert!(theme.is_dim("muted"));
+
+        let theme = Theme::system_with_palette(Some([0, 0, 0]), Some(&palette));
+        assert_eq!(
+            theme.color("accent"),
+            Color::Rgb {
+                r: 17,
+                g: 34,
+                b: 51
+            }
+        );
+        let theme = Theme::system_with_palette(Some([0, 0, 0]), Some(&palette[..15]));
+        assert_eq!(theme.color("accent"), Color::AnsiValue(5));
     }
 
     #[test]
