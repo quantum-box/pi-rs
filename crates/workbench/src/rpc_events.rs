@@ -312,7 +312,7 @@ impl Stream {
                     let result = tool_result_value(
                         &outcome.tool_content(),
                         Some(&outcome),
-                        outcome.is_structured(),
+                        Some(outcome.is_structured()),
                     );
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
@@ -508,9 +508,9 @@ pub(super) fn tool_failed(outcome: &Outcome) -> bool {
 pub(super) fn tool_result_value(
     text: &str,
     outcome: Option<&Outcome>,
-    is_structured: bool,
+    is_structured: Option<bool>,
 ) -> Value {
-    let (text, images) = if is_structured {
+    let (text, images) = if pi_rs::tool_content_is_structured(text, is_structured) {
         pi_rs::extract_tool_images(text.to_owned())
     } else {
         (text.to_owned(), Vec::new())
@@ -586,7 +586,7 @@ mod streaming_tool_tests {
             tool_result_value(
                 &result.tool_content(),
                 Some(&result),
-                result.is_structured()
+                Some(result.is_structured())
             ),
             json!({"content":[{"type":"text","text":"exact"}], "details":{"code":42}})
         );
@@ -607,7 +607,7 @@ mod streaming_tool_tests {
             is_error: true,
         };
         assert_eq!(
-            tool_result_value(text, Some(&outcome), outcome.is_structured()),
+            tool_result_value(text, Some(&outcome), Some(outcome.is_structured())),
             json!({"content":[{"type":"text","text":text}]})
         );
     }

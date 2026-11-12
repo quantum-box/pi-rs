@@ -263,11 +263,12 @@ fn payload(request: &ModelRequest, provider: &str) -> Value {
                 is_structured,
                 ..
             } => {
-                let (text, images) = if *is_structured {
-                    pi_rs_core::extract_tool_images(content.clone())
-                } else {
-                    (content.clone(), Vec::new())
-                };
+                let (text, images) =
+                    if pi_rs_core::tool_content_is_structured(content, *is_structured) {
+                        pi_rs_core::extract_tool_images(content.clone())
+                    } else {
+                        (content.clone(), Vec::new())
+                    };
                 let output = if images.is_empty() {
                     json!(text)
                 } else {
@@ -540,7 +541,7 @@ mod tests {
     #[test]
     fn tool_images_are_sent_as_images_not_base64_text() {
         let mut request = request();
-        request.messages.push(Message::Tool { is_structured: true, is_error: false, call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
+        request.messages.push(Message::Tool { is_structured: Some(true), is_error: false, call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
         let body = payload(&request, "openai-chatgpt");
         let output = &body["input"][2]["output"];
         assert_eq!(output[0]["type"], "input_text");
@@ -559,9 +560,14 @@ mod tests {
             call_id: "call".into(),
             content: text.into(),
             is_error: false,
-            is_structured: false,
+            is_structured: Some(false),
         });
         assert_eq!(payload(&request, "openai")["input"][2]["output"], text);
+        request.messages[2] =
+            serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
+        let output = &payload(&request, "openai")["input"][2]["output"];
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,aW1hZ2U=");
     }
 
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {

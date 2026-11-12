@@ -37,7 +37,7 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
             is_structured,
             ..
         } => {
-            let (content, images) = if *is_structured {
+            let (content, images) = if crate::tool_content_is_structured(content, *is_structured) {
                 extract_tool_images(content.clone())
             } else {
                 (content.clone(), Vec::new())
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn structured_tool_images_have_a_fixed_cost_and_preserve_original_data() {
         let result = |data: &str| Message::Tool {
-            is_structured: true,
+            is_structured: Some(true),
             is_error: false,
             call_id: "lookup".into(),
             content: serde_json::json!({"data":{"content":[
@@ -148,13 +148,13 @@ mod tests {
             call_id: "id".into(),
             content: content.clone(),
             is_error: false,
-            is_structured: false,
+            is_structured: Some(false),
         };
         let structured = Message::Tool {
             call_id: "id".into(),
             content,
             is_error: false,
-            is_structured: true,
+            is_structured: Some(true),
         };
         assert!(estimate_message_tokens(&plain) > estimate_message_tokens(&structured));
     }

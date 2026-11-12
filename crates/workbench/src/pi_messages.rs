@@ -718,7 +718,7 @@ mod tool_status_tests {
                 call_id: "call".into(),
                 content: text.into(),
                 is_error: false,
-                is_structured: true,
+                is_structured: Some(true),
             }],
             tools: vec![],
             max_output_tokens: 10,
@@ -727,6 +727,18 @@ mod tool_status_tests {
         assert_eq!(blocks[1]["type"], "image");
         assert_eq!(blocks[1]["data"], "aW1hZ2U=");
         assert!(!blocks[0]["text"].as_str().unwrap().contains("aW1hZ2U="));
+        let legacy =
+            serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
+        let body = client.encode(ModelRequest {
+            model: "fixture".into(),
+            messages: vec![legacy],
+            tools: vec![],
+            max_output_tokens: 10,
+        });
+        assert_eq!(
+            body["context"]["messages"][0]["content"][1]["data"],
+            "aW1hZ2U="
+        );
     }
 
     #[test]

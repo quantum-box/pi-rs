@@ -371,7 +371,7 @@ impl Projection {
                 call_id: self.invocation(records, operation_id)?.call.id.clone(),
                 content: outcome.tool_content(),
                 is_error: outcome.is_error(),
-                is_structured: outcome.is_structured(),
+                is_structured: Some(outcome.is_structured()),
             },
             Event::BashExecution { .. } => return shell_message(record),
             Event::SystemCheckpoint { content, .. } => Message::System {

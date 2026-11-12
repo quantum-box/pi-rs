@@ -1012,7 +1012,7 @@ mod tests {
             let rpc = super::super::rpc_events::tool_result_value(
                 &outcome.tool_content(),
                 Some(outcome),
-                outcome.is_structured(),
+                Some(outcome.is_structured()),
             );
             assert_eq!(rpc["details"], details);
             assert_eq!(rpc["content"][1]["data"], "aW1hZ2U=");

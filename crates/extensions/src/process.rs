@@ -115,8 +115,8 @@ fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) 
     }
 }
 
-// Older executable hooks discard unknown tool-message fields. Keep metadata by
-// call ID when the hook cannot represent it, even when it rewrites the content.
+// Older executable hooks discard unknown tool-message fields. Retain provenance
+// only for unchanged content; rewrites have unknown legacy provenance.
 fn restore_legacy_tool_metadata(
     original: &ModelRequest,
     updated: &mut ModelRequest,
@@ -126,11 +126,13 @@ fn restore_legacy_tool_metadata(
     for message in &mut updated.messages {
         if let Message::Tool {
             call_id,
+            content,
             is_error,
             is_structured,
             ..
         } = message
             && let Some(Message::Tool {
+                content: previous_content,
                 is_error: previous_error,
                 is_structured: previous_structure,
                 ..
@@ -143,7 +145,11 @@ fn restore_legacy_tool_metadata(
                 *is_error = *previous_error;
             }
             if restore_structure {
-                *is_structured = *previous_structure;
+                *is_structured = if content == previous_content {
+                    *previous_structure
+                } else {
+                    None
+                };
             }
         }
     }
@@ -301,6 +307,9 @@ struct Description {
     tool_message_error: bool,
     #[serde(default)]
     tool_message_structured: bool,
+    /// This executable distinguishes explicit false from missing provenance.
+    #[serde(default)]
+    tool_message_provenance_v2: bool,
     #[serde(default)]
     tool_call_hook: bool,
     #[serde(default)]
@@ -719,7 +728,7 @@ impl Extension for ExecutableExtension {
             request,
             &mut updated,
             !self.description.tool_message_error,
-            !self.description.tool_message_structured,
+            !self.description.tool_message_provenance_v2,
         );
         *request = updated;
         Ok(())
@@ -741,7 +750,7 @@ impl Extension for ExecutableExtension {
             request,
             &mut updated,
             !self.description.tool_message_error,
-            !self.description.tool_message_structured,
+            !self.description.tool_message_provenance_v2,
         );
         *request = updated;
         Ok(())
@@ -775,7 +784,7 @@ impl Extension for ExecutableExtension {
             &original,
             &mut updated,
             !self.description.tool_message_error,
-            !self.description.tool_message_structured,
+            !self.description.tool_message_provenance_v2,
         );
         *messages = updated.messages;
         Ok(())
@@ -1849,6 +1858,7 @@ async fn dispatch_with_host(
             text_result_v2: true,
             tool_message_error: true,
             tool_message_structured: true,
+            tool_message_provenance_v2: true,
             tool_call_hook: extension.handles_tool_call(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
@@ -2118,7 +2128,26 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            &message,
+            Message::Tool {
+                is_structured: None,
+                ..
+            }
+        ));
         assert_eq!(serde_json::to_value(message).unwrap(), legacy);
+        let explicit = Message::Tool {
+            call_id: "call".into(),
+            content: "text".into(),
+            is_error: false,
+            is_structured: Some(false),
+        };
+        let encoded = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(encoded["is_structured"], false);
+        assert_eq!(
+            serde_json::from_value::<Message>(encoded).unwrap(),
+            explicit
+        );
     }
 
     #[test]
@@ -2463,79 +2492,109 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn legacy_context_hooks_preserve_tool_status_while_current_hooks_can_change_it() {
+    async fn legacy_context_hooks_distinguish_unchanged_and_rewritten_provenance() {
         use std::os::unix::fs::PermissionsExt;
         let script = r##"#!/usr/bin/env python3
 import json,sys,os
 r=json.load(sys.stdin)
 name=os.path.basename(sys.argv[0])
 if r['type']=='describe':
-    value={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'tool_message_error':name!='legacy','tool_message_structured':name=='modern'}
+    value={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'tool_message_error':name!='legacy','tool_message_structured':name in ('prior','modern'),'tool_message_provenance_v2':name=='modern'}
 else:
     value=r.get('messages') if r['type']=='context_with_system' else r['request']
     messages=value if isinstance(value,list) else value['messages']
     for m in messages:
         if m['role']=='tool':
-            if name != 'intermediate': m.pop('is_error',None)
-            m.pop('is_structured',None)
-            m['content']='rewritten'
+            if name=='legacy': m.pop('is_error',None)
+            if name!='modern': m.pop('is_structured',None)
+            if m['call_id']=='to_text':
+                m['content']='replacement text'
+                if name=='modern': m['is_structured']=False
+            if m['call_id']=='to_structured':
+                m['content']='{"data":{"content":[{"type":"image","mimeType":"image/png","data":"YWJj"}]}}'
+                if name=='modern': m['is_structured']=True
 print(json.dumps({'version':1,'response':{'Ok':value}}))
 "##;
         let dir = tempfile::tempdir().unwrap();
-        for name in ["legacy", "intermediate", "modern"] {
+        for name in ["legacy", "intermediate", "prior", "modern"] {
             let path = dir.path().join(name);
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             let extension = ExecutableExtension::load(path).unwrap();
+            let item = |id: &str, content: &str, is_structured| Message::Tool {
+                call_id: id.into(),
+                content: content.into(),
+                is_error: true,
+                is_structured: Some(is_structured),
+            };
             let original = ModelRequest {
                 model: "fixture".into(),
                 messages: vec![
-                    Message::Tool {
-                        call_id: "call".into(),
-                        content: "original".into(),
-                        is_error: true,
-                        is_structured: true,
-                    },
-                    Message::Tool {
-                        call_id: "plain".into(),
-                        content: "plain".into(),
-                        is_error: false,
-                        is_structured: false,
-                    },
+                    item("unchanged_structured", "structured", true),
+                    item("unchanged_plain", "plain", false),
+                    item("to_text", "old structured", true),
+                    item("to_structured", "old plain", false),
                 ],
                 tools: vec![],
                 max_output_tokens: 10,
             };
+            let check = |messages: &[Message]| {
+                assert!(matches!(
+                    &messages[0],
+                    Message::Tool {
+                        is_error: true,
+                        is_structured: Some(true),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &messages[1],
+                    Message::Tool {
+                        is_error: true,
+                        is_structured: Some(false),
+                        ..
+                    }
+                ));
+                for (index, expected) in [(2, false), (3, true)] {
+                    let Message::Tool {
+                        content,
+                        is_error,
+                        is_structured,
+                        ..
+                    } = &messages[index]
+                    else {
+                        panic!("tool message missing")
+                    };
+                    assert!(*is_error);
+                    assert_eq!(
+                        *is_structured,
+                        if name == "modern" {
+                            Some(expected)
+                        } else {
+                            None
+                        }
+                    );
+                    assert_eq!(
+                        pi_rs_core::tool_content_is_structured(content, *is_structured),
+                        expected
+                    );
+                }
+            };
             let mut request = original.clone();
             extension.context(&mut request, None).unwrap();
-            assert!(
-                matches!(&request.messages[0], Message::Tool { content, is_error, is_structured, .. } if content == "rewritten" && *is_error == (name != "modern") && *is_structured == (name != "modern"))
-            );
-            assert!(
-                matches!(&request.messages[1], Message::Tool { content, is_structured: false, .. } if content == "rewritten")
-            );
+            check(&request.messages);
             let mut request = original.clone();
             extension
                 .before_request(&mut request, RequestPurpose::Turn, None)
                 .await
                 .unwrap();
-            assert!(
-                matches!(&request.messages[0], Message::Tool { content, is_error, is_structured, .. } if content == "rewritten" && *is_error == (name != "modern") && *is_structured == (name != "modern"))
-            );
-            assert!(
-                matches!(&request.messages[1], Message::Tool { content, is_structured: false, .. } if content == "rewritten")
-            );
+            check(&request.messages);
             let mut messages = original.messages;
             extension
                 .context_with_system(&mut messages, None)
                 .await
                 .unwrap();
-            assert!(
-                matches!(&messages[0], Message::Tool { content, is_error, is_structured, .. } if content == "rewritten" && *is_error == (name != "modern") && *is_structured == (name != "modern"))
-            );
-            assert!(
-                matches!(&messages[1], Message::Tool { content, is_structured: false, .. } if content == "rewritten")
-            );
+            check(&messages);
         }
     }
 

@@ -87,10 +87,12 @@ work; older executables receive a lossy legacy projection of patched failures,
 which cannot represent failure details. The same projection applies to nested
 host-call responses sent to older executables; current executables receive the
 full result. Tool messages carry `is_error` independently of their text; older
-context-hook executables retain the original status and structured-content flag
-by tool-call ID when they rewrite messages. Tool message `is_structured` marks
-encoded structured results so plain text, including JSON, stays verbatim. When
-older serialized messages omit the flag, they default to plain text. Patches to
+context-hook executables retain the original status by tool-call ID and retain
+structured provenance when content is unchanged. Their rewritten content has
+unknown provenance and follows legacy structured-envelope detection. Tool
+message `is_structured` marks known structured or plain results. Older serialized
+messages without the flag also use legacy detection, so images remain subject
+to normal filtering and extraction. Patches to
 non-text outcomes are reported as hook errors; use the full-outcome hook for
 those results.
 

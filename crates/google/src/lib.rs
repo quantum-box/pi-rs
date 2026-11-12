@@ -563,11 +563,12 @@ fn wire_request(
                         "Google tool result has no preceding call".into(),
                     ));
                 };
-                let (text, images) = if *is_structured {
-                    extract_tool_images(content.clone())
-                } else {
-                    (content.clone(), Vec::new())
-                };
+                let (text, images) =
+                    if pi_rs_core::tool_content_is_structured(content, *is_structured) {
+                        extract_tool_images(content.clone())
+                    } else {
+                        (content.clone(), Vec::new())
+                    };
                 let mut response = json!({"name":name,"response":{"output":text}});
                 if let Some(id) = id {
                     response["id"] = json!(id);
@@ -815,7 +816,7 @@ mod tests {
     #[test]
     fn plain_json_tool_output_is_not_extracted_as_an_image() {
         let text = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
-        let request = ModelRequest {
+        let mut request = ModelRequest {
             model: "gemini-3-pro-preview".into(),
             messages: vec![
                 Message::Assistant {
@@ -831,7 +832,7 @@ mod tests {
                     call_id: "call".into(),
                     content: text.into(),
                     is_error: false,
-                    is_structured: false,
+                    is_structured: Some(false),
                 },
             ],
             tools: vec![],
@@ -841,6 +842,13 @@ mod tests {
         let response = &body["contents"][1]["parts"][0]["functionResponse"];
         assert_eq!(response["response"]["output"], text);
         assert!(response.get("parts").is_none());
+        request.messages[1] =
+            serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
+        let body = wire_request(&request, None, "google").unwrap();
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["data"],
+            "aW1hZ2U="
+        );
     }
 
     #[test]
@@ -879,13 +887,13 @@ mod tests {
                         replay: None,
                     },
                     Message::Tool {
-                        is_structured: true,
+                        is_structured: Some(true),
                         is_error: false,
                         call_id: "a".into(),
                         content: image_result.clone(),
                     },
                     Message::Tool {
-                        is_structured: false,
+                        is_structured: Some(false),
                         is_error: false,
                         call_id: "b".into(),
                         content: "second result".into(),
@@ -1111,7 +1119,7 @@ mod tests {
                     })),
                 },
                 Message::Tool {
-                    is_structured: false,
+                    is_structured: Some(false),
                     is_error: false,
                     call_id: "logical-call".into(),
                     content: "tool output".into(),

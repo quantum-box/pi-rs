@@ -119,10 +119,12 @@ fn remove_images(messages: &mut [Message], user_placeholder: &str, tool_placehol
             }
             Message::Tool {
                 content,
-                is_structured: true,
+                is_structured,
                 ..
             } => {
-                if let Some(filtered) = remove_tool_images(content, tool_placeholder) {
+                if pi_rs::tool_content_is_structured(content, *is_structured)
+                    && let Some(filtered) = remove_tool_images(content, tool_placeholder)
+                {
                     *content = filtered;
                 }
             }
@@ -171,7 +173,7 @@ mod tests {
                 }],
             },
             Message::Tool {
-                is_structured: true,
+                is_structured: Some(true),
                 is_error: false,
                 call_id: "call".into(),
                 content: original.to_string(),
@@ -200,10 +202,25 @@ mod tests {
             call_id: "id".into(),
             content: content.into(),
             is_error: false,
-            is_structured: false,
+            is_structured: Some(false),
         }];
         remove_images(&mut messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
         assert!(matches!(&messages[0], Message::Tool { content: actual, .. } if actual == content));
+        let legacy =
+            serde_json::from_value(json!({"role":"tool", "call_id":"id", "content":content}))
+                .unwrap();
+        let mut messages = vec![legacy];
+        remove_images(&mut messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
+        let Message::Tool {
+            content: filtered,
+            is_structured: None,
+            ..
+        } = &messages[0]
+        else {
+            panic!("legacy tool message missing")
+        };
+        assert!(!filtered.contains("private"));
+        assert!(filtered.contains(BLOCKED_IMAGE));
     }
 
     #[test]
@@ -214,7 +231,7 @@ mod tests {
                 images: vec![pi_rs::ImageContent { data: "private".into(), mime_type: "image/png".into() }],
             },
             Message::Tool {
-                is_structured: true,
+                is_structured: Some(true),
                 is_error: false, call_id: "call".into(),
                 content: json!({"data":{"content":[{"type":"text","text":"before"},{"type":"image","data":"private"},{"type":"image","data":"private"},{"type":"text","text":"after"}]}}).to_string(),
             },

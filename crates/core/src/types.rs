@@ -168,6 +168,16 @@ impl ImageContent {
     }
 }
 
+/// Resolve provenance for tool messages written before the structured flag existed.
+/// Unknown legacy messages retain the historical structured-envelope detection.
+pub fn tool_content_is_structured(content: &str, is_structured: Option<bool>) -> bool {
+    is_structured.unwrap_or_else(|| {
+        serde_json::from_str::<Value>(content)
+            .ok()
+            .is_some_and(|value| value["data"]["content"].is_array())
+    })
+}
+
 /// Separate supported images from native structured tool output for provider encoding.
 pub fn extract_tool_images(mut content: String) -> (String, Vec<ImageContent>) {
     let mut images = Vec::new();
@@ -259,9 +269,9 @@ pub enum Message {
         /// Whether the tool result represents an error; absent in older messages.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
-        /// Whether `content` is an encoded structured tool result.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        is_structured: bool,
+        /// None denotes an older message whose provenance was not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_structured: Option<bool>,
     },
 }
 
