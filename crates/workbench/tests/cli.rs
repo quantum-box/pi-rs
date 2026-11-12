@@ -15,6 +15,10 @@ fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStrea
     let (sender, receiver) = std::sync::mpsc::channel();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        assert!(
+            Instant::now() < deadline,
+            "proxy request not received before deadline"
+        );
         if let Ok(request) = receiver.try_recv() {
             return request;
         }
@@ -2085,7 +2089,12 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         )
         .unwrap();
         let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
             loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "proxy did not receive a model request"
+                );
                 let (mut socket, mut reader, first) =
                     accept_proxy_request(listener.try_clone().unwrap());
                 let mut headers = String::new();
@@ -2135,9 +2144,10 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         if from_env {
             command.env("http_proxy", &proxy);
         }
+        let stderr = tempfile::NamedTempFile::new().unwrap();
         let mut child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr.reopen().unwrap()))
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(45);
@@ -2146,18 +2156,19 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
         }
         if child.try_wait().unwrap().is_none() {
             let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
+            let _ = child.wait();
             panic!(
                 "{provider}: CLI timed out; stderr: {}",
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
             );
         }
-        let output = child.wait_with_output().unwrap();
+        let status = child.wait().unwrap();
+        let stderr = std::fs::read(stderr.path()).unwrap();
         let (request, headers) = server.join().unwrap_or_else(|_| {
             panic!(
                 "{provider}: proxy server failed; status: {}; stderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
+                status,
+                String::from_utf8_lossy(&stderr)
             )
         });
         assert!(
@@ -2168,7 +2179,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
             headers.contains("proxy-authorization: basic dxnlcjpwyxnz"),
             "{provider}: {headers}"
         );
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("user:pass"));
+        assert!(!String::from_utf8_lossy(&stderr).contains("user:pass"));
     }
 }
 
