@@ -79,6 +79,8 @@ without `defaultProvider` are still accepted.
 Known text-only chat models receive Pi's image-omission placeholders for user
 and tool images. Unknown model capabilities leave image handling to the
 provider, and the explicit image-blocking setting retains precedence.
+Local image reads also report when the selected model cannot receive images;
+the saved tool result retains the image for later use with a compatible model.
 
 OpenAI Responses `max_output_tokens` incomplete events preserve the streamed
 partial response and report the `length` finish reason. Across model providers,
