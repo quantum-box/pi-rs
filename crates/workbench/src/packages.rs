@@ -133,6 +133,10 @@ pub async fn command(args: &Cli, command: PackageCommand) -> Result<()> {
             {
                 return Err(Error::Config("package is not configured".into()));
             }
+            // Like Pi, offline update validates the requested source but performs no work.
+            if args.offline {
+                return Ok(());
+            }
             for source in sources {
                 if requested
                     .as_ref()

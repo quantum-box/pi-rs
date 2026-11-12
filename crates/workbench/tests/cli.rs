@@ -10,6 +10,47 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn offline_package_update_is_a_noop_but_checks_requested_source() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let settings = home.join("settings.json");
+    let contents = json!({"packages": ["git:https://example.com/team/package.git"]}).to_string();
+    std::fs::write(&settings, &contents).unwrap();
+
+    for source in [None, Some("git:https://example.com/team/package.git")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command.current_dir(root.path()).env("PI_RS_HOME", &home);
+        command.args(["--offline", "update"]);
+        if let Some(source) = source {
+            command.arg(source);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), contents);
+        assert!(!home.join("packages").exists());
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--offline",
+            "update",
+            "git:https://example.com/team/missing.git",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("package is not configured"));
+}
+
+#[test]
 fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     let root = tempfile::tempdir().unwrap();
     let prompts = root.path().join("custom");
