@@ -134,6 +134,11 @@ impl Google {
         self
     }
 
+    /// Return the configured request headers for protected context identity.
+    pub fn context_headers(&self) -> reqwest::header::HeaderMap {
+        self.headers.clone()
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -611,10 +616,17 @@ fn wire_request(
 #[async_trait::async_trait]
 impl Model for Google {
     fn context_identity(&self) -> Option<String> {
-        if !self.headers.is_empty() || !self.http_proxies.is_empty() {
+        if !self.http_proxies.is_empty() {
             return None;
         }
-        pi_rs_core::fingerprint_model_context(&(
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        pi_rs_core::protected_model_fingerprint(&(
+            headers,
             "google-v1",
             self.endpoint.as_str(),
             self.provider.as_ref(),
@@ -839,6 +851,27 @@ fn report_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn static_custom_header_has_protected_stable_identity() {
+        let make = |secret: &'static str| {
+            let mut headers = HeaderMap::new();
+            let mut value = reqwest::header::HeaderValue::from_static(secret);
+            value.set_sensitive(true);
+            headers.insert("x-route-secret", value);
+            Google::new("https://example.com/v1", "key")
+                .unwrap()
+                .with_headers(headers)
+        };
+        let first = make("pin-one");
+        let same = make("pin-one");
+        let changed = make("pin-two");
+        assert!(first.context_identity().is_some());
+        assert_eq!(first.context_identity(), same.context_identity());
+        assert_ne!(first.context_identity(), changed.context_identity());
+        assert!(!first.context_identity().unwrap().contains("pin-one"));
+    }
 
     #[test]
     fn capacity_estimate_matches_image_and_replay_serialization() {

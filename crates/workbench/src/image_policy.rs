@@ -253,6 +253,7 @@ fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn effective_context_identity_includes_image_policy_and_adapter() {
         let make = |endpoint: &str, block_images, supports_images| WorkbenchModel {

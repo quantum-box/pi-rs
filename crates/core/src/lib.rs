@@ -1,6 +1,7 @@
 //! Model, session, and tool execution primitives for an embeddable agent.
 mod agent;
 mod context;
+mod context_fingerprint;
 mod extension;
 mod journal;
 mod lifecycle;
@@ -14,6 +15,7 @@ mod ui;
 
 pub use agent::*;
 pub use context::*;
+pub use context_fingerprint::protected_model_fingerprint;
 pub use extension::*;
 pub use journal::*;
 pub use lifecycle::{

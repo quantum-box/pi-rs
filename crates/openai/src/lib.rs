@@ -113,6 +113,11 @@ impl OpenAiResponses {
         self
     }
 
+    /// Return the configured request headers for protected context identity.
+    pub fn context_headers(&self) -> reqwest::header::HeaderMap {
+        self.headers.clone()
+    }
+
     pub fn with_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -328,10 +333,17 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
     fn context_identity(&self) -> Option<String> {
-        if !self.headers.is_empty() || !self.identity_safe_transport {
+        if !self.identity_safe_transport {
             return None;
         }
-        pi_rs_core::fingerprint_model_context(&(
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        pi_rs_core::protected_model_fingerprint(&(
+            headers,
             "openai-responses-v1",
             self.endpoint.as_str(),
             &self.provider,

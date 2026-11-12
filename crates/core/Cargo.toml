@@ -20,7 +20,11 @@ tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 cap-std = "4"
 sha2 = "0.10"
+hmac = "0.12"
 tempfile = "3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

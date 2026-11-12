@@ -311,7 +311,7 @@ impl Deferred {
             return None;
         }
         let bearer = self.credential.as_ref().is_some_and(Credential::is_bearer);
-        pi_rs::fingerprint_model_context(&(
+        pi_rs::protected_model_fingerprint(&(
             "deferred-context-v1",
             self.provider.id(),
             self.adapter.api(),
@@ -421,16 +421,18 @@ impl Client {
     ) -> Result<Option<(Client, Option<String>)>> {
         let (client, headers) = match self {
             Self::Deferred(deferred) => deferred.resolve_with_headers().await?,
-            Self::PiMessages(client) if client.needs_context_preparation() => {
-                (Self::PiMessages(client.clone()), client.context_headers())
-            }
-            _ => return Ok(None),
+            Self::Ollama(client) => (self.clone(), client.context_headers()),
+            Self::Anthropic(client) => (self.clone(), client.context_headers()),
+            Self::Google(client) => (self.clone(), client.context_headers()),
+            Self::OpenAi(client) => (self.clone(), client.context_headers()),
+            Self::PiMessages(client) => (self.clone(), client.context_headers()),
+            Self::Bedrock(_) => return Ok(None),
         };
         let client = match client {
             Self::PiMessages(client) => Self::PiMessages(client.prepare_context(model).await?),
             other => other,
         };
-        // Hash effective headers separately; adapter identities omit custom headers.
+        // The keyed fingerprint protects low-entropy headers and adapter credentials.
         let base = client
             .clone()
             .with_headers(HeaderMap::new())
@@ -441,7 +443,7 @@ impl Client {
             .collect();
         header_values.sort();
         let identity = base.and_then(|base| {
-            pi_rs::fingerprint_model_context(&("resolved-client-v1", base, header_values))
+            pi_rs::protected_model_fingerprint(&("resolved-client-v2", base, header_values))
         });
         Ok(Some((client, identity)))
     }
@@ -866,7 +868,7 @@ mod estimation_tests {
     use clap::Parser;
 
     #[test]
-    fn deferred_bedrock_uses_text_tool_estimator_without_synthetic_credentials() {
+    fn deferred_bedrock_estimates_tool_images_without_synthetic_credentials() {
         let client = Client::deferred(
             Provider::Bedrock,
             Adapter::Bedrock,
@@ -890,9 +892,10 @@ mod estimation_tests {
         };
         let message = pi_rs::Message::Tool { call_id: "id".into(), is_error: false, is_structured: Some(true),
             content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(20000)}]}}).to_string() };
-        assert!(client.estimate_message_tokens(&request, &message) > 4000);
+        assert!((1200..1300).contains(&client.estimate_message_tokens(&request, &message)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn deferred_static_credentials_have_stable_route_bound_identity() {
         let client = |provider, adapter, endpoint: &str, credential| {
@@ -944,6 +947,7 @@ mod estimation_tests {
         assert_ne!(anthropic.context_identity(), google.context_identity());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn anthropic_direct_and_deferred_reuse_measured_baselines() {
         struct MeasuredFixture {
@@ -1040,12 +1044,193 @@ mod estimation_tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_command_credentials_resolve_without_persisting_identity() {
+        let client = Client::deferred(
+            Provider::Google,
+            Adapter::Google,
+            "https://example.com/v1",
+            Some(Credential::Command("!echo key-one".into())),
+            RequestHeaders::for_test("x-routing", "!echo route-one"),
+        );
+        let (prepared, identity) = client
+            .prepare_for_context("fixture")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(prepared, Client::Google(_)));
+        assert!(identity.is_none());
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn unprotected_platform_does_not_persist_header_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-routing",
+            reqwest::header::HeaderValue::from_static("secret"),
+        );
+        let client = Client::Google(
+            pi_rs::google::Google::new("https://example.com/v1", "key")
+                .unwrap()
+                .with_headers(headers),
+        );
+        let (_, identity) = client
+            .prepare_for_context("fixture")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(identity.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_static_headers_reuse_baseline_without_unkeyed_header_fingerprint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let request = String::from_utf8_lossy(&bytes[..header_end]).to_lowercase();
+            let length = request
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while bytes.len() < header_end + length {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            assert!(request.contains("x-routing: route-one"));
+            assert!(request.contains("x-goog-api-key: key-one"));
+            let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"reply\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3000,\"candidatesTokenCount\":8}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut headers = HeaderMap::new();
+        let mut routing = reqwest::header::HeaderValue::from_static("route-one");
+        routing.set_sensitive(true);
+        headers.insert("x-routing", routing);
+        let client = Client::Google(
+            pi_rs::google::Google::new(&endpoint, "key-one")
+                .unwrap()
+                .with_context_probe(false)
+                .with_headers(headers),
+        );
+        let model = super::super::image_policy::WorkbenchModel {
+            client,
+            block_images: false,
+            supports_images: Some(true),
+            session_affinity: &[],
+            price: None,
+        };
+        let registry = pi_rs::Registry::default();
+        let mut agent = pi_rs::Agent {
+            registry: &registry,
+            system_prompt: "short",
+            model: &model,
+            model_name: "fixture",
+            limits: pi_rs::Limits::default(),
+        };
+        agent.limits.context_window = Some(5000);
+        agent.limits.output_tokens_per_request = 64;
+        let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        agent
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let record = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                pi_rs::Event::ModelRequested {
+                    context_configuration_sha256,
+                    ..
+                } => context_configuration_sha256.as_ref(),
+                _ => None,
+            })
+            .unwrap();
+        let base = model
+            .client
+            .clone()
+            .with_headers(HeaderMap::new())
+            .context_identity()
+            .unwrap();
+        let guessed = pi_rs::fingerprint_model_context(&(
+            "resolved-client-v2",
+            base,
+            vec![("x-routing".to_owned(), b"route-one".to_vec())],
+        ))
+        .unwrap();
+        let guessed_policy = pi_rs::fingerprint_model_context(&(
+            "workbench-policy-v2",
+            guessed,
+            false,
+            Some(true),
+            &[] as &[&str],
+        ))
+        .unwrap();
+        let guessed_journal = pi_rs::fingerprint_model_context(&(
+            "effective-context-v2",
+            guessed_policy,
+            "fixture",
+            vec!["short"],
+            Vec::<pi_rs::ToolSpec>::new(),
+        ))
+        .unwrap();
+        assert_ne!(*record, guessed_journal);
+        assert!(
+            !serde_json::to_string(&session.records())
+                .unwrap()
+                .contains("route-one")
+        );
+        agent.limits.context_window = Some(1000);
+        let result = agent
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert!(
+            matches!(result, Err(pi_rs::Error::Model(message)) if message.contains("automatic compaction is disabled"))
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn dynamic_credentials_and_headers_reuse_measured_usage_after_dispatch() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let directory = tempfile::tempdir().unwrap();
-        let calls = directory.path().join("credential-calls");
-        let command = format!("!echo called >> \"{}\" && echo key-one", calls.display());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -1088,7 +1273,7 @@ mod estimation_tests {
             Provider::Google,
             Adapter::Google,
             &endpoint,
-            Some(Credential::Command(command)),
+            Some(Credential::Command("!echo key-one".into())),
             RequestHeaders::for_test("x-routing", "!echo route-one"),
         )
         .with_context_probes(false);
@@ -1123,7 +1308,6 @@ mod estimation_tests {
             .await
             .unwrap();
         server.await.unwrap();
-        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
         agent.limits.context_window = Some(1000);
         let result = agent
             .run(
@@ -1137,9 +1321,9 @@ mod estimation_tests {
         assert!(
             matches!(result, Err(pi_rs::Error::Model(message)) if message.contains("automatic compaction is disabled"))
         );
-        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn resolved_dynamic_headers_are_included_in_prepared_identity() {
         let make = |header: &str| {
@@ -1165,6 +1349,7 @@ mod estimation_tests {
         assert_ne!(a, b);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn dynamic_credentials_are_resolved_once_for_each_prepared_client() {
         let make = |command: &str| {

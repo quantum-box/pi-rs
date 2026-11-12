@@ -194,10 +194,6 @@ impl PiMessages {
         self.headers.clone()
     }
 
-    pub(super) fn needs_context_preparation(&self) -> bool {
-        self.radius.is_some()
-    }
-
     /// Freeze credentials and the catalog-selected route for one request.
     pub(super) async fn prepare_context(&self, model: &str) -> Result<Self> {
         if self.radius.is_none() {
@@ -486,12 +482,18 @@ impl Model for PiMessages {
         // Radius discovers its route and credentials dynamically.
         if (self.identity == "radius" && self.prepared_limits.is_none())
             || self.radius.is_some()
-            || !self.headers.is_empty()
             || !self.identity_safe_transport
         {
             return None;
         }
-        pi_rs::fingerprint_model_context(&(
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        pi_rs::protected_model_fingerprint(&(
+            headers,
             "pi-messages-v1",
             self.endpoint.as_str(),
             &self.identity,
@@ -850,6 +852,7 @@ mod tool_status_tests {
             second.encode(request)["context"]["messages"][0]["content"][0]["type"],
             "text"
         );
+        #[cfg(unix)]
         assert_ne!(first.context_identity(), second.context_identity());
     }
 

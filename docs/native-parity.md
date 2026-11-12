@@ -1736,19 +1736,22 @@ prefix-specific character estimates rather than borrowing usage for the whole
 conversation. The compaction record and RPC response report Pi-compatible
 `tokensBefore`, independently of the native retention budget.
 
-Native request budgeting uses adapter-specific message estimates. Anthropic and
-Bedrock tool results count their original text envelope; adapters that extract tool images
-use a fixed image allowance instead of counting encoded image bytes. Matching
-provider replay blocks, including reasoning and signatures, are included when
-the adapter actually replays them. Bedrock currently omits replay and rejects
-user image input. Its dynamic AWS credentials and endpoint resolver do not
+Native request budgeting uses adapter-specific message estimates. Anthropic tool
+results count their original text envelope; Bedrock and other adapters that
+extract tool images use a fixed image allowance instead of counting encoded
+image bytes. Bedrock also accepts user images. Matching provider replay blocks,
+including reasoning and signatures, are included only when the adapter actually
+replays them. Bedrock's dynamic AWS credentials and endpoint resolver do not
 provide a provably stable identity, so measured baselines are not reused for
 Bedrock requests. A measured baseline is combined with provider-aware estimates of subsequent
 messages and any additional replay content. Request hooks that change the
 model, messages or tools invalidate the measured baseline; that fact is recorded
 with the request so it remains effective after reopening. A fingerprint also
 requires the effective adapter identity, image policy, model, system messages
-and tool schemas to match the measured request. Deferred workbench providers
+and tool schemas to match the measured request. Secret-bearing adapter and
+header identities use an owner-only persistent HMAC key on Unix. If protected
+key storage is unavailable, including on platforms without an implementation,
+the measured baseline is not reused. Deferred workbench providers
 resolve credentials and headers before the capacity check and use the same
 resolved adapter for dispatch; the AIP budget wrapper preserves preparation and
 its budget settlement. Radius also freezes the catalog-selected route

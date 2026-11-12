@@ -351,52 +351,98 @@ impl Model for Bedrock {
         fn text_tokens(text: &str) -> u64 {
             (text.encode_utf16().count() as u64).div_ceil(4)
         }
-        let visible = match message {
-            Message::System { content } if content.trim().is_empty() => return 0,
-            Message::User { content } => required_text(content.clone()),
+        match message {
+            Message::System { content } if content.trim().is_empty() => 0,
+            Message::User { content } => text_tokens(&required_text(content.clone())),
+            Message::UserWithImages { content, images }
+                if images.is_empty() && content.trim().is_empty() =>
+            {
+                text_tokens("<empty>")
+            }
             Message::Tool {
                 call_id,
                 content,
                 is_error,
-                ..
-            } if request.tools.is_empty() => format!(
-                "Historical tool result ({}; {}):\n{}",
-                call_id,
-                if *is_error { "error" } else { "success" },
+                is_structured,
+            } => {
+                let (text, images) =
+                    if pi_rs_core::tool_content_is_structured(content, *is_structured) {
+                        pi_rs_core::extract_tool_images(content.clone())
+                    } else {
+                        (content.clone(), Vec::new())
+                    };
+                let text = if request.tools.is_empty() {
+                    format!(
+                        "Historical tool result ({}; {}):\n{}",
+                        call_id,
+                        if *is_error { "error" } else { "success" },
+                        text
+                    )
+                } else {
+                    let mut text = required_text(text);
+                    if *is_error && self.is_claude(&request.model) && !images.is_empty() {
+                        text.push_str("Images from the tool error result:");
+                    }
+                    text
+                };
+                pi_rs_core::estimate_message_tokens(&Message::UserWithImages {
+                    content: text,
+                    images,
+                })
+            }
+            Message::Assistant {
                 content,
-            ),
-            Message::Tool { content, .. } => required_text(content.clone()),
-            Message::Assistant { content, calls, .. } if request.tools.is_empty() => {
-                let mut text = if content.trim().is_empty() {
+                calls,
+                replay,
+            } => {
+                let tool_free = request.tools.is_empty();
+                let mut visible = if content.trim().is_empty() {
                     String::new()
                 } else {
                     content.clone()
                 };
                 for call in calls {
-                    text.push_str(&format!(
-                        "Historical tool call ({}; {}):\n{}",
-                        call.id, call.name, call.arguments
-                    ));
+                    if tool_free {
+                        visible.push_str(&format!(
+                            "Historical tool call ({}; {}):\n{}",
+                            call.id, call.name, call.arguments
+                        ));
+                    } else {
+                        visible.push_str(&call.name);
+                        visible.push_str(&history_tool_input(&call.arguments).to_string());
+                    }
                 }
-                text
-            }
-            Message::Assistant { content, calls, .. } => {
-                let mut text = if content.trim().is_empty() {
-                    String::new()
-                } else {
-                    content.clone()
+                let base = text_tokens(&visible);
+                let Some(replay) = replay.as_deref().filter(|_| !tool_free || calls.is_empty())
+                else {
+                    return base;
                 };
-                for call in calls {
-                    let input = pi_rs_core::parse_tool_arguments(&call.arguments)
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    text.push_str(&call.name);
-                    text.push_str(&input.to_string());
+                let claude = self.is_claude(&request.model);
+                if replay_blocks(
+                    replay,
+                    &request.model,
+                    claude,
+                    content,
+                    calls,
+                    &mut ToolIds::default(),
+                )
+                .is_none()
+                {
+                    return base;
                 }
-                text
+                let mut ids = ToolIds::default();
+                let blocks: Vec<_> = replay.blocks.iter().map(|block| match block["type"].as_str() {
+                    Some("text") => serde_json::json!({"type":"text","text":block["text"]}),
+                    Some("tool_use") => serde_json::json!({"type":"tool_use","id":ids.get(block["id"].as_str().unwrap_or_default()),"name":block["name"],"input":block["input"]}),
+                    Some("reasoning") if block["redacted"].is_string() => serde_json::json!({"type":"reasoning","redacted":block["redacted"]}),
+                    Some("reasoning") if claude && block["signature"].as_str().is_some_and(|signature| !signature.is_empty()) => serde_json::json!({"type":"reasoning","text":block["text"],"signature":block["signature"]}),
+                    Some("reasoning") => serde_json::json!({"type":"reasoning","text":block["text"]}),
+                    _ => serde_json::Value::Null,
+                }).collect();
+                pi_rs_core::estimate_replay_tokens(&blocks).max(base)
             }
-            _ => return pi_rs_core::estimate_message_tokens(message),
-        };
-        text_tokens(&visible)
+            _ => pi_rs_core::estimate_message_tokens(message),
+        }
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
@@ -690,89 +736,105 @@ impl Model for Bedrock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn bedrock_still_rejects_user_images_before_provider_access() {
-        let model = Bedrock::from_env();
-        let request = ModelRequest {
-            model: "fixture".into(),
-            messages: vec![Message::UserWithImages {
-                content: "look".into(),
-                images: vec![pi_rs_core::ImageContent {
-                    mime_type: "image/png".into(),
-                    data: "AAAA".into(),
-                }],
-            }],
-            tools: vec![],
-            max_output_tokens: 1,
-        };
-        assert!(
-            matches!(model.stream(request).await, Err(Error::Config(message)) if message.contains("image input is not supported"))
-        );
-    }
-
     #[test]
-    fn capacity_estimates_follow_bedrock_text_encoding_and_ignore_replay() {
+    fn capacity_estimate_matches_multimodal_tool_and_reasoning_replay() {
         let model = Bedrock::from_env();
         assert!(model.context_identity().is_none());
         let mut request = ModelRequest {
-            model: "fixture".into(),
+            model: "anthropic.claude-test".into(),
             messages: vec![],
             tools: vec![],
             max_output_tokens: 1,
         };
-        let tool = |size| {
-            Message::Tool { call_id: "id".into(), content: serde_json::json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(size)}]}}).to_string(), is_error: false, is_structured: Some(true) }
-        };
-        let small = model.estimate_message_tokens(&request, &tool(4));
-        let large = model.estimate_message_tokens(&request, &tool(20000));
-        assert!(large > small + 4000);
-        let call = ToolCall {
-            id: "call".into(),
-            name: "lookup".into(),
-            arguments: "x".repeat(8000),
-        };
-        let replay = pi_rs_core::ProviderReplay {
-            identity: pi_rs_core::ResolvedModelIdentity {
-                provider: "bedrock".into(),
-                model: "fixture".into(),
-            },
-            blocks: vec![serde_json::json!({"reasoning":"x".repeat(30000)})],
-        };
-        let assistant = Message::Assistant {
-            content: "ok".into(),
-            calls: vec![call],
-            replay: Some(Box::new(replay)),
-        };
-        let with_replay = model.estimate_message_tokens(&request, &assistant);
-        let without_replay = if let Message::Assistant { content, calls, .. } = assistant {
-            Message::Assistant {
-                content,
-                calls,
-                replay: None,
-            }
-        } else {
-            unreachable!()
+        let tool = |size, is_error| {
+            Message::Tool { call_id: "id".into(), content: serde_json::json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(size)}]}}).to_string(), is_error, is_structured: Some(true) }
         };
         assert_eq!(
-            with_replay,
-            model.estimate_message_tokens(&request, &without_replay)
+            model.estimate_message_tokens(&request, &tool(4, false)),
+            model.estimate_message_tokens(&request, &tool(20000, false))
         );
-        assert!(with_replay > 1900);
         request.tools.push(pi_rs_core::ToolSpec {
             name: "lookup".into(),
             description: "".into(),
             parameters: serde_json::json!({}),
         });
-        assert!(model.estimate_message_tokens(&request, &without_replay) < 20);
+        let normal = model.estimate_message_tokens(&request, &tool(4, false));
         assert_eq!(
-            model.estimate_message_tokens(
-                &request,
-                &Message::User {
-                    content: " ".into()
-                }
-            ),
-            2
+            normal,
+            model.estimate_message_tokens(&request, &tool(20000, false))
         );
+        assert!(model.estimate_message_tokens(&request, &tool(4, true)) > normal);
+        let mut plain = tool(20000, false);
+        if let Message::Tool { is_structured, .. } = &mut plain {
+            *is_structured = Some(false);
+        }
+        assert!(model.estimate_message_tokens(&request, &plain) > 4000);
+        let user_image = Message::UserWithImages {
+            content: "look".into(),
+            images: vec![pi_rs_core::ImageContent {
+                mime_type: "image/png".into(),
+                data: "A".repeat(20000),
+            }],
+        };
+        assert_eq!(model.estimate_message_tokens(&request, &user_image), 1201);
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "amazon-bedrock".into(),
+                model: request.model.clone(),
+            },
+            blocks: vec![
+                serde_json::json!({"type":"reasoning","text":"x".repeat(8000),"signature":"sig"}),
+                serde_json::json!({"type":"text","text":"ok"}),
+            ],
+        };
+        let assistant = Message::Assistant {
+            content: "ok".into(),
+            calls: vec![],
+            replay: Some(Box::new(replay)),
+        };
+        let replay_cost = model.estimate_message_tokens(&request, &assistant);
+        assert!(replay_cost > 1900);
+        let mut with_unused_metadata = assistant.clone();
+        if let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &mut with_unused_metadata
+        {
+            replay.blocks[0]["ignored"] = serde_json::json!("x".repeat(30000));
+        }
+        assert_eq!(
+            model.estimate_message_tokens(&request, &with_unused_metadata),
+            replay_cost
+        );
+        let mut changed = assistant.clone();
+        if let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &mut changed
+        {
+            replay.identity.model = "other".into();
+        }
+        assert_eq!(model.estimate_message_tokens(&request, &changed), 1);
+        let call = ToolCall {
+            id: "id".into(),
+            name: "lookup".into(),
+            arguments: "{\"x\":1}".into(),
+        };
+        let mut with_call = assistant.clone();
+        if let Message::Assistant {
+            calls,
+            replay: Some(replay),
+            ..
+        } = &mut with_call
+        {
+            calls.push(call);
+            replay.blocks.push(
+                serde_json::json!({"type":"tool_use","id":"id","name":"lookup","input":{"x":1}}),
+            );
+        }
+        assert!(model.estimate_message_tokens(&request, &with_call) > 1900);
+        request.tools.clear();
+        assert!(model.estimate_message_tokens(&request, &with_call) < 100);
     }
 
     #[test]

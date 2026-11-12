@@ -163,6 +163,11 @@ impl Ollama {
         self
     }
 
+    /// Return the configured request headers for protected context identity.
+    pub fn context_headers(&self) -> reqwest::header::HeaderMap {
+        self.headers.clone()
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -533,10 +538,17 @@ fn running_context_window(value: &Value, model: &str) -> Option<u32> {
 #[async_trait::async_trait]
 impl Model for Ollama {
     fn context_identity(&self) -> Option<String> {
-        if !self.headers.is_empty() || !self.http_proxies.is_empty() {
+        if !self.http_proxies.is_empty() {
             return None;
         }
-        pi_rs_core::fingerprint_model_context(&(
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        pi_rs_core::protected_model_fingerprint(&(
+            headers,
             "chat-completions-v1",
             self.endpoint.as_str(),
             &self.token,

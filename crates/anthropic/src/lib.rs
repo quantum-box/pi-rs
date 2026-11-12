@@ -184,6 +184,11 @@ impl Anthropic {
         self
     }
 
+    /// Return the configured request headers for protected context identity.
+    pub fn context_headers(&self) -> reqwest::header::HeaderMap {
+        self.headers.clone()
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -801,13 +806,19 @@ impl StreamUsage {
 impl Model for Anthropic {
     fn context_identity(&self) -> Option<String> {
         // Unconfigured thinking can consult a changing remote model catalog.
-        if !self.headers.is_empty()
-            || !self.http_proxies.is_empty()
+        if !self.http_proxies.is_empty()
             || (self.thinking_level.is_some() && self.configured_thinking.is_none())
         {
             return None;
         }
-        pi_rs_core::fingerprint_model_context(&(
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        pi_rs_core::protected_model_fingerprint(&(
+            headers,
             "anthropic-v1",
             self.endpoint.as_str(),
             self.provider.as_ref(),
@@ -1134,6 +1145,7 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn context_identity_tracks_static_route_and_configuration() {
         let make = |endpoint: &str, key: &str| Anthropic::new(endpoint, key).unwrap();
