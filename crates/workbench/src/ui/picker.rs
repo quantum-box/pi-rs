@@ -882,7 +882,39 @@ impl Picker {
             return Input::Continue;
         }
         if keys.matches("tui.editor.deleteCharBackward", key) {
-            self.query.pop();
+            if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
+                self.query.truncate(index);
+            }
+            self.selected = 0;
+            return Input::Continue;
+        }
+        if keys.matches("tui.editor.deleteWordBackward", key) {
+            let end = self.query.trim_end_matches(char::is_whitespace).len();
+            let before = &self.query[..end];
+            let start =
+                before
+                    .split_word_bound_indices()
+                    .next_back()
+                    .map_or(0, |(index, segment)| {
+                        if segment.chars().any(char::is_alphanumeric) {
+                            segment
+                                .char_indices()
+                                .rev()
+                                .find(|(_, c)| "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`".contains(*c))
+                                .map_or(index, |(i, c)| index + i + c.len_utf8())
+                        } else {
+                            before
+                                .split_word_bound_indices()
+                                .rev()
+                                .take_while(|(_, part)| {
+                                    !part.chars().any(char::is_alphanumeric)
+                                        && !part.chars().all(char::is_whitespace)
+                                })
+                                .last()
+                                .map_or(index, |(i, _)| i)
+                        }
+                    });
+            self.query.truncate(start);
             self.selected = 0;
             return Input::Continue;
         }
@@ -1403,6 +1435,41 @@ fn truncate(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_deletes_words_at_unicode_and_punctuation_boundaries() {
+        let mut picker = Picker::new("Choose", vec![]);
+        let keys = Keys::default();
+        picker.paste("alpha café-file  ");
+        let delete_word = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        picker.input(delete_word, &keys);
+        assert_eq!(picker.query, "alpha café-");
+        picker.input(delete_word, &keys);
+        assert_eq!(picker.query, "alpha café");
+        picker.input(delete_word, &keys);
+        assert_eq!(picker.query, "alpha ");
+        picker.paste("e\u{301}");
+        picker.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &keys);
+        assert_eq!(picker.query, "alpha ");
+    }
+
+    #[test]
+    fn session_search_word_deletion_does_not_start_session_deletion() {
+        let mut picker = Picker::sessions(
+            vec![Item {
+                label: "first second".into(),
+                selection: Selection::Resume("other".into()),
+            }],
+            "active".into(),
+            Default::default(),
+        );
+        picker.paste("first second");
+        assert_eq!(picker.matches().len(), 1);
+        let keys = Keys::default();
+        picker.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT), &keys);
+        assert_eq!(picker.query, "first ");
+        assert!(picker.session_action.is_none());
+    }
 
     #[test]
     fn mouse_selects_and_activates_visible_items_and_wheel_clamps() {
