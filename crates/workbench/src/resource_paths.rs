@@ -106,7 +106,11 @@ pub fn resolve(
     for path in explicit {
         let path = absolute(&workspace, &path.to_string_lossy());
         if kind == Kind::Prompt && path.is_dir() {
-            append(&mut paths, vec![path]);
+            for found in expand(&path, kind, true, warnings)? {
+                if !paths.contains(&found) {
+                    paths.push(found);
+                }
+            }
             continue;
         }
         append(&mut paths, expand(&path, kind, true, warnings)?);

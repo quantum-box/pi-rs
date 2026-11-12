@@ -9,6 +9,82 @@ use pi_rs::{
 };
 use serde_json::{Value, json};
 
+#[test]
+fn explicit_prompt_directory_loads_nested_templates_in_rpc() {
+    let root = tempfile::tempdir().unwrap();
+    let prompts = root.path().join("custom");
+    std::fs::create_dir_all(prompts.join("nested")).unwrap();
+    std::fs::write(prompts.join("nested/review.md"), "Review this").unwrap();
+    std::fs::write(prompts.join("top.md"), "Top level").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("review.md", prompts.join("nested/audit.md")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-prompt-templates",
+            "--prompt-template",
+        ])
+        .arg(&prompts)
+        .args(["--mode", "rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
+    input.flush().unwrap();
+    let response = loop {
+        let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        if event["id"] == "commands" {
+            break event;
+        }
+    };
+    let commands = response["data"]["commands"]
+        .as_array()
+        .expect("command list");
+    for name in ["review", "top"] {
+        assert!(
+            commands
+                .iter()
+                .any(|command| command["name"] == name && command["source"] == "prompt"),
+            "{response}"
+        );
+    }
+    #[cfg(unix)]
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["name"] == "audit" && command["source"] == "prompt"),
+        "{response}"
+    );
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 // Some hosted runners open idle connections to local listeners. Read each
 // connection independently so one idle peer cannot block the real request.
 fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStream>, String) {
