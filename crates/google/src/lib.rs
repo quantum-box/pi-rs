@@ -315,6 +315,8 @@ enum ThinkingFamily {
 }
 
 fn family(id: &str) -> Option<ThinkingFamily> {
+    let normalized = id.to_ascii_lowercase();
+    let id = normalized.as_str();
     if gemini_major(id).is_some_and(|version| version >= 3)
         || matches!(id, "gemini-flash-latest" | "gemini-flash-lite-latest")
         || id.starts_with("gemma-4")
@@ -337,6 +339,7 @@ fn family(id: &str) -> Option<ThinkingFamily> {
 }
 
 fn gemini_major(id: &str) -> Option<u32> {
+    let id = id.to_ascii_lowercase();
     let version = id.strip_prefix("gemini-")?;
     let version = version.strip_prefix("live-").unwrap_or(version);
     version.split(['.', '-']).next()?.parse().ok()
@@ -375,6 +378,8 @@ fn available_thinking(id: &str, enabled: bool) -> Vec<&'static str> {
 
 fn thinking_config(id: &str, level: Option<&str>, max_tokens: u32) -> Option<Value> {
     let level = level?;
+    let normalized = id.to_ascii_lowercase();
+    let id = normalized.as_str();
     let family = family(id)?;
     match family {
         ThinkingFamily::LevelPro | ThinkingFamily::LevelFlash => {
@@ -798,7 +803,10 @@ mod tests {
         .to_string();
         for (model, nested) in [
             ("gemini-2.5-flash", false),
+            ("Gemini-2.5-flash", false),
+            ("GeMiNi-LiVe-2.5-flash", false),
             ("gemini-3-pro-preview", true),
+            ("GeMiNi-3-pro-preview", true),
             ("claude-sonnet-4", true),
             ("other-model", true),
         ] {
@@ -834,6 +842,11 @@ mod tests {
             };
             let body = wire_request(&request, None, "google").unwrap();
             let contents = body["contents"].as_array().unwrap();
+            if model.to_ascii_lowercase().starts_with("gemini") {
+                let call = &contents[0]["parts"][0];
+                assert_eq!(call["functionCall"].get("id").is_some(), nested, "{model}");
+                assert_eq!(call.get("thoughtSignature").is_some(), nested, "{model}");
+            }
             let responses = contents[1]["parts"].as_array().unwrap();
             assert_eq!(responses.len(), 2, "{model}");
             assert_eq!(
@@ -870,6 +883,26 @@ mod tests {
             assert!(!output.contains("YWJj"));
             assert!(!output.contains("ZGVm"));
         }
+    }
+
+    #[test]
+    fn mixed_case_gemini_ids_use_the_same_model_controls() {
+        for (lower, mixed) in [
+            ("gemini-2.5-flash-lite", "Gemini-2.5-Flash-Lite"),
+            ("gemini-2.5-pro", "Gemini-2.5-Pro"),
+            ("gemini-3-pro-preview", "GeMiNi-3-Pro-Preview"),
+            ("gemini-live-3-flash", "GeMiNi-LiVe-3-Flash"),
+        ] {
+            assert_eq!(gemini_major(lower), gemini_major(mixed));
+            assert_eq!(uses_tool_call_ids(lower), uses_tool_call_ids(mixed));
+            assert_eq!(model_thinking_levels(lower), model_thinking_levels(mixed));
+            assert_eq!(
+                thinking_config(lower, Some("minimal"), 1024),
+                thinking_config(mixed, Some("minimal"), 1024)
+            );
+        }
+        assert_eq!(gemini_major("not-gemini-2"), None);
+        assert_eq!(gemini_major("gemini-unknown"), None);
     }
 
     #[tokio::test]
