@@ -2131,6 +2131,13 @@ small streaming buffer and verify the complete decoded byte count.
 
 Full workspace tests and all-target Clippy pass.
 
+### Missing read path diagnostics
+
+An unrestricted local `read` of a missing path now reports the resolved path
+in Pi's `ENOENT: no such file or directory, access '…'` diagnostic. This also
+identifies the requested file when a parent directory is missing. Other I/O
+errors and restricted workspace path checks retain their existing behavior.
+
 ### Write and edit result checkpoint
 
 The model-facing `write` and `edit` success messages now match Pi and preserve
