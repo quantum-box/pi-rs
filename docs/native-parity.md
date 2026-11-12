@@ -307,6 +307,12 @@ cloning, HTML/JSONL exports, model discovery/selection and terminal restoration.
 
 ### Resources checkpoint
 
+Skill frontmatter treats non-string names as absent and falls back to the
+parent directory. Only the boolean `true` disables model invocation;
+other types leave a skill with a valid description available. Non-string
+descriptions are rejected with a diagnostic. Prompt templates use the same
+type-aware frontmatter parsing.
+
 Project configuration follows a stored trust decision, with an interactive
 trust selector and explicit `--trust` / `--no-trust` overrides. Context files
 remain readable independently of project trust. `/skills`, `/prompts`,
