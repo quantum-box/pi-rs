@@ -640,7 +640,7 @@ impl Profiles {
         Ok(profiles)
     }
 
-    fn parse(data: &Value) -> Result<Self> {
+    pub(super) fn parse(data: &Value) -> Result<Self> {
         let empty = serde_json::Map::new();
         let providers = match data.get("providers") {
             Some(providers) => providers
