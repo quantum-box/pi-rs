@@ -294,7 +294,14 @@ impl Resources {
         }
         for root in prompt_roots {
             let mut files = if root.is_file() {
-                vec![root]
+                if root
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".md"))
+                {
+                    vec![root]
+                } else {
+                    Vec::new()
+                }
             } else {
                 std::fs::read_dir(root)
                     .into_iter()
@@ -954,6 +961,110 @@ mod tests {
         let resources = Resources::load(&args).unwrap();
         assert_eq!(resources.system.as_deref(), Some("explicit base"));
         assert_eq!(resources.append_system, "first\n\nsecond");
+    }
+
+    #[test]
+    fn explicit_prompt_files_only_load_markdown() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("note.txt"), "text prompt").unwrap();
+        std::fs::write(root.join("review.md"), "markdown prompt").unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--prompt-template",
+            "note.txt",
+            "--prompt-template",
+            "review.md",
+        ])
+        .unwrap();
+        args.workspace = root.to_path_buf();
+        let resources = Resources::load(&args).unwrap();
+        assert!(resources.prompts.contains_key("review"));
+        assert!(!resources.prompts.contains_key("note"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_prompt_alias_uses_selected_name_and_extension() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("content.txt"), "text target").unwrap();
+        std::fs::write(root.join("content.md"), "markdown target").unwrap();
+        symlink("content.txt", root.join("alias.md")).unwrap();
+        symlink("content.md", root.join("alias.txt")).unwrap();
+        symlink("content.txt", root.join("second.md")).unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--prompt-template",
+            "alias.txt",
+            "--prompt-template",
+            "alias.md",
+            "--prompt-template",
+            "second.md",
+            "--prompt-template",
+            "content.md",
+        ])
+        .unwrap();
+        args.workspace = root.to_path_buf();
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(
+            resources
+                .prompts
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["alias"]
+        );
+        assert_eq!(resources.prompts["alias"].body, "text target");
+        args.prompt_template = vec!["content.md".into(), "alias.txt".into()];
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.prompts["content"].body, "markdown target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_prompt_alias_deduplicates_before_suffix_filtering() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("content.txt"), "fixture").unwrap();
+        symlink("content.txt", root.join("alias.md")).unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--no-skills", "--no-prompt-templates"]).unwrap();
+        args.workspace = root.to_path_buf();
+        args.prompt_template = vec!["content.txt".into(), "alias.md".into()];
+        assert!(Resources::load(&args).unwrap().prompts.is_empty());
+        args.prompt_template.reverse();
+        assert_eq!(
+            Resources::load(&args).unwrap().prompts["alias"].body,
+            "fixture"
+        );
+    }
+
+    #[test]
+    fn discovered_prompt_precedes_explicit_prompt_with_same_name() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join(".pi/prompts")).unwrap();
+        std::fs::create_dir(root.join("extra")).unwrap();
+        std::fs::write(root.join(".pi/prompts/review.md"), "discovered").unwrap();
+        std::fs::write(root.join("extra/review.md"), "explicit").unwrap();
+        let mut args =
+            Cli::try_parse_from(["pi", "--no-skills", "--prompt-template", "extra/review.md"])
+                .unwrap();
+        args.workspace = root.to_path_buf();
+        args.trusted = true;
+        args.settings = Default::default();
+        let resources = Resources::load(&args).unwrap();
+        assert_eq!(resources.prompts["review"].body, "discovered");
     }
 
     #[test]
