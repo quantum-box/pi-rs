@@ -327,6 +327,8 @@ struct Description {
     #[serde(default)]
     input_hook_host_calls: bool,
     #[serde(default)]
+    context_hook_host_calls: bool,
+    #[serde(default)]
     tool_execution_lifecycle_hook: bool,
     #[serde(default)]
     tool_execution_update_hook: bool,
@@ -875,6 +877,49 @@ impl Extension for ExecutableExtension {
         *messages = updated.messages;
         Ok(())
     }
+    async fn context_with_system_with_host(
+        &self,
+        messages: &mut Vec<Message>,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        if !self.description.context_hook_host_calls {
+            return self.context_with_system(messages, state).await;
+        }
+        let original = ModelRequest {
+            model: String::new(),
+            messages: messages.clone(),
+            tools: Vec::new(),
+            max_output_tokens: 0,
+        };
+        let payload = ProtocolRequest::ContextWithSystem {
+            messages: extension_context(&original).messages,
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let updated = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, payload, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        let mut updated = ModelRequest {
+            messages: updated,
+            ..original.clone()
+        };
+        restore_provider_replay(&original, &mut updated);
+        restore_legacy_tool_metadata(
+            &original,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
+        *messages = updated.messages;
+        Ok(())
+    }
+
     fn command(
         &self,
         name: &str,
@@ -2055,6 +2100,7 @@ async fn dispatch_with_host(
             tool_hook_host_calls: true,
             request_hook_host_calls: true,
             input_hook_host_calls: true,
+            context_hook_host_calls: true,
             tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
             tool_execution_update_hook: extension.handles_tool_execution_updates(),
             model_selection_hook: extension.handles_model_selection(),
@@ -2163,9 +2209,15 @@ async fn dispatch_with_host(
             mut messages,
             state,
         } => {
-            extension
-                .context_with_system(&mut messages, state.as_ref())
-                .await?;
+            if host.supports_custom_messages() {
+                extension
+                    .context_with_system_with_host(&mut messages, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .context_with_system(&mut messages, state.as_ref())
+                    .await?;
+            }
             encode(Ok(messages))
         }
         ProtocolRequest::Command {
@@ -3029,7 +3081,7 @@ else:
 import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     json.load(sys.stdin)
-    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'tool_hook_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'tool_hook_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
@@ -3038,6 +3090,7 @@ else:
     assert json.loads(sys.stdin.readline())=={'Ok':None}
     if kind=='input': result={'action':'continue'}
     elif kind=='before_request': result=r['request']
+    elif kind=='context_with_system': result=r['messages']
     elif kind=='tool_call': result=[r['arguments'],{'allow':True,'reason':None}]
     elif kind=='tool_result': result=None
     else: raise AssertionError(kind)
@@ -3074,6 +3127,10 @@ else:
             .before_request_with_host(&mut request, RequestPurpose::Turn, None, host.clone())
             .await
             .unwrap();
+        extension
+            .context_with_system_with_host(&mut request.messages, None, host.clone())
+            .await
+            .unwrap();
         let context = ToolContext {
             operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
             cancellation: CancellationToken::new(),
@@ -3104,7 +3161,7 @@ else:
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
     #[tokio::test]

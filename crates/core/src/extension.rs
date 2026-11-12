@@ -769,6 +769,15 @@ pub trait Extension: Send + Sync {
         Ok(())
     }
 
+    async fn context_with_system_with_host(
+        &self,
+        messages: &mut Vec<crate::Message>,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        self.context_with_system(messages, state).await
+    }
+
     async fn before_tool(
         &self,
         _name: &str,

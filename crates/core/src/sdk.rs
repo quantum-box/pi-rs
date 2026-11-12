@@ -275,7 +275,7 @@ impl SessionControl {
         let hooks = self.input_hooks.lock().expect("SDK input hooks").clone();
         if let Some(registry) = hooks.lifecycle {
             let events = self.events.upgrade();
-            crate::lifecycle::notify(
+            crate::lifecycle::notify_with_host(
                 &registry,
                 crate::LifecycleEvent::SessionInfoChanged { name: Some(name) },
                 &hooks.states,
@@ -285,6 +285,9 @@ impl SessionControl {
                         emit(events, &notification);
                     }
                 },
+                Arc::new(InputMessageHost {
+                    input: self.input.clone(),
+                }),
             )
             .await;
         }
@@ -2936,6 +2939,61 @@ mod tests {
         assert!(queued < first_request && first_request < delivered);
     }
 
+    struct ContextMessageHook(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Extension for ContextMessageHook {
+        fn id(&self) -> &str {
+            "context-message"
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+        async fn context_with_system_with_host(
+            &self,
+            _: &mut Vec<Message>,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "context".into(),
+                        content: crate::ContextContent::Text("context steer".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::Steer,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn context_hook_message_waits_for_current_request() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(ContextMessageHook(AtomicUsize::new(0))))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+        let records = session.journal().records();
+        let request = records
+            .iter()
+            .position(|r| matches!(r.event, crate::Event::ModelRequested { .. }))
+            .unwrap();
+        let delivery = records
+            .iter()
+            .position(|r| matches!(r.event, crate::Event::CustomMessageDelivered { .. }))
+            .unwrap();
+        assert!(request < delivery);
+    }
+
     struct InputMessageHook;
     #[async_trait::async_trait]
     impl Extension for InputMessageHook {
@@ -3716,6 +3774,62 @@ mod tests {
             Ok(Box::pin(futures_util::stream::pending()))
         }
     }
+    struct RenameMessageHook;
+    #[async_trait::async_trait]
+    impl Extension for RenameMessageHook {
+        fn id(&self) -> &str {
+            "rename-message"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionInfoChanged { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "rename".into(),
+                        content: crate::ContextContent::Text("renamed".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn active_rename_callback_can_send_custom_message() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")
+            .extension(Arc::new(RenameMessageHook))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let mut events = session.subscribe();
+        let queue = async move {
+            while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
+            control.set_session_name("new name").await.unwrap();
+            control.abort();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(session.prompt("wait"), queue)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(session.journal().queued_custom_messages().len(), 1);
+    }
+
     #[tokio::test]
     async fn active_control_acknowledges_custom_message_before_abort() {
         let mut session = SessionBuilder::new(Arc::new(WaitingModel), "wait")

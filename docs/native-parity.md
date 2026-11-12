@@ -2780,12 +2780,12 @@ host-call capability and report it unavailable with older hosts.
 
 The SDK supplies a message host to initial input hooks and to input hooks for
 steering and follow-ups during a run; idle `SessionControl` input hooks still
-use the older hook interface. Provider-request hooks and the normal scheduler's
-tool-call and tool-result hooks also receive a host. Lifecycle hosts are
-available for active `agent_start`, `turn_start`, `turn_end`, and ordinary
-scheduler tool execution events; settled `agent_end` and `agent_settled`; and
-SDK-owned session and model-selection notifications. Idle callbacks append
-messages without starting a model turn, except `NextTurn`, which is queued.
+use the older hook interface. Provider-request and context-with-system hooks
+and the normal scheduler's tool-call and tool-result hooks also receive a host.
+Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
+and ordinary and truncated-tool execution events; settled `agent_end` and
+`agent_settled`; and SDK-owned session and model-selection notifications,
+including active control rename notifications. Idle callbacks append messages without starting a model turn, except `NextTurn`, which is queued.
 Reentrant sends are serviced by the journal owner while the callback waits.
 Separately built extensions negotiate the individual callback capabilities.
 
@@ -2793,10 +2793,9 @@ Focused tests cover queue and tool-result ordering, callback reentrancy,
 initial and streaming input, provider-request delivery, session start and
 settled boundaries, process protocol metadata, and reopening before the next
 prompt. The host API does not yet express an idle `triggerTurn: true` request
-from these callbacks. Host calls also remain unavailable in context-with-system,
-legacy before-tool-only policy hooks, non-scheduler tool-result recovery,
-truncated-tool lifecycle notifications, active control rename notifications,
-user-bash, resource discovery, compaction, tree, and session-transition hooks.
+from these callbacks. Host calls also remain unavailable in legacy before-tool-only
+policy hooks, non-scheduler tool-result recovery, user-bash, resource discovery,
+compaction, tree, and session-transition hooks.
 Command effects retain their existing return-value mechanism; custom message
 renderers are unsupported.
 

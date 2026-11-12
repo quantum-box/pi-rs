@@ -877,7 +877,7 @@ impl Agent<'_> {
             };
             let dispatched = if truncated {
                 dispatcher
-                    .reject_truncated_tools(session, &invocations, &states, observer)
+                    .reject_truncated_tools(session, &invocations, &states, cancel, observer)
                     .await
             } else {
                 dispatcher
@@ -1068,11 +1068,31 @@ impl Agent<'_> {
             }
             let had_leading_system =
                 matches!(request.messages.first(), Some(Message::System { .. }));
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.context_with_system(&mut request.messages, states.get(extension.id()))) =>
-                    result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host = Arc::new(LifecycleMessageHost { sender });
+            let result = {
+                let future = tokio::time::timeout(
+                    self.limits.model_timeout,
+                    extension.context_with_system_with_host(
+                        &mut request.messages,
+                        states.get(extension.id()),
+                        host,
+                    ),
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((message, reply)) = incoming.recv() => {
+                            match queue_custom_message(session, message, observer) {
+                                Ok(()) => { let _ = reply.send(Ok(())); }
+                                Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                            }
+                        }
+                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                        result = &mut future => break result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
+                    }
+                }
             };
             hook(extension.as_ref(), result)?;
             if had_leading_system
@@ -1281,6 +1301,7 @@ impl Agent<'_> {
         session: &mut Session,
         invocations: &[Invocation],
         states: &ExtensionStates,
+        cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
         let observe_tools = self.registry.extensions.iter().any(|extension| {
@@ -1288,7 +1309,8 @@ impl Agent<'_> {
         });
         for invocation in invocations {
             if observe_tools {
-                self.observe_lifecycle(
+                self.observe_active_lifecycle(
+                    session,
                     crate::LifecycleEvent::ToolExecutionStart {
                         tool_call_id: invocation.call.id.clone(),
                         tool_name: invocation.call.name.clone(),
@@ -1297,10 +1319,10 @@ impl Agent<'_> {
                         parent_tool_call_id: None,
                     },
                     states,
-                    None,
+                    cancel,
                     observer,
                 )
-                .await;
+                .await?;
             }
             let outcome = Outcome::Failed(format!(
                 "Tool call \"{}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
@@ -1316,7 +1338,8 @@ impl Agent<'_> {
                 observer,
             )?;
             if observe_tools {
-                self.observe_lifecycle(
+                self.observe_active_lifecycle(
+                    session,
                     crate::LifecycleEvent::ToolExecutionEnd {
                         tool_call_id: invocation.call.id.clone(),
                         tool_name: invocation.call.name.clone(),
@@ -1326,10 +1349,10 @@ impl Agent<'_> {
                         parent_tool_call_id: None,
                     },
                     states,
-                    None,
+                    cancel,
                     observer,
                 )
-                .await;
+                .await?;
             }
         }
         Ok(())
@@ -4169,6 +4192,93 @@ mod queue_tests {
             std::future::pending().await
         }
     }
+    #[tokio::test]
+    async fn truncated_tool_lifecycle_hooks_can_send_messages() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                "truncated-hook"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_tool_execution_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                let text = match event {
+                    crate::LifecycleEvent::ToolExecutionStart { .. } => "start",
+                    crate::LifecycleEvent::ToolExecutionEnd { .. } => "end",
+                    _ => return Ok(()),
+                };
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "hook".into(),
+                        content: crate::ContextContent::Text(text.into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::Steer,
+                )
+                .await
+            }
+        }
+        let model = WaitingModel(Arc::new(tokio::sync::Notify::new()));
+        let mut registry = Registry::default();
+        registry.register(Arc::new(Hook)).unwrap();
+        let agent = Agent {
+            model: &model,
+            model_name: "test",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "test".into(),
+                arguments: "{}".into(),
+            },
+        };
+        session
+            .append(Event::ToolPlanned {
+                invocation: invocation.clone(),
+                parent_operation: Uuid::nil(),
+            })
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            agent.reject_truncated_tools(
+                &mut session,
+                &[invocation],
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pending = session.queued_custom_messages();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0].1.message.content,
+            crate::ContextContent::Text("start".into())
+        );
+        assert_eq!(
+            pending[1].1.message.content,
+            crate::ContextContent::Text("end".into())
+        );
+    }
+
     #[tokio::test]
     async fn queue_controls_are_acknowledged_while_a_model_request_is_waiting() {
         let ready = Arc::new(tokio::sync::Notify::new());
