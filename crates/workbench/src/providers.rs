@@ -147,10 +147,14 @@ impl Provider {
             })
         };
         match adapter {
-            Adapter::OpenAiResponses => Ok(Client::OpenAi(pi_rs::openai::OpenAiResponses::new(
-                endpoint,
-                token.ok_or_else(missing_key)?,
-            )?)),
+            Adapter::OpenAiResponses => {
+                let token = token.ok_or_else(missing_key)?;
+                Ok(Client::OpenAi(if self.id() == "openai" {
+                    pi_rs::openai::OpenAiResponses::new_api(endpoint, token)?
+                } else {
+                    pi_rs::openai::OpenAiResponses::new(endpoint, token)?
+                }))
+            }
             Adapter::ChatCompletions => {
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
@@ -366,7 +370,7 @@ impl Client {
             Self::Anthropic(client) => Self::Anthropic(client.with_headers(headers)),
             Self::Google(client) => Self::Google(client.with_headers(headers)),
             Self::PiMessages(client) => Self::PiMessages(client.with_headers(headers)),
-            Self::OpenAi(client) => Self::OpenAi(client),
+            Self::OpenAi(client) => Self::OpenAi(client.with_headers(headers)),
             Self::Deferred(_) => unreachable!("deferred provider headers resolve per request"),
         }
     }
@@ -541,11 +545,26 @@ impl Client {
             Self::Google(client) => Self::Google(client.with_thinking(thinking)),
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
             Self::OpenAi(client) => {
-                let levels = pi_rs::openai::thinking_levels(&args.model);
-                let thinking = if levels.len() == 1 {
+                let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let levels = metadata
+                    .as_ref()
+                    .and_then(|model| model.levels(Adapter::OpenAiResponses))
+                    .unwrap_or_else(|| pi_rs::openai::thinking_levels(&args.model));
+                let thinking = if metadata
+                    .as_ref()
+                    .is_some_and(|model| model.reasoning == Some(false))
+                    || levels.len() == 1 && levels[0] == "off"
+                {
                     None
                 } else {
-                    thinking.filter(|level| levels.iter().any(|item| item == level))
+                    thinking
+                        .filter(|level| levels.iter().any(|item| item == level))
+                        .and_then(|level| {
+                            metadata
+                                .as_ref()
+                                .and_then(|model| model.mapped_effort(level))
+                                .unwrap_or(Some(level))
+                        })
                 };
                 Self::OpenAi(client.with_thinking(thinking))
             }

@@ -53,6 +53,15 @@ fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStrea
 
 #[test]
 fn chatgpt_plan_provider_streams_through_the_cli() {
+    responses_provider_streams_through_the_cli("openai-chatgpt");
+}
+
+#[test]
+fn openai_api_key_provider_streams_through_the_cli() {
+    responses_provider_streams_through_the_cli("openai");
+}
+
+fn responses_provider_streams_through_the_cli(provider: &str) {
     let root = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -90,7 +99,7 @@ fn chatgpt_plan_provider_streams_through_the_cli() {
             "--no-tools",
             "--offline",
             "--provider",
-            "openai-chatgpt",
+            provider,
             "--model",
             "fixture-model",
             "--api-key",

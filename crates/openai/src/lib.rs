@@ -23,6 +23,8 @@ pub struct OpenAiResponses {
     endpoint: Url,
     token: String,
     thinking: Option<String>,
+    provider: String,
+    headers: reqwest::header::HeaderMap,
 }
 
 impl OpenAiResponses {
@@ -46,6 +48,15 @@ impl OpenAiResponses {
         Ok(self)
     }
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
+        Self::create(endpoint, token, true)
+    }
+
+    /// Connect with an OpenAI API key, rather than a ChatGPT plan token.
+    pub fn new_api(endpoint: &str, token: String) -> Result<Self> {
+        Self::create(endpoint, token, false)
+    }
+
+    fn create(endpoint: &str, token: String, plan: bool) -> Result<Self> {
         let endpoint = Url::parse(endpoint)
             .map_err(|_| Error::Config("invalid OpenAI Responses endpoint".into()))?;
         let secure = endpoint.as_str() == DEFAULT_ENDPOINT
@@ -53,7 +64,8 @@ impl OpenAiResponses {
                 && matches!(
                     endpoint.host_str(),
                     Some("127.0.0.1" | "localhost" | "[::1]")
-                ));
+                ))
+            || (!plan && endpoint.scheme() == "https");
         if !secure
             || endpoint.host().is_none()
             || !endpoint.username().is_empty()
@@ -76,11 +88,18 @@ impl OpenAiResponses {
             endpoint,
             token,
             thinking: None,
+            provider: if plan { "openai-chatgpt" } else { "openai" }.into(),
+            headers: reqwest::header::HeaderMap::new(),
         })
     }
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking = level.map(|level| if level == "off" { "none" } else { level }.to_owned());
+        self
+    }
+
+    pub fn with_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
+        self.headers = headers;
         self
     }
 
@@ -91,6 +110,7 @@ impl OpenAiResponses {
         let mut response = self
             .client
             .get(endpoint)
+            .headers(self.headers.clone())
             .bearer_auth(&self.token)
             .send()
             .await
@@ -114,17 +134,25 @@ impl OpenAiResponses {
         }
         let body: Value = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Model("invalid OpenAI model listing".into()))?;
-        let models = body["models"]
-            .as_array()
-            .ok_or_else(|| Error::Model("invalid OpenAI model listing".into()))?;
+        let models = body[if self.provider == "openai" {
+            "data"
+        } else {
+            "models"
+        }]
+        .as_array()
+        .ok_or_else(|| Error::Model("invalid OpenAI model listing".into()))?;
         Ok(models
             .iter()
-            .filter(|entry| entry["visibility"] == "list")
+            .filter(|entry| self.provider == "openai" || entry["visibility"] == "list")
             .filter_map(|entry| {
-                entry["slug"]
-                    .as_str()
-                    .filter(|slug| !slug.is_empty())
-                    .map(str::to_owned)
+                entry[if self.provider == "openai" {
+                    "id"
+                } else {
+                    "slug"
+                }]
+                .as_str()
+                .filter(|slug| !slug.is_empty())
+                .map(str::to_owned)
             })
             .collect())
     }
@@ -142,7 +170,7 @@ pub fn thinking_levels(model: &str) -> Vec<String> {
     levels.iter().map(|level| (*level).into()).collect()
 }
 
-fn payload(request: &ModelRequest) -> Value {
+fn payload(request: &ModelRequest, provider: &str) -> Value {
     let mut input = Vec::new();
     for message in &request.messages {
         match message {
@@ -161,14 +189,18 @@ fn payload(request: &ModelRequest) -> Value {
                 replay,
             } => {
                 if let Some(replay) = replay.as_deref().filter(|r| {
-                    r.identity.provider == "openai-chatgpt" && r.identity.model == request.model
+                    r.identity.provider == provider && r.identity.model == request.model
                 }) {
                     input.extend(replay.blocks.iter().cloned());
                 } else {
                     if !content.is_empty() {
                         input.push(json!({"role":"assistant", "content":content}));
                     }
-                    input.extend(calls.iter().map(|call| json!({"type":"function_call", "call_id":call.id, "name":call.name, "namespace":NAMESPACE, "arguments":call.arguments})));
+                    input.extend(calls.iter().map(|call| {
+                        let mut item = json!({"type":"function_call", "call_id":call.id, "name":call.name, "arguments":call.arguments});
+                        if provider == "openai-chatgpt" { item["namespace"] = json!(NAMESPACE); }
+                        item
+                    }));
                 }
             }
             Message::Tool { call_id, content } => {
@@ -189,7 +221,11 @@ fn payload(request: &ModelRequest) -> Value {
     let mut body = json!({"model":request.model, "input":input, "store":false, "stream":true, "max_output_tokens":request.max_output_tokens});
     if !request.tools.is_empty() {
         let tools: Vec<_> = request.tools.iter().map(|tool| json!({"type":"function", "name":tool.name, "description":tool.description, "parameters":tool.parameters, "strict":false})).collect();
-        body["tools"] = json!([{"type":"namespace", "name":NAMESPACE, "description":"Local tools", "tools":tools}]);
+        body["tools"] = if provider == "openai-chatgpt" {
+            json!([{"type":"namespace", "name":NAMESPACE, "description":"Local tools", "tools":tools}])
+        } else {
+            json!(tools)
+        };
     }
     body
 }
@@ -226,7 +262,8 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 impl Model for OpenAiResponses {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         let model = request.model.clone();
-        let mut body = payload(&request);
+        let mut body = payload(&request, &self.provider);
+        let provider = self.provider.clone();
         if let Some(thinking) = &self.thinking {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
@@ -234,6 +271,7 @@ impl Model for OpenAiResponses {
         let mut response = self
             .client
             .post(self.endpoint.clone())
+            .headers(self.headers.clone())
             .bearer_auth(&self.token)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body)
@@ -277,7 +315,7 @@ impl Model for OpenAiResponses {
                     "response.output_item.added" if event["item"]["type"] == "function_call" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let item = &event["item"];
-                        if item["namespace"] != NAMESPACE { Err(Error::Model("unexpected OpenAI tool namespace".into()))?; }
+                        if provider == "openai-chatgpt" && item["namespace"] != NAMESPACE { Err(Error::Model("unexpected OpenAI tool namespace".into()))?; }
                         let call = ToolCall { id:field(item,"call_id")?.into(), name:field(item,"name")?.into(), arguments:String::new() };
                         if calls.insert(index, call.clone()).is_some() { Err(Error::Model("duplicate OpenAI tool index".into()))?; }
                         yield ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:String::new() });
@@ -295,10 +333,10 @@ impl Model for OpenAiResponses {
                         let reported_calls: Vec<_> = output.iter().filter(|item| item["type"] == "function_call").collect();
                         if reported_calls.len() != calls.len() { Err(Error::Model("incomplete OpenAI tool stream".into()))?; }
                         for (call, item) in calls.values().zip(reported_calls) {
-                            if item["call_id"] != call.id || item["name"] != call.name || item["arguments"] != call.arguments || item["namespace"] != NAMESPACE { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
+                            if item["call_id"] != call.id || item["name"] != call.name || item["arguments"] != call.arguments || (provider == "openai-chatgpt" && item["namespace"] != NAMESPACE) { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
-                        let identity = ResolvedModelIdentity { provider:"openai-chatgpt".into(), model:model.clone() };
+                        let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
                         yield ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), resolved_model:Some(identity.clone()), finish_reason:Some("stop".into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:Some(Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
                         yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
                         return;
@@ -340,7 +378,7 @@ mod tests {
 
     #[test]
     fn plan_payload_uses_stateless_stream_and_namespaced_tools() {
-        let body = payload(&request());
+        let body = payload(&request(), "openai-chatgpt");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "developer");
@@ -351,10 +389,32 @@ mod tests {
     }
 
     #[test]
+    fn api_key_payload_uses_flat_functions_and_preserves_provider_identity() {
+        let mut request = request();
+        request.messages.push(Message::Assistant {
+            content: String::new(),
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        });
+        let body = payload(&request, "openai");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert!(body["input"][2].get("namespace").is_none());
+        assert!(
+            OpenAiResponses::new_api("https://example.com/v1/responses", "token".into()).is_ok()
+        );
+        assert!(OpenAiResponses::new("https://example.com/v1/responses", "token".into()).is_err());
+    }
+
+    #[test]
     fn tool_images_are_sent_as_images_not_base64_text() {
         let mut request = request();
         request.messages.push(Message::Tool { call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
-        let body = payload(&request);
+        let body = payload(&request, "openai-chatgpt");
         let output = &body["input"][2]["output"];
         assert_eq!(output[0]["type"], "input_text");
         assert!(!output[0]["text"].as_str().unwrap().contains("aW1hZ2U="));
@@ -394,6 +454,30 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn api_key_stream_accepts_flat_tool_calls_and_keeps_its_identity() {
+        let events = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"read\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"read\",\"arguments\":\"{}\"}]}}\n\n"
+        );
+        let (mut client, server) = fixture(events).await;
+        client.provider = "openai".into();
+        let events: Vec<_> = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(event, ModelEvent::Metadata(metadata)
+            if metadata.resolved_model.as_ref().is_some_and(|identity| identity.provider == "openai"))));
+        assert!(
+            matches!(events.last(), Some(ModelEvent::Complete { calls, .. }) if calls[0].name == "read")
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
