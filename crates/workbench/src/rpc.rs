@@ -49,8 +49,26 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut pending_compact: Option<Value> = None;
     let mut pending_queries: Vec<Value> = Vec::new();
     let mut pending_inputs: Vec<Value> = Vec::new();
+    let mut model_queries: Vec<(Value, mpsc::Receiver<Result<Value>>)> = Vec::new();
     let mut stream = super::rpc_events::Stream::default();
     loop {
+        let mut index = 0;
+        while index < model_queries.len() {
+            match model_queries[index].1.try_recv() {
+                Ok(result) => {
+                    let (request, _) = model_queries.swap_remove(index);
+                    response(&request, result.map(Some))?;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let (request, _) = model_queries.swap_remove(index);
+                    response(
+                        &request,
+                        Err(Error::Config("model discovery worker stopped".into())),
+                    )?;
+                }
+                Err(mpsc::TryRecvError::Empty) => index += 1,
+            }
+        }
         if let Some(active) = &mut worker {
             for event in active.drain_events() {
                 acknowledge(&mut pending_queries, &event);
@@ -153,6 +171,24 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 continue;
             }
         };
+        if request["type"] == "get_available_models" {
+            if model_queries.len() >= 16 {
+                response(
+                    &request,
+                    Err(Error::Config("too many pending model queries".into())),
+                )?;
+            } else {
+                let args = args.clone();
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result =
+                        available_models(&args, true).map(|(_, models)| json!({"models":models}));
+                    let _ = sender.send(result);
+                });
+                model_queries.push((request, receiver));
+            }
+            continue;
+        }
         if matches!(
             request["type"].as_str(),
             Some("prompt" | "steer" | "follow_up")

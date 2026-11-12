@@ -822,6 +822,97 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
 }
 
 #[test]
+fn rpc_model_discovery_does_not_block_other_commands() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (accepted, ready) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(first.starts_with("GET "), "{first}");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        accepted.send(()).unwrap();
+        let _ = gate.recv_timeout(Duration::from_secs(30));
+        let body = br#"{"data":[{"id":"fixture-model"}]}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        socket.write_all(body).unwrap();
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--workspace",
+            root.path().to_str().unwrap(),
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--model",
+            "fixture-model",
+            "--endpoint",
+            &endpoint,
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (events, received) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if events
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"get_available_models","id":"models"})
+    )
+    .unwrap();
+    ready.recv_timeout(Duration::from_secs(30)).unwrap();
+    writeln!(input, "{}", json!({"type":"get_state","id":"state"})).unwrap();
+    let event = received.recv_timeout(Duration::from_secs(10));
+    let _ = release.send(());
+    let event = event.expect("state request blocked behind model discovery");
+    assert_eq!(event["id"], "state", "{event}");
+    assert_eq!(event["success"], true);
+    let models = received.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert_eq!(models["id"], "models", "{models}");
+    assert_eq!(models["success"], true);
+    assert!(
+        models["data"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == "fixture-model")
+    );
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    server.join().unwrap();
+    assert!(status.success());
+}
+
+#[test]
 fn invalid_thinking_levels_warn_and_keep_the_last_valid_selection() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
