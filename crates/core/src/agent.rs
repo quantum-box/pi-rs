@@ -1722,7 +1722,7 @@ impl Agent<'_> {
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = tokio::time::timeout(self.limits.tool_timeout, extension.tool_result(
+                result = tokio::time::timeout(self.limits.tool_timeout, extension.tool_result_update(
                     &invocation.call, &reply.outcome, &context, states.get(extension.id()),
                 )) => result,
             };
@@ -3884,6 +3884,90 @@ mod tree_tests {
             )
             .await;
         assert_eq!(skipped.outcome, Outcome::Skipped("denied".into()));
+    }
+
+    #[tokio::test]
+    async fn result_patches_preserve_details_and_chain() {
+        struct Patch(&'static str);
+        #[async_trait::async_trait]
+        impl crate::Extension for Patch {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch(
+                &self,
+                _: &crate::ToolCall,
+                outcome: &Outcome,
+                _: &crate::ToolContext,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<Option<crate::ToolResultPatch>> {
+                let Outcome::SucceededWithDetails { output, details } = outcome else {
+                    panic!("missing details")
+                };
+                assert_eq!(details, &serde_json::json!({"source": "tool"}));
+                Ok(Some(crate::ToolResultPatch {
+                    output: Some(format!("{output}:{}", self.0)),
+                    details: None,
+                }))
+            }
+        }
+        let mut registry = Registry::default();
+        registry.register(Arc::new(Patch("first"))).unwrap();
+        registry.register(Arc::new(Patch("second"))).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut reply = ToolReply::from(Outcome::SucceededWithDetails {
+            output: "original".into(),
+            details: serde_json::json!({"source":"tool"}),
+        });
+        agent
+            .transform_tool_result(
+                &invocation,
+                &mut reply,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(
+            reply.outcome,
+            Outcome::SucceededWithDetails {
+                output: "original:first:second".into(),
+                details: serde_json::json!({"source":"tool"})
+            }
+        );
+        let patch = crate::ToolResultPatch {
+            output: None,
+            details: Some(serde_json::json!({"updated": true})),
+        };
+        assert_eq!(
+            patch.apply(&reply.outcome).unwrap(),
+            Outcome::SucceededWithDetails {
+                output: "original:first:second".into(),
+                details: serde_json::json!({"updated": true})
+            }
+        );
+        assert!(
+            crate::ToolResultPatch::default()
+                .apply(&Outcome::Failed("error".into()))
+                .is_err()
+        );
     }
 
     #[tokio::test]
