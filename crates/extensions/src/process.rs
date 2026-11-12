@@ -115,21 +115,36 @@ fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) 
     }
 }
 
-// Executables built before tool-message status support discard unknown fields.
-// Restore the original status by call ID while retaining their content edits.
-fn restore_legacy_tool_status(original: &ModelRequest, updated: &mut ModelRequest) {
+// Older executable hooks discard unknown tool-message fields. Keep metadata by
+// call ID when the hook cannot represent it, even when it rewrites the content.
+fn restore_legacy_tool_metadata(
+    original: &ModelRequest,
+    updated: &mut ModelRequest,
+    restore_status: bool,
+    restore_structure: bool,
+) {
     for message in &mut updated.messages {
         if let Message::Tool {
-            call_id, is_error, ..
+            call_id,
+            is_error,
+            is_structured,
+            ..
         } = message
             && let Some(Message::Tool {
-                is_error: previous, ..
+                is_error: previous_error,
+                is_structured: previous_structure,
+                ..
             }) = original
                 .messages
                 .iter()
                 .find(|item| matches!(item, Message::Tool { call_id: id, .. } if id == call_id))
         {
-            *is_error = *previous;
+            if restore_status {
+                *is_error = *previous_error;
+            }
+            if restore_structure {
+                *is_structured = *previous_structure;
+            }
         }
     }
 }
@@ -284,6 +299,8 @@ struct Description {
     text_result_v2: bool,
     #[serde(default)]
     tool_message_error: bool,
+    #[serde(default)]
+    tool_message_structured: bool,
     #[serde(default)]
     tool_call_hook: bool,
     #[serde(default)]
@@ -698,9 +715,12 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })?;
         restore_provider_replay(request, &mut updated);
-        if !self.description.tool_message_error {
-            restore_legacy_tool_status(request, &mut updated);
-        }
+        restore_legacy_tool_metadata(
+            request,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_structured,
+        );
         *request = updated;
         Ok(())
     }
@@ -717,9 +737,12 @@ impl Extension for ExecutableExtension {
         };
         let mut updated = self.request_async(message).await?;
         restore_provider_replay(request, &mut updated);
-        if !self.description.tool_message_error {
-            restore_legacy_tool_status(request, &mut updated);
-        }
+        restore_legacy_tool_metadata(
+            request,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_structured,
+        );
         *request = updated;
         Ok(())
     }
@@ -748,9 +771,12 @@ impl Extension for ExecutableExtension {
             ..original.clone()
         };
         restore_provider_replay(&original, &mut updated);
-        if !self.description.tool_message_error {
-            restore_legacy_tool_status(&original, &mut updated);
-        }
+        restore_legacy_tool_metadata(
+            &original,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_structured,
+        );
         *messages = updated.messages;
         Ok(())
     }
@@ -1822,6 +1848,7 @@ async fn dispatch_with_host(
             tool_result_hook: extension.handles_tool_result(),
             text_result_v2: true,
             tool_message_error: true,
+            tool_message_structured: true,
             tool_call_hook: extension.handles_tool_call(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
@@ -2443,36 +2470,49 @@ import json,sys,os
 r=json.load(sys.stdin)
 name=os.path.basename(sys.argv[0])
 if r['type']=='describe':
-    value={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'tool_message_error':name=='modern'}
+    value={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'tool_message_error':name!='legacy','tool_message_structured':name=='modern'}
 else:
     value=r.get('messages') if r['type']=='context_with_system' else r['request']
     messages=value if isinstance(value,list) else value['messages']
     for m in messages:
         if m['role']=='tool':
-            m.pop('is_error',None)
+            if name != 'intermediate': m.pop('is_error',None)
+            m.pop('is_structured',None)
             m['content']='rewritten'
 print(json.dumps({'version':1,'response':{'Ok':value}}))
 "##;
         let dir = tempfile::tempdir().unwrap();
-        for name in ["legacy", "modern"] {
+        for name in ["legacy", "intermediate", "modern"] {
             let path = dir.path().join(name);
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             let extension = ExecutableExtension::load(path).unwrap();
             let original = ModelRequest {
                 model: "fixture".into(),
-                messages: vec![Message::Tool {
-                    call_id: "call".into(),
-                    content: "original".into(),
-                    is_error: true,
-                }],
+                messages: vec![
+                    Message::Tool {
+                        call_id: "call".into(),
+                        content: "original".into(),
+                        is_error: true,
+                        is_structured: true,
+                    },
+                    Message::Tool {
+                        call_id: "plain".into(),
+                        content: "plain".into(),
+                        is_error: false,
+                        is_structured: false,
+                    },
+                ],
                 tools: vec![],
                 max_output_tokens: 10,
             };
             let mut request = original.clone();
             extension.context(&mut request, None).unwrap();
             assert!(
-                matches!(&request.messages[0], Message::Tool { content, is_error, .. } if content == "rewritten" && *is_error == (name == "legacy"))
+                matches!(&request.messages[0], Message::Tool { content, is_error, is_structured, .. } if content == "rewritten" && *is_error == (name != "modern") && *is_structured == (name != "modern"))
+            );
+            assert!(
+                matches!(&request.messages[1], Message::Tool { content, is_structured: false, .. } if content == "rewritten")
             );
             let mut request = original.clone();
             extension
@@ -2480,7 +2520,10 @@ print(json.dumps({'version':1,'response':{'Ok':value}}))
                 .await
                 .unwrap();
             assert!(
-                matches!(&request.messages[0], Message::Tool { content, is_error, .. } if content == "rewritten" && *is_error == (name == "legacy"))
+                matches!(&request.messages[0], Message::Tool { content, is_error, is_structured, .. } if content == "rewritten" && *is_error == (name != "modern") && *is_structured == (name != "modern"))
+            );
+            assert!(
+                matches!(&request.messages[1], Message::Tool { content, is_structured: false, .. } if content == "rewritten")
             );
             let mut messages = original.messages;
             extension
@@ -2488,7 +2531,10 @@ print(json.dumps({'version':1,'response':{'Ok':value}}))
                 .await
                 .unwrap();
             assert!(
-                matches!(&messages[0], Message::Tool { content, is_error, .. } if content == "rewritten" && *is_error == (name == "legacy"))
+                matches!(&messages[0], Message::Tool { content, is_error, is_structured, .. } if content == "rewritten" && *is_error == (name != "modern") && *is_structured == (name != "modern"))
+            );
+            assert!(
+                matches!(&messages[1], Message::Tool { content, is_structured: false, .. } if content == "rewritten")
             );
         }
     }

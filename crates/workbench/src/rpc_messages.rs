@@ -371,6 +371,7 @@ impl Projection {
                 call_id: self.invocation(records, operation_id)?.call.id.clone(),
                 content: outcome.tool_content(),
                 is_error: outcome.is_error(),
+                is_structured: outcome.is_structured(),
             },
             Event::BashExecution { .. } => return shell_message(record),
             Event::SystemCheckpoint { content, .. } => Message::System {
@@ -564,6 +565,7 @@ impl Projection {
                 call_id,
                 content,
                 is_error,
+                is_structured,
             } => {
                 let operation = match &record.event {
                     Event::ToolFinished {
@@ -581,7 +583,8 @@ impl Projection {
                     .and_then(|(id, _)| self.invocation(records, id))
                     .map_or("", |invocation| invocation.call.name.as_str());
                 let outcome = operation.map(|(_, outcome)| outcome);
-                let mut value = super::rpc_events::tool_result_value(content, outcome);
+                let mut value =
+                    super::rpc_events::tool_result_value(content, outcome, *is_structured);
                 value["role"] = json!("toolResult");
                 value["toolCallId"] = json!(call_id);
                 value["toolName"] = json!(name);

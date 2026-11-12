@@ -117,7 +117,11 @@ fn remove_images(messages: &mut [Message], user_placeholder: &str, tool_placehol
                 content.push_str(user_placeholder);
                 *message = Message::User { content };
             }
-            Message::Tool { content, .. } => {
+            Message::Tool {
+                content,
+                is_structured: true,
+                ..
+            } => {
                 if let Some(filtered) = remove_tool_images(content, tool_placeholder) {
                     *content = filtered;
                 }
@@ -167,6 +171,7 @@ mod tests {
                 }],
             },
             Message::Tool {
+                is_structured: true,
                 is_error: false,
                 call_id: "call".into(),
                 content: original.to_string(),
@@ -189,6 +194,19 @@ mod tests {
     }
 
     #[test]
+    fn plain_json_tool_text_is_not_changed_by_image_policy() {
+        let content = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"private"}] } }"#;
+        let mut messages = vec![Message::Tool {
+            call_id: "id".into(),
+            content: content.into(),
+            is_error: false,
+            is_structured: false,
+        }];
+        remove_images(&mut messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
+        assert!(matches!(&messages[0], Message::Tool { content: actual, .. } if actual == content));
+    }
+
+    #[test]
     fn non_vision_models_receive_reference_placeholders_for_user_and_tool_images() {
         let mut messages = vec![
             Message::UserWithImages {
@@ -196,6 +214,7 @@ mod tests {
                 images: vec![pi_rs::ImageContent { data: "private".into(), mime_type: "image/png".into() }],
             },
             Message::Tool {
+                is_structured: true,
                 is_error: false, call_id: "call".into(),
                 content: json!({"data":{"content":[{"type":"text","text":"before"},{"type":"image","data":"private"},{"type":"image","data":"private"},{"type":"text","text":"after"}]}}).to_string(),
             },

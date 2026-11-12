@@ -489,6 +489,7 @@ fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
                 call_id,
                 content,
                 is_error,
+                ..
             } => {
                 let mut block =
                     json!({"type":"tool_result","tool_use_id":call_id,"content":content});
@@ -1108,11 +1109,13 @@ mod tests {
                         call_id: "failed".into(),
                         content: "normal text".into(),
                         is_error: true,
+                        is_structured: false,
                     },
                     Message::Tool {
                         call_id: "ok".into(),
                         content: "Tool failed: but succeeded".into(),
                         is_error: false,
+                        is_structured: false,
                     },
                 ],
                 tools: vec![],

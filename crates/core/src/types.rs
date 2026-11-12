@@ -259,6 +259,9 @@ pub enum Message {
         /// Whether the tool result represents an error; absent in older messages.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        /// Whether `content` is an encoded structured tool result.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_structured: bool,
     },
 }
 
@@ -707,6 +710,14 @@ impl Outcome {
             }
             _ => false,
         }
+    }
+
+    /// Whether this outcome contains structured tool data.
+    pub fn is_structured(&self) -> bool {
+        matches!(
+            self,
+            Self::Structured { .. } | Self::StructuredWithDetails { .. }
+        )
     }
 
     /// Lossy projection for older native executable protocols.

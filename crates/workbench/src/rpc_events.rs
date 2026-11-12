@@ -309,7 +309,11 @@ impl Stream {
             } => {
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
-                    let result = tool_result_value(&outcome.tool_content(), Some(&outcome));
+                    let result = tool_result_value(
+                        &outcome.tool_content(),
+                        Some(&outcome),
+                        outcome.is_structured(),
+                    );
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
@@ -501,8 +505,16 @@ pub(super) fn tool_failed(outcome: &Outcome) -> bool {
     outcome.is_error()
 }
 
-pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value {
-    let (text, images) = pi_rs::extract_tool_images(text.to_owned());
+pub(super) fn tool_result_value(
+    text: &str,
+    outcome: Option<&Outcome>,
+    is_structured: bool,
+) -> Value {
+    let (text, images) = if is_structured {
+        pi_rs::extract_tool_images(text.to_owned())
+    } else {
+        (text.to_owned(), Vec::new())
+    };
     let mut content = vec![json!({"type":"text","text":text})];
     content.extend(
         images
@@ -571,7 +583,11 @@ mod streaming_tool_tests {
         };
         assert!(tool_failed(&result));
         assert_eq!(
-            tool_result_value(&result.tool_content(), Some(&result)),
+            tool_result_value(
+                &result.tool_content(),
+                Some(&result),
+                result.is_structured()
+            ),
             json!({"content":[{"type":"text","text":"exact"}], "details":{"code":42}})
         );
         let success = Outcome::TextResult {
@@ -580,6 +596,20 @@ mod streaming_tool_tests {
             is_error: false,
         };
         assert!(!tool_failed(&success));
+    }
+
+    #[test]
+    fn plain_json_result_is_verbatim_in_rpc() {
+        let text = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        let outcome = Outcome::TextResult {
+            output: text.into(),
+            details: None,
+            is_error: true,
+        };
+        assert_eq!(
+            tool_result_value(text, Some(&outcome), outcome.is_structured()),
+            json!({"content":[{"type":"text","text":text}]})
+        );
     }
 
     #[test]

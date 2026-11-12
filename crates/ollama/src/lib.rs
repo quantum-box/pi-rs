@@ -843,8 +843,11 @@ fn encode_message(message: Message) -> Vec<Value> {
             vec![json!({"role":"user","content":blocks})]
         }
         Message::Tool {
-            call_id, content, ..
-        } => encode_tool_result(&call_id, content),
+            call_id,
+            content,
+            is_structured,
+            ..
+        } => encode_tool_result(&call_id, content, is_structured),
         Message::Assistant { content, calls, .. } => {
             let mut message = json!({"role": "assistant", "content": content});
             if !calls.is_empty() {
@@ -865,9 +868,13 @@ fn encode_message(message: Message) -> Vec<Value> {
     }
 }
 
-fn encode_tool_result(call_id: &str, content: String) -> Vec<Value> {
+fn encode_tool_result(call_id: &str, content: String, is_structured: bool) -> Vec<Value> {
     let mut messages = Vec::new();
-    let (content, images) = pi_rs_core::extract_tool_images(content);
+    let (content, images) = if is_structured {
+        pi_rs_core::extract_tool_images(content)
+    } else {
+        (content, Vec::new())
+    };
     let mut images: Vec<_> = images
         .into_iter()
         .map(|image| {
@@ -995,7 +1002,7 @@ mod content_tests {
     #[test]
     fn image_tool_results_keep_pairing_and_move_images_to_a_user_content_block() {
         let content = json!({"data":{"content":[{"type":"text","text":"A chart"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]},"attachments":[]}).to_string();
-        let messages = encode_tool_result("call-1", content);
+        let messages = encode_tool_result("call-1", content, true);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["tool_call_id"], "call-1");
         assert!(
@@ -1009,10 +1016,23 @@ mod content_tests {
             "data:image/png;base64,aW1hZ2U="
         );
         assert_eq!(
-            encode_tool_result("text", "unchanged".into())[0]["content"],
+            encode_tool_result("text", "unchanged".into(), false)[0]["content"],
             "unchanged"
         );
     }
+    #[test]
+    fn plain_json_tool_output_stays_verbatim_and_has_no_image_message() {
+        let text = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        let messages = encode_message(Message::Tool {
+            call_id: "call".into(),
+            content: text.into(),
+            is_error: false,
+            is_structured: false,
+        });
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], text);
+    }
+
     #[test]
     fn user_images_are_sent_in_the_original_user_message() {
         let messages = encode_message(Message::UserWithImages {

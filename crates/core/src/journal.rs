@@ -2064,6 +2064,7 @@ fn conversation_entries_since(
                                 call_id: inv.call.id.clone(),
                                 content: outcome.tool_content(),
                                 is_error: outcome.is_error(),
+                                is_structured: outcome.is_structured(),
                             },
                         ));
                     }
@@ -2189,6 +2190,7 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
         } => Message::Tool {
             call_id,
             is_error,
+            is_structured: !images.is_empty(),
             content: if images.is_empty() {
                 text
             } else {
