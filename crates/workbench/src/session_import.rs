@@ -1058,6 +1058,16 @@ mod tests {
     }
 
     #[test]
+    fn imported_assistant_edit_counts_replacement_thinking() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"old thinking"},{"type":"text","text":"old"}],"stopReason":"stop","usage":{"totalTokens":100}}}),
+            json!({"type":"context_edit","id":"e","parentId":"a","targetId":"a","replacement":{"content":[{"type":"text","text":"a"},{"type":"thinking","thinking":"🦀bc"}]}}),
+        ]).unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 2);
+    }
+
+    #[test]
     fn continuation_counts_empty_assistants_and_respects_omissions() {
         use clap::Parser;
         for reason in ["error", "aborted", "stop"] {

@@ -84,27 +84,38 @@ pub(crate) fn estimate_source_tokens(
         Some(Event::BashExecution { execution }) => text_chars(&execution.command)
             .saturating_add(text_chars(&execution.output))
             .div_ceil(4),
-        Some(Event::Assistant {
-            request_id: Some(request_id),
-            ..
-        }) => {
-            let edited = session.branch().iter().any(|record| matches!(&record.event, Event::ContextEdited { target, .. } if *target == source));
-            let reasoning = if edited {
-                0
-            } else {
-                session
-                    .branch()
-                    .iter()
-                    .find_map(|record| match &record.event {
-                        Event::ModelFinished {
-                            request_id: id,
-                            metadata,
-                            ..
-                        } if id == request_id => metadata.reasoning.as_deref(),
-                        _ => None,
+        Some(Event::Assistant { request_id, .. }) => {
+            let branch = session.branch();
+            let replacement = branch.iter().rev().find_map(|record| match &record.event {
+                Event::ContextEdited {
+                    target,
+                    replacement,
+                } if *target == source => Some(replacement),
+                _ => None,
+            });
+            let reasoning = match replacement {
+                Some(Some(crate::ContextContent::Blocks(blocks))) => {
+                    blocks.iter().fold(0_u64, |chars, block| match block {
+                        crate::ContentBlock::Thinking { thinking } => {
+                            chars.saturating_add(text_chars(thinking))
+                        }
+                        _ => chars,
+                    })
+                }
+                Some(_) => 0,
+                None => request_id
+                    .and_then(|request_id| {
+                        branch.iter().find_map(|record| match &record.event {
+                            Event::ModelFinished {
+                                request_id: id,
+                                metadata,
+                                ..
+                            } if *id == request_id => metadata.reasoning.as_deref(),
+                            _ => None,
+                        })
                     })
                     .map(text_chars)
-                    .unwrap_or(0)
+                    .unwrap_or(0),
             };
             message_chars(message).saturating_add(reasoning).div_ceil(4)
         }

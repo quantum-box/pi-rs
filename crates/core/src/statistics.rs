@@ -323,6 +323,50 @@ mod tests {
     }
 
     #[test]
+    fn assistant_edit_estimates_latest_replacement_thinking_blocks() {
+        use crate::ContentBlock;
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let target = assistant(
+            &mut session,
+            "old",
+            Some("old reasoning"),
+            Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+        );
+        session
+            .edit_context(
+                target,
+                Some(ContextContent::Blocks(vec![
+                    ContentBlock::Text { text: "a".into() },
+                    ContentBlock::Thinking {
+                        thinking: "🦀".into(),
+                    },
+                    ContentBlock::Thinking {
+                        thinking: "bc".into(),
+                    },
+                ])),
+            )
+            .unwrap();
+        // One text unit plus four UTF-16 thinking units, rounded together.
+        assert_eq!(session.context_usage_estimate().tokens, 2);
+        session
+            .edit_context(target, Some(ContextContent::Text("x".into())))
+            .unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 1);
+        session
+            .edit_context(
+                target,
+                Some(ContextContent::Blocks(vec![ContentBlock::Thinking {
+                    thinking: "123456789".into(),
+                }])),
+            )
+            .unwrap();
+        assert_eq!(session.context_usage_estimate().tokens, 3);
+    }
+
+    #[test]
     fn model_selection_does_not_invalidate_measured_usage() {
         let mut session = Session::with_store(MemoryStore::default()).unwrap();
         assistant(
