@@ -32,7 +32,7 @@ impl Grep {
             .case_insensitive(args["ignoreCase"] == true)
             .build(&pattern)
             .map_err(|error| Error::Config(error.to_string()))?;
-        let context = args["context"].as_u64().unwrap_or(0).min(1000) as usize;
+        let context = usize::try_from(args["context"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
         Ok(Self {
             matcher,
             searcher: SearcherBuilder::new()
@@ -339,6 +339,44 @@ mod tests {
             grep.finish().tool_content(),
             "text:1: match first\ntext-2- after\ntext-5- before\ntext:6: match last"
         );
+    }
+
+    #[test]
+    fn context_over_one_thousand_lines_is_honored_and_byte_truncated() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let content = format!(
+            "{}needle\n{}",
+            "before\n".repeat(1001),
+            "after\n".repeat(1001)
+        );
+        std::fs::write(file.path(), content).unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"needle", "context":1001}), 100).unwrap();
+        grep.search(file.path(), "text", &CancellationToken::new())
+            .unwrap();
+        let output = grep.finish().tool_content();
+        assert!(output.starts_with("text-1- before\n"));
+        assert!(output.contains("text:1002: needle\n"));
+        assert!(output.ends_with("text-2003- after"));
+
+        let content = format!(
+            "{}needle\n{}",
+            format!("{}\n", "x".repeat(40)).repeat(1001),
+            "after\n".repeat(1001)
+        );
+        std::fs::write(file.path(), content).unwrap();
+        let mut grep = Grep::new(&json!({"pattern":"needle", "context":1001}), 100).unwrap();
+        grep.search(file.path(), "text", &CancellationToken::new())
+            .unwrap();
+        let outcome = grep.finish();
+        match outcome {
+            Outcome::SucceededWithDetails { output, details } => {
+                assert!(output.starts_with("text-1- "));
+                assert!(output.ends_with("[50.0KB limit reached]"));
+                assert_eq!(details["truncation"]["totalLines"], 2003);
+                assert_eq!(details["truncation"]["truncatedBy"], "bytes");
+            }
+            other => panic!("expected truncated output, got {other:?}"),
+        }
     }
 
     #[test]

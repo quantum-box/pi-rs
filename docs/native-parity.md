@@ -478,7 +478,8 @@ profile selects PowerShell. Windows CI exercises PowerShell output, timeout and 
 directory traversal. `grep` also checks cancellation between file reads, even
 when a file produces no matches. Local `grep` and `ls` report the resolved
 absolute path when the target is missing, and `grep` clamps a zero match limit
-to one as Pi does.
+to one as Pi does. Grep honors requested context beyond 1,000 lines and
+still applies the 50 KiB output limit with truncation metadata.
 
 ### Model-selection checkpoint
 
