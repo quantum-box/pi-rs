@@ -102,9 +102,65 @@ fn drain_until_idle(
     }
 }
 
+#[cfg(any(windows, test))]
+fn drain_console_records(
+    max: Duration,
+    idle: Duration,
+    mut wait: impl FnMut(Duration) -> std::io::Result<bool>,
+    mut discard: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    drain_until_idle(max, idle, |timeout| {
+        if wait(timeout)? {
+            discard()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })
+}
+
 #[cfg(test)]
 mod drain_tests {
     use super::*;
+
+    #[test]
+    fn drain_counts_incomplete_vt_records_as_activity() {
+        use std::sync::mpsc;
+        let (sender, receiver) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            sender.send(b'\x1b').unwrap();
+            std::thread::sleep(Duration::from_millis(35));
+            sender.send(b'[').unwrap();
+            std::thread::sleep(Duration::from_millis(35));
+            sender.send(b'9').unwrap();
+        });
+        let pending = std::cell::Cell::new(None);
+        let mut discarded = Vec::new();
+        drain_console_records(
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+            |timeout| match receiver.recv_timeout(timeout) {
+                Ok(byte) => {
+                    pending.set(Some(byte));
+                    Ok(true)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => Ok(false),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Model a quiet console, not an immediately readable EOF.
+                    std::thread::sleep(timeout);
+                    Ok(false)
+                }
+            },
+            || {
+                discarded.push(pending.take().unwrap());
+                Ok(())
+            },
+        )
+        .unwrap();
+        producer.join().unwrap();
+        assert_eq!(discarded, b"\x1b[9");
+    }
 
     #[test]
     fn drain_stops_at_deadline_during_continuous_input() {
