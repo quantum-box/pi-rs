@@ -721,10 +721,15 @@ fn markdown_at_depth(
                     lines.extend(table.render(theme, width));
                 }
             }
-            Event::Start(Tag::Link { dest_url, .. }) => links.push(dest_url.into_string()),
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                links.push((dest_url.into_string(), String::new()));
+            }
             Event::End(TagEnd::Link) => {
-                if let Some(url) = links.pop() {
-                    spans.push(Span::themed(format!(" ({url})"), theme, "mdLinkUrl"));
+                if let Some((url, label)) = links.pop() {
+                    let comparable_url = url.strip_prefix("mailto:").unwrap_or(&url);
+                    if label != url && label != comparable_url {
+                        spans.push(Span::themed(format!(" ({url})"), theme, "mdLinkUrl"));
+                    }
                 }
             }
             Event::Start(Tag::Strikethrough) => strikethrough += 1,
@@ -887,6 +892,9 @@ fn markdown_at_depth(
                 if code.is_some() {
                     code_text.push_str(&text);
                 } else {
+                    if let Some((_, label)) = links.last_mut() {
+                        label.push_str(&text);
+                    }
                     let mut span = Span::themed(
                         text,
                         theme,
@@ -899,19 +907,27 @@ fn markdown_at_depth(
                         },
                     );
                     span.bold = bold > 0 || heading > 0;
-                    span.underline = heading == 1;
+                    span.underline = heading == 1 || !links.is_empty();
                     span.italic = italic > 0;
                     span.strikethrough = strikethrough > 0;
                     spans.push(span);
                 }
             }
             Event::Code(text) => {
+                if let Some((_, label)) = links.last_mut() {
+                    label.push_str(&text);
+                }
                 let mut span = Span::themed(text, theme, "mdCode");
-                span.underline = heading == 1;
+                span.underline = heading == 1 || !links.is_empty();
                 span.bold = heading > 0;
                 spans.push(span);
             }
-            Event::SoftBreak => spans.push(Span::themed(" ", theme, "text")),
+            Event::SoftBreak => {
+                if let Some((_, label)) = links.last_mut() {
+                    label.push(' ');
+                }
+                spans.push(Span::themed(" ", theme, "text"));
+            }
             Event::End(TagEnd::Item) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
                 item_prefixes.pop();
@@ -1238,6 +1254,36 @@ mod tests {
                 .flat_map(|line| &line.spans)
                 .any(|span| span.text.contains("https://example.com"))
         );
+    }
+
+    #[test]
+    fn markdown_links_do_not_duplicate_their_visible_destination() {
+        for (source, expected) in [
+            ("<https://example.com>", "https://example.com"),
+            (
+                "[https://example.com](https://example.com)",
+                "https://example.com",
+            ),
+            ("<hello@example.com>", "hello@example.com"),
+            (
+                "[**docs**](https://example.com)",
+                "docs (https://example.com)",
+            ),
+        ] {
+            let lines = markdown(source, &Theme::system(), 100);
+            let spans = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>(),
+                expected
+            );
+            assert!(spans[0].underline, "{source}");
+        }
     }
     #[test]
     fn wraps_styles_without_splitting_graphemes_or_allowing_escapes() {
