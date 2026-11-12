@@ -1593,6 +1593,11 @@ fn rpc_live_toggles_override_project_settings_for_the_session() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(root.path().join(".pi")).unwrap();
     std::fs::write(
+        home.join("models.json"),
+        r#"{"providers":{"openai":{"models":[{"id":"second"}]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
         home.join("settings.json"),
         r#"{"compaction":{"enabled":false},"retry":{"enabled":false}}"#,
     )
@@ -1605,6 +1610,7 @@ fn rpc_live_toggles_override_project_settings_for_the_session() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .current_dir(root.path())
         .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "test-key")
         .args([
             "--trust",
             "--no-mcp",
@@ -1612,6 +1618,10 @@ fn rpc_live_toggles_override_project_settings_for_the_session() {
             "--model",
             "fixture",
             "--no-session",
+            "--context-window",
+            "32",
+            "--max-output-tokens",
+            "128",
             "--mode",
             "rpc",
         ])
@@ -1633,43 +1643,80 @@ fn rpc_live_toggles_override_project_settings_for_the_session() {
             }
         }
     });
-    let mut request = |id: &str, kind: &str, enabled: Option<bool>| -> Value {
-        let mut command = json!({"id":id, "type":kind});
-        if let Some(enabled) = enabled {
-            command["enabled"] = json!(enabled);
-        }
-        writeln!(input, "{command}").unwrap();
-        input.flush().unwrap();
-        loop {
-            let reply = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
-            if reply["id"] == id && reply["type"] == "response" {
-                assert_eq!(reply["success"], true, "{reply}");
-                break reply;
+    {
+        let mut request = |id: &str, kind: &str, enabled: Option<bool>| -> Value {
+            let mut command = json!({"id":id, "type":kind});
+            if let Some(enabled) = enabled {
+                command["enabled"] = json!(enabled);
             }
+            writeln!(input, "{command}").unwrap();
+            input.flush().unwrap();
+            loop {
+                let reply = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+                if reply["id"] == id && reply["type"] == "response" {
+                    assert_eq!(reply["success"], true, "{reply}");
+                    break reply;
+                }
+            }
+        };
+        assert_eq!(
+            request("initial", "get_state", None)["data"]["autoCompactionEnabled"],
+            true
+        );
+        for enabled in [false, true, false] {
+            request("compact", "set_auto_compaction", Some(enabled));
+            assert_eq!(
+                request("state", "get_state", None)["data"]["autoCompactionEnabled"],
+                enabled
+            );
+            request("retry", "set_auto_retry", Some(enabled));
+            assert_eq!(
+                request("after-retry", "get_state", None)["data"]["autoCompactionEnabled"],
+                enabled
+            );
+            let saved: Value =
+                serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["compaction"]["enabled"], enabled);
+            assert_eq!(saved["retry"]["enabled"], enabled);
         }
-    };
-    assert_eq!(
-        request("initial", "get_state", None)["data"]["autoCompactionEnabled"],
-        true
-    );
-    for enabled in [false, true, false] {
-        request("compact", "set_auto_compaction", Some(enabled));
-        assert_eq!(
-            request("state", "get_state", None)["data"]["autoCompactionEnabled"],
-            enabled
-        );
-        request("retry", "set_auto_retry", Some(enabled));
-        assert_eq!(
-            request("after-retry", "get_state", None)["data"]["autoCompactionEnabled"],
-            enabled
-        );
-        let saved: Value =
-            serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
-        assert_eq!(saved["compaction"]["enabled"], enabled);
-        assert_eq!(saved["retry"]["enabled"], enabled);
     }
-    request("stop", "shutdown", None);
-    drop(request);
+    let command =
+        json!({"id":"switch", "type":"set_model", "provider":"openai", "modelId":"second"});
+    writeln!(input, "{command}").unwrap();
+    input.flush().unwrap();
+    loop {
+        let reply = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        if reply["id"] == "switch" && reply["type"] == "response" {
+            assert_eq!(reply["success"], true, "{reply}");
+            break;
+        }
+    }
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"prompt", "type":"prompt", "message":"test worker restart"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut saw_disabled = false;
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        saw_disabled |= event
+            .to_string()
+            .contains("automatic compaction is disabled");
+        if event["type"] == "agent_settled"
+            || (event["id"] == "prompt" && event["success"] == false)
+        {
+            assert!(
+                saw_disabled,
+                "replacement worker ignored disabled compaction: {event}"
+            );
+            break;
+        }
+    }
+    writeln!(input, "{}", json!({"id":"stop", "type":"shutdown"})).unwrap();
+
     drop(input);
     let result = child.wait_with_output().unwrap();
     reader.join().unwrap();
@@ -1719,6 +1766,137 @@ fn rpc_live_toggles_override_project_settings_for_the_session() {
         .find(|event| event["id"] == "state")
         .unwrap();
     assert_eq!(state["data"]["autoCompactionEnabled"], true);
+}
+
+#[test]
+fn rpc_replacement_worker_keeps_retry_disabled() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+    std::fs::write(
+        root.path().join(".pi/settings.json"),
+        r#"{"retry":{"enabled":true,"maxRetries":1,"baseDelayMs":0}}"#,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"openai":{"baseUrl":endpoint,"apiKey":"test-key","models":[{"id":"second"}]}}}).to_string(),
+    )
+    .unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (stop, stopping) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut count = 0;
+        while stopping.try_recv().is_err() {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut reader = BufReader::new(socket.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    if line.starts_with("POST ") {
+                        count += 1;
+                    }
+                    let body = r#"{"error":{"message":"unavailable"}}"#;
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("fixture: {error}"),
+            }
+        }
+        count
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture",
+            "--no-session",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for command in [
+        json!({"id":"retry","type":"set_auto_retry","enabled":false}),
+        json!({"id":"switch","type":"set_model","provider":"openai","modelId":"second"}),
+    ] {
+        writeln!(input, "{command}").unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["id"] == command["id"] && event["type"] == "response" {
+                assert_eq!(event["success"], true, "{event}");
+                break;
+            }
+        }
+    }
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"prompt","type":"prompt","message":"test"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut retry_event = false;
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        retry_event |= event.to_string().contains("auto_retry_start");
+        if event["type"] == "agent_settled" {
+            break;
+        }
+    }
+    assert!(
+        !retry_event,
+        "replacement worker retried despite the live override"
+    );
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    stop.send(()).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(server.join().unwrap(), 1);
 }
 
 #[test]

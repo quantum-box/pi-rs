@@ -339,13 +339,13 @@ impl Settings {
             .write(true)
             .open(path.with_extension("lock"))?;
         lock.lock()?;
-        let mut settings = read_object(&path)?;
+        let mut settings = read_object(path)?;
         settings
             .as_object_mut()
             .expect("validated settings object")
             .insert(key.into(), value.clone());
-        validate_settings(&settings, &path)?;
-        write_json(&path, &settings)?;
+        validate_settings(&settings, path)?;
+        write_json(path, &settings)?;
         if !self.value.is_object() {
             self.value = Value::Object(Map::new());
         }

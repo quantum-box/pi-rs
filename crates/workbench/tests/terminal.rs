@@ -107,6 +107,11 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(root.path().join(".pi")).unwrap();
     std::fs::write(
+        home.join("models.json"),
+        r#"{"providers":{"openai":{"models":[{"id":"second"}]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
         home.join("settings.json"),
         r#"{"compaction":{"enabled":false},"retry":{"enabled":false}}"#,
     )
@@ -147,6 +152,7 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
         Command::new(env!("CARGO_BIN_EXE_pi"))
             .current_dir(root.path())
             .env("PI_RS_HOME", &home)
+            .env("OPENAI_API_KEY", "test-key")
             .env("TERM", "xterm-256color")
             .args([
                 "--trust",
@@ -154,6 +160,10 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
                 "--offline",
                 "--model",
                 "fixture",
+                "--context-window",
+                "32",
+                "--max-output-tokens",
+                "128",
                 "--tui-mode",
                 "fullscreen",
             ])
@@ -182,9 +192,17 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
         assert_eq!(saved[key]["enabled"], true);
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains(&format!("{label} · off")));
         master.write_all(b"\x1b").unwrap();
         output_until(&mut master, |text| text.contains("Enter to send"));
     }
+    master.write_all(b"/model openai/second\r").unwrap();
+    output_until(&mut master, |text| text.contains("Model › openai/second"));
+    master.write_all(b"test worker restart\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("automatic compaction is disabled")
+    });
 }
 
 #[test]
