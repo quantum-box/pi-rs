@@ -81,6 +81,8 @@ partial response and report the `length` finish reason. Across model providers,
 tool calls in a length-limited response are recorded as failed without executing
 their potentially incomplete arguments; the model receives those results and
 may request the tools again. Other incomplete reasons remain errors.
+Truncated compaction and branch summaries are rejected before changing the
+conversation branch.
 
 Native extensions can opt into tool execution start and end events, including
 nested call ancestry, final outcomes, and elapsed execution time. Streaming
