@@ -506,6 +506,8 @@ type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
 
 #[derive(Default)]
 struct View {
+    async_transitions: bool,
+    pending_transition: Option<std::sync::mpsc::Receiver<Result<Cli>>>,
     regular: RegularState,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
@@ -2826,6 +2828,25 @@ fn slash(
                 return Ok(None);
             }
             let mut next = args.clone();
+            if view.async_transitions {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        next.refresh_workspace_selection();
+                        next.session = session_path(&next.workspace, next.session_dir.as_deref());
+                        if let Some(directory) = next.session.parent() {
+                            std::fs::create_dir_all(directory)?;
+                        }
+                        initialize_session(&mut next)?;
+                        next.session_transition = Some(pi_rs::SessionStartReason::New);
+                        Ok(next)
+                    })();
+                    let _ = sender.send(result);
+                });
+                view.pending_transition = Some(receiver);
+                view.append("Preparing session (Esc to cancel)");
+                return Ok(None);
+            }
             next.refresh_workspace_selection();
             next.session = session_path(&args.workspace, args.session_dir.as_deref());
             if let Some(directory) = next.session.parent() {
@@ -3282,6 +3303,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         Err(error) => return Err(error),
     };
     let mut view = View {
+        async_transitions: true,
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
         ..View::default()
@@ -3325,6 +3347,23 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     loop {
+        if let Some(receiver) = &view.pending_transition {
+            let ready = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(Error::Config(
+                    "session transition worker stopped".into(),
+                ))),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = ready {
+                view.pending_transition = None;
+                match result.and_then(|next| apply_session(&mut args, &mut view, next)) {
+                    Ok(()) => {}
+                    Err(error) => view.append(&error.to_string()),
+                }
+                dirty = true;
+            }
+        }
         if !is_busy(&worker) {
             for event in std::mem::take(&mut args.selection_events) {
                 if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
@@ -3722,6 +3761,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         }
         if !args.trust_pending
             && view.picker.is_none()
+            && view.pending_transition.is_none()
             && !is_busy(&worker)
             && let Some((prompt, images)) = initial.pop_front()
         {
@@ -3872,6 +3912,18 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             }
             _ => continue,
         };
+        if view.pending_transition.is_some() {
+            match &event {
+                Event::Key(key) if key.code == KeyCode::Esc => {
+                    view.pending_transition = None;
+                    view.append("Session transition cancelled");
+                    dirty = true;
+                    continue;
+                }
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => continue,
+                _ => {}
+            }
+        }
         let mut mouse_activate = false;
         let event = match event {
             Event::Mouse(mouse)
@@ -6239,7 +6291,21 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
     let mut next = args.clone();
     next.session = path;
     next.session_transition = Some(pi_rs::SessionStartReason::Resume);
+    if view.async_transitions {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = restore_workspace(&mut next).map(|()| next);
+            let _ = sender.send(result);
+        });
+        view.pending_transition = Some(receiver);
+        view.append("Preparing session (Esc to cancel)");
+        return Ok(());
+    }
     restore_workspace(&mut next)?;
+    apply_session(args, view, next)
+}
+
+fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
     let resources = super::resources::Resources::load(&next)?;
     next.theme_paths = resources.themes.clone();
     view.restore(&next)?;
@@ -6503,6 +6569,82 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interactive_workspace_switch_prepares_in_background_before_applying_scope() {
+        use clap::Parser;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            r#"{"enabledModels":["ollama/dynamic"]}"#,
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 2048];
+            let _ = socket.read(&mut buf).unwrap();
+            accepted.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(10)).unwrap();
+            let body = r#"{"data":[{"id":"dynamic"}]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let path = root.path().join("target.jsonl");
+        pi_rs::Session::open(&path)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = launch;
+        args.session = root.path().join("launch.jsonl");
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"ollama":{"baseUrl":endpoint,"models":[{"id":"alpha"}]}}})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        let mut view = super::View {
+            async_transitions: true,
+            ..Default::default()
+        };
+        super::switch_session(&mut args, &mut view, path.clone()).unwrap();
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(args.model, "alpha");
+        assert_ne!(args.session, path);
+        assert!(matches!(
+            view.pending_transition.as_ref().unwrap().try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let next = view
+            .pending_transition
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        super::apply_session(&mut args, &mut view, next).unwrap();
+        assert_eq!(args.session, path);
+        assert_eq!(args.model, "dynamic");
+        server.join().unwrap();
+    }
+
     #[test]
     fn startup_loads_saved_workspace_settings_before_recording_selection() {
         use clap::Parser;

@@ -50,8 +50,33 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut pending_queries: Vec<Value> = Vec::new();
     let mut pending_inputs: Vec<Value> = Vec::new();
     let mut model_queries: Vec<(Value, mpsc::Receiver<Result<Value>>)> = Vec::new();
+    let mut transition: Option<(Value, mpsc::Receiver<Result<Cli>>)> = None;
+    let mut deferred = std::collections::VecDeque::<Value>::new();
     let mut stream = super::rpc_events::Stream::default();
     loop {
+        if let Some((_, receiver)) = &transition {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(Error::Config(
+                    "session transition worker stopped".into(),
+                ))),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                let (request, _) = transition.take().expect("pending transition");
+                let result = result.and_then(|next| {
+                    let previous_thinking = args.thinking.clone();
+                    let reason = if request["type"] == "new_session" { pi_rs::SessionStartReason::New } else { pi_rs::SessionStartReason::Resume };
+                    Worker::transition(&mut worker, &next, reason)?;
+                    args = next;
+                    if previous_thinking.as_deref().unwrap_or("off") != args.thinking.as_deref().unwrap_or("off") {
+                        emit(json!({"type":"thinking_level_changed","level":args.thinking.as_deref().unwrap_or("off")}))?;
+                    }
+                    Ok(Some(json!({"cancelled":false})))
+                });
+                response(&request, result)?;
+            }
+        }
         let mut index = 0;
         while index < model_queries.len() {
             match model_queries[index].1.try_recv() {
@@ -159,24 +184,50 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        let line = match receiver.recv_timeout(Duration::from_millis(20)) {
-            Ok(line) => line?,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) if model_queries.is_empty() => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Do not drop accepted model-list requests when a batch client
-                // closes stdin before discovery finishes.
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
+        let request = if transition.is_none() && !deferred.is_empty() {
+            deferred.pop_front().expect("deferred request")
+        } else {
+            let line = match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok(line) => line?,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected)
+                    if model_queries.is_empty() && transition.is_none() && deferred.is_empty() =>
+                {
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Do not drop accepted model-list requests when a batch client
+                    // closes stdin before discovery finishes.
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            };
+            match parse_request(&line) {
+                Ok(request) => request,
+                Err(error) => {
+                    response(&json!({"type":"parse"}), Err(error))?;
+                    continue;
+                }
             }
         };
-        let request = match parse_request(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                response(&json!({"type":"parse"}), Err(error))?;
-                continue;
+        if transition.is_some()
+            && !matches!(
+                request["type"].as_str(),
+                Some("get_available_models" | "get_available_thinking_levels")
+            )
+        {
+            if deferred.len() >= 256 {
+                response(
+                    &request,
+                    Err(Error::Config(
+                        "too many commands waiting for session transition".into(),
+                    )),
+                )?;
+            } else {
+                deferred.push_back(request);
             }
-        };
+            continue;
+        }
         if request["type"] == "get_available_models" {
             if model_queries.len() >= 16 {
                 response(
@@ -192,6 +243,67 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     let _ = sender.send(result);
                 });
                 model_queries.push((request, receiver));
+            }
+            continue;
+        }
+        if request["type"] == "switch_session" || request["type"] == "new_session" {
+            let prepared = (|| {
+                if !pending_inputs.is_empty() || busy(&worker) {
+                    return Err(Error::Config(
+                        "wait for the current operation before switching sessions".into(),
+                    ));
+                }
+                let is_new = request["type"] == "new_session";
+                let path = if is_new {
+                    None
+                } else {
+                    Some(
+                        args.workspace.join(
+                            request["sessionPath"]
+                                .as_str()
+                                .ok_or_else(|| Error::Config("sessionPath is required".into()))?,
+                        ),
+                    )
+                };
+                let parent = match request.get("parentSession") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(path)) => Some(path.clone()).filter(|path| !path.is_empty()),
+                    Some(_) if is_new => {
+                        return Err(Error::Config("parentSession must be a string".into()));
+                    }
+                    Some(_) => None,
+                };
+                if Worker::check_session_transition(
+                    Some(&mut worker),
+                    &args,
+                    pi_rs::BeforeSessionTransition::Switch {
+                        reason: if is_new {
+                            pi_rs::SessionSwitchReason::New
+                        } else {
+                            pi_rs::SessionSwitchReason::Resume
+                        },
+                        target_session_file: path.clone(),
+                    },
+                )? {
+                    return Ok(None);
+                }
+                let mut next = args.clone();
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = if let Some(path) = path {
+                        switch_session(&mut next, &path)
+                    } else {
+                        prepare_new_session(&mut next, parent.as_deref())
+                    }
+                    .map(|()| next);
+                    let _ = sender.send(result);
+                });
+                Ok(Some(receiver))
+            })();
+            match prepared {
+                Ok(Some(receiver)) => transition = Some((request, receiver)),
+                Ok(None) => response(&request, Ok(Some(json!({"cancelled":true}))))?,
+                Err(error) => response(&request, Err(error))?,
             }
             continue;
         }
@@ -685,7 +797,11 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 &args.workspace,
             )?;
             drop(session);
-            switch_session(args, &destination)?;
+            let retry_discovery = args.selection_discovery_pending;
+            args.selection_discovery_pending = false;
+            let switched = switch_session(args, &destination);
+            args.selection_discovery_pending = retry_discovery;
+            switched?;
             let mut data = json!({"cancelled":false});
             if let Some(text) = text {
                 data["text"] = json!(text);
@@ -712,29 +828,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             )? {
                 return Ok(Some(json!({"cancelled":true})));
             }
-            let destination = if args.no_session {
-                args.session
-                    .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
-            } else {
-                interactive::session_path(&args.workspace, args.session_dir.as_deref())
-            };
-            if let Some(directory) = destination.parent() {
-                std::fs::create_dir_all(directory)?;
-            }
-            let mut next = args.clone();
-            next.refresh_workspace_selection();
-            next.session = destination;
-            let mut session = Session::open(&next.session)?;
-            session.set_working_directory(&next.workspace)?;
-            super::backend::initialize_queue_modes(&mut session, &next)?;
-            if let Some(parent) = parent {
-                session.set_parent_session(parent)?;
-            }
-            next.restore_session_model(&session);
-            super::thinking::adjust(&mut next);
-            next.record_automatic_model_selection(&mut session)?;
-            drop(session);
-            *args = next;
+            prepare_new_session(args, parent)?;
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" => {
@@ -1077,6 +1171,33 @@ fn record_id(value: &Value) -> Result<u64> {
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
         .filter(|id| *id > 0)
         .ok_or_else(|| Error::Config("entry ID must be a positive integer".into()))
+}
+
+fn prepare_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
+    let destination = if args.no_session {
+        args.session
+            .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
+    } else {
+        interactive::session_path(&args.workspace, args.session_dir.as_deref())
+    };
+    if let Some(directory) = destination.parent() {
+        std::fs::create_dir_all(directory)?;
+    }
+    let mut next = args.clone();
+    next.refresh_workspace_selection();
+    next.session = destination;
+    let mut session = Session::open(&next.session)?;
+    session.set_working_directory(&next.workspace)?;
+    super::backend::initialize_queue_modes(&mut session, &next)?;
+    if let Some(parent) = parent {
+        session.set_parent_session(parent)?;
+    }
+    next.restore_session_model(&session);
+    super::thinking::adjust(&mut next);
+    next.record_automatic_model_selection(&mut session)?;
+    drop(session);
+    *args = next;
+    Ok(())
 }
 
 fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
