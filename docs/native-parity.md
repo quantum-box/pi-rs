@@ -2763,8 +2763,8 @@ clearing the resulting queue.
 
 ### Active-run native custom messages
 
-A native tool or active-run lifecycle callback can call `ToolHost::send_message` with `Steer`, `FollowUp`,
-`NextTurn`, or `AfterTurn`. These correspond to Pi's default steering,
+A native tool or supported extension callback can call `ToolHost::send_message`
+with `Steer`, `FollowUp`, `NextTurn`, or `AfterTurn`. These correspond to Pi's default steering,
 `deliverAs: "followUp"`, `deliverAs: "nextTurn"`, and
 `triggerTurn: false`, respectively. The last mode adds context after the
 current assistant turn and its tool results without itself starting another
@@ -2778,20 +2778,27 @@ FIFO order and queue modes with user input. Clearing the queue removes those
 two modes but retains next-turn messages. Executable extensions negotiate the
 host-call capability and report it unavailable with older hosts.
 
-The focused tests cover mixed user/custom queue ordering, branch-local clearing,
-tool-result ordering, all four delivery boundaries, process protocol metadata,
-and reopening a session before the next prompt. Lifecycle callbacks receive an
-acknowledged host during `agent_start`, `turn_start`, `turn_end`, and ordinary
-scheduler `tool_execution_start`, `tool_execution_update`, and
-`tool_execution_end` events. Reentrant sends are serviced by the journal owner
-while the callback waits; separately built extensions negotiate this support.
+The SDK supplies a message host to initial input hooks and to input hooks for
+steering and follow-ups during a run; idle `SessionControl` input hooks still
+use the older hook interface. Provider-request hooks and the normal scheduler's
+tool-call and tool-result hooks also receive a host. Lifecycle hosts are
+available for active `agent_start`, `turn_start`, `turn_end`, and ordinary
+scheduler tool execution events; settled `agent_end` and `agent_settled`; and
+SDK-owned session and model-selection notifications. Idle callbacks append
+messages without starting a model turn, except `NextTurn`, which is queued.
+Reentrant sends are serviced by the journal owner while the callback waits.
+Separately built extensions negotiate the individual callback capabilities.
 
-Host calls are not yet provided to `agent_end`, `agent_settled`, session and
-selection lifecycle callbacks, truncated-tool-result lifecycle notifications,
-input, context, provider-request, tool-call or tool-result hooks, user-bash,
-resource discovery, compaction, tree, and transition callbacks. Command effects
-still use their existing return-value mechanism. Custom message renderers are
-also unsupported.
+Focused tests cover queue and tool-result ordering, callback reentrancy,
+initial and streaming input, provider-request delivery, session start and
+settled boundaries, process protocol metadata, and reopening before the next
+prompt. The host API does not yet express an idle `triggerTurn: true` request
+from these callbacks. Host calls also remain unavailable in context-with-system,
+legacy before-tool-only policy hooks, non-scheduler tool-result recovery,
+truncated-tool lifecycle notifications, active control rename notifications,
+user-bash, resource discovery, compaction, tree, and session-transition hooks.
+Command effects retain their existing return-value mechanism; custom message
+renderers are unsupported.
 
 ### Rust extension lifecycle observation
 

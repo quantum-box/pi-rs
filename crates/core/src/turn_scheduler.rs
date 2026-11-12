@@ -147,6 +147,7 @@ impl Agent<'_> {
         normalized: TurnNormalized,
         states: &ExtensionStates,
         cancel: &CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
     ) -> Result<TurnPreparation> {
         let (tool, mut args) = match normalized {
             TurnNormalized::Ready { tool, args } => (tool, args),
@@ -162,7 +163,7 @@ impl Agent<'_> {
         let decision = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Error::Cancelled),
-            decision = tokio::time::timeout(tool_timeout, Self::turn_authorize(registry, &call.name, &mut args, &context, states)) =>
+            decision = tokio::time::timeout(tool_timeout, Self::turn_authorize(registry, &call.name, &mut args, &context, states, host)) =>
                 decision.map_err(|_| Error::Config("pre-tool hooks timed out".into()))??,
         };
         Ok(match decision {
@@ -195,6 +196,7 @@ impl Agent<'_> {
             normalized,
             states,
             cancel,
+            None,
         )
         .await
     }
@@ -205,13 +207,29 @@ impl Agent<'_> {
         args: &mut serde_json::Value,
         context: &ToolContext,
         states: &ExtensionStates,
+        host: Option<Arc<dyn ToolHost>>,
     ) -> Result<Decision> {
         for extension in &registry.extensions {
             let decision = hook(
                 extension.as_ref(),
-                extension
-                    .tool_call(name, args, context, states.get(extension.id()))
-                    .await,
+                match &host {
+                    Some(host) => {
+                        extension
+                            .tool_call_with_host(
+                                name,
+                                args,
+                                context,
+                                states.get(extension.id()),
+                                host.clone(),
+                            )
+                            .await
+                    }
+                    None => {
+                        extension
+                            .tool_call(name, args, context, states.get(extension.id()))
+                            .await
+                    }
+                },
             )?;
             if decision != Decision::Allow {
                 return Ok(decision);
@@ -270,6 +288,7 @@ impl Agent<'_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn turn_transform(
         registry: &Registry,
         tool_timeout: Duration,
@@ -278,6 +297,7 @@ impl Agent<'_> {
         states: &ExtensionStates,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
+        host: Option<Arc<dyn ToolHost>>,
     ) {
         if matches!(
             reply.outcome,
@@ -298,9 +318,12 @@ impl Agent<'_> {
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = tokio::time::timeout(tool_timeout, extension.tool_result_update(
-                    &invocation.call, &reply.outcome, &context, states.get(extension.id()),
-                )) => result,
+                result = tokio::time::timeout(tool_timeout, async {
+                    match &host {
+                        Some(host) => extension.tool_result_update_with_host(&invocation.call, &reply.outcome, &context, states.get(extension.id()), host.clone()).await,
+                        None => extension.tool_result_update(&invocation.call, &reply.outcome, &context, states.get(extension.id())).await,
+                    }
+                }) => result,
             };
             let error = match result {
                 Ok(Ok(Some(outcome)))
@@ -868,6 +891,7 @@ impl Agent<'_> {
                 let invocation = calls[index].invocation.clone();
                 let cancel = calls[index].cancellation.clone();
                 let timeout = self.limits.tool_timeout;
+                let hook_host = lifecycle_host.clone();
                 let future = async move {
                     let mut errors = Vec::new();
                     let mut collect = |event: Notification<'_>| {
@@ -888,6 +912,7 @@ impl Agent<'_> {
                         &snapshot,
                         &cancel,
                         &mut collect,
+                        Some(hook_host),
                     )
                     .await;
                     TurnEvent::Transformed(index, reply, duration, errors)
@@ -933,8 +958,9 @@ impl Agent<'_> {
                             Ok(normalized) => {
                                 let registry = self.registry.clone(); let snapshot = states.clone();
                                 let invocation = calls[index].invocation.clone(); let cancel = calls[index].cancellation.clone(); let timeout = self.limits.tool_timeout;
+                                let hook_host = lifecycle_host.clone();
                                 let future = async move {
-                                    let result = Self::turn_finish_preparation(&registry, timeout, &invocation, normalized, &snapshot, &cancel).await;
+                                    let result = Self::turn_finish_preparation(&registry, timeout, &invocation, normalized, &snapshot, &cancel, Some(hook_host)).await;
                                     TurnEvent::Prepared(index, result, Vec::new())
                                 }.boxed();
                                 futures.push(start_turn_future(future).await);

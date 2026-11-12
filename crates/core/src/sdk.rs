@@ -61,6 +61,45 @@ pub struct SessionControl {
     tool_timeout: std::time::Duration,
 }
 
+struct InputMessageHost {
+    input: mpsc::Sender<crate::AgentInput>,
+}
+#[async_trait::async_trait]
+impl crate::ToolHost for InputMessageHost {
+    fn tools(&self) -> Vec<crate::ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> crate::Outcome {
+        crate::Outcome::Skipped("tool calls unavailable in input hooks".into())
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.input
+            .send(crate::AgentInput::EnqueueCustom {
+                message: crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    message,
+                    delivery,
+                },
+                reply,
+            })
+            .await
+            .map_err(|_| "session is closed".to_owned())?;
+        receive
+            .await
+            .map_err(|_| "custom message response lost".to_owned())?
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Clone, Default)]
 struct InputHooks {
     extensions: Vec<Arc<dyn Extension>>,
@@ -177,7 +216,13 @@ impl SessionControl {
             let prepared = tokio::select! {
                 biased;
                 _ = self.input.closed() => return Err(Error::Config("session is closed".into())),
-                result = crate::extension::prepare_input(&hooks.extensions, event, &hooks.states) => result?,
+                result = async {
+                    if streaming {
+                        crate::extension::prepare_input_with_host(&hooks.extensions, event, &hooks.states, Arc::new(InputMessageHost { input: self.input.clone() })).await
+                    } else {
+                        crate::extension::prepare_input(&hooks.extensions, event, &hooks.states).await
+                    }
+                } => result?,
             };
             let Some(prepared) = prepared else {
                 return Ok(id);
@@ -538,7 +583,7 @@ impl AgentSession {
                 level: "off".into(),
                 previous_level,
             })
-            .await;
+            .await?;
         }
         let descriptor_changed = previous_descriptor.as_ref().is_some_and(|previous| {
             previous
@@ -556,23 +601,24 @@ impl AgentSession {
                 previous_model: previous_descriptor,
                 source: crate::ModelSelectSource::Set,
             })
-            .await;
+            .await?;
         }
         Ok(())
     }
 
-    async fn notify_selection_event(&self, event: crate::LifecycleEvent) {
+    async fn notify_selection_event(&mut self, event: crate::LifecycleEvent) -> Result<()> {
         if self.registry.has_model_selection_hooks() {
             let events = self.events.as_ref().expect("open session");
-            crate::lifecycle::notify(
+            crate::lifecycle::notify_idle_with_host(
                 &self.registry,
+                &mut self.session,
                 event,
-                &self.session.extension_states(),
                 self.limits.tool_timeout,
                 &mut |notification| emit(events, &notification),
             )
-            .await;
+            .await?;
         }
+        Ok(())
     }
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
         self.ensure_open()?;
@@ -674,7 +720,7 @@ impl AgentSession {
         self.notify_session_event(crate::LifecycleEvent::SessionInfoChanged {
             name: self.session.name().map(str::to_owned),
         })
-        .await;
+        .await?;
         Ok(())
     }
 
@@ -686,23 +732,24 @@ impl AgentSession {
                 reason,
                 previous_session_file,
             })
-            .await;
+            .await?;
         }
         Ok(())
     }
 
-    async fn notify_session_event(&mut self, event: crate::LifecycleEvent) {
+    async fn notify_session_event(&mut self, event: crate::LifecycleEvent) -> Result<()> {
         if self.registry.has_session_lifecycle_hooks() {
             let events = self.events.as_ref().expect("open session");
-            crate::lifecycle::notify(
+            crate::lifecycle::notify_idle_with_host(
                 &self.registry,
+                &mut self.session,
                 event,
-                &self.session.extension_states(),
                 self.limits.tool_timeout,
                 &mut |notification| emit(events, &notification),
             )
-            .await;
+            .await?;
         }
+        Ok(())
     }
     /// Changes future model context while retaining the original transcript and effects.
     pub fn edit_context(
@@ -934,10 +981,28 @@ impl AgentSession {
                     streaming_behavior: None,
                 };
                 let states = self.session.extension_states();
-                let prepared = tokio::select! {
-                    biased;
-                    _ = active.token.cancelled() => return Err(Error::Cancelled),
-                    result = self.registry.prepare_input(event, &states) => result?,
+                let (sender, mut incoming) = mpsc::channel(32);
+                let host = Arc::new(crate::agent::LifecycleMessageHost { sender });
+                let prepared = {
+                    let future = self.registry.prepare_input_with_host(event, &states, host);
+                    tokio::pin!(future);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            Some((input, reply)) = incoming.recv() => {
+                                let result = if input.delivery == crate::CustomMessageDelivery::NextTurn {
+                                    crate::agent::queue_custom_message(&mut self.session, input, &mut observe)
+                                } else {
+                                    self.session.append_custom_message(input.message).map(|()| {
+                                        observe(Notification::Committed(self.session.records().last().expect("appended custom message")));
+                                    })
+                                };
+                                match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                            }
+                            _ = active.token.cancelled() => return Err(Error::Cancelled),
+                            result = &mut future => break result?,
+                        }
+                    }
                 };
                 let Some(prepared) = prepared else {
                     return Ok(String::new());
@@ -1133,13 +1198,15 @@ impl AgentSession {
         self.input.close();
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
         while self.input.try_recv().is_ok() {}
-        if self.pending_start.is_none() {
+        let notification_result = if self.pending_start.is_none() {
             self.notify_session_event(crate::LifecycleEvent::SessionShutdown {
                 reason: crate::SessionShutdownReason::Quit,
                 target_session_file: None,
             })
-            .await;
-        }
+            .await
+        } else {
+            Ok(())
+        };
         let registry = std::mem::replace(&mut self.registry, Arc::new(Registry::default()));
         let result = if Arc::strong_count(&registry) == 1 {
             registry.shutdown().await
@@ -1149,7 +1216,7 @@ impl AgentSession {
         if let Some(events) = self.events.take() {
             let _ = events.send(SessionEvent::Closed);
         }
-        result
+        notification_result.and(result)
     }
     fn emit_last(&self) {
         if let (Some(events), Some(record)) = (&self.events, self.session.records().last()) {
@@ -2671,6 +2738,49 @@ mod tests {
         fn handles_tool_execution_lifecycle(&self) -> bool {
             true
         }
+        fn handles_tool_result(&self) -> bool {
+            true
+        }
+        async fn tool_call_with_host(
+            &self,
+            _: &str,
+            _: &mut serde_json::Value,
+            _: &crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::Decision> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "hook".into(),
+                    content: crate::ContextContent::Text("tool call".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            Ok(crate::Decision::Allow)
+        }
+        async fn tool_result_update_with_host(
+            &self,
+            _: &crate::ToolCall,
+            _: &crate::Outcome,
+            _: &crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::Outcome>> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "hook".into(),
+                    content: crate::ContextContent::Text("tool result".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            Ok(None)
+        }
         async fn lifecycle_with_host(
             &self,
             event: &crate::LifecycleEvent,
@@ -2743,7 +2853,15 @@ mod tests {
         assert_eq!(text(&requests[0]), ["first", "agent start"]);
         assert_eq!(
             text(&requests[1]),
-            ["first", "agent start", "turn end", "tool start", "tool end"]
+            [
+                "first",
+                "agent start",
+                "turn end",
+                "tool start",
+                "tool call",
+                "tool result",
+                "tool end"
+            ]
         );
         let tool = requests[1]
             .iter()
@@ -2759,6 +2877,232 @@ mod tests {
             session.journal().queued_custom_messages()[0].1.delivery,
             crate::CustomMessageDelivery::NextTurn
         );
+    }
+
+    struct RequestMessageHook(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Extension for RequestMessageHook {
+        fn id(&self) -> &str {
+            "request-message"
+        }
+        async fn before_request_with_host(
+            &self,
+            _: &mut ModelRequest,
+            _: crate::RequestPurpose,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "request".into(),
+                        content: crate::ContextContent::Text("request steer".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::Steer,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn provider_request_hook_message_is_journaled_and_delivered_after_current_request() {
+        let count = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(count.clone(), "fixture")
+            .extension(Arc::new(RequestMessageHook(AtomicUsize::new(0))))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.0.load(Ordering::SeqCst), 2);
+        let records = session.journal().records();
+        let queued = records
+            .iter()
+            .position(|r| matches!(r.event, crate::Event::CustomMessageQueued { .. }))
+            .unwrap();
+        let first_request = records
+            .iter()
+            .position(|r| matches!(r.event, crate::Event::ModelRequested { .. }))
+            .unwrap();
+        let delivered = records
+            .iter()
+            .position(|r| matches!(r.event, crate::Event::CustomMessageDelivered { .. }))
+            .unwrap();
+        assert!(queued < first_request && first_request < delivered);
+    }
+
+    struct InputMessageHook;
+    #[async_trait::async_trait]
+    impl Extension for InputMessageHook {
+        fn id(&self) -> &str {
+            "input-message"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            event: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            let text = if event.streaming_behavior.is_some() {
+                "streaming hook"
+            } else {
+                "idle hook"
+            };
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "input".into(),
+                    content: crate::ContextContent::Text(text.into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            if event.streaming_behavior.is_none() {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "input".into(),
+                        content: crate::ContextContent::Text("next".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+            }
+            Ok(crate::InputAction::Continue)
+        }
+    }
+    #[tokio::test]
+    async fn initial_input_hook_messages_preserve_idle_and_next_turn_order() {
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .extension(Arc::new(InputMessageHook))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("prompt"))
+            .await
+            .unwrap()
+            .unwrap();
+        let texts: Vec<_> = session
+            .messages()
+            .unwrap()
+            .into_iter()
+            .filter_map(|m| {
+                if let Message::User { content } = m {
+                    Some(content)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(texts, ["idle hook", "prompt", "next"]);
+    }
+    #[tokio::test]
+    async fn streaming_input_hook_can_send_without_deadlocking_queue_order() {
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(InputMessageHook))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let mut events = session.subscribe();
+        let driver = async move {
+            while !matches!(events.recv().await.unwrap(), SessionEvent::Request(_)) {}
+            control.steer("queued user").await.unwrap();
+            control.abort();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(session.prompt("prompt"), driver)
+        })
+        .await
+        .expect("input hook deadlocked");
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(
+            session.journal().queued_custom_messages()[0]
+                .1
+                .message
+                .content,
+            crate::ContextContent::Text("streaming hook".into())
+        );
+    }
+
+    struct IdleLifecycleMessages;
+    #[async_trait::async_trait]
+    impl Extension for IdleLifecycleMessages {
+        fn id(&self) -> &str {
+            "idle-lifecycle-messages"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            let (text, delivery) = match event {
+                crate::LifecycleEvent::SessionStart { .. } => {
+                    ("session start", crate::CustomMessageDelivery::Steer)
+                }
+                crate::LifecycleEvent::AgentSettled { .. } => {
+                    ("after settled", crate::CustomMessageDelivery::NextTurn)
+                }
+                _ => return Ok(()),
+            };
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "lifecycle".into(),
+                    content: crate::ContextContent::Text(text.into()),
+                    display: false,
+                    details: None,
+                },
+                delivery,
+            )
+            .await
+        }
+    }
+    #[tokio::test]
+    async fn session_start_and_settled_hooks_deliver_at_idle_boundaries() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(IdleLifecycleMessages))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.prompt("first"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        assert_eq!(session.journal().queued_custom_messages().len(), 1);
+        session.prompt("second").await.unwrap();
+        let texts: Vec<_> = session
+            .messages()
+            .unwrap()
+            .into_iter()
+            .filter_map(|m| {
+                if let Message::User { content } = m {
+                    Some(content)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(texts, ["session start", "first", "second", "after settled"]);
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
     }
 
     struct NestedModel;

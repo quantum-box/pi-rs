@@ -338,6 +338,55 @@ pub(crate) async fn notify_with_host(
     notify_inner(registry, event, states, timeout, observer, Some(host)).await;
 }
 
+pub(crate) async fn notify_idle_with_host(
+    registry: &Registry,
+    session: &mut Session,
+    event: LifecycleEvent,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+) -> crate::Result<()> {
+    let states = session.extension_states();
+    let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
+    let host = std::sync::Arc::new(crate::agent::LifecycleMessageHost { sender });
+    let mut errors = Vec::new();
+    let mut collect = |event: Notification<'_>| {
+        if let Notification::ExtensionLifecycleError {
+            extension,
+            event,
+            message,
+        } = event
+        {
+            errors.push((extension.to_owned(), event, message.to_owned()));
+        }
+    };
+    {
+        let future = notify_with_host(registry, event, &states, timeout, &mut collect, host);
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                Some((input, reply)) = incoming.recv() => {
+                    let result = if input.delivery == crate::CustomMessageDelivery::NextTurn {
+                        crate::agent::queue_custom_message(session, input, observer)
+                    } else {
+                        session.append_custom_message(input.message).map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
+                    };
+                    match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+                }
+                _ = &mut future => break,
+            }
+        }
+    }
+    for (extension, event, message) in &errors {
+        observer(Notification::ExtensionLifecycleError {
+            extension,
+            event,
+            message,
+        });
+    }
+    Ok(())
+}
+
 async fn notify_inner(
     registry: &Registry,
     event: LifecycleEvent,

@@ -344,31 +344,39 @@ impl Agent<'_> {
                         || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)
                 })
             });
-            self.observe_lifecycle(
-                crate::LifecycleEvent::AgentEnd {
-                    session_id: session.session_id(),
-                    run_id,
-                    state,
-                    messages,
-                },
-                &session.extension_states(),
-                None,
-                observer,
-            )
-            .await;
+            let end = crate::LifecycleEvent::AgentEnd {
+                session_id: session.session_id(),
+                run_id,
+                state,
+                messages,
+            };
+            if ensure_settled(session.operations()).is_ok() {
+                crate::lifecycle::notify_idle_with_host(
+                    self.registry,
+                    session,
+                    end,
+                    self.limits.model_timeout,
+                    observer,
+                )
+                .await?;
+            } else {
+                self.observe_lifecycle(end, &session.extension_states(), None, observer)
+                    .await;
+            }
             if !matches!(
                 state,
                 RunState::WaitingForOperation | RunState::WaitingForReconciliation
             ) {
-                self.observe_lifecycle(
+                crate::lifecycle::notify_idle_with_host(
+                    self.registry,
+                    session,
                     crate::LifecycleEvent::AgentSettled {
                         aborted: matches!(state, RunState::Cancelled),
                     },
-                    &session.extension_states(),
-                    None,
+                    self.limits.model_timeout,
                     observer,
                 )
-                .await;
+                .await?;
             }
         }
         result
@@ -1025,11 +1033,32 @@ impl Agent<'_> {
             max_output_tokens,
         };
         for extension in &self.registry.extensions {
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.before_request(&mut request, purpose, states.get(extension.id()))) =>
-                    result.map_err(|_| Error::Config("request context hook timed out".into()))?,
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host = Arc::new(LifecycleMessageHost { sender });
+            let result = {
+                let future = tokio::time::timeout(
+                    self.limits.model_timeout,
+                    extension.before_request_with_host(
+                        &mut request,
+                        purpose,
+                        states.get(extension.id()),
+                        host,
+                    ),
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((message, reply)) = incoming.recv() => {
+                            match queue_custom_message(session, message, observer) {
+                                Ok(()) => { let _ = reply.send(Ok(())); }
+                                Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                            }
+                        }
+                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                        result = &mut future => break result.map_err(|_| Error::Config("request context hook timed out".into()))?,
+                    }
+                }
             };
             hook(extension.as_ref(), result)?;
         }
@@ -1362,6 +1391,7 @@ impl Agent<'_> {
             states,
             cancel,
             observer,
+            None,
         )
         .await;
     }
@@ -2712,8 +2742,8 @@ fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> 
             (invocation.operation_id == parent).then_some(invocation.call.id)
         })
 }
-struct LifecycleMessageHost {
-    sender: mpsc::Sender<(
+pub(crate) struct LifecycleMessageHost {
+    pub(crate) sender: mpsc::Sender<(
         crate::QueuedCustomMessage,
         oneshot::Sender<std::result::Result<(), String>>,
     )>,

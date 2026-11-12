@@ -321,6 +321,12 @@ struct Description {
     #[serde(default)]
     lifecycle_host_calls: bool,
     #[serde(default)]
+    tool_hook_host_calls: bool,
+    #[serde(default)]
+    request_hook_host_calls: bool,
+    #[serde(default)]
+    input_hook_host_calls: bool,
+    #[serde(default)]
     tool_execution_lifecycle_hook: bool,
     #[serde(default)]
     tool_execution_update_hook: bool,
@@ -548,6 +554,27 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn input_with_host(
+        &self,
+        event: &InputEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<InputAction> {
+        if !self.description.input_hook_host_calls {
+            return self.input(event, state).await;
+        }
+        let request = ProtocolRequest::Input {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     fn handles_user_bash(&self) -> bool {
         self.description.user_bash_hook
@@ -780,6 +807,40 @@ impl Extension for ExecutableExtension {
         *request = updated;
         Ok(())
     }
+    async fn before_request_with_host(
+        &self,
+        request: &mut ModelRequest,
+        purpose: RequestPurpose,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        if !self.description.request_hook_host_calls {
+            return self.before_request(request, purpose, state).await;
+        }
+        let payload = ProtocolRequest::BeforeRequest {
+            request: extension_context(request),
+            summary: matches!(purpose, RequestPurpose::Summary),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let mut updated = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, payload, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        restore_provider_replay(request, &mut updated);
+        restore_legacy_tool_metadata(
+            request,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
+        *request = updated;
+        Ok(())
+    }
     fn handles_context_with_system(&self) -> bool {
         self.description.context_with_system_hook
     }
@@ -928,6 +989,35 @@ impl Extension for ExecutableExtension {
         *arguments = updated;
         Ok(decision.into())
     }
+    async fn tool_call_with_host(
+        &self,
+        name: &str,
+        arguments: &mut Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.tool_hook_host_calls || !self.description.tool_call_hook {
+            return self.tool_call(name, arguments, context, state).await;
+        }
+        let request = ProtocolRequest::ToolCall {
+            name: name.into(),
+            arguments: arguments.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (updated, decision): (Value, DecisionValue) = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        *arguments = updated;
+        Ok(decision.into())
+    }
     fn handles_tool_result(&self) -> bool {
         self.description.tool_result_hook
     }
@@ -984,6 +1074,35 @@ impl Extension for ExecutableExtension {
             }));
         }
         Ok(updated)
+    }
+
+    async fn tool_result_update_with_host(
+        &self,
+        call_data: &pi_rs_core::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<Outcome>> {
+        if !self.description.tool_hook_host_calls || !self.endpoint.text_result_v2 {
+            return self
+                .tool_result_update(call_data, outcome, context, state)
+                .await;
+        }
+        let request = ProtocolRequest::ToolResult {
+            call: call_data.clone(),
+            outcome: outcome.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+            text_result_v2: true,
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
 
     fn after_tool(
@@ -1933,6 +2052,9 @@ async fn dispatch_with_host(
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
             lifecycle_host_calls: true,
+            tool_hook_host_calls: true,
+            request_hook_host_calls: true,
+            input_hook_host_calls: true,
             tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
             tool_execution_update_hook: extension.handles_tool_execution_updates(),
             model_selection_hook: extension.handles_model_selection(),
@@ -1971,7 +2093,15 @@ async fn dispatch_with_host(
             encode(Ok(request))
         }
         ProtocolRequest::Input { event, state } => {
-            encode(extension.input(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .input_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.input(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::UserBash { event, state } => {
             encode(extension.user_bash(&event, state.as_ref()).await)
@@ -2018,9 +2148,15 @@ async fn dispatch_with_host(
             } else {
                 RequestPurpose::Turn
             };
-            extension
-                .before_request(&mut request, purpose, state.as_ref())
-                .await?;
+            if host.supports_custom_messages() {
+                extension
+                    .before_request_with_host(&mut request, purpose, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .before_request(&mut request, purpose, state.as_ref())
+                    .await?;
+            }
             encode(Ok(request))
         }
         ProtocolRequest::ContextWithSystem {
@@ -2069,9 +2205,15 @@ async fn dispatch_with_host(
             state,
         } => {
             let context = context(&operation_id)?;
-            let decision = extension
-                .tool_call(&name, &mut arguments, &context, state.as_ref())
-                .await?;
+            let decision = if host.supports_custom_messages() {
+                extension
+                    .tool_call_with_host(&name, &mut arguments, &context, state.as_ref(), host)
+                    .await?
+            } else {
+                extension
+                    .tool_call(&name, &mut arguments, &context, state.as_ref())
+                    .await?
+            };
             encode(Ok((arguments, DecisionValue::from(decision))))
         }
         ProtocolRequest::BeforeTool {
@@ -2140,18 +2282,25 @@ async fn dispatch_with_host(
             operation_id,
             state,
             text_result_v2,
-        } => encode(
-            extension
-                .tool_result_update(&call, &outcome, &context(&operation_id)?, state.as_ref())
-                .await
-                .map(|result| {
-                    if text_result_v2 {
-                        result
-                    } else {
-                        result.map(|outcome| outcome.legacy_text_result())
-                    }
-                }),
-        ),
+        } => {
+            let context = context(&operation_id)?;
+            let result = if host.supports_custom_messages() {
+                extension
+                    .tool_result_update_with_host(&call, &outcome, &context, state.as_ref(), host)
+                    .await
+            } else {
+                extension
+                    .tool_result_update(&call, &outcome, &context, state.as_ref())
+                    .await
+            };
+            encode(result.map(|result| {
+                if text_result_v2 {
+                    result
+                } else {
+                    result.map(|outcome| outcome.legacy_text_result())
+                }
+            }))
+        }
         ProtocolRequest::BeforeCompaction {
             summary,
             keep_turns,
@@ -2849,6 +2998,113 @@ else:
             )
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_input_request_and_tool_hooks_use_message_channel() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'tool_hook_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
+    assert frame['has_custom_messages']
+    print(json.dumps({'type':'send_message','delivery':'steer','message':{'customType':kind,'content':'hello','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    if kind=='input': result={'action':'continue'}
+    elif kind=='before_request': result=r['request']
+    elif kind=='tool_call': result=[r['arguments'],{'allow':True,'reason':None}]
+    elif kind=='tool_result': result=None
+    else: raise AssertionError(kind)
+    print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let host = Arc::new(Host(std::sync::atomic::AtomicUsize::new(0)));
+        let event = InputEvent {
+            text: "input".into(),
+            images: vec![],
+            source: pi_rs_core::InputSource::Interactive,
+            streaming_behavior: None,
+        };
+        assert!(matches!(
+            extension
+                .input_with_host(&event, None, host.clone())
+                .await
+                .unwrap(),
+            InputAction::Continue
+        ));
+        let mut request = ModelRequest {
+            model: "model".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 64,
+        };
+        extension
+            .before_request_with_host(&mut request, RequestPurpose::Turn, None, host.clone())
+            .await
+            .unwrap();
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let mut args = serde_json::json!({});
+        assert_eq!(
+            extension
+                .tool_call_with_host("tool", &mut args, &context, None, host.clone())
+                .await
+                .unwrap(),
+            Decision::Allow
+        );
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        };
+        assert!(
+            extension
+                .tool_result_update_with_host(
+                    &call,
+                    &Outcome::Succeeded("ok".into()),
+                    &context,
+                    None,
+                    host.clone()
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

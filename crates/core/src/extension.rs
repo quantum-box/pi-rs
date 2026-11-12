@@ -572,6 +572,15 @@ pub trait Extension: Send + Sync {
         Ok(InputAction::Continue)
     }
 
+    async fn input_with_host(
+        &self,
+        event: &InputEvent,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<InputAction> {
+        self.input(event, state).await
+    }
+
     fn handles_user_bash(&self) -> bool {
         false
     }
@@ -736,6 +745,16 @@ pub trait Extension: Send + Sync {
         self.context(request, state)
     }
 
+    async fn before_request_with_host(
+        &self,
+        request: &mut ModelRequest,
+        purpose: RequestPurpose,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        self.before_request(request, purpose, state).await
+    }
+
     /// Opt in to transforming the complete message list after context hooks.
     fn handles_context_with_system(&self) -> bool {
         false
@@ -774,6 +793,17 @@ pub trait Extension: Send + Sync {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<Decision> {
         self.before_tool(name, args, context, state).await
+    }
+
+    async fn tool_call_with_host(
+        &self,
+        name: &str,
+        args: &mut Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        self.tool_call(name, args, context, state).await
     }
 
     /// Opt in to transforming completed tool results before they enter the journal.
@@ -839,6 +869,17 @@ pub trait Extension: Send + Sync {
             Some(patch) => patch.apply(current).map(Some),
             None => Ok(replacement),
         }
+    }
+
+    async fn tool_result_update_with_host(
+        &self,
+        call: &crate::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<Outcome>> {
+        self.tool_result_update(call, outcome, context, state).await
     }
 
     fn after_tool(
@@ -1112,6 +1153,15 @@ impl Registry {
         prepare_input(&self.extensions, event, states).await
     }
 
+    pub(crate) async fn prepare_input_with_host(
+        &self,
+        event: InputEvent,
+        states: &ExtensionStates,
+        host: Arc<dyn ToolHost>,
+    ) -> Result<Option<InputEvent>> {
+        prepare_input_inner(&self.extensions, event, states, Some(host)).await
+    }
+
     pub fn set_refresher(&mut self, refresher: Arc<dyn RegistryRefresher>) {
         self.refresher = Some(refresher);
     }
@@ -1361,14 +1411,40 @@ impl Registry {
 
 pub(crate) async fn prepare_input(
     extensions: &[Arc<dyn Extension>],
+    event: InputEvent,
+    states: &ExtensionStates,
+) -> Result<Option<InputEvent>> {
+    prepare_input_inner(extensions, event, states, None).await
+}
+
+pub(crate) async fn prepare_input_with_host(
+    extensions: &[Arc<dyn Extension>],
+    event: InputEvent,
+    states: &ExtensionStates,
+    host: Arc<dyn ToolHost>,
+) -> Result<Option<InputEvent>> {
+    prepare_input_inner(extensions, event, states, Some(host)).await
+}
+
+async fn prepare_input_inner(
+    extensions: &[Arc<dyn Extension>],
     mut event: InputEvent,
     states: &ExtensionStates,
+    host: Option<Arc<dyn ToolHost>>,
 ) -> Result<Option<InputEvent>> {
     for extension in extensions
         .iter()
         .filter(|extension| extension.handles_input())
     {
-        let action = match extension.input(&event, states.get(extension.id())).await {
+        let response = match &host {
+            Some(host) => {
+                extension
+                    .input_with_host(&event, states.get(extension.id()), host.clone())
+                    .await
+            }
+            None => extension.input(&event, states.get(extension.id())).await,
+        };
+        let action = match response {
             Ok(action) => action,
             Err(error) => {
                 eprintln!("Extension {} (input): {error}", extension.id());
