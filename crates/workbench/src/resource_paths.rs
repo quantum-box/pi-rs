@@ -114,6 +114,12 @@ pub fn resolve(
     if kind.disabled(args) {
         return Ok(paths);
     }
+    // Pi merges enabled prompt resources before additional CLI prompt paths.
+    let additional_prompts = if kind == Kind::Prompt {
+        std::mem::take(&mut paths)
+    } else {
+        Vec::new()
+    };
     let mut layers = args.settings.resource_layers(kind.key())?;
     let project = workspace.join(".pi");
     let project = project.canonicalize().unwrap_or(project);
@@ -221,6 +227,7 @@ pub fn resolve(
             .cloned()
             .collect(),
     );
+    append(&mut paths, additional_prompts);
     Ok(paths)
 }
 // Pi's automatic prompt discovery scans only visible files in the prompt root,

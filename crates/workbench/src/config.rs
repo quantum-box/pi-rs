@@ -708,7 +708,10 @@ mod tests {
             &mut warnings,
         )
         .unwrap();
-        assert_eq!(paths, vec![link]);
+        assert_eq!(
+            paths,
+            vec![project.canonicalize().unwrap().join("prompts/review.md")]
+        );
         args.settings.resource_layers[1].1 = json!({"prompts": ["-prompts/review.md"]});
         let resources = super::super::resources::Resources::load(&args).unwrap();
         assert!(!resources.prompts.contains_key("review"));
@@ -846,6 +849,53 @@ mod tests {
         let resources = super::super::resources::Resources::load(&args).unwrap();
         assert!(!resources.prompts.contains_key("audit"));
         assert!(!resources.prompts.contains_key("review"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovered_prompts_precede_explicit_prompt_files() {
+        use clap::Parser;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        let project = workspace.join(".pi");
+        let prompts = project.join("prompts");
+        let extra = workspace.join("extra");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(prompts.join("review.md"), "discovered $1").unwrap();
+        std::fs::write(extra.join("review.md"), "explicit $1").unwrap();
+        symlink(prompts.join("review.md"), extra.join("audit.md")).unwrap();
+        let mut args = super::super::Cli::try_parse_from(["pi", "--no-skills"]).unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = Settings {
+            value: json!({}),
+            resource_layers: vec![(dir.path().join("agent"), json!({})), (project, json!({}))],
+        };
+        args.prompt_template = vec![extra.join("review.md"), extra.join("audit.md")];
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert_eq!(
+            resources.expand("/review code").as_deref(),
+            Some("discovered code")
+        );
+        assert!(!resources.prompts.contains_key("audit"));
+        assert!(
+            resources
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Duplicate prompt review"))
+        );
+        args.no_prompt_templates = true;
+        let resources = super::super::resources::Resources::load(&args).unwrap();
+        assert_eq!(
+            resources.expand("/review code").as_deref(),
+            Some("explicit code")
+        );
+        assert_eq!(
+            resources.expand("/audit code").as_deref(),
+            Some("discovered code")
+        );
     }
 
     #[test]
