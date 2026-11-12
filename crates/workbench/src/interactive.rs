@@ -2830,7 +2830,7 @@ fn slash(
             if let Some(directory) = next.session.parent() {
                 std::fs::create_dir_all(directory)?;
             }
-            initialize_session(&mut next, false)?;
+            initialize_session(&mut next)?;
             view.restore(&next)?;
             next.session_transition = Some(pi_rs::SessionStartReason::New);
             *args = next;
@@ -6254,10 +6254,10 @@ fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> 
 
 fn prepare_initial_session(args: &mut Cli) -> Result<()> {
     restore_workspace(args)?;
-    initialize_session(args, true)
+    initialize_session(args)
 }
 
-fn initialize_session(args: &mut Cli, restore_selection: bool) -> Result<()> {
+fn initialize_session(args: &mut Cli) -> Result<()> {
     let mut session = Session::open(&args.session)?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
@@ -6270,9 +6270,7 @@ fn initialize_session(args: &mut Cli, restore_selection: bool) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
-    if restore_selection {
-        args.restore_session_model(&session);
-    }
+    args.restore_session_model(&session);
     super::thinking::adjust(args);
     args.record_automatic_model_selection(&mut session)?;
     Ok(())
@@ -6900,7 +6898,7 @@ mod tests {
     }
 
     #[test]
-    fn new_session_keeps_current_model_while_resuming_empty_session_uses_initial_model() {
+    fn new_and_empty_saved_sessions_use_initial_model_and_default_thinking() {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
         let mut args = super::Cli::parse_from(["pi", "--offline"]);
@@ -6910,6 +6908,13 @@ mod tests {
         args.endpoint = "https://example.invalid/v1/chat/completions".into();
         args.endpoint_explicit = true;
         args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        std::fs::create_dir_all(directory.path().join(".pi")).unwrap();
+        std::fs::write(
+            directory.path().join(".pi/settings.json"),
+            r#"{"defaultThinkingLevel":"low"}"#,
+        )
+        .unwrap();
+        args.settings = super::super::config::Settings::load(directory.path(), true).unwrap();
         args.model = "alpha".into();
         args.thinking = Some("low".into());
         args.no_trust = true;
@@ -6924,12 +6929,12 @@ mod tests {
         assert_eq!(args.model, "beta");
         assert_eq!(args.thinking.as_deref(), Some("high"));
         super::slash("/new", &mut args, &mut view, None).unwrap();
-        assert_eq!(args.model, "beta");
-        assert_eq!(args.thinking.as_deref(), Some("high"));
+        assert_eq!(args.model, "alpha");
+        assert_eq!(args.thinking.as_deref(), Some("low"));
         let session = pi_rs::Session::open(&args.session).unwrap();
         assert_eq!(
             session.model_selection(),
-            Some(("beta".into(), Some("high".into())))
+            Some(("alpha".into(), Some("low".into())))
         );
         assert_eq!(session.model_provider(), None);
         drop(session);
