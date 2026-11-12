@@ -286,6 +286,10 @@ impl Cursor {
                     None
                 }
             }
+            Event::SourceEntry { format, .. } if format == "pi-rs:native-model-selection" => {
+                position.imported = None;
+                None
+            }
             Event::CacheWarm {
                 metadata,
                 usage,

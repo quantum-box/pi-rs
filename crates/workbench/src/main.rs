@@ -68,6 +68,8 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside p
 )]
 struct Cli {
     #[arg(skip)]
+    initial_selection: Option<InitialSelection>,
+    #[arg(skip)]
     session_transition: Option<pi_rs::SessionStartReason>,
     #[arg(skip)]
     settings: config::Settings,
@@ -296,6 +298,14 @@ struct Cli {
     /// Initial prompt when no explicit subcommand is used.
     #[arg(value_name = "PROMPT", num_args = 0.., trailing_var_arg = true)]
     prompt: Vec<String>,
+}
+
+#[derive(Clone)]
+struct InitialSelection {
+    provider: Provider,
+    endpoint: String,
+    model: String,
+    thinking: Option<String>,
 }
 
 impl Cli {
@@ -676,8 +686,8 @@ impl Cli {
     }
 
     fn restore_session_model(&mut self, session: &Session) {
-        // The current catalog does not include extension-registered Pi virtual
-        // models. Do not guess whether a previous selection routed a response.
+        // Extension-registered Pi virtual models are absent from this catalog.
+        // Pi treats absent catalog entries as nonvirtual.
         match session_import::branch_selection(session, |_, _| None) {
             session_import::BranchSelection::Native => {
                 if let Some((model, thinking)) = session.model_selection() {
@@ -691,8 +701,31 @@ impl Cli {
             } => {
                 self.restore_model_selection(model, thinking, Some(&provider));
             }
-            session_import::BranchSelection::Unresolved => {}
+            session_import::BranchSelection::Unresolved { thinking } => {
+                if let Some(initial) = &self.initial_selection {
+                    if !self.model_explicit {
+                        self.provider = initial.provider.clone();
+                        self.endpoint = initial.endpoint.clone();
+                        self.model = initial.model.clone();
+                        self.thinking_profile = None;
+                    }
+                    if !self.thinking_explicit {
+                        self.thinking = thinking.or_else(|| initial.thinking.clone());
+                    }
+                } else if !self.thinking_explicit && thinking.is_some() {
+                    self.thinking = thinking;
+                }
+            }
         }
+    }
+
+    fn remember_initial_selection(&mut self) {
+        self.initial_selection = Some(InitialSelection {
+            provider: self.provider.clone(),
+            endpoint: self.endpoint.clone(),
+            model: self.model.clone(),
+            thinking: self.thinking.clone(),
+        });
     }
 }
 
@@ -1151,6 +1184,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     if !args.thinking_explicit {
         args.apply_model_thinking_defaults();
     }
+    args.remember_initial_selection();
 
     if let Some(Command::Package(command)) = args.command.as_ref() {
         return packages::command(&args, command.clone()).await;

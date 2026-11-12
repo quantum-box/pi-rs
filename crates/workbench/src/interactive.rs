@@ -2587,6 +2587,7 @@ fn slash(
             )?;
             drop(session);
             args.session = destination;
+            args.restore_session_model(&Session::open(&args.session)?);
             view.restore(args)?;
             args.session_transition = Some(pi_rs::SessionStartReason::Fork);
             if let Some(input) = input {
@@ -3106,6 +3107,7 @@ fn slash(
                 .map_err(|_| Error::Config("use /checkout <record-id>".into()))?;
             let mut session = Session::open(&args.session)?;
             session.checkout(id)?;
+            args.restore_session_model(&session);
             drop(session);
             view.restore(args)?;
         }
@@ -6497,6 +6499,78 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn imported_branch_checkout_fork_and_switch_restore_selection() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"a","parentId":null,"provider":"ollama","modelId":"model-a"}),
+            json!({"type":"message","id":"u1","parentId":"a","message":{"role":"user","content":"first"}}),
+            json!({"type":"message","id":"b","parentId":"u1","message":{"role":"assistant","provider":"ollama","model":"model-b","content":[]}}),
+            json!({"type":"message","id":"u2","parentId":"b","message":{"role":"user","content":"second"}}),
+        ];
+        std::fs::write(
+            &source,
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let first = imported
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, pi_rs::Event::User { content, .. } if content == "first"))
+            .unwrap()
+            .id;
+        let second = imported
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, pi_rs::Event::User { content, .. } if content == "second"))
+            .unwrap()
+            .id;
+        let session_path = directory.path().join("native.jsonl");
+        imported.export_jsonl(&session_path).unwrap();
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.workspace = directory.path().into();
+        args.session_dir = Some(directory.path().into());
+        args.session = session_path;
+        args.model = "initial".into();
+        args.no_trust = true;
+        args.remember_initial_selection();
+        let mut view = super::View::default();
+        super::slash(&format!("/checkout {second}"), &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "model-b");
+        super::slash(&format!("/checkout {first}"), &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "model-a");
+        super::slash(&format!("/checkout {second}"), &mut args, &mut view, None).unwrap();
+        super::slash(&format!("/fork {first}"), &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "model-a");
+
+        let invalid_source = directory.path().join("invalid-pi.jsonl");
+        let invalid = [
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"t","parentId":null,"thinkingLevel":"high"}),
+            json!({"type":"message","id":"m","parentId":"t","message":{"role":"assistant","model":"missing-provider","content":[]}}),
+        ];
+        std::fs::write(
+            &invalid_source,
+            invalid.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let invalid_session = directory.path().join("invalid-native.jsonl");
+        super::super::session_import::read(&invalid_source)
+            .unwrap()
+            .export_jsonl(&invalid_session)
+            .unwrap();
+        super::switch_session(&mut args, &mut view, invalid_session).unwrap();
+        assert_eq!(args.model, "initial");
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+    }
+
     #[test]
     fn clear_requires_two_presses_within_500_ms_even_when_empty() {
         let mut view = super::View::default();

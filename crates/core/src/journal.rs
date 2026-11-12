@@ -1408,6 +1408,19 @@ impl Session {
                 entry: serde_json::Value::Null,
             })?;
         }
+        // Distinguish a native selection from a conversion appended directly
+        // after a Pi source entry that did not itself produce a selection.
+        if matches!(&event, Event::ModelSelected { .. })
+            && self.records.get(self.head.saturating_sub(1) as usize).is_some_and(|record| {
+                matches!(&record.event, Event::SourceEntry { format, entry }
+                    if format == "pi" && matches!(entry["type"].as_str(), Some("model_change" | "thinking_level_change" | "message")))
+            })
+        {
+            self.append(Event::SourceEntry {
+                format: "pi-rs:native-model-selection".into(),
+                entry: serde_json::Value::Null,
+            })?;
+        }
         let id = self.records.len() as u64 + 1;
         let next_head = match event {
             Event::Checkout { target } => target,

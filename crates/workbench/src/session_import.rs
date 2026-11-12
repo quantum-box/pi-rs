@@ -112,7 +112,9 @@ struct Importer {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum BranchSelection {
     Native,
-    Unresolved,
+    Unresolved {
+        thinking: Option<String>,
+    },
     Selected {
         provider: String,
         model: String,
@@ -122,7 +124,7 @@ pub(super) enum BranchSelection {
 
 /// Resolve Pi source entries only when restoring a branch, with the current catalog.
 /// A native selection made after import takes precedence over the imported history.
-/// The catalog returns whether a selected model is virtual, or None if unknown.
+/// The catalog returns whether a registered model is virtual; None means absent.
 pub(super) fn branch_selection(
     session: &Session,
     catalog: impl Fn(&str, &str) -> Option<bool>,
@@ -145,9 +147,15 @@ pub(super) fn branch_selection(
     for (index, record) in branch.iter().enumerate().rev() {
         if matches!(record.event, Event::ModelSelected { .. }) {
             let imported = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
-                matches!(&parent.event, Event::SourceEntry { format, entry } if format == "pi" &&
-                    (entry["type"] == "model_change" || entry["type"] == "thinking_level_change" ||
-                     (entry["type"] == "message" && entry["message"]["role"] == "assistant")))
+                if record.timestamp != parent.timestamp || record.run_id.is_some() { return false; }
+                let (Event::SourceEntry { format, entry }, Event::ModelSelected { model, provider, thinking }) = (&parent.event, &record.event) else { return false; };
+                if format != "pi" { return false; }
+                match entry["type"].as_str() {
+                    Some("model_change") => entry["modelId"].as_str() == Some(model) && entry["provider"].as_str() == provider.as_deref(),
+                    Some("thinking_level_change") => entry["thinkingLevel"].as_str() == thinking.as_deref() && branch[..index - 1].iter().any(|prior| matches!(&prior.event, Event::SourceEntry { format, entry } if format == "pi" && (entry["type"] == "model_change" || (entry["type"] == "message" && entry["message"]["role"] == "assistant" && entry["message"]["model"].as_str().is_some())))),
+                    Some("message") if entry["message"]["role"] == "assistant" => entry["message"]["model"].as_str() == Some(model) && entry["message"]["provider"].as_str() == provider.as_deref(),
+                    _ => false,
+                }
             });
             if !imported {
                 return BranchSelection::Native;
@@ -185,20 +193,19 @@ pub(super) fn branch_selection(
             let (Some(provider), Some(model)) =
                 (change["provider"].as_str(), change["modelId"].as_str())
             else {
-                return BranchSelection::Unresolved;
+                return BranchSelection::Unresolved { thinking };
             };
             match catalog(provider, model) {
                 Some(true) => {
                     return selected(&change["provider"], &change["modelId"], thinking);
                 }
-                None => return BranchSelection::Unresolved,
-                Some(false) => {}
+                None | Some(false) => {}
             }
         }
         return selected(&message["provider"], &message["model"], thinking);
     }
     if saw_pi {
-        BranchSelection::Unresolved
+        BranchSelection::Unresolved { thinking }
     } else {
         BranchSelection::Native
     }
@@ -214,7 +221,7 @@ fn selected(provider: &Value, model: &Value, thinking: Option<String>) -> Branch
             model: model.into(),
             thinking,
         },
-        _ => BranchSelection::Unresolved,
+        _ => BranchSelection::Unresolved { thinking },
     }
 }
 impl Importer {
@@ -1022,7 +1029,11 @@ mod tests {
         );
         assert_eq!(
             branch_selection(&session, |_, _| None),
-            BranchSelection::Unresolved
+            BranchSelection::Selected {
+                provider: "physical".into(),
+                model: "actual".into(),
+                thinking: Some("high".into())
+            }
         );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("export.jsonl");
@@ -1048,11 +1059,14 @@ mod tests {
             ]).unwrap();
             assert_eq!(
                 branch_selection(&session, |_, _| Some(false)),
-                BranchSelection::Unresolved
+                BranchSelection::Unresolved { thinking: None }
             );
             let mut args = super::super::Cli::parse_from(["pi"]);
             args.model = "initial".into();
             args.provider = super::super::Provider::Google;
+            args.remember_initial_selection();
+            args.model = "previous-session".into();
+            args.provider = super::super::Provider::Ollama;
             args.restore_session_model(&session);
             assert_eq!(args.provider.id(), "google");
             assert_eq!(args.model, "initial");
@@ -1072,6 +1086,89 @@ mod tests {
             branch_selection(&session, |_, _| None),
             BranchSelection::Native
         );
+    }
+    #[test]
+    fn native_selection_after_unconverted_thinking_entry_is_not_imported() {
+        let mut session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"think","parentId":null,"thinkingLevel":"high"}),
+        ]).unwrap();
+        session
+            .select_provider_model(Some("google"), "chosen", Some("low"))
+            .unwrap();
+        assert_eq!(
+            branch_selection(&session, |_, _| None),
+            BranchSelection::Native
+        );
+        let projected = super::super::rpc_entries::Entries::new(&session)
+            .after(None)
+            .unwrap();
+        assert!(
+            projected["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["type"] == "model_change" && entry["modelId"] == "chosen")
+        );
+    }
+    #[test]
+    fn legacy_native_selection_after_unconverted_thinking_is_not_misclassified() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"think","parentId":null,"thinkingLevel":"high"}),
+        ]).unwrap();
+        let mut records = session.records().to_vec();
+        records.push(Record {
+            id: records.len() as u64 + 1,
+            version: 2,
+            parent: Some(session.head()),
+            timestamp: None,
+            run_id: None,
+            event: Event::ModelSelected {
+                model: "native".into(),
+                provider: Some("google".into()),
+                thinking: Some("high".into()),
+            },
+        });
+        let legacy = Session::from_records(records).unwrap();
+        assert_eq!(
+            branch_selection(&legacy, |_, _| None),
+            BranchSelection::Native
+        );
+    }
+    #[test]
+    fn assistant_model_restoration_does_not_duplicate_pi_projection() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"anthropic","modelId":"old"}),
+            json!({"type":"message","id":"a","parentId":"change","message":{"role":"assistant","provider":"anthropic","model":"new","content":[{"type":"toolCall","id":"call","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"result","parentId":"a","message":{"role":"toolResult","toolCallId":"call","toolName":"read","content":[{"type":"text","text":"done"}],"isError":false}}),
+        ]).unwrap();
+        let projected = super::super::rpc_entries::Entries::new(&session)
+            .after(None)
+            .unwrap();
+        let entries = projected["entries"].as_array().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["message"]["role"] == "assistant")
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["message"]["role"] == "toolResult")
+                .count(),
+            1
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let shared = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, directory.path())
+            .unwrap();
+        let path = directory.path().join("shared.jsonl");
+        std::fs::write(&path, shared).unwrap();
+        assert!(read(&path).is_ok());
     }
     #[test]
     fn imports_v1_compaction_index_and_preserves_original_entry() {
