@@ -1325,10 +1325,11 @@ impl Agent<'_> {
                         {
                             let nested = self.nested_tools(session, batch, states, observer, inputs.as_deref_mut());
                             tokio::pin!(nested);
+                            let mut nested_result = None;
                             loop {
                                 tokio::select! {
                                     result = &mut nested => {
-                                        if let Err(error) = result { nested_error.get_or_insert(error); }
+                                        nested_result = Some(result);
                                         break;
                                     },
                                     completed = &mut outcomes, if completed_batch.is_none() => {
@@ -1340,10 +1341,20 @@ impl Agent<'_> {
                                                 progress_errors.push((extension.to_owned(), event, message.to_owned()));
                                             }
                                         };
-                                        self.observe_lifecycle(event, &snapshot, Some(cancel), &mut collect).await;
+                                        let notify = self.observe_lifecycle(event, &snapshot, Some(cancel), &mut collect);
+                                        tokio::pin!(notify);
+                                        loop {
+                                            tokio::select! {
+                                                _ = &mut notify => break,
+                                                result = &mut nested, if nested_result.is_none() => nested_result = Some(result),
+                                                completed = &mut outcomes, if completed_batch.is_none() => completed_batch = Some(completed),
+                                            }
+                                        }
+                                        if nested_result.is_some() { break; }
                                     }
                                 }
                             }
+                            if let Some(Err(error)) = nested_result { nested_error.get_or_insert(error); }
                         }
                         for (extension, event, message) in &progress_errors {
                             observer(Notification::ExtensionLifecycleError { extension, event, message });

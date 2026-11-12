@@ -345,7 +345,6 @@ async fn sibling_progress_is_delivered_while_nested_tool_runs() {
         observed: Arc<tokio::sync::Notify>,
     }
     struct Slow {
-        started: Arc<tokio::sync::Notify>,
         observed: Arc<tokio::sync::Notify>,
     }
     #[async_trait::async_trait]
@@ -396,7 +395,6 @@ async fn sibling_progress_is_delivered_while_nested_tool_runs() {
             }
         }
         async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
-            self.started.notify_one();
             if tokio::time::timeout(Duration::from_secs(5), self.observed.notified())
                 .await
                 .is_err()
@@ -410,6 +408,7 @@ async fn sibling_progress_is_delivered_while_nested_tool_runs() {
         parent: Arc<Parent>,
         slow: Arc<Slow>,
         events: Arc<Mutex<Vec<Value>>>,
+        callback_lock: tokio::sync::Mutex<()>,
     }
     #[async_trait::async_trait]
     impl Extension for Hooks {
@@ -430,6 +429,12 @@ async fn sibling_progress_is_delivered_while_nested_tool_runs() {
             event: &LifecycleEvent,
             _: Option<&ExtensionState>,
         ) -> ExtensionResult<()> {
+            let _guard = self.callback_lock.lock().await;
+            if matches!(event, LifecycleEvent::ToolExecutionStart { tool_name, .. } if tool_name == "slow")
+            {
+                self.parent.started.notify_one();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             if let LifecycleEvent::ToolExecutionUpdate { .. } = event {
                 self.parent.observed.notify_one();
             }
@@ -450,8 +455,9 @@ async fn sibling_progress_is_delivered_while_nested_tool_runs() {
                 started: started.clone(),
                 observed: observed.clone(),
             }),
-            slow: Arc::new(Slow { started, observed }),
+            slow: Arc::new(Slow { observed }),
             events: events.clone(),
+            callback_lock: tokio::sync::Mutex::new(()),
         }))
         .unwrap();
     let model = Script::new(vec![
