@@ -910,6 +910,7 @@ fn markdown_at_depth(
             Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
             Event::Start(Tag::Heading { level, .. }) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                previous_paragraph_end = None;
                 heading = level as usize;
                 if heading >= 3 {
                     let mut prefix =
@@ -921,6 +922,9 @@ fn markdown_at_depth(
             Event::End(TagEnd::Heading(_)) => {
                 heading = 0;
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
+                if lists.is_empty() && !text[range.end..].trim().is_empty() {
+                    lines.push(Line::default());
+                }
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
@@ -1200,6 +1204,21 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markdown_separates_headings_from_following_blocks() {
+        for (source, expected) in [
+            ("# Hello\nworld", vec!["Hello", "", "world"]),
+            ("# Hello\n\nworld", vec!["Hello", "", "world"]),
+            ("# Hello\n## Next", vec!["Hello", "", "Next"]),
+            ("# Hello\n\n", vec!["Hello"]),
+        ] {
+            let rendered: Vec<String> = markdown(source, &Theme::system(), 80)
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            assert_eq!(rendered, expected, "{source:?}");
+        }
+    }
     #[test]
     fn markdown_keeps_blank_lines_between_paragraphs() {
         let theme = Theme::system();
