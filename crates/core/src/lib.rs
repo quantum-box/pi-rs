@@ -27,6 +27,7 @@ pub use sdk::*;
 pub use statistics::{ContextUsage, SessionStats, TokenTotals};
 pub use tokens::{
     ContextUsageEstimate, estimate_message_tokens, estimate_replay_tokens, estimate_request_tokens,
+    fingerprint_model_context,
 };
 pub use tokio_util::sync::CancellationToken;
 pub use tool_arguments::parse_tool_arguments;

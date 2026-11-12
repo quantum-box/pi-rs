@@ -610,6 +610,20 @@ fn wire_request(
 
 #[async_trait::async_trait]
 impl Model for Google {
+    fn context_identity(&self) -> Option<String> {
+        if !self.headers.is_empty() || !self.http_proxies.is_empty() {
+            return None;
+        }
+        pi_rs_core::fingerprint_model_context(&(
+            "google-v1",
+            self.endpoint.as_str(),
+            self.provider.as_ref(),
+            self.replay_scope.as_ref(),
+            self.api_key.as_bytes(),
+            &self.thinking,
+        ))
+    }
+
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         match message {
             Message::Assistant {

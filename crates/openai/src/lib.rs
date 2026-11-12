@@ -26,6 +26,7 @@ pub struct OpenAiResponses {
     provider: String,
     headers: reqwest::header::HeaderMap,
     sampling: BTreeMap<String, Value>,
+    identity_safe_transport: bool,
 }
 
 impl OpenAiResponses {
@@ -43,6 +44,7 @@ impl OpenAiResponses {
         for proxy in proxies {
             builder = builder.proxy(proxy.clone());
         }
+        self.identity_safe_transport = proxies.is_empty();
         self.client = builder
             .build()
             .map_err(|_| Error::Config("could not initialize OpenAI client".into()))?;
@@ -99,6 +101,7 @@ impl OpenAiResponses {
             endpoint,
             token,
             thinking: None,
+            identity_safe_transport: true,
             provider: if plan { "openai-chatgpt" } else { "openai" }.into(),
             headers: reqwest::header::HeaderMap::new(),
             sampling: BTreeMap::new(),
@@ -324,6 +327,20 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    fn context_identity(&self) -> Option<String> {
+        if !self.headers.is_empty() || !self.identity_safe_transport {
+            return None;
+        }
+        pi_rs_core::fingerprint_model_context(&(
+            "openai-responses-v1",
+            self.endpoint.as_str(),
+            &self.provider,
+            &self.token,
+            &self.thinking,
+            &self.sampling,
+        ))
+    }
+
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         match message {
             Message::Assistant {

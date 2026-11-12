@@ -31,6 +31,9 @@ pub(crate) struct BudgetedModel<'a> {
 
 #[async_trait::async_trait]
 impl Model for BudgetedModel<'_> {
+    fn context_identity(&self) -> Option<String> {
+        self.inner.context_identity()
+    }
     fn estimate_message_tokens(
         &self,
         request: &ModelRequest,

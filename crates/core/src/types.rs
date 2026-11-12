@@ -611,6 +611,13 @@ pub type ModelStream = futures_util::stream::BoxStream<'static, Result<ModelEven
 
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
+    /// Stable identity of all configuration affecting the effective request.
+    /// Return None when the adapter cannot prove that identity across requests.
+    /// Implementations must not return credentials or other secrets in plaintext.
+    fn context_identity(&self) -> Option<String> {
+        None
+    }
+
     /// Estimate a message in the form this adapter sends to its provider.
     fn estimate_message_tokens(&self, _request: &ModelRequest, message: &Message) -> u64 {
         crate::estimate_message_tokens(message)

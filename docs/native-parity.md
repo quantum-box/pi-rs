@@ -1744,9 +1744,10 @@ measured baseline is combined with provider-aware estimates of subsequent
 messages and any additional replay content. Request hooks that change the
 model, messages or tools invalidate the measured baseline; that fact is recorded
 with the request so it remains effective after reopening. A fingerprint also
-requires the effective model, system messages and tool schemas to match the
-measured request. Older requests without these markers conservatively use a
-fresh estimate. The estimator remains a
+requires the effective adapter identity, image policy, model, system messages
+and tool schemas to match the measured request. Adapters that cannot prove a
+stable identity, including deferred clients, and older requests without these
+markers conservatively use a fresh estimate. The estimator remains a
 heuristic rather than a provider tokenizer or a strict upper bound.
 
 Tests cover trailing input, edits, compaction, model changes, checkout, reopening,

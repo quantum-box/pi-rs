@@ -288,6 +288,9 @@ impl Script {
 
 #[async_trait::async_trait]
 impl Model for Script {
+    fn context_identity(&self) -> Option<String> {
+        Some("test-script".into())
+    }
     async fn context_window(&self, _: &str) -> Option<u32> {
         u32::try_from(self.context_window.load(Ordering::SeqCst))
             .ok()
@@ -2219,6 +2222,9 @@ async fn measured_baseline_adds_provider_specific_trailing_tool_cost() {
     struct CostlyToolResult(Script);
     #[async_trait::async_trait]
     impl Model for CostlyToolResult {
+        fn context_identity(&self) -> Option<String> {
+            self.0.context_identity()
+        }
         fn estimate_message_tokens(&self, _: &ModelRequest, message: &Message) -> u64 {
             estimate_message_tokens(message)
                 + if matches!(message, Message::Tool { .. }) {
@@ -2272,6 +2278,9 @@ async fn measured_output_covers_replayed_reasoning_without_double_counting() {
     struct ReplayCost(Script);
     #[async_trait::async_trait]
     impl Model for ReplayCost {
+        fn context_identity(&self) -> Option<String> {
+            self.0.context_identity()
+        }
         fn estimate_message_tokens(&self, _: &ModelRequest, message: &Message) -> u64 {
             if matches!(message, Message::Assistant { .. }) {
                 1000
@@ -2394,6 +2403,9 @@ async fn measured_baseline_is_invalidated_by_runtime_catalog_refresh() {
     }
     #[async_trait::async_trait]
     impl Model for DiscoverAfterTool {
+        fn context_identity(&self) -> Option<String> {
+            self.script.context_identity()
+        }
         async fn context_window(&self, _: &str) -> Option<u32> {
             (self.calls.load(Ordering::SeqCst) > 0).then_some(1000)
         }
@@ -2527,6 +2539,85 @@ async fn measured_baseline_requires_matching_configuration_after_reopen() {
             result.is_ok(),
             initial_large && change,
             "initial_large={initial_large}, change={change}, result={result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn measured_baseline_requires_stable_adapter_identity() {
+    struct Adapter<'a> {
+        script: &'a Script,
+        identity: Option<&'static str>,
+        extra: u64,
+    }
+    #[async_trait::async_trait]
+    impl Model for Adapter<'_> {
+        fn context_identity(&self) -> Option<String> {
+            self.identity.map(str::to_owned)
+        }
+        fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+            estimate_request_tokens(request).saturating_add(self.extra)
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.script.stream(request).await
+        }
+    }
+    for (first_id, second_id, first_usage, extra, should_fit) in [
+        (Some("endpoint-a"), Some("endpoint-b"), 3000, 0, true),
+        (Some("endpoint-a"), Some("endpoint-b"), 20, 1500, false),
+        (None, None, 20, 1500, false),
+        (Some("same"), Some("same"), 3000, 0, false),
+    ] {
+        let mut first = answer("reply");
+        if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+            *usage = Some(Usage {
+                input_tokens: first_usage,
+                output_tokens: 8,
+            });
+        }
+        let script = Script::new(vec![first, answer("done")]);
+        let first_model = Adapter {
+            script: &script,
+            identity: first_id,
+            extra: 0,
+        };
+        let second_model = Adapter {
+            script: &script,
+            identity: second_id,
+            extra,
+        };
+        let registry = Registry::default();
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        let mut first_agent = agent(&first_model, &registry);
+        first_agent.limits.output_tokens_per_request = 64;
+        first_agent
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        let mut second_agent = agent(&second_model, &registry);
+        second_agent.limits.output_tokens_per_request = 64;
+        second_agent.limits.context_window = Some(1000);
+        let result = second_agent
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            should_fit,
+            "first={first_id:?}, second={second_id:?}, result={result:?}"
         );
     }
 }

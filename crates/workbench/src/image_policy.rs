@@ -21,6 +21,15 @@ pub(super) struct WorkbenchModel {
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    fn context_identity(&self) -> Option<String> {
+        pi_rs::fingerprint_model_context(&(
+            "workbench-policy-v1",
+            self.client.context_identity()?,
+            self.block_images,
+            self.supports_images,
+        ))
+    }
+
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
         self.client
             .estimate_request_tokens(&self.filtered(request.clone()))
@@ -170,6 +179,41 @@ fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_context_identity_includes_image_policy_and_adapter() {
+        let make = |endpoint: &str, block_images, supports_images| WorkbenchModel {
+            client: Client::Google(pi_rs::google::Google::new(endpoint, "fixture-key").unwrap()),
+            block_images,
+            supports_images,
+            session_affinity: &[],
+            price: None,
+        };
+        let original = make("https://example.com/v1", false, Some(true));
+        let blocked = make("https://example.com/v1", true, Some(true));
+        let nonvision = make("https://example.com/v1", false, Some(false));
+        let other = make("https://other.example.com/v1", false, Some(true));
+        assert!(original.context_identity().is_some());
+        assert_ne!(original.context_identity(), blocked.context_identity());
+        assert_ne!(original.context_identity(), nonvision.context_identity());
+        assert_ne!(original.context_identity(), other.context_identity());
+        let request = ModelRequest {
+            model: "fixture".into(),
+            tools: vec![],
+            max_output_tokens: 1,
+            messages: vec![Message::UserWithImages {
+                content: "look".into(),
+                images: vec![pi_rs::ImageContent {
+                    mime_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+            }],
+        };
+        assert_ne!(
+            original.filtered(request.clone()).messages,
+            blocked.filtered(request).messages
+        );
+    }
 
     #[test]
     fn image_policy_replaces_only_model_visible_image_blocks() {

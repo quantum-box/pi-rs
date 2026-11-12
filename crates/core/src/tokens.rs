@@ -10,6 +10,14 @@ pub struct ContextUsageEstimate {
     pub last_usage_record: Option<u64>,
 }
 
+/// Hash a serializable adapter configuration without persisting its contents.
+pub fn fingerprint_model_context<T: serde::Serialize>(configuration: &T) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    serde_json::to_vec(configuration)
+        .ok()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
 const ESTIMATED_IMAGE_CHARS: u64 = 4800;
 
 fn text_chars(text: &str) -> u64 {

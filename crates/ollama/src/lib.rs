@@ -532,6 +532,24 @@ fn running_context_window(value: &Value, model: &str) -> Option<u32> {
 
 #[async_trait::async_trait]
 impl Model for Ollama {
+    fn context_identity(&self) -> Option<String> {
+        if !self.headers.is_empty() || !self.http_proxies.is_empty() {
+            return None;
+        }
+        pi_rs_core::fingerprint_model_context(&(
+            "chat-completions-v1",
+            self.endpoint.as_str(),
+            &self.token,
+            format!("{:?}", self.compatibility),
+            self.supports_reasoning,
+            self.reasoning_enabled,
+            self.allow_reasoning_off,
+            &self.reasoning_effort,
+            &self.sampling,
+            self.cache_retention.anthropic_control(),
+        ))
+    }
+
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         let base = pi_rs_core::estimate_message_tokens(message);
         if matches!(message, Message::Assistant { .. }) {

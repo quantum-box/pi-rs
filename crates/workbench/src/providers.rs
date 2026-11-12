@@ -646,6 +646,17 @@ impl Client {
 
 #[async_trait::async_trait]
 impl Model for Client {
+    fn context_identity(&self) -> Option<String> {
+        match self {
+            Self::Ollama(c) => c.context_identity(),
+            Self::Anthropic(c) => c.context_identity(),
+            Self::Google(c) => c.context_identity(),
+            Self::PiMessages(c) => c.context_identity(),
+            Self::OpenAi(c) => c.context_identity(),
+            Self::Deferred(_) => None,
+        }
+    }
+
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &pi_rs::Message) -> u64 {
         match self {
             Self::Ollama(c) => c.estimate_message_tokens(request, message),
