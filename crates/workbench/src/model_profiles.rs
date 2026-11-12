@@ -1,5 +1,5 @@
 //! User-level connection profiles for the installed provider adapters.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
 use pi_rs::ollama::ChatCompatibility;
@@ -25,6 +25,7 @@ pub(super) struct Profiles {
 struct Profile {
     provider: Provider,
     endpoint: String,
+    provider_endpoints: BTreeSet<String>,
     api_key: Option<String>,
     headers: BTreeMap<String, String>,
     auth_header: bool,
@@ -638,7 +639,9 @@ impl Profiles {
                     })
                 })
             {
+                profile.provider_endpoints.remove(&profile.endpoint);
                 profile.endpoint.clone_from(&endpoint);
+                profile.provider_endpoints.insert(endpoint.clone());
             }
             profiles.radius_endpoint = Some(endpoint);
         }
@@ -705,6 +708,7 @@ impl Profiles {
                 || Ok(provider.default_endpoint().to_owned()),
                 |base| endpoint_from_base(&provider, provider.adapter(), base),
             )?;
+            let mut provider_endpoints = BTreeSet::from([endpoint.clone()]);
             profile
                 .models
                 .retain(|model| model.kind.as_deref().is_none_or(|kind| kind == "chat"));
@@ -728,6 +732,9 @@ impl Profiles {
                         ))
                     })?,
                 };
+                if let Some(base) = profile.base_url.as_deref() {
+                    provider_endpoints.insert(endpoint_from_base(&provider, adapter, base)?);
+                }
                 if let Some(base) = model.base_url.as_deref().or_else(|| {
                     profile
                         .base_url
@@ -780,6 +787,9 @@ impl Profiles {
                         || Ok(official.to_owned()),
                         |base| endpoint_from_base(&provider, adapter, base),
                     )?;
+                    if profile.base_url.is_some() {
+                        provider_endpoints.insert(endpoint.clone());
+                    }
                     model_endpoints.insert(model.id.clone(), endpoint);
                 }
             }
@@ -801,6 +811,7 @@ impl Profiles {
                     Profile {
                         provider,
                         endpoint,
+                        provider_endpoints,
                         api_key: profile.api_key,
                         headers: validate_headers(profile.headers)?,
                         auth_header: profile.auth_header,
@@ -889,7 +900,7 @@ impl Profiles {
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<Credential> {
         let profile = self.entries.get(provider.id())?;
-        if profile.endpoint != endpoint {
+        if !profile.provider_endpoints.contains(endpoint) {
             return None;
         }
         Credential::configured(profile.api_key.as_deref()?)
@@ -898,7 +909,7 @@ impl Profiles {
     pub fn has_provider_endpoint(&self, provider: &Provider, endpoint: &str) -> bool {
         self.entries
             .get(provider.id())
-            .is_some_and(|profile| profile.endpoint == endpoint)
+            .is_some_and(|profile| profile.provider_endpoints.contains(endpoint))
     }
 
     pub fn header_settings(
@@ -1704,6 +1715,94 @@ mod tests {
                 Some("explicit-key")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn provider_base_derived_api_routes_share_credentials_and_environment() {
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = Profiles::parse(&json!({"providers":{"relay":{
+            "baseUrl":"https://relay.example/v1", "apiKey":"profile-key",
+            "headers":{"X-Secret":"$PI_RS_DERIVED_ROUTE_SECRET_4C87"},
+            "models":[
+                {"id":"chat", "api":"openai-completions"},
+                {"id":"messages", "api":"anthropic-messages"},
+                {"id":"other", "api":"anthropic-messages", "baseUrl":"https://other.example/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        let chat = args.model_profiles.endpoint(&provider).to_owned();
+        let messages = args
+            .model_profiles
+            .model_endpoint(&provider, "messages")
+            .unwrap()
+            .to_owned();
+        let other = args
+            .model_profiles
+            .model_endpoint(&provider, "other")
+            .unwrap()
+            .to_owned();
+        assert_eq!(chat, "https://relay.example/v1/chat/completions");
+        assert_eq!(messages, "https://relay.example/v1/messages");
+        for endpoint in [&chat, &messages] {
+            assert_eq!(
+                args.configured_model_credential(&provider, endpoint)
+                    .unwrap()
+                    .literal(),
+                Some("profile-key")
+            );
+        }
+        assert!(
+            args.configured_model_credential(&provider, &other)
+                .is_none()
+        );
+
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({"relay":{
+            "type":"api_key", "key":"saved-key", "env":{"PI_RS_DERIVED_ROUTE_SECRET_4C87":"saved-header"}
+        }}));
+        for (model, endpoint) in [("chat", &chat), ("messages", &messages)] {
+            assert_eq!(
+                args.configured_model_credential(&provider, endpoint)
+                    .unwrap()
+                    .literal(),
+                Some("saved-key")
+            );
+            let headers = args
+                .model_profiles
+                .header_settings(&provider, endpoint, Some(model))
+                .with_environment(args.model_keys.environment(
+                    &provider,
+                    endpoint,
+                    &args.model_profiles,
+                ));
+            assert_eq!(
+                headers
+                    .static_headers(&provider, Some("saved-key"))
+                    .unwrap()["x-secret"],
+                "saved-header"
+            );
+            assert_eq!(
+                headers.resolve(&provider, Some("saved-key")).await.unwrap()["x-secret"],
+                "saved-header"
+            );
+        }
+        assert!(
+            args.configured_model_credential(&provider, &other)
+                .is_none()
+        );
+        assert!(
+            args.model_keys
+                .environment(&provider, &other, &args.model_profiles)
+                .is_none()
+        );
+        let headers = args
+            .model_profiles
+            .header_settings(&provider, &other, Some("other"))
+            .with_environment(
+                args.model_keys
+                    .environment(&provider, &other, &args.model_profiles),
+            );
+        assert!(headers.static_headers(&provider, None).is_err());
     }
 
     #[test]
