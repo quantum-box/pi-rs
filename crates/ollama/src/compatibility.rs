@@ -13,7 +13,35 @@ pub struct ChatCompatibility {
     pub(super) requires_reasoning_content_on_assistant_messages: Option<bool>,
     max_tokens_field: Option<MaxTokensField>,
     thinking_format: Option<ThinkingFormat>,
+    chat_template_args: Option<serde_json::Map<String, Value>>,
     zai_tool_stream: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseten_template_tracks_reasoning_and_mapped_effort() {
+        let compat: ChatCompatibility = serde_json::from_value(json!({
+            "thinkingFormat":"baseten",
+            "supportsReasoningEffort":true,
+            "chatTemplateArgs":{"enable_thinking":{"$var":"thinking.enabled"}}
+        }))
+        .unwrap();
+        let mut enabled = json!({});
+        compat.reasoning_options(&mut enabled, Some(true), true, Some("high"), true);
+        assert_eq!(
+            enabled,
+            json!({"chat_template_args":{"enable_thinking":true},"reasoning_effort":"high"})
+        );
+        let mut disabled = json!({});
+        compat.reasoning_options(&mut disabled, Some(true), false, Some("none"), true);
+        assert_eq!(
+            disabled,
+            json!({"chat_template_args":{"enable_thinking":false},"reasoning_effort":"none"})
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -34,6 +62,7 @@ enum ThinkingFormat {
     Qwen,
     QwenChatTemplate,
     Together,
+    Baseten,
     StringThinking,
     #[serde(other)]
     Other,
@@ -59,6 +88,7 @@ impl ChatCompatibility {
                 .or(self.requires_reasoning_content_on_assistant_messages),
             max_tokens_field: model.max_tokens_field.or(self.max_tokens_field),
             thinking_format: model.thinking_format.or(self.thinking_format),
+            chat_template_args: model.chat_template_args.or(self.chat_template_args),
             zai_tool_stream: model.zai_tool_stream.or(self.zai_tool_stream),
         }
     }
@@ -126,6 +156,38 @@ impl ChatCompatibility {
                 return;
             }
             Some(ThinkingFormat::Together) => body["reasoning"] = json!({"enabled":enabled}),
+            Some(ThinkingFormat::Baseten) => {
+                if let Some(template) = &self.chat_template_args {
+                    let mut values = serde_json::Map::new();
+                    for (key, value) in template {
+                        let resolved = match value.as_object() {
+                            Some(spec)
+                                if !enabled && spec.get("omitWhenOff") == Some(&json!(true)) =>
+                            {
+                                None
+                            }
+                            Some(spec) if spec.get("$var") == Some(&json!("thinking.enabled")) => {
+                                Some(json!(enabled))
+                            }
+                            Some(spec) if spec.get("$var") == Some(&json!("thinking.effort")) => {
+                                effort.map(|level| json!(level))
+                            }
+                            Some(_) => None,
+                            None => Some(value.clone()),
+                        };
+                        if let Some(value) = resolved {
+                            values.insert(key.clone(), value);
+                        }
+                    }
+                    if !values.is_empty() {
+                        body["chat_template_args"] = Value::Object(values);
+                    }
+                }
+                if support_effort && let Some(level) = effort {
+                    body["reasoning_effort"] = json!(level);
+                }
+                return;
+            }
             Some(ThinkingFormat::StringThinking) => {
                 if enabled || allow_off {
                     body["thinking"] = json!(effective);

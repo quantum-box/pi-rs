@@ -888,7 +888,15 @@ impl Profiles {
                     .and_then(|id| profile.model_endpoints.get(id))
                     .is_some_and(|value| value == endpoint)
         }) else {
-            return RequestHeaders::default();
+            let values = builtin_chat::find(provider.id())
+                .filter(|builtin| builtin.is_official_endpoint(endpoint))
+                .and_then(|_| BUILTIN_MODELS.get(provider.id()))
+                .and_then(|models| models.iter().find(|item| Some(item.id.as_str()) == model))
+                .map_or_else(BTreeMap::new, |item| item.metadata.headers.clone());
+            return RequestHeaders {
+                values,
+                ..RequestHeaders::default()
+            };
         };
         let mut configured = profile.headers.clone();
         if let Some(metadata) = model.and_then(|id| self.model(provider, id)) {
@@ -1184,6 +1192,63 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+
+    #[test]
+    fn baseten_and_nvidia_builtin_models_keep_capabilities_and_headers() {
+        let profiles = Profiles::parse(&json!({})).unwrap();
+        let baseten = profiles.provider("baseten").unwrap();
+        let nvidia = profiles.provider("nvidia").unwrap();
+        assert_eq!(profiles.model_ids(&baseten).len(), 14);
+        assert_eq!(profiles.model_ids(&nvidia).len(), 21);
+        let model = profiles.model(&baseten, "zai-org/GLM-5.2").unwrap();
+        assert_eq!(model.reasoning, Some(true));
+        assert_eq!(
+            model.thinking_level_map.get("high").unwrap().as_deref(),
+            Some("high")
+        );
+        let endpoint = profiles.endpoint(&nvidia);
+        let headers = profiles
+            .request_headers(
+                &nvidia,
+                endpoint,
+                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("fixture"),
+            )
+            .unwrap();
+        assert_eq!(headers["nvcf-poll-seconds"], "3600");
+        let untrusted = profiles
+            .request_headers(
+                &nvidia,
+                "https://relay.example/v1/chat/completions",
+                Some("deepseek-ai/deepseek-v4.1-flash"),
+                None,
+            )
+            .unwrap();
+        assert!(untrusted.get("nvcf-poll-seconds").is_none());
+        let configured = Profiles::parse(&json!({"providers":{"nvidia":{
+            "baseUrl":"https://relay.example/v1",
+            "modelOverrides":{"deepseek-ai/deepseek-v4.1-flash":{"headers":{"X-Relay-Secret":"private"}}}
+        }}})).unwrap();
+        let official = configured
+            .request_headers(
+                &nvidia,
+                endpoint,
+                Some("deepseek-ai/deepseek-v4.1-flash"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(official["nvcf-poll-seconds"], "3600");
+        assert!(official.get("x-relay-secret").is_none());
+        let relay = configured
+            .request_headers(
+                &nvidia,
+                "https://relay.example/v1/chat/completions",
+                Some("deepseek-ai/deepseek-v4.1-flash"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(relay["x-relay-secret"], "private");
+    }
 
     #[test]
     fn custom_profiles_can_declare_apis_only_on_their_models() {
