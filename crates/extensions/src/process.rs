@@ -1756,7 +1756,7 @@ mod tests {
                     arguments: "{}".into(),
                 },
                 outcome: Outcome::Succeeded("original".into()),
-                operation_id: uuid::Uuid::new_v4().to_string(),
+                operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
             },
         )
