@@ -324,9 +324,11 @@ advertise this capability with `tool_execution_lifecycle_hook`. A tool using
 ephemeral update events during execution. Progress is limited to 1 MiB per
 update and is not journaled. The bounded progress queue returns an error when
 full so a slow observer cannot indefinitely block a tool. The v2 executable protocol negotiates support;
-new executables work with old hosts, where progress is ignored. Parallel calls
-currently emit end notifications in journal order after the batch settles;
-completion-order notifications and progress from built-in tools remain open.
+new executables work with old hosts, where progress is ignored. The built-in
+shell tool publishes bounded cumulative output snapshots while it runs; slow
+observers can receive coalesced updates. Parallel calls currently emit end
+notifications in journal order after the batch settles; completion-order
+notifications and progress from other built-in tools remain open.
 Observers opt into updates separately with `handles_tool_execution_updates`
 (`tool_execution_update_hook` for executable extensions), so older observers
 continue to receive only event types they understand.
