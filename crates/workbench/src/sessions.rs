@@ -327,12 +327,14 @@ pub fn html(session: &Session) -> String {
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\"><title>{title}</title><style>body{{max-width:960px;margin:40px auto;padding:0 20px;font:16px system-ui;background:#16181d;color:#e4e6eb}}article,details{{padding:16px;margin:12px 0;border-radius:8px;background:#252932}}.user{{background:#243448}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}}summary{{cursor:pointer}}.thinking{{color:#a5abb6}}h1{{font-size:24px}}</style><h1>{title}</h1>"
     );
     let mut imported_assistant = None;
-    let mut imported_custom_entry = false;
+    let mut imported_legacy_custom = false;
     let mut has_system_prompt = false;
     for record in session.branch() {
         match &record.event {
             Event::SourceEntry { format, entry } => {
-                imported_custom_entry = format == "pi" && entry["type"] == "custom_message";
+                imported_legacy_custom = format == "pi"
+                    && entry["type"] == "message"
+                    && entry["message"]["role"] == "custom";
                 imported_assistant = (format == "pi"
                     && entry["type"] == "message"
                     && entry["message"]["role"] == "assistant")
@@ -344,8 +346,8 @@ pub fn html(session: &Session) -> String {
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
             Event::CustomMessage { message } => {
-                let show = message.display || imported_custom_entry;
-                imported_custom_entry = false;
+                let show = message.display || !imported_legacy_custom;
+                imported_legacy_custom = false;
                 if !show {
                     continue;
                 }
@@ -1254,6 +1256,29 @@ mod tests {
         assert!(document.contains("<b>visible</b>"));
         assert_eq!(document.matches("Hidden in terminal").count(), 1);
         assert!(!document.contains("private role"));
+    }
+
+    #[test]
+    fn html_exports_native_hidden_custom_messages() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        for (custom_type, content, display) in [
+            ("<native>", "hidden **native**", false),
+            ("visible", "visible native", true),
+        ] {
+            session
+                .append_custom_message(pi_rs::CustomMessage {
+                    custom_type: custom_type.into(),
+                    content: pi_rs::ContextContent::Text(content.into()),
+                    display,
+                    details: None,
+                })
+                .unwrap();
+        }
+        let document = html(&session);
+        assert!(document.contains("<b>&lt;native&gt;</b> <span>Hidden in terminal</span>"));
+        assert!(document.contains("hidden <strong>native</strong>"));
+        assert!(document.contains("visible native"));
+        assert_eq!(document.matches("Hidden in terminal").count(), 1);
     }
 
     #[test]
