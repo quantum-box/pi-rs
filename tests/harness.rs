@@ -1941,6 +1941,1160 @@ async fn durable_queue_distinguishes_followups_and_deduplicates_deliveries() {
     );
 }
 
+// The second request is sent only after the first nested read has started. This
+// exercises requests that cannot be coalesced by the dispatcher's initial drain.
+#[tokio::test]
+async fn late_nested_parallel_reads_overlap_and_are_journaled() {
+    struct Parent(Arc<tokio::sync::Notify>);
+    struct Read(Arc<tokio::sync::Notify>, tokio::sync::Barrier);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let first = host.call("late_read", json!({"id":1}));
+            let second = async {
+                self.0.notified().await;
+                host.call("late_read", json!({"id":2})).await
+            };
+            let (first, second) = tokio::join!(first, second);
+            assert_eq!(first, Outcome::Succeeded("1".into()));
+            assert_eq!(second, Outcome::Succeeded("2".into()));
+            Outcome::Succeeded("both".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Read {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "late_read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+            if args["id"] == 1 {
+                self.0.notify_one();
+            }
+            self.1.wait().await;
+            if args["id"] == 1 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Outcome::Succeeded(args["id"].to_string())
+        }
+    }
+    struct Fixture(Arc<tokio::sync::Notify>);
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "late-reads"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone())),
+                Arc::new(Read(self.0.clone(), tokio::sync::Barrier::new(2))),
+            ]
+        }
+    }
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(Arc::new(tokio::sync::Notify::new()))))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("read".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("late parallel read did not start")
+    .unwrap();
+    let nested: Vec<_> = session
+        .records()
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ToolPlanned { invocation, .. } if invocation.call.name == "late_read" => {
+                Some(invocation.operation_id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nested.len(), 2);
+    let finished: Vec<_> = session
+        .records()
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Succeeded(_),
+                ..
+            } if nested.contains(operation_id) => Some(*operation_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finished, nested,
+        "parallel read results must be committed in call order"
+    );
+}
+
+#[tokio::test]
+async fn late_nested_reads_overlap_while_read_dispatches_child() {
+    struct Parent(Arc<tokio::sync::Notify>);
+    struct Read(Arc<tokio::sync::Barrier>);
+    struct Child(Arc<tokio::sync::Notify>, Arc<tokio::sync::Barrier>);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let first = host.call("late_read", json!({"id":1}));
+            let second = async {
+                self.0.notified().await;
+                host.call("late_read", json!({"id":2})).await
+            };
+            let (first, second) = tokio::join!(first, second);
+            assert_eq!(first, Outcome::Succeeded("1".into()));
+            assert_eq!(second, Outcome::Succeeded("2".into()));
+            Outcome::Succeeded("both".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Read {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "late_read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            args: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            if args["id"] == 1 {
+                return host.call("child_read", json!({})).await;
+            }
+            self.0.wait().await;
+            Outcome::Succeeded("2".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Child {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "child_read".into(),
+                description: "child".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.0.notify_one();
+            self.1.wait().await;
+            Outcome::Succeeded("1".into())
+        }
+    }
+    struct Fixture(Arc<tokio::sync::Notify>);
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "late-reads"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            vec![
+                Arc::new(Parent(self.0.clone())),
+                Arc::new(Read(barrier.clone())),
+                Arc::new(Child(self.0.clone(), barrier)),
+            ]
+        }
+    }
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(Arc::new(tokio::sync::Notify::new()))))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("read".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("late parallel read did not start")
+    .unwrap();
+    let nested: Vec<_> = session
+        .records()
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ToolPlanned { invocation, .. } if invocation.call.name == "late_read" => {
+                Some(invocation.operation_id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nested.len(), 2);
+    let finished: Vec<_> = session
+        .records()
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Succeeded(_),
+                ..
+            } if nested.contains(operation_id) => Some(*operation_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finished, nested,
+        "nested parallel reads must commit in call order"
+    );
+}
+
+#[tokio::test]
+async fn late_nested_writes_remain_barriers() {
+    struct Parent(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<Mutex<Vec<String>>>,
+    );
+    struct Read(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<Mutex<Vec<String>>>,
+    );
+    struct Write(Arc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let first = host.call("ordered_read", json!({"id":"first"}));
+            let later = async {
+                self.0.notified().await;
+                let calls = host.call_batch(vec![
+                    ("ordered_write".into(), json!({})),
+                    ("ordered_read".into(), json!({"id":"last"})),
+                ]);
+                let release = async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    assert_eq!(*self.2.lock().unwrap(), vec!["first:start"]);
+                    self.1.notify_one();
+                };
+                let (results, ()) = tokio::join!(calls, release);
+                assert!(
+                    results
+                        .iter()
+                        .all(|outcome| matches!(outcome, Outcome::Succeeded(_)))
+                );
+            };
+            let (result, ()) = tokio::join!(first, later);
+            assert!(matches!(result, Outcome::Succeeded(_)));
+            Outcome::Succeeded("done".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Read {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ordered_read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+            let id = args["id"].as_str().unwrap();
+            self.2.lock().unwrap().push(format!("{id}:start"));
+            if id == "first" {
+                self.0.notify_one();
+                self.1.notified().await;
+            }
+            self.2.lock().unwrap().push(format!("{id}:end"));
+            Outcome::Succeeded(id.into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Write {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ordered_write".into(),
+                description: "write".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.0.lock().unwrap().push("write".into());
+            Outcome::Succeeded("written".into())
+        }
+    }
+    struct Fixture(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<Mutex<Vec<String>>>,
+    );
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "nested-order"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone(), self.1.clone(), self.2.clone())),
+                Arc::new(Read(self.0.clone(), self.1.clone(), self.2.clone())),
+                Arc::new(Write(self.2.clone())),
+            ]
+        }
+    }
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+            events.clone(),
+        )))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("order".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("barrier stalled")
+    .unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "first:start",
+            "first:end",
+            "write",
+            "last:start",
+            "last:end"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn late_writes_remain_barriers_while_read_dispatches_child() {
+    struct Parent(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<Mutex<Vec<String>>>,
+    );
+    struct Read(Arc<Mutex<Vec<String>>>);
+    struct Write(Arc<Mutex<Vec<String>>>);
+    struct Child(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let first = host.call("ordered_read", json!({"id":"first"}));
+            let later = async {
+                self.0.notified().await;
+                let calls = host.call_batch(vec![
+                    ("ordered_write".into(), json!({})),
+                    ("ordered_read".into(), json!({"id":"last"})),
+                ]);
+                let release = async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    assert_eq!(*self.2.lock().unwrap(), vec!["first:start"]);
+                    self.1.notify_one();
+                };
+                let (results, ()) = tokio::join!(calls, release);
+                assert!(
+                    results
+                        .iter()
+                        .all(|outcome| matches!(outcome, Outcome::Succeeded(_)))
+                );
+            };
+            let (result, ()) = tokio::join!(first, later);
+            assert!(matches!(result, Outcome::Succeeded(_)));
+            Outcome::Succeeded("done".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Read {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ordered_read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            args: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let id = args["id"].as_str().unwrap();
+            self.0.lock().unwrap().push(format!("{id}:start"));
+            if id == "first" {
+                assert!(matches!(
+                    host.call("ordered_child", json!({})).await,
+                    Outcome::Succeeded(_)
+                ));
+            }
+            self.0.lock().unwrap().push(format!("{id}:end"));
+            Outcome::Succeeded(id.into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Child {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ordered_child".into(),
+                description: "child".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.0.notify_one();
+            self.1.notified().await;
+            Outcome::Succeeded("child".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Write {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ordered_write".into(),
+                description: "write".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.0.lock().unwrap().push("write".into());
+            Outcome::Succeeded("written".into())
+        }
+    }
+    struct Fixture(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<Mutex<Vec<String>>>,
+    );
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "nested-order"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone(), self.1.clone(), self.2.clone())),
+                Arc::new(Read(self.2.clone())),
+                Arc::new(Write(self.2.clone())),
+                Arc::new(Child(self.0.clone(), self.1.clone())),
+            ]
+        }
+    }
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+            events.clone(),
+        )))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("order".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("barrier stalled")
+    .unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "first:start",
+            "first:end",
+            "write",
+            "last:start",
+            "last:end"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn nested_write_blocks_late_ancestor_read() {
+    struct Parent(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<Mutex<Vec<String>>>,
+    );
+    struct Read(Arc<Mutex<Vec<String>>>);
+    struct Write(Arc<Mutex<Vec<String>>>);
+    struct Child(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let first = host.call("ordered_read", json!({"id":"first"}));
+            let later = async {
+                self.0.notified().await;
+                let calls = host.call_batch(vec![("ordered_read".into(), json!({"id":"last"}))]);
+                let release = async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    assert_eq!(*self.2.lock().unwrap(), vec!["first:start"]);
+                    self.1.notify_one();
+                };
+                let (results, ()) = tokio::join!(calls, release);
+                assert!(
+                    results
+                        .iter()
+                        .all(|outcome| matches!(outcome, Outcome::Succeeded(_)))
+                );
+            };
+            let (result, ()) = tokio::join!(first, later);
+            assert!(matches!(result, Outcome::Succeeded(_)));
+            Outcome::Succeeded("done".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Read {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ordered_read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            args: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let id = args["id"].as_str().unwrap();
+            self.0.lock().unwrap().push(format!("{id}:start"));
+            if id == "first" {
+                assert!(matches!(
+                    host.call("ordered_child", json!({})).await,
+                    Outcome::Succeeded(_)
+                ));
+            }
+            self.0.lock().unwrap().push(format!("{id}:end"));
+            Outcome::Succeeded(id.into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Child {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ordered_child".into(),
+                description: "child".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.0.notify_one();
+            self.1.notified().await;
+            Outcome::Succeeded("child".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Write {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ordered_write".into(),
+                description: "write".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.0.lock().unwrap().push("write".into());
+            Outcome::Succeeded("written".into())
+        }
+    }
+    struct Fixture(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<Mutex<Vec<String>>>,
+    );
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "nested-order"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone(), self.1.clone(), self.2.clone())),
+                Arc::new(Read(self.2.clone())),
+                Arc::new(Write(self.2.clone())),
+                Arc::new(Child(self.0.clone(), self.1.clone())),
+            ]
+        }
+    }
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+            events.clone(),
+        )))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("order".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("barrier stalled")
+    .unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["first:start", "first:end", "last:start", "last:end"]
+    );
+}
+
+#[tokio::test]
+async fn cancellation_settles_late_nested_parallel_reads() {
+    struct Parent(Arc<tokio::sync::Notify>);
+    struct Read(Arc<tokio::sync::Notify>, CancellationToken);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let first = host.call("cancel_read", json!({"id":1}));
+            let second = async {
+                self.0.notified().await;
+                host.call("cancel_read", json!({"id":2})).await
+            };
+            let _ = tokio::join!(first, second);
+            Outcome::Succeeded("unexpected".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Read {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "cancel_read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, args: Value, _: ToolContext) -> Outcome {
+            if args["id"] == 1 {
+                self.0.notify_one();
+            } else {
+                self.1.cancel();
+            }
+            std::future::pending().await
+        }
+    }
+    struct Fixture(Arc<tokio::sync::Notify>, CancellationToken);
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "cancel-nested"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone())),
+                Arc::new(Read(self.0.clone(), self.1.clone())),
+            ]
+        }
+    }
+    let cancel = CancellationToken::new();
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Notify::new()),
+            cancel.clone(),
+        )))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"])]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("cancel".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("cancel did not settle");
+    assert!(result.is_err());
+    let nested: Vec<_> = session
+        .operations()
+        .into_iter()
+        .filter(|(invocation, _)| invocation.call.name == "cancel_read")
+        .collect();
+    assert_eq!(nested.len(), 2);
+    assert!(
+        nested
+            .iter()
+            .all(|(_, state)| matches!(state, OperationState::Finished(Outcome::Unknown(_))))
+    );
+}
+
+#[tokio::test]
+async fn nested_parallel_reads_are_limited_to_eight() {
+    struct Parent(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Semaphore>,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Notify>,
+    );
+    struct Read(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Semaphore>,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Notify>,
+    );
+    struct Child(Read);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let first = host.call("bounded_read", json!({"id":0}));
+            let later = async {
+                self.3.notified().await;
+                let calls = (1..9)
+                    .map(|id| ("bounded_read".into(), json!({"id":id})))
+                    .collect();
+                host.call_batch(calls).await
+            };
+            let release = async {
+                self.0.notified().await;
+                assert_eq!(self.2.load(Ordering::SeqCst), 8);
+                tokio::task::yield_now().await;
+                assert_eq!(self.2.load(Ordering::SeqCst), 8);
+                self.1.add_permits(9);
+            };
+            let (first, results, ()) = tokio::join!(first, later, release);
+            assert!(matches!(first, Outcome::Succeeded(_)));
+            assert_eq!(results.len(), 8);
+            assert!(
+                results
+                    .iter()
+                    .all(|result| matches!(result, Outcome::Succeeded(_)))
+            );
+            Outcome::Succeeded("done".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Read {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "bounded_read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke_with_host(
+            &self,
+            args: Value,
+            context: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            if args["id"] == 0 {
+                host.call("bounded_child", json!({})).await
+            } else {
+                self.invoke(args, context).await
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            let count = self.2.fetch_add(1, Ordering::SeqCst) + 1;
+            if count == 1 {
+                self.3.notify_one();
+            }
+            if count == 8 {
+                self.0.notify_one();
+            }
+            self.1.acquire().await.unwrap().forget();
+            Outcome::Succeeded("read".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Child {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "bounded_child".into(),
+                description: "child".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+            self.0.invoke(args, context).await
+        }
+    }
+    struct Fixture(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Semaphore>,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Notify>,
+    );
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "bounded-nested"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(
+                    self.0.clone(),
+                    self.1.clone(),
+                    self.2.clone(),
+                    self.3.clone(),
+                )),
+                Arc::new(Read(
+                    self.0.clone(),
+                    self.1.clone(),
+                    self.2.clone(),
+                    self.3.clone(),
+                )),
+                Arc::new(Child(Read(
+                    self.0.clone(),
+                    self.1.clone(),
+                    self.2.clone(),
+                    self.3.clone(),
+                ))),
+            ]
+        }
+    }
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Semaphore::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(tokio::sync::Notify::new()),
+        )))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"]), answer("done")]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("bounded".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("bounded reads stalled")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_settles_reads_across_nested_dispatch_levels() {
+    struct Parent(Arc<tokio::sync::Notify>);
+    struct Read(CancellationToken);
+    struct Child(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Tool for Parent {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: "parent".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            _: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            let first = host.call("level_read", json!({"id":1}));
+            let second = async {
+                self.0.notified().await;
+                host.call("level_read", json!({"id":2})).await
+            };
+            let _ = tokio::join!(first, second);
+            Outcome::Succeeded("unexpected".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Read {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "level_read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            unreachable!()
+        }
+        async fn invoke_with_host(
+            &self,
+            args: Value,
+            _: ToolContext,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> Outcome {
+            if args["id"] == 1 {
+                return host.call("level_child", json!({})).await;
+            }
+            self.0.cancel();
+            std::future::pending().await
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for Child {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "level_child".into(),
+                description: "child".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execution(&self) -> ToolExecution {
+            ToolExecution::ParallelRead
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+    struct Fixture(Arc<tokio::sync::Notify>, CancellationToken);
+    impl Extension for Fixture {
+        fn id(&self) -> &str {
+            "cancel-levels"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![
+                Arc::new(Parent(self.0.clone())),
+                Arc::new(Read(self.1.clone())),
+                Arc::new(Child(self.0.clone())),
+            ]
+        }
+    }
+    let cancel = CancellationToken::new();
+    let mut registry = Registry::default();
+    registry
+        .register(Arc::new(Fixture(
+            Arc::new(tokio::sync::Notify::new()),
+            cancel.clone(),
+        )))
+        .unwrap();
+    let model = Script::new(vec![tool_reply(&["{}"])]);
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel(1);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        agent(&model, &registry).run(
+            &mut session,
+            Some("cancel".into()),
+            &mut inputs,
+            &cancel,
+            &mut ignore,
+        ),
+    )
+    .await
+    .expect("nested cancellation did not settle");
+    assert!(result.is_err());
+    let nested: Vec<_> = session
+        .operations()
+        .into_iter()
+        .filter(|(invocation, _)| {
+            invocation.call.name == "level_read" || invocation.call.name == "level_child"
+        })
+        .collect();
+    assert_eq!(nested.len(), 3);
+    assert!(
+        nested
+            .iter()
+            .all(|(_, state)| matches!(state, OperationState::Finished(Outcome::Unknown(_))))
+    );
+}
+
 struct ParallelFixture {
     barrier: tokio::sync::Barrier,
 }

@@ -172,6 +172,8 @@ An in-process orchestrating tool can override `invoke_with_host` and use
 execution ordering and state hooks. The journal records each nested operation
 with its parent operation ID. Only the parent tool result enters model context.
 Consecutive nested parallel reads may overlap; mutating calls stay ordered.
+A read must not wait for the returned result of a later sibling read: results
+are journaled and returned in call order, so that dependency cannot settle.
 
 Cancellation after dispatch leaves the affected operations unknown and blocks
 automatic replay. Calls are bounded to eight nesting levels, 4096 nested calls

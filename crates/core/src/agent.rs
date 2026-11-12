@@ -5,7 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -756,6 +756,7 @@ impl Agent<'_> {
                         &mut states,
                         observer,
                         Some(followups),
+                        &[],
                     )
                     .await
             };
@@ -1173,6 +1174,7 @@ impl Agent<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn tool_batch<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -1181,6 +1183,7 @@ impl Agent<'_> {
         states: &mut ExtensionStates,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
+        late_reads: &[Arc<tokio::sync::Mutex<NestedReadFeed>>],
     ) -> Result<()> {
         let cancel = scope.cancellation;
         let observe_tools = self.registry.extensions.iter().any(|extension| {
@@ -1206,9 +1209,23 @@ impl Agent<'_> {
                 1
             };
             let (group, next) = remaining.split_at(count);
+            let mut group = group.to_vec();
+            let group_parent = session
+                .records()
+                .iter()
+                .find_map(|record| match &record.event {
+                    Event::ToolPlanned {
+                        invocation,
+                        parent_operation,
+                    } if invocation.operation_id == group[0].operation_id => {
+                        Some(*parent_operation)
+                    }
+                    _ => None,
+                });
+            let mut foreign_feeds = vec![None; group.len()];
             let mut prepared = Vec::with_capacity(count);
             let mut parents = Vec::with_capacity(count);
-            for invocation in group {
+            for invocation in &group {
                 let parent = tool_parent_call_id(session, invocation.operation_id);
                 if observe_tools {
                     self.observe_lifecycle(
@@ -1268,7 +1285,11 @@ impl Agent<'_> {
                     dispatches.push(invocation.operation_id);
                 }
             }
-            let (requests, mut incoming) = mpsc::channel(32);
+            let (requests, incoming) = mpsc::channel(32);
+            let inbox = Arc::new(tokio::sync::Mutex::new(NestedInbox {
+                incoming,
+                pending: VecDeque::new(),
+            }));
             let (updates, mut progress) = mpsc::channel::<crate::LifecycleEvent>(32);
             let (finish_progress, mut finish_signal) = oneshot::channel();
             let (progress_events, mut observed_progress) = mpsc::channel(32);
@@ -1311,73 +1332,93 @@ impl Agent<'_> {
                 errors
             });
             let specs = Arc::new(self.registry.tool_specs());
-            let invocations =
-                group
-                    .iter()
-                    .zip(prepared)
-                    .zip(&parents)
-                    .map(|((invocation, prepared), parent)| {
-                        let cancellation = match &prepared {
-                            Preparation::Ready { context, .. } => context.cancellation.clone(),
-                            Preparation::Skipped(_) => cancel.child_token(),
-                        };
-                        let host = Arc::new(NestedHost {
-                            requests: requests.clone(),
-                            specs: specs.clone(),
-                            parent_operation: invocation.operation_id,
-                            cancellation,
-                            depth: scope.depth,
-                            call_count: scope.call_count.clone(),
-                            ui: self.registry.ui.clone(),
-                            progress: Some(ProgressReporter {
-                                sender: updates.clone(),
-                                tool_call_id: invocation.call.id.clone(),
-                                tool_name: invocation.call.name.clone(),
-                                args: crate::parse_tool_arguments(&invocation.call.arguments)
-                                    .unwrap_or(serde_json::Value::Null),
-                                parent_tool_call_id: parent.clone(),
-                            }),
-                        });
-                        let ran = matches!(&prepared, Preparation::Ready { .. });
-                        async move {
-                            let started = std::time::Instant::now();
-                            let reply = self.invoke(prepared, cancel, host, scope.depth > 0).await;
-                            let duration = ran.then(|| {
-                                started.elapsed().as_millis().min(u64::MAX as u128) as u64
-                            });
-                            (reply, duration)
-                        }
-                    });
-            let outcomes = futures_util::future::join_all(invocations);
-            tokio::pin!(outcomes);
+            let mut outcomes = FuturesUnordered::new();
+            for ((invocation, prepared), parent) in group.iter().zip(prepared).zip(&parents) {
+                let index = outcomes.len();
+                outcomes.push(self.group_invocation(
+                    index,
+                    invocation,
+                    prepared,
+                    parent.clone(),
+                    requests.clone(),
+                    updates.clone(),
+                    specs.clone(),
+                    cancel.clone(),
+                    scope.depth,
+                    scope.call_count.clone(),
+                ));
+            }
+            let mut replies = (0..group.len()).map(|_| None).collect::<Vec<_>>();
             let mut nested_error = None;
-            let mut pending_requests = VecDeque::<NestedRequest>::new();
             let outcomes = loop {
                 tokio::select! {
-                    completed = &mut outcomes => break completed,
+                    Some((index, reply, duration)) = outcomes.next() => {
+                        replies[index] = Some((reply, duration));
+                        if outcomes.is_empty() { break replies; }
+                    },
+                    (feed_index, request) = next_late_read(late_reads, self.registry), if parallel(&group[0]) && !late_reads.is_empty() => {
+                        if let Some(request) = request {
+                            let invocation = request.invocation();
+                            commit(session, Event::ToolPlanned { invocation: invocation.clone(), parent_operation: request.parent_operation }, observer)?;
+                            let parent = tool_parent_call_id(session, invocation.operation_id);
+                            let args = request.arguments.clone();
+                            let request_cancel = request.cancellation.clone();
+                            let request_depth = request.depth;
+                            let request_call_count = request.call_count.clone();
+                            {
+                                let mut feed = late_reads[feed_index].lock().await;
+                                feed.count += 1;
+                                feed.extra.push((request, invocation.clone()));
+                            }
+                            if observe_tools {
+                                self.observe_lifecycle(crate::LifecycleEvent::ToolExecutionStart {
+                                    tool_call_id: invocation.call.id.clone(), tool_name: invocation.call.name.clone(),
+                                    args, parent_tool_call_id: parent.clone(),
+                                }, states, Some(&request_cancel), observer).await;
+                            }
+                            let prepared = match self.prepare_tool(&invocation, scope.advertised, states, &request_cancel).await {
+                                Ok(prepared) => prepared,
+                                Err(error) => {
+                                    request_cancel.cancel();
+                                    late_reads[feed_index].lock().await.blocked = true;
+                                    nested_error.get_or_insert(error);
+                                    continue;
+                                }
+                            };
+                            if matches!(&prepared, Preparation::Ready { .. }) {
+                                commit(session, Event::ToolStarted { operation_id: invocation.operation_id }, observer)?;
+                            }
+                            let index = group.len();
+                            outcomes.push(self.group_invocation(index, &invocation, prepared, parent.clone(), requests.clone(), updates.clone(), specs.clone(), request_cancel, request_depth, request_call_count));
+                            replies.push(None);
+                            parents.push(parent);
+                            let feed_parent = late_reads[feed_index].lock().await.parent;
+                            foreign_feeds.push((Some(feed_parent) != group_parent).then_some(feed_index));
+                            group.push(invocation);
+                        }
+                    },
                     Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
                     Some(event) = observed_progress.recv() => observer(Notification::ToolProgress(&event)),
-                    Some(request) = async {
-                        if pending_requests.is_empty() {
-                            pending_requests.extend(incoming.recv().await?);
-                        }
-                        pending_requests.pop_front()
-                    } => {
+                    Some(request) = async { inbox.lock().await.next().await } => {
                         let parent = request.parent_operation;
+                        let can_parallel = self.is_parallel_read(&request.name);
                         let mut batch = vec![request];
-                        while batch.len() < 8 {
-                            if pending_requests.is_empty() {
-                                match incoming.try_recv() {
-                                    Ok(requests) => pending_requests.extend(requests),
-                                    Err(_) => break,
+                        {
+                            let mut inbox = inbox.lock().await;
+                            while can_parallel && batch.len() < 8 {
+                                if inbox.pending.is_empty() {
+                                    match inbox.incoming.try_recv() {
+                                        Ok(requests) => inbox.pending.extend(requests),
+                                        Err(_) => break,
+                                    }
                                 }
+                                let request = inbox.pending.pop_front().expect("queued nested request");
+                                if request.parent_operation != parent || !self.is_parallel_read(&request.name) {
+                                    inbox.pending.push_front(request);
+                                    break;
+                                }
+                                batch.push(request);
                             }
-                            let request = pending_requests.pop_front().expect("queued nested request");
-                            if request.parent_operation != parent {
-                                pending_requests.push_front(request);
-                                break;
-                            }
-                            batch.push(request);
                         }
                         // The nested future also emits notifications. Share the observer so
                         // sibling progress can be forwarded while that future is pending.
@@ -1386,7 +1427,13 @@ impl Agent<'_> {
                             let mut nested_observer = |event: Notification<'_>| {
                                 (shared.lock().expect("observer"))(event);
                             };
-                            let nested = self.nested_tools(session, batch, states, &mut nested_observer, inputs.as_deref_mut());
+                            let count = batch.len();
+                            let feed = Arc::new(tokio::sync::Mutex::new(NestedReadFeed { inbox: inbox.clone(), parent, blocked: !can_parallel, count, extra: Vec::new(), deferred: Vec::new() }));
+                            // A write is a barrier for ancestor reads, including
+                            // when it dispatches tools of its own.
+                            let mut feeds = if parallel(&group[0]) { late_reads.to_vec() } else { Vec::new() };
+                            feeds.push(feed);
+                            let nested = self.nested_tools(session, batch, states, &mut nested_observer, inputs.as_deref_mut(), &feeds);
                             tokio::pin!(nested);
                             let mut completed = None;
                             loop {
@@ -1395,14 +1442,30 @@ impl Agent<'_> {
                                         if let Err(error) = result { nested_error.get_or_insert(error); }
                                         break completed;
                                     },
-                                    result = &mut outcomes, if completed.is_none() => completed = Some(result),
+                                    Some((index, reply, duration)) = outcomes.next(), if completed.is_none() => {
+                                        replies[index] = Some((reply, duration));
+                                        if outcomes.is_empty() { completed = Some(()); }
+                                    },
                                     Some(event) = observed_progress.recv() => {
                                         (shared.lock().expect("observer"))(Notification::ToolProgress(&event));
                                     }
                                 }
                             }
                         };
-                        if let Some(completed) = completed { break completed; }
+                        // Descendants may have run one of this group's reads.
+                        // Commit those replies here, after earlier group members.
+                        for feed in late_reads {
+                            let mut feed = feed.lock().await;
+                            if Some(feed.parent) == group_parent {
+                                for deferred in feed.deferred.drain(..) {
+                                    group.push(deferred.invocation);
+                                    replies.push(Some((deferred.reply, deferred.duration)));
+                                    parents.push(deferred.parent);
+                                    foreign_feeds.push(None);
+                                }
+                            }
+                        }
+                        if completed.is_some() { break replies; }
                     }
                 }
             };
@@ -1432,9 +1495,25 @@ impl Agent<'_> {
             }
             let mut first_error = None;
             // All started outcomes are recorded even if one parallel member failed.
-            for ((invocation, (mut outcome, duration)), parent) in
-                group.iter().zip(outcomes).zip(parents)
+            for (index, ((invocation, outcome), parent)) in
+                group.iter().zip(outcomes).zip(parents).enumerate()
             {
+                let (mut outcome, duration) = outcome.expect("all group members completed");
+                // The caller's group owns this read's position in the journal.
+                // Hand it back rather than recording it in the child's group.
+                if let Some(feed_index) = foreign_feeds[index] {
+                    late_reads[feed_index]
+                        .lock()
+                        .await
+                        .deferred
+                        .push(DeferredRead {
+                            invocation: invocation.clone(),
+                            reply: outcome,
+                            duration,
+                            parent,
+                        });
+                    continue;
+                }
                 self.transform_tool_result(invocation, &mut outcome, states, cancel, observer)
                     .await;
                 let finished = self.finish_tool(session, invocation, outcome, states, observer);
@@ -1497,6 +1576,57 @@ impl Agent<'_> {
         Ok(())
     }
 
+    fn is_parallel_read(&self, name: &str) -> bool {
+        self.registry
+            .tools
+            .get(name)
+            .is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn group_invocation<'b>(
+        &'b self,
+        index: usize,
+        invocation: &Invocation,
+        prepared: Preparation<'b>,
+        parent: Option<String>,
+        requests: mpsc::Sender<Vec<NestedRequest>>,
+        updates: mpsc::Sender<crate::LifecycleEvent>,
+        specs: Arc<Vec<ToolSpec>>,
+        cancel: CancellationToken,
+        depth: usize,
+        call_count: Arc<AtomicUsize>,
+    ) -> impl std::future::Future<Output = (usize, ToolReply, Option<u64>)> + Send + 'b {
+        let cancellation = match &prepared {
+            Preparation::Ready { context, .. } => context.cancellation.clone(),
+            Preparation::Skipped(_) => cancel.child_token(),
+        };
+        let host = Arc::new(NestedHost {
+            requests,
+            specs,
+            parent_operation: invocation.operation_id,
+            cancellation,
+            depth,
+            call_count,
+            ui: self.registry.ui.clone(),
+            progress: Some(ProgressReporter {
+                sender: updates,
+                tool_call_id: invocation.call.id.clone(),
+                tool_name: invocation.call.name.clone(),
+                args: crate::parse_tool_arguments(&invocation.call.arguments)
+                    .unwrap_or(serde_json::Value::Null),
+                parent_tool_call_id: parent,
+            }),
+        });
+        let ran = matches!(&prepared, Preparation::Ready { .. });
+        async move {
+            let started = std::time::Instant::now();
+            let reply = self.invoke(prepared, &cancel, host, depth > 0).await;
+            let duration = ran.then(|| started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            (index, reply, duration)
+        }
+    }
+
     async fn nested_tools<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -1504,8 +1634,13 @@ impl Agent<'_> {
         states: &mut ExtensionStates,
         observer: &mut Observer<'_>,
         inputs: Option<&mut mpsc::Receiver<T>>,
+        late_reads: &[Arc<tokio::sync::Mutex<NestedReadFeed>>],
     ) -> Result<()> {
-        let invocations: Vec<_> = requests
+        let mut extra_offsets = Vec::with_capacity(late_reads.len());
+        for feed in late_reads {
+            extra_offsets.push(feed.lock().await.extra.len());
+        }
+        let mut invocations: Vec<_> = requests
             .iter()
             .map(|request| {
                 let operation_id = Uuid::new_v4();
@@ -1543,12 +1678,24 @@ impl Agent<'_> {
                 states,
                 observer,
                 inputs,
+                late_reads,
             ))
             .await
         }
         .await;
         if execute.is_err() {
             requests[0].cancellation.cancel();
+        }
+        let mut requests = requests;
+        for (feed, offset) in late_reads.iter().zip(extra_offsets) {
+            let mut feed = feed.lock().await;
+            if feed.parent != requests[0].parent_operation {
+                continue;
+            }
+            for (request, invocation) in feed.extra.drain(offset..) {
+                requests.push(request);
+                invocations.push(invocation);
+            }
         }
         for (request, invocation) in requests.into_iter().zip(invocations) {
             let operation_id = invocation.operation_id;
@@ -3178,6 +3325,87 @@ struct NestedRequest {
     depth: usize,
     call_count: Arc<AtomicUsize>,
     reply: oneshot::Sender<Outcome>,
+}
+
+impl NestedRequest {
+    fn invocation(&self) -> Invocation {
+        let operation_id = Uuid::new_v4();
+        Invocation {
+            operation_id,
+            call: crate::ToolCall {
+                id: operation_id.to_string(),
+                name: self.name.clone(),
+                arguments: self.arguments.to_string(),
+            },
+        }
+    }
+}
+
+// The active descendant temporarily shares its ancestors' queues. Each feed
+// tracks its own group limit and stops at the first write or other parent.
+struct NestedInbox {
+    incoming: mpsc::Receiver<Vec<NestedRequest>>,
+    pending: VecDeque<NestedRequest>,
+}
+impl NestedInbox {
+    async fn next(&mut self) -> Option<NestedRequest> {
+        if self.pending.is_empty() {
+            self.pending.extend(self.incoming.recv().await?);
+        }
+        self.pending.pop_front()
+    }
+}
+struct DeferredRead {
+    invocation: Invocation,
+    reply: ToolReply,
+    duration: Option<u64>,
+    parent: Option<String>,
+}
+struct NestedReadFeed {
+    inbox: Arc<tokio::sync::Mutex<NestedInbox>>,
+    parent: Uuid,
+    blocked: bool,
+    count: usize,
+    extra: Vec<(NestedRequest, Invocation)>,
+    deferred: Vec<DeferredRead>,
+}
+impl NestedReadFeed {
+    async fn next(&mut self, registry: &Registry) -> Option<NestedRequest> {
+        if self.blocked || self.count >= 8 {
+            return std::future::pending().await;
+        }
+        let mut inbox = self.inbox.lock().await;
+        if inbox.pending.is_empty() {
+            match inbox.incoming.recv().await {
+                Some(requests) => inbox.pending.extend(requests),
+                None => {
+                    self.blocked = true;
+                    return None;
+                }
+            }
+        }
+        let request = inbox.pending.front()?;
+        if request.parent_operation != self.parent
+            || !registry
+                .tools
+                .get(&request.name)
+                .is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead)
+        {
+            self.blocked = true;
+            return None;
+        }
+        inbox.pending.pop_front()
+    }
+}
+async fn next_late_read(
+    feeds: &[Arc<tokio::sync::Mutex<NestedReadFeed>>],
+    registry: &Registry,
+) -> (usize, Option<NestedRequest>) {
+    use futures_util::future::select_all;
+    let futures = feeds.iter().enumerate().map(|(index, feed)| {
+        Box::pin(async move { (index, feed.lock().await.next(registry).await) })
+    });
+    select_all(futures).await.0
 }
 
 fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> {
