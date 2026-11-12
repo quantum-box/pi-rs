@@ -1599,6 +1599,83 @@ mod tests {
     }
 
     #[test]
+    fn startup_thinking_establishes_initial_model_and_repairs_marker_only_history() {
+        use clap::Parser;
+        for legacy in [false, true] {
+            let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            if legacy {
+                let mut records = session.records().to_vec();
+                for event in [
+                    Event::SourceEntry {
+                        format: "pi-rs:thinking-selection".into(),
+                        entry: Value::Null,
+                    },
+                    Event::ModelSelected {
+                        provider: None,
+                        model: "initial".into(),
+                        thinking: Some("high".into()),
+                    },
+                ] {
+                    let parent = records.last().unwrap().id;
+                    records.push(Record {
+                        id: parent + 1,
+                        parent: Some(parent),
+                        version: 2,
+                        timestamp: None,
+                        run_id: None,
+                        event,
+                    });
+                }
+                session = Session::from_records(records).unwrap();
+            }
+            let mut args = super::super::Cli::parse_from(["pi", "--thinking", "high"]);
+            args.model = "initial".into();
+            args.model_explicit = false;
+            args.thinking_explicit = true;
+            args.thinking = Some("high".into());
+            args.record_automatic_model_selection(&mut session).unwrap();
+            let projected = super::super::rpc_entries::Entries::new(&session)
+                .after(None)
+                .unwrap();
+            let entries = projected["entries"].as_array().unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["type"] == "model_change" && entry["modelId"] == "initial")
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["type"] == "thinking_level_change"
+                        && entry["thinkingLevel"] == "high")
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("share.jsonl");
+            let bytes = super::super::rpc_entries::Entries::new(&session)
+                .write_share_branch(&session, directory.path())
+                .unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let shared = read(&path).unwrap();
+            assert!(
+                matches!(branch_selection(&shared, |_, _| None), BranchSelection::Selected { model, thinking: Some(level), .. } if model == "initial" && level == "high")
+            );
+            session
+                .select_provider_model(None, "initial", Some("high"))
+                .unwrap();
+            let projected = super::super::rpc_entries::Entries::new(&session)
+                .after(None)
+                .unwrap();
+            assert!(
+                projected["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["type"] == "model_change" && entry["modelId"] == "initial")
+            );
+        }
+    }
+
+    #[test]
     fn incomplete_prior_model_change_does_not_hide_complete_response() {
         let session = import_pi(vec![
             json!({"type":"session","version":3}),

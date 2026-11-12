@@ -843,6 +843,7 @@ impl Session {
         if self.model_selection() != Some((model.into(), thinking.map(str::to_owned)))
             || self.model_provider() != provider
             || self.has_imported_response_since_selection()
+            || self.has_only_thinking_selection()
         {
             self.append(Event::ModelSelected {
                 model: model.into(),
@@ -851,6 +852,25 @@ impl Session {
             })?;
         }
         Ok(())
+    }
+
+    // Older journals may contain only a thinking marker and its synthetic
+    // ModelSelected record. An explicit model choice must establish a model.
+    fn has_only_thinking_selection(&self) -> bool {
+        let branch = self.branch();
+        let mut saw_thinking = false;
+        for (index, record) in branch.iter().enumerate().rev() {
+            if matches!(record.event, Event::ModelSelected { .. }) {
+                let thinking_only = index.checked_sub(1).and_then(|i| branch.get(i)).is_some_and(|parent| {
+                    matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")
+                });
+                if !thinking_only {
+                    return false;
+                }
+                saw_thinking = true;
+            }
+        }
+        saw_thinking
     }
 
     /// Persist a thinking-only change without implying a model selection.
@@ -862,6 +882,9 @@ impl Session {
     ) -> Result<()> {
         if model.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
+        }
+        if !self.has_model_context() {
+            return self.select_provider_model(provider, model, Some(thinking));
         }
         if self
             .model_selection()
@@ -879,6 +902,18 @@ impl Session {
             thinking: Some(thinking.into()),
         })?;
         Ok(())
+    }
+
+    fn has_model_context(&self) -> bool {
+        let branch = self.branch();
+        branch.iter().enumerate().any(|(index, record)| match &record.event {
+            Event::SourceEntry { format, entry } if format == "pi" => entry["type"] == "model_change"
+                || (entry["type"] == "message" && entry["message"]["role"] == "assistant"),
+            Event::ModelSelected { .. } => !index.checked_sub(1).and_then(|i| branch.get(i))
+                .is_some_and(|parent| matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")),
+            Event::Assistant { request_id: Some(_), .. } => true,
+            _ => false,
+        })
     }
 
     /// Record the host connection used for subsequent model requests.

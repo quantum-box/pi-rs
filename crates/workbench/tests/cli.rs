@@ -2098,20 +2098,32 @@ fn rpc_model_discovery_does_not_block_other_commands() {
     let (accepted, ready) = std::sync::mpsc::channel();
     let (release, gate) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let (mut socket, mut reader, first) = accept_proxy_request(listener);
-        assert!(first.starts_with("GET "), "{first}");
         loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            if line == "\r\n" || line.is_empty() {
-                break;
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
             }
+            if first.starts_with("GET /api/ps ") {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            assert!(first.starts_with("GET /v1/models "), "{first}");
+            accepted.send(()).unwrap();
+            let _ = gate.recv_timeout(Duration::from_secs(30));
+            let body = br#"{"data":[{"id":"fixture-model"}]}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(body).unwrap();
+            break;
         }
-        accepted.send(()).unwrap();
-        let _ = gate.recv_timeout(Duration::from_secs(30));
-        let body = br#"{"data":[{"id":"fixture-model"}]}"#;
-        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-        socket.write_all(body).unwrap();
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", root.path())
@@ -2164,7 +2176,7 @@ fn rpc_model_discovery_does_not_block_other_commands() {
     assert_eq!(event["success"], true);
     let models = received.recv_timeout(Duration::from_secs(30)).unwrap();
     assert_eq!(models["id"], "models", "{models}");
-    assert_eq!(models["success"], true);
+    assert_eq!(models["success"], true, "{models}");
     assert!(
         models["data"]["models"]
             .as_array()

@@ -22,6 +22,7 @@ struct Position {
     imported: Option<u64>,
     model: Option<u64>,
     response_model: Option<u64>,
+    explicit_model_seen: bool,
 }
 
 pub(super) struct Entries {
@@ -270,6 +271,7 @@ impl Cursor {
             Event::SourceEntry { format, entry } if format == "pi" => {
                 if entry["type"] == "model_change" {
                     position.response_model = None;
+                    position.explicit_model_seen = true;
                 } else if entry["type"] == "message"
                     && entry["message"]["role"] == "assistant"
                     && entry["message"]["api"] != "pi-virtual"
@@ -363,6 +365,7 @@ impl Cursor {
                     return entries;
                 }
                 position.response_model = None;
+                position.explicit_model_seen = true;
                 let previous = parent.model.and_then(|id| {
                     let Event::ModelSelected {
                         model,
@@ -377,7 +380,8 @@ impl Cursor {
                 // A response may have been routed by a virtual selection. An
                 // explicit native selection must override that selection even
                 // when it names the same physical model as the response.
-                let model_changed = parent.response_model.is_some()
+                let model_changed = !parent.explicit_model_seen
+                    || parent.response_model.is_some()
                     || previous.is_none_or(|old| (old.0, old.1) != (current.0, current.1));
                 let thinking_changed = previous.is_none_or(|old| old.2 != current.2);
                 let model_entry =
