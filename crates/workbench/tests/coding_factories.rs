@@ -6,7 +6,10 @@ use std::{
 use futures_util::stream;
 use pi_rs::{CancellationToken, Extension, Outcome, Registry, Result, ToolContext};
 use pi_rs_workbench::{
-    coding::{CodingTools, ConditionalEdit, EditOperations, ReadOperations, WriteOperations},
+    coding::{
+        BashOperations, CodingTools, ConditionalEdit, EditOperations, ReadOperations,
+        ShellSpawnContext, WriteOperations,
+    },
     coding_factories::{
         coding_tools_from, coding_tools_from_with_local_shell, create_coding_tools,
         create_read_only_tools, injected_file_tools_from, read_only_tools_from,
@@ -76,6 +79,27 @@ async fn local_factory_tools_resolve_relative_to_supplied_cwd() {
 #[derive(Default)]
 struct Remote {
     calls: Mutex<Vec<(String, PathBuf)>>,
+    local_shell: bool,
+}
+#[async_trait::async_trait]
+impl BashOperations for Remote {
+    fn is_local(&self) -> bool {
+        self.local_shell
+    }
+    async fn exec(
+        &self,
+        context: ShellSpawnContext,
+        _: Option<std::time::Duration>,
+        _: CancellationToken,
+        out: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((format!("bash:{}", context.command), context.cwd));
+        out.send(b"remote shell output\n".to_vec()).await.unwrap();
+        Ok(Some(0))
+    }
 }
 #[async_trait::async_trait]
 impl ReadOperations for Remote {
@@ -259,6 +283,107 @@ async fn fully_injected_file_tools_work_without_local_shell() {
             matches!(shell.invoke(json!({"command":"cat host-only"}), context()).await, Outcome::Succeeded(output) if output.contains("host shell fixture"))
         );
     }
+}
+
+#[tokio::test]
+async fn fully_injected_coding_set_uses_one_remote_backend() {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Remote::default());
+    let source = CodingTools::local(directory.path())
+        .unwrap()
+        .with_read_operations(backend.clone())
+        .unwrap()
+        .with_write_operations(backend.clone())
+        .unwrap()
+        .with_edit_operations(backend.clone())
+        .unwrap()
+        .with_bash_operations(backend.clone())
+        .unwrap();
+    let set = coding_tools_from(&source).unwrap();
+    assert_eq!(names(&set), ["read", "bash", "edit", "write"]);
+    assert!(coding_tools_from_with_local_shell(&source).is_err());
+    let tools = set.tools();
+    let tool = |name| tools.iter().find(|tool| tool.spec().name == name).unwrap();
+    assert!(
+        matches!(tool("read").invoke(json!({"path":"file"}), context()).await, Outcome::Succeeded(text) if text.contains("remote content"))
+    );
+    assert!(
+        matches!(tool("bash").invoke(json!({"command":"remote-command"}), context()).await, Outcome::Succeeded(text) if text.contains("remote shell output"))
+    );
+    assert!(matches!(
+        tool("write")
+            .invoke(json!({"path":"file","content":"written"}), context())
+            .await,
+        Outcome::Succeeded(_)
+    ));
+    assert!(matches!(
+        tool("edit")
+            .invoke(
+                json!({"path":"file","edits":[{"oldText":"remote","newText":"updated"}]}),
+                context()
+            )
+            .await,
+        Outcome::SucceededWithDetails { .. }
+    ));
+    assert!(!directory.path().join("file").exists());
+    let calls = backend.calls.lock().unwrap();
+    for expected in ["read", "bash:remote-command", "write", "edit"] {
+        assert!(
+            calls.iter().any(|(name, _)| name == expected),
+            "missing {expected}: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn coding_factory_rejects_mixed_shell_and_file_backends() {
+    let directory = tempfile::tempdir().unwrap();
+    for mask in 1..15 {
+        let backend = Arc::new(Remote::default());
+        let mut source = CodingTools::local(directory.path()).unwrap();
+        if mask & 1 != 0 {
+            source = source.with_read_operations(backend.clone()).unwrap();
+        }
+        if mask & 2 != 0 {
+            source = source.with_write_operations(backend.clone()).unwrap();
+        }
+        if mask & 4 != 0 {
+            source = source.with_edit_operations(backend.clone()).unwrap();
+        }
+        if mask & 8 != 0 {
+            source = source.with_bash_operations(backend).unwrap();
+        }
+        assert!(coding_tools_from(&source).is_err(), "partial mask {mask}");
+    }
+    let file_backend = Arc::new(Remote::default());
+    let shell_backend = Arc::new(Remote::default());
+    let source = CodingTools::local(directory.path())
+        .unwrap()
+        .with_read_operations(file_backend.clone())
+        .unwrap()
+        .with_write_operations(file_backend.clone())
+        .unwrap()
+        .with_edit_operations(file_backend)
+        .unwrap()
+        .with_bash_operations(shell_backend)
+        .unwrap();
+    assert!(coding_tools_from(&source).is_err());
+    assert!(coding_tools_from_with_local_shell(&source).is_err());
+    let local = Arc::new(Remote {
+        local_shell: true,
+        ..Default::default()
+    });
+    let source = CodingTools::local(directory.path())
+        .unwrap()
+        .with_read_operations(local.clone())
+        .unwrap()
+        .with_write_operations(local.clone())
+        .unwrap()
+        .with_edit_operations(local.clone())
+        .unwrap()
+        .with_bash_operations(local)
+        .unwrap();
+    assert!(coding_tools_from(&source).is_err());
 }
 
 #[test]

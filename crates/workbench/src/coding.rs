@@ -94,6 +94,21 @@ impl CodingTools {
         self.edit_operations.is_some()
     }
 
+    pub(crate) fn has_custom_bash_operations(&self) -> bool {
+        self.bash_operations.is_some()
+    }
+
+    pub(crate) fn shell_and_file_operations_share_remote_backend(&self) -> bool {
+        match (&self.read_operations, &self.bash_operations) {
+            (Some(read), Some(shell)) => {
+                self.file_operations_share_backend()
+                    && !shell.is_local()
+                    && Arc::as_ptr(read) as *const () == Arc::as_ptr(shell) as *const ()
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn file_operations_share_backend(&self) -> bool {
         match (
             &self.read_operations,

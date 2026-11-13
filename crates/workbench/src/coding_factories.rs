@@ -54,14 +54,17 @@ pub fn create_read_only_tools(cwd: &Path) -> Result<CodingToolSet> {
 }
 
 /// Select the coding set from a host-configured profile, retaining its options.
-/// Scoped file tools do not restrict the shell, which is not sandboxed.
-/// Custom file operations require the shell-free factory or explicit local-shell opt-in.
+/// Scoped local file tools do not restrict the local shell, which is not sandboxed.
+/// Custom operations must all share one non-local backend Arc. The host must
+/// ensure that backend consistently enforces its access policy.
 pub fn coding_tools_from(source: &CodingTools) -> Result<CodingToolSet> {
-    if source.has_custom_read_operations()
+    let custom_files = source.has_custom_read_operations()
         || source.has_custom_write_operations()
-        || source.has_custom_edit_operations()
+        || source.has_custom_edit_operations();
+    if (custom_files || source.has_custom_bash_operations())
+        && !source.shell_and_file_operations_share_remote_backend()
     {
-        return Err(Error::Config("custom file operations require injected_file_tools_from or explicit local-shell opt-in".into()));
+        return Err(Error::Config("coding tools require read, write, edit and non-local bash operations sharing the same backend Arc; use the shell-free set or explicitly opt into a local shell".into()));
     }
     select_coding_with_shell(source)
 }
@@ -88,6 +91,9 @@ pub fn injected_file_tools_from(source: &CodingTools) -> Result<CodingToolSet> {
 /// on the injected backend. All file operations must share one backend Arc.
 pub fn coding_tools_from_with_local_shell(source: &CodingTools) -> Result<CodingToolSet> {
     require_shared_file_backend(source)?;
+    if source.has_custom_bash_operations() {
+        return Err(Error::Config("local-shell opt-in requires the default host-local shell, not injected bash operations".into()));
+    }
     select_coding_with_shell(source)
 }
 
