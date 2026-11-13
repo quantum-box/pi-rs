@@ -789,6 +789,29 @@ impl Agent<'_> {
             let group_ids: Vec<usize> = nested_groups.keys().copied().collect();
             for id in group_ids {
                 let (group, ready) = nested_groups.get_mut(&id).expect("nested group");
+                // A scoped cancellation can arrive after one member prepared
+                // but before its peers finish preparation. Retire prepared
+                // members and detach skipped members from the batch gate; the
+                // lane still journals their skipped outcomes in order.
+                for &index in group.iter() {
+                    if !scope.cancellation.is_cancelled()
+                        && calls[index].cancellation.is_cancelled()
+                        && matches!(calls[index].phase, TurnPhase::Prepared(_))
+                    {
+                        calls[index].phase =
+                            TurnPhase::NotStarted("cancelled before dispatch".into());
+                    }
+                }
+                group.retain(|&index| {
+                    !matches!(
+                        calls[index].phase,
+                        TurnPhase::NotStarted(_) | TurnPhase::Finished
+                    )
+                });
+                if group.is_empty() {
+                    nested_groups.remove(&id);
+                    continue;
+                }
                 if !*ready
                     && group
                         .iter()

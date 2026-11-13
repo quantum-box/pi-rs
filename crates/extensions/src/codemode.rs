@@ -1904,6 +1904,148 @@ mod tests {
         );
         session.close().await.unwrap();
     }
+    #[tokio::test]
+    async fn cancelled_nested_read_batch_retires_prepared_peers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct BatchTool {
+            name: &'static str,
+            slow_started: Arc<tokio::sync::Notify>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Tool for BatchTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            fn execution(&self) -> pi_rs_core::ToolExecution {
+                if self.name == "batch" {
+                    pi_rs_core::ToolExecution::Sequential
+                } else {
+                    pi_rs_core::ToolExecution::ParallelRead
+                }
+            }
+            async fn prepare_arguments(&self, args: Value) -> ExtensionResult<Value> {
+                if self.name == "slow_read" {
+                    self.slow_started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(args)
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded("unexpected".into())
+            }
+            async fn invoke_with_host(
+                &self,
+                _: Value,
+                context: ToolContext,
+                _: Option<&ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> Outcome {
+                if self.name != "batch" {
+                    return self.invoke(json!({}), context).await;
+                }
+                let pending = tokio::spawn(async move {
+                    host.call_batch(vec![
+                        ("fast_read".into(), json!({})),
+                        ("slow_read".into(), json!({})),
+                    ])
+                    .await
+                });
+                self.slow_started.notified().await;
+                context.cancellation.cancel();
+                let _ = pending.await;
+                Outcome::Failed("batch cancelled".into())
+            }
+        }
+        struct BatchExtension {
+            slow_started: Arc<tokio::sync::Notify>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Extension for BatchExtension {
+            fn id(&self) -> &str {
+                "batch-test"
+            }
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                ["batch", "fast_read", "slow_read"]
+                    .into_iter()
+                    .map(|name| {
+                        Arc::new(BatchTool {
+                            name,
+                            slow_started: self.slow_started.clone(),
+                            calls: self.calls.clone(),
+                        }) as Arc<dyn Tool>
+                    })
+                    .collect()
+            }
+        }
+        struct BatchModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for BatchModel {
+            async fn stream(
+                &self,
+                request: ModelRequest,
+            ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                use pi_rs_core::{Message, ModelEvent, ToolCall};
+                let events = if let Some(content) =
+                    request.messages.iter().find_map(|message| match message {
+                        Message::Tool { content, .. } => Some(content),
+                        _ => None,
+                    }) {
+                    assert!(content.contains("batch cancelled"), "{content}");
+                    vec![
+                        Ok(ModelEvent::Text("done".into())),
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: None,
+                        }),
+                    ]
+                } else {
+                    vec![Ok(ModelEvent::Complete {
+                        calls: vec![ToolCall {
+                            id: "batch".into(),
+                            name: "batch".into(),
+                            arguments: "{}".into(),
+                        }],
+                        usage: None,
+                    })]
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(BatchModel), "fixture")
+            .extension(Arc::new(BatchExtension {
+                slow_started: Arc::new(tokio::sync::Notify::new()),
+                calls: calls.clone(),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(5), session.prompt("test"))
+            .await
+            .expect("cancelled batch stranded scheduler")
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let operations = session.journal().unwrap().operations();
+        for name in ["fast_read", "slow_read"] {
+            assert!(
+                operations
+                    .iter()
+                    .any(|(invocation, state)| invocation.call.name == name
+                        && matches!(
+                            state,
+                            pi_rs_core::OperationState::Finished(Outcome::Skipped(_))
+                        ))
+            );
+        }
+        session.close().await.unwrap();
+    }
     #[test]
     fn options_are_restricted_to_the_first_line() {
         let reply = run("text('first');\n// @options: {}", None);
