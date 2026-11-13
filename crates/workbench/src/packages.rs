@@ -315,6 +315,21 @@ fn collect_package_themes(root: &Path, pi: &Value) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     let mut themes = Vec::new();
+    // Explicit files are authoritative: ignore files and symlink traversal
+    // rules for directory scans must not hide a named manifest entry.
+    for pattern in &patterns {
+        let candidate = pattern.strip_prefix('+').unwrap_or(pattern);
+        if pattern.starts_with(['!', '-']) || candidate.contains(['*', '?', '[', '{']) {
+            continue;
+        }
+        let path = root.join(candidate.replace('\\', "/"));
+        if path.is_file()
+            && path.extension().is_some_and(|ext| ext == "json")
+            && manifest_selected(&path, root, &patterns)
+        {
+            themes.push(path);
+        }
+    }
     for entry in ignore::WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(false)
@@ -334,6 +349,8 @@ fn collect_package_themes(root: &Path, pi: &Value) -> Result<Vec<PathBuf>> {
             themes.push(entry.into_path());
         }
     }
+    let mut seen = std::collections::HashSet::new();
+    themes.retain(|path| seen.insert(dunce::simplified(path).to_path_buf()));
     Ok(themes)
 }
 
@@ -379,22 +396,15 @@ fn read_pi_package_json(path: &Path) -> Result<Value> {
             .iter()
             .any(|name| pi.get(name).is_some())
     });
-    let themes = pi
-        .and_then(|pi| pi.get("themes"))
-        .cloned()
-        .unwrap_or_else(|| {
-            if explicit {
-                json!([])
-            } else {
-                json!(["themes"])
-            }
-        });
-    // Only theme support is opted in here. In particular, reading a Pi
-    // package must not enable its executable extensions during preparation.
-    Ok(
-        json!({"pi": {"extensions": [], "skills": [], "prompts": [], "themes": themes},
-        "version": value.get("version")}),
-    )
+    let theme_only = if explicit {
+        json!({"extensions": [], "skills": [], "prompts": [],
+            "themes": pi.and_then(|pi| pi.get("themes")).cloned().unwrap_or_else(|| json!([]))})
+    } else {
+        json!({})
+    };
+    // Treat an explicit Pi resource manifest as authoritative before scanning
+    // native executables; only theme entries are supported from this format.
+    Ok(json!({"pi": theme_only, "version": value.get("version")}))
 }
 
 struct ResourceFilter {
@@ -925,6 +935,8 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
     }
     let mut manifest = if root.join("pi-package.json").is_file() {
         config::read_object(&root.join("pi-package.json"))?
+    } else if !root.join("Cargo.toml").is_file() && root.join("package.json").is_file() {
+        read_pi_package_json(&root.join("package.json")).unwrap_or_else(|_| json!({}))
     } else {
         json!({})
     };
@@ -1000,16 +1012,7 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
         .get("pi")
         .filter(|value| value.is_object())
         .unwrap_or(&manifest);
-    let mut resources = collect_package_resources(&root, pi, installed_binaries)?;
-    // Keep native default handling for other resource types while honoring
-    // theme declarations from a Pi package.json during normal preparation.
-    if !root.join("pi-package.json").is_file()
-        && !root.join("Cargo.toml").is_file()
-        && root.join("package.json").is_file()
-        && let Ok(manifest) = read_pi_package_json(&root.join("package.json"))
-    {
-        resources.themes = collect_package_themes(&root, &manifest["pi"])?;
-    }
+    let resources = collect_package_resources(&root, pi, installed_binaries)?;
     for executable in &resources.extensions {
         pi_rs_extensions::ExecutableExtension::load(executable.to_string_lossy().as_ref())?;
     }
@@ -1699,6 +1702,59 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicitly_named_theme_file_bypasses_ignore_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let theme = root.join("assets/ignored.json");
+        std::fs::write(&theme, "{}").unwrap();
+        std::fs::write(root.join(".ignore"), "assets/\n").unwrap();
+        let manifest = json!({"themes":["assets/ignored.json"]});
+        assert_eq!(
+            collect_package_themes(root, &manifest).unwrap(),
+            [theme.clone()]
+        );
+        assert_eq!(
+            collect_package_resources(root, &manifest, Vec::new())
+                .unwrap()
+                .themes,
+            [theme]
+        );
+        let excluded = json!({"themes":["assets/ignored.json", "!assets/ignored.json"]});
+        assert!(collect_package_themes(root, &excluded).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicitly_named_theme_files_follow_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("package");
+        let external = directory.path().join("external");
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("theme.json"), "{}").unwrap();
+        symlink(
+            external.join("theme.json"),
+            root.join("assets/file-link.json"),
+        )
+        .unwrap();
+        symlink(&external, root.join("assets/dir-link")).unwrap();
+        let files = vec![
+            root.join("assets/file-link.json"),
+            root.join("assets/dir-link/theme.json"),
+        ];
+        let manifest = json!({"themes":["assets/file-link.json", "assets/dir-link/theme.json"]});
+        assert_eq!(collect_package_themes(&root, &manifest).unwrap(), files);
+        assert_eq!(
+            collect_package_resources(&root, &manifest, Vec::new())
+                .unwrap()
+                .themes,
+            files
+        );
+    }
+
     #[test]
     fn local_package_sources_trim_surrounding_whitespace() {
         let directory = tempfile::tempdir().unwrap();

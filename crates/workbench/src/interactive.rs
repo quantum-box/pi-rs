@@ -8028,7 +8028,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let pi_manifest = serde_json::json!({"version":"1.0.0", "pi":{"themes":["assets/visual.json"],"extensions":["extensions/unexpected"]},
+        let pi_manifest = serde_json::json!({"version":"1.0.0", "pi":{"themes":["assets/visual.json"]},
             "scripts":{"prepare":"must-not-run"}});
         std::fs::write(
             pi_source.join("package.json"),
@@ -8046,7 +8046,6 @@ mod tests {
             !sentinel.exists(),
             "picker must not execute package extensions"
         );
-        std::fs::remove_file(extension).unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8054,7 +8053,15 @@ mod tests {
             .block_on(super::super::packages::prepare(&args))
             .unwrap();
         assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
-        assert!(!sentinel.exists());
+        assert!(
+            !sentinel.exists(),
+            "preparation must not execute undeclared extensions"
+        );
+        let index_text = std::fs::read_to_string(&index).unwrap();
+        assert!(
+            index_text.contains("pi-package"),
+            "package must actually be prepared"
+        );
     }
 
     #[test]
