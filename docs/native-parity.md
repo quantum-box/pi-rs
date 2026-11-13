@@ -3635,10 +3635,17 @@ that their smaller output limit remains usable. Cache usage includes
 one-hour write details when Bedrock reports them. Model support and minimum
 cacheable lengths are determined by Bedrock.
 
-Not yet supported: Pi's interactive AWS profile login/storage, non-image
-multimodal inputs, workbench-specific thinking display controls, tool
+Configured provider and model request headers are applied before SigV4 signing;
+`authorization`, `host`, and `x-amz-*` cannot override SDK authentication or
+routing. Library callers can set custom headers on `Bedrock`. Effective custom
+headers are included in the protected prepared-request identity. Custom values
+are marked sensitive in SDK traces and redacted from service diagnostics.
+During requests and stream reads with custom values, SDK and HTTP transport
+events are suppressed because signing and error traces can contain unredacted
+headers or echoed response frames; application tracing remains enabled.
+
+Not yet supported: non-image multimodal inputs, workbench-specific thinking display controls, tool
 choice/strict sampling, guardrails, prompt management ARNs, live account-specific
-model discovery, custom request headers, and workbench proxy/idle-timeout
-settings. Custom model endpoints in workbench configuration are rejected;
+model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.

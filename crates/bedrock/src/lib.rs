@@ -1,4 +1,5 @@
 //! Amazon Bedrock ConverseStream adapter.
+mod headers;
 mod options;
 use aws_sdk_bedrockruntime::{
     Client,
@@ -24,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone)]
 pub struct Bedrock {
     client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
+    headers: BTreeMap<String, Vec<String>>,
     unsupported: Option<String>,
     bearer: Option<String>,
     force_sigv4: bool,
@@ -48,6 +50,7 @@ impl Bedrock {
     pub fn from_env() -> Self {
         Self {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            headers: BTreeMap::new(),
             unsupported: None,
             bearer: None,
             force_sigv4: false,
@@ -72,6 +75,7 @@ impl Bedrock {
     pub fn new(client: Client) -> Self {
         Self {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
+            headers: BTreeMap::new(),
             unsupported: None,
             bearer: None,
             force_sigv4: false,
@@ -98,6 +102,7 @@ impl Bedrock {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(Client::new(
                 &config,
             )))),
+            headers: BTreeMap::new(),
             unsupported: None,
             bearer: None,
             force_sigv4: false,
@@ -119,6 +124,20 @@ impl Bedrock {
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
             summary: false,
         }
+    }
+    /// Replace custom request headers; authentication and SigV4 headers are ignored.
+    pub fn with_headers(mut self, headers: http::HeaderMap) -> Result<Self> {
+        self.headers = headers::filtered(headers)?;
+        self.prepared_identity = None;
+        Ok(self)
+    }
+    /// Add missing default headers without overriding configured request headers.
+    pub fn with_default_headers(mut self, headers: &http::HeaderMap) -> Result<Self> {
+        for (name, value) in headers::filtered(headers.clone())? {
+            self.headers.entry(name).or_insert(value);
+        }
+        self.prepared_identity = None;
+        Ok(self)
     }
     /// Prefer bearer authentication over the AWS credential chain.
     pub fn with_bearer_token(mut self, token: String) -> Result<Self> {
@@ -284,6 +303,7 @@ impl Bedrock {
             config.use_dual_stack(),
             auth_identity,
             &self.model_name,
+            &self.headers,
             format!("{:?}", self.reasoning),
             &self.mapped_effort,
             (
@@ -449,7 +469,17 @@ fn required_text(text: String) -> String {
 fn diagnostic(
     meta: &aws_smithy_types::error::metadata::ErrorMetadata,
     fallback_id: Option<&str>,
+    secrets: &[String],
 ) -> String {
+    let redact = |value: &str| {
+        let mut value = value.to_owned();
+        for secret in secrets {
+            if !secret.is_empty() {
+                value = value.replace(secret, "[REDACTED]");
+            }
+        }
+        value
+    };
     let clean = |s: &str| {
         s.chars()
             .filter(|c| !c.is_control())
@@ -465,7 +495,11 @@ fn diagnostic(
     }) {
         parts.push(code.into());
     }
-    if let Some(message) = meta.message().map(clean).filter(|s| !s.trim().is_empty()) {
+    if let Some(message) = meta
+        .message()
+        .map(|message| clean(&redact(message)))
+        .filter(|s| !s.trim().is_empty())
+    {
         parts.push(message);
     }
     if let Some(id) = meta.request_id().or(fallback_id).filter(|s| {
@@ -475,7 +509,7 @@ fn diagnostic(
     }) {
         parts.push(format!("request id: {id}"));
     }
-    parts.join(": ")
+    redact(&parts.join(": "))
 }
 fn bearer_client(builder: aws_sdk_bedrockruntime::config::Builder, token: &str) -> Client {
     let config = builder
@@ -668,9 +702,10 @@ fn request_error(
     e: aws_sdk_bedrockruntime::error::SdkError<
         aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
     >,
+    secrets: &[String],
 ) -> Error {
     if let Some(service) = e.as_service_error() {
-        let message = diagnostic(service.meta(), service.request_id());
+        let message = diagnostic(service.meta(), service.request_id(), secrets);
         if service.is_throttling_exception()
             || service.is_model_timeout_exception()
             || service.is_service_unavailable_exception()
@@ -1096,7 +1131,35 @@ impl Model for Bedrock {
                     .map_err(build_error)?,
             );
         }
-        let mut response = command.send().await.map_err(request_error)?;
+        let headers = self.headers.clone();
+        let mut secrets: Vec<_> = self
+            .headers
+            .values()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+        if let Some(token) = self.bearer.as_ref().filter(|token| !token.is_empty()) {
+            secrets.push(token.clone());
+        }
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        use tracing::instrument::WithSubscriber;
+        let has_secrets = !secrets.is_empty();
+        let mut request = command.customize();
+        if !headers.is_empty() {
+            request = request.mutate_request(move |request| headers::apply(request, &headers));
+        }
+        let request = request.send();
+        let guarded_dispatch = has_secrets.then(|| {
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            tracing::Dispatch::new(headers::SigningTraceGuard(dispatch))
+        });
+        let response = if let Some(dispatch) = &guarded_dispatch {
+            request.with_subscriber(dispatch.clone()).await
+        } else {
+            request.await
+        };
+        let mut response = response.map_err(|error| request_error(error, &secrets))?;
         let request_id = response.request_id().map(str::to_owned);
         Ok(Box::pin(async_stream::try_stream! {
             let mut calls: BTreeMap<i32, ToolCall> = BTreeMap::new();
@@ -1105,16 +1168,23 @@ impl Model for Bedrock {
             let mut text_blocks: BTreeMap<i32, String> = BTreeMap::new();
             let mut reasoning: BTreeMap<i32, ReasoningBlock> = BTreeMap::new();
             let mut stopped_blocks = BTreeSet::new();
-            while let Some(event)=response.stream.recv().await.map_err(|e| {
+            loop {
+                let receive = response.stream.recv();
+                let next = if let Some(dispatch) = &guarded_dispatch {
+                    receive.with_subscriber(dispatch.clone()).await
+                } else {
+                    receive.await
+                };
+                let Some(event) = next.map_err(|e| {
                 if let Some(service) = e.as_service_error() {
-                    let mut message=diagnostic(service.meta(), request_id.as_deref());
+                    let mut message=diagnostic(service.meta(), request_id.as_deref(), &secrets);
                     if service.meta().code().is_none() {
                         let code = if service.is_validation_exception() { Some("ValidationException") } else if service.is_throttling_exception() { Some("ThrottlingException") } else if service.is_service_unavailable_exception() { Some("ServiceUnavailableException") } else if service.is_internal_server_exception() { Some("InternalServerException") } else if service.is_model_stream_error_exception() { Some("ModelStreamErrorException") } else { None };
                         if let Some(code) = code { message.insert_str(0, &format!("{code}: ")); }
                     }
                     if service.is_throttling_exception() || service.is_service_unavailable_exception() || service.is_internal_server_exception() || service.is_model_stream_error_exception() { Error::RetryableModel(message) } else { Error::Model(message) }
                 } else { Error::RetryableModel("Bedrock stream transport failed".into()) }
-            })? {
+            })? else { break };
                 match event {
                     ConverseStreamOutput::ContentBlockStart(event) => if let Some(ContentBlockStart::ToolUse(tool))=event.start {
                         let index=event.content_block_index;
@@ -1199,6 +1269,56 @@ mod tests {
         );
         assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "answer"));
     }
+    #[tokio::test]
+    async fn prepared_identity_changes_with_effective_custom_headers() {
+        let config = aws_types::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_types::region::Region::new("us-east-1"))
+            .endpoint_url("https://example.invalid")
+            .credentials_provider(
+                aws_credential_types::provider::SharedCredentialsProvider::new(
+                    aws_credential_types::Credentials::new("access", "secret", None, None, "test"),
+                ),
+            )
+            .build();
+        let identity = |value: &'static str, reserved: &'static str| {
+            let config = config.clone();
+            async move {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-context", http::HeaderValue::from_static(value));
+                headers.insert("authorization", http::HeaderValue::from_static(reserved));
+                Bedrock::from_sdk_config(config)
+                    .with_headers(headers)
+                    .unwrap()
+                    .prepare_bedrock()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .context_identity()
+                    .unwrap()
+            }
+        };
+        let a = identity("private-a", "ignored-a").await;
+        let same = identity("private-a", "ignored-b").await;
+        let b = identity("private-b", "ignored-a").await;
+        assert_eq!(a, same);
+        assert_ne!(a, b);
+        let mut repeated = http::HeaderMap::new();
+        repeated.append("x-context", http::HeaderValue::from_static("private-a"));
+        repeated.append("x-context", http::HeaderValue::from_static("private-b"));
+        let repeated_identity = Bedrock::from_sdk_config(config)
+            .with_headers(repeated)
+            .unwrap()
+            .prepare_bedrock()
+            .await
+            .unwrap()
+            .unwrap()
+            .context_identity()
+            .unwrap();
+        assert_ne!(a, repeated_identity);
+        assert!(!a.contains("private-a"));
+    }
+
     #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn selected_profile_wins_over_ambient_keys_without_mutating_environment() {
@@ -1238,7 +1358,15 @@ mod tests {
                 .unwrap();
             assert_eq!(prepared.context_identity(), fresh.context_identity());
             assert!(prepared.context_identity().is_some());
-            let profile = chain.with_profile("selected".into());
+            let mut custom = http::HeaderMap::new();
+            custom.append("x-profile-route", http::HeaderValue::from_static("first"));
+            custom.append("x-profile-route", http::HeaderValue::from_static("second"));
+            let profile = chain
+                .with_headers(custom)
+                .unwrap()
+                .with_profile("selected".into());
+            let prepared = profile.prepare_bedrock().await.unwrap().unwrap();
+            assert_eq!(prepared.headers["x-profile-route"], ["first", "second"]);
             let credentials = profile
                 .load_config()
                 .await
@@ -2049,13 +2177,13 @@ mod tests {
             ErrorKind::ServerError,
         ] {
             assert!(matches!(
-                request_error(error(Some(kind))),
+                request_error(error(Some(kind)), &[]),
                 Error::RetryableModel(_)
             ));
         }
-        assert!(matches!(request_error(error(None)), Error::Config(_)));
+        assert!(matches!(request_error(error(None), &[]), Error::Config(_)));
         assert!(matches!(
-            request_error(error(Some(ErrorKind::ClientError))),
+            request_error(error(Some(ErrorKind::ClientError)), &[]),
             Error::Config(_)
         ));
     }
@@ -2066,7 +2194,7 @@ mod tests {
             .code("ValidationException")
             .message("bad\u{1b}[31m input\nnext")
             .build();
-        let text = diagnostic(&meta, Some("unsafe\nrequest-id"));
+        let text = diagnostic(&meta, Some("unsafe\nrequest-id"), &[]);
         assert_eq!(
             text,
             "Bedrock error: ValidationException: bad[31m inputnext"

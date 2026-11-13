@@ -498,10 +498,13 @@ impl Client {
             other => other,
         };
         // The keyed fingerprint protects low-entropy headers and adapter credentials.
-        let base = client
-            .clone()
-            .with_headers(HeaderMap::new())
-            .context_identity();
+        let base = match &client {
+            Self::Bedrock(_) => client.context_identity(),
+            _ => client
+                .clone()
+                .with_headers(HeaderMap::new())
+                .context_identity(),
+        };
         let mut header_values: Vec<_> = headers
             .iter()
             .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
@@ -547,11 +550,13 @@ impl Client {
                     .stream(request)
                     .await
             }
-            Self::Bedrock(_) if !defaults.is_empty() => Err(Error::Config(
-                "custom Bedrock headers are not supported".into(),
-            )),
-            Self::Bedrock(client) if cache_disabled => {
-                client.clone().for_summary().stream(request).await
+            Self::Bedrock(client) => {
+                let client = client.clone().with_default_headers(defaults)?;
+                if cache_disabled {
+                    client.for_summary().stream(request).await
+                } else {
+                    client.stream(request).await
+                }
             }
             Self::Deferred(client) => {
                 if client.observed {
@@ -582,10 +587,9 @@ impl Client {
             Self::Google(client) => Self::Google(client.with_headers(headers)),
             Self::PiMessages(client) => Self::PiMessages(client.with_headers(headers)),
             Self::OpenAi(client) => Self::OpenAi(client.with_headers(headers)),
-            Self::Bedrock(client) => Self::Bedrock(if headers.is_empty() {
-                client
-            } else {
-                client.unsupported("custom Bedrock headers are not supported")
+            Self::Bedrock(client) => Self::Bedrock(match client.clone().with_headers(headers) {
+                Ok(client) => client,
+                Err(_) => client.unsupported("invalid Bedrock custom headers"),
             }),
             Self::Deferred(_) => unreachable!("deferred provider headers resolve per request"),
         }
