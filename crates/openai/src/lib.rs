@@ -23,6 +23,37 @@ enum RawStreamError {
     Transport,
 }
 
+fn recognized_response_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "response.created"
+            | "response.queued"
+            | "response.in_progress"
+            | "response.output_item.added"
+            | "response.output_item.done"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.refusal.delta"
+            | "response.refusal.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_text.done"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.custom_tool_call_input.delta"
+            | "response.custom_tool_call_input.done"
+            | "response.completed"
+            | "response.incomplete"
+            | "response.failed"
+            | "response.done"
+    )
+}
+
 #[derive(Clone)]
 pub struct OpenAiResponses {
     client: Client,
@@ -448,11 +479,10 @@ impl Model for OpenAiResponses {
         let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
         // ChatGPT plan responses can be valid SSE without a Content-Type header.
         // The event parser still requires a valid response.completed event.
-        if !(content_type
+        let declared_sse = content_type
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("text/event-stream"))
-            || (content_type.is_none() && provider == "openai-chatgpt"))
-        {
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        if !(declared_sse || (content_type.is_none() && provider == "openai-chatgpt")) {
             return Err(Error::Model("expected OpenAI event stream".into()));
         }
         // Bound wire bytes before the SSE parser sees them. Coalesce incomplete
@@ -495,7 +525,7 @@ impl Model for OpenAiResponses {
                 if item.data == "[DONE]" { continue; }
                 let event: Value = serde_json::from_str(&item.data).map_err(|_| Error::Model("invalid OpenAI stream event".into()))?;
                 let kind = field(&event, "type")?;
-                started = true;
+                started |= recognized_response_event(kind);
                 match kind {
                     "response.output_text.delta" | "response.refusal.delta" => yield ModelEvent::Text(field(&event,"delta")?.into()),
                     "response.reasoning_summary_text.delta" => { let text = field(&event,"delta")?; reasoning.push_str(text); yield ModelEvent::Reasoning(text.into()); },
@@ -539,7 +569,7 @@ impl Model for OpenAiResponses {
                     _ => {}
                 }
             }
-            if started {
+            if declared_sse || started {
                 Err(Error::RetryableModel("OpenAI stream ended without response.completed".into()))?;
             } else {
                 Err(Error::Model("invalid OpenAI event stream".into()))?;
@@ -889,6 +919,61 @@ mod tests {
         let (client, server) =
             fixture_with_content_type("<html>wrong content type</html>", Some("text/html")).await;
         assert!(client.stream(request()).await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_declared_sse_remains_retryable_for_all_responses_providers() {
+        for provider in ["openai-chatgpt", "openai"] {
+            let (mut client, server) =
+                fixture_with_content_type("", Some("text/event-stream")).await;
+            client.provider = provider.into();
+            let error = client
+                .stream(request())
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableModel(message) if message.contains("without response.completed"))
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn headerless_unknown_events_do_not_mark_a_response_started() {
+        for kind in ["unrelated", "response.not_a_real_event"] {
+            let body = format!("data: {{\"type\":\"{kind}\"}}\n\n");
+            let (client, server) = fixture_with_content_type(&body, None).await;
+            let error = client
+                .stream(request())
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::Model(message) if message == "invalid OpenAI event stream")
+            );
+            server.await.unwrap();
+        }
+        let (client, server) = fixture_with_content_type(
+            "data: {\"type\":\"unrelated\"}\n\ndata: {\"type\":\"response.created\"}\n\n",
+            None,
+        )
+        .await;
+        let error = client
+            .stream(request())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableModel(message) if message.contains("without response.completed"))
+        );
         server.await.unwrap();
     }
 
