@@ -409,7 +409,7 @@ impl Deferred {
             _ => {}
         }
         if let Some(settings) = &self.http_settings {
-            client = client.with_http_settings(settings)?;
+            client = client.with_http_settings_and_env(settings, self.headers.environment())?;
         }
         if let Some((args, reported)) = &self.options {
             client = client.with_model_options(args, *reported)?;
@@ -448,9 +448,17 @@ impl Client {
     }
 
     pub fn with_http_settings(self, settings: &super::config::Settings) -> Result<Self> {
+        self.with_http_settings_and_env(settings, None)
+    }
+
+    pub fn with_http_settings_and_env(
+        self,
+        settings: &super::config::Settings,
+        env: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Self> {
         let this = match self {
             Self::Bedrock(client) => {
-                return Ok(match super::http_proxy::bedrock_client(settings)? {
+                return Ok(match super::http_proxy::bedrock_client(settings, env)? {
                     Some(http) => Self::Bedrock(client.with_http_client(http)),
                     None => Self::Bedrock(client),
                 });

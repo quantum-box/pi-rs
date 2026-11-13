@@ -183,13 +183,19 @@ impl Bedrock {
     }
 
     async fn load_config(&self) -> aws_types::SdkConfig {
-        let loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(client) = &self.http_client {
+            loader = loader.http_client(client.clone());
+        }
         if let Some(profile) = &self.profile {
             // Load the effective region first, including the selected profile's region.
             // The profile provider uses it for STS when assuming a role.
             let config = loader.profile_name(profile).load().await;
-            let provider_config = aws_config::provider_config::ProviderConfig::without_region()
+            let mut provider_config = aws_config::provider_config::ProviderConfig::without_region()
                 .with_region(config.region().cloned());
+            if let Some(client) = &self.http_client {
+                provider_config = provider_config.with_http_client(client.clone());
+            }
             let credentials = aws_config::profile::ProfileFileCredentialsProvider::builder()
                 .configure(&provider_config)
                 .profile_name(profile)
@@ -416,15 +422,22 @@ impl Bedrock {
         mut self,
         client: aws_smithy_runtime_api::client::http::SharedHttpClient,
     ) -> Self {
-        let existing = self.client.get().map(|current| {
-            Client::from_conf(
-                current
-                    .config()
-                    .to_builder()
-                    .http_client(client.clone())
-                    .build(),
-            )
-        });
+        // Environment-backed credential providers must be rebuilt with the
+        // transport as well, including any previously loaded SDK config.
+        let existing = if self.environment_config {
+            self.known_config = Some(std::sync::Arc::new(tokio::sync::OnceCell::new()));
+            None
+        } else {
+            self.client.get().map(|current| {
+                Client::from_conf(
+                    current
+                        .config()
+                        .to_builder()
+                        .http_client(client.clone())
+                        .build(),
+                )
+            })
+        };
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(existing));
         self.http_client = Some(client);
         self.prepared_identity = None;

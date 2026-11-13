@@ -55,6 +55,9 @@ impl RequestHeaders {
         self.env = env.cloned();
         self
     }
+    pub fn environment(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.env.as_ref()
+    }
     pub fn has_command(&self) -> bool {
         self.values.values().any(|value| value.starts_with('!'))
     }

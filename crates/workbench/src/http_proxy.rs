@@ -65,14 +65,29 @@ fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Ve
 /// Build a Smithy transport that applies the proxy decision to each request URL.
 pub(super) fn bedrock_client(
     settings: &crate::config::Settings,
+    provider_env: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Option<aws_smithy_runtime_api::client::http::SharedHttpClient>> {
     use aws_smithy_http_client::{Connector, proxy::ProxyConfig, tls};
     use aws_smithy_runtime_api::client::http::{SharedHttpConnector, http_client_fn};
     let env = |lower, upper| {
-        std::env::var(lower)
-            .ok()
+        provider_env
+            .and_then(|env| env.get(lower))
+            .and_then(serde_json::Value::as_str)
             .filter(|v| !v.is_empty())
-            .or_else(|| std::env::var(upper).ok().filter(|v| !v.is_empty()))
+            .map(str::to_owned)
+            .or_else(|| {
+                provider_env
+                    .and_then(|env| env.get(upper))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                std::env::var(lower)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| std::env::var(upper).ok().filter(|v| !v.is_empty()))
+            })
     };
     let all = env("all_proxy", "ALL_PROXY");
     let fallback = settings
@@ -86,6 +101,16 @@ pub(super) fn bedrock_client(
         .or(all)
         .or_else(|| fallback.map(str::to_owned));
     let excluded = env("no_proxy", "NO_PROXY").unwrap_or_default();
+    // Credentials from instance/container metadata must never traverse a proxy.
+    // Custom endpoints are matched by origin, not by URL prefix.
+    let metadata_origins = [
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var(name).ok())
+    .filter_map(|value| Url::parse(&value).ok())
+    .collect::<Vec<_>>();
     let http = parse_proxy(http.as_deref())?;
     let https = parse_proxy(https.as_deref())?;
     if http.is_none() && https.is_none() {
@@ -121,6 +146,7 @@ pub(super) fn bedrock_client(
             http,
             https,
             excluded: excluded.clone(),
+            metadata_origins: metadata_origins.clone(),
         })
     })))
 }
@@ -130,6 +156,7 @@ struct BedrockConnector {
     http: Option<aws_smithy_runtime_api::client::http::SharedHttpConnector>,
     https: Option<aws_smithy_runtime_api::client::http::SharedHttpConnector>,
     excluded: String,
+    metadata_origins: Vec<Url>,
 }
 impl std::fmt::Debug for BedrockConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -141,28 +168,61 @@ impl aws_smithy_runtime_api::client::http::HttpConnector for BedrockConnector {
         &self,
         request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
     ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
-        let proxy = Url::parse(request.uri()).ok().and_then(|url| {
-            if bedrock_bypasses_proxy(&url, &self.excluded) {
-                return None;
-            }
+        let Ok(url) = Url::parse(request.uri()) else {
+            use aws_smithy_runtime_api::client::{
+                http::HttpConnectorFuture, result::ConnectorError,
+            };
+            return HttpConnectorFuture::new(async {
+                Err(ConnectorError::user(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Invalid AWS request URL",
+                ))))
+            });
+        };
+        let metadata = matches!(
+            url.host_str().map(|h| h.trim_matches(['[', ']'])),
+            Some(
+                "169.254.169.254"
+                    | "fd00:ec2::254"
+                    | "169.254.170.2"
+                    | "169.254.170.23"
+                    | "fd00:ec2::23"
+            )
+        ) || self
+            .metadata_origins
+            .iter()
+            .any(|endpoint| endpoint.origin() == url.origin());
+        let proxy = if metadata || bedrock_bypasses_proxy(&url, &self.excluded) {
+            None
+        } else {
             match url.scheme() {
                 "http" => self.http.as_ref(),
                 "https" => self.https.as_ref(),
                 _ => None,
             }
-        });
+        };
         proxy.unwrap_or(&self.direct).call(request)
     }
 }
 
 fn bedrock_bypasses_proxy(url: &Url, excluded: &str) -> bool {
-    // Pi treats *.example.com like .example.com, including the apex.
+    // Pi treats both *.example.com and *example.com as domain suffixes.
     let normalized = excluded
         .split(|c: char| c == ',' || c.is_whitespace())
         .map(|entry| {
             entry
-                .strip_prefix("*.")
-                .map_or_else(|| entry.to_owned(), |tail| format!(".{tail}"))
+                .strip_prefix('*')
+                .filter(|_| entry != "*")
+                .map_or_else(
+                    || entry.to_owned(),
+                    |tail| {
+                        if tail.starts_with('.') {
+                            tail.to_owned()
+                        } else {
+                            format!(".{tail}")
+                        }
+                    },
+                )
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -331,6 +391,13 @@ mod tests {
         let child = Url::parse("https://api.example.com").unwrap();
         assert!(bedrock_bypasses_proxy(&apex, "*.example.com"));
         assert!(bedrock_bypasses_proxy(&child, "*.example.com"));
+        assert!(bedrock_bypasses_proxy(&apex, "*example.com"));
+        assert!(bedrock_bypasses_proxy(&child, "*example.com"));
+        assert!(!bedrock_bypasses_proxy(
+            &Url::parse("https://badexample.com").unwrap(),
+            "*example.com"
+        ));
+        assert!(bedrock_bypasses_proxy(&apex, "*"));
         assert!(!bedrock_bypasses_proxy(&apex, "*.example.com:80"));
     }
 
