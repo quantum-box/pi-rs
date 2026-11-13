@@ -336,7 +336,9 @@ async fn access_at(
             data.insert("kimi-coding".into(), serde_json::to_value(&value)?);
             Ok(())
         })?;
-        if minimum.is_some_and(|minimum| expires_soon(&value, minimum)) {
+        // Pi applies the same five-minute floor when an explicit minimum is
+        // requested after refresh; ordinary model access accepts the new token.
+        if minimum.is_some() && expires_soon(&value, refresh_window) {
             return Err(error("refreshed token expires too soon"));
         }
         Ok(value.access)

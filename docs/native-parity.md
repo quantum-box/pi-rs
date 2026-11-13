@@ -170,8 +170,9 @@ and live acceptance with a Vercel account remain open.
 The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,
 and the six pinned Kimi chat models. Their image limits, prices, context windows,
 and per-model reasoning settings remain distinct; the high-speed coding model
-uses its DeepSeek-style thinking switch. Subscription OAuth and live Kimi
-acceptance remain open.
+uses its DeepSeek-style thinking switch. Subscription OAuth supports device
+login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
+remains open.
 
 Markdown links use the reference's non-hyperlink terminal fallback: link text
 is underlined and destinations appear in parentheses only when they differ from
@@ -2903,7 +2904,10 @@ hidden files and dependency directories.
 or model. It supports JSON output and a read-only `--no-refresh` check.
 `print-api-key` and `print-bearer-token` explicitly resolve their own
 credential type. Model-specific endpoints are respected. Radius bearer
-tokens use the normal refresh path and accept `--min-expiry`. The default
+tokens use the normal refresh path and accept `--min-expiry`. Kimi bearer
+exports follow the pinned Pi resolver: after refresh, an explicit minimum is
+checked with a five-minute floor, even when a shorter minimum was requested.
+The rotated credential is saved before that check. The default
 check output contains only status and metadata.
 
 Loopback checks covered expired and refreshed Radius credentials,

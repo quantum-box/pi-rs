@@ -4493,8 +4493,13 @@ fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
 }
 
 #[test]
-fn kimi_bearer_minimum_checks_requested_lifetime_after_persisting_refresh() {
-    for (minimum, succeeds) in [("30s", true), ("3m", false)] {
+fn kimi_bearer_minimum_matches_pi_window_after_persisting_refresh() {
+    for (minimum, expires_in, succeeds) in [
+        ("30s", 120, false),
+        ("3m", 120, false),
+        ("30s", 600, true),
+        ("15m", 600, false),
+    ] {
         let root = tempfile::tempdir().unwrap();
         let auth = root.path().join("auth.json");
         std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0},"other":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
@@ -4517,7 +4522,9 @@ fn kimi_bearer_minimum_checks_requested_lifetime_after_persisting_refresh() {
             };
             let mut request = [0; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
-            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":120}"#;
+            let body = format!(
+                r#"{{"access_token":"new","refresh_token":"rotated","expires_in":{expires_in}}}"#
+            );
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
