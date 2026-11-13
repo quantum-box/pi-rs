@@ -214,6 +214,11 @@ impl Agent<'_> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        if input.is_none()
+            && let Some(record) = session.restore_tree_trigger_branch(run_id)?
+        {
+            observer(Notification::Committed(record));
+        }
         let recorded = session
             .records()
             .iter()
@@ -248,6 +253,20 @@ impl Agent<'_> {
             let Some(trigger_id) = session.pending_custom_trigger() else {
                 break;
             };
+            match session.restore_tree_trigger_branch(trigger_id) {
+                Ok(Some(record)) => observer(Notification::Committed(record)),
+                Ok(None) => {}
+                Err(error) => {
+                    observer(Notification::RunStarted { run_id: trigger_id });
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id: trigger_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    break;
+                }
+            }
             session.set_run_id(Some(trigger_id));
             observer(Notification::RunStarted { run_id: trigger_id });
             let trigger_result = self
@@ -534,7 +553,7 @@ impl Agent<'_> {
         Ok(())
     }
 
-    async fn resolve_prior_turn_end(
+    pub(crate) async fn resolve_prior_turn_end(
         &self,
         session: &mut Session,
         incoming_run: Uuid,

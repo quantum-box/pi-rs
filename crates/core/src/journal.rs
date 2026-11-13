@@ -1315,6 +1315,33 @@ impl Session {
         })
     }
 
+    /// Restore the branch that owns an interrupted session-wide tree trigger.
+    /// The current branch must be settled; the destination may contain the
+    /// pending operation that recovery is about to reconcile.
+    pub(crate) fn restore_tree_trigger_branch(&mut self, run_id: Uuid) -> Result<Option<&Record>> {
+        let is_tree_trigger = self.records.iter().any(|record| matches!(&record.event,
+            Event::TreeMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn));
+        if !is_tree_trigger || self.pending_custom_trigger() != Some(run_id) {
+            return Ok(None);
+        }
+        let Some(target) = self
+            .records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.run_id == Some(run_id) && !matches!(record.event, Event::Checkout { .. })
+            })
+            .map(|record| record.id)
+        else {
+            return Ok(None);
+        };
+        if self.branch().iter().any(|record| record.id == target) {
+            return Ok(None);
+        }
+        ensure_settled(self.operations())?;
+        self.append(Event::Checkout { target }).map(Some)
+    }
+
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
         self.queued_input_records()
             .filter_map(|record| match &record.event {
@@ -2774,6 +2801,58 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
 #[cfg(test)]
 mod session_metadata_tests {
     use super::*;
+
+    #[test]
+    fn tree_trigger_restore_rejects_an_unsettled_current_branch() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let trigger = Uuid::new_v4();
+        session
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: trigger,
+                    message: crate::CustomMessage {
+                        custom_type: "tree".into(),
+                        content: crate::ContextContent::Text("trigger".into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(trigger));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(1).unwrap();
+        let operation_id = Uuid::new_v4();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "tool".into(),
+                        name: "tool".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session.append(Event::ToolStarted { operation_id }).unwrap();
+        let head = session.head();
+        assert!(
+            matches!(session.restore_tree_trigger_branch(trigger), Err(Error::Reconciliation(id)) if id == operation_id)
+        );
+        assert_eq!(session.head(), head);
+        assert_eq!(session.pending_custom_trigger(), Some(trigger));
+    }
 
     #[test]
     fn dropping_the_store_unlocks_duplicated_file_descriptors() {

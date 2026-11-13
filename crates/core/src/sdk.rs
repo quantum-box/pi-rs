@@ -762,6 +762,19 @@ impl AgentSession {
         let Some(trigger_id) = self.session.pending_custom_trigger() else {
             return Ok(None);
         };
+        if let Some(record) = self
+            .session
+            .restore_tree_trigger_branch(trigger_id)?
+            .cloned()
+        {
+            if let Some(events) = &self.events {
+                emit(events, &Notification::Committed(&record));
+            }
+            self.refresh_input_hooks();
+            if let Some((model, _)) = self.session.model_selection() {
+                self.model_name = model;
+            }
+        }
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let mut observe = |event: Notification<'_>| {
@@ -1073,6 +1086,7 @@ impl AgentSession {
                 images = (!prepared.images.is_empty()).then_some(prepared.images);
             }
             if let Some(images) = images {
+                agent.resolve_prior_turn_end(&mut self.session, run_id, &active.token, &mut observe).await?;
                 self.session.append_user_with_images(
                     input.take().unwrap_or_default(),
                     images,
@@ -1960,6 +1974,172 @@ mod tests {
                 .unwrap();
         reopened.start().await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interrupted_tree_trigger_restores_its_branch_after_checkout() {
+        for delivered in [false, true] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tree-running.jsonl");
+            let mut journal = Session::open(&path).unwrap();
+            journal
+                .append_user_with_images("branch A".into(), vec![], None)
+                .unwrap();
+            let trigger_id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "tree-running".into(),
+                content: crate::ContextContent::Text("trigger".into()),
+                display: false,
+                details: None,
+            };
+            journal
+                .append(crate::Event::TreeMessageQueued {
+                    input: crate::QueuedCustomMessage {
+                        id: trigger_id,
+                        message: message.clone(),
+                        delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    },
+                })
+                .unwrap();
+            journal.set_run_id(Some(trigger_id));
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: None,
+                })
+                .unwrap();
+            if delivered {
+                journal
+                    .append(crate::Event::CustomMessageDelivered {
+                        id: trigger_id,
+                        message,
+                    })
+                    .unwrap();
+            }
+            journal.set_run_id(None);
+            journal.checkout(1).unwrap();
+            journal
+                .append_user_with_images("branch B".into(), vec![], None)
+                .unwrap();
+            let branch_b = journal.head();
+            drop(journal);
+            let mut reopened =
+                SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                    .open(&path)
+                    .unwrap();
+            reopened.start().await.unwrap();
+            assert!(reopened.journal().pending_custom_trigger().is_none());
+            assert_eq!(
+                reopened
+                    .journal()
+                    .records()
+                    .iter()
+                    .filter(|record| matches!(record.event,
+                crate::Event::CustomMessageDelivered { id, .. } if id == trigger_id))
+                    .count(),
+                1
+            );
+            assert!(reopened.journal().conversation_at(branch_b).unwrap().iter().any(|message| matches!(message, Message::User { content } if content == "branch B")));
+            {
+                let snapshots = requests.lock().unwrap();
+                assert_eq!(snapshots.len(), 1);
+                assert!(snapshots[0].iter().any(
+                    |message| matches!(message, Message::User { content } if content == "branch A")
+                ));
+                assert!(!snapshots[0].iter().any(
+                    |message| matches!(message, Message::User { content } if content == "branch B")
+                ));
+            }
+            drop(reopened);
+            let mut again =
+                SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                    .open(&path)
+                    .unwrap();
+            again.start().await.unwrap();
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn automatic_trigger_drain_restores_origin_after_another_run() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = TreeCaptureModel(requests.clone());
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("branch A".into(), vec![], None)
+            .unwrap();
+        let trigger_id = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "auto-tree".into(),
+            content: crate::ContextContent::Text("trigger".into()),
+            display: false,
+            details: None,
+        };
+        session
+            .append(crate::Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: trigger_id,
+                    message: message.clone(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(trigger_id));
+        session
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session
+            .append(crate::Event::CustomMessageDelivered {
+                id: trigger_id,
+                message,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(1).unwrap();
+        session
+            .append_user_with_images("branch B".into(), vec![], None)
+            .unwrap();
+        let branch_b = session.head();
+        let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
+        let answer = agent
+            .run_correlated(
+                &mut session,
+                Uuid::new_v4(),
+                Some("new prompt".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert!(session.pending_custom_trigger().is_none());
+        assert_eq!(
+            session
+                .records()
+                .iter()
+                .filter(|record| matches!(record.event,
+            crate::Event::CustomMessageDelivered { id, .. } if id == trigger_id))
+                .count(),
+            1
+        );
+        assert!(
+            session.conversation_at(branch_b).unwrap().iter().any(
+                |message| matches!(message, Message::User { content } if content == "branch B")
+            )
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
     #[async_trait::async_trait]
     impl Extension for BeforeTreeMessages {
@@ -5048,6 +5228,78 @@ mod tests {
         let user = records.iter().position(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "new prompt")).unwrap();
         assert!(completed < delivered && delivered < user);
         assert_eq!(records.iter().filter(|record| record.run_id == Some(old_run) && matches!(&record.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "turn-end-recovery")).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn image_prompt_resolves_previous_turn_before_journaling_input() {
+        let hook = Arc::new(TurnEndRecoveryHook {
+            before_first: false,
+            calls: AtomicUsize::new(1),
+            paused: tokio::sync::Notify::new(),
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let previous = Uuid::new_v4();
+        journal.set_run_id(Some(previous));
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: Some("old".into()),
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::User {
+                content: "old".into(),
+                input_id: Some(previous),
+            })
+            .unwrap();
+        let assistant_record = journal
+            .append(crate::Event::Assistant {
+                content: "old answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap()
+            .id;
+        journal.set_run_id(None);
+        let mut session =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .extension(hook)
+                .unwrap()
+                .build(journal)
+                .unwrap();
+        session
+            .prompt_with_images(
+                "new image",
+                vec![crate::ImageContent {
+                    data: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let records = session.journal().records();
+        let completed = records.iter().position(|record| matches!(record.event,
+            crate::Event::TurnEndCallbacksCompleted { assistant_record: id } if id == assistant_record)).unwrap();
+        let delivered = records.iter().position(|record| record.run_id == Some(previous) && matches!(&record.event,
+            crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "turn-end-recovery")).unwrap();
+        let image = records
+            .iter()
+            .position(|record| {
+                matches!(&record.event,
+            crate::Event::UserWithImages { content, .. } if content == "new image")
+            })
+            .unwrap();
+        assert!(completed < delivered && delivered < image);
+        let snapshots = requests.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        let before = snapshots[0]
+            .iter()
+            .position(|message| matches!(message, Message::User { content } if content == "one:1"))
+            .unwrap();
+        let image = snapshots[0].iter().position(|message| matches!(message, Message::UserWithImages { content, .. } if content == "new image")).unwrap();
+        assert!(before < image);
     }
 
     #[tokio::test]
