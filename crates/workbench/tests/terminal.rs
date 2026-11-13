@@ -1350,6 +1350,33 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         }
     };
     wait_level(displayed);
+    let wait_notifications = |master: &mut File, count: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // A full PTY output buffer can prevent the UI dispatching events.
+            let mut output = [0; 8192];
+            let _ = master.read(&mut output);
+            let entries: Vec<serde_json::Value> =
+                std::fs::read_to_string(home.join("events.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+            if entries.len() >= count {
+                return entries;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "selection events were not delivered: {entries:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let notifications = wait_notifications(&mut master, 1);
+    assert_eq!(
+        notifications[0],
+        serde_json::json!({"type":"thinking_level_select", "level":"high", "previousLevel":"low"})
+    );
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
         text.contains("Default thinking level per model")
@@ -1381,26 +1408,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         assert!(read_settings().get("modelThinkingLevels").is_none());
     }
     wait_level("low");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let notifications = loop {
-        // Keep draining the PTY while waiting: fullscreen redraws can fill its
-        // output buffer and block the UI before it dispatches the notification.
-        let mut output = [0; 8192];
-        let _ = master.read(&mut output);
-        let entries: Vec<serde_json::Value> = std::fs::read_to_string(home.join("events.jsonl"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-        if entries.len() >= 2 {
-            break entries;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "selection events were not delivered: {entries:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let notifications = wait_notifications(&mut master, 2);
     assert_eq!(
         notifications[0],
         serde_json::json!({"type":"thinking_level_select", "level":"high", "previousLevel":"low"})
@@ -1705,8 +1713,18 @@ fn exit_during_shell_restores_terminal_and_drains_late_key_release() {
         0
     );
     let original = unsafe { original.assume_init() };
+    #[cfg(debug_assertions)]
+    let barrier_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    #[cfg(debug_assertions)]
+    barrier_listener.set_nonblocking(true).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    #[cfg(debug_assertions)]
+    command.env(
+        "PI_RS_TEST_INPUT_DRAIN_BARRIER",
+        barrier_listener.local_addr().unwrap().to_string(),
+    );
     let mut process = Process(
-        Command::new(env!("CARGO_BIN_EXE_pi"))
+        command
             .current_dir(root.path())
             .env("PI_RS_HOME", root.path().join("home"))
             .env("TERM", "xterm-256color")
@@ -1731,7 +1749,33 @@ fn exit_during_shell_restores_terminal_and_drains_late_key_release() {
     output_until(&mut master, |text| text.contains("shell-running"));
     master.write_all(b"\x03\x03").unwrap();
     output_until(&mut master, |text| text.contains("\x1b[<u"));
+    #[cfg(debug_assertions)]
+    let mut barrier = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match barrier_listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("terminal drain barrier: {error}"),
+            }
+        }
+    };
+    #[cfg(debug_assertions)]
+    {
+        barrier
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut ready = [0];
+        barrier.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"D");
+    }
     master.write_all(b"\x1b[99;5:3u").unwrap();
+    #[cfg(debug_assertions)]
+    barrier.write_all(b"C").unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let mut state = std::mem::MaybeUninit::<libc::termios>::uninit();
