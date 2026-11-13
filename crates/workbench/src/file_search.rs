@@ -74,7 +74,7 @@ impl Grep {
         }
         result?;
         if self.context != 0 && !matches.is_empty() {
-            render_context(
+            render_context_or_unavailable(
                 path,
                 display,
                 &matches,
@@ -334,6 +334,57 @@ struct Block {
     after: Prefix,
 }
 
+// Pi keeps the match if a subsequent context read fails. Preserve prior
+// results and discard any partial context produced before an I/O failure.
+fn render_context_or_unavailable(
+    path: &Path,
+    display: &str,
+    matches: &[u64],
+    context: u64,
+    output: &mut Output,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let before = (
+        output.lines.len(),
+        output.total_bytes,
+        output.total_lines,
+        output.long_lines,
+        output.kept_bytes,
+        output.prefix_full,
+    );
+    match render_context(path, display, matches, context, output, cancellation) {
+        Ok(()) => Ok(()),
+        Err(Error::Io(_)) if !cancellation.is_cancelled() => {
+            output.lines.truncate(before.0);
+            output.total_bytes = before.1;
+            output.total_lines = before.2;
+            output.long_lines = before.3;
+            output.kept_bytes = before.4;
+            output.prefix_full = before.5;
+            for &number in matches {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                output.line(
+                    display,
+                    &ContextLine {
+                        number,
+                        text: "(unable to read file)".into(),
+                        truncated: false,
+                    },
+                    true,
+                );
+            }
+            Ok(())
+        }
+        Err(_) if cancellation.is_cancelled() => Err(Error::Cancelled),
+        Err(error) => Err(error),
+    }
+}
+
 fn render_context(
     path: &Path,
     display: &str,
@@ -456,6 +507,48 @@ mod tests {
         );
     }
     use serde_json::json;
+    #[test]
+    fn unavailable_context_keeps_matches_and_prior_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("removed");
+        let token = CancellationToken::new();
+        let mut output = Output {
+            matches: 3,
+            limit: 100,
+            ..Output::default()
+        };
+        output.line("earlier", &ContextLine::new(1, b"earlier match"), true);
+        render_context_or_unavailable(&missing, "removed", &[2, 5], 1, &mut output, &token)
+            .unwrap();
+        assert_eq!(
+            output.lines.join("\n"),
+            "earlier:1: earlier match\nremoved:2: (unable to read file)\nremoved:5: (unable to read file)"
+        );
+        assert_eq!(output.matches, 3);
+        assert_eq!(output.total_lines, 3);
+        assert_eq!(output.total_bytes, output.lines.join("\n").len() as u64);
+    }
+
+    #[test]
+    fn cancelled_context_does_not_fall_back_to_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut output = Output::default();
+        assert!(matches!(
+            render_context_or_unavailable(
+                &directory.path().join("removed"),
+                "removed",
+                &[1],
+                1,
+                &mut output,
+                &token
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert!(output.lines.is_empty());
+    }
+
     #[test]
     fn overlapping_context_is_repeated_for_each_matching_line() {
         let file = tempfile::NamedTempFile::new().unwrap();
