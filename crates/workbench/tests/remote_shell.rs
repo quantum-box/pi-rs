@@ -1,8 +1,9 @@
 use futures_util::stream;
 use pi_rs::*;
 use pi_rs_workbench::coding::{
-    BashOperations, CodingTools, ReadOperations, ShellConfig, ShellOutputStore, ShellSpawnContext,
-    create_bash_tool, create_bash_tool_with_shell_outputs, create_read_tool_with_shell_outputs,
+    BashOperations, CodingTools, ReadOperations, RemotePathOptions, ShellConfig, ShellOutputStore,
+    ShellSpawnContext, create_bash_tool, create_bash_tool_with_shell_outputs,
+    create_read_tool_with_options_and_shell_outputs, create_read_tool_with_shell_outputs,
 };
 use serde_json::json;
 use std::{
@@ -155,7 +156,7 @@ async fn paired_remote_read_can_page_only_its_shell_transcripts() {
     let read = create_read_tool_with_shell_outputs(
         std::env::temp_dir().as_path(),
         Arc::new(DenyRead),
-        store,
+        store.clone(),
     )
     .unwrap();
     let unrelated = create_read_tool_with_shell_outputs(
@@ -177,6 +178,21 @@ async fn paired_remote_read_can_page_only_its_shell_transcripts() {
     };
     let page = read
         .invoke(json!({"path":path, "offset":2, "limit":1}), context())
+        .await;
+    assert!(matches!(page, Outcome::Succeeded(text) if text.starts_with("hello\n")));
+    let transcript = Path::new(&path);
+    let combined = create_read_tool_with_options_and_shell_outputs(
+        std::env::temp_dir().as_path(),
+        Arc::new(DenyRead),
+        RemotePathOptions {
+            remote_home: Some(transcript.parent().unwrap().to_owned()),
+        },
+        store,
+    )
+    .unwrap();
+    let home_path = format!("~/{}", transcript.file_name().unwrap().to_string_lossy());
+    let page = combined
+        .invoke(json!({"path":home_path, "offset":2, "limit":1}), context())
         .await;
     assert!(matches!(page, Outcome::Succeeded(text) if text.starts_with("hello\n")));
     let denied = unrelated.invoke(json!({"path":path}), context()).await;
