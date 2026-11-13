@@ -232,6 +232,12 @@ pub enum ContextContent {
 pub enum ContentBlock {
     Text {
         text: String,
+        #[serde(
+            default,
+            rename = "textSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        text_signature: Option<String>,
     },
     Image {
         data: String,
@@ -240,11 +246,25 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        #[serde(
+            default,
+            rename = "thinkingSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thinking_signature: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        redacted: bool,
     },
     ToolCall {
         id: String,
         name: String,
         arguments: Value,
+        #[serde(
+            default,
+            rename = "thoughtSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
     },
 }
 
@@ -472,6 +492,9 @@ pub struct ModelMetadata {
     pub provider_prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<ResolvedModelIdentity>,
+    /// Provider adapter scope used to replay edited context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_identity: Option<ResolvedModelIdentity>,
     /// API actually used for this request, independent of the provider's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_api: Option<ModelApi>,
@@ -577,6 +600,22 @@ pub struct ResolvedModelIdentity {
 pub struct ProviderReplay {
     pub identity: ResolvedModelIdentity,
     pub blocks: Vec<Value>,
+}
+
+impl ProviderReplay {
+    pub fn is_context_edit(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| b.get("_pi_context_edit_api").is_some())
+    }
+
+    /// Edited replay is scoped to the originating transport as well as the model.
+    pub fn supports_api(&self, api: ModelApi) -> bool {
+        self.blocks
+            .iter()
+            .find_map(|b| b.get("_pi_context_edit_api").and_then(Value::as_str))
+            .is_none_or(|name| name == api.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -522,6 +522,7 @@ pub(super) fn imported_custom_message(entry: &Value, legacy: bool) -> Result<pi_
             match block["type"].as_str() {
                 Some("text") => result.push(pi_rs::ContentBlock::Text {
                     text: required(block, "text")?.into(),
+                    text_signature: block["textSignature"].as_str().map(str::to_owned),
                 }),
                 Some("image") => {
                     let (_, images) = user_content(&Value::Array(vec![block.clone()]))?;
@@ -740,7 +741,12 @@ fn convert(
                                         .as_str()
                                         .unwrap_or_default()
                                         .into(),
-                                    model: model.into(),
+                                    model: if message["api"] == "google-generative-ai" {
+                                        model.strip_prefix("models/").unwrap_or(model)
+                                    } else {
+                                        model
+                                    }
+                                    .into(),
                                 }
                             }),
                             ..Default::default()
@@ -1056,6 +1062,32 @@ mod tests {
         ]).unwrap();
         assert!(session.context_usage_estimate().last_usage_record.is_none());
         assert!(session.context_usage(1000).unwrap().tokens.is_some());
+    }
+
+    #[test]
+    fn imported_edit_keeps_signatures_but_unknown_endpoint_cannot_replay() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","provider":"google","api":"google-generative-ai","model":"gemini","content":[{"type":"text","text":"old"}],"stopReason":"stop"}}),
+            json!({"type":"context_edit","id":"e","parentId":"a","targetId":"a","replacement":{"content":[{"type":"text","text":"new","textSignature":"text-sig"},{"type":"thinking","thinking":"private","thinkingSignature":"sig"},{"type":"toolCall","id":"call","name":"read","arguments":{},"thoughtSignature":"call-sig"}]}}),
+        ]).unwrap();
+        assert!(
+            matches!(&session.current_messages()[0], Message::Assistant { content, replay: None, .. } if content == "new")
+        );
+        let event = session
+            .records()
+            .iter()
+            .find_map(|r| match &r.event {
+                Event::ContextEdited {
+                    replacement: Some(content),
+                    ..
+                } => Some(serde_json::to_value(content).unwrap()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(event[0]["textSignature"], "text-sig");
+        assert_eq!(event[1]["thinkingSignature"], "sig");
+        assert_eq!(event[2]["thoughtSignature"], "call-sig");
     }
 
     #[test]

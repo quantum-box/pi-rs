@@ -2,6 +2,7 @@
 mod agent;
 mod context;
 mod context_fingerprint;
+mod context_replay;
 mod extension;
 mod journal;
 mod lifecycle;
@@ -16,6 +17,7 @@ mod ui;
 pub use agent::*;
 pub use context::*;
 pub use context_fingerprint::protected_model_fingerprint;
+pub use context_replay::endpoint_replay_scope;
 pub use extension::*;
 pub use journal::*;
 pub use lifecycle::{

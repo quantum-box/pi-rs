@@ -232,7 +232,7 @@ pub fn thinking_levels(model: &str) -> Vec<String> {
     levels.iter().map(|level| (*level).into()).collect()
 }
 
-fn payload(request: &ModelRequest, provider: &str) -> Value {
+fn payload(request: &ModelRequest, provider: &str, edited_scope: &str) -> Value {
     let mut input = Vec::new();
     for message in &request.messages {
         match message {
@@ -251,9 +251,35 @@ fn payload(request: &ModelRequest, provider: &str) -> Value {
                 replay,
             } => {
                 if let Some(replay) = replay.as_deref().filter(|r| {
-                    r.identity.provider == provider && r.identity.model == request.model
+                    r.identity.provider
+                        == if r.is_context_edit() {
+                            edited_scope
+                        } else {
+                            provider
+                        }
+                        && r.identity.model == request.model
+                        && r.supports_api(pi_rs_core::ModelApi::OpenaiResponses)
                 }) {
-                    input.extend(replay.blocks.iter().cloned());
+                    let edited = replay
+                        .blocks
+                        .iter()
+                        .any(|block| block.get("_pi_context_edit_api").is_some());
+                    input.extend(
+                        replay
+                            .blocks
+                            .iter()
+                            .filter(|block| block.get("_pi_context_edit_api").is_none())
+                            .cloned()
+                            .map(|mut block| {
+                                if edited
+                                    && provider == "openai-chatgpt"
+                                    && block["type"] == "function_call"
+                                {
+                                    block["namespace"] = json!(NAMESPACE);
+                                }
+                                block
+                            }),
+                    );
                 } else {
                     if !content.is_empty() {
                         input.push(json!({"role":"assistant", "content":content}));
@@ -358,8 +384,14 @@ impl Model for OpenAiResponses {
             Message::Assistant {
                 replay: Some(replay),
                 ..
-            } if replay.identity.provider == self.provider
-                && replay.identity.model == request.model =>
+            } if replay.identity.provider
+                == if replay.is_context_edit() {
+                    pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str())
+                } else {
+                    self.provider.clone()
+                }
+                && replay.identity.model == request.model
+                && replay.supports_api(pi_rs_core::ModelApi::OpenaiResponses) =>
             {
                 pi_rs_core::estimate_replay_tokens(&replay.blocks)
                     .max(pi_rs_core::estimate_message_tokens(message))
@@ -370,7 +402,9 @@ impl Model for OpenAiResponses {
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         let model = request.model.clone();
-        let mut body = payload(&request, &self.provider);
+        let edited_scope =
+            pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
+        let mut body = payload(&request, &self.provider, &edited_scope);
         let provider = self.provider.clone();
         if let Some(thinking) = &self.thinking {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
@@ -459,7 +493,7 @@ impl Model for OpenAiResponses {
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
-                        yield ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
+                        yield ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() });
                         yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
                         return;
                     }
@@ -475,6 +509,59 @@ impl Model for OpenAiResponses {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edited_reasoning_is_endpoint_scoped_for_payload_and_budget() {
+        let a = OpenAiResponses::new_api_provider(
+            "https://one.example/v1/responses",
+            "token".into(),
+            "shared",
+        )
+        .unwrap();
+        let b = OpenAiResponses::new_api_provider(
+            "https://two.example/v1/responses",
+            "token".into(),
+            "shared",
+        )
+        .unwrap();
+        let scope_a = pi_rs_core::endpoint_replay_scope("shared", a.endpoint.as_str());
+        let scope_b = pi_rs_core::endpoint_replay_scope("shared", b.endpoint.as_str());
+        let assistant = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: scope_a.clone(),
+                    model: "m".into(),
+                },
+                blocks: vec![
+                    json!({"type":"reasoning","encrypted_content":"x".repeat(5000)}),
+                    json!({"role":"assistant","content":"answer"}),
+                    json!({"_pi_context_edit_api":"openai-responses"}),
+                ],
+            })),
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![assistant.clone()],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        assert_eq!(
+            payload(&request, "shared", &scope_a)["input"][0]["type"],
+            "reasoning"
+        );
+        assert!(
+            !payload(&request, "shared", &scope_b)
+                .to_string()
+                .contains("encrypted_content")
+        );
+        assert!(a.estimate_message_tokens(&request, &assistant) > 1000);
+        assert_eq!(
+            b.estimate_message_tokens(&request, &assistant),
+            pi_rs_core::estimate_message_tokens(&assistant)
+        );
+    }
 
     #[test]
     fn capacity_estimate_matches_image_and_replay_serialization() {
@@ -601,7 +688,7 @@ mod tests {
 
     #[test]
     fn plan_payload_uses_stateless_stream_and_namespaced_tools() {
-        let body = payload(&request(), "openai-chatgpt");
+        let body = payload(&request(), "openai-chatgpt", "openai-chatgpt");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "developer");
@@ -623,7 +710,7 @@ mod tests {
             }],
             replay: None,
         });
-        let body = payload(&request, "openai");
+        let body = payload(&request, "openai", "openai");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "read");
         assert!(body["input"][2].get("namespace").is_none());
@@ -637,7 +724,7 @@ mod tests {
     fn tool_images_are_sent_as_images_not_base64_text() {
         let mut request = request();
         request.messages.push(Message::Tool { is_structured: Some(true), is_error: false, call_id:"call".into(), content:json!({"data":{"content":[{"type":"text","text":"picture"},{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}}).to_string() });
-        let body = payload(&request, "openai-chatgpt");
+        let body = payload(&request, "openai-chatgpt", "openai-chatgpt");
         let output = &body["input"][2]["output"];
         assert_eq!(output[0]["type"], "input_text");
         assert!(!output[0]["text"].as_str().unwrap().contains("aW1hZ2U="));
@@ -657,10 +744,13 @@ mod tests {
             is_error: false,
             is_structured: Some(false),
         });
-        assert_eq!(payload(&request, "openai")["input"][2]["output"], text);
+        assert_eq!(
+            payload(&request, "openai", "openai")["input"][2]["output"],
+            text
+        );
         request.messages[2] =
             serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
-        let output = &payload(&request, "openai")["input"][2]["output"];
+        let output = &payload(&request, "openai", "openai")["input"][2]["output"];
         assert_eq!(output[1]["type"], "input_image");
         assert_eq!(output[1]["image_url"], "data:image/png;base64,aW1hZ2U=");
     }

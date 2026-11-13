@@ -1,8 +1,8 @@
+#[cfg(test)]
+use pi_rs_core::ModelRequest;
 use std::collections::BTreeSet;
 
-use pi_rs_core::{
-    Decision, Extension, ExtensionResult, ExtensionState, Message, ModelRequest, ToolContext,
-};
+use pi_rs_core::{Decision, Extension, ExtensionResult, ExtensionState, Message, ToolContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -82,14 +82,14 @@ impl Extension for PlanMode {
 
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let plan = match decode(state)? {
-            PlanState::Normal => return Ok(()),
+            PlanState::Normal => return Ok(pi_rs_core::ContextChange::Unchanged),
             PlanState::Planning { plan } => {
                 request
-                    .tools
+                    .tools_mut()
                     .retain(|tool| self.read_only.contains(&tool.name));
                 format!(
                     "Planning mode. Investigate with the approved read-only tools. Current plan:\n{plan}"
@@ -99,11 +99,9 @@ impl Extension for PlanMode {
                 "Accepted working plan. Follow the host's current authorization for each operation.\n{plan}"
             ),
         };
-        request.messages.insert(
-            1.min(request.messages.len()),
-            Message::User { content: plan },
-        );
-        Ok(())
+        let insert_at = 1.min(request.messages.len());
+        request.insert_user(insert_at, Message::User { content: plan })?;
+        Ok(pi_rs_core::ContextChange::Changed)
     }
 
     async fn before_tool(
@@ -149,7 +147,11 @@ mod tests {
                 .collect(),
             max_output_tokens: 32,
         };
-        extension.context(&mut request, Some(&state)).unwrap();
+        let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        extension.context(&mut guarded, Some(&state)).unwrap();
+        assert!(!access.assistant_accessed());
+        assert_eq!(access.user_edits().len(), 1);
         assert_eq!(request.tools.len(), 1);
         assert_eq!(request.tools[0].name, "read");
         let context = ToolContext {

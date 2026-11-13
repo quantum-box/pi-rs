@@ -12,6 +12,8 @@ pub struct ChatCompatibility {
     supports_reasoning_effort: Option<bool>,
     pub(super) supports_strict_mode: Option<bool>,
     pub(super) requires_reasoning_content_on_assistant_messages: Option<bool>,
+    pub(super) requires_thinking_as_text: Option<bool>,
+    pub(super) reasoning_field: Option<String>,
     max_tokens_field: Option<MaxTokensField>,
     thinking_format: Option<ThinkingFormat>,
     chat_template_args: Option<serde_json::Map<String, Value>>,
@@ -107,6 +109,10 @@ impl ChatCompatibility {
             requires_reasoning_content_on_assistant_messages: model
                 .requires_reasoning_content_on_assistant_messages
                 .or(self.requires_reasoning_content_on_assistant_messages),
+            requires_thinking_as_text: model
+                .requires_thinking_as_text
+                .or(self.requires_thinking_as_text),
+            reasoning_field: model.reasoning_field.or(self.reasoning_field),
             max_tokens_field: model.max_tokens_field.or(self.max_tokens_field),
             thinking_format: model.thinking_format.or(self.thinking_format),
             chat_template_args: model.chat_template_args.or(self.chat_template_args),

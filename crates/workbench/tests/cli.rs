@@ -4799,6 +4799,86 @@ else:
     );
 }
 
+fn read_kimi_fixture_request(stream: TcpStream) -> std::io::Result<(TcpStream, String, Vec<u8>)> {
+    // Accepted sockets can inherit nonblocking mode on Windows and macOS.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut first = String::new();
+    if reader.read_line(&mut first)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "missing HTTP request",
+        ));
+    }
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete HTTP headers",
+            ));
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+    }
+    if length > 64 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "oversized HTTP request",
+        ));
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    Ok((stream, first, body))
+}
+
+#[test]
+fn kimi_fixture_waits_for_request_bytes_after_accept() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        accepted_tx.send(()).unwrap();
+        let (_, first, body) = read_kimi_fixture_request(stream).unwrap();
+        read_tx.send((first, body)).unwrap();
+    });
+    let mut client = TcpStream::connect(address).unwrap();
+    accepted_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(read_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    client
+        .write_all(b"POST /api/oauth/token HTTP/1.1\r\nContent-Length: 4\r\n\r\ntest")
+        .unwrap();
+    let (first, body) = read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(first.starts_with("POST /api/oauth/token "));
+    assert_eq!(body, b"test");
+    server.join().unwrap();
+}
+
 #[test]
 fn kimi_bearer_minimum_matches_pi_window_after_persisting_refresh() {
     for (minimum, expires_in, succeeds) in [
@@ -4815,7 +4895,7 @@ fn kimi_bearer_minimum_matches_pi_window_after_persisting_refresh() {
         let host = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(15);
-            let mut stream = loop {
+            let stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error)
@@ -4827,8 +4907,9 @@ fn kimi_bearer_minimum_matches_pi_window_after_persisting_refresh() {
                     Err(error) => panic!("token request not received: {error}"),
                 }
             };
-            let mut request = [0; 4096];
-            assert!(stream.read(&mut request).unwrap() > 0);
+            let (mut stream, first, request) = read_kimi_fixture_request(stream).unwrap();
+            assert!(first.starts_with("POST /api/oauth/token "));
+            assert!(String::from_utf8_lossy(&request).contains("refresh_token=old-refresh"));
             let body = format!(
                 r#"{{"access_token":"new","refresh_token":"rotated","expires_in":{expires_in}}}"#
             );
@@ -4839,7 +4920,7 @@ fn kimi_bearer_minimum_matches_pi_window_after_persisting_refresh() {
             )
             .unwrap();
         });
-        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
             .current_dir(root.path())
             .env("PI_RS_HOME", root.path())
             .env("KIMI_CODE_OAUTH_HOST", host)
@@ -4852,9 +4933,25 @@ fn kimi_bearer_minimum_matches_pi_window_after_persisting_refresh() {
                 "--min-expiry",
                 minimum,
             ])
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let timed_out = child.try_wait().unwrap().is_none();
+        if timed_out {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
         server.join().unwrap();
+        assert!(
+            !timed_out,
+            "Kimi auth command timed out: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(
             output.status.success(),
             succeeds,

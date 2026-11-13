@@ -387,7 +387,7 @@ pub fn html(session: &Session) -> String {
                     pi_rs::ContextContent::Blocks(blocks) => {
                         for block in blocks {
                             match block {
-                                pi_rs::ContentBlock::Text { text } => {
+                                pi_rs::ContentBlock::Text { text, .. } => {
                                     render_export_markdown(&mut html, text)
                                 }
                                 pi_rs::ContentBlock::Image { data, mime_type } => {

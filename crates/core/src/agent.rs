@@ -23,6 +23,60 @@ use crate::{
     UsageReport,
 };
 
+// Provider replay may contain private thinking and opaque signatures. Hooks and
+// observers receive portable messages; only unchanged messages regain replay.
+fn portable_request(request: &ModelRequest) -> ModelRequest {
+    let mut portable = request.clone();
+    for message in &mut portable.messages {
+        if let Message::Assistant { replay, .. } = message {
+            *replay = None;
+        }
+    }
+    portable
+}
+
+// Only used when the host-controlled wrapper never exposed mutable assistant
+// messages or the message container to the hook.
+fn retain_replay_after_safe_hook(
+    original: &ModelRequest,
+    updated: &mut ModelRequest,
+    edits: &[crate::ContextUserEdit],
+) {
+    let mut mapping: Vec<Option<usize>> = (0..original.messages.len()).map(Some).collect();
+    for edit in edits {
+        match edit {
+            crate::ContextUserEdit::Insert { index, .. } if *index <= mapping.len() => {
+                mapping.insert(*index, None)
+            }
+            crate::ContextUserEdit::Remove { index } if *index < mapping.len() => {
+                mapping.remove(*index);
+            }
+            _ => return,
+        }
+    }
+    if mapping.len() != updated.messages.len() {
+        return;
+    }
+    for (source, after) in mapping.iter().zip(&updated.messages) {
+        if let Some(index) = source
+            && let Message::Assistant { content, calls, .. } = &original.messages[*index]
+            && !matches!(after, Message::Assistant { content: other, calls: other_calls, .. } if content == other && calls == other_calls)
+        {
+            return;
+        }
+    }
+    for (source, after) in mapping.into_iter().zip(&mut updated.messages) {
+        if let Some(index) = source
+            && let (
+                Message::Assistant { replay: source, .. },
+                Message::Assistant { replay: target, .. },
+            ) = (&original.messages[index], after)
+        {
+            *target = source.clone();
+        }
+    }
+}
+
 /// Shared switch checked before each automatic context compaction.
 #[derive(Clone, Debug)]
 pub struct AutoCompactionControl {
@@ -1678,6 +1732,9 @@ impl Agent<'_> {
             None
         };
         for extension in &self.registry.extensions {
+            let mut portable = portable_request(&request);
+            let mut guarded = crate::ContextRequest::new(&mut portable);
+            let access = guarded.access();
             let (sender, mut incoming) = mpsc::channel(32);
             let host: Arc<dyn ToolHost> = match session.current_run_id() {
                 Some(run_id) => callback_root_host(
@@ -1700,7 +1757,7 @@ impl Agent<'_> {
                 let future = tokio::time::timeout(
                     self.limits.model_timeout,
                     extension.before_request_with_host(
-                        &mut request,
+                        &mut guarded,
                         purpose,
                         states.get(extension.id()),
                         host,
@@ -1721,7 +1778,14 @@ impl Agent<'_> {
                     }
                 }
             };
+            let unsafe_access = access.assistant_accessed();
             hook(extension.as_ref(), result)?;
+            if !unsafe_access {
+                retain_replay_after_safe_hook(&request, &mut portable, &access.user_edits());
+            } else {
+                portable = portable_request(&portable);
+            }
+            request = portable;
         }
         for extension in &self.registry.extensions {
             if !extension.handles_context_with_system() {
@@ -1729,6 +1793,9 @@ impl Agent<'_> {
             }
             let had_leading_system =
                 matches!(request.messages.first(), Some(Message::System { .. }));
+            let mut portable = portable_request(&request);
+            let mut guarded = crate::ContextMessages::new(&mut portable.messages);
+            let access = guarded.access();
             let (sender, mut incoming) = mpsc::channel(32);
             let host: Arc<dyn ToolHost> = match session.current_run_id() {
                 Some(run_id) => callback_root_host(
@@ -1751,7 +1818,7 @@ impl Agent<'_> {
                 let future = tokio::time::timeout(
                     self.limits.model_timeout,
                     extension.context_with_system_with_host(
-                        &mut request.messages,
+                        &mut guarded,
                         states.get(extension.id()),
                         host,
                     ),
@@ -1771,7 +1838,14 @@ impl Agent<'_> {
                     }
                 }
             };
+            let unsafe_access = access.assistant_accessed();
             hook(extension.as_ref(), result)?;
+            if !unsafe_access {
+                retain_replay_after_safe_hook(&request, &mut portable, &access.user_edits());
+            } else {
+                portable = portable_request(&portable);
+            }
+            request = portable;
             if had_leading_system
                 && !matches!(request.messages.first(), Some(Message::System { .. }))
             {
@@ -1880,7 +1954,7 @@ impl Agent<'_> {
             },
             observer,
         )?;
-        observer(Notification::Request(&request));
+        observer(Notification::Request(&portable_request(&request)));
         const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
         let mut content = String::new();
         let mut metadata = ModelMetadata::default();
@@ -5856,5 +5930,753 @@ mod queue_tests {
             crate::QueueMode::OneAtATime
         );
         assert_eq!(fork.queue_mode(InputKind::Steer), crate::QueueMode::All);
+    }
+}
+
+#[cfg(test)]
+mod request_privacy_tests {
+    use super::*;
+    use crate::{
+        Extension, ExtensionResult, ExtensionState, MemoryStore, ModelApi, ProviderReplay,
+        ResolvedModelIdentity,
+    };
+    use std::sync::Mutex;
+
+    struct Hook {
+        seen: Arc<Mutex<Vec<String>>>,
+        rewrite_before: bool,
+        rewrite_after: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for Hook {
+        fn id(&self) -> &str {
+            "privacy-test"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(&**request).unwrap());
+            if self.rewrite_before
+                && let Some(Message::Assistant { content, .. }) = request
+                    .messages
+                    .iter_mut()
+                    .find(|m| matches!(m, Message::Assistant { .. }))
+            {
+                *content = "changed".into();
+            }
+            Ok(if self.rewrite_before {
+                crate::ContextChange::Changed
+            } else {
+                crate::ContextChange::Unchanged
+            })
+        }
+        async fn before_request_with_host(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            purpose: RequestPurpose,
+            state: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            let change = self.before_request(request, purpose, state).await?;
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "privacy-host".into(),
+                    content: crate::ContextContent::Text("request hook".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::NextTurn,
+            )
+            .await?;
+            Ok(change)
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(&**messages).unwrap());
+            if self.rewrite_after
+                && let Some(Message::Assistant { content, .. }) = messages
+                    .iter_mut()
+                    .find(|m| matches!(m, Message::Assistant { .. }))
+            {
+                *content = "changed".into();
+            }
+            Ok(if self.rewrite_after {
+                crate::ContextChange::Changed
+            } else {
+                crate::ContextChange::Unchanged
+            })
+        }
+        async fn context_with_system_with_host(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            state: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            let change = self.context_with_system(messages, state).await?;
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "privacy-host".into(),
+                    content: crate::ContextContent::Text("context hook".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::NextTurn,
+            )
+            .await?;
+            Ok(change)
+        }
+    }
+    struct CaptureModel(Arc<Mutex<Vec<ModelRequest>>>);
+    #[async_trait::async_trait]
+    impl Model for CaptureModel {
+        async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            self.0.lock().unwrap().push(request);
+            Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )])))
+        }
+    }
+    #[test]
+    fn mutation_tracker_survives_replacing_hook_wrapper() {
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let mut guarded = crate::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        guarded.messages.push(Message::User {
+            content: "changed".into(),
+        });
+        let alternate = Box::leak(Box::new(ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        }));
+        guarded = crate::ContextRequest::new(alternate);
+        assert!(!guarded.access().assistant_accessed());
+        assert!(access.assistant_accessed());
+    }
+
+    struct DefaultNoop;
+    #[async_trait::async_trait]
+    impl Extension for DefaultNoop {
+        fn id(&self) -> &str {
+            "default-noop"
+        }
+    }
+
+    struct SystemNoop;
+    #[async_trait::async_trait]
+    impl Extension for SystemNoop {
+        fn id(&self) -> &str {
+            "system-noop"
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+    }
+
+    struct ReplaceIdentical {
+        after: bool,
+        lie: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ReplaceIdentical {
+        fn id(&self) -> &str {
+            "replace-identical"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            if self.after {
+                return Ok(crate::ContextChange::Unchanged);
+            }
+            let index = request
+                .messages
+                .iter()
+                .position(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap();
+            let Message::Assistant { content, calls, .. } = request.messages.remove(index) else {
+                unreachable!()
+            };
+            request.messages.insert(
+                index,
+                Message::Assistant {
+                    content,
+                    calls,
+                    replay: None,
+                },
+            );
+            Ok(if self.lie {
+                crate::ContextChange::Unchanged
+            } else {
+                crate::ContextChange::Changed
+            })
+        }
+        fn handles_context_with_system(&self) -> bool {
+            self.after
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            let index = messages
+                .iter()
+                .position(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap();
+            let Message::Assistant { content, calls, .. } = messages.remove(index) else {
+                unreachable!()
+            };
+            messages.insert(
+                index,
+                Message::Assistant {
+                    content,
+                    calls,
+                    replay: None,
+                },
+            );
+            Ok(if self.lie {
+                crate::ContextChange::Unchanged
+            } else {
+                crate::ContextChange::Changed
+            })
+        }
+    }
+
+    struct SafeEdits;
+    #[async_trait::async_trait]
+    impl Extension for SafeEdits {
+        fn id(&self) -> &str {
+            "safe-edits"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            request.tools_mut().clear();
+            request
+                .system_content_mut()
+                .unwrap()
+                .push_str(" safely modified");
+            Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    struct SafeSystemHook;
+    #[async_trait::async_trait]
+    impl Extension for SafeSystemHook {
+        fn id(&self) -> &str {
+            "safe-system"
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            messages
+                .system_content_mut()
+                .unwrap()
+                .push_str(" safe system edit");
+            Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    struct SafeUserEdits {
+        after: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for SafeUserEdits {
+        fn id(&self) -> &str {
+            "safe-user-edits"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            if !self.after {
+                request.insert_user(
+                    1,
+                    Message::User {
+                        content: "inserted".into(),
+                    },
+                )?;
+                request.remove_user(2)?;
+            }
+            Ok(crate::ContextChange::Changed)
+        }
+        fn handles_context_with_system(&self) -> bool {
+            self.after
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            messages.insert_user(
+                1,
+                Message::User {
+                    content: "inserted".into(),
+                },
+            )?;
+            messages.remove_user(2)?;
+            Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    fn tool_group(count: usize) -> Vec<Message> {
+        let calls: Vec<_> = (0..count)
+            .map(|i| crate::ToolCall {
+                id: format!("call-{i}"),
+                name: "tool".into(),
+                arguments: "{}".into(),
+            })
+            .collect();
+        let mut messages = vec![
+            Message::System {
+                content: "system".into(),
+            },
+            Message::Assistant {
+                content: String::new(),
+                calls,
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: "p".into(),
+                        model: "m".into(),
+                    },
+                    blocks: vec![serde_json::json!({"private":"signature"})],
+                })),
+            },
+        ];
+        messages.extend((0..count).map(|i| Message::Tool {
+            call_id: format!("call-{i}"),
+            content: "result".into(),
+            is_error: false,
+            is_structured: Some(false),
+        }));
+        messages.push(Message::User {
+            content: "later".into(),
+        });
+        messages
+    }
+
+    #[test]
+    fn tracked_insertions_cannot_split_single_or_parallel_tool_groups() {
+        for count in [1, 3] {
+            let original = tool_group(count);
+            for index in 2..2 + count {
+                let mut request = ModelRequest {
+                    model: "m".into(),
+                    messages: original.clone(),
+                    tools: vec![],
+                    max_output_tokens: 8,
+                };
+                let mut guarded = crate::ContextRequest::new(&mut request);
+                let access = guarded.access();
+                assert!(
+                    guarded
+                        .insert_user(
+                            index,
+                            Message::User {
+                                content: "injected".into()
+                            }
+                        )
+                        .is_err()
+                );
+                assert!(access.user_edits().is_empty());
+                assert_eq!(request.messages, original);
+                let mut messages = original.clone();
+                let mut guarded = crate::ContextMessages::new(&mut messages);
+                let access = guarded.access();
+                assert!(
+                    guarded
+                        .insert_user(
+                            index,
+                            Message::User {
+                                content: "injected".into()
+                            }
+                        )
+                        .is_err()
+                );
+                assert!(access.user_edits().is_empty());
+                assert_eq!(messages, original);
+            }
+            for index in [1, 2 + count] {
+                let mut request = ModelRequest {
+                    model: "m".into(),
+                    messages: original.clone(),
+                    tools: vec![],
+                    max_output_tokens: 8,
+                };
+                let mut guarded = crate::ContextRequest::new(&mut request);
+                let access = guarded.access();
+                guarded
+                    .insert_user(
+                        index,
+                        Message::User {
+                            content: "allowed".into(),
+                        },
+                    )
+                    .unwrap();
+                assert!(!access.assistant_accessed());
+                assert_eq!(access.user_edits().len(), 1);
+                assert!(request.messages.iter().any(|m| matches!(
+                    m,
+                    Message::Assistant {
+                        replay: Some(_),
+                        ..
+                    }
+                )));
+            }
+            let mut pending = original[..2].to_vec();
+            let mut guarded = crate::ContextMessages::new(&mut pending);
+            assert!(
+                guarded
+                    .insert_user(
+                        2,
+                        Message::User {
+                            content: "early".into()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn pending_parallel_calls_require_each_result_before_insertion() {
+        let mut pending = tool_group(2);
+        if let Message::Assistant { calls, .. } = &mut pending[1] {
+            calls[1].id = calls[0].id.clone();
+        }
+        pending.truncate(3);
+        let mut guarded = crate::ContextMessages::new(&mut pending);
+        assert!(
+            guarded
+                .insert_user(
+                    3,
+                    Message::User {
+                        content: "early".into()
+                    }
+                )
+                .is_err()
+        );
+        guarded.push(Message::Tool {
+            call_id: "call-0".into(),
+            content: "second result".into(),
+            is_error: false,
+            is_structured: Some(false),
+        });
+        guarded
+            .insert_user(
+                4,
+                Message::User {
+                    content: "after".into(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn tracked_user_operations_reject_assistant_insertion_and_removal() {
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "a".into(),
+                calls: vec![],
+                replay: None,
+            }],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let mut guarded = crate::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        assert!(guarded.remove_user(0).is_err());
+        assert!(
+            guarded
+                .insert_user(
+                    0,
+                    Message::Assistant {
+                        content: "a".into(),
+                        calls: vec![],
+                        replay: None
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            guarded
+                .insert_user(
+                    9,
+                    Message::User {
+                        content: "bad".into()
+                    }
+                )
+                .is_err()
+        );
+        assert!(access.user_edits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_hook_status_preserves_default_noop_and_rejects_identical_replacement() {
+        for text in ["same visible text", ""] {
+            for mode in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] {
+                let mut session = Session::with_store(MemoryStore::default()).unwrap();
+                session
+                    .append(Event::User {
+                        content: "question".into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+                for secret in ["private-a", "private-b"] {
+                    let id = Uuid::new_v4();
+                    session
+                        .append(Event::ModelFinished {
+                            request_id: id,
+                            metadata: ModelMetadata {
+                                replay: Some(Box::new(ProviderReplay {
+                                    identity: ResolvedModelIdentity {
+                                        provider: "provider".into(),
+                                        model: "m".into(),
+                                    },
+                                    blocks: vec![serde_json::json!({"private":secret})],
+                                })),
+                                ..Default::default()
+                            },
+                            usage: UsageReport::Unconfirmed,
+                            failure: None,
+                            partial: String::new(),
+                            reply: None,
+                        })
+                        .unwrap();
+                    session
+                        .append(Event::Assistant {
+                            content: text.into(),
+                            invocations: vec![],
+                            usage: None,
+                            request_id: Some(id),
+                        })
+                        .unwrap();
+                }
+                let mut registry = Registry::default();
+                if mode == 0 {
+                    registry.register(Arc::new(DefaultNoop)).unwrap();
+                } else if mode == 3 {
+                    registry.register(Arc::new(SystemNoop)).unwrap();
+                } else if mode == 6 {
+                    registry.register(Arc::new(SafeEdits)).unwrap();
+                } else if mode == 7 {
+                    registry.register(Arc::new(SafeSystemHook)).unwrap();
+                } else if mode == 8 || mode == 9 {
+                    registry
+                        .register(Arc::new(SafeUserEdits { after: mode == 9 }))
+                        .unwrap();
+                } else {
+                    registry
+                        .register(Arc::new(ReplaceIdentical {
+                            after: mode == 2 || mode == 5,
+                            lie: mode >= 4,
+                        }))
+                        .unwrap();
+                }
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let model = CaptureModel(captured);
+                let agent = Agent {
+                    model: &model,
+                    model_name: "m",
+                    registry: &registry,
+                    system_prompt: "system",
+                    limits: Limits::default(),
+                };
+                let (request, transformed) = agent
+                    .request(
+                        &mut session,
+                        &ExtensionStates::default(),
+                        128,
+                        None,
+                        RequestPurpose::Turn,
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                    )
+                    .await
+                    .unwrap();
+                let replay: Vec<_> = request
+                    .messages
+                    .iter()
+                    .filter_map(|m| match m {
+                        Message::Assistant { replay, .. } => Some(replay.as_ref()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(replay.len(), 2);
+                if mode == 0 || mode == 3 || mode == 6 || mode == 7 || mode == 8 || mode == 9 {
+                    assert_eq!(transformed, mode >= 6);
+                    assert_eq!(replay[0].unwrap().blocks[0]["private"], "private-a");
+                    assert_eq!(replay[1].unwrap().blocks[0]["private"], "private-b");
+                } else {
+                    assert!(transformed);
+                    assert!(replay.iter().all(|value| value.is_none()));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hooks_and_notifications_hide_edited_replay_and_restore_only_unchanged() {
+        for (rewrite_before, rewrite_after) in [(false, false), (true, false), (false, true)] {
+            let rewrite = rewrite_before || rewrite_after;
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "question".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            let request_id = Uuid::new_v4();
+            session
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: ModelMetadata {
+                        provider_api: Some(ModelApi::GoogleGenerativeAi),
+                        replay_identity: Some(ResolvedModelIdentity {
+                            provider: crate::endpoint_replay_scope("google", "https://example.com"),
+                            model: "m".into(),
+                        }),
+                        ..Default::default()
+                    },
+                    usage: UsageReport::Unconfirmed,
+                    failure: None,
+                    partial: String::new(),
+                    reply: None,
+                })
+                .unwrap();
+            let target = session
+                .append(Event::Assistant {
+                    content: "old".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: Some(request_id),
+                })
+                .unwrap()
+                .id;
+            let replacement = serde_json::from_value(serde_json::json!([{"type":"thinking","thinking":"private-thinking","thinkingSignature":"private-signature"},{"type":"text","text":"visible"}])).unwrap();
+            session.edit_context(target, Some(replacement)).unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(Hook {
+                    seen: seen.clone(),
+                    rewrite_before,
+                    rewrite_after,
+                }))
+                .unwrap();
+            let model = CaptureModel(captured.clone());
+            let agent = Agent {
+                model: &model,
+                model_name: "m",
+                registry: &registry,
+                system_prompt: "system",
+                limits: Limits::default(),
+            };
+            let cancel = CancellationToken::new();
+            let mut notifications = Vec::new();
+            let mut observer = |event: Notification<'_>| {
+                if let Notification::Request(request) = event {
+                    notifications.push(serde_json::to_string(request).unwrap());
+                }
+            };
+            let (request, transformed) = agent
+                .request(
+                    &mut session,
+                    &ExtensionStates::default(),
+                    128,
+                    None,
+                    RequestPurpose::Turn,
+                    &cancel,
+                    &mut observer,
+                )
+                .await
+                .unwrap();
+            assert_eq!(transformed, rewrite);
+            agent
+                .reply::<AgentInput>(
+                    &mut session,
+                    request,
+                    true,
+                    transformed,
+                    &cancel,
+                    &mut observer,
+                    None,
+                )
+                .await
+                .unwrap();
+            let hooks = seen.lock().unwrap();
+            assert_eq!(hooks.len(), 2);
+            for exposed in hooks.iter().chain(notifications.iter()) {
+                assert!(!exposed.contains("private-thinking"));
+                assert!(!exposed.contains("private-signature"));
+            }
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(
+                session
+                    .queued_custom_messages()
+                    .iter()
+                    .filter(|(_, input)| input.message.custom_type == "privacy-host")
+                    .count(),
+                2
+            );
+            let captured = captured.lock().unwrap();
+            let Message::Assistant {
+                content, replay, ..
+            } = captured[0]
+                .messages
+                .iter()
+                .find(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(content, if rewrite { "changed" } else { "visible" });
+            assert_eq!(replay.is_some(), !rewrite);
+            if let Some(replay) = replay {
+                assert!(
+                    serde_json::to_string(replay)
+                        .unwrap()
+                        .contains("private-signature")
+                );
+            }
+        }
     }
 }

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pi_rs::{
-    Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState, Message, ModelRequest,
-    Outcome, Result, Tool, ToolContext, ToolExecution, ToolSpec,
+    Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState, Outcome, Result, Tool,
+    ToolContext, ToolExecution, ToolSpec,
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
@@ -127,10 +127,10 @@ impl Extension for ProjectInstructions {
 
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs::ContextRequest<'_>,
         _: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
-        let Some(Message::System { content }) = request.messages.first_mut() else {
+    ) -> ExtensionResult<pi_rs::ContextChange> {
+        let Some(content) = request.system_content_mut() else {
             return Err("system message missing".into());
         };
         content.push_str(
@@ -139,7 +139,7 @@ impl Extension for ProjectInstructions {
                 .context(&self.skills)
                 .map_err(|error| error.to_string())?,
         );
-        Ok(())
+        Ok(pi_rs::ContextChange::Changed)
     }
 }
 
@@ -173,17 +173,18 @@ impl Extension for WorkbenchContext {
 
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs::ContextRequest<'_>,
         _: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs::ContextChange> {
         if let Some(instruction) = &self.instruction {
-            let Some(Message::System { content }) = request.messages.first_mut() else {
+            let Some(content) = request.system_content_mut() else {
                 return Err("system message missing".into());
             };
             content.push_str("\n\n");
             content.push_str(instruction);
+            return Ok(pi_rs::ContextChange::Changed);
         }
-        Ok(())
+        Ok(pi_rs::ContextChange::Unchanged)
     }
 
     fn after_tool(

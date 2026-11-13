@@ -6021,11 +6021,11 @@ mod tests {
         }
         async fn before_request_with_host(
             &self,
-            _: &mut ModelRequest,
+            _: &mut crate::ContextRequest<'_>,
             _: crate::RequestPurpose,
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
-        ) -> crate::ExtensionResult<()> {
+        ) -> crate::ExtensionResult<crate::ContextChange> {
             if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
                 host.send_message(
                     crate::CustomMessage {
@@ -6038,7 +6038,7 @@ mod tests {
                 )
                 .await?;
             }
-            Ok(())
+            Ok(crate::ContextChange::Unchanged)
         }
     }
     #[tokio::test]
@@ -6081,10 +6081,10 @@ mod tests {
         }
         async fn context_with_system_with_host(
             &self,
-            _: &mut Vec<Message>,
+            _: &mut crate::ContextMessages<'_>,
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
-        ) -> crate::ExtensionResult<()> {
+        ) -> crate::ExtensionResult<crate::ContextChange> {
             if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
                 host.send_message(
                     crate::CustomMessage {
@@ -6097,7 +6097,7 @@ mod tests {
                 )
                 .await?;
             }
-            Ok(())
+            Ok(crate::ContextChange::Unchanged)
         }
     }
     #[tokio::test]
@@ -6812,26 +6812,26 @@ mod tests {
         }
         async fn before_request_with_host(
             &self,
-            _: &mut ModelRequest,
+            _: &mut crate::ContextRequest<'_>,
             _: crate::RequestPurpose,
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
-        ) -> crate::ExtensionResult<()> {
+        ) -> crate::ExtensionResult<crate::ContextChange> {
             if self.phase == "before_request" {
                 self.send(host).await?;
             }
-            Ok(())
+            Ok(crate::ContextChange::Unchanged)
         }
         async fn context_with_system_with_host(
             &self,
-            _: &mut Vec<Message>,
+            _: &mut crate::ContextMessages<'_>,
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
-        ) -> crate::ExtensionResult<()> {
+        ) -> crate::ExtensionResult<crate::ContextChange> {
             if self.phase == "context" {
                 self.send(host).await?;
             }
-            Ok(())
+            Ok(crate::ContextChange::Unchanged)
         }
     }
     #[tokio::test]
@@ -7676,11 +7676,11 @@ mod tests {
         }
         async fn before_request_with_host(
             &self,
-            _: &mut ModelRequest,
+            _: &mut crate::ContextRequest<'_>,
             _: crate::RequestPurpose,
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
-        ) -> crate::ExtensionResult<()> {
+        ) -> crate::ExtensionResult<crate::ContextChange> {
             let attempt = self.0.fetch_add(1, Ordering::SeqCst);
             host.send_message_with_key(
                 crate::CustomMessage {
@@ -7693,6 +7693,7 @@ mod tests {
                 "same",
             )
             .await
+            .map(|()| crate::ContextChange::Unchanged)
         }
     }
     #[tokio::test]
@@ -7748,11 +7749,11 @@ mod tests {
         }
         async fn before_request_with_host(
             &self,
-            _: &mut ModelRequest,
+            _: &mut crate::ContextRequest<'_>,
             _: crate::RequestPurpose,
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
-        ) -> crate::ExtensionResult<()> {
+        ) -> crate::ExtensionResult<crate::ContextChange> {
             host.send_message_with_key(
                 crate::CustomMessage {
                     custom_type: "turn-request".into(),
@@ -7764,6 +7765,7 @@ mod tests {
                 "same",
             )
             .await
+            .map(|()| crate::ContextChange::Unchanged)
         }
         async fn lifecycle_with_host(
             &self,
@@ -7908,11 +7910,11 @@ mod tests {
         }
         async fn before_request_with_host(
             &self,
-            _: &mut ModelRequest,
+            _: &mut crate::ContextRequest<'_>,
             _: crate::RequestPurpose,
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
-        ) -> crate::ExtensionResult<()> {
+        ) -> crate::ExtensionResult<crate::ContextChange> {
             host.send_message_with_key(
                 crate::CustomMessage {
                     custom_type: self.0.into(),
@@ -7924,6 +7926,7 @@ mod tests {
                 "same",
             )
             .await
+            .map(|()| crate::ContextChange::Unchanged)
         }
     }
     #[tokio::test]
@@ -8018,26 +8021,26 @@ mod tests {
         }
         async fn before_request_with_host(
             &self,
-            _: &mut ModelRequest,
+            _: &mut crate::ContextRequest<'_>,
             _: crate::RequestPurpose,
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
-        ) -> crate::ExtensionResult<()> {
+        ) -> crate::ExtensionResult<crate::ContextChange> {
             if self.phase == "before_request" {
                 self.send(host).await?;
             }
-            Ok(())
+            Ok(crate::ContextChange::Unchanged)
         }
         async fn context_with_system_with_host(
             &self,
-            _: &mut Vec<Message>,
+            _: &mut crate::ContextMessages<'_>,
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
-        ) -> crate::ExtensionResult<()> {
+        ) -> crate::ExtensionResult<crate::ContextChange> {
             if self.phase == "context" {
                 self.send(host).await?;
             }
-            Ok(())
+            Ok(crate::ContextChange::Unchanged)
         }
     }
     #[tokio::test]

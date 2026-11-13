@@ -27,6 +27,7 @@ pub struct Ollama {
     client: Client,
     http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
+    provider: String,
     token: Option<String>,
     headers: HeaderMap,
     cache_retention: CacheRetention,
@@ -109,6 +110,7 @@ impl Ollama {
             client,
             http_proxies: Vec::new(),
             endpoint,
+            provider: "ollama".into(),
             token,
             headers: HeaderMap::new(),
             cache_retention: CacheRetention::None,
@@ -236,27 +238,56 @@ impl Ollama {
         self
     }
 
+    /// Scope replay to the configured provider, even on shared gateways.
+    pub fn with_provider(mut self, provider: &str) -> Self {
+        self.provider = provider.to_owned();
+        self
+    }
+
     fn replay_identity(&self, model: &str) -> ResolvedModelIdentity {
         ResolvedModelIdentity {
-            provider: format!(
-                "chat-completions+sha256:{:x}",
-                Sha256::digest(self.endpoint.as_str().as_bytes())
-            ),
+            provider: pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str()),
             model: model.to_owned(),
         }
+    }
+
+    fn has_ambiguous_legacy_replay(&self, request: &ModelRequest) -> bool {
+        let scope = format!(
+            "chat-completions+sha256:{:x}",
+            Sha256::digest(self.endpoint.as_str().as_bytes())
+        );
+        request.messages.iter().any(|message| matches!(message, Message::Assistant { replay: Some(replay), .. } if replay.identity.model == request.model && replay.identity.provider == scope))
     }
 
     fn compatible_message(&self, message: Message, identity: &ResolvedModelIdentity) -> Vec<Value> {
         let mut reasoning = None;
         let mut details = Vec::new();
+        let mut edited_reasoning = Vec::new();
+        let mut edited_order = Vec::new();
         if let Message::Assistant {
             replay: Some(replay),
             ..
         } = &message
             && replay.identity == *identity
+            && replay.supports_api(ModelApi::OpenaiCompletions)
         {
             for block in &replay.blocks {
-                if block["type"] == "reasoning_content" {
+                if block["type"] == "context_edit_reasoning" {
+                    edited_reasoning.push(block.clone());
+                    edited_order.push(block.clone());
+                    if self.compatibility.preserves_reasoning_details()
+                        && let Some(items) = block["details"].as_array()
+                    {
+                        details.extend(
+                            items
+                                .iter()
+                                .filter(|item| reasoning_details::is_valid(item))
+                                .cloned(),
+                        );
+                    }
+                } else if block["type"] == "context_edit_text" {
+                    edited_order.push(block.clone());
+                } else if block["type"] == "reasoning_content" {
                     reasoning = block["text"].as_str().map(str::to_owned);
                 } else if self.compatibility.preserves_reasoning_details()
                     && reasoning_details::is_valid(block)
@@ -286,6 +317,76 @@ impl Ollama {
         }
         if !details.is_empty() {
             first["reasoning_details"] = Value::Array(details);
+        }
+        if !edited_reasoning.is_empty() && self.supports_reasoning != Some(false) {
+            let text = edited_reasoning
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if self.compatibility.requires_thinking_as_text == Some(true) {
+                let ordered: String = edited_order
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .collect();
+                first["content"] = json!(if edited_order
+                    .iter()
+                    .any(|b| b["type"] == "context_edit_text")
+                {
+                    ordered
+                } else if first["content"].as_str().unwrap_or_default().is_empty() {
+                    text
+                } else {
+                    format!(
+                        "{text}\n\n{}",
+                        first["content"].as_str().unwrap_or_default()
+                    )
+                });
+            } else {
+                let ordinary: Vec<_> = edited_reasoning
+                    .iter()
+                    .filter(|b| {
+                        !self.compatibility.preserves_reasoning_details()
+                            || !b["details"]
+                                .as_array()
+                                .is_some_and(|items| items.iter().any(reasoning_details::is_valid))
+                    })
+                    .collect();
+                let text = ordinary
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let field = ordinary
+                    .first()
+                    .and_then(|b| b["field"].as_str())
+                    .or(self.compatibility.reasoning_field.as_deref())
+                    .unwrap_or("reasoning_content");
+                if !text.is_empty()
+                    && matches!(field, "reasoning_content" | "reasoning" | "reasoning_text")
+                {
+                    first[field] = json!(text);
+                }
+            }
+        }
+        if first["role"] == "assistant"
+            && first["content"].as_str().is_some_and(str::is_empty)
+            && first.get("tool_calls").is_none()
+            && first
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            && first
+                .get("reasoning")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            && first
+                .get("reasoning_text")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            && first.get("reasoning_details").is_none()
+        {
+            return Vec::new();
         }
         messages
     }
@@ -551,6 +652,7 @@ impl Model for Ollama {
             headers,
             "chat-completions-v1",
             self.endpoint.as_str(),
+            &self.provider,
             &self.token,
             format!("{:?}", self.compatibility),
             self.supports_reasoning,
@@ -568,17 +670,50 @@ impl Model for Ollama {
             let encoded =
                 self.compatible_message(message.clone(), &self.replay_identity(&request.model));
             let extra = encoded.iter().fold(0_u64, |sum, item| {
-                ["reasoning_content", "reasoning_details"]
-                    .iter()
-                    .filter_map(|key| item.get(*key))
-                    .filter(|value| !value.as_str().is_some_and(str::is_empty))
-                    .fold(sum, |sum, value| {
-                        sum.saturating_add(pi_rs_core::estimate_replay_tokens(
-                            std::slice::from_ref(value),
-                        ))
-                    })
+                [
+                    "reasoning_content",
+                    "reasoning",
+                    "reasoning_text",
+                    "reasoning_details",
+                ]
+                .iter()
+                .filter_map(|key| item.get(*key))
+                .filter(|value| !value.as_str().is_some_and(str::is_empty))
+                .fold(sum, |sum, value| {
+                    sum.saturating_add(pi_rs_core::estimate_replay_tokens(std::slice::from_ref(
+                        value,
+                    )))
+                })
             });
-            base.saturating_add(extra)
+            let visible_extra = if self.compatibility.requires_thinking_as_text == Some(true) {
+                if let Message::Assistant {
+                    replay: Some(replay),
+                    ..
+                } = message
+                {
+                    if replay.identity == self.replay_identity(&request.model)
+                        && replay.supports_api(ModelApi::OpenaiCompletions)
+                    {
+                        replay
+                            .blocks
+                            .iter()
+                            .filter(|b| b["type"] == "context_edit_reasoning")
+                            .filter_map(|b| b["text"].as_str())
+                            .fold(0u64, |sum, text| {
+                                sum.saturating_add(pi_rs_core::estimate_replay_tokens(&[json!(
+                                    text
+                                )]))
+                            })
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            base.saturating_add(extra).saturating_add(visible_extra)
         } else {
             base
         }
@@ -590,6 +725,9 @@ impl Model for Ollama {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        if self.has_ambiguous_legacy_replay(&request) {
+            return Err(Error::Model("Legacy chat-completions reasoning replay has no provider identity. Edit or remove the affected assistant context, or start a new session, before continuing.".into()));
+        }
         let requested_model = request.model.clone();
         let identity = self.replay_identity(&requested_model);
         let infer_finish = self.compatibility.supports_finish_reason == Some(false);
@@ -706,6 +844,7 @@ impl Model for Ollama {
             let mut usage = None;
             let mut metadata = ModelMetadata {
                 provider_api: Some(ModelApi::OpenaiCompletions),
+                replay_identity: Some(identity.clone()),
                 ..ModelMetadata::default()
             };
             let mut reasoning_text = String::new();
@@ -751,7 +890,7 @@ impl Model for Ollama {
                     if !reasoning_text.is_empty() {
                         metadata.reasoning = Some(reasoning_text);
                     }
-                    if metadata.reasoning.is_some() || metadata.replay.is_some() {
+                    if metadata.reasoning.is_some() || metadata.replay.is_some() || metadata.replay_identity.is_some() {
                         yield ModelEvent::Metadata(metadata);
                     }
                     yield ModelEvent::Complete { calls, usage };
@@ -1062,6 +1201,23 @@ mod content_tests {
         );
     }
     #[test]
+    fn context_identity_distinguishes_shared_gateway_providers() {
+        let first = Ollama::new("https://gateway.example", None)
+            .unwrap()
+            .with_provider("first");
+        let same = Ollama::new("https://gateway.example", None)
+            .unwrap()
+            .with_provider("first");
+        let other = Ollama::new("https://gateway.example", None)
+            .unwrap()
+            .with_provider("other");
+        if let Some(identity) = first.context_identity() {
+            assert_eq!(Some(identity.clone()), same.context_identity());
+            assert_ne!(Some(identity), other.context_identity());
+        }
+    }
+
+    #[test]
     fn context_capacity_uses_matching_running_models_and_rejects_invalid_sizes() {
         let value = json!({"models": [
             {"name":"other:latest", "context_length": 1},
@@ -1096,6 +1252,216 @@ mod content_tests {
                 .reasoning_effort
                 .as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn edited_reasoning_falls_back_when_details_are_unusable() {
+        for (config, detail) in [
+            (json!({}), json!({"type":"reasoning.text","text":"valid"})),
+            (
+                json!({"thinkingFormat":"openrouter"}),
+                json!({"type":"reasoning.text","text":7}),
+            ),
+        ] {
+            let model = Ollama::new("https://gateway.example", None)
+                .unwrap()
+                .with_chat_compatibility(
+                    serde_json::from_value(config).unwrap(),
+                    Some(true),
+                    true,
+                    true,
+                );
+            let message = Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: model.replay_identity("m"),
+                    blocks: vec![
+                        json!({"type":"context_edit_reasoning","text":"preserved","details":[detail],"field":null}),
+                        json!({"_pi_context_edit_api":"openai-completions"}),
+                    ],
+                })),
+            };
+            let encoded = model.compatible_message(message, &model.replay_identity("m"));
+            assert_eq!(encoded[0]["reasoning_content"], "preserved");
+            assert!(encoded[0].get("reasoning_details").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_unbound_replay_reports_incompatibility_without_request() {
+        let message = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: format!(
+                        "chat-completions+sha256:{:x}",
+                        Sha256::digest(b"https://gateway.example/")
+                    ),
+                    model: "m".into(),
+                },
+                blocks: vec![json!({"type":"reasoning_content","text":"secret"})],
+            })),
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![message],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        for provider in ["one", "two"] {
+            let model = Ollama::new("https://gateway.example", None)
+                .unwrap()
+                .with_provider(provider);
+            assert!(model.has_ambiguous_legacy_replay(&request));
+            let mut different_model = request.clone();
+            different_model.model = "other".into();
+            assert!(!model.has_ambiguous_legacy_replay(&different_model));
+            let encoded = model.compatible_message(
+                different_model.messages[0].clone(),
+                &model.replay_identity("other"),
+            );
+            assert_eq!(encoded[0]["content"], "answer");
+            assert!(!encoded[0].to_string().contains("secret"));
+            let other_endpoint = Ollama::new("https://other.example", None)
+                .unwrap()
+                .with_provider(provider);
+            assert!(!other_endpoint.has_ambiguous_legacy_replay(&request));
+            let error = match model.stream(request.clone()).await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("legacy replay must be rejected"),
+            };
+            assert!(error.contains("no provider identity"));
+        }
+    }
+
+    #[test]
+    fn shared_gateway_provider_identity_and_mixed_edited_reasoning() {
+        let compat = serde_json::from_value(json!({"thinkingFormat":"openrouter"})).unwrap();
+        let a = Ollama::new("https://gateway.example/v1/chat/completions", None)
+            .unwrap()
+            .with_provider("provider-a")
+            .with_chat_compatibility(compat, Some(true), true, true);
+        let b = Ollama::new("https://gateway.example/v1/chat/completions", None)
+            .unwrap()
+            .with_provider("provider-b");
+        let message = Message::Assistant {
+            content: "firstmiddlelast".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: a.replay_identity("m"),
+                blocks: vec![
+                    json!({"type":"context_edit_text","text":"first"}),
+                    json!({"type":"context_edit_reasoning","text":"signed","details":[{"type":"reasoning.text","text":"signed"}]}),
+                    json!({"type":"context_edit_text","text":"middle"}),
+                    json!({"type":"context_edit_reasoning","text":"ordinary","field":null}),
+                    json!({"type":"context_edit_text","text":"last"}),
+                    json!({"_pi_context_edit_api":"openai-completions"}),
+                ],
+            })),
+        };
+        let encoded = a.compatible_message(message.clone(), &a.replay_identity("m"));
+        assert_eq!(encoded[0]["reasoning_details"][0]["text"], "signed");
+        assert_eq!(encoded[0]["reasoning_content"], "ordinary");
+        let other = b.compatible_message(message.clone(), &b.replay_identity("m"));
+        assert!(other[0].get("reasoning_content").is_none());
+        assert!(other[0].get("reasoning_details").is_none());
+        let text_model = a.with_chat_compatibility(
+            serde_json::from_value(json!({"requiresThinkingAsText":true})).unwrap(),
+            Some(true),
+            true,
+            true,
+        );
+        assert_eq!(
+            text_model.compatible_message(message, &text_model.replay_identity("m"))[0]["content"],
+            "firstsignedmiddleordinarylast"
+        );
+    }
+
+    #[test]
+    fn edited_reasoning_uses_compatibility_and_counts_wire_fields() {
+        for (config, field) in [
+            (json!({"reasoningField":"reasoning"}), "reasoning"),
+            (json!({"reasoningField":"reasoning_text"}), "reasoning_text"),
+            (json!({}), "reasoning_content"),
+        ] {
+            let model = Ollama::new("https://example.com", None)
+                .unwrap()
+                .with_chat_compatibility(
+                    serde_json::from_value(config).unwrap(),
+                    Some(true),
+                    true,
+                    true,
+                );
+            let message = Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: model.replay_identity("model"),
+                    blocks: vec![
+                        json!({"type":"context_edit_reasoning","text":"x".repeat(5000),"field":null}),
+                        json!({"_pi_context_edit_api":"openai-completions"}),
+                    ],
+                })),
+            };
+            let request = ModelRequest {
+                model: "model".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            assert_eq!(
+                model.compatible_message(message.clone(), &model.replay_identity("model"))[0]
+                    [field]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                5000
+            );
+            assert!(model.estimate_message_tokens(&request, &message) > 1000);
+        }
+        let model = Ollama::new("https://example.com", None)
+            .unwrap()
+            .with_chat_compatibility(
+                serde_json::from_value(json!({"requiresThinkingAsText":true})).unwrap(),
+                Some(true),
+                true,
+                true,
+            );
+        let message = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: model.replay_identity("model"),
+                blocks: vec![
+                    json!({"type":"context_edit_reasoning","text":"x".repeat(5000),"field":null}),
+                    json!({"_pi_context_edit_api":"openai-completions"}),
+                ],
+            })),
+        };
+        let request = ModelRequest {
+            model: "model".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        assert!(model.compatible_message(message.clone(), &model.replay_identity("model"))[0]["content"].as_str().unwrap().ends_with("\n\nanswer"));
+        assert!(model.estimate_message_tokens(&request, &message) > 1000);
+        let empty = Message::Assistant {
+            content: String::new(),
+            calls: vec![],
+            replay: if let Message::Assistant { replay, .. } = message {
+                replay
+            } else {
+                unreachable!()
+            },
+        };
+        assert!(
+            model
+                .compatible_message(empty, &model.replay_identity("other"))
+                .is_empty()
         );
     }
 

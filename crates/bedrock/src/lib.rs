@@ -410,6 +410,19 @@ struct ReasoningBlock {
     redacted: Vec<u8>,
 }
 
+fn push_replay_text(out: &mut Vec<ContentBlock>, pending_whitespace: &mut String, text: &str) {
+    if text.trim().is_empty() {
+        if let Some(ContentBlock::Text(previous)) = out.last_mut() {
+            previous.push_str(text);
+        } else {
+            pending_whitespace.push_str(text);
+        }
+    } else {
+        pending_whitespace.push_str(text);
+        out.push(ContentBlock::Text(std::mem::take(pending_whitespace)));
+    }
+}
+
 fn replay_blocks(
     replay: &ProviderReplay,
     model: &str,
@@ -418,7 +431,10 @@ fn replay_blocks(
     calls: &[ToolCall],
     ids: &mut ToolIds,
 ) -> Option<Vec<ContentBlock>> {
-    if replay.identity.provider != "amazon-bedrock" || replay.identity.model != model {
+    if !replay.supports_api(pi_rs_core::ModelApi::BedrockConverseStream)
+        || replay.identity.provider != "amazon-bedrock"
+        || replay.identity.model != model
+    {
         return None;
     }
     let rendered: String = replay
@@ -447,18 +463,25 @@ fn replay_blocks(
     {
         return None;
     }
-    let mut out = Vec::new();
+    let mut out: Vec<ContentBlock> = Vec::new();
+    let mut pending_whitespace = String::new();
     for b in &replay.blocks {
+        if b.get("_pi_context_edit_api").is_some() {
+            continue;
+        }
         match b["type"].as_str()? {
-            "text" => out.push(ContentBlock::Text(b["text"].as_str()?.to_owned())),
-            "tool_use" => out.push(ContentBlock::ToolUse(
-                types::ToolUseBlock::builder()
-                    .tool_use_id(ids.get(b["id"].as_str()?))
-                    .name(b["name"].as_str()?)
-                    .input(doc(b["input"].clone()))
-                    .build()
-                    .ok()?,
-            )),
+            "text" => push_replay_text(&mut out, &mut pending_whitespace, b["text"].as_str()?),
+            "tool_use" => {
+                pending_whitespace.clear();
+                out.push(ContentBlock::ToolUse(
+                    types::ToolUseBlock::builder()
+                        .tool_use_id(ids.get(b["id"].as_str()?))
+                        .name(b["name"].as_str()?)
+                        .input(doc(b["input"].clone()))
+                        .build()
+                        .ok()?,
+                ));
+            }
             "reasoning" => {
                 let reasoning = if let Some(encoded) = b["redacted"].as_str() {
                     let bytes = base64::engine::general_purpose::STANDARD
@@ -475,7 +498,7 @@ fn replay_blocks(
                         return None;
                     }
                     if is_claude && signature.is_none() {
-                        out.push(ContentBlock::Text(text.to_owned()));
+                        push_replay_text(&mut out, &mut pending_whitespace, text);
                         continue;
                     }
                     let sig = if is_claude {
@@ -491,6 +514,7 @@ fn replay_blocks(
                             .ok()?,
                     )
                 };
+                pending_whitespace.clear();
                 out.push(ContentBlock::ReasoningContent(reasoning));
             }
             _ => return None,
@@ -1024,9 +1048,9 @@ impl Model for Bedrock {
                 let value=if block.redacted.is_empty() { serde_json::json!({"type":"reasoning", "text":block.text, "signature":block.signature}) } else { serde_json::json!({"type":"reasoning", "redacted":base64::engine::general_purpose::STANDARD.encode(&block.redacted)}) };
                 ordered.insert(*i,value);
             }
-            let replay=(!reasoning.is_empty() && reason != "max_tokens" && reason != "model_context_window_exceeded").then(|| Box::new(ProviderReplay { identity:ResolvedModelIdentity {provider:"amazon-bedrock".into(),model:requested_model},blocks:ordered.into_values().collect() }));
+            let replay=(!reasoning.is_empty() && reason != "max_tokens" && reason != "model_context_window_exceeded").then(|| Box::new(ProviderReplay { identity:ResolvedModelIdentity {provider:"amazon-bedrock".into(),model:requested_model.clone()},blocks:ordered.into_values().collect() }));
             let finish_reason = match reason.as_str() { "end_turn" | "stop_sequence" => "stop", "tool_use" => "tool_calls", "max_tokens" | "model_context_window_exceeded" => "length", _ => unreachable!() };
-            yield ModelEvent::Metadata(ModelMetadata {finish_reason:Some(finish_reason.into()), cached_input_tokens:cache_read, cache_creation_input_tokens:cache_write, cache_write_1h_tokens:cache_write_1h, provider_api:Some(pi_rs_core::ModelApi::BedrockConverseStream), reasoning:(!reasoning_text.is_empty()).then_some(reasoning_text), replay, ..Default::default()});
+            yield ModelEvent::Metadata(ModelMetadata {finish_reason:Some(finish_reason.into()), cached_input_tokens:cache_read, cache_creation_input_tokens:cache_write, cache_write_1h_tokens:cache_write_1h, provider_api:Some(pi_rs_core::ModelApi::BedrockConverseStream), replay_identity:Some(ResolvedModelIdentity { provider:"amazon-bedrock".into(), model:requested_model }), reasoning:(!reasoning_text.is_empty()).then_some(reasoning_text), replay, ..Default::default()});
             yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
         }))
     }
@@ -1332,6 +1356,150 @@ mod tests {
         assert!(model.estimate_message_tokens(&request, &with_call) > 1900);
         request.tools.clear();
         assert!(model.estimate_message_tokens(&request, &with_call) < 100);
+    }
+
+    #[test]
+    fn edited_replay_omits_blank_text_without_losing_signed_reasoning() {
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "amazon-bedrock".into(),
+                model: "anthropic.claude-test".into(),
+            },
+            blocks: vec![
+                serde_json::json!({"type":"text","text":""}),
+                serde_json::json!({"type":"text","text":"first"}),
+                serde_json::json!({"type":"text","text":" \n"}),
+                serde_json::json!({"type":"text","text":"second"}),
+                serde_json::json!({"type":"reasoning","text":"private","signature":"sig"}),
+                serde_json::json!({"type":"text","text":"   "}),
+                serde_json::json!({"type":"tool_use","id":"id","name":"lookup","input":{}}),
+                serde_json::json!({"_pi_context_edit_api":"bedrock-converse-stream"}),
+            ],
+        };
+        let call = ToolCall {
+            id: "id".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        };
+        let blocks = replay_blocks(
+            &replay,
+            "anthropic.claude-test",
+            true,
+            "first \nsecond   ",
+            &[call],
+            &mut ToolIds::default(),
+        )
+        .unwrap();
+        assert!(matches!(&blocks[0], ContentBlock::Text(text) if text == "first \n"));
+        assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "second"));
+        assert!(
+            matches!(&blocks[2], ContentBlock::ReasoningContent(types::ReasoningContentBlock::ReasoningText(text)) if text.signature() == Some("sig"))
+        );
+        assert!(matches!(&blocks[3], ContentBlock::ToolUse(_)));
+        assert!(
+            blocks
+                .iter()
+                .all(|block| !matches!(block, ContentBlock::Text(text) if text.trim().is_empty()))
+        );
+    }
+
+    #[test]
+    fn whitespace_before_unsigned_reasoning_is_preserved_as_text() {
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "amazon-bedrock".into(),
+                model: "anthropic.claude-test".into(),
+            },
+            blocks: vec![
+                serde_json::json!({"type":"text","text":" \n"}),
+                serde_json::json!({"type":"reasoning","text":"reason","signature":""}),
+                serde_json::json!({"type":"text","text":"visible"}),
+                serde_json::json!({"type":"tool_use","id":"id","name":"lookup","input":{}}),
+                serde_json::json!({"_pi_context_edit_api":"bedrock-converse-stream"}),
+            ],
+        };
+        let call = ToolCall {
+            id: "id".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        };
+        let blocks = replay_blocks(
+            &replay,
+            "anthropic.claude-test",
+            true,
+            " \nvisible",
+            std::slice::from_ref(&call),
+            &mut ToolIds::default(),
+        )
+        .unwrap();
+        assert!(matches!(&blocks[0], ContentBlock::Text(text) if text == " \nreason"));
+        assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "visible"));
+        assert!(matches!(&blocks[2], ContentBlock::ToolUse(_)));
+        let mut signed = replay.clone();
+        signed.blocks[1]["signature"] = serde_json::json!("sig");
+        let blocks = replay_blocks(
+            &signed,
+            "anthropic.claude-test",
+            true,
+            " \nvisible",
+            &[call],
+            &mut ToolIds::default(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&blocks[0], ContentBlock::ReasoningContent(types::ReasoningContentBlock::ReasoningText(text)) if text.signature() == Some("sig"))
+        );
+        assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "visible"));
+    }
+
+    #[test]
+    fn unsigned_whitespace_reasoning_never_emits_blank_text_blocks() {
+        for thinking_first in [true, false] {
+            let thinking = serde_json::json!({"type":"reasoning","text":" \n","signature":""});
+            let visible = serde_json::json!({"type":"text","text":"visible"});
+            let mut blocks = if thinking_first {
+                vec![thinking, visible]
+            } else {
+                vec![visible, thinking]
+            };
+            blocks
+                .push(serde_json::json!({"type":"tool_use","id":"id","name":"lookup","input":{}}));
+            blocks.push(serde_json::json!({"_pi_context_edit_api":"bedrock-converse-stream"}));
+            let replay = ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "amazon-bedrock".into(),
+                    model: "anthropic.claude-test".into(),
+                },
+                blocks,
+            };
+            let call = ToolCall {
+                id: "id".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            };
+            let blocks = replay_blocks(
+                &replay,
+                "anthropic.claude-test",
+                true,
+                "visible",
+                &[call],
+                &mut ToolIds::default(),
+            )
+            .unwrap();
+            assert!(
+                blocks.iter().all(
+                    |block| !matches!(block, ContentBlock::Text(text) if text.trim().is_empty())
+                )
+            );
+            assert!(blocks.iter().any(
+                |block| matches!(block, ContentBlock::Text(text) if text.contains("visible"))
+            ));
+            assert!(
+                blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolUse(_)))
+            );
+        }
     }
 
     #[test]
