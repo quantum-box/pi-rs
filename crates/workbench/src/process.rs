@@ -55,6 +55,50 @@ pub(super) fn refresh_barrier() -> Result<RefreshBarrier> {
     })
 }
 
+// Used for operations that remain cancellable until their irreversible step.
+pub(super) fn refresh_barrier_cancellable(
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<RefreshBarrier>> {
+    let process = loop {
+        if cancelled() {
+            return Ok(None);
+        }
+        match IN_FLIGHT_REFRESH.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(25))
+            }
+        }
+    };
+    let worker = std::env::var_os(REFRESH_BARRIER_ENV)
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+        })
+        .transpose()?;
+    if let Some(file) = &worker {
+        loop {
+            if cancelled() {
+                return Ok(None);
+            }
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(25))
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
+            }
+        }
+    }
+    Ok(Some(RefreshBarrier {
+        _process: process,
+        _worker: worker,
+    }))
+}
+
 fn shutdown_reason(reason: SessionStartReason) -> SessionShutdownReason {
     match reason {
         SessionStartReason::Startup => SessionShutdownReason::Quit,
