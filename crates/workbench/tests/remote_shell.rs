@@ -222,6 +222,45 @@ async fn coding_tools_share_transcripts_between_injected_backends() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn continuous_descendant_output_cannot_starve_post_exit_drain_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let operations = pi_rs_workbench::coding::create_local_bash_operations(None);
+    let (output, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let reader = tokio::spawn(async move {
+        let mut bytes = 0usize;
+        while let Some(chunk) = receiver.recv().await {
+            bytes += chunk.len();
+        }
+        bytes
+    });
+    let cancellation = CancellationToken::new();
+    let context = ShellSpawnContext {
+        command: "yes x & yes y & yes z &".into(),
+        cwd: root.path().to_owned(),
+        env: std::env::vars_os().collect(),
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        operations.exec(context, None, cancellation.clone(), output),
+    )
+    .await;
+    if result.is_err() {
+        cancellation.cancel();
+    }
+    assert_eq!(
+        result
+            .expect("continuous output starved the drain deadline")
+            .unwrap(),
+        Some(0)
+    );
+    assert!(
+        reader.await.unwrap() > 0,
+        "descendants must have produced output"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn cancellation_after_shell_exit_kills_descendant_during_pipe_drain() {
     let root = tempfile::tempdir().unwrap();
     let marker = root.path().join("must-not-exist");

@@ -1458,6 +1458,7 @@ impl BashOperations for LocalBashOperations {
                     status = Some(result?);
                     drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
                 },
+                _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
                 count = stdout.read(&mut stdout_buffer), if stdout_open => {
                     let count = count?; stdout_open = count != 0;
                     if count != 0 {
@@ -1480,7 +1481,6 @@ impl BashOperations for LocalBashOperations {
                         }
                     }
                 },
-                _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
             }
         }
         if let Some(task) = input_task {
