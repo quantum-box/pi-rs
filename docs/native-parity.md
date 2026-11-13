@@ -2815,6 +2815,10 @@ must supply a stable key unique for each logical send within that callback.
 Identical keyed replays reuse the journal entry even when callback order
 changes; reusing a key with different content fails the run instead of retrying
 indefinitely. Executable extensions negotiate keyed-message support.
+Request callback identity is reconstructed from completed turns and model
+attempts; there is no separately journaled callback-invocation marker. Distinct
+request callback invocations before either boundary share a key scope, so
+extensions must distinguish their sends in that case.
 
 Exactly-once recovery is not possible for unkeyed callback sends when a process
 stops between sends or the callback takes a different path. Ordinary Pi-style
