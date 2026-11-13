@@ -370,3 +370,18 @@ async fn cancellation_interrupts_immediate_entry_stats_even_when_they_fail() {
         assert!(backend.count.load(std::sync::atomic::Ordering::SeqCst) < 100_000);
     }
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn rejects_drive_relative_paths_before_backend_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Backend::default());
+    let tool = create_ls_tool(root.path(), backend.clone()).unwrap();
+    for path in ["D:logs", "D:"] {
+        assert!(matches!(
+            tool.invoke(json!({"path": path}), context()).await,
+            Outcome::Failed(_)
+        ));
+        assert!(backend.calls.lock().unwrap().is_empty());
+    }
+}

@@ -108,11 +108,15 @@ fn normalize(value: &str, remote_home: Option<&Path>) -> Result<PathBuf> {
     if value == "~" || value.starts_with("~/") || (cfg!(windows) && value.starts_with("~\\")) {
         let home = remote_home
             .ok_or_else(|| Error::Config("remote home directory is not configured".into()))?;
-        return Ok(if value == "~" {
-            home.to_owned()
+        return if value == "~" {
+            Ok(home.to_owned())
         } else {
-            home.join(&value[2..])
-        });
+            let tail = Path::new(&value[2..]);
+            if tail.has_root() || matches!(tail.components().next(), Some(Component::Prefix(_))) {
+                return Err(Error::Config("invalid backend home-relative path".into()));
+            }
+            checked_resolve(home, tail)
+        };
     }
     if value.starts_with("file://") {
         return url::Url::parse(value)
@@ -161,6 +165,18 @@ fn resolve(root: &Path, input: &Path) -> PathBuf {
         }
     }
     resolved
+}
+fn checked_resolve(root: &Path, input: &Path) -> Result<PathBuf> {
+    if !input.is_absolute() && matches!(input.components().next(), Some(Component::Prefix(_))) {
+        return Err(Error::Config(
+            "drive-relative backend path is not supported".into(),
+        ));
+    }
+    let path = resolve(root, input);
+    if !path.is_absolute() {
+        return Err(Error::Config("backend path must be absolute".into()));
+    }
+    Ok(path)
 }
 // Retain only the bounded display prefix while counting complete output for
 // truncation metadata. Yield periodically so cancellation can interrupt work.
@@ -296,10 +312,10 @@ impl Tool for RemoteLs {
                         Error::Config("limit must be an integer between 1 and 100000".into())
                     })? as usize,
             };
-            let path = resolve(
+            let path = checked_resolve(
                 &self.root,
                 &normalize(requested, self.options.remote_home.as_deref())?,
-            );
+            )?;
             if !self.operations.exists(&path).await? {
                 return Err(Error::Config(format!("Path not found: {}", path.display())));
             }
