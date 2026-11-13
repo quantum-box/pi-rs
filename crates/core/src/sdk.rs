@@ -139,7 +139,23 @@ impl Drop for InputPermit {
 }
 
 #[derive(Clone)]
+struct RunConfig {
+    model: std::sync::Weak<dyn Model>,
+    model_name: String,
+    system_prompt: String,
+    registry: std::sync::Weak<Registry>,
+    limits: Limits,
+}
+
+struct SessionOwner {
+    journal: std::sync::Weak<tokio::sync::Mutex<Session>>,
+    input: std::sync::Weak<tokio::sync::Mutex<mpsc::Receiver<crate::AgentInput>>>,
+    config: Mutex<RunConfig>,
+}
+
+#[derive(Clone)]
 pub struct SessionControl {
+    owner: Arc<SessionOwner>,
     input: mpsc::Sender<crate::AgentInput>,
     active: Arc<Mutex<Option<CancellationToken>>>,
     auto_compaction: crate::AutoCompactionControl,
@@ -547,17 +563,33 @@ impl SessionBuilder {
         let auto_compaction = session.auto_compaction_control();
         let retry = session.retry_control();
         let input_hooks = Arc::new(Mutex::new(InputHooks::new(&self.registry, &session)));
+        let session_id = session.session_id();
+        let session = Arc::new(tokio::sync::Mutex::new(session));
+        let input = Arc::new(tokio::sync::Mutex::new(input));
+        let registry = Arc::new(self.registry);
+        let owner = Arc::new(SessionOwner {
+            journal: Arc::downgrade(&session),
+            input: Arc::downgrade(&input),
+            config: Mutex::new(RunConfig {
+                model: Arc::downgrade(&self.model),
+                model_name: self.model_name.clone(),
+                system_prompt: self.system_prompt.clone(),
+                registry: Arc::downgrade(&registry),
+                limits: self.limits.clone(),
+            }),
+        });
         Ok(AgentSession {
             model: self.model,
             model_name: self.model_name,
             system_prompt: self.system_prompt,
-            registry: Arc::new(self.registry),
+            registry,
             limits: self.limits,
-            session_id: session.session_id(),
-            session: Arc::new(tokio::sync::Mutex::new(session)),
-            input: Arc::new(tokio::sync::Mutex::new(input)),
+            session_id,
+            session,
+            input,
             events: Some(events),
             control: SessionControl {
+                owner,
                 input: sender,
                 active: Arc::new(Mutex::new(None)),
                 auto_compaction,
@@ -775,6 +807,7 @@ impl AgentSession {
         }
         self.model = model;
         self.model_name = name;
+        self.refresh_run_config();
         Ok(())
     }
 
@@ -848,16 +881,20 @@ impl AgentSession {
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
         self.ensure_open()?;
         self.system_prompt = prompt.into();
+        self.refresh_run_config();
         Ok(())
     }
     /// Register before forking. Forks share the existing registry and its connections.
     pub fn register_extension(&mut self, extension: Arc<dyn Extension>) -> Result<()> {
         self.ensure_open()?;
-        Arc::get_mut(&mut self.registry)
-            .ok_or_else(|| {
-                Error::Config("register extensions before sharing this session with a fork".into())
-            })?
-            .register(extension)?;
+        if Arc::strong_count(&self.registry) != 1 {
+            return Err(Error::Config(
+                "register extensions before sharing this session with a fork".into(),
+            ));
+        }
+        let result = Arc::make_mut(&mut self.registry).register(extension);
+        self.refresh_run_config();
+        result?;
         self.refresh_input_hooks()?;
         Ok(())
     }
@@ -876,6 +913,7 @@ impl AgentSession {
             .model_selection()
         {
             self.model_name = model;
+            self.refresh_run_config();
         }
         Ok(())
     }
@@ -929,6 +967,7 @@ impl AgentSession {
                 InputHooks::new(&self.registry, &journal);
             if let Some((model, _)) = journal.model_selection() {
                 self.model_name = model;
+                self.refresh_run_config();
             }
         }
         let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observer);
@@ -994,6 +1033,7 @@ impl AgentSession {
                 .model_selection()
             {
                 self.model_name = model;
+                self.refresh_run_config();
             }
         }
         if let Some((reason, previous_session_file)) = self.pending_start.take() {
@@ -1265,6 +1305,7 @@ impl AgentSession {
                 .session_id(),
         );
         fork.registry = self.registry.clone();
+        fork.refresh_run_config();
         fork.pending_start = Some((crate::SessionStartReason::Fork, self.session_file.clone()));
         fork.refresh_input_hooks()?;
         Ok(fork)
@@ -1318,8 +1359,20 @@ impl AgentSession {
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         self.start().await?;
-        let mut journal = self.session.lock().await;
-        let mut input_queue = self.input.lock().await;
+        let journal_owner = self
+            .control
+            .owner
+            .journal
+            .upgrade()
+            .ok_or_else(|| Error::Config("session is closed".into()))?;
+        let input_owner = self
+            .control
+            .owner
+            .input
+            .upgrade()
+            .ok_or_else(|| Error::Config("session is closed".into()))?;
+        let mut journal = journal_owner.lock().await;
+        let mut input_queue = input_owner.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let mut observe = |event: Notification<'_>| {
@@ -1327,12 +1380,27 @@ impl AgentSession {
             emit(&events, &event);
             observer(event);
         };
+        let config = self
+            .control
+            .owner
+            .config
+            .lock()
+            .expect("run config")
+            .clone();
+        let registry = config
+            .registry
+            .upgrade()
+            .ok_or_else(|| Error::Config("session is closed".into()))?;
+        let model = config
+            .model
+            .upgrade()
+            .ok_or_else(|| Error::Config("session is closed".into()))?;
         let agent = Agent {
-            model: self.model.as_ref(),
-            model_name: &self.model_name,
-            registry: &self.registry,
-            system_prompt: &self.system_prompt,
-            limits: self.limits.clone(),
+            model: model.as_ref(),
+            model_name: &config.model_name,
+            registry: &registry,
+            system_prompt: &config.system_prompt,
+            limits: config.limits.clone(),
         };
         let mut result = async {
             if prepare && self.registry.has_input_hooks() {
@@ -1623,6 +1691,15 @@ impl AgentSession {
         }
         notification_result.and(result)
     }
+    fn refresh_run_config(&self) {
+        *self.control.owner.config.lock().expect("run config") = RunConfig {
+            model: Arc::downgrade(&self.model),
+            model_name: self.model_name.clone(),
+            system_prompt: self.system_prompt.clone(),
+            registry: Arc::downgrade(&self.registry),
+            limits: self.limits.clone(),
+        };
+    }
     fn emit_last(&self) -> Result<()> {
         let journal = self.journal()?;
         if let (Some(events), Some(record)) = (&self.events, journal.records().last()) {
@@ -1807,6 +1884,67 @@ mod tests {
         assert_eq!(
             explicit.limits.tool_timeout,
             std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_owner_tracks_configuration_and_releases_session_resources() {
+        let first: Arc<dyn Model> = Arc::new(WaitingModel);
+        let mut session = SessionBuilder::new(first, "first").in_memory().unwrap();
+        let control = session.controls();
+        session.set_system_prompt("updated prompt").unwrap();
+        let second: Arc<dyn Model> = Arc::new(WaitingModel);
+        session.set_model(second.clone(), "second").unwrap();
+        session
+            .register_extension(Arc::new(InputExtension))
+            .unwrap();
+        {
+            let config = control.owner.config.lock().unwrap().clone();
+            assert_eq!(config.model_name, "second");
+            assert_eq!(config.system_prompt, "updated prompt");
+            assert!(Arc::ptr_eq(&config.model.upgrade().unwrap(), &second));
+            assert!(Arc::ptr_eq(
+                &config.registry.upgrade().unwrap(),
+                &session.registry
+            ));
+            assert!(config.registry.upgrade().unwrap().has_input_hooks());
+            assert_eq!(config.limits.tool_timeout, session.limits.tool_timeout);
+        }
+        let head = session.journal().unwrap().head();
+        let fork = session.fork_at(head).unwrap();
+        {
+            let config = fork.control.owner.config.lock().unwrap().clone();
+            assert_eq!(config.model_name, "second");
+            assert!(Arc::ptr_eq(
+                &config.registry.upgrade().unwrap(),
+                &fork.registry
+            ));
+        }
+        drop(fork);
+        session.close().await.unwrap();
+        drop(session);
+        drop(second);
+        assert!(control.owner.journal.upgrade().is_none());
+        assert!(control.owner.input.upgrade().is_none());
+        assert!(
+            control
+                .owner
+                .config
+                .lock()
+                .unwrap()
+                .model
+                .upgrade()
+                .is_none()
+        );
+        assert!(
+            control
+                .owner
+                .config
+                .lock()
+                .unwrap()
+                .registry
+                .upgrade()
+                .is_none()
         );
     }
 
