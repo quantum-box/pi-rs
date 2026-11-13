@@ -125,6 +125,7 @@ struct Graph {
     node_group: Vec<Option<usize>>,
     cur_group: Option<usize>,
     over_cap: bool,
+    warnings: Vec<String>,
     dir: Dir,
 }
 
@@ -193,6 +194,7 @@ fn parse_graph(src: &str) -> Option<Graph> {
         node_group: Vec::new(),
         cur_group: None,
         over_cap: false,
+        warnings: Vec::new(),
         dir,
     };
 
@@ -225,7 +227,9 @@ fn parse_graph(src: &str) -> Option<Graph> {
             "classdef" | "class" | "style" | "linkstyle" | "click" | "direction" => continue,
             _ => {}
         }
-        parse_statement(st, &mut graph);
+        if let Some(warning) = parse_statement(st, &mut graph) {
+            graph.warnings.push(warning);
+        }
         if graph.over_cap {
             return None;
         }
@@ -291,12 +295,16 @@ fn flush_statement(cur: &mut String, out: &mut Vec<String>) {
     cur.clear();
 }
 
-fn parse_statement(st: &str, graph: &mut Graph) {
+pub(super) fn flowchart_warnings(src: &str) -> Vec<String> {
+    parse_graph(src).map_or_else(Vec::new, |graph| graph.warnings)
+}
+
+fn parse_statement(st: &str, graph: &mut Graph) -> Option<String> {
     let chars: Vec<char> = st.chars().collect();
     let mut i = 0;
 
     let Some((mut prev, ni)) = parse_node_group(&chars, i, graph) else {
-        return;
+        return Some(format!("dropped, expected a node: \"{st}\""));
     };
     i = ni;
 
@@ -306,18 +314,20 @@ fn parse_statement(st: &str, graph: &mut Graph) {
             break;
         }
         let Some((left, right, line, label, ni)) = parse_link(&chars, i) else {
-            break;
+            let rest: String = chars[i..].iter().collect();
+            return Some(format!("dropped, expected a link: \"{rest}\""));
         };
         i = skip_spaces(&chars, ni);
         let Some((next, ni)) = parse_node_group(&chars, i, graph) else {
-            break;
+            let rest: String = chars[i..].iter().collect();
+            return Some(format!("dropped, expected a node: \"{rest}\""));
         };
         i = ni;
         for &f in &prev {
             for &t in &next {
                 if graph.edges.len() >= MAX_EDGES {
                     graph.over_cap = true;
-                    return;
+                    return None;
                 }
                 let (from, to, head_to, head_from) = if left == Head::Arrow && right != Head::Arrow
                 {
@@ -337,6 +347,7 @@ fn parse_statement(st: &str, graph: &mut Graph) {
         }
         prev = next;
     }
+    None
 }
 
 fn parse_node_group(
@@ -413,6 +424,20 @@ fn parse_node(chars: &[char], start: usize, graph: &mut Graph) -> Option<(usize,
     let shape = shape.unwrap_or(Shape::Rect);
     let label = label.as_deref();
     let idx = graph.node_index(&id, label, shape)?;
+    let mut after = after;
+    if chars
+        .get(after..)
+        .is_some_and(|rest| rest.starts_with(&[':', ':', ':']))
+    {
+        after += 3;
+        while chars
+            .get(after)
+            .copied()
+            .is_some_and(|c| is_id_char(c) || c == '-')
+        {
+            after += 1;
+        }
+    }
     Some((idx, after))
 }
 
@@ -761,6 +786,7 @@ fn parse_state(src: &str) -> Option<Graph> {
         node_group: Vec::new(),
         cur_group: None,
         over_cap: false,
+        warnings: Vec::new(),
         dir: Dir::Down,
     };
 
@@ -975,6 +1001,7 @@ fn parse_class(src: &str) -> Option<(Graph, Vec<ClassInfo>)> {
         node_group: Vec::new(),
         cur_group: None,
         over_cap: false,
+        warnings: Vec::new(),
         dir: Dir::Down,
     };
     let mut infos: Vec<ClassInfo> = Vec::new();
@@ -1252,6 +1279,7 @@ fn parse_er(src: &str) -> Option<(Graph, Vec<ClassInfo>)> {
         node_group: Vec::new(),
         cur_group: None,
         over_cap: false,
+        warnings: Vec::new(),
         dir: Dir::Down,
     };
     let mut infos: Vec<ClassInfo> = Vec::new();
@@ -2187,6 +2215,7 @@ fn build_scope(
         node_group: Vec::new(),
         cur_group: None,
         over_cap: false,
+        warnings: Vec::new(),
         dir: graph.dir,
     };
     layout_canvas(&synth, &extras, max_width)
