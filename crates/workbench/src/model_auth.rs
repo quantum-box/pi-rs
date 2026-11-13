@@ -69,7 +69,11 @@ impl Credential {
         self.is_command()
             || matches!(
                 self,
-                Self::ChatGpt | Self::Kimi | Self::Invalid | Self::BedrockProfile(_)
+                Self::ChatGpt
+                    | Self::Kimi
+                    | Self::Invalid
+                    | Self::BedrockProfile(_)
+                    | Self::BedrockChain
             )
     }
 

@@ -358,7 +358,7 @@ impl Deferred {
         auth_path: &std::path::Path,
     ) -> Result<(Client, HeaderMap)> {
         let token = match &self.credential {
-            Some(Credential::BedrockProfile(_)) => None,
+            Some(Credential::BedrockProfile(_) | Credential::BedrockChain) => None,
             Some(Credential::ChatGpt) if self.http_settings.is_some() => Some(
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
@@ -399,10 +399,14 @@ impl Deferred {
             .connect_prechecked(self.adapter, &self.endpoint, token, bearer, radius_checked)?
             .with_headers(headers.clone())
             .with_context_probes(self.probe_context);
-        if let (Some(Credential::BedrockProfile(profile)), Client::Bedrock(bedrock)) =
-            (&self.credential, &mut client)
-        {
-            *bedrock = bedrock.clone().with_profile(profile.clone());
+        match (&self.credential, &mut client) {
+            (Some(Credential::BedrockProfile(profile)), Client::Bedrock(bedrock)) => {
+                *bedrock = bedrock.clone().with_profile(profile.clone());
+            }
+            (Some(Credential::BedrockChain), Client::Bedrock(bedrock)) => {
+                *bedrock = bedrock.clone().with_credential_chain();
+            }
+            _ => {}
         }
         if let Some(settings) = &self.http_settings {
             client = client.with_http_settings(settings)?;

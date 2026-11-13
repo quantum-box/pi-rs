@@ -26,6 +26,7 @@ pub struct Bedrock {
     client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
     unsupported: Option<String>,
     bearer: Option<String>,
+    force_sigv4: bool,
     profile: Option<String>,
     model_name: Option<(String, String)>,
     known_config: Option<std::sync::Arc<tokio::sync::OnceCell<aws_types::SdkConfig>>>,
@@ -49,6 +50,7 @@ impl Bedrock {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             unsupported: None,
             bearer: None,
+            force_sigv4: false,
             profile: None,
             model_name: None,
             known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new())),
@@ -72,6 +74,7 @@ impl Bedrock {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
             unsupported: None,
             bearer: None,
+            force_sigv4: false,
             profile: None,
             model_name: None,
             known_config: None,
@@ -97,6 +100,7 @@ impl Bedrock {
             )))),
             unsupported: None,
             bearer: None,
+            force_sigv4: false,
             profile: None,
             model_name: None,
             known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
@@ -127,6 +131,7 @@ impl Bedrock {
             .map(|client| bearer_client(client.config().to_builder(), &token));
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(client));
         self.bearer = Some(token);
+        self.force_sigv4 = false;
         self.prepared_identity = None;
         Ok(self)
     }
@@ -134,6 +139,19 @@ impl Bedrock {
     /// modifying the process environment. This replaces any caller-supplied client.
     pub fn with_profile(mut self, profile: String) -> Self {
         self.profile = Some(profile);
+        self.bearer = None;
+        self.force_sigv4 = true;
+        self.client = std::sync::Arc::new(tokio::sync::OnceCell::new());
+        self.known_config = Some(std::sync::Arc::new(tokio::sync::OnceCell::new()));
+        self.prepared_identity = None;
+        self
+    }
+
+    /// Rebuild from the standard SDK configuration using the credential chain,
+    /// ignoring any ambient Bedrock bearer token and replacing a supplied client.
+    pub fn with_credential_chain(mut self) -> Self {
+        self.force_sigv4 = true;
+        self.bearer = None;
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new());
         self.known_config = Some(std::sync::Arc::new(tokio::sync::OnceCell::new()));
         self.prepared_identity = None;
@@ -212,7 +230,8 @@ impl Bedrock {
                 .or_else(|| config.endpoint_url().map(str::to_owned))
         };
         let bearer = self.bearer.clone().or_else(|| {
-            if (!self.environment_config && config.token_provider().is_some())
+            if self.force_sigv4
+                || (!self.environment_config && config.token_provider().is_some())
                 || config
                     .get_origin("auth_scheme_preference")
                     .is_client_config()
@@ -228,11 +247,12 @@ impl Bedrock {
             }
             ("bearer", token.clone(), String::new(), None, None)
         } else {
-            if (!self.environment_config && config.token_provider().is_some())
-                || config.auth_scheme_preference().is_some()
-                || config
-                    .get_origin("auth_scheme_preference")
-                    .is_client_config()
+            if !self.force_sigv4
+                && ((!self.environment_config && config.token_provider().is_some())
+                    || config.auth_scheme_preference().is_some()
+                    || config
+                        .get_origin("auth_scheme_preference")
+                        .is_client_config())
             {
                 return Ok(None);
             }
@@ -1013,6 +1033,13 @@ impl Model for Bedrock {
                         bearer_client(
                             aws_sdk_bedrockruntime::config::Builder::from(&config),
                             token,
+                        )
+                    } else if self.force_sigv4 {
+                        use aws_smithy_runtime_api::client::auth::AuthSchemeId;
+                        Client::from_conf(
+                            aws_sdk_bedrockruntime::config::Builder::from(&config)
+                                .auth_scheme_preference([AuthSchemeId::new("sigv4")])
+                                .build(),
                         )
                     } else {
                         Client::new(&config)

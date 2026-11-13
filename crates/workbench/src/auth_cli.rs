@@ -121,7 +121,7 @@ async fn resolve(
     if let Some(credential) = args.configured_model_credential(provider, endpoint) {
         if matches!(credential, super::model_auth::Credential::BedrockChain) {
             return Ok(
-                (wanted.is_none() && bedrock_ambient_configured()).then_some(Resolved {
+                (wanted.is_none() && bedrock_ambient_configured(false)).then_some(Resolved {
                     kind: AuthType::ApiKey,
                     value: None,
                 }),
@@ -161,7 +161,7 @@ async fn resolve(
     }
     // Pi checks for configured AWS sources without contacting AWS. Such sources
     // do not expose a single API key that can safely be printed.
-    if provider == &Provider::Bedrock && wanted.is_none() && bedrock_ambient_configured() {
+    if provider == &Provider::Bedrock && wanted.is_none() && bedrock_ambient_configured(true) {
         return Ok(Some(Resolved {
             kind: AuthType::ApiKey,
             value: None,
@@ -184,9 +184,9 @@ async fn resolve(
     Ok(None)
 }
 
-fn bedrock_ambient_configured() -> bool {
+fn bedrock_ambient_configured(include_bearer: bool) -> bool {
     let has = |name| std::env::var(name).is_ok_and(|value| !value.is_empty());
-    has("AWS_BEARER_TOKEN_BEDROCK")
+    (include_bearer && has("AWS_BEARER_TOKEN_BEDROCK"))
         || has("AWS_PROFILE")
         || (has("AWS_ACCESS_KEY_ID") && has("AWS_SECRET_ACCESS_KEY"))
         || has("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")

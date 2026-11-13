@@ -5973,7 +5973,6 @@ fn bedrock_auth_check_handles_saved_profile_and_ambient_chain() {
             ("AWS_SECRET_ACCESS_KEY", "secret"),
         ],
         vec![("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/fixture")],
-        vec![("AWS_BEARER_TOKEN_BEDROCK", "token")],
     ] {
         let ambient = check(&["check", "--json"], &vars);
         assert_eq!(
@@ -5993,6 +5992,21 @@ fn bedrock_auth_check_handles_saved_profile_and_ambient_chain() {
             "credential_not_available"
         );
     }
+    let bearer_only = check(
+        &["check", "--json"],
+        &[("AWS_BEARER_TOKEN_BEDROCK", "token")],
+    );
+    assert_eq!(bearer_only.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bearer_only.stdout).unwrap()["reason"],
+        "credentials_not_configured"
+    );
+    std::fs::write(&auth, "{}").unwrap();
+    let ambient_bearer = check(
+        &["check", "--json"],
+        &[("AWS_BEARER_TOKEN_BEDROCK", "token")],
+    );
+    assert_eq!(ambient_bearer.status.code(), Some(0));
     std::fs::write(
         &auth,
         json!({"amazon-bedrock":{"type":"api_key","key":"stored-token"}}).to_string(),
@@ -6120,5 +6134,171 @@ fn bedrock_saved_chain_overrides_models_json_api_key_for_requests_and_auth_check
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "models-bearer"
+    );
+}
+
+#[test]
+fn bedrock_explicit_auth_modes_ignore_ambient_bearer() {
+    for mode in ["chain", "profile", "ambient", "stored", "override"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let auth = match mode {
+            "chain" | "override" => json!({"amazon-bedrock":{"type":"api_key"}}),
+            "profile" => {
+                json!({"amazon-bedrock":{"type":"api_key","env":{"AWS_PROFILE":"selected"}}})
+            }
+            "stored" => json!({"amazon-bedrock":{"type":"api_key","key":"stored-token"}}),
+            _ => json!({}),
+        };
+        std::fs::write(home.join("auth.json"), auth.to_string()).unwrap();
+        let credentials = root.path().join("credentials");
+        std::fs::write(
+            &credentials,
+            "[selected]\naws_access_key_id=PROFILEACCESS\naws_secret_access_key=profile-secret\n",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /model/"), "{first}");
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            match mode {
+                "chain" | "profile" => {
+                    assert!(
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("authorization: aws4-hmac-sha256"),
+                        "{headers}"
+                    );
+                    let key = if mode == "chain" {
+                        "CHAINACCESS"
+                    } else {
+                        "PROFILEACCESS"
+                    };
+                    assert!(headers.contains(&format!("Credential={key}/")), "{headers}");
+                    assert!(!headers.contains("ambient-token"));
+                }
+                "ambient" => assert!(headers.contains("Bearer ambient-token"), "{headers}"),
+                "stored" => assert!(headers.contains("Bearer stored-token"), "{headers}"),
+                "override" => assert!(headers.contains("Bearer override-token"), "{headers}"),
+                _ => unreachable!(),
+            }
+            write!(
+                socket,
+                "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_ACCESS_KEY_ID", "CHAINACCESS")
+            .env("AWS_SECRET_ACCESS_KEY", "chain-secret")
+            .env("AWS_BEARER_TOKEN_BEDROCK", "ambient-token")
+            .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", endpoint)
+            .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_CONFIG_FILE", root.path().join("missing-config"))
+            .env("AWS_SHARED_CREDENTIALS_FILE", credentials)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env_remove("AWS_PROFILE")
+            .env_remove("AWS_SESSION_TOKEN")
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "amazon-bedrock",
+                "--model",
+                "amazon.nova-2-lite-v1:0",
+            ]);
+        if mode == "override" {
+            command.args(["--api-key", "override-token"]);
+        }
+        let output = command.args(["--print", "hello"]).output().unwrap();
+        server.join().unwrap();
+        assert!(
+            !output.status.success(),
+            "fixture intentionally returns an error"
+        );
+    }
+}
+
+#[test]
+fn bedrock_explicit_chain_fails_without_aws_credentials_instead_of_using_bearer() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        json!({"amazon-bedrock":{"type":"api_key"}}).to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_BEARER_TOKEN_BEDROCK", "ambient-token")
+        .env(
+            "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+            format!("http://{}", listener.local_addr().unwrap()),
+        )
+        .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_CONFIG_FILE", root.path().join("missing-config"))
+        .env(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            root.path().join("missing-credentials"),
+        )
+        .env("NO_PROXY", "127.0.0.1,localhost");
+    for key in [
+        "AWS_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "amazon-bedrock",
+            "--model",
+            "amazon.nova-2-lite-v1:0",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "request was sent despite missing chain credentials"
     );
 }
