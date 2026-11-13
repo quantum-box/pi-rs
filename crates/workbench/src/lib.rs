@@ -16,6 +16,7 @@ const MAX_FILE: u64 = 64 * 1024;
 const MAX_COMMAND_INPUT: u64 = 1024 * 1024;
 
 pub mod coding;
+pub mod coding_factories;
 mod coding_paths;
 pub use coding_paths::normalize_plain as normalize_path;
 mod file_search;

@@ -598,6 +598,24 @@ use the existing host API.
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
 
+Embedded hosts can use `coding_factories::create_coding_tools` and
+`create_read_only_tools` to register Pi's ordered coding or read-only tool sets
+without registering every built-in tool. The factories use the unrestricted
+local profile. The corresponding `coding_tools_from` and `read_only_tools_from`
+functions select from a host-configured `CodingTools`, preserving its file-tool
+scope and options. The coding set's shell runs with the host process's permissions
+and is not sandboxed, including with a scoped file profile; hosts must apply their
+own shell policy. For injected file operations, `injected_file_tools_from` yields
+read, edit and write without a shell. It requires all three operations to use
+the same backend `Arc`, which also lets injected edit and write share their
+mutation lock. Hosts must ensure the backend enforces the intended access policy.
+`coding_tools_from_with_local_shell` explicitly adds a host-local, unsandboxed
+shell to that set; `coding_tools_from` rejects custom file operations so this
+choice cannot happen implicitly. Partial or independently allocated injected
+backends are rejected. The read-only set rejects custom read operations because
+grep, find and ls still access the local filesystem. A set is an `Extension` and
+can be registered directly with `Registry`; overlapping sets have duplicate tool names.
+
 ### Persistent runtime checkpoint
 
 Terminal and RPC prompts now reuse a runtime rather than rebuilding model and
