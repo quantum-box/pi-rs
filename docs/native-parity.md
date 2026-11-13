@@ -2821,8 +2821,11 @@ stops between sends or the callback takes a different path. Ordinary Pi-style
 unkeyed sends remain accepted on recovery; re-executing a callback can append a
 message again. Extensions that can supply stable keys may use them for
 recovery-safe delivery and must not switch an interrupted run's sends from
-unkeyed to keyed: older journals
-do not contain enough information to match those identities. Automatic trigger
+unkeyed to keyed: older journals do not contain enough information to match
+those identities. Journals produced by earlier versions of this draft did not
+scope keyed sends by turn or recovered tool operation; interrupted runs from
+those versions cannot be migrated without potentially duplicating a send.
+Automatic trigger
 runs retain their own SDK run events and do not replace the initiating run's
 result.
 
