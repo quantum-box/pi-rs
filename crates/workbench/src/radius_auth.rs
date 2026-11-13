@@ -193,19 +193,24 @@ impl Gateway {
         };
         let credential = self.credential_from_token(token, None)?;
         let _guard = auth_lock().await?;
-        save(&credential)
+        save_at(&auth_path(), &credential).await
     }
 
     pub(super) async fn logout(&self) -> Result<bool> {
         let _guard = auth_lock().await?;
-        if !self.has_credential()? {
-            return Ok(false);
-        }
-        super::config::update_object(&auth_path(), |data| {
-            data.remove("radius");
+        let mut removed = false;
+        super::config::update_auth_object(&auth_path(), |data| {
+            if self
+                .credential_from_value(&Value::Object(data.clone()))?
+                .is_some()
+            {
+                data.remove("radius");
+                removed = true;
+            }
             Ok(())
-        })?;
-        Ok(true)
+        })
+        .await?;
+        Ok(removed)
     }
 
     pub(super) async fn access(&self, min_validity: Duration) -> Result<Option<String>> {
@@ -341,7 +346,7 @@ impl Gateway {
             };
             let credential = self.credential_from_token(token, None)?;
             let _guard = auth_lock().await?;
-            save(&credential)
+            save_at(&auth_path(), &credential).await
         }
         .await;
         incoming.reply(result.is_ok()).await;
@@ -540,11 +545,12 @@ async fn auth_lock_at(directory: &std::path::Path) -> Result<std::fs::File> {
         .map_err(|_| Error::Config("Radius credential storage is busy".into()))?
 }
 
-fn save(credential: &Credential) -> Result<()> {
-    super::config::update_object(&auth_path(), |data| {
+async fn save_at(path: &std::path::Path, credential: &Credential) -> Result<()> {
+    super::config::update_auth_object(path, |data| {
         data.insert("radius".into(), serde_json::to_value(credential)?);
         Ok(())
     })
+    .await
 }
 
 fn valid_secret(value: &str) -> bool {
@@ -571,6 +577,33 @@ fn request_error() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn login_save_waits_for_shared_auth_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"other":{"type":"api_key","key":"keep"}}"#).unwrap();
+        let held = super::super::auth_lock::acquire_async(&path).await.unwrap();
+        let mut save = tokio::spawn({
+            let path = path.clone();
+            async move {
+                let credential: Credential = serde_json::from_value(serde_json::json!({
+                "type":"oauth", "gateway":"https://radius.example/", "access":"new", "refresh":"new-refresh", "expires":123
+            })).unwrap();
+                save_at(&path, &credential).await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut save)
+                .await
+                .is_err()
+        );
+        drop(held);
+        save.await.unwrap().unwrap();
+        let value = super::super::config::read_auth_object(&path).await.unwrap();
+        assert_eq!(value["radius"]["refresh"], "new-refresh");
+        assert_eq!(value["other"]["key"], "keep");
+    }
 
     #[tokio::test]
     async fn refresh_token_request_uses_configured_proxy() {

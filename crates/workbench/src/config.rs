@@ -480,6 +480,14 @@ pub(super) fn update_object_locked(
     write_json(path, &value)
 }
 
+pub(super) async fn update_auth_object(
+    path: &Path,
+    update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
+    let guard = super::auth_lock::acquire_async(path).await?;
+    update_object_locked(path, Some(&guard), update)
+}
+
 pub fn read_object(path: &Path) -> Result<Value> {
     if path.file_name().is_none_or(|name| name != "auth.json") {
         return read_object_unlocked(path);

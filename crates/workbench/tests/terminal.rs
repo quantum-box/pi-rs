@@ -2037,6 +2037,10 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     master.write_all(b"/new\r").unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     while !marker.exists() && process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        // Keep the PTY flowing while the worker starts; a full output buffer
+        // can otherwise prevent the UI from dispatching the command.
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(marker.exists(), "transition hook did not start");
@@ -2155,7 +2159,16 @@ fn sigint_restores_terminal_before_waiting_for_refresh_barrier() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"hello\r").unwrap();
-    started_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if started_rx.try_recv().is_ok() {
+            break;
+        }
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        assert!(Instant::now() < deadline, "refresh request did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(
         unsafe { libc::kill(process.0.id() as i32, libc::SIGINT) },
         0

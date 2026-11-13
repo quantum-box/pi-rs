@@ -369,9 +369,13 @@ pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()>
     })
 }
 
-pub(super) fn save_openrouter_oauth(key: &str) -> Result<()> {
+pub(super) async fn save_openrouter_oauth(key: &str) -> Result<()> {
+    save_openrouter_oauth_at(&config::agent_dir().join("auth.json"), key).await
+}
+
+async fn save_openrouter_oauth_at(path: &std::path::Path, key: &str) -> Result<()> {
     let provider = Provider::named("openrouter").expect("built-in OpenRouter provider");
-    config::update_object(&config::agent_dir().join("auth.json"), |data| {
+    config::update_auth_object(path, |data| {
         data.insert(
             provider.id().into(),
             json!({
@@ -381,6 +385,7 @@ pub(super) fn save_openrouter_oauth(key: &str) -> Result<()> {
         );
         Ok(())
     })
+    .await
 }
 
 pub(super) fn remove(provider: &Provider) -> Result<bool> {
@@ -407,6 +412,38 @@ pub(super) fn valid_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn async_key_read_and_openrouter_save_wait_for_shared_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"other":{"type":"api_key","key":"keep"}}"#).unwrap();
+        let held = super::super::auth_lock::acquire_async(&path).await.unwrap();
+        let mut writer = tokio::spawn({
+            let path = path.clone();
+            async move { save_openrouter_oauth_at(&path, "new-key").await }
+        });
+        let mut reader = tokio::spawn({
+            let path = path.clone();
+            async move { Keys::load_path_async(&path).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(120), &mut writer)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(120), &mut reader)
+                .await
+                .is_err()
+        );
+        drop(held);
+        writer.await.unwrap().unwrap();
+        reader.await.unwrap().unwrap();
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert_eq!(stored["openrouter"]["access"], "new-key");
+        assert_eq!(stored["other"]["key"], "keep");
+    }
 
     #[test]
     fn logout_forgets_key_before_a_reload_can_be_cancelled() {

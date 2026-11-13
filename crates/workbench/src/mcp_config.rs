@@ -212,7 +212,7 @@ async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExt
             let provider = provider.clone();
             Box::pin(async move {
                 args.model_profiles = super::model_profiles::Profiles::load()?;
-                args.model_keys = super::model_auth::Keys::load()?;
+                args.model_keys = super::model_auth::Keys::load_async().await?;
                 let provider = args.model_profiles.provider(&provider).ok_or_else(|| {
                     Error::Config("MCP auth.provider does not name an installed provider".into())
                 })?;

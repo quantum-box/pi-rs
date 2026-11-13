@@ -520,7 +520,7 @@ impl Tool for Operations {
     }
 
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
-        let keys = match Keys::load() {
+        let keys = match Keys::load_async().await {
             Ok(keys) => keys,
             Err(error) => return Outcome::Failed(error.to_string()),
         };
