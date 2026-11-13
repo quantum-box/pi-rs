@@ -5,6 +5,38 @@ use serde_json::{Map, Value, json};
 
 use super::{Api, Entry, ImageInput};
 
+fn classifier_envelope(entry: &Entry, mut body: Value) -> Value {
+    if matches!(entry.api, Api::WorkersAiSystemOne) {
+        body.as_object_mut()
+            .expect("classifier request")
+            .remove("model");
+        json!({"model":entry.model.id,"input":body})
+    } else {
+        body
+    }
+}
+
+pub(super) fn classifier_response(body: &Value) -> Result<&Value> {
+    if body["success"] == false {
+        return Err(Error::Model("Cloudflare Workers AI request failed".into()));
+    }
+    let result = body["result"]
+        .as_object()
+        .ok_or_else(|| Error::Model("invalid Cloudflare Workers AI response".into()))?;
+    if result.contains_key("answers") {
+        return Ok(&body["result"]);
+    }
+    if result.get("state").and_then(Value::as_str) != Some("Completed") {
+        return Err(Error::Model(
+            "Cloudflare Workers AI run did not complete".into(),
+        ));
+    }
+    body["result"]["result"]
+        .as_object()
+        .map(|_| &body["result"]["result"])
+        .ok_or_else(|| Error::Model("invalid Cloudflare Workers AI response".into()))
+}
+
 fn image_parts(values: &Value) -> Result<Vec<pi_rs::ImageContent>> {
     if values.is_null() {
         return Ok(vec![]);
@@ -73,7 +105,7 @@ pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Valu
     let mut body = json!({"model":entry.model.id,"state":state,"questions":wire});
     let images = image_parts(&context["images"])?;
     if images.is_empty() {
-        return Ok((body, false));
+        return Ok((classifier_envelope(entry, body), false));
     }
     if !entry.accepts_images() {
         return Err(Error::Config(
@@ -127,8 +159,8 @@ pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Valu
         .model
         .compat
         .send_image_opt_in_header
-        .unwrap_or(!entry.openrouter_compat());
-    Ok((body, opt_in))
+        .unwrap_or(!matches!(entry.api, Api::WorkersAiSystemOne) && !entry.openrouter_compat());
+    Ok((classifier_envelope(entry, body), opt_in))
 }
 
 pub(super) fn classifier_answers(questions: &Value, answers: &Value) -> Result<Value> {
@@ -229,7 +261,7 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
             .min(u64::from(u32::MAX))
     };
     let (input, output, cache_read, cache_write) = match entry.api {
-        Api::SystemOne => {
+        Api::SystemOne | Api::WorkersAiSystemOne => {
             if !value.contains_key("input_tokens") && !value.contains_key("output_tokens") {
                 return None;
             }
