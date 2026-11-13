@@ -2,6 +2,7 @@
 mod agent;
 mod context;
 mod context_fingerprint;
+mod context_replay;
 mod extension;
 mod journal;
 mod lifecycle;

@@ -418,7 +418,10 @@ fn replay_blocks(
     calls: &[ToolCall],
     ids: &mut ToolIds,
 ) -> Option<Vec<ContentBlock>> {
-    if replay.identity.provider != "amazon-bedrock" || replay.identity.model != model {
+    if !replay.supports_api(pi_rs_core::ModelApi::BedrockConverseStream)
+        || replay.identity.provider != "amazon-bedrock"
+        || replay.identity.model != model
+    {
         return None;
     }
     let rendered: String = replay
@@ -449,6 +452,9 @@ fn replay_blocks(
     }
     let mut out = Vec::new();
     for b in &replay.blocks {
+        if b.get("_pi_context_edit_api").is_some() {
+            continue;
+        }
         match b["type"].as_str()? {
             "text" => out.push(ContentBlock::Text(b["text"].as_str()?.to_owned())),
             "tool_use" => out.push(ContentBlock::ToolUse(
@@ -1024,9 +1030,9 @@ impl Model for Bedrock {
                 let value=if block.redacted.is_empty() { serde_json::json!({"type":"reasoning", "text":block.text, "signature":block.signature}) } else { serde_json::json!({"type":"reasoning", "redacted":base64::engine::general_purpose::STANDARD.encode(&block.redacted)}) };
                 ordered.insert(*i,value);
             }
-            let replay=(!reasoning.is_empty() && reason != "max_tokens" && reason != "model_context_window_exceeded").then(|| Box::new(ProviderReplay { identity:ResolvedModelIdentity {provider:"amazon-bedrock".into(),model:requested_model},blocks:ordered.into_values().collect() }));
+            let replay=(!reasoning.is_empty() && reason != "max_tokens" && reason != "model_context_window_exceeded").then(|| Box::new(ProviderReplay { identity:ResolvedModelIdentity {provider:"amazon-bedrock".into(),model:requested_model.clone()},blocks:ordered.into_values().collect() }));
             let finish_reason = match reason.as_str() { "end_turn" | "stop_sequence" => "stop", "tool_use" => "tool_calls", "max_tokens" | "model_context_window_exceeded" => "length", _ => unreachable!() };
-            yield ModelEvent::Metadata(ModelMetadata {finish_reason:Some(finish_reason.into()), cached_input_tokens:cache_read, cache_creation_input_tokens:cache_write, cache_write_1h_tokens:cache_write_1h, provider_api:Some(pi_rs_core::ModelApi::BedrockConverseStream), reasoning:(!reasoning_text.is_empty()).then_some(reasoning_text), replay, ..Default::default()});
+            yield ModelEvent::Metadata(ModelMetadata {finish_reason:Some(finish_reason.into()), cached_input_tokens:cache_read, cache_creation_input_tokens:cache_write, cache_write_1h_tokens:cache_write_1h, provider_api:Some(pi_rs_core::ModelApi::BedrockConverseStream), replay_identity:Some(ResolvedModelIdentity { provider:"amazon-bedrock".into(), model:requested_model }), reasoning:(!reasoning_text.is_empty()).then_some(reasoning_text), replay, ..Default::default()});
             yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
         }))
     }

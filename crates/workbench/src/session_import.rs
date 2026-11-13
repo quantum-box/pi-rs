@@ -739,7 +739,12 @@ fn convert(
                                         .as_str()
                                         .unwrap_or_default()
                                         .into(),
-                                    model: model.into(),
+                                    model: if message["api"] == "google-generative-ai" {
+                                        model.strip_prefix("models/").unwrap_or(model)
+                                    } else {
+                                        model
+                                    }
+                                    .into(),
                                 }
                             }),
                             ..Default::default()
@@ -1055,6 +1060,34 @@ mod tests {
         ]).unwrap();
         assert!(session.context_usage_estimate().last_usage_record.is_none());
         assert!(session.context_usage(1000).unwrap().tokens.is_some());
+    }
+
+    #[test]
+    fn imported_edit_replays_signed_thinking_in_order() {
+        let session = import_pi(vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","provider":"anthropic","api":"anthropic-messages","model":"claude","content":[{"type":"text","text":"old"}],"stopReason":"stop"}}),
+            json!({"type":"context_edit","id":"e","parentId":"a","targetId":"a","replacement":{"content":[{"type":"thinking","thinking":"private","thinkingSignature":"sig"},{"type":"text","text":"new"},{"type":"thinking","thinking":"","thinkingSignature":"redacted","redacted":true}]}}),
+        ]).unwrap();
+        let messages = session.current_messages();
+        let Message::Assistant {
+            content,
+            replay: Some(replay),
+            ..
+        } = &messages[0]
+        else {
+            panic!("missing edited replay")
+        };
+        assert_eq!(content, "new");
+        assert_eq!(
+            replay.blocks,
+            vec![
+                json!({"type":"thinking","thinking":"private","signature":"sig"}),
+                json!({"type":"text","text":"new"}),
+                json!({"type":"redacted_thinking","data":"redacted"}),
+                json!({"_pi_context_edit_api":"anthropic-messages"})
+            ]
+        );
     }
 
     #[test]

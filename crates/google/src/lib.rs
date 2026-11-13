@@ -519,10 +519,24 @@ fn wire_request(
                 calls: invocations,
                 replay,
             } => {
-                let parts = if let Some(replay) =
-                    replay.as_ref().filter(|replay| replay.identity == identity)
-                {
-                    replay.blocks.clone()
+                let parts = if let Some(replay) = replay.as_ref().filter(|replay| {
+                    replay.identity == identity && replay.supports_api(ModelApi::GoogleGenerativeAi)
+                }) {
+                    replay
+                        .blocks
+                        .iter()
+                        .filter(|part| part.get("_pi_context_edit_api").is_none())
+                        .cloned()
+                        .map(|mut part| {
+                            if !explicit_tool_ids
+                                && let Some(call) =
+                                    part.get_mut("functionCall").and_then(Value::as_object_mut)
+                            {
+                                call.remove("id");
+                            }
+                            part
+                        })
+                        .collect()
                 } else {
                     let mut parts = Vec::new();
                     if !content.is_empty() {
@@ -711,6 +725,7 @@ impl Model for Google {
             let mut stream = response.bytes_stream().eventsource();
             let mut metadata = ModelMetadata {
                 provider_api: Some(ModelApi::GoogleGenerativeAi),
+                replay_identity: Some(identity(&replay_scope, &model)),
                 ..ModelMetadata::default()
             };
             let mut calls = Vec::new();
@@ -871,6 +886,38 @@ mod tests {
         assert_eq!(first.context_identity(), same.context_identity());
         assert_ne!(first.context_identity(), changed.context_identity());
         assert!(!first.context_identity().unwrap().contains("pin-one"));
+    }
+
+    #[test]
+    fn edited_replay_keeps_thought_order_only_for_original_model() {
+        let replay = ProviderReplay {
+            identity: identity("google", "gemini"),
+            blocks: vec![
+                json!({"text":"first"}),
+                json!({"thought":true,"text":"private","thoughtSignature":"sig"}),
+                json!({"text":"last"}),
+                json!({"_pi_context_edit_api":"google-generative-ai"}),
+            ],
+        };
+        let mut request = ModelRequest {
+            model: "gemini".into(),
+            messages: vec![Message::Assistant {
+                content: "firstlast".into(),
+                calls: vec![],
+                replay: Some(Box::new(replay)),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        assert_eq!(
+            wire_request(&request, None, "google").unwrap()["contents"][0]["parts"],
+            json!([{"text":"first"},{"thought":true,"text":"private","thoughtSignature":"sig"},{"text":"last"}])
+        );
+        request.model = "other".into();
+        assert_eq!(
+            wire_request(&request, None, "google").unwrap()["contents"][0]["parts"],
+            json!([{"text":"firstlast"}])
+        );
     }
 
     #[test]

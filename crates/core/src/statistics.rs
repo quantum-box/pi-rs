@@ -342,9 +342,13 @@ mod tests {
                     ContentBlock::Text { text: "a".into() },
                     ContentBlock::Thinking {
                         thinking: "🦀".into(),
+                        thinking_signature: None,
+                        redacted: false,
                     },
                     ContentBlock::Thinking {
                         thinking: "bc".into(),
+                        thinking_signature: None,
+                        redacted: false,
                     },
                 ])),
             )
@@ -360,6 +364,8 @@ mod tests {
                 target,
                 Some(ContextContent::Blocks(vec![ContentBlock::Thinking {
                     thinking: "123456789".into(),
+                    thinking_signature: None,
+                    redacted: false,
                 }])),
             )
             .unwrap();
@@ -625,6 +631,8 @@ mod tests {
         };
         let thinking = ContentBlock::Thinking {
             thinking: "abcd".into(),
+            thinking_signature: None,
+            redacted: false,
         };
         session
             .edit_context(

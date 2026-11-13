@@ -249,14 +249,18 @@ impl Ollama {
     fn compatible_message(&self, message: Message, identity: &ResolvedModelIdentity) -> Vec<Value> {
         let mut reasoning = None;
         let mut details = Vec::new();
+        let mut edited_reasoning = Vec::new();
         if let Message::Assistant {
             replay: Some(replay),
             ..
         } = &message
             && replay.identity == *identity
+            && replay.supports_api(ModelApi::OpenaiCompletions)
         {
             for block in &replay.blocks {
-                if block["type"] == "reasoning_content" {
+                if block["type"] == "context_edit_reasoning" {
+                    edited_reasoning.push(block.clone());
+                } else if block["type"] == "reasoning_content" {
                     reasoning = block["text"].as_str().map(str::to_owned);
                 } else if self.compatibility.preserves_reasoning_details()
                     && reasoning_details::is_valid(block)
@@ -286,6 +290,15 @@ impl Ollama {
         }
         if !details.is_empty() {
             first["reasoning_details"] = Value::Array(details);
+        } else if let Some(field) = edited_reasoning.first().and_then(|b| b["field"].as_str())
+            && matches!(field, "reasoning_content" | "reasoning" | "reasoning_text")
+        {
+            let text = edited_reasoning
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            first[field] = json!(text);
         }
         messages
     }
@@ -706,6 +719,7 @@ impl Model for Ollama {
             let mut usage = None;
             let mut metadata = ModelMetadata {
                 provider_api: Some(ModelApi::OpenaiCompletions),
+                replay_identity: Some(identity.clone()),
                 ..ModelMetadata::default()
             };
             let mut reasoning_text = String::new();
@@ -751,7 +765,7 @@ impl Model for Ollama {
                     if !reasoning_text.is_empty() {
                         metadata.reasoning = Some(reasoning_text);
                     }
-                    if metadata.reasoning.is_some() || metadata.replay.is_some() {
+                    if metadata.reasoning.is_some() || metadata.replay.is_some() || metadata.replay_identity.is_some() {
                         yield ModelEvent::Metadata(metadata);
                     }
                     yield ModelEvent::Complete { calls, usage };

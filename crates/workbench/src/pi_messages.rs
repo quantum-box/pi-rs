@@ -352,6 +352,7 @@ impl PiMessages {
                         .filter(|replay| {
                             replay.identity.provider == self.identity
                                 && replay.identity.model == request.model
+                                && replay.supports_api(pi_rs::ModelApi::PiMessages)
                                 && replay.blocks.first().is_some_and(|marker| {
                                     marker["type"] == REPLAY_ORIGIN
                                         && marker["endpoint"] == self.origin_hash
@@ -366,7 +367,13 @@ impl PiMessages {
                                 blocks.extend(calls.iter().map(super::rpc_events::tool_call_value));
                                 blocks
                             },
-                            |replay| replay.blocks[1..].to_vec(),
+                            |replay| {
+                                replay.blocks[1..]
+                                    .iter()
+                                    .filter(|block| block.get("_pi_context_edit_api").is_none())
+                                    .cloned()
+                                    .collect()
+                            },
                         );
                     json!({
                         "role":"assistant","content":blocks,"provider":self.identity,"api":"pi-messages","model":request.model,

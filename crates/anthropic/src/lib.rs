@@ -445,7 +445,11 @@ async fn read_json(mut response: Response) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|_| Error::Model("invalid Anthropic response".into()))
 }
 
-fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
+fn encode_request(
+    request: ModelRequest,
+    replay_scope: &str,
+    allow_empty_signature: bool,
+) -> Result<Value> {
     let mut system = Vec::new();
     let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
     for message in request.messages {
@@ -480,7 +484,20 @@ fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
                             &calls,
                         ) =>
                     {
-                        replay.blocks
+                        replay
+                            .blocks
+                            .into_iter()
+                            .filter(|block| block.get("_pi_context_edit_api").is_none())
+                            .map(|mut block| {
+                                if block["_pi_thinking"] == true && allow_empty_signature {
+                                    return json!({"type":"thinking","thinking":block["text"],"signature":""});
+                                }
+                                if let Some(object) = block.as_object_mut() {
+                                    object.remove("_pi_thinking");
+                                }
+                                block
+                            })
+                            .collect()
                     }
                     _ => {
                         let mut blocks: Vec<_> = text_block(content).into_iter().collect();
@@ -639,13 +656,16 @@ fn replay_matches(
     text: &str,
     calls: &[ToolCall],
 ) -> bool {
-    if replay.identity.provider != scope || replay.identity.model != model {
+    if !replay.supports_api(ModelApi::AnthropicMessages)
+        || replay.identity.provider != scope
+        || replay.identity.model != model
+    {
         return false;
     }
     let rendered = replay
         .blocks
         .iter()
-        .filter(|block| block["type"] == "text")
+        .filter(|block| block["type"] == "text" && block["_pi_thinking"] != true)
         .filter_map(|block| block["text"].as_str())
         .collect::<String>();
     if rendered != text {
@@ -869,7 +889,7 @@ impl Model for Anthropic {
         let openrouter =
             provider.as_ref() == "openrouter" || self.endpoint.host_str() == Some("openrouter.ai");
         let replay_scope = self.replay_scope.clone();
-        let mut body = encode_request(request, &replay_scope)?;
+        let mut body = encode_request(request, &replay_scope, self.allow_empty_signature)?;
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
         if let Some(level) = self.thinking_level.as_deref() {
             configure_thinking(&mut body, details.as_ref(), level, max_output_tokens)?;
@@ -912,6 +932,7 @@ impl Model for Anthropic {
             let mut usage = StreamUsage::default();
             let mut metadata = ModelMetadata {
                 provider_api: Some(ModelApi::AnthropicMessages),
+                replay_identity: Some(ResolvedModelIdentity { provider: replay_scope.to_string(), model: requested_model.clone() }),
                 ..ModelMetadata::default()
             };
             let mut reasoning_text = String::new();
@@ -1227,6 +1248,40 @@ mod tests {
     }
 
     #[test]
+    fn edited_replay_is_scoped_and_private_marker_is_not_sent() {
+        let make = |model: &str| ModelRequest {
+            model: model.into(),
+            tools: vec![],
+            max_output_tokens: 16,
+            messages: vec![Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: "anthropic".into(),
+                        model: "claude".into(),
+                    },
+                    blocks: vec![
+                        json!({"type":"thinking","thinking":"secret","signature":"signed"}),
+                        json!({"type":"text","text":"answer"}),
+                        json!({"_pi_context_edit_api":"anthropic-messages"}),
+                    ],
+                })),
+            }],
+        };
+        let same = encode_request(make("claude"), "anthropic", false).unwrap();
+        assert_eq!(
+            same["messages"][0]["content"],
+            json!([{"type":"thinking","thinking":"secret","signature":"signed"},{"type":"text","text":"answer"}])
+        );
+        let other = encode_request(make("other"), "anthropic", false).unwrap();
+        assert_eq!(
+            other["messages"][0]["content"],
+            json!([{"type":"text","text":"answer"}])
+        );
+    }
+
+    #[test]
     fn tool_result_error_status_is_encoded_independently_of_text() {
         let body = encode_request(
             ModelRequest {
@@ -1252,6 +1307,7 @@ mod tests {
                 max_output_tokens: 128,
             },
             "fixture",
+            false,
         )
         .unwrap();
         let blocks = body["messages"]

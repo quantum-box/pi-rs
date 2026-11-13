@@ -251,9 +251,30 @@ fn payload(request: &ModelRequest, provider: &str) -> Value {
                 replay,
             } => {
                 if let Some(replay) = replay.as_deref().filter(|r| {
-                    r.identity.provider == provider && r.identity.model == request.model
+                    r.identity.provider == provider
+                        && r.identity.model == request.model
+                        && r.supports_api(pi_rs_core::ModelApi::OpenaiResponses)
                 }) {
-                    input.extend(replay.blocks.iter().cloned());
+                    let edited = replay
+                        .blocks
+                        .iter()
+                        .any(|block| block.get("_pi_context_edit_api").is_some());
+                    input.extend(
+                        replay
+                            .blocks
+                            .iter()
+                            .filter(|block| block.get("_pi_context_edit_api").is_none())
+                            .cloned()
+                            .map(|mut block| {
+                                if edited
+                                    && provider == "openai-chatgpt"
+                                    && block["type"] == "function_call"
+                                {
+                                    block["namespace"] = json!(NAMESPACE);
+                                }
+                                block
+                            }),
+                    );
                 } else {
                     if !content.is_empty() {
                         input.push(json!({"role":"assistant", "content":content}));

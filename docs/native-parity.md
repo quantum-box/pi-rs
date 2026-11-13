@@ -727,7 +727,12 @@ as pairs before sending context to a provider.
 Native entry points are `context-edit <id> <text>`, `context-edit <id> --delete`,
 `/context-edit`, `/context-delete` and the RPC `edit_context` request with a
 `target` record ID and `replacement`. Pi `context_edit` entries use the same
-projection when imported, including text and image replacements.
+projection when imported, including text and image replacements. Assistant
+replacement thinking retains its signature and redaction flag and is replayed
+in block order to the original provider, API and model after tool-pair repair.
+Provider replay stays private to the adapter. When older records or imported
+chat-completions histories do not identify the original replay scope, thinking
+is omitted rather than sent to an unverified endpoint.
 
 ### Multimodal input checkpoint
 
@@ -2477,8 +2482,9 @@ Unsupported levels follow the shared model-aware controls.
 
 Signed and redacted blocks are retained in the original assistant block order
 for the same provider and model. Tool continuations replay those blocks along
-with the tool use and result. A context edit invalidates replay when it
-changes the assistant text or tool calls. Native executable context hooks
+with the tool use and result. Assistant context edits replace the original
+replay with the edited block sequence, preserving signed and redacted thinking
+and excluding tool calls removed by repair. Native executable context hooks
 receive the portable messages and retain replay for unchanged turns.
 
 A loopback fixture verified adaptive effort, signed and redacted block replay
