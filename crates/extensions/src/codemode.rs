@@ -1430,7 +1430,7 @@ mod tests {
                 Err(pi_rs_core::Error::Reconciliation(operation_id)) if explicit_limits => {
                     assert!(
                         session
-                            .journal()
+                            .journal().unwrap()
                             .operations()
                             .iter()
                             .any(|(invocation, state)| {
@@ -1513,7 +1513,10 @@ mod tests {
             .in_memory()
             .unwrap();
         assert_eq!(session.prompt("image").await.unwrap(), "done");
-        assert_eq!(session.journal().extension_states()[ID].data["saved"], true);
+        assert_eq!(
+            session.journal().unwrap().extension_states()[ID].data["saved"],
+            true
+        );
         session.close().await.unwrap();
     }
 
@@ -1595,7 +1598,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result, "done");
-        assert_eq!(session.journal().operations().len(), 3);
+        assert_eq!(session.journal().unwrap().operations().len(), 3);
         session.close().await.unwrap();
     }
     #[test]

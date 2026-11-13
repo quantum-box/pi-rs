@@ -527,14 +527,20 @@ impl AgentSession {
             }
         }
     }
-    /// Borrow the journal while the session is idle. Drop the guard before
-    /// invoking another session operation. Panics if the journal is in use.
-    pub fn journal(&self) -> tokio::sync::MutexGuard<'_, Session> {
-        self.session.try_lock().expect("session journal is in use")
+    /// Try to borrow the journal. Drop the guard before another session operation.
+    pub fn journal(&self) -> Result<tokio::sync::MutexGuard<'_, Session>> {
+        self.session
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))
+    }
+
+    /// Wait asynchronously until the journal is available.
+    pub async fn journal_async(&self) -> tokio::sync::MutexGuard<'_, Session> {
+        self.session.lock().await
     }
     pub fn messages(&self) -> Result<Vec<Message>> {
         {
-            let session = self.journal();
+            let session = self.journal()?;
             session.conversation_at(session.head())
         }
     }
@@ -874,7 +880,7 @@ impl AgentSession {
     pub async fn set_name_with_hooks(&mut self, name: &str) -> Result<()> {
         self.start().await?;
         self.set_name(name)?;
-        let name = self.journal().name().map(str::to_owned);
+        let name = self.journal()?.name().map(str::to_owned);
         self.notify_session_event(crate::LifecycleEvent::SessionInfoChanged { name })
             .await?;
         let _ = self.drain_idle_triggers().await?;
@@ -1074,7 +1080,7 @@ impl AgentSession {
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
         self.ensure_open()?;
         let destination = std::path::absolute(destination)?;
-        let forked = self.journal().fork_to(record, &destination)?;
+        let forked = self.journal()?.fork_to(record, &destination)?;
         let mut fork = self.fork_session(forked)?;
         fork.session_file = Some(destination);
         Ok(fork)
@@ -1087,7 +1093,7 @@ impl AgentSession {
         destination: Option<&Path>,
     ) -> Result<Self> {
         self.ensure_open()?;
-        let journal = self.journal();
+        let journal = self.journal()?;
         let record = journal
             .records()
             .iter()
@@ -1706,6 +1712,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn journal_contention_is_reported_and_async_access_waits() {
+        let session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .in_memory()
+            .unwrap();
+        let guard = session.journal().unwrap();
+        assert!(session.journal().is_err());
+        let waiting = session.journal_async();
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .is_ok()
+        );
+    }
+
     struct CustomEntryExtension;
     struct CustomMessageExtension;
     impl Extension for CustomMessageExtension {
@@ -1753,11 +1781,11 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        let previous = session.journal().head();
+        let previous = session.journal().unwrap().head();
         session
             .extension_command("message-extension", "context", "")
             .unwrap();
-        let records = session.journal().records().to_vec();
+        let records = session.journal().unwrap().records().to_vec();
         assert!(matches!(
             records[records.len() - 2].event,
             crate::Event::CustomEntry { .. }
@@ -1766,7 +1794,7 @@ mod tests {
             records.last().unwrap().event,
             crate::Event::CustomMessage { .. }
         ));
-        let target = session.journal().head();
+        let target = session.journal().unwrap().head();
         let messages = session.messages().unwrap();
         assert!(
             matches!(messages.last(), Some(Message::User { content }) if content == "injected text")
@@ -1838,14 +1866,14 @@ mod tests {
             .unwrap()
             .append_user_with_images("hello".into(), Vec::new(), None)
             .unwrap();
-        let previous = session.journal().head();
+        let previous = session.journal().unwrap().head();
         let before = session.messages().unwrap();
         session
             .extension_command("bookmark-extension", "bookmark", "remember")
             .unwrap();
-        let bookmarked = session.journal().head();
+        let bookmarked = session.journal().unwrap().head();
         assert!(
-            matches!(&session.journal().records().last().unwrap().event, crate::Event::CustomEntry { entry } if entry.custom_type == "bookmark" && entry.data.as_ref().unwrap()["note"] == "remember")
+            matches!(&session.journal().unwrap().records().last().unwrap().event, crate::Event::CustomEntry { entry } if entry.custom_type == "bookmark" && entry.data.as_ref().unwrap()["note"] == "remember")
         );
         assert_eq!(
             serde_json::to_value(session.messages().unwrap()).unwrap(),
@@ -1855,6 +1883,7 @@ mod tests {
         assert!(
             !session
                 .journal()
+                .unwrap()
                 .branch()
                 .iter()
                 .any(|record| matches!(record.event, crate::Event::CustomEntry { .. }))
@@ -1863,6 +1892,7 @@ mod tests {
         assert!(
             session
                 .journal()
+                .unwrap()
                 .branch()
                 .iter()
                 .any(|record| matches!(record.event, crate::Event::CustomEntry { .. }))
@@ -1874,7 +1904,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(&session.journal().records().last().unwrap().event, crate::Event::CustomEntry { entry } if entry.custom_type == "sdk")
+            matches!(&session.journal().unwrap().records().last().unwrap().event, crate::Event::CustomEntry { entry } if entry.custom_type == "sdk")
         );
     }
 
@@ -1926,7 +1956,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            session.journal().model_selection(),
+            session.journal().unwrap().model_selection(),
             Some(("second".into(), None))
         );
         session
@@ -1982,6 +2012,7 @@ mod tests {
         session.prompt("selected").await.unwrap();
         let entry_id = session
             .journal()
+            .unwrap()
             .records()
             .iter()
             .find(|record| {
@@ -1991,7 +2022,7 @@ mod tests {
             })
             .unwrap()
             .id;
-        let head = session.journal().head();
+        let head = session.journal().unwrap().head();
         assert!(matches!(
             session
                 .fork_with_hooks(entry_id, crate::ForkPosition::Before, Some(&destination))
@@ -1999,7 +2030,7 @@ mod tests {
             Err(Error::Cancelled)
         ));
         assert!(!destination.exists());
-        assert_eq!(session.journal().head(), head);
+        assert_eq!(session.journal().unwrap().head(), head);
         veto.store(false, Ordering::SeqCst);
         let before = session
             .fork_with_hooks(entry_id, crate::ForkPosition::Before, Some(&destination))
@@ -2057,7 +2088,7 @@ mod tests {
         for (input, expected) in [("  設計\nレビュー  ", Some("設計 レビュー")), (" ", None)]
         {
             session.set_name_with_hooks(input).await.unwrap();
-            assert_eq!(session.journal().name(), expected);
+            assert_eq!(session.journal().unwrap().name(), expected);
             assert!(
                 matches!(events.try_recv().unwrap(), SessionEvent::Record(record)
                 if matches!(record.event, crate::Event::SessionInfo { .. }))
@@ -2068,7 +2099,7 @@ mod tests {
             );
         }
         session.start().await.unwrap();
-        let head = session.journal().head();
+        let head = session.journal().unwrap().head();
         let mut fork = session
             .fork_to(head, directory.path().join("fork.jsonl"))
             .unwrap();
@@ -2143,6 +2174,7 @@ mod tests {
         session.prompt("first").await.unwrap();
         let selected = session
             .journal()
+            .unwrap()
             .records()
             .iter()
             .find(|record| matches!(record.event, crate::Event::User { .. }))
@@ -2159,9 +2191,15 @@ mod tests {
                 .open(&path)
                 .unwrap();
         reopened.start().await.unwrap();
-        assert!(reopened.journal().pending_custom_trigger().is_none());
+        assert!(
+            reopened
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
         assert_eq!(requests.lock().unwrap().len(), 2);
-        assert_eq!(reopened.journal().records().iter().filter(|record| matches!(&record.event,
+        assert_eq!(reopened.journal().unwrap().records().iter().filter(|record| matches!(&record.event,
             crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "tree-crash")).count(), 1);
         drop(reopened);
         let mut reopened =
@@ -2206,10 +2244,17 @@ mod tests {
                 .unwrap();
         reopened.start().await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 1);
-        assert!(reopened.journal().pending_custom_trigger().is_none());
+        assert!(
+            reopened
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
         assert_eq!(
             reopened
                 .journal()
+                .unwrap()
                 .records()
                 .iter()
                 .filter(|record| matches!(record.event,
@@ -2279,11 +2324,18 @@ mod tests {
                     .open(&path)
                     .unwrap();
             reopened.start().await.unwrap();
-            assert!(reopened.journal().pending_custom_trigger().is_none());
-            assert_eq!(reopened.journal().head(), branch_b);
+            assert!(
+                reopened
+                    .journal()
+                    .unwrap()
+                    .pending_custom_trigger()
+                    .is_none()
+            );
+            assert_eq!(reopened.journal().unwrap().head(), branch_b);
             assert_eq!(
                 reopened
                     .journal()
+                    .unwrap()
                     .records()
                     .iter()
                     .filter(|record| matches!(record.event,
@@ -2291,7 +2343,7 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(reopened.journal().conversation_at(branch_b).unwrap().iter().any(|message| matches!(message, Message::User { content } if content == "branch B")));
+            assert!(reopened.journal().unwrap().conversation_at(branch_b).unwrap().iter().any(|message| matches!(message, Message::User { content } if content == "branch B")));
             {
                 let snapshots = requests.lock().unwrap();
                 assert_eq!(snapshots.len(), 1);
@@ -2592,8 +2644,8 @@ mod tests {
         let names = names.lock().unwrap();
         assert_eq!(names[0], "model-B");
         assert!(names[1..].iter().all(|name| name == "model-A"));
-        assert!(session.journal().branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "B prompt")));
-        assert!(!session.journal().branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "branch A")));
+        assert!(session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "B prompt")));
+        assert!(!session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "branch A")));
     }
 
     #[tokio::test]
@@ -2656,14 +2708,23 @@ mod tests {
                 .to_string()
                 .contains("requires registered model model-A")
         );
-        assert_eq!(session.journal().head(), branch_b);
-        assert_eq!(session.journal().pending_custom_trigger(), Some(run_id));
+        assert_eq!(session.journal().unwrap().head(), branch_b);
+        assert_eq!(
+            session.journal().unwrap().pending_custom_trigger(),
+            Some(run_id)
+        );
         session
             .register_branch_model("model-A", model_a.clone())
             .unwrap();
         session.start().await.unwrap();
-        assert_eq!(session.journal().head(), branch_b);
-        assert!(session.journal().pending_custom_trigger().is_none());
+        assert_eq!(session.journal().unwrap().head(), branch_b);
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
         assert_eq!(model_a.0.load(Ordering::SeqCst), 1);
         assert_eq!(model_b.0.load(Ordering::SeqCst), 0);
     }
@@ -2681,8 +2742,8 @@ mod tests {
             .registry(registry.clone())
             .in_memory()
             .unwrap();
-        let first_id = first_session.journal().session_id();
-        let second_id = second_session.journal().session_id();
+        let first_id = first_session.journal().unwrap().session_id();
+        let second_id = second_session.journal().unwrap().session_id();
         assert!(Arc::ptr_eq(
             &registry.branch_model(first_id, "same-name").unwrap(),
             &first
@@ -2775,7 +2836,7 @@ mod tests {
             .await
             .unwrap();
             assert!(result.is_err());
-            assert_eq!(session.journal().head(), branch_b);
+            assert_eq!(session.journal().unwrap().head(), branch_b);
             assert!(session.messages().unwrap().iter().any(
                 |message| matches!(message, Message::User { content } if content == "branch B")
             ));
@@ -2866,8 +2927,11 @@ mod tests {
         assert!(
             matches!(session.start().await, Err(Error::PendingOperation(id)) if id == operation_id)
         );
-        assert_eq!(session.journal().head(), branch_b);
-        assert_eq!(session.journal().pending_custom_trigger(), Some(run_id));
+        assert_eq!(session.journal().unwrap().head(), branch_b);
+        assert_eq!(
+            session.journal().unwrap().pending_custom_trigger(),
+            Some(run_id)
+        );
     }
 
     #[test]
@@ -3016,6 +3080,7 @@ mod tests {
             session.prompt("first").await.unwrap();
             let selected = session
                 .journal()
+                .unwrap()
                 .records()
                 .iter()
                 .find(|record| matches!(record.event, crate::Event::User { .. }))
@@ -3028,10 +3093,17 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(matches!(result, Err(Error::Cancelled)), cancel_tree);
-            assert!(session.journal().pending_custom_trigger().is_none());
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .pending_custom_trigger()
+                    .is_none()
+            );
             assert_eq!(
                 session
                     .journal()
+                    .unwrap()
                     .records()
                     .iter()
                     .filter(|record| matches!(&record.event,
@@ -3075,6 +3147,7 @@ mod tests {
         session.prompt("first").await.unwrap();
         let selected = session
             .journal()
+            .unwrap()
             .records()
             .iter()
             .find(|record| matches!(record.event, crate::Event::User { .. }))
@@ -3084,10 +3157,10 @@ mod tests {
             .navigate_tree(selected, crate::TreeNavigationOptions::default())
             .await
             .unwrap();
-        assert_eq!(session.journal().queued_custom_messages().len(), 1);
-        let head = session.journal().head();
+        assert_eq!(session.journal().unwrap().queued_custom_messages().len(), 1);
+        let head = session.journal().unwrap().head();
         let fork = session.fork_at(head).unwrap();
-        assert_eq!(fork.journal().queued_custom_messages().len(), 1);
+        assert_eq!(fork.journal().unwrap().queued_custom_messages().len(), 1);
         drop(fork);
         drop(session);
         let mut reopened =
@@ -3106,7 +3179,13 @@ mod tests {
         assert!(texts.ends_with(&["second", "tree next"]), "{texts:?}");
         drop(snapshots);
         reopened.checkout(selected).unwrap();
-        assert!(reopened.journal().queued_custom_messages().is_empty());
+        assert!(
+            reopened
+                .journal()
+                .unwrap()
+                .queued_custom_messages()
+                .is_empty()
+        );
     }
     struct TreeLifecycleMessage;
     #[async_trait::async_trait]
@@ -3155,6 +3234,7 @@ mod tests {
         session.prompt("first").await.unwrap();
         let selected = session
             .journal()
+            .unwrap()
             .records()
             .iter()
             .find(|record| matches!(record.event, crate::Event::User { .. }))
@@ -3168,8 +3248,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(model.0.load(Ordering::SeqCst), 2);
-        assert!(session.journal().pending_custom_trigger().is_none());
-        assert_eq!(session.journal().branch().iter().filter(|record|
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
+        assert_eq!(session.journal().unwrap().branch().iter().filter(|record|
             matches!(&record.event, crate::Event::CustomMessageDelivered { message, .. }
                 if message.custom_type == "tree")).count(), 1);
         drop(session);
@@ -3218,6 +3304,7 @@ mod tests {
         session.prompt("second").await.unwrap();
         let selected = session
             .journal()
+            .unwrap()
             .records()
             .iter()
             .find_map(|record| {
@@ -3258,10 +3345,13 @@ mod tests {
         let summary = result.summary_entry.unwrap();
         assert_eq!(
             summary.parent,
-            session.journal().records()[selected as usize - 1].parent
+            session.journal().unwrap().records()[selected as usize - 1].parent
         );
         assert!(matches!(summary.event, crate::Event::BranchSummary { .. }));
-        assert_eq!(session.journal().labels()[&summary.id], "SDK summary");
+        assert_eq!(
+            session.journal().unwrap().labels()[&summary.id],
+            "SDK summary"
+        );
         let observed: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
         assert!(
             observed.iter().any(
@@ -3286,12 +3376,12 @@ mod tests {
             .in_memory()
             .unwrap();
         session.prompt("first").await.unwrap();
-        let selected = session.journal().head();
+        let selected = session.journal().unwrap().head();
         session.prompt("second").await.unwrap();
         session
             .set_model(Arc::new(WaitingModel), "waiting")
             .unwrap();
-        let head = session.journal().head();
+        let head = session.journal().unwrap().head();
         let control = session.controls();
         let mut events = session.subscribe();
         let driver = async {
@@ -3315,14 +3405,22 @@ mod tests {
         assert!(
             session
                 .journal()
+                .unwrap()
                 .branch()
                 .iter()
                 .any(|record| record.id == head)
         );
-        assert!(!session.journal().records().iter().any(|record| matches!(
-            record.event,
-            crate::Event::Checkout { .. } | crate::Event::BranchSummary { .. }
-        )));
+        assert!(
+            !session
+                .journal()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|record| matches!(
+                    record.event,
+                    crate::Event::Checkout { .. } | crate::Event::BranchSummary { .. }
+                ))
+        );
         session.close().await.unwrap();
     }
 
@@ -3355,11 +3453,12 @@ mod tests {
             })
             .unwrap();
         session.prompt("fork point").await.unwrap();
-        let head = session.journal().head();
+        let head = session.journal().unwrap().head();
         let mut fork = session.fork_at(head).unwrap();
         assert!(!fork.auto_compaction_enabled());
         assert_eq!(
             fork.journal()
+                .unwrap()
                 .auto_compaction_control()
                 .token_settings()
                 .reserve_tokens,
@@ -3371,6 +3470,7 @@ mod tests {
         assert_eq!(
             session
                 .journal()
+                .unwrap()
                 .auto_compaction_control()
                 .token_settings()
                 .reserve_tokens,
@@ -3406,12 +3506,17 @@ mod tests {
             })
             .unwrap();
         let target = ("report".encode_utf16().count() as u64 + 600).div_ceil(4) + 1;
-        let control = session.journal().auto_compaction_control();
+        let control = session.journal().unwrap().auto_compaction_control();
         control.set_token_settings(crate::CompactionTokens {
             reserve_tokens: None,
             keep_recent_tokens: Some(target),
         });
-        assert_eq!(control.retained_turns(&session.journal(), 1).unwrap(), 1);
+        assert_eq!(
+            control
+                .retained_turns(&session.journal().unwrap(), 1)
+                .unwrap(),
+            1
+        );
         session.close().await.unwrap();
     }
 
@@ -3465,6 +3570,7 @@ mod tests {
         assert!(
             !session
                 .journal()
+                .unwrap()
                 .records()
                 .iter()
                 .any(|record| matches!(record.event, crate::Event::Compacted { .. }))
@@ -3538,7 +3644,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(session.journal().pending_custom_trigger().is_none());
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
         let snapshots = requests.lock().unwrap();
         assert_eq!(snapshots.len(), 3);
         let texts: Vec<_> = snapshots[2]
@@ -3593,7 +3705,13 @@ mod tests {
             texts.ends_with(&["compact trigger", "compact next"]),
             "{texts:?}"
         );
-        assert!(session.journal().pending_custom_trigger().is_none());
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3612,7 +3730,13 @@ mod tests {
                 keep_turns: 0,
             })
             .unwrap();
-        assert!(session.journal().pending_custom_trigger().is_none());
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
         let snapshots = requests.lock().unwrap();
         assert_eq!(snapshots.len(), 2);
         let texts: Vec<_> = snapshots[1]
@@ -3673,6 +3797,7 @@ mod tests {
         assert!(
             session
                 .journal()
+                .unwrap()
                 .queued_custom_messages()
                 .iter()
                 .any(|(_, message)| message.message.content
@@ -3681,6 +3806,7 @@ mod tests {
         assert!(
             session
                 .journal()
+                .unwrap()
                 .queued_inputs()
                 .iter()
                 .any(|input| input.input.content == "control input")
@@ -3791,7 +3917,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(model.0.load(Ordering::SeqCst), 3);
-        assert!(session.journal().pending_custom_trigger().is_none());
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
         drop(session);
         let restored = Session::open(&path).unwrap();
         assert!(restored.pending_custom_trigger().is_none());
@@ -3817,7 +3949,13 @@ mod tests {
                 .contains("Nothing to compact")
         );
         assert_eq!(model.0.load(Ordering::SeqCst), 1);
-        assert!(session.journal().pending_custom_trigger().is_none());
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
     }
 
     struct StatisticsModel {
@@ -3867,8 +4005,8 @@ mod tests {
         assert_eq!(session.statistics().cost, Some(0.0));
         session.prompt("hello").await.unwrap();
         let stats = session.statistics();
-        assert_eq!(stats, session.journal().statistics());
-        assert_eq!(stats.session_id, session.journal().session_id());
+        assert_eq!(stats, session.journal().unwrap().statistics());
+        assert_eq!(stats.session_id, session.journal().unwrap().session_id());
         assert_eq!((stats.user_messages, stats.assistant_messages), (1, 1));
         assert_eq!(
             (
@@ -3883,7 +4021,7 @@ mod tests {
         let usage = session.context_usage().await.unwrap().unwrap();
         assert_eq!((usage.context_window, usage.tokens), (4096, Some(13)));
         assert_eq!(usage.percent, Some(13.0 / 4096.0 * 100.0));
-        let head = session.journal().head();
+        let head = session.journal().unwrap().head();
         let mut fork = session.fork_at(head).unwrap();
         assert_eq!(fork.statistics().tokens, stats.tokens);
         assert_ne!(fork.statistics().session_id, stats.session_id);
@@ -4070,7 +4208,7 @@ mod tests {
             .send_custom_message(message("removed"), false)
             .await
             .unwrap();
-        let removed = session.journal().head();
+        let removed = session.journal().unwrap().head();
         session.edit_context(removed, None).unwrap();
         assert_eq!(session.resume().await.unwrap(), "answer 2");
         assert_eq!(model.0.load(Ordering::SeqCst), 2);
@@ -4146,7 +4284,7 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        let root = session.journal().head();
+        let root = session.journal().unwrap().head();
         session
             .extension_command("input-test", "prefix", "branch")
             .unwrap();
@@ -4166,7 +4304,7 @@ mod tests {
         assert_eq!(queued[0].input.id, id);
         assert_eq!(queued[0].input.content, "branch:FIXTURE");
         assert_eq!(queued[0].images, vec![image]);
-        let head = session.journal().head();
+        let head = session.journal().unwrap().head();
         let mut fork = session.fork_at(head).unwrap();
         fork.controls().follow_up("forked").await.unwrap();
         assert_eq!(
@@ -4261,10 +4399,13 @@ mod tests {
             session.messages().unwrap()
         );
         let path = directory.path().join("fork.jsonl");
-        let head = session.journal().head();
+        let head = session.journal().unwrap().head();
         let mut fork = session.fork_to(head, &path).unwrap();
-        assert_ne!(fork.journal().session_id(), session.journal().session_id());
-        let head = session.journal().head();
+        assert_ne!(
+            fork.journal().unwrap().session_id(),
+            session.journal().unwrap().session_id()
+        );
+        let head = session.journal().unwrap().head();
         assert!(session.fork_to(head, &path).is_err());
         fork.prompt("second").await.unwrap();
         fork.close().await.unwrap();
@@ -4283,10 +4424,13 @@ mod tests {
             .in_memory()
             .unwrap();
         session.prompt("first").await.unwrap();
-        let head = session.journal().head();
+        let head = session.journal().unwrap().head();
         let mut fork = session.fork_at(head).unwrap();
         assert_eq!(fork.messages().unwrap(), session.messages().unwrap());
-        assert_ne!(fork.journal().session_id(), session.journal().session_id());
+        assert_ne!(
+            fork.journal().unwrap().session_id(),
+            session.journal().unwrap().session_id()
+        );
         session.close().await.unwrap();
         assert_eq!(closed.load(Ordering::SeqCst), 0);
         assert_eq!(fork.prompt("continue fork").await.unwrap(), "answer 2");
@@ -4434,7 +4578,7 @@ mod tests {
             .in_memory()
             .unwrap();
             session.prompt("prompt").await.unwrap();
-            assert_eq!(session.journal().records().iter().filter(|record| matches!(&record.event,
+            assert_eq!(session.journal().unwrap().records().iter().filter(|record| matches!(&record.event,
                 crate::Event::CustomMessageQueued { input } if input.message.custom_type == "live-key")).count(), 1, "polling={polling}");
         }
     }
@@ -4500,6 +4644,7 @@ mod tests {
         assert!(matches!(result, Err(Error::Cancelled)));
         let run_id = original
             .journal()
+            .unwrap()
             .records()
             .iter()
             .find_map(|record| match record.event {
@@ -4510,7 +4655,8 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let mut journal = Session::from_records(original.journal().records().to_vec()).unwrap();
+        let mut journal =
+            Session::from_records(original.journal().unwrap().records().to_vec()).unwrap();
         let hook = Arc::new(PendingKeyedResultHook {
             paused: tokio::sync::Notify::new(),
             calls: AtomicUsize::new(0),
@@ -4767,8 +4913,9 @@ mod tests {
             .position(|m| matches!(m, Message::User { content } if content == "steer"))
             .unwrap();
         assert!(tool_pos < steer_pos);
-        assert_eq!(session.journal().queued_custom_messages().len(), 1);
-        let restored = Session::from_records(session.journal().records().to_vec()).unwrap();
+        assert_eq!(session.journal().unwrap().queued_custom_messages().len(), 1);
+        let restored =
+            Session::from_records(session.journal().unwrap().records().to_vec()).unwrap();
         assert_eq!(
             restored.queued_custom_messages()[0].1.delivery,
             crate::CustomMessageDelivery::NextTurn
@@ -4786,7 +4933,13 @@ mod tests {
             text(snapshots.last().unwrap()),
             ["first", "after", "steer", "follow", "second", "next"]
         );
-        assert!(session.journal().queued_custom_messages().is_empty());
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .queued_custom_messages()
+                .is_empty()
+        );
     }
 
     struct LifecycleMessageExtension;
@@ -4985,9 +5138,11 @@ mod tests {
             .position(|m| matches!(m, Message::User { content } if content == "turn end"))
             .unwrap();
         assert!(tool < turn_end);
-        assert_eq!(session.journal().queued_custom_messages().len(), 1);
+        assert_eq!(session.journal().unwrap().queued_custom_messages().len(), 1);
         assert_eq!(
-            session.journal().queued_custom_messages()[0].1.delivery,
+            session.journal().unwrap().queued_custom_messages()[0]
+                .1
+                .delivery,
             crate::CustomMessageDelivery::NextTurn
         );
     }
@@ -5033,7 +5188,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(count.0.load(Ordering::SeqCst), 2);
-        let records = session.journal().records().to_vec();
+        let records = session.journal().unwrap().records().to_vec();
         let queued = records
             .iter()
             .position(|r| matches!(r.event, crate::Event::CustomMessageQueued { .. }))
@@ -5092,7 +5247,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(model.0.load(Ordering::SeqCst), 2);
-        let records = session.journal().records().to_vec();
+        let records = session.journal().unwrap().records().to_vec();
         let request = records
             .iter()
             .position(|r| matches!(r.event, crate::Event::ModelRequested { .. }))
@@ -5195,7 +5350,7 @@ mod tests {
         .expect("input hook deadlocked");
         assert!(matches!(result, Err(Error::Cancelled)));
         assert_eq!(
-            session.journal().queued_custom_messages()[0]
+            session.journal().unwrap().queued_custom_messages()[0]
                 .1
                 .message
                 .content,
@@ -5255,7 +5410,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(model.0.load(Ordering::SeqCst), 1);
-        assert_eq!(session.journal().queued_custom_messages().len(), 1);
+        assert_eq!(session.journal().unwrap().queued_custom_messages().len(), 1);
         session.prompt("second").await.unwrap();
         let texts: Vec<_> = session
             .messages()
@@ -5331,7 +5486,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(model.0.load(Ordering::SeqCst), 2);
-            let records = session.journal().records().to_vec();
+            let records = session.journal().unwrap().records().to_vec();
             let id = records
                 .iter()
                 .find_map(|record| match &record.event {
@@ -5352,7 +5507,13 @@ mod tests {
                         ..
                     }
                 )));
-            assert!(session.journal().pending_custom_trigger().is_none());
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .pending_custom_trigger()
+                    .is_none()
+            );
         }
     }
     #[tokio::test]
@@ -5413,8 +5574,14 @@ mod tests {
                 usize::from(phase != 3),
                 "phase {phase}"
             );
-            assert_eq!(session.journal().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
-            assert!(session.journal().pending_custom_trigger().is_none());
+            assert_eq!(session.journal().unwrap().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .pending_custom_trigger()
+                    .is_none()
+            );
         }
     }
 
@@ -5457,8 +5624,14 @@ mod tests {
                 .unwrap();
             session.start().await.unwrap();
             assert_eq!(model.0.load(Ordering::SeqCst), 1, "{state:?}");
-            assert!(session.journal().pending_custom_trigger().is_none());
-            assert_eq!(session.journal().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .pending_custom_trigger()
+                    .is_none()
+            );
+            assert_eq!(session.journal().unwrap().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
         }
     }
 
@@ -5515,7 +5688,7 @@ mod tests {
                 usize::from(should_resume),
                 "{state:?}"
             );
-            assert_eq!(session.journal().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
+            assert_eq!(session.journal().unwrap().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id)).count(), 1);
         }
     }
 
@@ -5593,8 +5766,14 @@ mod tests {
                 .unwrap();
             session.start().await.unwrap();
             assert_eq!(model.0.load(Ordering::SeqCst), 1, "delivered={delivered}");
-            assert!(session.journal().pending_custom_trigger().is_none());
-            assert_eq!(session.journal().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: x, .. } if x == id)).count(), 1);
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .pending_custom_trigger()
+                    .is_none()
+            );
+            assert_eq!(session.journal().unwrap().records().iter().filter(|r| matches!(r.event, crate::Event::CustomMessageDelivered { id: x, .. } if x == id)).count(), 1);
         }
     }
 
@@ -6151,7 +6330,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let records = session.journal().records().to_vec();
+        let records = session.journal().unwrap().records().to_vec();
         let completed = records.iter().position(|record| matches!(record.event,
             crate::Event::TurnEndCallbacksCompleted { assistant_record: id } if id == assistant_record)).unwrap();
         let delivered = records.iter().position(|record| record.run_id == Some(previous) && matches!(&record.event,
@@ -6590,6 +6769,7 @@ mod tests {
         session.prompt("prompt").await.unwrap();
         let ids: Vec<_> = session
             .journal()
+            .unwrap()
             .records()
             .iter()
             .filter_map(|record| match &record.event {
@@ -6812,6 +6992,7 @@ mod tests {
         session.prompt("prompt").await.unwrap();
         let queued: Vec<_> = session
             .journal()
+            .unwrap()
             .records()
             .iter()
             .filter_map(|record| match &record.event {
@@ -7302,7 +7483,13 @@ mod tests {
             .unwrap();
         session.start().await.unwrap();
         assert_eq!(model.0.load(Ordering::SeqCst), 2);
-        let branch: Vec<_> = session.journal().branch().into_iter().cloned().collect();
+        let branch: Vec<_> = session
+            .journal()
+            .unwrap()
+            .branch()
+            .into_iter()
+            .cloned()
+            .collect();
         let deliveries: Vec<_> = branch
             .iter()
             .filter_map(|r| match &r.event {
@@ -7512,7 +7699,7 @@ mod tests {
             .in_memory()
             .unwrap();
         session.prompt("first").await.unwrap();
-        let target = session.journal().head();
+        let target = session.journal().unwrap().head();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             session.fork_with_hooks(target, crate::ForkPosition::At, None),
@@ -7520,7 +7707,8 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(result, Err(Error::Cancelled)));
-        let restored = Session::from_records(session.journal().records().to_vec()).unwrap();
+        let restored =
+            Session::from_records(session.journal().unwrap().records().to_vec()).unwrap();
         assert_eq!(restored.queued_custom_messages().len(), 1);
         assert_eq!(
             restored.queued_custom_messages()[0].1.message.content,
@@ -7539,7 +7727,7 @@ mod tests {
             .in_memory()
             .unwrap();
         session.prompt("first").await.unwrap();
-        let target = session.journal().head();
+        let target = session.journal().unwrap().head();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             session.fork_with_hooks(target, crate::ForkPosition::At, None),
@@ -7548,7 +7736,13 @@ mod tests {
         .unwrap();
         assert!(matches!(result, Err(Error::Cancelled)));
         assert_eq!(model.0.load(Ordering::SeqCst), 2);
-        assert!(session.journal().pending_custom_trigger().is_none());
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .pending_custom_trigger()
+                .is_none()
+        );
     }
 
     struct NestedModel;
@@ -7713,6 +7907,7 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
         let plans = session
             .journal()
+            .unwrap()
             .records()
             .iter()
             .filter(|record| matches!(record.event, crate::Event::ToolPlanned { .. }))
@@ -7721,15 +7916,17 @@ mod tests {
         assert!(
             session
                 .journal()
+                .unwrap()
                 .operations()
                 .iter()
                 .any(|(invocation, _)| invocation.call.name == "child"
                     && invocation.call.arguments.contains("wrapped"))
         );
-        assert_eq!(session.journal().operations().len(), 4);
+        assert_eq!(session.journal().unwrap().operations().len(), 4);
         assert!(
             session
                 .journal()
+                .unwrap()
                 .operations()
                 .iter()
                 .all(|(_, state)| matches!(state, crate::OperationState::Finished(_)))
@@ -7783,11 +7980,12 @@ mod tests {
         assert!(
             !session
                 .journal()
+                .unwrap()
                 .records()
                 .iter()
                 .any(|record| matches!(record.event, crate::Event::ToolStarted { .. }))
         );
-        assert!(session.journal().operations().iter().any(|(_, state)| matches!(state, crate::OperationState::Finished(crate::Outcome::Skipped(reason)) if reason.contains("preparation timed out"))));
+        assert!(session.journal().unwrap().operations().iter().any(|(_, state)| matches!(state, crate::OperationState::Finished(crate::Outcome::Skipped(reason)) if reason.contains("preparation timed out"))));
     }
     struct ParallelBundle;
     #[async_trait::async_trait]
@@ -7865,7 +8063,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(result, "done");
-        assert_eq!(session.journal().operations().len(), 3);
+        assert_eq!(session.journal().unwrap().operations().len(), 3);
         session.close().await.unwrap();
     }
     struct BlockingChild {
@@ -7943,10 +8141,11 @@ mod tests {
             Err(Error::Reconciliation(_)) | Err(Error::Cancelled)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(session.journal().operations().len(), 2);
+        assert_eq!(session.journal().unwrap().operations().len(), 2);
         assert!(
             session
                 .journal()
+                .unwrap()
                 .operations()
                 .iter()
                 .all(|(_, state)| matches!(
@@ -8013,7 +8212,7 @@ mod tests {
             .unwrap();
         assert_eq!(session.prompt("save state").await.unwrap(), "done");
         assert_eq!(
-            session.journal().extension_states()["stateful"].data["secret"],
+            session.journal().unwrap().extension_states()["stateful"].data["secret"],
             "private state"
         );
         assert!(
@@ -8021,7 +8220,7 @@ mod tests {
                 .unwrap()
                 .contains("private state")
         );
-        assert!(session.journal().records().iter().any(|record| matches!(&record.event, crate::Event::ToolFinished { states, outcome: crate::Outcome::Succeeded(_), .. } if states.contains_key("stateful"))));
+        assert!(session.journal().unwrap().records().iter().any(|record| matches!(&record.event, crate::Event::ToolFinished { states, outcome: crate::Outcome::Succeeded(_), .. } if states.contains_key("stateful"))));
         session.close().await.unwrap();
     }
     #[tokio::test]
@@ -8052,7 +8251,7 @@ mod tests {
         assert!(matches!(result, Err(Error::Cancelled)));
         assert_eq!(session.pending_inputs(), 0);
         assert_eq!(
-            session.journal().queue_mode(InputKind::FollowUp),
+            session.journal().unwrap().queue_mode(InputKind::FollowUp),
             crate::QueueMode::OneAtATime
         );
         assert!(control.clear_queued_inputs().await.is_err());
@@ -8115,9 +8314,9 @@ mod tests {
         assert!(
             matches!(request.messages.last(), Some(crate::Message::User { content }) if content.ends_with("Additional focus: Preserve the deployment decision."))
         );
-        assert!(!session.journal().records().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content.contains("deployment decision"))));
+        assert!(!session.journal().unwrap().records().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content.contains("deployment decision"))));
         assert!(
-            matches!(&session.journal().records().last().unwrap().event, crate::Event::Compacted { summary, .. } if summary == "answer 4")
+            matches!(&session.journal().unwrap().records().last().unwrap().event, crate::Event::Compacted { summary, .. } if summary == "answer 4")
         );
         session.close().await.unwrap();
     }
@@ -8215,7 +8414,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(result, Err(Error::Cancelled)));
-        assert_eq!(session.journal().queued_custom_messages().len(), 1);
+        assert_eq!(session.journal().unwrap().queued_custom_messages().len(), 1);
     }
 
     #[tokio::test]
@@ -8247,7 +8446,8 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(result, Err(Error::Cancelled)));
-        let restored = Session::from_records(session.journal().records().to_vec()).unwrap();
+        let restored =
+            Session::from_records(session.journal().unwrap().records().to_vec()).unwrap();
         assert_eq!(
             restored.queued_custom_messages()[0].1.message.details,
             Some(serde_json::json!({"x":1}))
@@ -8317,7 +8517,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(result, Err(Error::Cancelled)));
-        assert_eq!(session.journal().name(), Some("In progress"));
+        assert_eq!(session.journal().unwrap().name(), Some("In progress"));
         session.close().await.unwrap();
     }
     struct ImageModel;
@@ -8364,6 +8564,7 @@ mod tests {
         assert_eq!(
             session
                 .journal()
+                .unwrap()
                 .records()
                 .iter()
                 .filter(|record| matches!(record.event, crate::Event::Assistant { .. }))
@@ -8373,18 +8574,19 @@ mod tests {
         assert_eq!(
             session
                 .journal()
+                .unwrap()
                 .records()
                 .iter()
                 .filter(|record| matches!(record.event, crate::Event::UserWithImages { .. }))
                 .count(),
             2
         );
-        let head = session.journal().head();
+        let head = session.journal().unwrap().head();
         let mut fork = session.fork_at(head).unwrap();
         assert!(fork.messages().unwrap().iter().any(
             |message| matches!(message, Message::UserWithImages { images, .. } if images.len() == 1)
         ));
-        let count = session.journal().records().len();
+        let count = session.journal().unwrap().records().len();
         assert!(
             session
                 .prompt_with_images(
@@ -8397,7 +8599,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(session.journal().records().len(), count);
+        assert_eq!(session.journal().unwrap().records().len(), count);
         fork.close().await.unwrap();
         session.close().await.unwrap();
     }
@@ -8437,8 +8639,8 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.resume().await.unwrap(), "answer 2");
         assert_eq!(reopened.resume().await.unwrap(), "answer 2");
-        assert_eq!(reopened.journal().records().iter().filter(|record| matches!(&record.event, crate::Event::InputQueuedWithImages { input } if input.input.id == input_id)).count(), 1);
-        assert_eq!(reopened.journal().records().iter().filter(|record| matches!(&record.event, crate::Event::UserWithImages { input_id: Some(id), .. } if *id == input_id)).count(), 1);
+        assert_eq!(reopened.journal().unwrap().records().iter().filter(|record| matches!(&record.event, crate::Event::InputQueuedWithImages { input } if input.input.id == input_id)).count(), 1);
+        assert_eq!(reopened.journal().unwrap().records().iter().filter(|record| matches!(&record.event, crate::Event::UserWithImages { input_id: Some(id), .. } if *id == input_id)).count(), 1);
         reopened.close().await.unwrap();
     }
     struct PriorityModel {
