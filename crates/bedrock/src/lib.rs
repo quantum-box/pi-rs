@@ -26,6 +26,8 @@ pub struct Bedrock {
     client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
     unsupported: Option<String>,
     bearer: Option<String>,
+    force_sigv4: bool,
+    profile: Option<String>,
     model_name: Option<(String, String)>,
     known_config: Option<std::sync::Arc<tokio::sync::OnceCell<aws_types::SdkConfig>>>,
     prepared_identity: Option<String>,
@@ -48,6 +50,8 @@ impl Bedrock {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             unsupported: None,
             bearer: None,
+            force_sigv4: false,
+            profile: None,
             model_name: None,
             known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new())),
             prepared_identity: None,
@@ -70,6 +74,8 @@ impl Bedrock {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
             unsupported: None,
             bearer: None,
+            force_sigv4: false,
+            profile: None,
             model_name: None,
             known_config: None,
             prepared_identity: None,
@@ -94,6 +100,8 @@ impl Bedrock {
             )))),
             unsupported: None,
             bearer: None,
+            force_sigv4: false,
+            profile: None,
             model_name: None,
             known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
                 config,
@@ -123,8 +131,55 @@ impl Bedrock {
             .map(|client| bearer_client(client.config().to_builder(), &token));
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(client));
         self.bearer = Some(token);
+        self.force_sigv4 = false;
         self.prepared_identity = None;
         Ok(self)
+    }
+    /// Rebuild from the standard SDK configuration using a named profile, without
+    /// modifying the process environment. This replaces any caller-supplied client.
+    pub fn with_profile(mut self, profile: String) -> Self {
+        self.profile = Some(profile);
+        self.bearer = None;
+        self.force_sigv4 = true;
+        self.client = std::sync::Arc::new(tokio::sync::OnceCell::new());
+        self.known_config = Some(std::sync::Arc::new(tokio::sync::OnceCell::new()));
+        self.prepared_identity = None;
+        self
+    }
+
+    /// Rebuild from the standard SDK configuration using the credential chain,
+    /// ignoring any ambient Bedrock bearer token and replacing a supplied client.
+    pub fn with_credential_chain(mut self) -> Self {
+        self.profile = None;
+        self.force_sigv4 = true;
+        self.bearer = None;
+        self.client = std::sync::Arc::new(tokio::sync::OnceCell::new());
+        self.known_config = Some(std::sync::Arc::new(tokio::sync::OnceCell::new()));
+        self.prepared_identity = None;
+        self
+    }
+
+    async fn load_config(&self) -> aws_types::SdkConfig {
+        let loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(profile) = &self.profile {
+            // Load the effective region first, including the selected profile's region.
+            // The profile provider uses it for STS when assuming a role.
+            let config = loader.profile_name(profile).load().await;
+            let provider_config = aws_config::provider_config::ProviderConfig::without_region()
+                .with_region(config.region().cloned());
+            let credentials = aws_config::profile::ProfileFileCredentialsProvider::builder()
+                .configure(&provider_config)
+                .profile_name(profile)
+                .build();
+            config
+                .to_builder()
+                .credentials_provider(
+                    aws_credential_types::provider::SharedCredentialsProvider::new(credentials),
+                )
+                .build()
+        } else {
+            loader.load().await
+        }
     }
     /// Bind a configured model name to its ID for model-specific Converse behavior.
     pub fn with_model_name(mut self, model: &str, name: Option<&str>) -> Self {
@@ -148,9 +203,7 @@ impl Bedrock {
             return Ok(None);
         };
         let config = config
-            .get_or_init(|| async {
-                aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
-            })
+            .get_or_init(|| async { self.load_config().await })
             .await;
         // A caller-supplied HTTP transport can reroute requests independently
         // of the SDK endpoint configuration.
@@ -178,7 +231,8 @@ impl Bedrock {
                 .or_else(|| config.endpoint_url().map(str::to_owned))
         };
         let bearer = self.bearer.clone().or_else(|| {
-            if (!self.environment_config && config.token_provider().is_some())
+            if self.force_sigv4
+                || (!self.environment_config && config.token_provider().is_some())
                 || config
                     .get_origin("auth_scheme_preference")
                     .is_client_config()
@@ -194,11 +248,12 @@ impl Bedrock {
             }
             ("bearer", token.clone(), String::new(), None, None)
         } else {
-            if (!self.environment_config && config.token_provider().is_some())
-                || config.auth_scheme_preference().is_some()
-                || config
-                    .get_origin("auth_scheme_preference")
-                    .is_client_config()
+            if !self.force_sigv4
+                && ((!self.environment_config && config.token_provider().is_some())
+                    || config.auth_scheme_preference().is_some()
+                    || config
+                        .get_origin("auth_scheme_preference")
+                        .is_client_config())
             {
                 return Ok(None);
             }
@@ -969,10 +1024,7 @@ impl Model for Bedrock {
                 {
                     let config = if let Some(known) = &self.known_config {
                         known
-                            .get_or_init(|| async {
-                                aws_config::load_defaults(aws_config::BehaviorVersion::latest())
-                                    .await
-                            })
+                            .get_or_init(|| async { self.load_config().await })
                             .await
                             .clone()
                     } else {
@@ -982,6 +1034,13 @@ impl Model for Bedrock {
                         bearer_client(
                             aws_sdk_bedrockruntime::config::Builder::from(&config),
                             token,
+                        )
+                    } else if self.force_sigv4 {
+                        use aws_smithy_runtime_api::client::auth::AuthSchemeId;
+                        Client::from_conf(
+                            aws_sdk_bedrockruntime::config::Builder::from(&config)
+                                .auth_scheme_preference([AuthSchemeId::new("sigv4")])
+                                .build(),
                         )
                     } else {
                         Client::new(&config)
@@ -1140,6 +1199,216 @@ mod tests {
         );
         assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "answer"));
     }
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn selected_profile_wins_over_ambient_keys_without_mutating_environment() {
+        use aws_credential_types::provider::ProvideCredentials;
+        if std::env::var_os("PI_RS_PROFILE_TEST_CHILD").is_some() {
+            let before = std::env::var("AWS_PROFILE").unwrap();
+            let model = Bedrock::from_env().with_profile("selected".into());
+            let config = model.load_config().await;
+            let credentials = config
+                .credentials_provider()
+                .unwrap()
+                .provide_credentials()
+                .await
+                .unwrap();
+            assert_eq!(credentials.access_key_id(), "SELECTEDKEY");
+            assert_eq!(config.region().unwrap().as_ref(), "us-west-2");
+
+            // The last selection must win in either order, even after a
+            // previously selected profile has populated its SDK config.
+            let _ = model.prepare_bedrock().await.unwrap();
+            let chain = model.with_credential_chain();
+            let chain_config = chain.load_config().await;
+            assert_eq!(chain_config.region().unwrap().as_ref(), "ap-southeast-1");
+            let credentials = chain_config
+                .credentials_provider()
+                .unwrap()
+                .provide_credentials()
+                .await
+                .unwrap();
+            assert_eq!(credentials.access_key_id(), "AMBIENTKEY");
+            let prepared = chain.prepare_bedrock().await.unwrap().unwrap();
+            let fresh = Bedrock::from_env()
+                .with_credential_chain()
+                .prepare_bedrock()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(prepared.context_identity(), fresh.context_identity());
+            assert!(prepared.context_identity().is_some());
+            let profile = chain.with_profile("selected".into());
+            let credentials = profile
+                .load_config()
+                .await
+                .credentials_provider()
+                .unwrap()
+                .provide_credentials()
+                .await
+                .unwrap();
+            assert_eq!(credentials.access_key_id(), "SELECTEDKEY");
+            assert_eq!(std::env::var("AWS_PROFILE").unwrap(), before);
+            assert_eq!(std::env::var("AWS_ACCESS_KEY_ID").unwrap(), "AMBIENTKEY");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join("credentials");
+        let config = dir.path().join("config");
+        std::fs::write(
+            &credentials,
+            "[selected]\naws_access_key_id=SELECTEDKEY\naws_secret_access_key=SELECTEDSECRET\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &config,
+            "[profile selected]\nregion=us-west-2\n[profile ambient]\nregion=ap-southeast-1\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::selected_profile_wins_over_ambient_keys_without_mutating_environment",
+            ])
+            .env("PI_RS_PROFILE_TEST_CHILD", "1")
+            .env("AWS_PROFILE", "ambient")
+            .env("AWS_ACCESS_KEY_ID", "AMBIENTKEY")
+            .env("AWS_SECRET_ACCESS_KEY", "AMBIENTSECRET")
+            .env("AWS_SHARED_CREDENTIALS_FILE", credentials)
+            .env("AWS_CONFIG_FILE", config)
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env_remove("AWS_REGION")
+            .env_remove("AWS_DEFAULT_REGION")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn selected_assume_role_profile_uses_its_region_for_sts() {
+        use aws_credential_types::provider::ProvideCredentials;
+        if std::env::var_os("PI_RS_ASSUME_ROLE_TEST_CHILD").is_some() {
+            let config = Bedrock::from_env()
+                .with_profile("selected".into())
+                .load_config()
+                .await;
+            assert_eq!(config.region().unwrap().as_ref(), "us-west-2");
+            let credentials = config
+                .credentials_provider()
+                .unwrap()
+                .provide_credentials()
+                .await
+                .unwrap();
+            assert_eq!(credentials.access_key_id(), "ASSUMEDKEY");
+            assert_eq!(std::env::var("AWS_PROFILE").unwrap(), "ambient");
+            return;
+        }
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join("credentials");
+        let config = dir.path().join("config");
+        std::fs::write(
+            &credentials,
+            "[source]\naws_access_key_id=SOURCEKEY\naws_secret_access_key=SOURCESECRET\n",
+        )
+        .unwrap();
+        std::fs::write(&config, "[profile selected]\nregion=us-west-2\nrole_arn=arn:aws:iam::123456789012:role/test\nsource_profile=source\n").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::selected_assume_role_profile_uses_its_region_for_sts",
+            ])
+            .env("PI_RS_ASSUME_ROLE_TEST_CHILD", "1")
+            .env("AWS_PROFILE", "ambient")
+            .env("AWS_ACCESS_KEY_ID", "AMBIENTKEY")
+            .env("AWS_SECRET_ACCESS_KEY", "AMBIENTSECRET")
+            .env("AWS_SHARED_CREDENTIALS_FILE", credentials)
+            .env("AWS_CONFIG_FILE", config)
+            .env("AWS_ENDPOINT_URL_STS", endpoint)
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env_remove("AWS_REGION")
+            .env_remove("AWS_DEFAULT_REGION")
+            .env_remove("AWS_ENDPOINT_URL")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some()
+                    {
+                        let _ = child.kill();
+                        let output = child.wait_with_output().unwrap();
+                        panic!(
+                            "STS was not called: {} {}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("STS listener: {e}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut data = Vec::new();
+        let mut buffer = [0; 4096];
+        let (header_end, length) = loop {
+            let n = socket.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buffer[..n]);
+            if let Some(pos) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&data[..pos]);
+                let len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                break (pos + 4, len);
+            }
+        };
+        while data.len() < header_end + length {
+            let n = socket.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buffer[..n]);
+        }
+        let request = String::from_utf8_lossy(&data);
+        assert!(
+            request.contains("Credential=SOURCEKEY/")
+                && request.contains("/us-west-2/sts/aws4_request"),
+            "{request}"
+        );
+        assert!(request.contains("Action=AssumeRole"));
+        let body = "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><AssumeRoleResult><Credentials><AccessKeyId>ASSUMEDKEY</AccessKeyId><SecretAccessKey>ASSUMEDSECRET</SecretAccessKey><SessionToken>SESSION</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult><ResponseMetadata><RequestId>fixture</RequestId></ResponseMetadata></AssumeRoleResponse>";
+        write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: text/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn environment_auth_produces_a_prepared_identity() {

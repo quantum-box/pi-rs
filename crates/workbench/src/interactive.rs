@@ -381,6 +381,8 @@ enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
     ProviderKey(super::Provider),
+    BedrockProfile,
+    BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
@@ -2898,7 +2900,11 @@ fn slash(
                     .provider(rest)
                     .ok_or_else(|| Error::Config("unsupported model provider".into()))?;
                 if login {
-                    edit_provider_key(provider, view);
+                    if provider.id() == "amazon-bedrock" {
+                        show_bedrock_methods(view);
+                    } else {
+                        edit_provider_key(provider, view);
+                    }
                 } else {
                     remove_provider_key(provider, args, view)?;
                 }
@@ -4230,6 +4236,18 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
+                                LocalEditor::BedrockChain => super::model_auth::save_bedrock_profile(None)
+                                    .and_then(|()| super::model_auth::Keys::load())
+                                    .map(|keys| { args.model_keys = keys; view.invalidate_model_catalog(); view.append("Using existing AWS credential chain for amazon-bedrock"); }),
+                                LocalEditor::BedrockProfile => {
+                                    super::model_auth::save_bedrock_profile(Some(text.trim()))
+                                        .and_then(|()| super::model_auth::Keys::load())
+                                        .map(|keys| {
+                                            args.model_keys = keys;
+                                            view.invalidate_model_catalog();
+                                            view.append("AWS profile saved for amazon-bedrock");
+                                        })
+                                }
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
                                     args.model_endpoint_for(
@@ -5277,6 +5295,26 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
         view.append("Only one model in scope");
     }
     Ok(())
+}
+
+fn show_bedrock_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Select Amazon Bedrock authentication method",
+        vec![
+            Item {
+                label: "Bearer token".into(),
+                selection: Selection::BedrockBearer,
+            },
+            Item {
+                label: "AWS profile".into(),
+                selection: Selection::BedrockProfile,
+            },
+            Item {
+                label: "Existing AWS credential chain".into(),
+                selection: Selection::BedrockChain,
+            },
+        ],
+    ));
 }
 
 fn show_radius_methods(view: &mut View) {
@@ -6346,7 +6384,35 @@ fn select(
             select_model_input(args, view, &model)?;
         }
         Selection::Completion { range, text } => insert_completion(view, range, &text),
+        Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
+            show_bedrock_methods(view)
+        }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
+        Selection::BedrockBearer => edit_provider_key(super::Provider::Bedrock, view),
+        Selection::BedrockProfile => {
+            let dialog = crate::ui::dialog::Dialog::new(
+                uuid::Uuid::new_v4(),
+                pi_rs::UiRequest::Input {
+                    title: "Enter AWS profile name".into(),
+                    placeholder: None,
+                    initial_value: None,
+                    timeout: None,
+                },
+            );
+            view.local_editor = Some((LocalEditor::BedrockProfile, dialog));
+        }
+        Selection::BedrockChain => {
+            let dialog = crate::ui::dialog::Dialog::new(
+                uuid::Uuid::new_v4(),
+                pi_rs::UiRequest::Input {
+                    title: "Configure AWS credentials, then press Enter to continue".into(),
+                    placeholder: None,
+                    initial_value: None,
+                    timeout: None,
+                },
+            );
+            view.local_editor = Some((LocalEditor::BedrockChain, dialog));
+        }
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
         Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings, false, None),
