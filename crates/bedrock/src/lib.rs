@@ -450,13 +450,29 @@ fn replay_blocks(
     {
         return None;
     }
-    let mut out = Vec::new();
+    let mut out: Vec<ContentBlock> = Vec::new();
+    let mut pending_whitespace = String::new();
     for b in &replay.blocks {
         if b.get("_pi_context_edit_api").is_some() {
             continue;
         }
+        if b["type"] != "text" {
+            pending_whitespace.clear();
+        }
         match b["type"].as_str()? {
-            "text" => out.push(ContentBlock::Text(b["text"].as_str()?.to_owned())),
+            "text" => {
+                let text = b["text"].as_str()?;
+                if text.trim().is_empty() {
+                    if let Some(ContentBlock::Text(previous)) = out.last_mut() {
+                        previous.push_str(text);
+                    } else {
+                        pending_whitespace.push_str(text);
+                    }
+                } else {
+                    pending_whitespace.push_str(text);
+                    out.push(ContentBlock::Text(std::mem::take(&mut pending_whitespace)));
+                }
+            }
             "tool_use" => out.push(ContentBlock::ToolUse(
                 types::ToolUseBlock::builder()
                     .tool_use_id(ids.get(b["id"].as_str()?))
@@ -1338,6 +1354,51 @@ mod tests {
         assert!(model.estimate_message_tokens(&request, &with_call) > 1900);
         request.tools.clear();
         assert!(model.estimate_message_tokens(&request, &with_call) < 100);
+    }
+
+    #[test]
+    fn edited_replay_omits_blank_text_without_losing_signed_reasoning() {
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "amazon-bedrock".into(),
+                model: "anthropic.claude-test".into(),
+            },
+            blocks: vec![
+                serde_json::json!({"type":"text","text":""}),
+                serde_json::json!({"type":"text","text":"first"}),
+                serde_json::json!({"type":"text","text":" \n"}),
+                serde_json::json!({"type":"text","text":"second"}),
+                serde_json::json!({"type":"reasoning","text":"private","signature":"sig"}),
+                serde_json::json!({"type":"text","text":"   "}),
+                serde_json::json!({"type":"tool_use","id":"id","name":"lookup","input":{}}),
+                serde_json::json!({"_pi_context_edit_api":"bedrock-converse-stream"}),
+            ],
+        };
+        let call = ToolCall {
+            id: "id".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        };
+        let blocks = replay_blocks(
+            &replay,
+            "anthropic.claude-test",
+            true,
+            "first \nsecond   ",
+            &[call],
+            &mut ToolIds::default(),
+        )
+        .unwrap();
+        assert!(matches!(&blocks[0], ContentBlock::Text(text) if text == "first \n"));
+        assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "second"));
+        assert!(
+            matches!(&blocks[2], ContentBlock::ReasoningContent(types::ReasoningContentBlock::ReasoningText(text)) if text.signature() == Some("sig"))
+        );
+        assert!(matches!(&blocks[3], ContentBlock::ToolUse(_)));
+        assert!(
+            blocks
+                .iter()
+                .all(|block| !matches!(block, ContentBlock::Text(text) if text.trim().is_empty()))
+        );
     }
 
     #[test]
