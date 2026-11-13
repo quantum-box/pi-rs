@@ -20,6 +20,7 @@ pub enum PackageCommand {
         #[arg(short = 'l', long)]
         local: bool,
     },
+    #[command(visible_alias = "uninstall")]
     Remove {
         source: String,
         #[arg(short = 'l', long)]
