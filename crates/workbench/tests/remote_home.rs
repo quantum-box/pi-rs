@@ -166,3 +166,30 @@ async fn coding_tools_apply_shared_backend_home_only_to_injected_tools() {
         .await;
     }
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn injected_tools_reject_drive_relative_paths_before_backend_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Backend::default());
+    let tools = vec![
+        create_read_tool(root.path(), backend.clone()).unwrap(),
+        create_write_tool(root.path(), backend.clone()).unwrap(),
+        create_edit_tool_with_path_options(
+            root.path(),
+            backend.clone(),
+            EditToolOptions::default(),
+            RemotePathOptions::default(),
+        )
+        .unwrap(),
+    ];
+    for tool in tools {
+        let mut arguments = args(&tool.spec().name);
+        arguments["path"] = json!("D:logs");
+        assert!(matches!(
+            tool.invoke(arguments, context()).await,
+            Outcome::Failed(_)
+        ));
+        assert!(backend.0.lock().unwrap().is_empty());
+    }
+}

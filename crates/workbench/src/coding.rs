@@ -652,7 +652,12 @@ pub fn create_read_tool_with_shell_outputs(
     operations: Arc<dyn ReadOperations>,
     outputs: ShellOutputStore,
 ) -> Result<Arc<dyn Tool>> {
-    create_read_tool_with_options_and_shell_outputs(root, operations, RemotePathOptions::default(), outputs)
+    create_read_tool_with_options_and_shell_outputs(
+        root,
+        operations,
+        RemotePathOptions::default(),
+        outputs,
+    )
 }
 
 /// Construct an injected read tool with an explicit backend home.
@@ -661,7 +666,12 @@ pub fn create_read_tool_with_options(
     operations: Arc<dyn ReadOperations>,
     options: RemotePathOptions,
 ) -> Result<Arc<dyn Tool>> {
-    create_read_tool_with_options_and_shell_outputs(root, operations, options, ShellOutputStore::default())
+    create_read_tool_with_options_and_shell_outputs(
+        root,
+        operations,
+        options,
+        ShellOutputStore::default(),
+    )
 }
 
 /// Configure backend paths and a shared shell transcript store together.
@@ -746,8 +756,8 @@ impl Tool for RemoteReadTool {
         let _guard = cancellation.clone().drop_guard();
         let operation = async {
             let name = string(&args, "path")?.to_owned();
-            let input = crate::coding_paths::input(&name, self.remote_home.as_deref())?;
-            let requested = crate::coding_paths::resolve(&self.tool.root, &input);
+            let input = crate::coding_paths::remote_input(&name, self.remote_home.as_deref())?;
+            let requested = crate::coding_paths::resolve_remote(&self.tool.root, &input)?;
             let transcript = self
                 .shell_outputs
                 .0
@@ -1121,10 +1131,10 @@ impl Tool for RemoteWriteTool {
         let result = async {
             let display = string(&args, "path")?.to_owned();
             let content = string(&args, "content")?.to_owned();
-            let path = crate::coding_paths::resolve(
+            let path = crate::coding_paths::resolve_remote(
                 &self.tool.root,
-                &crate::coding_paths::input(&display, self.remote_home.as_deref())?,
-            );
+                &crate::coding_paths::remote_input(&display, self.remote_home.as_deref())?,
+            )?;
             let cancellation = context.cancellation.child_token();
             let _guard = cancellation.clone().drop_guard();
             let operations = self.operations.clone();
@@ -1334,10 +1344,10 @@ impl Tool for RemoteEditTool {
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
         let result = async {
             let display = string(&args, "path")?.to_owned();
-            let path = crate::coding_paths::resolve(
+            let path = crate::coding_paths::resolve_remote(
                 &self.tool.root,
-                &crate::coding_paths::input(&display, self.remote_home.as_deref())?,
-            );
+                &crate::coding_paths::remote_input(&display, self.remote_home.as_deref())?,
+            )?;
             let cancellation = context.cancellation.child_token();
             let _guard = cancellation.clone().drop_guard();
             let operations = self.operations.clone();
