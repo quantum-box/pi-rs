@@ -52,6 +52,23 @@ impl ResourceOrigin {
     }
 }
 
+fn synthetic_command_source(command: &pi_rs::RegisteredCommand) -> serde_json::Value {
+    match command.source_kind {
+        pi_rs::ExtensionCommandSourceKind::Builtin => json!({
+            "path": format!("builtin:{}", command.extension_id),
+            "source": "builtin",
+            "scope": "user",
+            "origin": "top-level",
+        }),
+        _ => json!({
+            "path": format!("<inline:{}>", command.extension_id),
+            "source": "inline",
+            "scope": "temporary",
+            "origin": "top-level",
+        }),
+    }
+}
+
 impl Runtime {
     pub async fn discover_resources(
         &mut self,
@@ -209,12 +226,7 @@ impl Runtime {
         for command in self.registry.registered_commands() {
             let source = match command.source_path.as_deref() {
                 Some(path) => source_info(path, &self.resources.packages.extensions),
-                None => json!({
-                    "path": format!("builtin:{}", command.extension_id),
-                    "source": "builtin",
-                    "scope": "user",
-                    "origin": "top-level",
-                }),
+                None => synthetic_command_source(&command),
             };
             let mut entry =
                 json!({"name":command.invocation_name,"source":"extension","sourceInfo":source});
@@ -911,6 +923,44 @@ impl pi_rs::Extension for LocalCommandPolicy {
 #[cfg(test)]
 mod resource_origin_tests {
     use super::*;
+
+    struct InlineCommand;
+    impl pi_rs::Extension for InlineCommand {
+        fn id(&self) -> &str {
+            "custom"
+        }
+        fn commands(&self) -> &[&str] {
+            &["set"]
+        }
+    }
+
+    #[test]
+    fn command_provenance_distinguishes_inline_from_builtin() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(pi_rs_extensions::Notes))
+            .unwrap();
+        registry.register(Arc::new(InlineCommand)).unwrap();
+        let commands = registry.registered_commands();
+        let builtin = commands
+            .iter()
+            .find(|command| command.extension_id == "notes" && command.name == "set")
+            .unwrap();
+        let inline = commands
+            .iter()
+            .find(|command| command.extension_id == "custom")
+            .unwrap();
+        assert_eq!(builtin.invocation_name, "set:1");
+        assert_eq!(inline.invocation_name, "set:2");
+        assert_eq!(
+            synthetic_command_source(builtin),
+            json!({"path":"builtin:notes", "source":"builtin", "scope":"user", "origin":"top-level"})
+        );
+        assert_eq!(
+            synthetic_command_source(inline),
+            json!({"path":"<inline:custom>", "source":"inline", "scope":"temporary", "origin":"top-level"})
+        );
+    }
 
     #[test]
     fn extension_paths_resolve_against_workspace_with_home_and_file_urls() {

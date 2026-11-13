@@ -20,6 +20,8 @@ Notes and TODOs are enabled by the terminal. In one-shot CLI mode, add
 show their saved state. `/extensions` lists the bundled terminal extensions.
 `--disable-extension <id>` removes an optional extension from composition.
 The TODO extension's ID is `todo-list`, while its CLI selector is `todo`.
+Command discovery distinguishes built-in, inline, and file-backed owners;
+see [extension command provenance](extension-command-provenance.md).
 
 All state changes use the existing journal. Reopening a session restores its
 state, and checking out an earlier record restores the state at that branch.

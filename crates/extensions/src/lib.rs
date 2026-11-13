@@ -20,6 +20,9 @@ impl Extension for Notes {
     fn id(&self) -> &str {
         "notes"
     }
+    fn source_is_builtin(&self) -> bool {
+        true
+    }
     fn commands(&self) -> &[&str] {
         &["set", "append", "clear"]
     }
@@ -95,6 +98,9 @@ pub struct TodoList;
 impl Extension for TodoList {
     fn id(&self) -> &str {
         "todo-list"
+    }
+    fn source_is_builtin(&self) -> bool {
+        true
     }
     fn commands(&self) -> &[&str] {
         &["set", "clear"]

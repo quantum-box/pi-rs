@@ -202,6 +202,12 @@ fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
     let commands = response["data"]["commands"]
         .as_array()
         .expect("command list");
+    let builtin = commands
+        .iter()
+        .find(|command| command["sourceInfo"]["path"] == "builtin:plan-mode")
+        .expect("builtin plan command provenance");
+    assert_eq!(builtin["sourceInfo"]["source"], "builtin");
+    assert_eq!(builtin["sourceInfo"]["scope"], "user");
     for name in ["top", ".hidden", "ignored"] {
         assert!(
             commands

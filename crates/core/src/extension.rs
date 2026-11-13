@@ -781,6 +781,12 @@ pub trait Extension: Send + Sync {
         None
     }
 
+    /// Whether this in-process extension is supplied as a host built-in.
+    /// Extensions without a source path default to inline provenance.
+    fn source_is_builtin(&self) -> bool {
+        false
+    }
+
     /// Host-only command. Returns a state change to commit on the active branch.
     fn command(
         &self,
@@ -1293,6 +1299,14 @@ pub trait Extension: Send + Sync {
     }
 }
 
+/// Origin known to the host for an extension-provided command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtensionCommandSourceKind {
+    Builtin,
+    Inline,
+    File,
+}
+
 #[derive(Clone, Debug)]
 pub struct RegisteredCommand {
     pub extension_id: String,
@@ -1300,6 +1314,7 @@ pub struct RegisteredCommand {
     pub invocation_name: String,
     pub description: Option<String>,
     pub source_path: Option<std::path::PathBuf>,
+    pub source_kind: ExtensionCommandSourceKind,
 }
 
 /// Metadata available for a registered native tool.
@@ -1852,6 +1867,13 @@ impl Registry {
                     invocation_name: String::new(),
                     description: extension.command_description(name).map(str::to_owned),
                     source_path: extension.command_source().map(std::path::Path::to_path_buf),
+                    source_kind: if extension.command_source().is_some() {
+                        ExtensionCommandSourceKind::File
+                    } else if extension.source_is_builtin() {
+                        ExtensionCommandSourceKind::Builtin
+                    } else {
+                        ExtensionCommandSourceKind::Inline
+                    },
                 });
             }
         }

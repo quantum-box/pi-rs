@@ -49,6 +49,9 @@ impl Extension for ReviewContext {
     fn id(&self) -> &str {
         ID
     }
+    fn source_is_builtin(&self) -> bool {
+        true
+    }
 
     fn commands(&self) -> &[&str] {
         &["record"]
