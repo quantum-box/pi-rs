@@ -1357,34 +1357,52 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
 
 #[test]
 fn settings_choose_and_clear_per_model_thinking() {
-    check_per_model_thinking_settings(false, false);
+    check_per_model_thinking_settings(false, false, false);
 }
 
 #[test]
 fn project_per_model_thinking_preserves_live_edits_and_disk_precedence() {
-    check_per_model_thinking_settings(true, false);
+    check_per_model_thinking_settings(true, false, false);
 }
 
 #[test]
 fn clearing_per_model_thinking_uses_unqualified_model_fallback() {
-    check_per_model_thinking_settings(false, true);
+    check_per_model_thinking_settings(false, true, false);
 }
 
-fn check_per_model_thinking_settings(project_override: bool, model_fallback: bool) {
+#[test]
+fn delayed_per_model_thinking_callback_preserves_next_selection() {
+    check_per_model_thinking_settings(false, true, true);
+}
+
+fn check_per_model_thinking_settings(project_override: bool, model_fallback: bool, delayed: bool) {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let session_path = root.path().join("session.jsonl");
     std::fs::create_dir_all(&home).unwrap();
+    let listener = delayed.then(|| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        listener
+    });
     let extension = root.path().join("selection.py");
     std::fs::write(&extension, r##"#!/usr/bin/env python3
-import json, os, sys
+import json, os, socket, sys
 request = json.load(sys.stdin)
 if request['type'] == 'describe':
     result = {'id':'selection', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'model_selection_hook':True}
 elif request['type'] == 'lifecycle':
+    event = request['event']
+    address = os.environ.get('PI_RS_TEST_SELECTION_GATE')
+    if address and event.get('type') == 'thinking_level_select' and event.get('level') == 'high':
+        host, port = address.rsplit(':', 1)
+        with socket.create_connection((host, int(port)), timeout=10) as gate:
+            gate.sendall(b'S')
+            if gate.recv(1) != b'G':
+                raise RuntimeError('selection gate was not released')
     with open(os.path.join(os.environ['PI_RS_HOME'], 'events.jsonl'), 'a') as log:
-        log.write(json.dumps(request['event']) + '\n')
+        log.write(json.dumps(event) + '\n')
     result = None
 else:
     result = None
@@ -1433,8 +1451,15 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
         0
     );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    if let Some(listener) = &listener {
+        command.env(
+            "PI_RS_TEST_SELECTION_GATE",
+            listener.local_addr().unwrap().to_string(),
+        );
+    }
     let _process = Process(
-        Command::new(env!("CARGO_BIN_EXE_pi"))
+        command
             .args([
                 "--workspace",
                 root.path().to_str().unwrap(),
@@ -1523,31 +1548,60 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
             std::thread::sleep(Duration::from_millis(20));
         }
     };
+    if let Some(listener) = listener {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut gate = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    let mut output = [0; 8192];
+                    let _ = master.read(&mut output);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("first per-model callback did not start: {error}"),
+            }
+        };
+        gate.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut started = [0];
+        gate.read_exact(&mut started).unwrap();
+        assert_eq!(&started, b"S");
+        // Request the second model selection while the first callback is held.
+        master.write_all(b"\r").unwrap();
+        assert!(!home.join("events.jsonl").exists());
+        gate.write_all(b"G").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Clear override · use default")
+        });
+    }
     let notifications = wait_notifications(&mut master, 1);
     assert_eq!(
         notifications[0],
         serde_json::json!({"type":"thinking_level_select", "level":"high", "previousLevel":"low"})
     );
-    master.write_all(b"\x03").unwrap();
-    output_until(&mut master, |text| {
-        text.contains("Default thinking level per model")
-            && text.contains(if model_fallback {
-                "2 configured"
-            } else {
-                "1 configured"
-            })
-    });
-    master.write_all(b"\r").unwrap();
-    output_until(&mut master, |text| text.contains("Thinking: select model"));
-    master.write_all(b"ollama/fixture-model").unwrap();
-    let reopened = if project_override { "low" } else { "high" };
-    output_until(&mut master, |text| {
-        text.contains(&format!("ollama/fixture-model · {reopened}"))
-    });
-    master.write_all(b"\r").unwrap();
-    output_until(&mut master, |text| {
-        text.contains("Clear override · use default")
-    });
+    if !delayed {
+        master.write_all(b"\x03").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Default thinking level per model")
+                && text.contains(if model_fallback {
+                    "2 configured"
+                } else {
+                    "1 configured"
+                })
+        });
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains("Thinking: select model"));
+        master.write_all(b"ollama/fixture-model").unwrap();
+        let reopened = if project_override { "low" } else { "high" };
+        output_until(&mut master, |text| {
+            text.contains(&format!("ollama/fixture-model · {reopened}"))
+        });
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Clear override · use default")
+        });
+    }
     master.write_all(b"Clear\r").unwrap();
     output_until(&mut master, |text| text.contains("Thinking: select model"));
     if model_fallback {
