@@ -107,28 +107,81 @@ async fn send_model_request(
     client: &reqwest::Client,
     request: reqwest::Request,
     api: Api,
-) -> Result<reqwest::Response> {
+) -> Result<Vec<u8>> {
     let retries = if matches!(api, Api::SystemOne) {
         CLASSIFIER_MAX_RETRIES
     } else {
         0
     };
-    for attempt in 0..=retries {
+    'attempt: for attempt in 0..=retries {
         let request = request
             .try_clone()
             .ok_or_else(|| Error::Config("model operation request cannot be retried".into()))?;
-        let response = client.execute(request).await.map_err(|error| {
-            Error::Model(
-                if error.is_timeout() {
-                    "model operation timed out"
-                } else {
-                    "model operation could not connect"
-                }
-                .into(),
-            )
-        })?;
+        let mut response = match client.execute(request).await {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() && attempt < retries => {
+                tokio::time::sleep(classifier_retry_delay(
+                    &HeaderMap::new(),
+                    attempt,
+                    chrono::Utc::now(),
+                )?)
+                .await;
+                continue;
+            }
+            Err(error) => {
+                return Err(Error::Model(
+                    if error.is_timeout() {
+                        "model operation timed out"
+                    } else {
+                        "model operation could not connect"
+                    }
+                    .into(),
+                ));
+            }
+        };
         if response.status().is_success() {
-            return Ok(response);
+            if response
+                .content_length()
+                .is_some_and(|length| length > RESPONSE_LIMIT as u64)
+            {
+                return Err(Error::Model(
+                    "model operation response exceeds the size limit".into(),
+                ));
+            }
+            let mut body = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if body.len() + chunk.len() > RESPONSE_LIMIT {
+                            return Err(Error::Model(
+                                "model operation response exceeds the size limit".into(),
+                            ));
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => return Ok(body),
+                    Err(error) if error.is_timeout() && attempt < retries => {
+                        drop(response);
+                        tokio::time::sleep(classifier_retry_delay(
+                            &HeaderMap::new(),
+                            attempt,
+                            chrono::Utc::now(),
+                        )?)
+                        .await;
+                        continue 'attempt;
+                    }
+                    Err(error) => {
+                        return Err(Error::Model(
+                            if error.is_timeout() {
+                                "model operation timed out"
+                            } else {
+                                "could not read model operation response"
+                            }
+                            .into(),
+                        ));
+                    }
+                }
+            }
         }
         if attempt == retries || !retryable_classifier_response(&response) {
             return Err(Error::Model(format!(
@@ -810,28 +863,7 @@ impl Operations {
             .body(serde_json::to_vec(&payload)?)
             .build()
             .map_err(|_| Error::Config("invalid model operation request".into()))?;
-        let mut response = send_model_request(&self.client, request, entry.api).await?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > RESPONSE_LIMIT as u64)
-        {
-            return Err(Error::Model(
-                "model operation response exceeds the size limit".into(),
-            ));
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| Error::Model("could not read model operation response".into()))?
-        {
-            if body.len() + chunk.len() > RESPONSE_LIMIT {
-                return Err(Error::Model(
-                    "model operation response exceeds the size limit".into(),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = send_model_request(&self.client, request, entry.api).await?;
         let body: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::Model("model operation response is not valid JSON".into()))?;
         data["api"] = json!(entry.api);
@@ -1056,6 +1088,85 @@ mod tests {
                 .unwrap()
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn classifier_retries_timeouts_before_headers_and_during_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (body_stall, cancel) in [(false, false), (true, false), (false, true), (true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (ready, received) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut first, _) = listener.accept().await.unwrap();
+                let mut bytes = [0u8; 2048];
+                assert_ne!(first.read(&mut bytes).await.unwrap(), 0);
+                if body_stall {
+                    first
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 12\r\n\r\n{")
+                        .await
+                        .unwrap();
+                }
+                ready.send(()).unwrap();
+                if cancel {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(1500), listener.accept())
+                            .await
+                            .is_err(),
+                        "cancelled request was retried"
+                    );
+                } else {
+                    let (mut second, _) =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .expect("timeout was not retried")
+                            .unwrap();
+                    assert_ne!(second.read(&mut bytes).await.unwrap(), 0);
+                    second
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                }
+                drop(first);
+            });
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .unwrap();
+            let request = client
+                .post(format!("http://{address}/test"))
+                .body("fixture")
+                .build()
+                .unwrap();
+            let cancellation = pi_rs::CancellationToken::new();
+            let operation = tokio::spawn({
+                let cancellation = cancellation.clone();
+                async move {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => None,
+                        result = send_model_request(&client, request, Api::SystemOne) => Some(result),
+                    }
+                }
+            });
+            received.await.unwrap();
+            if cancel {
+                cancellation.cancel();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                assert!(result.is_none());
+            } else {
+                assert_eq!(result.unwrap().unwrap(), b"ok");
+            }
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
