@@ -2926,6 +2926,118 @@ mod tests {
     }
 
     #[test]
+    fn versioned_patches_cannot_split_tool_result_groups() {
+        for count in [1, 3] {
+            let calls: Vec<_> = (0..count)
+                .map(|i| pi_rs_core::ToolCall {
+                    id: format!("c{i}"),
+                    name: "tool".into(),
+                    arguments: "{}".into(),
+                })
+                .collect();
+            let mut messages = vec![
+                Message::System {
+                    content: "system".into(),
+                },
+                Message::Assistant {
+                    content: String::new(),
+                    calls,
+                    replay: Some(Box::new(pi_rs_core::ProviderReplay {
+                        identity: pi_rs_core::ResolvedModelIdentity {
+                            provider: "p".into(),
+                            model: "m".into(),
+                        },
+                        blocks: vec![serde_json::json!({"private":"signature"})],
+                    })),
+                },
+            ];
+            messages.extend((0..count).map(|i| Message::Tool {
+                call_id: format!("c{i}"),
+                content: "result".into(),
+                is_error: false,
+                is_structured: Some(false),
+            }));
+            messages.push(Message::User {
+                content: "later".into(),
+            });
+            for index in 2..2 + count {
+                let response:ContextResponse<ModelRequest> = serde_json::from_value(serde_json::json!({"change":"safe_patch","patch":{"user_edits":[{"op":"insert","index":index,"message":{"role":"user","content":"injected"}}]}})).unwrap();
+                let ContextResponse::SafePatch { patch } = response else {
+                    panic!("expected patch")
+                };
+                let mut request = ModelRequest {
+                    model: "m".into(),
+                    messages: messages.clone(),
+                    tools: vec![],
+                    max_output_tokens: 8,
+                };
+                let snapshot = request.clone();
+                let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+                let access = guarded.access();
+                assert!(commit_request_patch(&mut guarded, &patch).is_err());
+                assert!(access.user_edits().is_empty());
+                assert_eq!(request, snapshot);
+                let mut list = messages.clone();
+                let mut guarded = pi_rs_core::ContextMessages::new(&mut list);
+                let access = guarded.access();
+                assert!(commit_messages_patch(&mut guarded, &patch).is_err());
+                assert!(access.user_edits().is_empty());
+                assert_eq!(list, messages);
+            }
+            // A valid edit preceding an invalid edit must not be applied either.
+            let patch = ContextPatch {
+                user_edits: vec![
+                    pi_rs_core::ContextUserEdit::Insert {
+                        index: 1,
+                        message: Message::User {
+                            content: "first".into(),
+                        },
+                    },
+                    pi_rs_core::ContextUserEdit::Insert {
+                        index: 3,
+                        message: Message::User {
+                            content: "split".into(),
+                        },
+                    },
+                ],
+                ..Default::default()
+            };
+            let mut request = ModelRequest {
+                model: "m".into(),
+                messages: messages.clone(),
+                tools: vec![],
+                max_output_tokens: 8,
+            };
+            let snapshot = request.clone();
+            assert!(
+                commit_request_patch(&mut pi_rs_core::ContextRequest::new(&mut request), &patch)
+                    .is_err()
+            );
+            assert_eq!(request, snapshot);
+            let patch = ContextPatch {
+                user_edits: vec![pi_rs_core::ContextUserEdit::Insert {
+                    index: 2 + count,
+                    message: Message::User {
+                        content: "after results".into(),
+                    },
+                }],
+                ..Default::default()
+            };
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            commit_request_patch(&mut guarded, &patch).unwrap();
+            assert!(!access.assistant_accessed());
+            assert!(guarded.messages.iter().any(|m| matches!(
+                m,
+                Message::Assistant {
+                    replay: Some(_),
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
     fn safe_patch_preserves_private_replay_and_rejects_invalid_edits_atomically() {
         let mut original = ModelRequest {
             model: "m".into(),

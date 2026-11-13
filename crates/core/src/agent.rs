@@ -4472,6 +4472,159 @@ mod request_privacy_tests {
         }
     }
 
+    fn tool_group(count: usize) -> Vec<Message> {
+        let calls: Vec<_> = (0..count)
+            .map(|i| crate::ToolCall {
+                id: format!("call-{i}"),
+                name: "tool".into(),
+                arguments: "{}".into(),
+            })
+            .collect();
+        let mut messages = vec![
+            Message::System {
+                content: "system".into(),
+            },
+            Message::Assistant {
+                content: String::new(),
+                calls,
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: "p".into(),
+                        model: "m".into(),
+                    },
+                    blocks: vec![serde_json::json!({"private":"signature"})],
+                })),
+            },
+        ];
+        messages.extend((0..count).map(|i| Message::Tool {
+            call_id: format!("call-{i}"),
+            content: "result".into(),
+            is_error: false,
+            is_structured: Some(false),
+        }));
+        messages.push(Message::User {
+            content: "later".into(),
+        });
+        messages
+    }
+
+    #[test]
+    fn tracked_insertions_cannot_split_single_or_parallel_tool_groups() {
+        for count in [1, 3] {
+            let original = tool_group(count);
+            for index in 2..2 + count {
+                let mut request = ModelRequest {
+                    model: "m".into(),
+                    messages: original.clone(),
+                    tools: vec![],
+                    max_output_tokens: 8,
+                };
+                let mut guarded = crate::ContextRequest::new(&mut request);
+                let access = guarded.access();
+                assert!(
+                    guarded
+                        .insert_user(
+                            index,
+                            Message::User {
+                                content: "injected".into()
+                            }
+                        )
+                        .is_err()
+                );
+                assert!(access.user_edits().is_empty());
+                assert_eq!(request.messages, original);
+                let mut messages = original.clone();
+                let mut guarded = crate::ContextMessages::new(&mut messages);
+                let access = guarded.access();
+                assert!(
+                    guarded
+                        .insert_user(
+                            index,
+                            Message::User {
+                                content: "injected".into()
+                            }
+                        )
+                        .is_err()
+                );
+                assert!(access.user_edits().is_empty());
+                assert_eq!(messages, original);
+            }
+            for index in [1, 2 + count] {
+                let mut request = ModelRequest {
+                    model: "m".into(),
+                    messages: original.clone(),
+                    tools: vec![],
+                    max_output_tokens: 8,
+                };
+                let mut guarded = crate::ContextRequest::new(&mut request);
+                let access = guarded.access();
+                guarded
+                    .insert_user(
+                        index,
+                        Message::User {
+                            content: "allowed".into(),
+                        },
+                    )
+                    .unwrap();
+                assert!(!access.assistant_accessed());
+                assert_eq!(access.user_edits().len(), 1);
+                assert!(request.messages.iter().any(|m| matches!(
+                    m,
+                    Message::Assistant {
+                        replay: Some(_),
+                        ..
+                    }
+                )));
+            }
+            let mut pending = original[..2].to_vec();
+            let mut guarded = crate::ContextMessages::new(&mut pending);
+            assert!(
+                guarded
+                    .insert_user(
+                        2,
+                        Message::User {
+                            content: "early".into()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn pending_parallel_calls_require_each_result_before_insertion() {
+        let mut pending = tool_group(2);
+        if let Message::Assistant { calls, .. } = &mut pending[1] {
+            calls[1].id = calls[0].id.clone();
+        }
+        pending.truncate(3);
+        let mut guarded = crate::ContextMessages::new(&mut pending);
+        assert!(
+            guarded
+                .insert_user(
+                    3,
+                    Message::User {
+                        content: "early".into()
+                    }
+                )
+                .is_err()
+        );
+        guarded.push(Message::Tool {
+            call_id: "call-0".into(),
+            content: "second result".into(),
+            is_error: false,
+            is_structured: Some(false),
+        });
+        guarded
+            .insert_user(
+                4,
+                Message::User {
+                    content: "after".into(),
+                },
+            )
+            .unwrap();
+    }
+
     #[test]
     fn tracked_user_operations_reject_assistant_insertion_and_removal() {
         let mut request = ModelRequest {

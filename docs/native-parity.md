@@ -736,7 +736,8 @@ wrappers invalidate replay whenever a hook obtains general mutable access to
 assistant messages, irrespective of the hook's reported status or the resulting
 values. Narrow tool and system-content accessors, plus tracked insertion and
 removal of user messages, retain replay for untouched assistant messages.
-Executables can
+Tracked insertions are rejected if they would split an assistant tool call from
+its results, including parallel results. Executables can
 negotiate the versioned context protocol and return a payload-free unchanged
 response; the host retains its original request in that case. Executables set
 `context_provenance_v1` for payload-free unchanged responses. Executables also

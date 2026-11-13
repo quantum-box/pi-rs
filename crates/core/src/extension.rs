@@ -424,6 +424,40 @@ impl ContextAccess {
     }
 }
 
+// A tool-call assistant and its contiguous results are one provider turn.
+// Do not insert while any of its calls are still awaiting results, or between
+// contiguous results (including malformed/extra results already in history).
+fn splits_tool_group(messages: &[crate::Message], index: usize) -> bool {
+    if index > 0
+        && matches!(messages.get(index), Some(crate::Message::Tool { .. }))
+        && (matches!(messages.get(index - 1), Some(crate::Message::Tool { .. }))
+            || matches!(messages.get(index - 1), Some(crate::Message::Assistant { calls, .. }) if !calls.is_empty()))
+    {
+        return true;
+    }
+    let mut start = index;
+    while start > 0 && matches!(messages[start - 1], crate::Message::Tool { .. }) {
+        start -= 1;
+    }
+    let Some(crate::Message::Assistant { calls, .. }) =
+        start.checked_sub(1).and_then(|i| messages.get(i))
+    else {
+        return false;
+    };
+    let mut outstanding = BTreeMap::<&str, usize>::new();
+    for call in calls {
+        *outstanding.entry(&call.id).or_default() += 1;
+    }
+    for message in &messages[start..index] {
+        if let crate::Message::Tool { call_id, .. } = message
+            && let Some(count) = outstanding.get_mut(call_id.as_str())
+        {
+            *count = count.saturating_sub(1);
+        }
+    }
+    outstanding.values().any(|count| *count != 0)
+}
+
 fn insert_context_user(
     messages: &mut Vec<crate::Message>,
     access: &ContextAccess,
@@ -437,6 +471,9 @@ fn insert_context_user(
         )
     {
         return Err("context insertion must be a user message at a valid index".into());
+    }
+    if splits_tool_group(messages, index) {
+        return Err("context insertion cannot split an assistant tool-call/result group".into());
     }
     access.record_user_edit(ContextUserEdit::Insert {
         index,
