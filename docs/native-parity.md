@@ -731,8 +731,9 @@ projection when imported, including text and image replacements. Assistant
 replacement thinking retains its signature and redaction flag and is replayed
 in block order to the original provider, API and model after tool-pair repair.
 Provider replay stays private to the adapter; native and executable request
-hooks and request notifications receive portable copies, and unchanged messages
-regain their replay before dispatch. Edited Anthropic, Google and OpenAI Responses thinking requires the recorded
+hooks and request notifications receive portable copies. An unchanged assistant
+message regains replay before dispatch only when it matches uniquely in both the
+original and transformed request; ambiguous duplicates lose replay. Edited Anthropic, Google and OpenAI Responses thinking requires the recorded
 endpoint binding; chat-completions replay is also bound to the configured
 provider. Older and imported histories without that binding omit edited thinking
 rather than send it to an unverified destination. Legacy unedited chat-completions

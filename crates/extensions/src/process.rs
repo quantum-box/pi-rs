@@ -84,35 +84,7 @@ fn extension_context(request: &ModelRequest) -> ModelRequest {
 }
 
 fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) {
-    let same_model = original.model == updated.model;
-    for (index, message) in updated.messages.iter_mut().enumerate() {
-        let Message::Assistant {
-            content,
-            calls,
-            replay,
-        } = message
-        else {
-            continue;
-        };
-        if !same_model {
-            *replay = None;
-            continue;
-        }
-        let matching = |previous: &Message| match previous {
-            Message::Assistant {
-                content: original_content,
-                calls: original_calls,
-                replay,
-            } if original_content == content && original_calls == calls => replay.clone(),
-            _ => None,
-        };
-        // Tool IDs identify a continuation even if a hook inserted other messages.
-        *replay = original.messages.get(index).and_then(matching).or_else(|| {
-            (!calls.is_empty())
-                .then(|| original.messages.iter().find_map(matching))
-                .flatten()
-        });
-    }
+    pi_rs_core::restore_request_replay(original, updated);
 }
 
 // Older executable hooks discard unknown tool-message fields. Retain provenance

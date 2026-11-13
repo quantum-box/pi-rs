@@ -35,10 +35,12 @@ fn portable_request(request: &ModelRequest) -> ModelRequest {
     portable
 }
 
-fn restore_request_replay(original: &ModelRequest, updated: &mut ModelRequest) {
+/// Restore provider replay only when an assistant message has a unique match on
+/// both sides of a portable request transformation. Ambiguous matches are dropped.
+pub fn restore_request_replay(original: &ModelRequest, updated: &mut ModelRequest) {
     let same_model = original.model == updated.model;
     let portable_messages = updated.messages.clone();
-    for (index, message) in updated.messages.iter_mut().enumerate() {
+    for message in &mut updated.messages {
         let Message::Assistant {
             content,
             calls,
@@ -52,33 +54,25 @@ fn restore_request_replay(original: &ModelRequest, updated: &mut ModelRequest) {
             continue;
         }
         let matches = |candidate: &Message| matches!(candidate, Message::Assistant { content: text, calls: previous, .. } if text == content && previous == calls);
-        let source = original
+        let mut candidates = original
             .messages
-            .get(index)
-            .filter(|candidate| matches(candidate))
-            .or_else(|| {
-                if calls.is_empty() {
-                    return None;
-                }
-                let mut candidates = original
-                    .messages
-                    .iter()
-                    .filter(|candidate| matches(candidate));
-                let candidate = candidates.next()?;
-                if candidates.next().is_some()
-                    || portable_messages
-                        .iter()
-                        .filter(|candidate| matches(candidate))
-                        .count()
-                        != 1
-                {
-                    return None;
-                }
-                Some(candidate)
-            });
-        if let Some(Message::Assistant {
+            .iter()
+            .filter(|candidate| matches(candidate));
+        let Some(source) = candidates.next() else {
+            continue;
+        };
+        if candidates.next().is_some()
+            || portable_messages
+                .iter()
+                .filter(|candidate| matches(candidate))
+                .count()
+                != 1
+        {
+            continue;
+        }
+        if let Message::Assistant {
             replay: previous, ..
-        }) = source
+        } = source
         {
             *replay = previous.clone();
         }
@@ -4374,6 +4368,90 @@ mod request_privacy_tests {
                         .contains("private-signature")
                 );
             }
+        }
+    }
+
+    fn private_assistant(text: &str, secret: &str) -> Message {
+        Message::Assistant {
+            content: text.into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "p".into(),
+                    model: "m".into(),
+                },
+                blocks: vec![serde_json::json!({"private":secret})],
+            })),
+        }
+    }
+
+    fn replay_request(messages: Vec<Message>) -> ModelRequest {
+        ModelRequest {
+            model: "m".into(),
+            messages,
+            tools: vec![],
+            max_output_tokens: 16,
+        }
+    }
+
+    #[test]
+    fn duplicate_assistants_never_restore_ambiguous_private_replay() {
+        for text in ["same", ""] {
+            let original = replay_request(vec![
+                private_assistant(text, "secret-a"),
+                private_assistant(text, "secret-b"),
+            ]);
+            // Removing the first duplicate leaves the other at the same index.
+            let mut removed = portable_request(&original);
+            removed.messages.remove(0);
+            restore_request_replay(&original, &mut removed);
+            assert!(matches!(
+                &removed.messages[0],
+                Message::Assistant { replay: None, .. }
+            ));
+            // Even an unchanged pair is ambiguous once private state is hidden.
+            let mut unchanged = portable_request(&original);
+            restore_request_replay(&original, &mut unchanged);
+            assert!(
+                unchanged
+                    .messages
+                    .iter()
+                    .all(|m| matches!(m, Message::Assistant { replay: None, .. }))
+            );
+            // A hook can also duplicate a single source; neither copy may inherit replay.
+            let single = replay_request(vec![private_assistant(text, "secret-a")]);
+            let mut duplicated = portable_request(&single);
+            duplicated.messages.push(duplicated.messages[0].clone());
+            restore_request_replay(&single, &mut duplicated);
+            assert!(
+                duplicated
+                    .messages
+                    .iter()
+                    .all(|m| matches!(m, Message::Assistant { replay: None, .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn unique_text_and_thinking_only_assistants_survive_insertions() {
+        for text in ["visible", ""] {
+            let original = replay_request(vec![private_assistant(text, "private")]);
+            let mut updated = portable_request(&original);
+            updated.messages.insert(
+                0,
+                Message::User {
+                    content: "inserted".into(),
+                },
+            );
+            restore_request_replay(&original, &mut updated);
+            let Message::Assistant {
+                replay: Some(replay),
+                ..
+            } = &updated.messages[1]
+            else {
+                panic!("unique replay was lost")
+            };
+            assert_eq!(replay.blocks[0]["private"], "private");
         }
     }
 
