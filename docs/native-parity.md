@@ -598,6 +598,14 @@ use the existing host API.
 SDK tests cover follow-up consumption, abort during a model stream, shared
 connection lifetime and retaining an independent fork history.
 
+Embedded hosts can use `coding_factories::create_coding_tools` and
+`create_read_only_tools` to register Pi's ordered coding or read-only tool sets
+without registering every built-in tool. The factories use the unrestricted
+local profile. The corresponding `coding_tools_from` and `read_only_tools_from`
+functions select from a host-configured `CodingTools`, preserving scoped access,
+image options and injected operations. A set is an `Extension` and can be
+registered directly with `Registry`; overlapping sets have duplicate tool names.
+
 ### Persistent runtime checkpoint
 
 Terminal and RPC prompts now reuse a runtime rather than rebuilding model and
