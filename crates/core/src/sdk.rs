@@ -1253,6 +1253,12 @@ impl AgentSession {
     pub fn tools(&self) -> Vec<crate::ToolSpec> {
         self.registry.tool_specs()
     }
+    /// Inspect the session's configured registry, including extension ownership
+    /// and model-advertisement status for inactive as well as active tools.
+    /// Per-request registry refreshes during a run are not reflected here.
+    pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
+        self.registry.registered_tool_info()
+    }
     pub fn pending_inputs(&self) -> Result<usize> {
         let input = self
             .input

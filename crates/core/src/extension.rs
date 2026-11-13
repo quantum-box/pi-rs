@@ -1302,6 +1302,20 @@ pub struct RegisteredCommand {
     pub source_path: Option<std::path::PathBuf>,
 }
 
+/// Metadata available for a registered native tool.
+///
+/// `active` records model advertisement, not authorization: inactive tools
+/// remain registered for nested calls, subject to the host's policies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegisteredToolInfo {
+    pub spec: ToolSpec,
+    pub extension_id: String,
+    /// The owning extension's declared source path, when available. This is
+    /// the value returned by `Extension::command_source`, not a package origin.
+    pub extension_source_path: Option<std::path::PathBuf>,
+    pub active: bool,
+}
+
 pub(crate) struct RegisteredTool {
     pub owner: String,
     pub tool: Arc<dyn Tool>,
@@ -1929,6 +1943,31 @@ impl Registry {
     }
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|tool| tool.spec.clone()).collect()
+    }
+
+    /// Return each registered tool's owner and model-advertisement status.
+    /// The result is ordered by tool name and includes inactive tools.
+    pub fn registered_tool_info(&self) -> Vec<RegisteredToolInfo> {
+        self.tools
+            .iter()
+            .map(|(name, tool)| {
+                let source = self
+                    .extensions
+                    .iter()
+                    .find(|extension| extension.id() == tool.owner)
+                    .and_then(|extension| extension.command_source())
+                    .map(std::path::Path::to_path_buf);
+                RegisteredToolInfo {
+                    spec: tool.spec.clone(),
+                    extension_id: tool.owner.clone(),
+                    extension_source_path: source,
+                    active: self
+                        .active
+                        .as_ref()
+                        .is_none_or(|active| active.contains(name)),
+                }
+            })
+            .collect()
     }
 
     pub async fn shutdown(&self) -> Result<()> {
