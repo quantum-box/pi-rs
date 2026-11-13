@@ -1,5 +1,3 @@
-[workspace]
-
 [package]
 name = "pi-rs-remote-ls"
 version = "0.1.0"
