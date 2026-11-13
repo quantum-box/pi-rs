@@ -114,8 +114,12 @@ async fn configured_sets_keep_injected_operations_and_scope() {
         .with_write_operations(backend.clone())
         .unwrap();
     let coding = coding_tools_from(&configured).unwrap().tools();
-    let readonly = read_only_tools_from(&configured).unwrap().tools();
-    let read = readonly
+    let error = match read_only_tools_from(&configured) {
+        Ok(_) => panic!("mixed remote read and local search accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("custom read operations"));
+    let read = coding
         .iter()
         .find(|tool| tool.spec().name == "read")
         .unwrap();
@@ -145,6 +149,61 @@ async fn configured_sets_keep_injected_operations_and_scope() {
         read.invoke(json!({"path":"../outside"}), context()).await,
         Outcome::Failed(_)
     ));
+}
+
+#[test]
+fn scoped_coding_set_selects_platform_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = CodingTools::new(directory.path()).unwrap();
+    let set = coding_tools_from(&source).unwrap();
+    let expected = if cfg!(windows) { "powershell" } else { "bash" };
+    assert_eq!(names(&set), ["read", expected, "edit", "write"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scoped_file_profile_does_not_sandbox_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let secret = directory.path().join("outside.txt");
+    std::fs::write(&secret, "outside fixture").unwrap();
+    let set = coding_tools_from(&CodingTools::new(&root).unwrap())
+        .unwrap()
+        .tools();
+    let read = set.iter().find(|tool| tool.spec().name == "read").unwrap();
+    assert!(matches!(
+        read.invoke(json!({"path":secret}), context()).await,
+        Outcome::Failed(_)
+    ));
+    let shell = set.iter().find(|tool| tool.spec().name == "bash").unwrap();
+    assert!(
+        matches!(shell.invoke(json!({"command":"cat ../outside.txt"}), context()).await, Outcome::Succeeded(output) if output.contains("outside fixture"))
+    );
+}
+
+#[tokio::test]
+async fn remote_read_cannot_expose_local_absolute_search_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let secret = directory.path().join("outside.txt");
+    std::fs::write(&secret, "local secret").unwrap();
+    let configured = CodingTools::local(directory.path())
+        .unwrap()
+        .with_read_operations(Arc::new(Remote::default()))
+        .unwrap();
+    // The requested grep would otherwise search this host path; no mixed set is returned.
+    let candidate = read_only_tools_from(&configured);
+    if let Ok(set) = candidate {
+        let grep = set
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "grep")
+            .unwrap();
+        let result = grep
+            .invoke(json!({"pattern":"local secret", "path":secret}), context())
+            .await;
+        panic!("mixed set exposed local absolute path: {result:?}");
+    }
 }
 
 #[derive(Default)]

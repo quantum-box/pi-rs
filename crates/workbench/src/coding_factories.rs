@@ -43,6 +43,7 @@ fn select(source: &CodingTools, id: &'static str, names: &[&str]) -> Result<Codi
 }
 
 /// Pi's default coding tools, using the unrestricted local profile for `cwd`.
+/// The shell runs with the host process's permissions and is not sandboxed.
 pub fn create_coding_tools(cwd: &Path) -> Result<CodingToolSet> {
     coding_tools_from(&CodingTools::local(cwd)?)
 }
@@ -53,16 +54,26 @@ pub fn create_read_only_tools(cwd: &Path) -> Result<CodingToolSet> {
 }
 
 /// Select the coding set from a host-configured profile, retaining its options.
+/// Scoped file tools do not restrict the shell, which is not sandboxed.
 pub fn coding_tools_from(source: &CodingTools) -> Result<CodingToolSet> {
-    select(
-        source,
-        "pi-coding-tools",
-        &["read", "bash", "edit", "write"],
-    )
+    let tools = source.tools();
+    let shell = if tools.iter().any(|tool| tool.spec().name == "bash") {
+        "bash"
+    } else {
+        "powershell"
+    };
+    select(source, "pi-coding-tools", &["read", shell, "edit", "write"])
 }
 
-/// Select the read-only set from a host-configured profile, retaining its options.
+/// Select read-only local tools from a configured profile.
+/// Custom read operations are rejected until search tools support the same backend.
 pub fn read_only_tools_from(source: &CodingTools) -> Result<CodingToolSet> {
+    if source.has_custom_read_operations() {
+        return Err(Error::Config(
+            "read-only tool sets cannot combine custom read operations with local search tools"
+                .into(),
+        ));
+    }
     select(
         source,
         "pi-read-only-tools",

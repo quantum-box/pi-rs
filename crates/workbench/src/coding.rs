@@ -71,6 +71,10 @@ impl CodingTools {
         Ok(self)
     }
 
+    pub(crate) fn has_custom_read_operations(&self) -> bool {
+        self.read_operations.is_some()
+    }
+
     /// Inject model-facing writes in the unrestricted profile. The backend is
     /// responsible for its own remote access policy.
     pub fn with_write_operations(mut self, operations: Arc<dyn WriteOperations>) -> Result<Self> {
