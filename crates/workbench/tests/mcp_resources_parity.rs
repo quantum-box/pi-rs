@@ -76,6 +76,24 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                     Some("initialize") => Some(
                         json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"resources":{}},"serverInfo":{"name":"fixture","version":"1"}}),
                     ),
+                    Some("resources/list")
+                        if matches!(
+                            request["params"]["cursor"].as_str(),
+                            Some("  opaque \t" | "")
+                        ) =>
+                    {
+                        Some(json!({"resources":[],"nextCursor":request["params"]["cursor"]}))
+                    }
+                    Some("resources/templates/list")
+                        if matches!(
+                            request["params"]["cursor"].as_str(),
+                            Some("  opaque \t" | "")
+                        ) =>
+                    {
+                        Some(
+                            json!({"resourceTemplates":[],"nextCursor":request["params"]["cursor"]}),
+                        )
+                    }
                     Some("resources/list") if request["params"]["cursor"] == "oversized" => Some(
                         json!({"resources":[{"uri":"file:///large","name":"large","description":"猫\n".repeat(300_000)}],"nextCursor":"after-large"}),
                     ),
@@ -223,6 +241,26 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
             assert_eq!(logged[before].1, None);
             assert_eq!(logged[before + 1].1.as_deref(), Some("next"));
         }
+        for cursor in ["  opaque \t", ""] {
+            let result = tool
+                .invoke(
+                    json!({"cursor":cursor}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::new_v4(),
+                        cancellation: CancellationToken::new(),
+                    },
+                )
+                .await;
+            let Outcome::Structured { data, .. } = result else {
+                panic!("unexpected cursor page {result:?}")
+            };
+            assert_eq!(data["nextCursor"], cursor);
+            assert_eq!(
+                calls.lock().unwrap().last().unwrap().1.as_deref(),
+                Some(cursor)
+            );
+        }
+        let before_invalid = calls.lock().unwrap().len();
         let invalid = tool
             .invoke(
                 json!({"cursor":42}),
@@ -235,7 +273,7 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
         assert!(
             matches!(invalid, Outcome::Failed(message) if message.contains("cursor must be a string"))
         );
-        assert_eq!(calls.lock().unwrap().len(), before + 2);
+        assert_eq!(calls.lock().unwrap().len(), before_invalid);
     }
     let hidden_config: ServerConfig = serde_json::from_value(json!({"url":format!("http://{address}/mcp"),"oauth":false,"exposure":"direct","toolExposure":{"list_resources":"hidden"}})).unwrap();
     let hidden = McpExtension::connect("hidden", &hidden_config, directory.path())

@@ -1578,10 +1578,7 @@ impl McpTool {
 fn resource_page_params(arguments: &Value) -> Result<rmcp::model::PaginatedRequestParams> {
     let cursor = match arguments.get("cursor") {
         None | Some(Value::Null) => None,
-        Some(Value::String(value)) => {
-            let value = value.trim();
-            (!value.is_empty()).then(|| value.to_owned())
-        }
+        Some(Value::String(value)) => Some(value.clone()),
         Some(_) => return Err(Error::Config("cursor must be a string".into())),
     };
     let mut params = rmcp::model::PaginatedRequestParams::default();
