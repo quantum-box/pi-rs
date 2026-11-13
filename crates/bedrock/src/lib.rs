@@ -10,7 +10,7 @@ use aws_sdk_bedrockruntime::{
 use aws_smithy_types::{Blob, Document, Number};
 use aws_types::request_id::RequestId;
 use base64::Engine;
-pub use options::{ReasoningLevel, thinking_levels};
+pub use options::{ReasoningLevel, requires_thinking, thinking_levels};
 use pi_rs_core::{
     CacheRetention, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
     ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
@@ -30,6 +30,7 @@ pub struct Bedrock {
     cache_retention: CacheRetention,
     long_cache_support: Option<bool>,
     force_cache: bool,
+    summary: bool,
 }
 impl Bedrock {
     /// Resolve the region and standard AWS credential chain lazily.
@@ -44,6 +45,7 @@ impl Bedrock {
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
+            summary: false,
         }
     }
     /// Use a caller-configured SDK client, including custom profile or endpoint settings.
@@ -58,6 +60,7 @@ impl Bedrock {
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
+            summary: false,
         }
     }
     /// Prefer bearer authentication over the AWS credential chain.
@@ -90,10 +93,7 @@ impl Bedrock {
         level: Option<&str>,
         mapped_effort: Option<&str>,
     ) -> Result<Self> {
-        self.reasoning = level
-            .filter(|level| *level != "off" || mapped_effort.is_some())
-            .map(ReasoningLevel::parse)
-            .transpose()?;
+        self.reasoning = level.map(ReasoningLevel::parse).transpose()?;
         self.mapped_effort = mapped_effort.map(str::to_owned);
         Ok(self)
     }
@@ -110,8 +110,9 @@ impl Bedrock {
     /// Prepare a one-off summary without cache checkpoints or optional thinking.
     pub fn for_summary(mut self) -> Self {
         self.cache_retention = CacheRetention::None;
-        self.reasoning = None;
+        self.reasoning = Some(ReasoningLevel::Off);
         self.mapped_effort = None;
+        self.summary = true;
         self
     }
     /// Enable cache checkpoints for a model whose capabilities cannot be inferred from its name.
@@ -632,10 +633,18 @@ impl Model for Bedrock {
         if client.config().region().is_none() {
             return Err(Error::Config("Bedrock requires an AWS region; set AWS_REGION or configure a region in the selected AWS profile".into()));
         }
+        let reasoning = if self.summary
+            && options::requires_thinking(&request.model, model_name)
+            && !(tool_free && options::sonnet_55(&request.model, model_name))
+        {
+            Some(ReasoningLevel::Low)
+        } else {
+            self.reasoning
+        };
         let fields = options::reasoning_fields(
             &request.model,
             model_name,
-            self.reasoning,
+            reasoning,
             self.mapped_effort.as_deref(),
             request.max_output_tokens,
             client.config().region().map(|region| region.as_ref()),

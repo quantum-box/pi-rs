@@ -646,7 +646,13 @@ impl Client {
                 let thinking = thinking.or_else(|| {
                     metadata
                         .as_ref()
-                        .filter(|model| model.reasoning == Some(true))
+                        .filter(|model| {
+                            model.reasoning == Some(true)
+                                && !pi_rs::bedrock::requires_thinking(
+                                    &args.model,
+                                    model.name.as_deref(),
+                                )
+                        })
                         .map(|_| "off")
                 });
                 let mapped = thinking.and_then(|level| {
@@ -846,7 +852,9 @@ mod bedrock_tests {
                 &json!({"providers":{"amazon-bedrock":{"models":[
                     {"id":"anthropic.claude-opus-4-1","name":"Claude Opus 4.1"},
                     {"id":"anthropic.claude-opus-4-6","name":"Claude Opus 4.6","reasoning":true},
-                    {"id":"anthropic.claude-sonnet-5","name":"Claude Sonnet 5","reasoning":true}
+                    {"id":"anthropic.claude-sonnet-5","name":"Claude Sonnet 5","reasoning":true},
+                    {"id":"opaque-fable","name":"Claude Fable 5","reasoning":true,"thinkingLevelMap":{"high":"high"}},
+                    {"id":"anthropic.claude-opus-5-5","name":"Claude Opus 5.5","reasoning":true}
                 ]}}}),
             )
             .unwrap();
@@ -875,6 +883,19 @@ mod bedrock_tests {
                     .await
                     .unwrap();
             }
+            for model in ["opaque-fable", "anthropic.claude-opus-5-5"] {
+                args.model = model.into();
+                for summary in [false, true] {
+                    args.thinking = None;
+                    let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                        .with_model_options(&args, false)
+                        .unwrap();
+                    let _stream = client
+                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                        .await
+                        .unwrap();
+                }
+            }
             return;
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -901,7 +922,7 @@ mod bedrock_tests {
             .unwrap();
         let server = async {
             let mut requests = Vec::new();
-            for _ in 0..14 {
+            for _ in 0..18 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut buf = [0; 8192];
@@ -997,6 +1018,22 @@ mod bedrock_tests {
                 request["additionalModelRequestFields"],
                 json!({"thinking":{"type":"disabled"}})
             );
+        }
+        for (normal, summary) in [(14, 15), (16, 17)] {
+            assert!(
+                requests[normal]
+                    .get("additionalModelRequestFields")
+                    .is_none()
+            );
+            assert_eq!(
+                requests[summary]["additionalModelRequestFields"]["thinking"]["type"],
+                "adaptive"
+            );
+            assert_eq!(
+                requests[summary]["additionalModelRequestFields"]["output_config"]["effort"],
+                "low"
+            );
+            assert_eq!(requests[summary]["inferenceConfig"]["maxTokens"], 512);
         }
     }
 }

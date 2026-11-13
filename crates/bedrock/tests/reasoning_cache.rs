@@ -321,35 +321,76 @@ async fn claude_models_that_cannot_disable_thinking_report_configuration_error()
         ))
         .endpoint_url("http://127.0.0.1:1")
         .build();
-    let client = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config));
+    let client = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config))
+        .with_reasoning(Some("off"), None)
+        .unwrap();
     for model in [
         "anthropic.claude-fable-5",
         "anthropic.claude-mythos-5-1",
         "anthropic.claude-opus-5-5",
         "anthropic.claude-sonnet-5-5",
     ] {
-        for summary in [false, true] {
-            let request = request(model, 512);
-            let result = if summary {
-                client
-                    .stream_for_summary(Uuid::nil(), Uuid::nil(), request)
-                    .await
-            } else {
-                client.stream(request).await
-            };
-            let error = match result {
-                Ok(_) => panic!("accepted thinking off for {model}"),
-                Err(e) => e,
-            };
-            assert!(
-                matches!(error, pi_rs_core::Error::Config(_)),
-                "{model}: {error}"
-            );
-            assert!(
-                error.to_string().contains("cannot disable thinking"),
-                "{model}: {error}"
-            );
-        }
+        let error = match client.stream(request(model, 512)).await {
+            Ok(_) => panic!("accepted thinking off for {model}"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(error, pi_rs_core::Error::Config(_)),
+            "{model}: {error}"
+        );
+        assert!(
+            error.to_string().contains("cannot disable thinking"),
+            "{model}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn required_thinking_models_keep_default_and_use_low_effort_for_summaries() {
+    for (model, name) in [
+        ("anthropic.claude-fable-5", None),
+        ("anthropic.claude-mythos-5-1", None),
+        ("anthropic.claude-opus-5-5", None),
+        ("opaque", Some("Claude Opus 5.5")),
+        ("anthropic.claude-sonnet-5-5", None),
+    ] {
+        let (normal, _) = capture(
+            "us-east-1",
+            |c| c.with_model_name(model, name),
+            request(model, 512),
+            false,
+        )
+        .await;
+        assert!(
+            normal.get("additionalModelRequestFields").is_none(),
+            "{model}"
+        );
+        let (summary, _) = capture(
+            "us-east-1",
+            |c| {
+                c.with_model_name(model, name)
+                    .with_reasoning(Some("max"), None)
+                    .unwrap()
+            },
+            request(model, 512),
+            true,
+        )
+        .await;
+        assert_eq!(summary["inferenceConfig"]["maxTokens"], 512);
+        assert_eq!(
+            summary["additionalModelRequestFields"]["thinking"]["type"], "adaptive",
+            "{model}"
+        );
+        assert_eq!(
+            summary["additionalModelRequestFields"]["output_config"]["effort"], "low",
+            "{model}"
+        );
+        assert!(
+            !pi_rs_bedrock::thinking_levels(model, name)
+                .iter()
+                .any(|level| level == "off"),
+            "{model}"
+        );
     }
 }
 

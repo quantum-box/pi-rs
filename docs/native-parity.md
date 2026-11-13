@@ -3373,11 +3373,13 @@ and requires an output limit of at least 2,048; unlike Pi's simple API, this
 adapter does not increase the host's output budget automatically. Reasoning
 options for other model families are not sent, matching Pi's Bedrock adapter.
 Claude 5 models that default to adaptive thinking receive an explicit disabled
-setting when thinking is off. Fable 5, Mythos 5 and Opus 5.5 cannot disable
-thinking, so off and summary requests fail with a configuration error instead
-of silently consuming reasoning tokens. Sonnet 5.5 uses `between_tools` when
-there are no tools; with tools, off fails because thinking can still occur
-between tool calls.
+setting when thinking is off, where supported. Fable 5, Mythos 5 and Opus 5.5
+cannot disable thinking; unset uses the model's adaptive default, explicit off
+returns a configuration error, and summaries use adaptive thinking at low
+effort. The output limit applies to thinking and answer combined, so thinking
+can reduce the space available for a summary. Sonnet 5.5 uses `between_tools`
+for tool-free summaries; with tools, explicit off fails and summaries use low
+adaptive effort because thinking can still occur between tool calls.
 
 For supported Claude models, the provider adds default five-minute cache
 checkpoints after the system content and at the end of the final user message.

@@ -85,12 +85,27 @@ const NEW_ADAPTIVE: &[&str] = &[
     "opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "haiku-5", "fable-5", "mythos-5",
 ];
 
+/// Whether the model cannot guarantee thinking is off during tool use.
+pub fn requires_thinking(model: &str, name: Option<&str>) -> bool {
+    let items = candidates(model, name);
+    has_any(&items, &["claude"])
+        && has_any(&items, &["fable-5", "mythos-5", "opus-5-5", "sonnet-5-5"])
+}
+
+pub(crate) fn sonnet_55(model: &str, name: Option<&str>) -> bool {
+    let items = candidates(model, name);
+    has_any(&items, &["claude"]) && has_any(&items, &["sonnet-5-5"])
+}
+
 pub fn thinking_levels(model: &str, name: Option<&str>) -> Vec<String> {
     let items = candidates(model, name);
     if !has_any(&items, &["claude", "gpt-"]) {
         return vec!["off".into()];
     }
-    let mut levels = vec!["off", "minimal", "low", "medium", "high"];
+    let mut levels = vec!["minimal", "low", "medium", "high"];
+    if !requires_thinking(model, name) {
+        levels.insert(0, "off");
+    }
     if has_any(&items, NEW_ADAPTIVE)
         || (has_any(&items, &["gpt-"]) && !has_any(&items, &["gpt-oss"]))
     {
@@ -169,10 +184,13 @@ pub(crate) fn reasoning_fields(
 ) -> Result<Option<Value>> {
     let items = candidates(model, name);
     if has_any(&items, &["claude"]) {
+        if level.is_none() && requires_thinking(model, name) {
+            return Ok(None);
+        }
         let level = level.unwrap_or(ReasoningLevel::Off);
         if level == ReasoningLevel::Off {
             if has_any(&items, &["fable-5", "mythos-5", "opus-5-5"]) {
-                return Err(Error::Config("This Bedrock Claude model cannot disable thinking; select a reasoning level or use a different model for summaries".into()));
+                return Err(Error::Config("This Bedrock Claude model cannot disable thinking; select a reasoning level or use a different model".into()));
             }
             if has_any(&items, &["sonnet-5-5"]) {
                 return if tool_free {
@@ -230,6 +248,9 @@ pub(crate) fn reasoning_fields(
         return Ok(Some(fields));
     }
     let Some(level) = level else { return Ok(None) };
+    if level == ReasoningLevel::Off && mapped.is_none() {
+        return Ok(None);
+    }
     if has_any(&items, &["gpt-oss"]) {
         return Ok(Some(
             json!({"reasoning_effort":mapped.unwrap_or(level.oss_effort())}),
