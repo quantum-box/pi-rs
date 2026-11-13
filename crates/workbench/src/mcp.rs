@@ -1075,13 +1075,33 @@ async fn run_page_preparation<F>(
     work: F,
 ) -> Result<PreparedPage>
 where
-    F: FnOnce() -> Result<PreparedPage> + Send + 'static,
+    F: FnOnce(pi_rs::CancellationToken) -> Result<PreparedPage> + Send + 'static,
 {
-    let task = tokio::task::spawn_blocking(work);
+    let worker_cancel = cancellation.child_token();
+    let _cancel_on_drop = worker_cancel.clone().drop_guard();
+    let task = tokio::task::spawn_blocking(move || work(worker_cancel));
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(Error::Cancelled),
         result = task => result.map_err(|e| Error::Config(format!("MCP page preparation failed: {e}")))?,
+    }
+}
+
+// Serde may pass an entire large string to Write at once. Split those writes
+// so a dropped or cancelled invocation stops serialization cooperatively.
+struct CancellableWriter<W> {
+    inner: W,
+    cancellation: pi_rs::CancellationToken,
+}
+impl<W: Write> Write for CancellableWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(std::io::Error::other("MCP page preparation cancelled"));
+        }
+        self.inner.write(&bytes[..bytes.len().min(64 * 1024)])
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -1255,9 +1275,19 @@ impl McpTool {
         data: Value,
         cancellation: &pi_rs::CancellationToken,
     ) -> Result<Value> {
-        let worker_cancel = cancellation.clone();
-        let prepared = run_page_preparation(cancellation, move || {
-            let text = serde_json::to_string(&data)?;
+        let prepared = run_page_preparation(cancellation, move |worker_cancel| {
+            let mut writer = CancellableWriter {
+                inner: Vec::new(),
+                cancellation: worker_cancel.clone(),
+            };
+            if let Err(error) = serde_json::to_writer(&mut writer, &data) {
+                return if worker_cancel.is_cancelled() {
+                    Err(Error::Cancelled)
+                } else {
+                    Err(error.into())
+                };
+            }
+            let text = writer.inner;
             if worker_cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -1266,7 +1296,7 @@ impl McpTool {
             }
             let mut file = tempfile::NamedTempFile::new()
                 .map_err(|e| Error::Config(format!("cannot save MCP page: {e}")))?;
-            for chunk in text.as_bytes().chunks(64 * 1024) {
+            for chunk in text.chunks(64 * 1024) {
                 if worker_cancel.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
@@ -1845,7 +1875,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            run_page_preparation(&worker_token, move || {
+            run_page_preparation(&worker_token, move |_worker_cancel| {
                 let file = tempfile::NamedTempFile::new().unwrap();
                 started_tx.send(file.path().to_owned()).unwrap();
                 release_rx.recv().unwrap();
@@ -1878,6 +1908,72 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_preparation_cancels_worker_without_cancelling_parent() {
+        let parent = pi_rs::CancellationToken::new();
+        let caller_parent = parent.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_page_preparation(&caller_parent, move |worker_cancel| {
+                let file = tempfile::NamedTempFile::new().unwrap();
+                started_tx.send(file.path().to_owned()).unwrap();
+                while !worker_cancel.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(file);
+                let _ = stopped_tx.send(());
+                Err(Error::Cancelled)
+            })
+            .await
+        });
+        let path = tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(5), stopped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!parent.is_cancelled());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn serialization_checks_cancellation_during_large_string() {
+        struct CancellingSink {
+            token: pi_rs::CancellationToken,
+            bytes: usize,
+        }
+        impl Write for CancellingSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes += bytes.len();
+                if self.bytes >= 64 * 1024 {
+                    self.token.cancel();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let token = pi_rs::CancellationToken::new();
+        let sink = CancellingSink {
+            token: token.clone(),
+            bytes: 0,
+        };
+        let mut writer = CancellableWriter {
+            inner: sink,
+            cancellation: token,
+        };
+        assert!(
+            serde_json::to_writer(&mut writer, &json!({"large": "x".repeat(1024 * 1024)})).is_err()
+        );
+        assert!(writer.inner.bytes < 128 * 1024);
     }
 
     #[test]

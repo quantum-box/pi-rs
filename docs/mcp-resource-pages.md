@@ -24,3 +24,8 @@ eight saved pages are retained per connection; older handles expire. This
 retrieval does not require a local filesystem read tool. Like Pi, saved pages
 contain the filtered listing; unlike Pi, they are read through the page tool
 instead of a filesystem path.
+
+Page serialization and file writes run on a blocking worker. Cancellation or
+dropping the call stops the worker cooperatively at write boundaries and removes
+unpublished temporary files. A single JSON serializer scan or filesystem write
+cannot be interrupted until that operation returns.
