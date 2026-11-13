@@ -3379,10 +3379,42 @@ Tool-free summary requests retain tool history as text and pass structured
 images as image blocks. The SDK chooses the endpoint and signs requests or uses the
 bearer token. No AWS resources are created.
 
+Claude and GPT-family models support the Pi reasoning levels and configured
+thinking-level mappings. Claude uses adaptive thinking on the supported newer
+families and budgeted thinking on earlier models; GPT and GPT-OSS use their
+respective effort fields, including explicit mappings such as GPT `off` to
+`none`. The output limit supplied by the host remains a hard
+ceiling. Budgeted Claude thinking reserves at least 1,024 tokens for the answer
+and requires an output limit of at least 2,048; unlike Pi's simple API, this
+adapter does not increase the host's output budget automatically. Reasoning
+options for other model families are not sent, matching Pi's Bedrock adapter.
+Claude 5 models that default to adaptive thinking receive an explicit disabled
+setting when thinking is off, where supported. Fable 5, Mythos 5 and Opus 5.5
+cannot disable thinking; unset uses the model's adaptive default, explicit off
+returns a configuration error, and summaries use adaptive thinking at low
+effort. The output limit applies to thinking and answer combined, so thinking
+can reduce the space available for a summary. Sonnet 5.5 uses `between_tools`
+for tool-free summaries; with tools, explicit off fails and summaries use low
+adaptive effort because thinking can still occur between tool calls.
+
+For supported Claude models, the provider adds default five-minute cache
+checkpoints after the system content and at the end of the final user message.
+Set `PI_CACHE_RETENTION=long` to request one-hour checkpoints on models that
+support that TTL; otherwise the provider uses five-minute checkpoints.
+Workbench model and provider compatibility can explicitly override one-hour
+support, and library callers can use `with_cache_retention` and
+`with_long_cache_support`. Set
+`AWS_BEDROCK_FORCE_CACHE=1` when the model ID and configured name cannot identify
+a supported model; forcing checkpoints alone does not enable one-hour TTL.
+Tool-free summaries disable checkpoints and optional reasoning so
+that their smaller output limit remains usable. Cache usage includes
+one-hour write details when Bedrock reports them. Model support and minimum
+cacheable lengths are determined by Bedrock.
+
 Not yet supported: Pi's interactive AWS profile login/storage, non-image
-multimodal inputs, reasoning configuration controls, prompt cache checkpoints,
-tool choice/strict sampling, guardrails, prompt management ARNs, live
-account-specific model discovery, custom request headers, and workbench
-proxy/idle-timeout settings. Custom model endpoints in workbench configuration
-are rejected; callers embedding the adapter can pass a configured AWS SDK
-client, including a test endpoint, through `Bedrock::new`.
+multimodal inputs, custom thinking budgets and display controls, tool
+choice/strict sampling, guardrails, prompt management ARNs, live account-specific
+model discovery, custom request headers, and workbench proxy/idle-timeout
+settings. Custom model endpoints in workbench configuration are rejected;
+callers embedding the adapter can pass a configured AWS SDK client, including a
+test endpoint, through `Bedrock::new`.

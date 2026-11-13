@@ -489,6 +489,9 @@ impl Client {
             Self::Bedrock(_) if !defaults.is_empty() => Err(Error::Config(
                 "custom Bedrock headers are not supported".into(),
             )),
+            Self::Bedrock(client) if cache_disabled => {
+                client.clone().for_summary().stream(request).await
+            }
             Self::Deferred(client) => {
                 if client.observed {
                     super::output(json!({"type":"model_progress","stage":"resolving_credentials"}));
@@ -745,16 +748,37 @@ impl Client {
                 Self::OpenAi(client)
             }
             Self::Bedrock(client) => {
-                let name = args
+                let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let thinking = thinking.or_else(|| {
+                    metadata
+                        .as_ref()
+                        .filter(|model| {
+                            model.reasoning == Some(true)
+                                && !pi_rs::bedrock::requires_thinking(
+                                    &args.model,
+                                    model.name.as_deref(),
+                                )
+                        })
+                        .map(|_| "off")
+                });
+                let mapped = thinking.and_then(|level| {
+                    metadata
+                        .as_ref()
+                        .and_then(|model| model.mapped_effort(level))
+                });
+                let level = if mapped == Some(None) { None } else { thinking };
+                let long_cache_override = args
                     .model_profiles
-                    .model(&args.provider, &args.model)
-                    .and_then(|model| model.name);
-                let client = client.with_model_name(&args.model, name.as_deref());
-                Self::Bedrock(if thinking.is_some_and(|level| level != "off") {
-                    client.unsupported("Bedrock thinking controls are not supported")
-                } else {
-                    client
-                })
+                    .bedrock_long_cache_override(&args.provider, metadata.as_ref());
+                let client = client
+                    .with_model_name(
+                        &args.model,
+                        metadata.as_ref().and_then(|model| model.name.as_deref()),
+                    )
+                    .with_cache_retention(cache_retention(true))
+                    .with_long_cache_support(long_cache_override)
+                    .with_reasoning(level, mapped.flatten())?;
+                Self::Bedrock(client)
             }
             Self::Deferred(mut client) => {
                 client.options = Some((Box::new(args.clone()), reported));
@@ -1424,5 +1448,287 @@ mod estimation_tests {
         assert!(changed.estimator.get().is_none());
         assert!(!std::ptr::eq(first, changed.estimation_client().unwrap()));
         assert!(std::ptr::eq(first, deferred.estimation_client().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod bedrock_tests {
+    use super::*;
+    use clap::Parser;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn bedrock_summary_and_configured_effort_reach_workbench() {
+        const CHILD: &str = "PI_RS_BEDROCK_WORKBENCH_SUMMARY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut args = super::super::Cli::try_parse_from(["pi", "--offline"]).unwrap();
+            args.model_profiles=super::super::model_profiles::Profiles::parse(&json!({"providers":{"amazon-bedrock":{"compat":{"supportsLongCacheRetention":false},"models":[
+                {"id":"anthropic.claude-opus-4-8","name":"Claude Opus 4.8","reasoning":true,"thinkingLevelMap":{"xhigh":"high"}},
+                {"id":"anthropic.claude-sonnet-4-6","name":"Claude Sonnet 4.6","reasoning":true,"compat":{"supportsLongCacheRetention":true}},
+                {"id":"openai.gpt-5-test","reasoning":true,"thinkingLevelMap":{"off":"none"}},
+                {"id":"openai.gpt-5-null","reasoning":true,"thinkingLevelMap":{"off":null}},
+                {"id":"openai.gpt-5-unmapped","reasoning":true},
+                {"id":"openai.gpt-5-nonreason","reasoning":false,"thinkingLevelMap":{"off":"none"}}
+            ]}}})).unwrap();
+            args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
+            let request = |model: &str| ModelRequest {
+                model: model.into(),
+                messages: vec![
+                    pi_rs::Message::System {
+                        content: "system".into(),
+                    },
+                    pi_rs::Message::User {
+                        content: "hello".into(),
+                    },
+                ],
+                tools: vec![],
+                max_output_tokens: 512,
+            };
+            args.model = "anthropic.claude-sonnet-4-5-20250929-v1:0".into();
+            args.thinking = Some("high".into());
+            let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                .with_model_options(&args, false)
+                .unwrap();
+            let _stream = client
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), true)
+                .await
+                .unwrap();
+            args.model = "anthropic.claude-opus-4-8".into();
+            args.thinking = Some("xhigh".into());
+            let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                .with_model_options(&args, false)
+                .unwrap();
+            let _stream = client
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .await
+                .unwrap();
+            for (model, level) in [
+                ("anthropic.claude-sonnet-4-6", "high"),
+                ("openai.gpt-5-test", "off"),
+                ("openai.gpt-5-null", "off"),
+            ] {
+                args.model = model.into();
+                args.thinking = Some(level.into());
+                let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let _stream = client
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .await
+                    .unwrap();
+            }
+            for model in [
+                "openai.gpt-5-test",
+                "openai.gpt-5-null",
+                "openai.gpt-5-unmapped",
+                "openai.gpt-5-nonreason",
+            ] {
+                args.model = model.into();
+                args.thinking = None;
+                let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let _stream = client
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .await
+                    .unwrap();
+            }
+            args.model_profiles=super::super::model_profiles::Profiles::parse(&json!({"providers":{"amazon-bedrock":{"compat":{"supportsLongCacheRetention":true},"models":[{"id":"anthropic.claude-opus-4-8","name":"Claude Opus 4.8","reasoning":true,"compat":{"supportsLongCacheRetention":false}}]}}})).unwrap();
+            args.model = "anthropic.claude-opus-4-8".into();
+            args.thinking = Some("high".into());
+            let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                .with_model_options(&args, false)
+                .unwrap();
+            let _stream = client
+                .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                .await
+                .unwrap();
+            args.model_profiles = super::super::model_profiles::Profiles::parse(
+                &json!({"providers":{"amazon-bedrock":{"models":[
+                    {"id":"anthropic.claude-opus-4-1","name":"Claude Opus 4.1"},
+                    {"id":"anthropic.claude-opus-4-6","name":"Claude Opus 4.6","reasoning":true},
+                    {"id":"anthropic.claude-sonnet-5","name":"Claude Sonnet 5","reasoning":true},
+                    {"id":"opaque-fable","name":"Claude Fable 5","reasoning":true,"thinkingLevelMap":{"high":"high"}},
+                    {"id":"anthropic.claude-opus-5-5","name":"Claude Opus 5.5","reasoning":true}
+                ]}}}),
+            )
+            .unwrap();
+            for (model, thinking) in [
+                ("anthropic.claude-opus-4-1", None),
+                ("anthropic.claude-opus-4-6", Some("max")),
+            ] {
+                args.model = model.into();
+                args.thinking = thinking.map(str::to_owned);
+                let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let _stream = client
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .await
+                    .unwrap();
+            }
+            args.model = "anthropic.claude-sonnet-5".into();
+            for (thinking, summary) in [(None, false), (Some("high"), true)] {
+                args.thinking = thinking.map(str::to_owned);
+                let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let _stream = client
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                    .await
+                    .unwrap();
+            }
+            for model in ["opaque-fable", "anthropic.claude-opus-5-5"] {
+                args.model = model.into();
+                for summary in [false, true] {
+                    args.thinking = None;
+                    let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                        .with_model_options(&args, false)
+                        .unwrap();
+                    let _stream = client
+                        .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
+                        .await
+                        .unwrap();
+                }
+            }
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "providers::bedrock_tests::bedrock_summary_and_configured_effort_reach_workbench",
+            ])
+            .env(CHILD, "1")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_DEFAULT_REGION", "us-east-1")
+            .env("AWS_ACCESS_KEY_ID", "SYNTHETIC_ACCESS_KEY")
+            .env("AWS_SECRET_ACCESS_KEY", "synthetic-secret")
+            .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", format!("http://{addr}"))
+            .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("PI_CACHE_RETENTION", "long")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK")
+            .env_remove("AWS_SESSION_TOKEN")
+            .env_remove("AWS_PROFILE")
+            .spawn()
+            .unwrap();
+        let server = async {
+            let mut requests = Vec::new();
+            for _ in 0..18 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 8192];
+                let (end, len) = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..pos]);
+                        let len = headers
+                            .lines()
+                            .find_map(|l| {
+                                l.split_once(':')
+                                    .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                                    .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (pos + 4, len);
+                    }
+                };
+                while bytes.len() < end + len {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                requests.push(
+                    serde_json::from_slice::<serde_json::Value>(&bytes[end..end + len]).unwrap(),
+                );
+                socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: 0\r\n\r\n").await.unwrap();
+            }
+            requests
+        };
+        let requests = match tokio::time::timeout(std::time::Duration::from_secs(20), server).await
+        {
+            Ok(requests) => requests,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("workbench child did not complete loopback requests")
+            }
+        };
+        assert!(child.wait().unwrap().success());
+        let summary = &requests[0];
+        assert_eq!(summary["inferenceConfig"]["maxTokens"], 512);
+        assert!(summary.get("additionalModelRequestFields").is_none());
+        assert_eq!(summary["system"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            summary["messages"][0]["content"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            requests[1]["additionalModelRequestFields"]["output_config"]["effort"],
+            "high"
+        );
+        assert_eq!(
+            requests[1]["system"][1]["cachePoint"],
+            json!({"type":"default"})
+        );
+        assert_eq!(
+            requests[2]["system"][1]["cachePoint"],
+            json!({"type":"default","ttl":"1h"})
+        );
+        assert_eq!(
+            requests[3]["additionalModelRequestFields"]["reasoning"]["effort"],
+            "none"
+        );
+        assert!(requests[4].get("additionalModelRequestFields").is_none());
+        assert_eq!(
+            requests[5]["additionalModelRequestFields"]["reasoning"]["effort"],
+            "none"
+        );
+        assert!(requests[6].get("additionalModelRequestFields").is_none());
+        assert!(requests[7].get("additionalModelRequestFields").is_none());
+        assert!(requests[8].get("additionalModelRequestFields").is_none());
+        assert_eq!(
+            requests[9]["system"][1]["cachePoint"],
+            json!({"type":"default"})
+        );
+        assert_eq!(
+            requests[10]["system"][1]["cachePoint"],
+            json!({"type":"default"})
+        );
+        assert_eq!(
+            requests[11]["system"][1]["cachePoint"],
+            json!({"type":"default","ttl":"1h"})
+        );
+        assert_eq!(
+            requests[11]["additionalModelRequestFields"]["output_config"]["effort"],
+            "max"
+        );
+        for request in &requests[12..14] {
+            assert_eq!(
+                request["additionalModelRequestFields"],
+                json!({"thinking":{"type":"disabled"}})
+            );
+        }
+        for (normal, summary) in [(14, 15), (16, 17)] {
+            assert!(
+                requests[normal]
+                    .get("additionalModelRequestFields")
+                    .is_none()
+            );
+            assert_eq!(
+                requests[summary]["additionalModelRequestFields"]["thinking"]["type"],
+                "adaptive"
+            );
+            assert_eq!(
+                requests[summary]["additionalModelRequestFields"]["output_config"]["effort"],
+                "low"
+            );
+            assert_eq!(requests[summary]["inferenceConfig"]["maxTokens"], 512);
+        }
     }
 }

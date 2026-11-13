@@ -632,7 +632,7 @@ async fn inspectable_sdk_credentials_and_bearer_reuse_measured_capacity() {
                 event("contentBlockDelta", json!({"contentBlockIndex":0,"delta":{"text":"done"}})),
                 event("contentBlockStop", json!({"contentBlockIndex":0})),
                 event("messageStop", json!({"stopReason":"end_turn"})),
-                event("metadata", json!({"usage":{"inputTokens":3000,"outputTokens":8,"totalTokens":3008},"metrics":{"latencyMs":1}})),
+                event("metadata", json!({"usage":{"inputTokens":20,"outputTokens":8,"totalTokens":28,"cacheReadInputTokens":2000,"cacheWriteInputTokens":1000},"metrics":{"latencyMs":1}})),
             ].concat();
             socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n", frames.len()).as_bytes()).await.unwrap();
             socket.write_all(&frames).await.unwrap();
