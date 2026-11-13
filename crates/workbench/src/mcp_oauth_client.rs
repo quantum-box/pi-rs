@@ -31,6 +31,10 @@ pub struct SafeAuthClient(
 pub(crate) struct DispatchState {
     pub(crate) closed: bool,
     pub(crate) cancellation: Option<pi_rs::CancellationToken>,
+    #[cfg(test)]
+    before_commit: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    after_commit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SafeAuthClient {
@@ -38,22 +42,7 @@ impl SafeAuthClient {
         &self,
         future: impl std::future::Future<Output = Result<T, HttpError>>,
     ) -> Result<T, HttpError> {
-        let mut future = std::pin::pin!(future);
-        std::future::poll_fn(|cx| {
-            let closed = self.1.lock().unwrap_or_else(|error| error.into_inner());
-            if closed.closed
-                || closed
-                    .cancellation
-                    .as_ref()
-                    .is_some_and(pi_rs::CancellationToken::is_cancelled)
-            {
-                return std::task::Poll::Ready(Err(HttpError::UnexpectedServerResponse(
-                    "MCP request cancelled before dispatch".into(),
-                )));
-            }
-            future.as_mut().poll(cx)
-        })
-        .await
+        dispatch(&self.1, future).await
     }
     async fn token(&self, force: bool) -> Result<String, AuthError> {
         let client = self.0.clone();
@@ -73,7 +62,53 @@ impl SafeAuthClient {
         .await
         .map_err(|()| AuthError::InternalError("MCP OAuth operation stopped".into()))?
     }
+}
 
+async fn dispatch<T>(
+    gate: &Mutex<DispatchState>,
+    future: impl std::future::Future<Output = Result<T, HttpError>>,
+) -> Result<T, HttpError> {
+    let mut future = std::pin::pin!(future);
+    let committed = std::sync::atomic::AtomicBool::new(false);
+    std::future::poll_fn(|cx| {
+        let state = gate.lock().unwrap_or_else(|error| error.into_inner());
+        let cancelled = || {
+            state.closed
+                || state
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(pi_rs::CancellationToken::is_cancelled)
+        };
+        if cancelled() {
+            return std::task::Poll::Ready(Err(HttpError::UnexpectedServerResponse(
+                "MCP request cancelled before dispatch".into(),
+            )));
+        }
+        if !committed.load(std::sync::atomic::Ordering::SeqCst) {
+            #[cfg(test)]
+            if let Some(hook) = &state.before_commit {
+                hook();
+            }
+            // This is the dispatch-start boundary. Cancellation can be set
+            // without this mutex, so recheck after committing and before
+            // polling the HTTP future. A cancellation observed here wins.
+            committed.store(true, std::sync::atomic::Ordering::SeqCst);
+            if cancelled() {
+                return std::task::Poll::Ready(Err(HttpError::UnexpectedServerResponse(
+                    "MCP request cancelled before dispatch".into(),
+                )));
+            }
+            #[cfg(test)]
+            if let Some(hook) = &state.after_commit {
+                hook();
+            }
+        }
+        future.as_mut().poll(cx)
+    })
+    .await
+}
+
+impl SafeAuthClient {
     pub(crate) async fn call<T, F, Fut>(
         &self,
         token: Option<String>,
@@ -208,5 +243,58 @@ impl StreamableHttpClient for SafeAuthClient {
             )
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn cancellation_and_dispatch_have_a_defined_start_boundary() {
+        for cancel_before_commit in [true, false] {
+            let token = pi_rs::CancellationToken::new();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let resume_rx = Mutex::new(resume_rx);
+            let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                reached_tx.send(()).unwrap();
+                resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            });
+            let state = DispatchState {
+                cancellation: Some(token.clone()),
+                before_commit: cancel_before_commit.then(|| hook.clone()),
+                after_commit: (!cancel_before_commit).then_some(hook),
+                ..Default::default()
+            };
+            let gate = Arc::new(Mutex::new(state));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let worker_polls = polls.clone();
+            let worker = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(dispatch(&gate, async move {
+                    worker_polls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }))
+            });
+            reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            token.cancel();
+            resume_tx.send(()).unwrap();
+            let result = worker.join().unwrap();
+            assert_eq!(result.is_err(), cancel_before_commit);
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                usize::from(!cancel_before_commit)
+            );
+        }
     }
 }
