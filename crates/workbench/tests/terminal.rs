@@ -1498,17 +1498,15 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     });
     master.write_all(b"high\r").unwrap();
     let displayed = "high";
-    output_until(&mut master, |text| {
-        text.contains(&format!("ollama/fixture-model · {displayed}"))
-    });
+    if !delayed {
+        output_until(&mut master, |text| {
+            text.contains(&format!("ollama/fixture-model · {displayed}"))
+        });
+    }
     let read_settings = || -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap()
     };
-    assert_eq!(
-        read_settings()["modelThinkingLevels"]["ollama/fixture-model"],
-        "high"
-    );
-    let wait_level = |expected: &str| {
+    let wait_level = |master: &mut File, expected: &str| {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(session) = pi_rs::Session::snapshot(&session_path)
@@ -1522,10 +1520,17 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
                 Instant::now() < deadline,
                 "thinking level was not applied to the session"
             );
+            // A full PTY can block the UI before it persists the selection.
+            let mut output = [0; 8192];
+            let _ = master.read(&mut output);
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    wait_level(displayed);
+    wait_level(&mut master, displayed);
+    assert_eq!(
+        read_settings()["modelThinkingLevels"]["ollama/fixture-model"],
+        "high"
+    );
     let wait_notifications = |master: &mut File, count: usize| {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1613,7 +1618,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     } else {
         assert!(read_settings().get("modelThinkingLevels").is_none());
     }
-    wait_level("low");
+    wait_level(&mut master, "low");
     let notifications = wait_notifications(&mut master, 2);
     assert_eq!(
         notifications[0],
@@ -1638,7 +1643,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         read_settings()["modelThinkingLevels"]["ollama/plain-model"],
         "off"
     );
-    wait_level("low");
+    wait_level(&mut master, "low");
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
         text.contains("Default thinking level per model")
