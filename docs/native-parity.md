@@ -730,9 +730,10 @@ Native entry points are `context-edit <id> <text>`, `context-edit <id> --delete`
 projection when imported, including text and image replacements. Assistant
 replacement thinking retains its signature and redaction flag and is replayed
 in block order to the original provider, API and model after tool-pair repair.
-Provider replay stays private to the adapter. When older records or imported
-chat-completions histories do not identify the original replay scope, thinking
-is omitted rather than sent to an unverified endpoint.
+Provider replay stays private to the adapter. Edited Anthropic and Google
+thinking also requires the recorded endpoint binding; older and imported
+histories without that binding omit it rather than send it to an unverified
+endpoint. Google text and tool-call signatures remain attached to their blocks.
 
 ### Multimodal input checkpoint
 

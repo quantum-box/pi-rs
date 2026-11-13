@@ -228,6 +228,12 @@ pub enum ContextContent {
 pub enum ContentBlock {
     Text {
         text: String,
+        #[serde(
+            default,
+            rename = "textSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        text_signature: Option<String>,
     },
     Image {
         data: String,
@@ -249,6 +255,12 @@ pub enum ContentBlock {
         id: String,
         name: String,
         arguments: Value,
+        #[serde(
+            default,
+            rename = "thoughtSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
     },
 }
 
@@ -587,6 +599,12 @@ pub struct ProviderReplay {
 }
 
 impl ProviderReplay {
+    pub fn is_context_edit(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| b.get("_pi_context_edit_api").is_some())
+    }
+
     /// Edited replay is scoped to the originating transport as well as the model.
     pub fn supports_api(&self, api: ModelApi) -> bool {
         self.blocks

@@ -290,15 +290,48 @@ impl Ollama {
         }
         if !details.is_empty() {
             first["reasoning_details"] = Value::Array(details);
-        } else if let Some(field) = edited_reasoning.first().and_then(|b| b["field"].as_str())
-            && matches!(field, "reasoning_content" | "reasoning" | "reasoning_text")
-        {
+        } else if !edited_reasoning.is_empty() && self.supports_reasoning != Some(false) {
             let text = edited_reasoning
                 .iter()
                 .filter_map(|b| b["text"].as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            first[field] = json!(text);
+            if self.compatibility.requires_thinking_as_text == Some(true) {
+                let visible = first["content"].as_str().unwrap_or_default();
+                first["content"] = json!(if visible.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n\n{visible}")
+                });
+            } else {
+                let field = edited_reasoning
+                    .first()
+                    .and_then(|b| b["field"].as_str())
+                    .or(self.compatibility.reasoning_field.as_deref())
+                    .unwrap_or("reasoning_content");
+                if matches!(field, "reasoning_content" | "reasoning" | "reasoning_text") {
+                    first[field] = json!(text);
+                }
+            }
+        }
+        if first["role"] == "assistant"
+            && first["content"].as_str().is_some_and(str::is_empty)
+            && first.get("tool_calls").is_none()
+            && first
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            && first
+                .get("reasoning")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            && first
+                .get("reasoning_text")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            && first.get("reasoning_details").is_none()
+        {
+            return Vec::new();
         }
         messages
     }
@@ -581,17 +614,37 @@ impl Model for Ollama {
             let encoded =
                 self.compatible_message(message.clone(), &self.replay_identity(&request.model));
             let extra = encoded.iter().fold(0_u64, |sum, item| {
-                ["reasoning_content", "reasoning_details"]
-                    .iter()
-                    .filter_map(|key| item.get(*key))
-                    .filter(|value| !value.as_str().is_some_and(str::is_empty))
-                    .fold(sum, |sum, value| {
-                        sum.saturating_add(pi_rs_core::estimate_replay_tokens(
-                            std::slice::from_ref(value),
-                        ))
-                    })
+                [
+                    "reasoning_content",
+                    "reasoning",
+                    "reasoning_text",
+                    "reasoning_details",
+                ]
+                .iter()
+                .filter_map(|key| item.get(*key))
+                .filter(|value| !value.as_str().is_some_and(str::is_empty))
+                .fold(sum, |sum, value| {
+                    sum.saturating_add(pi_rs_core::estimate_replay_tokens(std::slice::from_ref(
+                        value,
+                    )))
+                })
             });
-            base.saturating_add(extra)
+            let visible_extra = if self.compatibility.requires_thinking_as_text == Some(true) {
+                if let Message::Assistant { content, .. } = message {
+                    encoded
+                        .first()
+                        .and_then(|v| v["content"].as_str())
+                        .and_then(|text| text.strip_suffix(content.as_str()))
+                        .filter(|s| !s.is_empty())
+                        .map(|s| pi_rs_core::estimate_replay_tokens(&[json!(s)]))
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            base.saturating_add(extra).saturating_add(visible_extra)
         } else {
             base
         }
@@ -1110,6 +1163,91 @@ mod content_tests {
                 .reasoning_effort
                 .as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn edited_reasoning_uses_compatibility_and_counts_wire_fields() {
+        for (config, field) in [
+            (json!({"reasoningField":"reasoning"}), "reasoning"),
+            (json!({"reasoningField":"reasoning_text"}), "reasoning_text"),
+            (json!({}), "reasoning_content"),
+        ] {
+            let model = Ollama::new("https://example.com", None)
+                .unwrap()
+                .with_chat_compatibility(
+                    serde_json::from_value(config).unwrap(),
+                    Some(true),
+                    true,
+                    true,
+                );
+            let message = Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: model.replay_identity("model"),
+                    blocks: vec![
+                        json!({"type":"context_edit_reasoning","text":"x".repeat(5000),"field":null}),
+                        json!({"_pi_context_edit_api":"openai-completions"}),
+                    ],
+                })),
+            };
+            let request = ModelRequest {
+                model: "model".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            assert_eq!(
+                model.compatible_message(message.clone(), &model.replay_identity("model"))[0]
+                    [field]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                5000
+            );
+            assert!(model.estimate_message_tokens(&request, &message) > 1000);
+        }
+        let model = Ollama::new("https://example.com", None)
+            .unwrap()
+            .with_chat_compatibility(
+                serde_json::from_value(json!({"requiresThinkingAsText":true})).unwrap(),
+                Some(true),
+                true,
+                true,
+            );
+        let message = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: model.replay_identity("model"),
+                blocks: vec![
+                    json!({"type":"context_edit_reasoning","text":"x".repeat(5000),"field":null}),
+                    json!({"_pi_context_edit_api":"openai-completions"}),
+                ],
+            })),
+        };
+        let request = ModelRequest {
+            model: "model".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        assert!(model.compatible_message(message.clone(), &model.replay_identity("model"))[0]["content"].as_str().unwrap().ends_with("\n\nanswer"));
+        assert!(model.estimate_message_tokens(&request, &message) > 1000);
+        let empty = Message::Assistant {
+            content: String::new(),
+            calls: vec![],
+            replay: if let Message::Assistant { replay, .. } = message {
+                replay
+            } else {
+                unreachable!()
+            },
+        };
+        assert!(
+            model
+                .compatible_message(empty, &model.replay_identity("other"))
+                .is_empty()
         );
     }
 

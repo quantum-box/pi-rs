@@ -915,7 +915,7 @@ impl View {
             pi_rs::ContextContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
-                        pi_rs::ContentBlock::Text { text: value } => text.push_str(value),
+                        pi_rs::ContentBlock::Text { text: value, .. } => text.push_str(value),
                         pi_rs::ContentBlock::Image { data, mime_type } => {
                             images.push(pi_rs::ImageContent {
                                 data: data.clone(),

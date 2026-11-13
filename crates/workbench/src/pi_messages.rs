@@ -375,6 +375,9 @@ impl PiMessages {
                                     .collect()
                             },
                         );
+                    if blocks.is_empty() {
+                        continue;
+                    }
                     json!({
                         "role":"assistant","content":blocks,"provider":self.identity,"api":"pi-messages","model":request.model,
                         "timestamp":0,"stopReason":if calls.is_empty() {"stop"} else {"toolUse"},
@@ -858,6 +861,40 @@ mod tool_status_tests {
         assert_eq!(
             second.encode(request)["context"]["messages"][0]["content"][0]["type"],
             "text"
+        );
+        let thinking_only = Message::Assistant {
+            content: String::new(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "radius".into(),
+                    model: "fixture".into(),
+                },
+                blocks: vec![
+                    json!({"type":REPLAY_ORIGIN,"endpoint":first.origin_hash}),
+                    json!({"type":"thinking","thinking":"private"}),
+                    json!({"_pi_context_edit_api":"pi-messages"}),
+                ],
+            })),
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![thinking_only],
+            tools: vec![],
+            max_output_tokens: 10,
+        };
+        assert_eq!(
+            first.encode(request.clone())["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            second.encode(request)["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
         #[cfg(any(unix, windows))]
         assert_ne!(first.context_identity(), second.context_identity());

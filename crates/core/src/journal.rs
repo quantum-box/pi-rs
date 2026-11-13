@@ -1820,6 +1820,7 @@ fn validate_context_edit(
                         id,
                         name,
                         arguments,
+                        ..
                     } if id.is_empty() || name.is_empty() || !arguments.is_object() => {
                         return Err(Error::Session("invalid replacement tool call".into()));
                     }
@@ -2622,13 +2623,16 @@ fn repair_tool_pairs(
 fn project_content(message: Message, replacement: &crate::ContextContent) -> Message {
     use crate::{ContentBlock, ContextContent};
     let blocks = match replacement {
-        ContextContent::Text(text) => vec![ContentBlock::Text { text: text.clone() }],
+        ContextContent::Text(text) => vec![ContentBlock::Text {
+            text: text.clone(),
+            text_signature: None,
+        }],
         ContextContent::Blocks(blocks) => blocks.clone(),
     };
     let text = blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -2661,6 +2665,7 @@ fn project_content(message: Message, replacement: &crate::ContextContent) -> Mes
                         id,
                         name,
                         arguments,
+                        ..
                     } => Some(crate::ToolCall {
                         id,
                         name,

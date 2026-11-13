@@ -448,6 +448,7 @@ async fn read_json(mut response: Response) -> Result<Value> {
 fn encode_request(
     request: ModelRequest,
     replay_scope: &str,
+    edited_scope: &str,
     allow_empty_signature: bool,
 ) -> Result<Value> {
     let mut system = Vec::new();
@@ -478,7 +479,7 @@ fn encode_request(
                     Some(replay)
                         if replay_matches(
                             &replay,
-                            replay_scope,
+                            if replay.is_context_edit() { edited_scope } else { replay_scope },
                             &request.model,
                             &content,
                             &calls,
@@ -854,13 +855,26 @@ impl Model for Anthropic {
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        let edited_scope =
+            pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
         match message {
             Message::Tool { content, .. } => content.encode_utf16().count().div_ceil(4) as u64,
             Message::Assistant {
                 content,
                 calls,
                 replay: Some(replay),
-            } if replay_matches(replay, &self.replay_scope, &request.model, content, calls) => {
+            } if replay_matches(
+                replay,
+                if replay.is_context_edit() {
+                    &edited_scope
+                } else {
+                    &self.replay_scope
+                },
+                &request.model,
+                content,
+                calls,
+            ) =>
+            {
                 pi_rs_core::estimate_replay_tokens(&replay.blocks)
                     .max(pi_rs_core::estimate_message_tokens(message))
             }
@@ -889,7 +903,13 @@ impl Model for Anthropic {
         let openrouter =
             provider.as_ref() == "openrouter" || self.endpoint.host_str() == Some("openrouter.ai");
         let replay_scope = self.replay_scope.clone();
-        let mut body = encode_request(request, &replay_scope, self.allow_empty_signature)?;
+        let edited_scope = pi_rs_core::endpoint_replay_scope(&replay_scope, self.endpoint.as_str());
+        let mut body = encode_request(
+            request,
+            &replay_scope,
+            &edited_scope,
+            self.allow_empty_signature,
+        )?;
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
         if let Some(level) = self.thinking_level.as_deref() {
             configure_thinking(&mut body, details.as_ref(), level, max_output_tokens)?;
@@ -932,7 +952,7 @@ impl Model for Anthropic {
             let mut usage = StreamUsage::default();
             let mut metadata = ModelMetadata {
                 provider_api: Some(ModelApi::AnthropicMessages),
-                replay_identity: Some(ResolvedModelIdentity { provider: replay_scope.to_string(), model: requested_model.clone() }),
+                replay_identity: Some(ResolvedModelIdentity { provider: edited_scope, model: requested_model.clone() }),
                 ..ModelMetadata::default()
             };
             let mut reasoning_text = String::new();
@@ -1248,6 +1268,41 @@ mod tests {
     }
 
     #[test]
+    fn edited_thinking_is_bound_to_the_original_endpoint() {
+        let scope_a = pi_rs_core::endpoint_replay_scope("anthropic", "https://a.example/messages");
+        let scope_b = pi_rs_core::endpoint_replay_scope("anthropic", "https://b.example/messages");
+        let request = ModelRequest {
+            model: "claude".into(),
+            messages: vec![
+                Message::User {
+                    content: "question".into(),
+                },
+                Message::Assistant {
+                    content: String::new(),
+                    calls: vec![],
+                    replay: Some(Box::new(ProviderReplay {
+                        identity: ResolvedModelIdentity {
+                            provider: scope_a.clone(),
+                            model: "claude".into(),
+                        },
+                        blocks: vec![
+                            json!({"type":"thinking","thinking":"secret","signature":"sig"}),
+                            json!({"_pi_context_edit_api":"anthropic-messages"}),
+                        ],
+                    })),
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let same = encode_request(request.clone(), "anthropic", &scope_a, false).unwrap();
+        assert_eq!(same["messages"][1]["content"][0]["thinking"], "secret");
+        let other = encode_request(request, "anthropic", &scope_b, false).unwrap();
+        assert_eq!(other["messages"].as_array().unwrap().len(), 1);
+        assert!(!other.to_string().contains("secret"));
+    }
+
+    #[test]
     fn edited_replay_is_scoped_and_private_marker_is_not_sent() {
         let make = |model: &str| ModelRequest {
             model: model.into(),
@@ -1269,12 +1324,12 @@ mod tests {
                 })),
             }],
         };
-        let same = encode_request(make("claude"), "anthropic", false).unwrap();
+        let same = encode_request(make("claude"), "anthropic", "anthropic", false).unwrap();
         assert_eq!(
             same["messages"][0]["content"],
             json!([{"type":"thinking","thinking":"secret","signature":"signed"},{"type":"text","text":"answer"}])
         );
-        let other = encode_request(make("other"), "anthropic", false).unwrap();
+        let other = encode_request(make("other"), "anthropic", "anthropic", false).unwrap();
         assert_eq!(
             other["messages"][0]["content"],
             json!([{"type":"text","text":"answer"}])
@@ -1306,6 +1361,7 @@ mod tests {
                 tools: vec![],
                 max_output_tokens: 128,
             },
+            "fixture",
             "fixture",
             false,
         )

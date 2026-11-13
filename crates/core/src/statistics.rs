@@ -339,7 +339,10 @@ mod tests {
             .edit_context(
                 target,
                 Some(ContextContent::Blocks(vec![
-                    ContentBlock::Text { text: "a".into() },
+                    ContentBlock::Text {
+                        text: "a".into(),
+                        text_signature: None,
+                    },
                     ContentBlock::Thinking {
                         thinking: "🦀".into(),
                         thinking_signature: None,
@@ -623,11 +626,13 @@ mod tests {
             id: "keep".into(),
             name: "read".into(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         };
         let unmatched = ContentBlock::ToolCall {
             id: "missing".into(),
             name: "large".into(),
             arguments: serde_json::json!({"data":"x".repeat(4000)}),
+            thought_signature: None,
         };
         let thinking = ContentBlock::Thinking {
             thinking: "abcd".into(),
@@ -638,7 +643,10 @@ mod tests {
             .edit_context(
                 assistant,
                 Some(ContextContent::Blocks(vec![
-                    ContentBlock::Text { text: "ok".into() },
+                    ContentBlock::Text {
+                        text: "ok".into(),
+                        text_signature: None,
+                    },
                     thinking.clone(),
                     keep,
                     unmatched.clone(),

@@ -453,6 +453,10 @@ fn identity(provider: &str, model: &str) -> ResolvedModelIdentity {
     }
 }
 
+fn identity_for_scope(provider: &str, model: &str) -> ResolvedModelIdentity {
+    identity(provider, model)
+}
+
 fn push_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>, merge: bool) {
     if parts.is_empty() {
         return;
@@ -479,6 +483,7 @@ fn wire_request(
     request: &ModelRequest,
     thinking: Option<&str>,
     replay_scope: &str,
+    edited_scope: &str,
 ) -> Result<Value> {
     let identity = identity(replay_scope, model_id(&request.model));
     let gemini_v3 = gemini_major(&identity.model).is_some_and(|version| version >= 3);
@@ -520,7 +525,13 @@ fn wire_request(
                 replay,
             } => {
                 let parts = if let Some(replay) = replay.as_ref().filter(|replay| {
-                    replay.identity == identity && replay.supports_api(ModelApi::GoogleGenerativeAi)
+                    replay.identity
+                        == if replay.is_context_edit() {
+                            identity_for_scope(edited_scope, &identity.model)
+                        } else {
+                            identity.clone()
+                        }
+                        && replay.supports_api(ModelApi::GoogleGenerativeAi)
                 }) {
                     replay
                         .blocks
@@ -528,6 +539,14 @@ fn wire_request(
                         .filter(|part| part.get("_pi_context_edit_api").is_none())
                         .cloned()
                         .map(|mut part| {
+                            if gemini_v3
+                                && replay.is_context_edit()
+                                && part.get("functionCall").is_some()
+                                && part.get("thoughtSignature").is_none()
+                            {
+                                part["thoughtSignature"] =
+                                    json!("skip_thought_signature_validator");
+                            }
                             if !explicit_tool_ids
                                 && let Some(call) =
                                     part.get_mut("functionCall").and_then(Value::as_object_mut)
@@ -651,11 +670,22 @@ impl Model for Google {
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        let edited_scope =
+            pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
         match message {
             Message::Assistant {
                 replay: Some(replay),
                 ..
-            } if replay.identity == identity(&self.replay_scope, model_id(&request.model)) => {
+            } if replay.identity
+                == identity(
+                    if replay.is_context_edit() {
+                        &edited_scope
+                    } else {
+                        &self.replay_scope
+                    },
+                    model_id(&request.model),
+                ) =>
+            {
                 pi_rs_core::estimate_replay_tokens(&replay.blocks)
                     .max(pi_rs_core::estimate_message_tokens(message))
             }
@@ -689,7 +719,9 @@ impl Model for Google {
         } else {
             self.thinking.as_deref()
         };
-        let body = wire_request(&request, thinking, &self.replay_scope)?;
+        let edited_scope =
+            pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
+        let body = wire_request(&request, thinking, &self.replay_scope, &edited_scope)?;
         let mut url = self.url(Some(&format!("{model}:streamGenerateContent")));
         url.query_pairs_mut().append_pair("alt", "sse");
         let mut last_progress = None;
@@ -725,7 +757,7 @@ impl Model for Google {
             let mut stream = response.bytes_stream().eventsource();
             let mut metadata = ModelMetadata {
                 provider_api: Some(ModelApi::GoogleGenerativeAi),
-                replay_identity: Some(identity(&replay_scope, &model)),
+                replay_identity: Some(identity(&edited_scope, &model)),
                 ..ModelMetadata::default()
             };
             let mut calls = Vec::new();
@@ -889,6 +921,74 @@ mod tests {
     }
 
     #[test]
+    fn edited_replay_is_endpoint_bound_and_gemini_calls_keep_or_gain_signature() {
+        let scope_a = pi_rs_core::endpoint_replay_scope("google", "https://a.example/v1");
+        let scope_b = pi_rs_core::endpoint_replay_scope("google", "https://b.example/v1");
+        let mut request = ModelRequest {
+            model: "gemini-3-pro".into(),
+            messages: vec![Message::Assistant {
+                content: "answer".into(),
+                calls: vec![ToolCall {
+                    id: "c".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: identity(&scope_a, "gemini-3-pro"),
+                    blocks: vec![
+                        json!({"text":"answer","thoughtSignature":"text-sig"}),
+                        json!({"thought":true,"text":"secret","thoughtSignature":"thinking-sig"}),
+                        json!({"functionCall":{"id":"c","name":"read","args":{}},"thoughtSignature":"call-sig"}),
+                        json!({"_pi_context_edit_api":"google-generative-ai"}),
+                    ],
+                })),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let same = wire_request(&request, None, "google", &scope_a).unwrap();
+        assert_eq!(
+            same["contents"][0]["parts"][0]["thoughtSignature"],
+            "text-sig"
+        );
+        assert_eq!(
+            same["contents"][0]["parts"][2]["thoughtSignature"],
+            "call-sig"
+        );
+        let other = wire_request(&request, None, "google", &scope_b).unwrap();
+        assert!(!other.to_string().contains("secret"));
+        assert_eq!(
+            other["contents"][0]["parts"][1]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        if let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = &mut request.messages[0]
+        {
+            replay.blocks[2]
+                .as_object_mut()
+                .unwrap()
+                .remove("thoughtSignature");
+        }
+        let unsigned = wire_request(&request, None, "google", &scope_a).unwrap();
+        assert_eq!(
+            unsigned["contents"][0]["parts"][2]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        if let Message::Assistant { content, calls, .. } = &mut request.messages[0] {
+            content.clear();
+            calls.clear();
+        }
+        assert!(
+            wire_request(&request, None, "google", &scope_b).unwrap()["contents"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn edited_replay_keeps_thought_order_only_for_original_model() {
         let replay = ProviderReplay {
             identity: identity("google", "gemini"),
@@ -910,12 +1010,12 @@ mod tests {
             max_output_tokens: 16,
         };
         assert_eq!(
-            wire_request(&request, None, "google").unwrap()["contents"][0]["parts"],
+            wire_request(&request, None, "google", "google").unwrap()["contents"][0]["parts"],
             json!([{"text":"first"},{"thought":true,"text":"private","thoughtSignature":"sig"},{"text":"last"}])
         );
         request.model = "other".into();
         assert_eq!(
-            wire_request(&request, None, "google").unwrap()["contents"][0]["parts"],
+            wire_request(&request, None, "google", "google").unwrap()["contents"][0]["parts"],
             json!([{"text":"firstlast"}])
         );
     }
@@ -993,13 +1093,13 @@ mod tests {
             tools: vec![],
             max_output_tokens: 32,
         };
-        let body = wire_request(&request, None, "google").unwrap();
+        let body = wire_request(&request, None, "google", "google").unwrap();
         let response = &body["contents"][1]["parts"][0]["functionResponse"];
         assert_eq!(response["response"]["output"], text);
         assert!(response.get("parts").is_none());
         request.messages[1] =
             serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
-        let body = wire_request(&request, None, "google").unwrap();
+        let body = wire_request(&request, None, "google", "google").unwrap();
         assert_eq!(
             body["contents"][1]["parts"][0]["functionResponse"]["parts"][0]["inlineData"]["data"],
             "aW1hZ2U="
@@ -1060,7 +1160,7 @@ mod tests {
                 tools: vec![],
                 max_output_tokens: 32,
             };
-            let body = wire_request(&request, None, "google").unwrap();
+            let body = wire_request(&request, None, "google", "google").unwrap();
             let contents = body["contents"].as_array().unwrap();
             if model.to_ascii_lowercase().starts_with("gemini") {
                 let call = &contents[0]["parts"][0];
@@ -1250,7 +1350,7 @@ mod tests {
             max_output_tokens: 32,
         };
         assert_eq!(
-            wire_request(&request, None, "google").unwrap()["contents"][0]["parts"],
+            wire_request(&request, None, "google", "google").unwrap()["contents"][0]["parts"],
             expected
         );
     }
@@ -1286,7 +1386,7 @@ mod tests {
             tools: Vec::new(),
             max_output_tokens: 1024,
         };
-        let wire = wire_request(&request, Some("low"), "google").unwrap();
+        let wire = wire_request(&request, Some("low"), "google", "google").unwrap();
         assert_eq!(wire["contents"][0]["parts"][0], original);
         assert_eq!(
             wire["contents"][1]["parts"][0]["functionResponse"]["id"],
@@ -1298,7 +1398,7 @@ mod tests {
             "Follow-up after the tool result"
         );
         request.model = "gemini-3.1-pro".into();
-        let other = wire_request(&request, Some("low"), "google").unwrap();
+        let other = wire_request(&request, Some("low"), "google", "google").unwrap();
         let call = &other["contents"][0]["parts"][0];
         assert_eq!(call["functionCall"]["id"], "logical-call");
         assert_ne!(call["thoughtSignature"], original["thoughtSignature"]);

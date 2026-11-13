@@ -1,6 +1,15 @@
 //! Provider-specific replay for content-only edits, built after tool-pair repair.
 use crate::{ContentBlock, ContextContent, ModelApi, ModelMetadata, ProviderReplay, ToolCall};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+/// Stable, non-secret endpoint binding for edited replay.
+pub fn endpoint_replay_scope(scope: &str, endpoint: &str) -> String {
+    format!(
+        "{scope}+endpoint-sha256:{:x}",
+        Sha256::digest(endpoint.as_bytes())
+    )
+}
 
 pub(crate) fn replacement_replay(
     replacement: &ContextContent,
@@ -10,13 +19,23 @@ pub(crate) fn replacement_replay(
     let ContextContent::Blocks(blocks) = replacement else {
         return None;
     };
-    let identity = metadata
-        .replay
-        .as_ref()
-        .map(|r| r.identity.clone())
-        .or_else(|| metadata.replay_identity.clone())
-        .or_else(|| metadata.resolved_model.clone())?;
     let api = metadata.provider_api?;
+    let identity = if matches!(
+        api,
+        ModelApi::AnthropicMessages | ModelApi::GoogleGenerativeAi
+    ) {
+        let identity = metadata.replay_identity.clone()?;
+        if !identity.provider.contains("+endpoint-sha256:") {
+            return None;
+        }
+        identity
+    } else {
+        metadata
+            .replay_identity
+            .clone()
+            .or_else(|| metadata.replay.as_ref().map(|r| r.identity.clone()))
+            .or_else(|| metadata.resolved_model.clone())?
+    };
     let mut result = Vec::new();
     if api == ModelApi::PiMessages {
         // The gateway binds replay to its endpoint as well as provider and model.
@@ -30,7 +49,7 @@ pub(crate) fn replacement_replay(
                 None
             }
             (ModelApi::PiMessages, _) => serde_json::to_value(block).ok(),
-            (ModelApi::AnthropicMessages, ContentBlock::Text { text }) => {
+            (ModelApi::AnthropicMessages, ContentBlock::Text { text, .. }) => {
                 Some(json!({"type":"text","text":text}))
             }
             (
@@ -54,8 +73,18 @@ pub(crate) fn replacement_replay(
                     None
                 }
             }
-            (ModelApi::GoogleGenerativeAi, ContentBlock::Text { text }) => {
-                Some(json!({"text":text}))
+            (
+                ModelApi::GoogleGenerativeAi,
+                ContentBlock::Text {
+                    text,
+                    text_signature,
+                },
+            ) => {
+                let mut part = json!({"text":text});
+                if let Some(signature) = text_signature.as_deref().filter(|s| !s.is_empty()) {
+                    part["thoughtSignature"] = json!(signature);
+                }
+                Some(part)
             }
             (
                 ModelApi::GoogleGenerativeAi,
@@ -77,7 +106,7 @@ pub(crate) fn replacement_replay(
                     Some(part)
                 }
             }
-            (ModelApi::BedrockConverseStream, ContentBlock::Text { text }) => {
+            (ModelApi::BedrockConverseStream, ContentBlock::Text { text, .. }) => {
                 Some(json!({"type":"text","text":text}))
             }
             (
@@ -98,7 +127,7 @@ pub(crate) fn replacement_replay(
                     None
                 }
             }
-            (ModelApi::OpenaiResponses, ContentBlock::Text { text }) => {
+            (ModelApi::OpenaiResponses, ContentBlock::Text { text, .. }) => {
                 Some(json!({"role":"assistant","content":text}))
             }
             (
@@ -138,13 +167,19 @@ pub(crate) fn replacement_replay(
                     id,
                     name,
                     arguments,
+                    thought_signature,
                 },
             ) if calls.iter().any(|call| call.id == *id) => match api {
                 ModelApi::AnthropicMessages | ModelApi::BedrockConverseStream => {
                     Some(json!({"type":"tool_use","id":id,"name":name,"input":arguments}))
                 }
                 ModelApi::GoogleGenerativeAi => {
-                    Some(json!({"functionCall":{"id":id,"name":name,"args":arguments}}))
+                    let mut part = json!({"functionCall":{"id":id,"name":name,"args":arguments}});
+                    if let Some(signature) = thought_signature.as_deref().filter(|s| !s.is_empty())
+                    {
+                        part["thoughtSignature"] = json!(signature);
+                    }
+                    Some(part)
                 }
                 ModelApi::OpenaiResponses => Some(
                     json!({"type":"function_call","call_id":id,"name":name,"arguments":arguments.to_string()}),
@@ -182,8 +217,11 @@ mod tests {
             .append(Event::ModelFinished {
                 request_id,
                 metadata: ModelMetadata {
-                    resolved_model: Some(ResolvedModelIdentity {
-                        provider: "anthropic".into(),
+                    replay_identity: Some(ResolvedModelIdentity {
+                        provider: endpoint_replay_scope(
+                            "anthropic",
+                            "https://api.example/messages",
+                        ),
                         model: "claude".into(),
                     }),
                     provider_api: Some(ModelApi::AnthropicMessages),
@@ -232,7 +270,10 @@ mod tests {
                     json!({"_pi_context_edit_api":"anthropic-messages"})
                 ]
             );
-            assert_eq!(replay.identity.provider, "anthropic");
+            assert_eq!(
+                replay.identity.provider,
+                endpoint_replay_scope("anthropic", "https://api.example/messages")
+            );
         }
         session.checkout(target).unwrap();
         assert!(
@@ -251,7 +292,10 @@ mod tests {
                 metadata: ModelMetadata {
                     provider_api: Some(ModelApi::AnthropicMessages),
                     replay_identity: Some(ResolvedModelIdentity {
-                        provider: "anthropic".into(),
+                        provider: endpoint_replay_scope(
+                            "anthropic",
+                            "https://api.example/messages",
+                        ),
                         model: "claude".into(),
                     }),
                     ..Default::default()
@@ -322,7 +366,7 @@ mod tests {
         let metadata = |api| ModelMetadata {
             provider_api: Some(api),
             replay_identity: Some(ResolvedModelIdentity {
-                provider: "scope".into(),
+                provider: endpoint_replay_scope("scope", "https://example.com"),
                 model: "model".into(),
             }),
             ..Default::default()
@@ -354,6 +398,41 @@ mod tests {
     }
 
     #[test]
+    fn google_replacement_keeps_text_and_tool_signatures_at_their_positions() {
+        let replacement: ContextContent = serde_json::from_value(json!([
+            {"type":"text","text":"a","textSignature":"text-sig"},
+            {"type":"thinking","thinking":"hidden","thinkingSignature":"think-sig"},
+            {"type":"toolCall","id":"c","name":"read","arguments":{},"thoughtSignature":"tool-sig"}
+        ]))
+        .unwrap();
+        let metadata = ModelMetadata {
+            provider_api: Some(ModelApi::GoogleGenerativeAi),
+            replay_identity: Some(ResolvedModelIdentity {
+                provider: endpoint_replay_scope("google", "https://one.example"),
+                model: "gemini".into(),
+            }),
+            ..Default::default()
+        };
+        let call = ToolCall {
+            id: "c".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        let replay = replacement_replay(&replacement, &metadata, &[call]).unwrap();
+        assert_eq!(
+            replay.blocks[..3],
+            [
+                json!({"text":"a","thoughtSignature":"text-sig"}),
+                json!({"thought":true,"text":"hidden","thoughtSignature":"think-sig"}),
+                json!({"functionCall":{"id":"c","name":"read","args":{}},"thoughtSignature":"tool-sig"})
+            ]
+        );
+        let mut old = metadata.clone();
+        old.replay_identity.as_mut().unwrap().provider = "google".into();
+        assert!(replacement_replay(&replacement, &old, &[]).is_none());
+    }
+
+    #[test]
     fn thinking_only_replacement_is_retained_and_old_json_defaults_work() {
         let old: ContentBlock =
             serde_json::from_value(json!({"type":"thinking","thinking":"x"})).unwrap();
@@ -371,8 +450,8 @@ mod tests {
         .unwrap();
         let metadata = ModelMetadata {
             provider_api: Some(ModelApi::AnthropicMessages),
-            resolved_model: Some(ResolvedModelIdentity {
-                provider: "anthropic".into(),
+            replay_identity: Some(ResolvedModelIdentity {
+                provider: endpoint_replay_scope("anthropic", "https://api.example/messages"),
                 model: "claude".into(),
             }),
             ..Default::default()

@@ -521,6 +521,7 @@ pub(super) fn imported_custom_message(entry: &Value, legacy: bool) -> Result<pi_
             match block["type"].as_str() {
                 Some("text") => result.push(pi_rs::ContentBlock::Text {
                     text: required(block, "text")?.into(),
+                    text_signature: block["textSignature"].as_str().map(str::to_owned),
                 }),
                 Some("image") => {
                     let (_, images) = user_content(&Value::Array(vec![block.clone()]))?;
@@ -1063,31 +1064,29 @@ mod tests {
     }
 
     #[test]
-    fn imported_edit_replays_signed_thinking_in_order() {
+    fn imported_edit_keeps_signatures_but_unknown_endpoint_cannot_replay() {
         let session = import_pi(vec![
             json!({"type":"session","version":3}),
-            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","provider":"anthropic","api":"anthropic-messages","model":"claude","content":[{"type":"text","text":"old"}],"stopReason":"stop"}}),
-            json!({"type":"context_edit","id":"e","parentId":"a","targetId":"a","replacement":{"content":[{"type":"thinking","thinking":"private","thinkingSignature":"sig"},{"type":"text","text":"new"},{"type":"thinking","thinking":"","thinkingSignature":"redacted","redacted":true}]}}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","provider":"google","api":"google-generative-ai","model":"gemini","content":[{"type":"text","text":"old"}],"stopReason":"stop"}}),
+            json!({"type":"context_edit","id":"e","parentId":"a","targetId":"a","replacement":{"content":[{"type":"text","text":"new","textSignature":"text-sig"},{"type":"thinking","thinking":"private","thinkingSignature":"sig"},{"type":"toolCall","id":"call","name":"read","arguments":{},"thoughtSignature":"call-sig"}]}}),
         ]).unwrap();
-        let messages = session.current_messages();
-        let Message::Assistant {
-            content,
-            replay: Some(replay),
-            ..
-        } = &messages[0]
-        else {
-            panic!("missing edited replay")
-        };
-        assert_eq!(content, "new");
-        assert_eq!(
-            replay.blocks,
-            vec![
-                json!({"type":"thinking","thinking":"private","signature":"sig"}),
-                json!({"type":"text","text":"new"}),
-                json!({"type":"redacted_thinking","data":"redacted"}),
-                json!({"_pi_context_edit_api":"anthropic-messages"})
-            ]
+        assert!(
+            matches!(&session.current_messages()[0], Message::Assistant { content, replay: None, .. } if content == "new")
         );
+        let event = session
+            .records()
+            .iter()
+            .find_map(|r| match &r.event {
+                Event::ContextEdited {
+                    replacement: Some(content),
+                    ..
+                } => Some(serde_json::to_value(content).unwrap()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(event[0]["textSignature"], "text-sig");
+        assert_eq!(event[1]["thinkingSignature"], "sig");
+        assert_eq!(event[2]["thoughtSignature"], "call-sig");
     }
 
     #[test]
