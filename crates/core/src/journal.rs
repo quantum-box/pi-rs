@@ -139,6 +139,15 @@ impl CompactedSystemPrompt {
 // Keep the public journal event shape stable as optional provider metadata grows.
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
+    /// Identity of one request-hook invocation, retained across interrupted runs.
+    RequestCallbackStarted {
+        id: Uuid,
+        purpose: String,
+    },
+    /// A prepared request was discarded before model execution.
+    RequestCallbackAbandoned {
+        id: Uuid,
+    },
     /// Original external entry retained during an explicit session import.
     SourceEntry {
         format: String,

@@ -852,6 +852,9 @@ impl Agent<'_> {
                         ));
                     }
                     let summary_limit = max_output_tokens.min(512).min(budget / 2);
+                    if let Some(id) = open_request_callback(session, run_id, RequestPurpose::Turn) {
+                        commit(session, Event::RequestCallbackAbandoned { id }, observer)?;
+                    }
                     let spent = active
                         .summarize_prefix(
                             session,
@@ -1139,6 +1142,28 @@ impl Agent<'_> {
             tools,
             max_output_tokens,
         };
+        let invocation = if let Some(run_id) = session.current_run_id()
+            && !self.registry.extensions.is_empty()
+        {
+            let id = match open_request_callback(session, run_id, purpose) {
+                Some(id) => id,
+                None => {
+                    let id = Uuid::new_v4();
+                    commit(
+                        session,
+                        Event::RequestCallbackStarted {
+                            id,
+                            purpose: request_purpose_name(purpose).to_owned(),
+                        },
+                        observer,
+                    )?;
+                    id
+                }
+            };
+            Some(id)
+        } else {
+            None
+        };
         for extension in &self.registry.extensions {
             let (sender, mut incoming) = mpsc::channel(32);
             let host: Arc<dyn ToolHost> = match session.current_run_id() {
@@ -1146,7 +1171,10 @@ impl Agent<'_> {
                     session,
                     sender,
                     run_id,
-                    request_callback_phase(session, run_id, purpose, "before_request"),
+                    format!(
+                        "before_request:invocation:{}",
+                        invocation.expect("active callback invocation")
+                    ),
                 )
                 .for_extension(extension.id())
                 .expect("callback host scope"),
@@ -1194,7 +1222,10 @@ impl Agent<'_> {
                     session,
                     sender,
                     run_id,
-                    request_callback_phase(session, run_id, purpose, "context_with_system"),
+                    format!(
+                        "context_with_system:invocation:{}",
+                        invocation.expect("active callback invocation")
+                    ),
                 )
                 .for_extension(extension.id())
                 .expect("callback host scope"),
@@ -2990,36 +3021,40 @@ fn callback_turn_phase(phase: &str, turn_index: u32) -> String {
     }
 }
 
-fn request_callback_phase(
-    session: &Session,
-    run_id: Uuid,
-    purpose: RequestPurpose,
-    phase: &str,
-) -> String {
-    let mut phase = callback_turn_phase(phase, completed_run_turns(session, run_id));
-    if purpose == RequestPurpose::Summary {
-        phase.push_str(":summary");
+fn request_purpose_name(purpose: RequestPurpose) -> &'static str {
+    match purpose {
+        RequestPurpose::Turn => "turn",
+        RequestPurpose::Summary => "summary",
     }
-    let attempts = session
+}
+
+fn open_request_callback(session: &Session, run_id: Uuid, purpose: RequestPurpose) -> Option<Uuid> {
+    let mut abandoned = HashSet::new();
+    for record in session
         .branch()
-        .iter()
+        .into_iter()
         .rev()
         .filter(|record| record.run_id == Some(run_id))
-        .take_while(|record| !matches!(record.event, Event::Assistant { .. }))
-        .filter(|record| {
-            matches!(
-                record.event,
-                Event::ModelFinished {
-                    failure: None | Some(ModelFailure::Retryable),
-                    ..
-                }
-            )
-        })
-        .count();
-    if attempts > 0 {
-        phase.push_str(&format!(":request:{attempts}"));
+    {
+        match &record.event {
+            Event::ModelFinished {
+                failure: None | Some(ModelFailure::Retryable),
+                ..
+            }
+            | Event::Assistant { .. } => return None,
+            Event::RequestCallbackAbandoned { id } => {
+                abandoned.insert(*id);
+            }
+            Event::RequestCallbackStarted {
+                id,
+                purpose: recorded,
+            } if recorded == request_purpose_name(purpose) && !abandoned.contains(id) => {
+                return Some(*id);
+            }
+            _ => {}
+        }
     }
-    phase
+    None
 }
 
 fn callback_root_host(
@@ -3824,6 +3859,46 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
         }
     }
     ensure_settled(session.operations())
+}
+
+#[cfg(test)]
+mod request_callback_marker_tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_request_and_restarted_request_keep_distinct_durable_identities() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        session.set_run_id(Some(run_id));
+        let first = Uuid::new_v4();
+        session
+            .append(Event::RequestCallbackStarted {
+                id: first,
+                purpose: "turn".into(),
+            })
+            .unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            open_request_callback(&restored, run_id, RequestPurpose::Turn),
+            Some(first)
+        );
+        session
+            .append(Event::RequestCallbackAbandoned { id: first })
+            .unwrap();
+        let second = Uuid::new_v4();
+        session
+            .append(Event::RequestCallbackStarted {
+                id: second,
+                purpose: "turn".into(),
+            })
+            .unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            open_request_callback(&restored, run_id, RequestPurpose::Turn),
+            Some(second)
+        );
+        assert_ne!(first, second);
+    }
 }
 
 #[cfg(test)]

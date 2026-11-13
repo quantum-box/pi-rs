@@ -2373,6 +2373,12 @@ fn output(event: Value) {
 
 fn metadata(record: &pi_rs::Record) -> Value {
     let mut value = match &record.event {
+        Event::RequestCallbackStarted { id, purpose } => {
+            json!({"event":"request_callback_started","invocation_id":id,"purpose":purpose})
+        }
+        Event::RequestCallbackAbandoned { id } => {
+            json!({"event":"request_callback_abandoned","invocation_id":id})
+        }
         Event::InputQueueCleared { ids } => json!({"event":"input_queue_cleared","ids":ids}),
         Event::QueueModeSelected { kind, mode } => {
             json!({"event":"queue_mode_selected","kind":kind,"mode":mode})
