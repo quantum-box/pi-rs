@@ -718,8 +718,69 @@ impl WriteOperations for LocalWriteOperations {
         Ok(())
     }
     async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
-        tokio::fs::write(path, content).await?;
+        let path = path.to_owned();
+        let file = tokio::task::spawn_blocking(move || open_local_write_file(&path))
+            .await
+            .map_err(|error| Error::Config(error.to_string()))??;
+        let mut file = tokio::fs::File::from_std(file);
+        file.set_len(0).await?;
+        file.write_all(content.as_bytes()).await?;
+        file.flush().await?;
         Ok(())
+    }
+}
+
+// Open without truncation, then verify the opened object before changing it.
+// O_NONBLOCK prevents a FIFO substituted after the metadata check from hanging.
+fn open_local_write_file(path: &Path) -> Result<std::fs::File> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(Error::Config("expected a regular file".into()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Ok(metadata) = std::fs::symlink_metadata(path)
+                && metadata.file_type().is_symlink()
+            {
+                return Err(Error::Config(
+                    "dangling symlink cannot be used as a mutation target".into(),
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(all(test, unix))]
+    pause_local_write_open(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    Ok(file)
+}
+
+#[cfg(all(test, unix))]
+struct LocalWriteOpenHook {
+    expected: PathBuf,
+    ready: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(all(test, unix))]
+static LOCAL_WRITE_OPEN_HOOK: std::sync::Mutex<Option<LocalWriteOpenHook>> =
+    std::sync::Mutex::new(None);
+#[cfg(all(test, unix))]
+fn pause_local_write_open(path: &Path) {
+    if let Some(hook) = LOCAL_WRITE_OPEN_HOOK.lock().unwrap().as_ref()
+        && hook.expected == path
+    {
+        let _ = hook.ready.send(());
+        let _ = hook.resume.recv_timeout(Duration::from_secs(5));
     }
 }
 
@@ -2386,6 +2447,61 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_write_fifo_substitution_settles_after_cancellation() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("target");
+        std::fs::write(&path, "original").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *LOCAL_WRITE_OPEN_HOOK.lock().unwrap() = Some(LocalWriteOpenHook {
+            expected: path.clone(),
+            ready: ready_tx,
+            resume: resume_rx,
+        });
+        let tool = create_write_tool(&root, Arc::new(LocalWriteOperations)).unwrap();
+        let cancellation = pi_rs::CancellationToken::new();
+        let token = cancellation.clone();
+        let task = tokio::spawn(async move {
+            tool.invoke(
+                json!({"path":"target", "content":"new"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: token,
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .expect("open precheck completed");
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // A reader lets open succeed, exercising post-open fstat, not just ENXIO.
+        let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(fd >= 0);
+        let _reader = unsafe { std::fs::File::from_raw_fd(fd) };
+        cancellation.cancel();
+        resume_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("FIFO open must not block")
+            .unwrap();
+        *LOCAL_WRITE_OPEN_HOOK.lock().unwrap() = None;
+        assert!(matches!(result, Outcome::Failed(_)));
+        assert!(std::fs::metadata(&path).unwrap().file_type().is_fifo());
+        let mut byte = [0u8; 1];
+        let count = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(count, 0, "no content was written to the FIFO");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

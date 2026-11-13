@@ -421,3 +421,38 @@ async fn backend_alias_identity_serializes_writes() {
         Outcome::Succeeded(_)
     ));
 }
+
+#[tokio::test]
+async fn local_write_adapter_creates_and_truncates_regular_files() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("file");
+    let ops = pi_rs_workbench::coding::LocalWriteOperations;
+    ops.write_file(&path, "long content").await.unwrap();
+    ops.write_file(&path, "new").await.unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_write_rejects_fifo_without_reader() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("pipe");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let tool = create_write_tool(
+        root.path(),
+        Arc::new(pi_rs_workbench::coding::LocalWriteOperations),
+    )
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        tool.invoke(
+            json!({"path":"pipe", "content":"no"}),
+            context(CancellationToken::new()),
+        ),
+    )
+    .await
+    .expect("FIFO without a reader must not block");
+    assert!(matches!(result, Outcome::Failed(_)));
+}

@@ -495,8 +495,9 @@ operation under the old lock. Existing unrestricted local tools have the same
 class of pathname race. Defending against hostile concurrent filesystem changes
 requires handle-relative traversal, no-follow checks and a handle-relative
 replacement protocol across supported platforms. `LocalWriteOperations` is a
-basic Pi-style filesystem adapter; the default local tool retains its atomic-write
-behavior.
+basic Pi-style filesystem adapter. It checks file type before and after opening
+and uses nonblocking Unix opens to reject FIFO substitutions; the default local
+tool retains its atomic-write behavior.
 
 Remote injection and factories for model shell, edit, grep, find and ls remain
 incomplete. User-shell extension operations are a separate existing interface.
