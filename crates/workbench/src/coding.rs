@@ -691,6 +691,8 @@ impl Tool for RemoteReadTool {
 pub trait WriteOperations: Send + Sync {
     /// Return true only when paths address this host's local filesystem. This
     /// makes writes share the canonicalized cross-process lock used by local edits.
+    /// This is cooperative locking, not a security boundary: path components can
+    /// be replaced by outside processes after resolution and before an operation.
     fn uses_local_filesystem(&self) -> bool {
         false
     }

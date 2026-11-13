@@ -487,8 +487,16 @@ backend-supplied resource identity within this process. Backends must map all
 aliases to the same identity to serialize them. Cancellation is observed between operations.
 The backend is responsible for its access policy and must not return before its
 write has settled. Scoped profiles reject custom operations because local path
-checks cannot verify remote symlinks. `LocalWriteOperations` is a basic Pi-style
-filesystem adapter; the default local tool retains its atomic-write behavior.
+checks cannot verify remote symlinks. These local locks coordinate participating
+pi-rs operations; they are not a security boundary. The resolved target is a
+pathname, not a pinned directory or file handle. An external process can
+replace the target or a parent component after resolution and redirect an
+operation under the old lock. Existing unrestricted local tools have the same
+class of pathname race. Defending against hostile concurrent filesystem changes
+requires handle-relative traversal, no-follow checks and a handle-relative
+replacement protocol across supported platforms. `LocalWriteOperations` is a
+basic Pi-style filesystem adapter; the default local tool retains its atomic-write
+behavior.
 
 Remote injection and factories for model shell, edit, grep, find and ls remain
 incomplete. User-shell extension operations are a separate existing interface.
