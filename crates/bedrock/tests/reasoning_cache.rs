@@ -270,6 +270,90 @@ async fn adaptive_max_defaults_to_max_and_honors_mapping() {
 }
 
 #[tokio::test]
+async fn claude_default_on_thinking_is_disabled_for_off_and_summaries() {
+    for (model, name) in [
+        ("anthropic.claude-opus-5", None),
+        ("anthropic.claude-sonnet-5", None),
+        ("anthropic.claude-haiku-5-5", None),
+        ("opaque", Some("Claude Opus 5")),
+    ] {
+        for (level, summary) in [(None, false), (Some("off"), false), (Some("high"), true)] {
+            let (body, _) = capture(
+                "us-east-1",
+                |c| {
+                    c.with_model_name(model, name)
+                        .with_reasoning(level, None)
+                        .unwrap()
+                },
+                request(model, 512),
+                summary,
+            )
+            .await;
+            assert_eq!(
+                body["additionalModelRequestFields"],
+                json!({"thinking":{"type":"disabled"}}),
+                "{model}"
+            );
+        }
+    }
+    let mut req = request("anthropic.claude-sonnet-5-5", 512);
+    req.tools.clear();
+    let (body, _) = capture(
+        "us-east-1",
+        |c| c.with_reasoning(Some("high"), None).unwrap(),
+        req,
+        true,
+    )
+    .await;
+    assert_eq!(
+        body["additionalModelRequestFields"],
+        json!({"thinking":{"type":"between_tools"}})
+    );
+}
+
+#[tokio::test]
+async fn claude_models_that_cannot_disable_thinking_report_configuration_error() {
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version_latest()
+        .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+        .credentials_provider(aws_credential_types::Credentials::new(
+            "test", "secret", None, None, "test",
+        ))
+        .endpoint_url("http://127.0.0.1:1")
+        .build();
+    let client = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config));
+    for model in [
+        "anthropic.claude-fable-5",
+        "anthropic.claude-mythos-5-1",
+        "anthropic.claude-opus-5-5",
+        "anthropic.claude-sonnet-5-5",
+    ] {
+        for summary in [false, true] {
+            let request = request(model, 512);
+            let result = if summary {
+                client
+                    .stream_for_summary(Uuid::nil(), Uuid::nil(), request)
+                    .await
+            } else {
+                client.stream(request).await
+            };
+            let error = match result {
+                Ok(_) => panic!("accepted thinking off for {model}"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(error, pi_rs_core::Error::Config(_)),
+                "{model}: {error}"
+            );
+            assert!(
+                error.to_string().contains("cannot disable thinking"),
+                "{model}: {error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn gpt_mapping_summary_and_unsupported_cache_models() {
     let (oss, _) = capture(
         "us-east-1",

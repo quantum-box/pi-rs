@@ -79,9 +79,10 @@ const ADAPTIVE: &[&str] = &[
     "sonnet-5",
     "haiku-5",
     "fable-5",
+    "mythos-5",
 ];
 const NEW_ADAPTIVE: &[&str] = &[
-    "opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "haiku-5", "fable-5",
+    "opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "haiku-5", "fable-5", "mythos-5",
 ];
 
 pub fn thinking_levels(model: &str, name: Option<&str>) -> Vec<String> {
@@ -164,11 +165,25 @@ pub(crate) fn reasoning_fields(
     mapped: Option<&str>,
     max_tokens: u32,
     region: Option<&str>,
+    tool_free: bool,
 ) -> Result<Option<Value>> {
-    let Some(level) = level else { return Ok(None) };
     let items = candidates(model, name);
     if has_any(&items, &["claude"]) {
+        let level = level.unwrap_or(ReasoningLevel::Off);
         if level == ReasoningLevel::Off {
+            if has_any(&items, &["fable-5", "mythos-5", "opus-5-5"]) {
+                return Err(Error::Config("This Bedrock Claude model cannot disable thinking; select a reasoning level or use a different model for summaries".into()));
+            }
+            if has_any(&items, &["sonnet-5-5"]) {
+                return if tool_free {
+                    Ok(Some(json!({"thinking":{"type":"between_tools"}})))
+                } else {
+                    Err(Error::Config("Claude Sonnet 5.5 cannot disable thinking between tool calls; select a reasoning level or use a different model".into()))
+                };
+            }
+            if has_any(&items, &["opus-5", "sonnet-5", "haiku-5-5"]) {
+                return Ok(Some(json!({"thinking":{"type":"disabled"}})));
+            }
             return Ok(None);
         }
         let gov = region.is_some_and(|r| r.to_ascii_lowercase().starts_with("us-gov-"))
@@ -214,6 +229,7 @@ pub(crate) fn reasoning_fields(
         }
         return Ok(Some(fields));
     }
+    let Some(level) = level else { return Ok(None) };
     if has_any(&items, &["gpt-oss"]) {
         return Ok(Some(
             json!({"reasoning_effort":mapped.unwrap_or(level.oss_effort())}),
@@ -248,7 +264,8 @@ mod tests {
                 Some(ReasoningLevel::Xhigh),
                 None,
                 1024,
-                None
+                None,
+                true
             )
             .unwrap(),
             Some(
@@ -262,7 +279,8 @@ mod tests {
                 Some(ReasoningLevel::Minimal),
                 None,
                 1024,
-                None
+                None,
+                true
             )
             .unwrap(),
             Some(json!({"reasoning":{"effort":"low"}}))
@@ -274,13 +292,23 @@ mod tests {
                 Some(ReasoningLevel::High),
                 None,
                 1024,
-                None
+                None,
+                true
             )
             .unwrap(),
             None
         );
         assert_eq!(
-            reasoning_fields("anthropic.claude-opus-4-8", None, None, None, 1024, None).unwrap(),
+            reasoning_fields(
+                "anthropic.claude-opus-4-8",
+                None,
+                None,
+                None,
+                1024,
+                None,
+                true
+            )
+            .unwrap(),
             None
         );
         assert!(ReasoningLevel::parse("nonsense").is_err());

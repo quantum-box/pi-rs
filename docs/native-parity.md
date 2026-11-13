@@ -3372,6 +3372,12 @@ ceiling. Budgeted Claude thinking reserves at least 1,024 tokens for the answer
 and requires an output limit of at least 2,048; unlike Pi's simple API, this
 adapter does not increase the host's output budget automatically. Reasoning
 options for other model families are not sent, matching Pi's Bedrock adapter.
+Claude 5 models that default to adaptive thinking receive an explicit disabled
+setting when thinking is off. Fable 5, Mythos 5 and Opus 5.5 cannot disable
+thinking, so off and summary requests fail with a configuration error instead
+of silently consuming reasoning tokens. Sonnet 5.5 uses `between_tools` when
+there are no tools; with tools, off fails because thinking can still occur
+between tool calls.
 
 For supported Claude models, the provider adds default five-minute cache
 checkpoints after the system content and at the end of the final user message.
@@ -3382,7 +3388,7 @@ support, and library callers can use `with_cache_retention` and
 `with_long_cache_support`. Set
 `AWS_BEDROCK_FORCE_CACHE=1` when the model ID and configured name cannot identify
 a supported model; forcing checkpoints alone does not enable one-hour TTL.
-Tool-free summaries disable checkpoints and reasoning so
+Tool-free summaries disable checkpoints and optional reasoning so
 that their smaller output limit remains usable. Cache usage includes
 one-hour write details when Bedrock reports them. Model support and minimum
 cacheable lengths are determined by Bedrock.

@@ -107,7 +107,7 @@ impl Bedrock {
         self.long_cache_support = supported;
         self
     }
-    /// Prepare a one-off summary without cache checkpoints or model thinking.
+    /// Prepare a one-off summary without cache checkpoints or optional thinking.
     pub fn for_summary(mut self) -> Self {
         self.cache_retention = CacheRetention::None;
         self.reasoning = None;
@@ -639,6 +639,7 @@ impl Model for Bedrock {
             self.mapped_effort.as_deref(),
             request.max_output_tokens,
             client.config().region().map(|region| region.as_ref()),
+            tool_free,
         )?;
         let requested_model = request.model.clone();
         let mut command = client

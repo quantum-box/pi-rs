@@ -845,7 +845,8 @@ mod bedrock_tests {
             args.model_profiles = super::super::model_profiles::Profiles::parse(
                 &json!({"providers":{"amazon-bedrock":{"models":[
                     {"id":"anthropic.claude-opus-4-1","name":"Claude Opus 4.1"},
-                    {"id":"anthropic.claude-opus-4-6","name":"Claude Opus 4.6","reasoning":true}
+                    {"id":"anthropic.claude-opus-4-6","name":"Claude Opus 4.6","reasoning":true},
+                    {"id":"anthropic.claude-sonnet-5","name":"Claude Sonnet 5","reasoning":true}
                 ]}}}),
             )
             .unwrap();
@@ -860,6 +861,17 @@ mod bedrock_tests {
                     .unwrap();
                 let _stream = client
                     .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .await
+                    .unwrap();
+            }
+            args.model = "anthropic.claude-sonnet-5".into();
+            for (thinking, summary) in [(None, false), (Some("high"), true)] {
+                args.thinking = thinking.map(str::to_owned);
+                let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let _stream = client
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), summary)
                     .await
                     .unwrap();
             }
@@ -889,7 +901,7 @@ mod bedrock_tests {
             .unwrap();
         let server = async {
             let mut requests = Vec::new();
-            for _ in 0..12 {
+            for _ in 0..14 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut buf = [0; 8192];
@@ -980,5 +992,11 @@ mod bedrock_tests {
             requests[11]["additionalModelRequestFields"]["output_config"]["effort"],
             "max"
         );
+        for request in &requests[12..14] {
+            assert_eq!(
+                request["additionalModelRequestFields"],
+                json!({"thinking":{"type":"disabled"}})
+            );
+        }
     }
 }
