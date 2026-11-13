@@ -19,7 +19,22 @@ pub(super) fn read(
     if !file.metadata()?.is_file() {
         return Err(Error::Config("expected a regular text file".into()));
     }
-    let mut reader = BufReader::new(file);
+    read_from(
+        BufReader::new(file),
+        display_path,
+        offset,
+        limit,
+        cancellation,
+    )
+}
+
+pub(super) fn read_from(
+    mut reader: impl BufRead,
+    display_path: &str,
+    offset: usize,
+    limit: Option<usize>,
+    cancellation: &CancellationToken,
+) -> Result<Outcome> {
     let mut buffer = Vec::new();
     let mut decoded = [0; 8192];
     let mut head = Vec::new();

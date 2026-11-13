@@ -27,6 +27,7 @@ pub struct CodingTools {
     auto_resize_images: bool,
     image_profile: Option<crate::image_profile::ImageResizeProfile>,
     model_supports_images: Option<bool>,
+    read_operations: Option<Arc<dyn ReadOperations>>,
 }
 
 impl CodingTools {
@@ -42,6 +43,7 @@ impl CodingTools {
             auto_resize_images: true,
             image_profile: None,
             model_supports_images: None,
+            read_operations: None,
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -50,6 +52,19 @@ impl CodingTools {
         tools.unrestricted = true;
         Ok(tools)
     }
+    /// Replace model-facing read operations in the unrestricted local Pi profile.
+    /// A remote backend controls its own access policy; scoped profiles cannot use it
+    /// because local canonicalization cannot establish remote symlink boundaries.
+    pub fn with_read_operations(mut self, operations: Arc<dyn ReadOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom read operations require the unrestricted profile".into(),
+            ));
+        }
+        self.read_operations = Some(operations);
+        Ok(self)
+    }
+
     pub fn with_shell_config(mut self, shell: ShellConfig) -> Self {
         self.shell = shell;
         self
@@ -382,14 +397,176 @@ impl Extension for CodingTools {
         kinds
             .into_iter()
             .map(|kind| {
-                Arc::new(CodingTool {
+                let tool = CodingTool {
                     root: self.root.clone(),
                     unrestricted: self.unrestricted,
                     shell: self.shell.clone(),
                     kind,
-                }) as Arc<dyn Tool>
+                };
+                if matches!(kind, Kind::Read { .. })
+                    && let Some(operations) = &self.read_operations
+                {
+                    Arc::new(RemoteReadTool {
+                        tool,
+                        operations: operations.clone(),
+                    }) as Arc<dyn Tool>
+                } else {
+                    Arc::new(tool) as Arc<dyn Tool>
+                }
             })
             .collect()
+    }
+}
+
+/// File operations for an unrestricted model-facing read tool. Paths are absolute
+/// and normalized relative to the configured working directory. Implementations
+/// are responsible for enforcing any remote access policy and for cancelling work
+/// when their futures are dropped.
+#[async_trait::async_trait]
+pub trait ReadOperations: Send + Sync {
+    async fn access(&self, path: &Path) -> Result<()>;
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
+    async fn detect_image_mime_type(&self, _path: &Path) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// Local implementation of the read operations interface.
+pub struct LocalReadOperations;
+
+#[async_trait::async_trait]
+impl ReadOperations for LocalReadOperations {
+    async fn access(&self, path: &Path) -> Result<()> {
+        let file = tokio::fs::File::open(path).await?;
+        if !file.metadata().await?.is_file() {
+            return Err(Error::Config("expected a regular file".into()));
+        }
+        Ok(())
+    }
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        Ok(tokio::fs::read(path).await?)
+    }
+    async fn detect_image_mime_type(&self, path: &Path) -> Result<Option<String>> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+            Ok(reader
+                .format()
+                .map(|format| format.to_mime_type().to_owned()))
+        })
+        .await
+        .map_err(|error| Error::Config(error.to_string()))?
+    }
+}
+
+/// Construct a model-facing read tool backed by custom operations. This factory
+/// uses Pi's unrestricted path semantics; the backend owns access enforcement.
+pub fn create_read_tool(root: &Path, operations: Arc<dyn ReadOperations>) -> Result<Arc<dyn Tool>> {
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteReadTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        },
+        operations,
+    }))
+}
+
+struct RemoteReadTool {
+    tool: CodingTool,
+    operations: Arc<dyn ReadOperations>,
+}
+
+#[async_trait::async_trait]
+impl Tool for RemoteReadTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let cancellation = context.cancellation.child_token();
+        let _guard = cancellation.clone().drop_guard();
+        let operation = async {
+            let name = string(&args, "path")?.to_owned();
+            let input = crate::coding_paths::normalize(&name)?;
+            let path = crate::coding_paths::resolve(&self.tool.root, &input);
+            self.operations.access(&path).await?;
+            let mime = self.operations.detect_image_mime_type(&path).await?;
+            let bytes = self.operations.read_file(&path).await?;
+            let tool = self.tool.clone();
+            let token = cancellation.clone();
+            tokio::task::spawn_blocking(move || -> Result<Outcome> {
+                if token.is_cancelled() { return Err(Error::Cancelled); }
+                if let Some(mime) = mime {
+                    if bytes.len() > 20 * 1024 * 1024 { return Err(Error::Config("image exceeds 20 MiB".into())); }
+                    let format = image::ImageFormat::from_mime_type(&mime)
+                        .ok_or_else(|| Error::Config(format!("unsupported image MIME type: {mime}")))?;
+                    let reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+                    let mut data = tool.process_image(&path, reader, format)?;
+                    if matches!(tool.kind, Kind::Read { model_supports_images: Some(false), .. })
+                        && let Some(note) = data["content"][0]["text"].as_str() {
+                        data["content"][0]["text"] = json!(format!("{note}\n[Current model does not support images. The image will be omitted from this request.]"));
+                    }
+                    Ok(Outcome::Structured { data, attachments: vec![] })
+                } else {
+                    let offset = usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1)).unwrap_or(usize::MAX);
+                    let limit = args["limit"].as_u64().map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+                    crate::text_page::read_from(std::io::BufReader::new(Cursor::new(bytes)), &name, offset, limit, &token)
+                }
+            }).await.map_err(|error| Error::Config(error.to_string()))?
+        };
+        let result = tokio::select! { biased; _ = cancellation.cancelled() => Err(Error::Cancelled), result = operation => result };
+        match result {
+            Ok(outcome) => outcome,
+            Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+    async fn invoke_programmatic(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+        _: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        match self.invoke(args, context).await {
+            Outcome::Structured { data, attachments } => {
+                let mut image = data["content"]
+                    .as_array()
+                    .and_then(|blocks| blocks.iter().find(|b| b["type"] == "image"))
+                    .cloned()
+                    .unwrap_or_else(|| data.clone());
+                if image["type"] == "image" {
+                    image["note"] = json!(
+                        data["content"]
+                            .as_array()
+                            .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
+                            .unwrap_or_default()
+                    );
+                }
+                Outcome::Structured {
+                    data: image,
+                    attachments,
+                }
+                .into()
+            }
+            outcome => outcome.into(),
+        }
     }
 }
 
@@ -722,6 +899,15 @@ impl CodingTool {
         if path.metadata()?.len() > 20 * 1024 * 1024 {
             return Err(Error::Config("image exceeds 20 MiB".into()));
         }
+        self.process_image(path, reader, format).map(Some)
+    }
+
+    fn process_image<R: std::io::BufRead + std::io::Seek>(
+        &self,
+        path: &Path,
+        reader: image::ImageReader<R>,
+        format: image::ImageFormat,
+    ) -> Result<Value> {
         if self.unrestricted
             && let Kind::Read {
                 auto_resize: true,
@@ -754,10 +940,10 @@ impl CodingTool {
                     prepared.source.0, prepared.source.1, prepared.output.0, prepared.output.1
                 ));
             }
-            return Ok(Some(json!({"content":[
+            return Ok(json!({"content":[
                 {"type":"text", "text":note},
                 {"type":"image", "mimeType":prepared.mime_type, "data":base64::engine::general_purpose::STANDARD.encode(prepared.bytes)}
-            ]})));
+            ]}));
         }
         let (bytes, mime_type, source, output) = if matches!(
             self.kind,
@@ -820,10 +1006,10 @@ impl CodingTool {
                 output.1
             )
         };
-        Ok(Some(json!({"content":[
+        Ok(json!({"content":[
             {"type":"text","text":note},
             {"type":"image","mimeType":mime_type,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}
-        ]})))
+        ]}))
     }
 
     fn read(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
