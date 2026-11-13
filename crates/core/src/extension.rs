@@ -362,16 +362,114 @@ pub struct Compaction {
     pub keep_turns: usize,
 }
 
-/// Whether a request hook modified its input.
-///
-/// `Unchanged` certifies that the hook did not modify, replace, remove, or
-/// reorder any part of its input, including changes that compare equal. The
-/// host retains private provider replay only on that explicit certification.
-/// Return `Changed` for every transformation; replay is then dropped.
+/// A hook's reported change status. The host tracks mutable access separately;
+/// this status never proves that assistant messages were left unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextChange {
     Unchanged,
     Changed,
+}
+
+/// A host-owned record of mutable access, retained independently of the wrapper.
+#[derive(Clone, Default)]
+pub struct ContextAccess {
+    assistant_accessed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    touched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl ContextAccess {
+    pub fn assistant_accessed(&self) -> bool {
+        self.assistant_accessed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn touched(&self) -> bool {
+        self.touched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn mark_safe(&self) {
+        self.touched
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn mark_assistant(&self) {
+        self.mark_safe();
+        self.assistant_accessed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A portable request with host-tracked mutable access. General mutable access
+/// invalidates private assistant replay, even if the result compares equal.
+pub struct ContextRequest<'a> {
+    request: &'a mut ModelRequest,
+    access: ContextAccess,
+}
+impl<'a> ContextRequest<'a> {
+    pub fn new(request: &'a mut ModelRequest) -> Self {
+        Self {
+            request,
+            access: ContextAccess::default(),
+        }
+    }
+    pub fn access(&self) -> ContextAccess {
+        self.access.clone()
+    }
+    pub fn tools_mut(&mut self) -> &mut Vec<crate::ToolSpec> {
+        self.access.mark_safe();
+        &mut self.request.tools
+    }
+    pub fn system_content_mut(&mut self) -> Option<&mut String> {
+        self.access.mark_safe();
+        match self.request.messages.first_mut() {
+            Some(crate::Message::System { content }) => Some(content),
+            _ => None,
+        }
+    }
+}
+impl std::ops::Deref for ContextRequest<'_> {
+    type Target = ModelRequest;
+    fn deref(&self) -> &Self::Target {
+        self.request
+    }
+}
+impl std::ops::DerefMut for ContextRequest<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.access.mark_assistant();
+        self.request
+    }
+}
+
+/// A portable message list; general mutable access invalidates assistant replay.
+pub struct ContextMessages<'a> {
+    messages: &'a mut Vec<crate::Message>,
+    access: ContextAccess,
+}
+impl<'a> ContextMessages<'a> {
+    pub fn new(messages: &'a mut Vec<crate::Message>) -> Self {
+        Self {
+            messages,
+            access: ContextAccess::default(),
+        }
+    }
+    pub fn access(&self) -> ContextAccess {
+        self.access.clone()
+    }
+    pub fn system_content_mut(&mut self) -> Option<&mut String> {
+        self.access.mark_safe();
+        match self.messages.first_mut() {
+            Some(crate::Message::System { content }) => Some(content),
+            _ => None,
+        }
+    }
+}
+impl std::ops::Deref for ContextMessages<'_> {
+    type Target = Vec<crate::Message>;
+    fn deref(&self) -> &Self::Target {
+        self.messages
+    }
+}
+impl std::ops::DerefMut for ContextMessages<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.access.mark_assistant();
+        self.messages
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -691,7 +789,7 @@ pub trait Extension: Send + Sync {
 
     fn context(
         &self,
-        _request: &mut ModelRequest,
+        _request: &mut ContextRequest<'_>,
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<ContextChange> {
         Ok(ContextChange::Unchanged)
@@ -699,7 +797,7 @@ pub trait Extension: Send + Sync {
 
     async fn before_request(
         &self,
-        request: &mut ModelRequest,
+        request: &mut ContextRequest<'_>,
         _purpose: RequestPurpose,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<ContextChange> {
@@ -714,7 +812,7 @@ pub trait Extension: Send + Sync {
     /// Transform the provider-visible messages, including system messages.
     async fn context_with_system(
         &self,
-        _messages: &mut Vec<crate::Message>,
+        _messages: &mut ContextMessages<'_>,
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<ContextChange> {
         Ok(ContextChange::Unchanged)

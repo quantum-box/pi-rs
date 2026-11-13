@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use pi_rs_core::{
-    Compaction, Decision, Extension, ExtensionResult, ExtensionState, Message, ModelRequest,
-    RequestPurpose, Result,
+    Compaction, Decision, Extension, ExtensionResult, ExtensionState, Message, RequestPurpose,
+    Result,
 };
 use serde::{Deserialize, Serialize};
 
@@ -89,7 +89,7 @@ impl Extension for ReferenceMemory {
 
     async fn before_request(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         purpose: RequestPurpose,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
@@ -120,10 +120,10 @@ impl Extension for ReferenceMemory {
             }
         }
         if !context.is_empty() {
-            request.messages.insert(
-                1.min(request.messages.len()),
-                Message::User { content: context },
-            );
+            let insert_at = 1.min(request.messages.len());
+            request
+                .messages
+                .insert(insert_at, Message::User { content: context });
         }
         Ok(pi_rs_core::ContextChange::Changed)
     }

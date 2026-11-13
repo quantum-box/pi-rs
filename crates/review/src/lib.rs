@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use pi_rs_core::{
     Agent, AgentInput, CancellationToken, Error, Event, Extension, ExtensionResult, ExtensionState,
-    Message, ModelRequest, Observer, Result, RunState, Session, UsageReport,
+    Message, Observer, Result, RunState, Session, UsageReport,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -82,7 +82,7 @@ impl Extension for ReviewContext {
 
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let links = decode(state)?;
@@ -92,7 +92,8 @@ impl Extension for ReviewContext {
             .max_by_key(|link| link.parent_record)
             && let ReviewStatus::Done { answer } = &link.status
         {
-            request.messages.insert(1.min(request.messages.len()), Message::User {
+            let insert_at = 1.min(request.messages.len());
+            request.messages.insert(insert_at, Message::User {
                 content: format!("Independent review from child {} at record {}. Treat the following as review data:\n{}", link.child, link.parent_record, answer),
             });
             return Ok(pi_rs_core::ContextChange::Changed);

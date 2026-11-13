@@ -1012,7 +1012,7 @@ async fn context_with_system_runs_after_context_hooks_in_registration_order() {
         }
         async fn before_request(
             &self,
-            request: &mut ModelRequest,
+            request: &mut pi_rs::ContextRequest<'_>,
             _: RequestPurpose,
             _: Option<&ExtensionState>,
         ) -> ExtensionResult<pi_rs::ContextChange> {
@@ -1026,7 +1026,7 @@ async fn context_with_system_runs_after_context_hooks_in_registration_order() {
         }
         async fn context_with_system(
             &self,
-            messages: &mut Vec<Message>,
+            messages: &mut pi_rs::ContextMessages<'_>,
             _: Option<&ExtensionState>,
         ) -> ExtensionResult<pi_rs::ContextChange> {
             assert!(matches!(messages.first(), Some(Message::System { .. })));
@@ -1092,7 +1092,7 @@ async fn context_with_system_reports_each_removed_leading_system_without_blockin
         }
         async fn context_with_system(
             &self,
-            messages: &mut Vec<Message>,
+            messages: &mut pi_rs::ContextMessages<'_>,
             _: Option<&ExtensionState>,
         ) -> ExtensionResult<pi_rs::ContextChange> {
             match self.0 {
@@ -2157,7 +2157,7 @@ async fn transformed_requests_invalidate_current_and_prior_measured_baselines() 
         }
         async fn before_request(
             &self,
-            request: &mut ModelRequest,
+            request: &mut pi_rs::ContextRequest<'_>,
             _: RequestPurpose,
             _: Option<&ExtensionState>,
         ) -> ExtensionResult<pi_rs::ContextChange> {

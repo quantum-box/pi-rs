@@ -731,13 +731,17 @@ projection when imported, including text and image replacements. Assistant
 replacement thinking retains its signature and redaction flag and is replayed
 in block order to the original provider, API and model after tool-pair repair.
 Provider replay stays private to the adapter; native and executable request
-hooks and request notifications receive portable copies. Native request hooks
-return `ContextChange::Unchanged` only when they have not modified their input;
-the original request and all its replay are retained in that case. A hook that
-returns `Changed` drops replay for the request, even if its output compares equal.
-Executable hooks using the existing protocol are treated as changed because that
-protocol does not attest to preservation. This changes the native hook return
-signature and requires native extension implementations to return a status.
+hooks and request notifications receive portable copies. Host-tracked hook
+wrappers invalidate replay whenever a hook obtains general mutable access to
+assistant messages, irrespective of the hook's reported status or the resulting
+values. Narrow tool and system-content accessors retain replay. Executables can
+negotiate the versioned context protocol and return a payload-free unchanged
+response; the host retains its original request in that case. Executables set
+`context_provenance_v1` in their description, implement `context_v2`,
+`before_request_v2` and `context_with_system_v2`, and return either
+`{"change":"unchanged"}` or `{"change":"changed","value":...}`. An unchanged
+response cannot carry a value. Legacy protocol responses are treated as changed.
+Native extension hook signatures use the tracked wrappers.
 Edited Anthropic, Google and OpenAI Responses thinking requires the recorded
 endpoint binding; chat-completions replay is also bound to the configured
 provider. Older and imported histories without that binding omit edited thinking

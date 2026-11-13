@@ -1,8 +1,8 @@
+#[cfg(test)]
+use pi_rs_core::ModelRequest;
 use std::collections::BTreeSet;
 
-use pi_rs_core::{
-    Decision, Extension, ExtensionResult, ExtensionState, Message, ModelRequest, ToolContext,
-};
+use pi_rs_core::{Decision, Extension, ExtensionResult, ExtensionState, Message, ToolContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -82,7 +82,7 @@ impl Extension for PlanMode {
 
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let plan = match decode(state)? {
@@ -99,10 +99,10 @@ impl Extension for PlanMode {
                 "Accepted working plan. Follow the host's current authorization for each operation.\n{plan}"
             ),
         };
-        request.messages.insert(
-            1.min(request.messages.len()),
-            Message::User { content: plan },
-        );
+        let insert_at = 1.min(request.messages.len());
+        request
+            .messages
+            .insert(insert_at, Message::User { content: plan });
         Ok(pi_rs_core::ContextChange::Changed)
     }
 
@@ -149,7 +149,12 @@ mod tests {
                 .collect(),
             max_output_tokens: 32,
         };
-        extension.context(&mut request, Some(&state)).unwrap();
+        extension
+            .context(
+                &mut pi_rs_core::ContextRequest::new(&mut request),
+                Some(&state),
+            )
+            .unwrap();
         assert_eq!(request.tools.len(), 1);
         assert_eq!(request.tools[0].name, "read");
         let context = ToolContext {

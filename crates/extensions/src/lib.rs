@@ -8,8 +8,7 @@ pub use process::{ExecutableExtension, extension_flag, serve_extension};
 use std::sync::Arc;
 
 use pi_rs_core::{
-    Extension, ExtensionResult, ExtensionState, Message, ModelRequest, Outcome, Tool, ToolContext,
-    ToolSpec,
+    Extension, ExtensionResult, ExtensionState, Message, Outcome, Tool, ToolContext, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -48,15 +47,16 @@ impl Extension for Notes {
     }
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let text = notes(state)?;
         if text.is_empty() {
             return Ok(pi_rs_core::ContextChange::Unchanged);
         }
+        let insert_at = 1.min(request.messages.len());
         request.messages.insert(
-            1.min(request.messages.len()),
+            insert_at,
             Message::User {
                 content: format!("Saved session notes (reference data):\n{text}"),
             },
@@ -118,15 +118,16 @@ impl Extension for TodoList {
     }
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let items = todos(state)?;
         if items.is_empty() {
             return Ok(pi_rs_core::ContextChange::Unchanged);
         }
+        let insert_at = 1.min(request.messages.len());
         request.messages.insert(
-            1.min(request.messages.len()),
+            insert_at,
             Message::User {
                 content: format!(
                     "Current task checklist (reference data):\n{}",
@@ -232,5 +233,75 @@ mod tests {
                 .is_err()
         );
         assert_eq!(todos(Some(&state)).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod request_access_tests {
+    use super::*;
+    use pi_rs_core::{ContextRequest, ModelRequest, RequestPurpose};
+
+    #[tokio::test]
+    async fn tool_search_and_codemode_change_tools_without_accessing_assistants() {
+        let spec = |name: &str| ToolSpec {
+            name: name.into(),
+            description: "description".into(),
+            parameters: json!({"type":"object"}),
+        };
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "visible".into(),
+                calls: vec![],
+                replay: None,
+            }],
+            tools: vec![spec("codemode"), spec("hidden")],
+            max_output_tokens: 16,
+        };
+        let search = tool_search::ToolSearch::new(vec![tool_search::SearchDocument {
+            tool: spec("hidden"),
+            namespace: "tools".into(),
+        }]);
+        let mut guarded = ContextRequest::new(&mut request);
+        let access = guarded.access();
+        search
+            .before_request(&mut guarded, RequestPurpose::Turn, None)
+            .await
+            .unwrap();
+        assert!(!access.assistant_accessed());
+        assert!(!request.tools.iter().any(|tool| tool.name == "hidden"));
+        let mut guarded = ContextRequest::new(&mut request);
+        let access = guarded.access();
+        codemode::Codemode::default()
+            .before_request(&mut guarded, RequestPurpose::Turn, None)
+            .await
+            .unwrap();
+        assert!(!access.assistant_accessed());
+        assert!(
+            request.tools[0]
+                .description
+                .contains("Available tool declarations")
+        );
+        request.tools.clear();
+        let mut guarded = ContextRequest::new(&mut request);
+        let access = guarded.access();
+        assert_eq!(
+            search
+                .before_request(&mut guarded, RequestPurpose::Turn, None)
+                .await
+                .unwrap(),
+            pi_rs_core::ContextChange::Unchanged
+        );
+        assert!(!access.assistant_accessed());
+        let mut guarded = ContextRequest::new(&mut request);
+        let access = guarded.access();
+        assert_eq!(
+            codemode::Codemode::default()
+                .before_request(&mut guarded, RequestPurpose::Turn, None)
+                .await
+                .unwrap(),
+            pi_rs_core::ContextChange::Unchanged
+        );
+        assert!(!access.assistant_accessed());
     }
 }

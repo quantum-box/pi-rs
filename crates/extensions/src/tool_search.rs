@@ -1,11 +1,13 @@
 //! Deferred tool discovery, with ranking adapted from Pi v1.5.0 under MIT.
 //! Copyright (c) 2025 Mario Zechner. See ../PI-LICENSE.
+#[cfg(test)]
+use pi_rs_core::ModelRequest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
 use pi_rs_core::{
-    Extension, ExtensionResult, ExtensionState, ModelRequest, Outcome, RequestPurpose, Tool,
-    ToolContext, ToolExecution, ToolSpec,
+    Extension, ExtensionResult, ExtensionState, Outcome, RequestPurpose, Tool, ToolContext,
+    ToolExecution, ToolSpec,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -65,12 +67,13 @@ impl Extension for ToolSearch {
     }
     async fn before_request(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         _: RequestPurpose,
         previous: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        let original_tools = request.tools.clone();
         let loaded = state(previous)?.loaded;
-        request.tools.retain(|tool| {
+        request.tools_mut().retain(|tool| {
             loaded.contains(&tool.name)
                 || !self
                     .documents
@@ -87,10 +90,14 @@ impl Extension for ToolSearch {
                 .iter()
                 .any(|tool| tool.name == document.tool.name)
             {
-                request.tools.push(document.tool.clone());
+                request.tools_mut().push(document.tool.clone());
             }
         }
-        Ok(pi_rs_core::ContextChange::Changed)
+        Ok(if request.tools == original_tools {
+            pi_rs_core::ContextChange::Unchanged
+        } else {
+            pi_rs_core::ContextChange::Changed
+        })
     }
     fn after_tool(
         &self,

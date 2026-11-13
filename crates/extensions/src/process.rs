@@ -144,6 +144,10 @@ enum ProtocolRequest {
         request: ModelRequest,
         state: Option<ExtensionState>,
     },
+    ContextV2 {
+        request: ModelRequest,
+        state: Option<ExtensionState>,
+    },
     Input {
         event: InputEvent,
         state: Option<ExtensionState>,
@@ -182,6 +186,15 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
     },
     ContextWithSystem {
+        messages: Vec<Message>,
+        state: Option<ExtensionState>,
+    },
+    BeforeRequestV2 {
+        request: ModelRequest,
+        summary: bool,
+        state: Option<ExtensionState>,
+    },
+    ContextWithSystemV2 {
         messages: Vec<Message>,
         state: Option<ExtensionState>,
     },
@@ -311,7 +324,41 @@ struct Description {
     resource_discovery_hook: bool,
     #[serde(default)]
     context_with_system_hook: bool,
+    #[serde(default)]
+    context_provenance_v1: bool,
 }
+#[derive(Serialize)]
+#[serde(tag = "change", rename_all = "snake_case")]
+enum ContextResponse<T> {
+    Unchanged,
+    Changed { value: T },
+}
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for ContextResponse<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let mut object = value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| serde::de::Error::custom("invalid context response"))?;
+        match object
+            .remove("change")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .as_deref()
+        {
+            Some("unchanged") if object.is_empty() => Ok(Self::Unchanged),
+            Some("changed") if object.len() == 1 && object.contains_key("value") => {
+                let payload = object.remove("value").expect("checked value");
+                serde_json::from_value(payload)
+                    .map(|value| Self::Changed { value })
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Err(serde::de::Error::custom("invalid context response")),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
     spec: ToolSpec,
@@ -684,41 +731,65 @@ impl Extension for ExecutableExtension {
     }
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
-        let mut updated = self.request(ProtocolRequest::Context {
-            request: extension_context(request),
-            state: state.cloned(),
-        })?;
+        let mut updated = if self.description.context_provenance_v1 {
+            match self.request(ProtocolRequest::ContextV2 {
+                request: extension_context(request),
+                state: state.cloned(),
+            })? {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            self.request(ProtocolRequest::Context {
+                request: extension_context(request),
+                state: state.cloned(),
+            })?
+        };
         restore_legacy_tool_metadata(
             request,
             &mut updated,
             !self.description.tool_message_error,
             !self.description.tool_message_provenance_v2,
         );
-        *request = updated;
+        **request = updated;
         Ok(pi_rs_core::ContextChange::Changed)
     }
     async fn before_request(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         purpose: RequestPurpose,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
-        let message = ProtocolRequest::BeforeRequest {
-            request: extension_context(request),
-            summary: purpose == RequestPurpose::Summary,
-            state: state.cloned(),
+        let mut updated = if self.description.context_provenance_v1 {
+            match self
+                .request_async(ProtocolRequest::BeforeRequestV2 {
+                    request: extension_context(request),
+                    summary: purpose == RequestPurpose::Summary,
+                    state: state.cloned(),
+                })
+                .await?
+            {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            self.request_async(ProtocolRequest::BeforeRequest {
+                request: extension_context(request),
+                summary: purpose == RequestPurpose::Summary,
+                state: state.cloned(),
+            })
+            .await?
         };
-        let mut updated = self.request_async(message).await?;
         restore_legacy_tool_metadata(
             request,
             &mut updated,
             !self.description.tool_message_error,
             !self.description.tool_message_provenance_v2,
         );
-        *request = updated;
+        **request = updated;
         Ok(pi_rs_core::ContextChange::Changed)
     }
     fn handles_context_with_system(&self) -> bool {
@@ -726,7 +797,7 @@ impl Extension for ExecutableExtension {
     }
     async fn context_with_system(
         &self,
-        messages: &mut Vec<Message>,
+        messages: &mut pi_rs_core::ContextMessages<'_>,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let original = ModelRequest {
@@ -735,12 +806,24 @@ impl Extension for ExecutableExtension {
             tools: Vec::new(),
             max_output_tokens: 0,
         };
-        let updated = self
-            .request_async(ProtocolRequest::ContextWithSystem {
+        let updated = if self.description.context_provenance_v1 {
+            match self
+                .request_async(ProtocolRequest::ContextWithSystemV2 {
+                    messages: extension_context(&original).messages,
+                    state: state.cloned(),
+                })
+                .await?
+            {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            self.request_async(ProtocolRequest::ContextWithSystem {
                 messages: extension_context(&original).messages,
                 state: state.cloned(),
             })
-            .await?;
+            .await?
+        };
         let mut updated = ModelRequest {
             messages: updated,
             ..original.clone()
@@ -751,7 +834,7 @@ impl Extension for ExecutableExtension {
             !self.description.tool_message_error,
             !self.description.tool_message_provenance_v2,
         );
-        *messages = updated.messages;
+        **messages = updated.messages;
         Ok(pi_rs_core::ContextChange::Changed)
     }
     fn command(
@@ -1840,6 +1923,7 @@ async fn dispatch_with_host(
             session_transition_hook: extension.handles_session_transitions(),
             resource_discovery_hook: extension.handles_resource_discovery(),
             context_with_system_hook: extension.handles_context_with_system(),
+            context_provenance_v1: true,
             tools: extension
                 .tools()
                 .into_iter()
@@ -1862,8 +1946,23 @@ async fn dispatch_with_host(
             encode(tool.prepare_arguments(arguments).await)
         }
         ProtocolRequest::Context { mut request, state } => {
-            extension.context(&mut request, state.as_ref())?;
+            extension.context(
+                &mut pi_rs_core::ContextRequest::new(&mut request),
+                state.as_ref(),
+            )?;
             encode(Ok(request))
+        }
+        ProtocolRequest::ContextV2 { mut request, state } => {
+            let original = request.clone();
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            extension.context(&mut guarded, state.as_ref())?;
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && request == original {
+                ContextResponse::Unchanged
+            } else {
+                ContextResponse::Changed { value: request }
+            }))
         }
         ProtocolRequest::Input { event, state } => {
             encode(extension.input(&event, state.as_ref()).await)
@@ -1906,7 +2005,11 @@ async fn dispatch_with_host(
                 RequestPurpose::Turn
             };
             extension
-                .before_request(&mut request, purpose, state.as_ref())
+                .before_request(
+                    &mut pi_rs_core::ContextRequest::new(&mut request),
+                    purpose,
+                    state.as_ref(),
+                )
                 .await?;
             encode(Ok(request))
         }
@@ -1915,9 +2018,52 @@ async fn dispatch_with_host(
             state,
         } => {
             extension
-                .context_with_system(&mut messages, state.as_ref())
+                .context_with_system(
+                    &mut pi_rs_core::ContextMessages::new(&mut messages),
+                    state.as_ref(),
+                )
                 .await?;
             encode(Ok(messages))
+        }
+        ProtocolRequest::BeforeRequestV2 {
+            mut request,
+            summary,
+            state,
+        } => {
+            let purpose = if summary {
+                RequestPurpose::Summary
+            } else {
+                RequestPurpose::Turn
+            };
+            let original = request.clone();
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            extension
+                .before_request(&mut guarded, purpose, state.as_ref())
+                .await?;
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && request == original {
+                ContextResponse::Unchanged
+            } else {
+                ContextResponse::Changed { value: request }
+            }))
+        }
+        ProtocolRequest::ContextWithSystemV2 {
+            mut messages,
+            state,
+        } => {
+            let original = messages.clone();
+            let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
+            let access = guarded.access();
+            extension
+                .context_with_system(&mut guarded, state.as_ref())
+                .await?;
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && messages == original {
+                ContextResponse::Unchanged
+            } else {
+                ContextResponse::Changed { value: messages }
+            }))
         }
         ProtocolRequest::Command {
             name,
@@ -2455,6 +2601,154 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn versioned_protocol_uses_tracked_access_not_hook_claims() {
+        struct Hook(bool);
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "tracked-hook"
+            }
+            async fn before_request(
+                &self,
+                request: &mut pi_rs_core::ContextRequest<'_>,
+                _: RequestPurpose,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::ContextChange> {
+                if self.0 {
+                    let removed = request.messages.remove(0);
+                    request.messages.insert(0, removed);
+                    Ok(pi_rs_core::ContextChange::Unchanged)
+                } else {
+                    request.tools_mut().clear();
+                    Ok(pi_rs_core::ContextChange::Changed)
+                }
+            }
+        }
+        for unsafe_access in [false, true] {
+            let extension: Arc<dyn Extension> = Arc::new(Hook(unsafe_access));
+            let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+                .await
+                .unwrap();
+            assert_eq!(description["context_provenance_v1"], true);
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 8,
+            };
+            let result = dispatch(
+                extension,
+                ProtocolRequest::BeforeRequestV2 {
+                    request,
+                    summary: false,
+                    state: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result["change"],
+                if unsafe_access {
+                    "changed"
+                } else {
+                    "unchanged"
+                }
+            );
+            assert_eq!(result.get("value").is_some(), unsafe_access);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_context_provenance_negotiates_unchanged_and_rejects_extra_payload() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    v={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'context_provenance_v1':name!='legacy'}
+else:
+    x=r.get('request',r.get('messages'))
+    messages=x['messages'] if isinstance(x,dict) else x
+    assert all('replay' not in m for m in messages)
+    if name=='legacy': v=x
+    elif name=='invalid': v={'change':'unchanged','value':x}
+    elif name=='changed': v={'change':'changed','value':x}
+    else: v={'change':'unchanged'}
+print(json.dumps({'version':1,'response':{'Ok':v}}))
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["legacy", "unchanged", "changed", "invalid"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let extension = ExecutableExtension::load(&path).unwrap();
+            let mut request = ModelRequest {
+                model: "m".into(),
+                messages: vec![Message::Assistant {
+                    content: "visible".into(),
+                    calls: vec![],
+                    replay: Some(Box::new(pi_rs_core::ProviderReplay {
+                        identity: pi_rs_core::ResolvedModelIdentity {
+                            provider: "p".into(),
+                            model: "m".into(),
+                        },
+                        blocks: vec![serde_json::json!({"private":"secret"})],
+                    })),
+                }],
+                tools: vec![],
+                max_output_tokens: 8,
+            };
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            let result = extension
+                .before_request(&mut guarded, RequestPurpose::Turn, None)
+                .await;
+            if name == "invalid" {
+                assert!(result.is_err());
+                continue;
+            }
+            assert!(result.is_ok());
+            assert_eq!(access.assistant_accessed(), name != "unchanged");
+            assert_eq!(
+                matches!(
+                    &request.messages[0],
+                    Message::Assistant {
+                        replay: Some(_),
+                        ..
+                    }
+                ),
+                name == "unchanged"
+            );
+            let mut sync_request = ModelRequest {
+                model: "m".into(),
+                messages: vec![Message::User {
+                    content: "visible".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 8,
+            };
+            let mut sync_guard = pi_rs_core::ContextRequest::new(&mut sync_request);
+            let sync_access = sync_guard.access();
+            extension.context(&mut sync_guard, None).unwrap();
+            assert_eq!(sync_access.assistant_accessed(), name != "unchanged");
+            let mut messages = vec![Message::User {
+                content: "visible".into(),
+            }];
+            let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
+            let access = guarded.access();
+            extension
+                .context_with_system(&mut guarded, None)
+                .await
+                .unwrap();
+            assert_eq!(access.assistant_accessed(), name != "unchanged");
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn legacy_context_hooks_distinguish_unchanged_and_rewritten_provenance() {
@@ -2546,17 +2840,23 @@ print(json.dumps({'version':1,'response':{'Ok':value}}))
                 }
             };
             let mut request = original.clone();
-            extension.context(&mut request, None).unwrap();
+            extension
+                .context(&mut pi_rs_core::ContextRequest::new(&mut request), None)
+                .unwrap();
             check(&request.messages);
             let mut request = original.clone();
             extension
-                .before_request(&mut request, RequestPurpose::Turn, None)
+                .before_request(
+                    &mut pi_rs_core::ContextRequest::new(&mut request),
+                    RequestPurpose::Turn,
+                    None,
+                )
                 .await
                 .unwrap();
             check(&request.messages);
             let mut messages = original.messages;
             extension
-                .context_with_system(&mut messages, None)
+                .context_with_system(&mut pi_rs_core::ContextMessages::new(&mut messages), None)
                 .await
                 .unwrap();
             check(&messages);
@@ -3126,7 +3426,7 @@ print(json.dumps({'version':1,'response':{'Ok':value}}))
             }
             async fn context_with_system(
                 &self,
-                messages: &mut Vec<Message>,
+                messages: &mut pi_rs_core::ContextMessages<'_>,
                 state: Option<&ExtensionState>,
             ) -> ExtensionResult<pi_rs_core::ContextChange> {
                 assert_eq!(state.unwrap().data["value"], "saved");

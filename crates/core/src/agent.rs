@@ -35,6 +35,20 @@ fn portable_request(request: &ModelRequest) -> ModelRequest {
     portable
 }
 
+// Only used when the host-controlled wrapper never exposed mutable assistant
+// messages or the message container to the hook.
+fn retain_replay_after_safe_hook(original: &ModelRequest, updated: &mut ModelRequest) {
+    for (before, after) in original.messages.iter().zip(&mut updated.messages) {
+        if let (
+            Message::Assistant { replay: source, .. },
+            Message::Assistant { replay: target, .. },
+        ) = (before, after)
+        {
+            *target = source.clone();
+        }
+    }
+}
+
 /// Shared switch checked before each automatic context compaction.
 #[derive(Clone, Debug)]
 pub struct AutoCompactionControl {
@@ -973,22 +987,22 @@ impl Agent<'_> {
         let original = request.clone();
         for extension in &self.registry.extensions {
             let mut portable = portable_request(&request);
+            let mut guarded = crate::ContextRequest::new(&mut portable);
+            let access = guarded.access();
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.before_request(&mut portable, purpose, states.get(extension.id()))) =>
+                result = tokio::time::timeout(self.limits.model_timeout, extension.before_request(&mut guarded, purpose, states.get(extension.id()))) =>
                     result.map_err(|_| Error::Config("request context hook timed out".into()))?,
             };
-            match hook(extension.as_ref(), result)? {
-                crate::ContextChange::Unchanged => {
-                    if portable != portable_request(&request) {
-                        return Err(Error::Config(
-                            "request hook reported unchanged but modified its input".into(),
-                        ));
-                    }
-                }
-                crate::ContextChange::Changed => request = portable_request(&portable),
+            let unsafe_access = access.assistant_accessed();
+            hook(extension.as_ref(), result)?;
+            if !unsafe_access {
+                retain_replay_after_safe_hook(&request, &mut portable);
+            } else {
+                portable = portable_request(&portable);
             }
+            request = portable;
         }
         for extension in &self.registry.extensions {
             if !extension.handles_context_with_system() {
@@ -997,22 +1011,22 @@ impl Agent<'_> {
             let had_leading_system =
                 matches!(request.messages.first(), Some(Message::System { .. }));
             let mut portable = portable_request(&request);
+            let mut guarded = crate::ContextMessages::new(&mut portable.messages);
+            let access = guarded.access();
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.context_with_system(&mut portable.messages, states.get(extension.id()))) =>
+                result = tokio::time::timeout(self.limits.model_timeout, extension.context_with_system(&mut guarded, states.get(extension.id()))) =>
                     result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
             };
-            match hook(extension.as_ref(), result)? {
-                crate::ContextChange::Unchanged => {
-                    if portable != portable_request(&request) {
-                        return Err(Error::Config(
-                            "context hook reported unchanged but modified its input".into(),
-                        ));
-                    }
-                }
-                crate::ContextChange::Changed => request = portable_request(&portable),
+            let unsafe_access = access.assistant_accessed();
+            hook(extension.as_ref(), result)?;
+            if !unsafe_access {
+                retain_replay_after_safe_hook(&request, &mut portable);
+            } else {
+                portable = portable_request(&portable);
             }
+            request = portable;
             if had_leading_system
                 && !matches!(request.messages.first(), Some(Message::System { .. }))
             {
@@ -4168,14 +4182,14 @@ mod request_privacy_tests {
         }
         async fn before_request(
             &self,
-            request: &mut ModelRequest,
+            request: &mut crate::ContextRequest<'_>,
             _: RequestPurpose,
             _: Option<&ExtensionState>,
         ) -> ExtensionResult<crate::ContextChange> {
             self.seen
                 .lock()
                 .unwrap()
-                .push(serde_json::to_string(&*request).unwrap());
+                .push(serde_json::to_string(&**request).unwrap());
             if self.rewrite_before
                 && let Some(Message::Assistant { content, .. }) = request
                     .messages
@@ -4195,13 +4209,13 @@ mod request_privacy_tests {
         }
         async fn context_with_system(
             &self,
-            messages: &mut Vec<Message>,
+            messages: &mut crate::ContextMessages<'_>,
             _: Option<&ExtensionState>,
         ) -> ExtensionResult<crate::ContextChange> {
             self.seen
                 .lock()
                 .unwrap()
-                .push(serde_json::to_string(messages).unwrap());
+                .push(serde_json::to_string(&**messages).unwrap());
             if self.rewrite_after
                 && let Some(Message::Assistant { content, .. }) = messages
                     .iter_mut()
@@ -4229,6 +4243,30 @@ mod request_privacy_tests {
             )])))
         }
     }
+    #[test]
+    fn mutation_tracker_survives_replacing_hook_wrapper() {
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let mut guarded = crate::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        guarded.messages.push(Message::User {
+            content: "changed".into(),
+        });
+        let alternate = Box::leak(Box::new(ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        }));
+        guarded = crate::ContextRequest::new(alternate);
+        assert!(!guarded.access().assistant_accessed());
+        assert!(access.assistant_accessed());
+    }
+
     struct DefaultNoop;
     #[async_trait::async_trait]
     impl Extension for DefaultNoop {
@@ -4250,6 +4288,7 @@ mod request_privacy_tests {
 
     struct ReplaceIdentical {
         after: bool,
+        lie: bool,
     }
     #[async_trait::async_trait]
     impl Extension for ReplaceIdentical {
@@ -4258,7 +4297,7 @@ mod request_privacy_tests {
         }
         async fn before_request(
             &self,
-            request: &mut ModelRequest,
+            request: &mut crate::ContextRequest<'_>,
             _: RequestPurpose,
             _: Option<&ExtensionState>,
         ) -> ExtensionResult<crate::ContextChange> {
@@ -4281,14 +4320,18 @@ mod request_privacy_tests {
                     replay: None,
                 },
             );
-            Ok(crate::ContextChange::Changed)
+            Ok(if self.lie {
+                crate::ContextChange::Unchanged
+            } else {
+                crate::ContextChange::Changed
+            })
         }
         fn handles_context_with_system(&self) -> bool {
             self.after
         }
         async fn context_with_system(
             &self,
-            messages: &mut Vec<Message>,
+            messages: &mut crate::ContextMessages<'_>,
             _: Option<&ExtensionState>,
         ) -> ExtensionResult<crate::ContextChange> {
             let index = messages
@@ -4306,6 +4349,53 @@ mod request_privacy_tests {
                     replay: None,
                 },
             );
+            Ok(if self.lie {
+                crate::ContextChange::Unchanged
+            } else {
+                crate::ContextChange::Changed
+            })
+        }
+    }
+
+    struct SafeEdits;
+    #[async_trait::async_trait]
+    impl Extension for SafeEdits {
+        fn id(&self) -> &str {
+            "safe-edits"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            request.tools_mut().clear();
+            request
+                .system_content_mut()
+                .unwrap()
+                .push_str(" safely modified");
+            Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    struct SafeSystemHook;
+    #[async_trait::async_trait]
+    impl Extension for SafeSystemHook {
+        fn id(&self) -> &str {
+            "safe-system"
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            messages
+                .system_content_mut()
+                .unwrap()
+                .push_str(" safe system edit");
             Ok(crate::ContextChange::Changed)
         }
     }
@@ -4313,7 +4403,7 @@ mod request_privacy_tests {
     #[tokio::test]
     async fn explicit_hook_status_preserves_default_noop_and_rejects_identical_replacement() {
         for text in ["same visible text", ""] {
-            for mode in [0, 1, 2, 3] {
+            for mode in [0, 1, 2, 3, 4, 5, 6, 7] {
                 let mut session = Session::with_store(MemoryStore::default()).unwrap();
                 session
                     .append(Event::User {
@@ -4356,9 +4446,16 @@ mod request_privacy_tests {
                     registry.register(Arc::new(DefaultNoop)).unwrap();
                 } else if mode == 3 {
                     registry.register(Arc::new(SystemNoop)).unwrap();
+                } else if mode == 6 {
+                    registry.register(Arc::new(SafeEdits)).unwrap();
+                } else if mode == 7 {
+                    registry.register(Arc::new(SafeSystemHook)).unwrap();
                 } else {
                     registry
-                        .register(Arc::new(ReplaceIdentical { after: mode == 2 }))
+                        .register(Arc::new(ReplaceIdentical {
+                            after: mode == 2 || mode == 5,
+                            lie: mode >= 4,
+                        }))
                         .unwrap();
                 }
                 let captured = Arc::new(Mutex::new(Vec::new()));
@@ -4391,8 +4488,8 @@ mod request_privacy_tests {
                     })
                     .collect();
                 assert_eq!(replay.len(), 2);
-                if mode == 0 || mode == 3 {
-                    assert!(!transformed);
+                if mode == 0 || mode == 3 || mode == 6 || mode == 7 {
+                    assert_eq!(transformed, mode == 6 || mode == 7);
                     assert_eq!(replay[0].unwrap().blocks[0]["private"], "private-a");
                     assert_eq!(replay[1].unwrap().blocks[0]["private"], "private-b");
                 } else {

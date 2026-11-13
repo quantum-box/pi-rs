@@ -1,12 +1,14 @@
 //! A bounded QuickJS runner that reaches external effects only through ToolHost.
+#[cfg(test)]
+use pi_rs_core::ModelRequest;
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use pi_rs_core::{
-    Extension, ExtensionResult, ExtensionState, ModelRequest, Outcome, RequestPurpose, Tool,
-    ToolContext, ToolHost, ToolReply, ToolSpec,
+    Extension, ExtensionResult, ExtensionState, Outcome, RequestPurpose, Tool, ToolContext,
+    ToolHost, ToolReply, ToolSpec,
 };
 use rquickjs::{
     AsyncContext, AsyncRuntime, Promise,
@@ -61,10 +63,11 @@ impl Extension for Codemode {
     }
     async fn before_request(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         _: RequestPurpose,
         _: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        let original_tools = request.tools.clone();
         let mut declarations = String::new();
         for tool in request.tools.iter().filter(|tool| {
             !matches!(
@@ -80,7 +83,7 @@ impl Extension for Codemode {
             declarations.push('\n');
         }
         if let Some(tool) = request
-            .tools
+            .tools_mut()
             .iter_mut()
             .find(|tool| tool.name == "codemode")
         {
@@ -89,11 +92,15 @@ impl Extension for Codemode {
             tool.description.push_str(&declarations);
             if self.only {
                 request
-                    .tools
+                    .tools_mut()
                     .retain(|tool| matches!(tool.name.as_str(), "codemode" | "tool_search"));
             }
         }
-        Ok(pi_rs_core::ContextChange::Changed)
+        Ok(if request.tools == original_tools {
+            pi_rs_core::ContextChange::Unchanged
+        } else {
+            pi_rs_core::ContextChange::Changed
+        })
     }
 }
 struct ScriptTool {

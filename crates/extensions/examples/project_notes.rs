@@ -1,6 +1,6 @@
 //! Build with `cargo build -p pi-rs-extensions --example project_notes`.
 //! Load with `pi --extension target/debug/examples/project_notes`.
-use pi_rs_core::{Extension, ExtensionResult, ExtensionState, ModelRequest, Result};
+use pi_rs_core::{Extension, ExtensionResult, ExtensionState, Result};
 use pi_rs_extensions::{Notes, serve_extension};
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ impl Extension for ProjectNotes {
     }
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
         Notes.context(request, state)
