@@ -733,7 +733,10 @@ in block order to the original provider, API and model after tool-pair repair.
 Provider replay stays private to the adapter. Edited Anthropic, Google and OpenAI Responses thinking requires the recorded
 endpoint binding; chat-completions replay is also bound to the configured
 provider. Older and imported histories without that binding omit edited thinking
-rather than send it to an unverified destination. Google text and tool-call signatures remain attached to their blocks.
+rather than send it to an unverified destination. Legacy unedited chat-completions
+replay without a provider binding stops with an explanatory error; editing or
+removing the affected assistant context or starting a new session clears the
+ambiguity. Google text and tool-call signatures remain attached to their blocks.
 
 ### Multimodal input checkpoint
 

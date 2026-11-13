@@ -336,7 +336,12 @@ impl Ollama {
             } else {
                 let ordinary: Vec<_> = edited_reasoning
                     .iter()
-                    .filter(|b| b["details"].as_array().is_none())
+                    .filter(|b| {
+                        !self.compatibility.preserves_reasoning_details()
+                            || !b["details"]
+                                .as_array()
+                                .is_some_and(|items| items.iter().any(reasoning_details::is_valid))
+                    })
                     .collect();
                 let text = ordinary
                     .iter()
@@ -710,6 +715,9 @@ impl Model for Ollama {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        if request.messages.iter().any(|message| matches!(message, Message::Assistant { replay: Some(replay), .. } if replay.identity.provider.starts_with("chat-completions+sha256:"))) {
+            return Err(Error::Model("Legacy chat-completions reasoning replay has no provider identity. Edit or remove the affected assistant context, or start a new session, before continuing.".into()));
+        }
         let requested_model = request.model.clone();
         let identity = self.replay_identity(&requested_model);
         let infer_finish = self.compatibility.supports_finish_reason == Some(false);
@@ -1218,6 +1226,71 @@ mod content_tests {
                 .as_deref(),
             Some("high")
         );
+    }
+
+    #[test]
+    fn edited_reasoning_falls_back_when_details_are_unusable() {
+        for (config, detail) in [
+            (json!({}), json!({"type":"reasoning.text","text":"valid"})),
+            (
+                json!({"thinkingFormat":"openrouter"}),
+                json!({"type":"reasoning.text","text":7}),
+            ),
+        ] {
+            let model = Ollama::new("https://gateway.example", None)
+                .unwrap()
+                .with_chat_compatibility(
+                    serde_json::from_value(config).unwrap(),
+                    Some(true),
+                    true,
+                    true,
+                );
+            let message = Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: model.replay_identity("m"),
+                    blocks: vec![
+                        json!({"type":"context_edit_reasoning","text":"preserved","details":[detail],"field":null}),
+                        json!({"_pi_context_edit_api":"openai-completions"}),
+                    ],
+                })),
+            };
+            let encoded = model.compatible_message(message, &model.replay_identity("m"));
+            assert_eq!(encoded[0]["reasoning_content"], "preserved");
+            assert!(encoded[0].get("reasoning_details").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_unbound_replay_reports_incompatibility_without_request() {
+        let message = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "chat-completions+sha256:old".into(),
+                    model: "m".into(),
+                },
+                blocks: vec![json!({"type":"reasoning_content","text":"secret"})],
+            })),
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![message],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        for provider in ["one", "two"] {
+            let model = Ollama::new("https://gateway.example", None)
+                .unwrap()
+                .with_provider(provider);
+            let error = match model.stream(request.clone()).await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("legacy replay must be rejected"),
+            };
+            assert!(error.contains("no provider identity"));
+        }
     }
 
     #[test]

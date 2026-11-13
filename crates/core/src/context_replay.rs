@@ -53,11 +53,7 @@ pub(crate) fn replacement_replay(
             }
             (ModelApi::PiMessages, _) => serde_json::to_value(block).ok(),
             (ModelApi::AnthropicMessages, ContentBlock::Text { text, .. }) => {
-                if text.trim().is_empty() {
-                    Some(json!({"type":"text","text":text,"_pi_omitted_text":true}))
-                } else {
-                    Some(json!({"type":"text","text":text}))
-                }
+                (!text.is_empty()).then(|| json!({"type":"text","text":text}))
             }
             (
                 ModelApi::AnthropicMessages,
@@ -197,7 +193,20 @@ pub(crate) fn replacement_replay(
             _ => None,
         };
         if let Some(value) = value {
-            result.push(value);
+            if api == ModelApi::AnthropicMessages
+                && value["type"] == "text"
+                && value.get("_pi_thinking").is_none()
+                && let Some(previous) = result.last_mut()
+                && previous["type"] == "text"
+                && previous.get("_pi_thinking").is_none()
+                && let (Some(before), Some(after)) =
+                    (previous["text"].as_str(), value["text"].as_str())
+                && (before.trim().is_empty() || after.trim().is_empty())
+            {
+                previous["text"] = json!(format!("{before}{after}"));
+            } else {
+                result.push(value);
+            }
         }
     }
     // The chat-completions adapter constructs visible text and calls itself.
@@ -443,8 +452,8 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_replacement_drops_empty_and_whitespace_text() {
-        let replacement: ContextContent = serde_json::from_value(json!([{"type":"text","text":""},{"type":"text","text":"  "},{"type":"text","text":"answer"}])).unwrap();
+    fn anthropic_replacement_merges_whitespace_and_skips_empty() {
+        let replacement: ContextContent = serde_json::from_value(json!([{"type":"text","text":""},{"type":"text","text":"first"},{"type":"text","text":" \n"},{"type":"text","text":"second"}])).unwrap();
         let metadata = ModelMetadata {
             provider_api: Some(ModelApi::AnthropicMessages),
             replay_identity: Some(ResolvedModelIdentity {
@@ -454,9 +463,8 @@ mod tests {
             ..Default::default()
         };
         let replay = replacement_replay(&replacement, &metadata, &[]).unwrap();
-        assert_eq!(replay.blocks[0]["_pi_omitted_text"], true);
-        assert_eq!(replay.blocks[1]["_pi_omitted_text"], true);
-        assert_eq!(replay.blocks[2], json!({"type":"text","text":"answer"}));
+        assert_eq!(replay.blocks[0], json!({"type":"text","text":"first \n"}));
+        assert_eq!(replay.blocks[1], json!({"type":"text","text":"second"}));
     }
 
     #[test]

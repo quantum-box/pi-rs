@@ -1268,12 +1268,12 @@ mod tests {
     }
 
     #[test]
-    fn edited_replay_skips_empty_text_without_losing_thinking() {
+    fn edited_replay_preserves_whitespace_and_thinking() {
         let scope = pi_rs_core::endpoint_replay_scope("anthropic", "https://one.example/messages");
         let request = ModelRequest {
             model: "m".into(),
             messages: vec![Message::Assistant {
-                content: "  answer".into(),
+                content: "first \nsecond".into(),
                 calls: vec![],
                 replay: Some(Box::new(ProviderReplay {
                     identity: ResolvedModelIdentity {
@@ -1281,9 +1281,9 @@ mod tests {
                         model: "m".into(),
                     },
                     blocks: vec![
-                        json!({"type":"text","text":"  ","_pi_omitted_text":true}),
+                        json!({"type":"text","text":"first \n"}),
+                        json!({"type":"text","text":"second"}),
                         json!({"type":"thinking","thinking":"secret","signature":"sig"}),
-                        json!({"type":"text","text":"answer"}),
                         json!({"_pi_context_edit_api":"anthropic-messages"}),
                     ],
                 })),
@@ -1294,7 +1294,7 @@ mod tests {
         let body = encode_request(request, "anthropic", &scope, false).unwrap();
         assert_eq!(
             body["messages"][0]["content"],
-            json!([{"type":"thinking","thinking":"secret","signature":"sig"},{"type":"text","text":"answer"}])
+            json!([{"type":"text","text":"first \n"},{"type":"text","text":"second"},{"type":"thinking","thinking":"secret","signature":"sig"}])
         );
     }
 
