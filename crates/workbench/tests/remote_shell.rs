@@ -49,14 +49,14 @@ async fn remote_environment_is_opt_in_and_hook_can_supply_variables() {
         Ok(context)
     });
     let tool = create_bash_tool(
-        Path::new("/remote"),
+        std::env::temp_dir().as_path(),
         ShellConfig::default().with_spawn_hook(hook),
         capture.clone(),
     )
     .unwrap();
     tool.invoke(json!({"command":"test"}), context()).await;
     let tool = create_bash_tool(
-        Path::new("/remote"),
+        std::env::temp_dir().as_path(),
         ShellConfig::default().with_remote_environment(true),
         capture.clone(),
     )
@@ -107,16 +107,20 @@ impl BashOperations for Lines {
 async fn paired_remote_read_can_page_only_its_shell_transcripts() {
     let store = ShellOutputStore::default();
     let bash = create_bash_tool_with_shell_outputs(
-        Path::new("/remote"),
+        std::env::temp_dir().as_path(),
         ShellConfig::default(),
         Arc::new(Lines),
         store.clone(),
     )
     .unwrap();
-    let read = create_read_tool_with_shell_outputs(Path::new("/remote"), Arc::new(DenyRead), store)
-        .unwrap();
+    let read = create_read_tool_with_shell_outputs(
+        std::env::temp_dir().as_path(),
+        Arc::new(DenyRead),
+        store,
+    )
+    .unwrap();
     let unrelated = create_read_tool_with_shell_outputs(
-        Path::new("/remote"),
+        std::env::temp_dir().as_path(),
         Arc::new(DenyRead),
         ShellOutputStore::default(),
     )
@@ -351,7 +355,12 @@ async fn remote_shell_cancellation_timeout_exit_and_truncation() {
             .with_bash_operations(remote.clone())
             .is_err()
     );
-    let tool = create_bash_tool(Path::new("/remote"), ShellConfig::default(), remote).unwrap();
+    let tool = create_bash_tool(
+        std::env::temp_dir().as_path(),
+        ShellConfig::default(),
+        remote,
+    )
+    .unwrap();
     let context = || ToolContext {
         operation_id: uuid::Uuid::new_v4(),
         cancellation: CancellationToken::new(),
