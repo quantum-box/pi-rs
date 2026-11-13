@@ -1,5 +1,3 @@
-[workspace]
-
 [package]
 name = "pi-rs-remote-grep"
 version = "0.1.0"
