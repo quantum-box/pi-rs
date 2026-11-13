@@ -2229,3 +2229,104 @@ fn sigint_restores_terminal_before_waiting_for_refresh_barrier() {
     let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(auth).unwrap()).unwrap();
     assert_eq!(stored["kimi-coding"]["refresh"], "rotated");
 }
+
+#[test]
+fn bedrock_login_selects_profile_chain_and_logout() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/login amazon-bedrock\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Existing AWS credential chain")
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| text.contains("amazon-bedrock API key"));
+    master.write_all(b"fixture-bearer\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("API key saved for amazon-bedrock")
+    });
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["amazon-bedrock"]["key"], "fixture-bearer");
+    master.write_all(b"/login amazon-bedrock\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Existing AWS credential chain")
+    });
+    master.write_all(b"\x1b[B\r").unwrap();
+    output_until(&mut master, |text| text.contains("Enter AWS profile name"));
+    master.write_all(b"my-profile\r").unwrap();
+    output_until(&mut master, |text| text.contains("AWS profile saved"));
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["amazon-bedrock"]["env"]["AWS_PROFILE"], "my-profile");
+    master.write_all(b"/login amazon-bedrock\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Existing AWS credential chain")
+    });
+    master.write_all(b"\x1b[B\x1b[B\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Configure AWS credentials")
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Using existing AWS credential chain")
+    });
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(
+        auth["amazon-bedrock"],
+        serde_json::json!({"type":"api_key"})
+    );
+    master.write_all(b"/logout amazon-bedrock\r").unwrap();
+    output_until(&mut master, |text| text.contains("Removed saved API key"));
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
+    assert!(auth.get("amazon-bedrock").is_none());
+}

@@ -66,6 +66,11 @@ Use `pi login openai-chatgpt --new-account` to add another account or workspace,
 `pi login openai-chatgpt --account <client-id>` to select one. The terminal's
 `/login` menu also offers saved accounts and a new-account option.
 
+For Amazon Bedrock, use `/login amazon-bedrock` in the terminal to choose a
+bearer token, a named AWS profile, or the existing AWS credential chain. The
+choice is saved in Pi's `auth.json`; `/logout amazon-bedrock` removes it. Named
+profiles are resolved by the AWS SDK without changing the process environment.
+
 To use a Kimi Code subscription, run `pi login kimi-coding` and complete the
 device authorization, then select `--provider kimi-coding`. In the terminal,
 `/login kimi-coding` and `/logout kimi-coding` sign in and out. Tokens are

@@ -26,6 +26,7 @@ pub struct Bedrock {
     client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
     unsupported: Option<String>,
     bearer: Option<String>,
+    profile: Option<String>,
     model_name: Option<(String, String)>,
     known_config: Option<std::sync::Arc<tokio::sync::OnceCell<aws_types::SdkConfig>>>,
     prepared_identity: Option<String>,
@@ -48,6 +49,7 @@ impl Bedrock {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             unsupported: None,
             bearer: None,
+            profile: None,
             model_name: None,
             known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new())),
             prepared_identity: None,
@@ -70,6 +72,7 @@ impl Bedrock {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
             unsupported: None,
             bearer: None,
+            profile: None,
             model_name: None,
             known_config: None,
             prepared_identity: None,
@@ -94,6 +97,7 @@ impl Bedrock {
             )))),
             unsupported: None,
             bearer: None,
+            profile: None,
             model_name: None,
             known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
                 config,
@@ -126,6 +130,28 @@ impl Bedrock {
         self.prepared_identity = None;
         Ok(self)
     }
+    /// Rebuild from the standard SDK configuration using a named profile, without
+    /// modifying the process environment. This replaces any caller-supplied client.
+    pub fn with_profile(mut self, profile: String) -> Self {
+        self.profile = Some(profile);
+        self.client = std::sync::Arc::new(tokio::sync::OnceCell::new());
+        self.known_config = Some(std::sync::Arc::new(tokio::sync::OnceCell::new()));
+        self.prepared_identity = None;
+        self
+    }
+
+    async fn load_config(&self) -> aws_types::SdkConfig {
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(profile) = &self.profile {
+            let credentials = aws_config::profile::ProfileFileCredentialsProvider::builder()
+                .profile_name(profile)
+                .build();
+            loader = loader
+                .profile_name(profile)
+                .credentials_provider(credentials);
+        }
+        loader.load().await
+    }
     /// Bind a configured model name to its ID for model-specific Converse behavior.
     pub fn with_model_name(mut self, model: &str, name: Option<&str>) -> Self {
         self.model_name = name.map(|name| (model.to_owned(), name.to_owned()));
@@ -148,9 +174,7 @@ impl Bedrock {
             return Ok(None);
         };
         let config = config
-            .get_or_init(|| async {
-                aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
-            })
+            .get_or_init(|| async { self.load_config().await })
             .await;
         // A caller-supplied HTTP transport can reroute requests independently
         // of the SDK endpoint configuration.
@@ -969,10 +993,7 @@ impl Model for Bedrock {
                 {
                     let config = if let Some(known) = &self.known_config {
                         known
-                            .get_or_init(|| async {
-                                aws_config::load_defaults(aws_config::BehaviorVersion::latest())
-                                    .await
-                            })
+                            .get_or_init(|| async { self.load_config().await })
                             .await
                             .clone()
                     } else {
@@ -1140,6 +1161,60 @@ mod tests {
         );
         assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "answer"));
     }
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn selected_profile_wins_over_ambient_keys_without_mutating_environment() {
+        use aws_credential_types::provider::ProvideCredentials;
+        if std::env::var_os("PI_RS_PROFILE_TEST_CHILD").is_some() {
+            let before = std::env::var("AWS_PROFILE").unwrap();
+            let model = Bedrock::from_env().with_profile("selected".into());
+            let config = model.load_config().await;
+            let credentials = config
+                .credentials_provider()
+                .unwrap()
+                .provide_credentials()
+                .await
+                .unwrap();
+            assert_eq!(credentials.access_key_id(), "SELECTEDKEY");
+            assert_eq!(config.region().unwrap().as_ref(), "us-west-2");
+            assert_eq!(std::env::var("AWS_PROFILE").unwrap(), before);
+            assert_eq!(std::env::var("AWS_ACCESS_KEY_ID").unwrap(), "AMBIENTKEY");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join("credentials");
+        let config = dir.path().join("config");
+        std::fs::write(
+            &credentials,
+            "[selected]\naws_access_key_id=SELECTEDKEY\naws_secret_access_key=SELECTEDSECRET\n",
+        )
+        .unwrap();
+        std::fs::write(&config, "[profile selected]\nregion=us-west-2\n").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::selected_profile_wins_over_ambient_keys_without_mutating_environment",
+            ])
+            .env("PI_RS_PROFILE_TEST_CHILD", "1")
+            .env("AWS_PROFILE", "ambient")
+            .env("AWS_ACCESS_KEY_ID", "AMBIENTKEY")
+            .env("AWS_SECRET_ACCESS_KEY", "AMBIENTSECRET")
+            .env("AWS_SHARED_CREDENTIALS_FILE", credentials)
+            .env("AWS_CONFIG_FILE", config)
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env_remove("AWS_REGION")
+            .env_remove("AWS_DEFAULT_REGION")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn environment_auth_produces_a_prepared_identity() {
