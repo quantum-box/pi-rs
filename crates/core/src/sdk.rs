@@ -147,7 +147,11 @@ struct RunConfig {
     limits: Limits,
 }
 
+type PendingStart = Arc<Mutex<Option<(crate::SessionStartReason, Option<PathBuf>)>>>;
+
 struct SessionOwner {
+    pending_start: PendingStart,
+    closed: CancellationToken,
     journal: std::sync::Weak<tokio::sync::Mutex<Session>>,
     input: std::sync::Weak<tokio::sync::Mutex<mpsc::Receiver<crate::AgentInput>>>,
     config: Mutex<RunConfig>,
@@ -305,18 +309,19 @@ impl SessionControl {
             images,
         };
         message.validate()?;
-        let _order = self.input_order.acquire().await?;
+        let order = self.input_order.acquire().await?;
         if self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
         }
         let hooks = self.input_hooks.lock().expect("SDK input hooks").clone();
         if !hooks.extensions.is_empty() {
-            let streaming = self
-                .active
-                .lock()
-                .expect("session control")
+            let active_token = self.active.lock().expect("session control").clone();
+            let streaming = active_token
                 .as_ref()
                 .is_some_and(|token| !token.is_cancelled());
+            if !streaming {
+                return self.enqueue_idle(message, hooks, order).await;
+            }
             let event = crate::InputEvent {
                 text: message.input.content,
                 images: message.images,
@@ -326,6 +331,7 @@ impl SessionControl {
             let prepared = tokio::select! {
                 biased;
                 _ = self.input.closed() => return Err(Error::Config("session is closed".into())),
+                _ = active_token.as_ref().expect("active operation").cancelled() => return Err(Error::Cancelled),
                 result = async {
                     if streaming {
                         crate::extension::prepare_input_with_host(&hooks.extensions, event, &hooks.states, Arc::new(InputMessageHost { input: self.input.clone() })).await
@@ -347,6 +353,161 @@ impl SessionControl {
             .map_err(|_| Error::Config("session is closed".into()))?;
         Ok(id)
     }
+    async fn enqueue_idle(
+        &self,
+        mut message: QueuedMessage,
+        hooks: InputHooks,
+        order: InputPermit,
+    ) -> Result<Uuid> {
+        let id = message.input.id;
+        let closed = &self.owner.closed;
+        let journal_owner = self
+            .owner
+            .journal
+            .upgrade()
+            .ok_or_else(|| Error::Config("session is closed".into()))?;
+        let input_owner = self
+            .owner
+            .input
+            .upgrade()
+            .ok_or_else(|| Error::Config("session is closed".into()))?;
+        let mut journal = tokio::select! {
+            _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
+            journal = journal_owner.lock() => journal,
+        };
+        let mut inputs = tokio::select! {
+            _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
+            inputs = input_owner.lock() => inputs,
+        };
+        if closed.is_cancelled() {
+            return Err(Error::Config("session is closed".into()));
+        }
+        let token = CancellationToken::new();
+        *self.active.lock().expect("session control") = Some(token.clone());
+        let active = ActiveRun {
+            token,
+            state: self.active.clone(),
+        };
+        let events = self
+            .events
+            .upgrade()
+            .ok_or_else(|| Error::Config("session is closed".into()))?;
+        let mut observe = |event: Notification<'_>| {
+            self.observe(&event);
+            emit(&events, &event);
+        };
+        if let Some(record) = journal.recover_tree_trigger_handoff()?.cloned() {
+            observe(Notification::Committed(&record));
+            self.input_hooks.lock().expect("SDK input hooks").states = journal.extension_states();
+            if let Some((model, _)) = journal.model_selection() {
+                self.owner.config.lock().expect("run config").model_name = model;
+            }
+        }
+        let startup = self
+            .owner
+            .pending_start
+            .lock()
+            .expect("session startup")
+            .take();
+        if let Some((reason, previous_session_file)) = startup {
+            let config = self.owner.config.lock().expect("run config").clone();
+            let registry = config
+                .registry
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            if registry.has_session_lifecycle_hooks() {
+                tokio::select! {
+                    _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
+                    _ = active.token.cancelled() => return Err(Error::Cancelled),
+                    result = crate::lifecycle::notify_idle_with_host(&registry, &mut journal,
+                        crate::LifecycleEvent::SessionStart { reason, previous_session_file },
+                        config.limits.tool_timeout, &mut observe) => result?,
+                }
+            }
+        }
+        let event = crate::InputEvent {
+            text: std::mem::take(&mut message.input.content),
+            images: std::mem::take(&mut message.images),
+            source: crate::InputSource::Extension,
+            streaming_behavior: None,
+        };
+        let (sender, mut incoming) = mpsc::channel(32);
+        let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let states = journal.extension_states();
+        let future =
+            crate::extension::prepare_input_with_host(&hooks.extensions, event, &states, host);
+        tokio::pin!(future);
+        let prepared = loop {
+            tokio::select! {
+                biased;
+                Some((input, reply)) = incoming.recv() => {
+                    let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                        crate::agent::queue_custom_message(&mut journal, input, &mut observe)
+                    } else {
+                        journal.append_custom_message(input.message).map(|()| observe(Notification::Committed(journal.records().last().expect("appended custom message"))))
+                    };
+                    match result {
+                        Ok(()) => { let _ = reply.send(Ok(())); }
+                        Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                    }
+                }
+                _ = closed.cancelled() => return Err(Error::Config("session is closed".into())),
+                _ = active.token.cancelled() => return Err(Error::Cancelled),
+                result = &mut future => break result?,
+            }
+        };
+        if let Some(prepared) = prepared {
+            message.input.content = prepared.text;
+            message.images = prepared.images;
+            message.validate()?;
+            // The receiver is held by this owner. Drain a full channel before
+            // sending rather than awaiting capacity that only we can free.
+            if self.input.capacity() == 0 {
+                crate::agent::queue_inputs(&mut journal, &mut inputs, &mut observe)?;
+            }
+            self.input
+                .try_send(message.into())
+                .map_err(|_| Error::Config("session input channel is unavailable".into()))?;
+        }
+        let trigger = journal.pending_custom_trigger();
+        // Host calls from the triggered run must be able to submit controls.
+        drop(order);
+        if let Some(trigger_id) = trigger {
+            let config = self.owner.config.lock().expect("run config").clone();
+            let model = config
+                .model
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            let registry = config
+                .registry
+                .upgrade()
+                .ok_or_else(|| Error::Config("session is closed".into()))?;
+            let agent = Agent {
+                model: model.as_ref(),
+                model_name: &config.model_name,
+                registry: &registry,
+                system_prompt: &config.system_prompt,
+                limits: config.limits,
+            };
+            let result = agent
+                .run_correlated(
+                    &mut journal,
+                    trigger_id,
+                    None,
+                    &mut inputs,
+                    &active.token,
+                    &mut observe,
+                )
+                .await;
+            let final_inputs = active.finish_inputs(&mut journal, &mut inputs, &mut observe);
+            result?;
+            final_inputs?;
+        } else {
+            active.finish_inputs(&mut journal, &mut inputs, &mut observe)?;
+        }
+        Ok(id)
+    }
+
     /// Send custom context during an active operation, acknowledged after journaling.
     pub async fn send_custom_message(
         &self,
@@ -567,7 +728,10 @@ impl SessionBuilder {
         let session = Arc::new(tokio::sync::Mutex::new(session));
         let input = Arc::new(tokio::sync::Mutex::new(input));
         let registry = Arc::new(self.registry);
+        let pending_start = Arc::new(Mutex::new(Some((crate::SessionStartReason::Startup, None))));
         let owner = Arc::new(SessionOwner {
+            pending_start: pending_start.clone(),
+            closed: CancellationToken::new(),
             journal: Arc::downgrade(&session),
             input: Arc::downgrade(&input),
             config: Mutex::new(RunConfig {
@@ -600,7 +764,7 @@ impl SessionBuilder {
                 tool_timeout,
             },
             closed: false,
-            pending_start: Some((crate::SessionStartReason::Startup, None)),
+            pending_start,
             session_file: None,
         })
     }
@@ -620,7 +784,7 @@ pub struct AgentSession {
     control: SessionControl,
     events: Option<broadcast::Sender<SessionEvent>>,
     closed: bool,
-    pending_start: Option<(crate::SessionStartReason, Option<PathBuf>)>,
+    pending_start: PendingStart,
     session_file: Option<PathBuf>,
 }
 impl AgentSession {
@@ -955,7 +1119,7 @@ impl AgentSession {
         };
         let result = agent
             .navigate_tree_with_options(
-                &mut *journal,
+                &mut journal,
                 selected,
                 options,
                 &active.token,
@@ -970,7 +1134,7 @@ impl AgentSession {
                 self.refresh_run_config();
             }
         }
-        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observer);
+        let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observer);
         let result = result.and(final_inputs);
         if let Err(error) = result {
             drop(input_queue);
@@ -1015,34 +1179,39 @@ impl AgentSession {
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
         self.ensure_open()?;
-        let recovered = self
-            .session
-            .lock()
-            .await
-            .recover_tree_trigger_handoff()?
-            .cloned();
+        let mut journal = self.session.lock().await;
+        let recovered = journal.recover_tree_trigger_handoff()?.cloned();
         if let Some(record) = recovered {
             if let Some(events) = &self.events {
                 emit(events, &Notification::Committed(&record));
             }
-            self.refresh_input_hooks()?;
-            if let Some((model, _)) = self
-                .session
-                .try_lock()
-                .map_err(|_| Error::Session("session journal is in use".into()))?
-                .model_selection()
-            {
-                self.model_name = model;
-                self.refresh_run_config();
-            }
+            *self.control.input_hooks.lock().expect("SDK input hooks") =
+                InputHooks::new(&self.registry, &journal);
         }
-        if let Some((reason, previous_session_file)) = self.pending_start.take() {
-            self.notify_session_event(crate::LifecycleEvent::SessionStart {
-                reason,
-                previous_session_file,
-            })
+        if let Some((model, _)) = journal.model_selection()
+            && self.model_name != model
+        {
+            self.model_name = model;
+            self.refresh_run_config();
+        }
+        let startup = self.pending_start.lock().expect("session startup").take();
+        if let Some((reason, previous_session_file)) = startup
+            && self.registry.has_session_lifecycle_hooks()
+        {
+            let events = self.events.as_ref().expect("open session");
+            crate::lifecycle::notify_idle_with_host(
+                &self.registry,
+                &mut journal,
+                crate::LifecycleEvent::SessionStart {
+                    reason,
+                    previous_session_file,
+                },
+                self.limits.tool_timeout,
+                &mut |event| emit(events, &event),
+            )
             .await?;
         }
+        drop(journal);
         let _ = self.drain_idle_triggers().await?;
         Ok(())
     }
@@ -1068,15 +1237,15 @@ impl AgentSession {
         };
         let result = agent
             .run_correlated(
-                &mut *journal,
+                &mut journal,
                 trigger_id,
                 None,
-                &mut *input_queue,
+                &mut input_queue,
                 &active.token,
                 &mut observe,
             )
             .await;
-        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observe);
+        let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observe);
         let answer = result?;
         final_inputs?;
         Ok(Some(answer))
@@ -1306,7 +1475,8 @@ impl AgentSession {
         );
         fork.registry = self.registry.clone();
         fork.refresh_run_config();
-        fork.pending_start = Some((crate::SessionStartReason::Fork, self.session_file.clone()));
+        *fork.pending_start.lock().expect("session startup") =
+            Some((crate::SessionStartReason::Fork, self.session_file.clone()));
         fork.refresh_input_hooks()?;
         Ok(fork)
     }
@@ -1412,7 +1582,7 @@ impl AgentSession {
                 };
                 let prepared = prepare_idle_input_with_host(
                     &self.registry,
-                    &mut *journal,
+                    &mut journal,
                     event,
                     &active.token,
                     &mut observe,
@@ -1422,10 +1592,10 @@ impl AgentSession {
                 if let Some(trigger_id) = pending_trigger {
                     agent
                         .run_correlated(
-                            &mut *journal,
+                            &mut journal,
                             trigger_id,
                             None,
-                            &mut *input_queue,
+                            &mut input_queue,
                             &active.token,
                             &mut observe,
                         )
@@ -1439,7 +1609,7 @@ impl AgentSession {
             }
             if let Some(images) = images {
                 agent
-                    .resolve_prior_turn_end(&mut *journal, run_id, &active.token, &mut observe)
+                    .resolve_prior_turn_end(&mut journal, run_id, &active.token, &mut observe)
                     .await?;
                 journal.append_user_with_images(
                     input.take().unwrap_or_default(),
@@ -1452,17 +1622,17 @@ impl AgentSession {
             }
             agent
                 .run_correlated(
-                    &mut *journal,
+                    &mut journal,
                     run_id,
                     input,
-                    &mut *input_queue,
+                    &mut input_queue,
                     &active.token,
                     &mut observe,
                 )
                 .await
         }
         .await;
-        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observe);
+        let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observe);
         if result.is_ok()
             && let Err(error) = final_inputs
         {
@@ -1575,14 +1745,14 @@ impl AgentSession {
         };
         let result = agent
             .compact_with_host_and_inputs(
-                &mut *journal,
+                &mut journal,
                 compaction,
                 &active.token,
                 &mut observer,
-                &mut *input_queue,
+                &mut input_queue,
             )
             .await;
-        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observer);
+        let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observer);
         let result = result.and(final_inputs);
         drop(input_queue);
         drop(journal);
@@ -1631,11 +1801,11 @@ impl AgentSession {
             Some(keep_turns) => {
                 agent
                     .summarize_with_instructions(
-                        &mut *journal,
+                        &mut journal,
                         keep_turns,
                         &active.token,
                         &mut observer,
-                        Some(&mut *input_queue),
+                        Some(&mut input_queue),
                         instructions,
                     )
                     .await
@@ -1643,16 +1813,16 @@ impl AgentSession {
             None => {
                 agent
                     .summarize_configured(
-                        &mut *journal,
+                        &mut journal,
                         &active.token,
                         &mut observer,
-                        Some(&mut *input_queue),
+                        Some(&mut input_queue),
                         instructions,
                     )
                     .await
             }
         };
-        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observer);
+        let final_inputs = active.finish_inputs(&mut journal, &mut input_queue, &mut observer);
         let result = result.and(final_inputs);
         drop(input_queue);
         drop(journal);
@@ -1664,6 +1834,7 @@ impl AgentSession {
             return Ok(());
         }
         self.closed = true;
+        self.control.owner.closed.cancel();
         self.control.abort();
         {
             let mut input = self.input.lock().await;
@@ -1671,7 +1842,12 @@ impl AgentSession {
             while input.try_recv().is_ok() {}
         }
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
-        let notification_result = if self.pending_start.is_none() {
+        let started = self
+            .pending_start
+            .lock()
+            .expect("session startup")
+            .is_none();
+        let notification_result = if started {
             self.notify_session_event(crate::LifecycleEvent::SessionShutdown {
                 reason: crate::SessionShutdownReason::Quit,
                 target_session_file: None,
@@ -1731,6 +1907,7 @@ impl AgentSession {
 }
 impl Drop for AgentSession {
     fn drop(&mut self) {
+        self.control.owner.closed.cancel();
         self.control.abort();
         self.registry.remove_session_branch_models(self.session_id);
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
@@ -2874,7 +3051,7 @@ mod tests {
                     &mut journal,
                     Uuid::new_v4(),
                     Some("B prompt".into()),
-                    &mut *input_queue,
+                    &mut input_queue,
                     &active.token,
                     &mut observe
                 ),
@@ -2892,8 +3069,8 @@ mod tests {
         control.steer("after B").await.unwrap();
         active
             .finish_inputs(
-                &mut *session.session.try_lock().unwrap(),
-                &mut *input_queue,
+                &mut session.session.try_lock().unwrap(),
+                &mut input_queue,
                 &mut observe,
             )
             .unwrap();
@@ -7999,6 +8176,303 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["trigger", "next", "user"]);
+    }
+
+    #[tokio::test]
+    async fn idle_control_hook_runs_trigger_and_delivers_next_turn() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(TriggerInputHook))
+            .unwrap()
+            .extension(Arc::new(NameHook(lifecycle.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            session.controls().follow_up("queued"),
+        )
+        .await
+        .expect("idle control deadlocked")
+        .unwrap();
+        assert!(model.0.load(Ordering::SeqCst) >= 1);
+        let journal = session.journal().unwrap();
+        let delivered: Vec<_> = journal
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                crate::Event::CustomMessageDelivered { message, .. } => {
+                    Some(message.content.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            [
+                crate::ContextContent::Text("trigger".into()),
+                crate::ContextContent::Text("next".into())
+            ]
+        );
+        assert!(journal.pending_custom_trigger().is_none());
+        drop(journal);
+        session.start().await.unwrap();
+        assert_eq!(
+            lifecycle
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, crate::LifecycleEvent::SessionStart { .. }))
+                .count(),
+            1
+        );
+    }
+
+    struct PausedIdleControlHook {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Extension for PausedIdleControlHook {
+        fn id(&self) -> &str {
+            "paused-idle-control"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            event: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            if event.text == "control" {
+                self.entered.notify_one();
+                self.release.notified().await;
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "paused".into(),
+                        content: crate::ContextContent::Text("next".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+            }
+            Ok(crate::InputAction::Continue)
+        }
+    }
+    #[tokio::test]
+    async fn idle_control_and_prompt_serialize_without_deadlock() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .extension(Arc::new(PausedIdleControlHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let (queued, prompted) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(control.follow_up("control"), async {
+                entered.notified().await;
+                release.notify_one();
+                session.prompt("prompt").await
+            })
+        })
+        .await
+        .expect("concurrent control and prompt deadlocked");
+        queued.unwrap();
+        prompted.unwrap();
+        assert!(session.journal().unwrap().records().iter().any(|record| matches!(&record.event,
+            crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "paused")));
+    }
+
+    struct ReentrantTriggeredRun(Arc<Mutex<Option<SessionControl>>>);
+    #[async_trait::async_trait]
+    impl Extension for ReentrantTriggeredRun {
+        fn id(&self) -> &str {
+            "reentrant-triggered-run"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::AgentStart { .. }) {
+                let control = self.0.lock().unwrap().clone().unwrap();
+                control
+                    .steer("nested")
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_trigger_run_allows_reentrant_control_input() {
+        let slot = Arc::new(Mutex::new(None));
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .extension(Arc::new(TriggerInputHook))
+            .unwrap()
+            .extension(Arc::new(ReentrantTriggeredRun(slot.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        *slot.lock().unwrap() = Some(control.clone());
+        session.start().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            control.follow_up("queued"),
+        )
+        .await
+        .expect("triggered callback deadlocked")
+        .unwrap();
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|record| matches!(&record.event,
+            crate::Event::InputQueued { input } if input.content == "nested"))
+        );
+    }
+
+    struct ReentrantTurnStart {
+        control: Arc<Mutex<Option<SessionControl>>>,
+        sent: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ReentrantTurnStart {
+        fn id(&self) -> &str {
+            "reentrant-turn-start"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::TurnStart { .. })
+                && !self.sent.swap(true, Ordering::SeqCst)
+            {
+                let control = self.control.lock().unwrap().clone().unwrap();
+                control
+                    .steer("turn nested")
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn idle_trigger_turn_start_allows_reentrant_control() {
+        let slot = Arc::new(Mutex::new(None));
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .extension(Arc::new(TriggerInputHook))
+            .unwrap()
+            .extension(Arc::new(ReentrantTurnStart {
+                control: slot.clone(),
+                sent: std::sync::atomic::AtomicBool::new(false),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        *slot.lock().unwrap() = Some(control.clone());
+        session.start().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            control.follow_up("queued"),
+        )
+        .await
+        .expect("turn start callback deadlocked")
+        .unwrap();
+        assert!(
+            session
+                .journal()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|record| matches!(&record.event,
+            crate::Event::InputQueued { input } if input.content == "turn nested"))
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_control_ack_survives_abort_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-input.jsonl");
+        let notified = Arc::new(tokio::sync::Notify::new());
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(PendingIdleInputHook(notified.clone())))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        let control = session.controls();
+        let sender = control.clone();
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(sender.steer("input"), async {
+                notified.notified().await;
+                control.abort();
+            })
+        })
+        .await
+        .expect("idle cancellation deadlocked");
+        assert!(matches!(result, Err(Error::Cancelled)));
+        session.close().await.unwrap();
+        drop(session);
+        let restored = Session::open(&path).unwrap();
+        assert_eq!(restored.queued_custom_messages().len(), 1);
+        assert_eq!(
+            restored.queued_custom_messages()[0].1.delivery,
+            crate::CustomMessageDelivery::TriggerTurn
+        );
+        drop(restored);
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut reopened = SessionBuilder::new(model.clone(), "fixture")
+            .open(&path)
+            .unwrap();
+        reopened.start().await.unwrap();
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        let journal = reopened.journal().unwrap();
+        assert_eq!(journal.records().iter().filter(|record| matches!(&record.event,
+            crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "idle-input")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn closing_session_cancels_idle_control_hook() {
+        let notified = Arc::new(tokio::sync::Notify::new());
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(PendingIdleInputHook(notified.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = session.controls();
+        let (result, closed) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(control.steer("input"), async {
+                notified.notified().await;
+                session.close().await
+            })
+        })
+        .await
+        .expect("session close deadlocked");
+        assert!(result.is_err());
+        closed.unwrap();
     }
 
     struct PendingIdleInputHook(Arc<tokio::sync::Notify>);

@@ -2796,10 +2796,10 @@ FIFO order and queue modes with user input. Clearing the queue removes those
 two modes but retains next-turn messages. Executable extensions negotiate the
 host-call capability and report it unavailable with older hosts.
 
-The SDK supplies a message host to initial input hooks and to input hooks for
-steering and follow-ups during a run; idle `SessionControl` input hooks still
-use the older hook interface. Provider-request and context-with-system hooks
-and the normal scheduler's tool-call and tool-result hooks also receive a host.
+The SDK supplies a message host to initial input hooks and to `SessionControl`
+input hooks while idle or during a run. Idle host sends are acknowledged after
+journaling, and trigger messages start a run through the shared session owner.
+Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
 `agent_settled`; and SDK-owned session and model-selection notifications,
@@ -2877,7 +2877,6 @@ even when the latter were queued earlier. The native scheduler follows that
 order; it is covered for both user and custom starting messages. Host-aware
 `before_tool` policies can opt in with
 `handles_before_tool_host`; separately built extensions negotiate this support.
-Host calls also remain unavailable in idle `SessionControl` input hooks.
 Model-generated summary compaction, synchronous SDK `compact()`, and the
 asynchronous `compact_with_hooks()` SDK alternative run host-aware before/after
 hooks. Synchronous SDK `compact()` blocks its caller while a separate runtime

@@ -465,7 +465,7 @@ impl Agent<'_> {
             prior_result
         } else if lifecycle {
             let states = session.extension_states();
-            self.observe_active_lifecycle(
+            self.observe_active_lifecycle_with_inputs(
                 session,
                 crate::LifecycleEvent::AgentStart {
                     session_id: session.session_id(),
@@ -475,6 +475,7 @@ impl Agent<'_> {
                 &states,
                 cancel,
                 observer,
+                Some(followups),
             )
             .await
         } else {
@@ -619,6 +620,21 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
+        self.observe_active_lifecycle_with_inputs::<AgentInput>(
+            session, event, states, cancel, observer, None,
+        )
+        .await
+    }
+
+    async fn observe_active_lifecycle_with_inputs<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        event: crate::LifecycleEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
+    ) -> Result<()> {
         let (sender, mut incoming) = mpsc::channel(32);
         let host: Arc<dyn ToolHost> = match &event {
             crate::LifecycleEvent::AgentStart { run_id, .. } => {
@@ -674,6 +690,9 @@ impl Agent<'_> {
                             Ok(()) => { let _ = reply.send(Ok(())); }
                             Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
                         }
+                    }
+                    Some(input) = receive_input(&mut inputs) => {
+                        queue_input(session, input.into(), observer)?;
                     }
                     _ = cancel.cancelled() => break,
                     _ = &mut notify => break,
@@ -1118,12 +1137,13 @@ impl Agent<'_> {
             {
                 if lifecycle {
                     active
-                        .observe_active_lifecycle(
+                        .observe_active_lifecycle_with_inputs(
                             session,
                             turn_start(true),
                             &states,
                             cancel,
                             observer,
+                            Some(followups),
                         )
                         .await?;
                 }
@@ -1189,12 +1209,13 @@ impl Agent<'_> {
                     {
                         if lifecycle && retry_attempt == 0 {
                             active
-                                .observe_active_lifecycle(
+                                .observe_active_lifecycle_with_inputs(
                                     session,
                                     turn_start(false),
                                     &states,
                                     cancel,
                                     observer,
+                                    Some(followups),
                                 )
                                 .await?;
                         }
@@ -1302,12 +1323,13 @@ impl Agent<'_> {
                 let allowance = request.max_output_tokens;
                 if lifecycle && retry_attempt == 0 {
                     active
-                        .observe_active_lifecycle(
+                        .observe_active_lifecycle_with_inputs(
                             session,
                             turn_start(false),
                             &states,
                             cancel,
                             observer,
+                            Some(followups),
                         )
                         .await?;
                 }
@@ -1444,7 +1466,7 @@ impl Agent<'_> {
             if lifecycle {
                 let messages = crate::lifecycle::messages(session, |id| id >= assistant_record);
                 dispatcher
-                    .observe_active_lifecycle(
+                    .observe_active_lifecycle_with_inputs(
                         session,
                         crate::LifecycleEvent::TurnEnd {
                             run_id,
@@ -1454,6 +1476,7 @@ impl Agent<'_> {
                         &states,
                         cancel,
                         observer,
+                        Some(followups),
                     )
                     .await?;
                 if cancel.is_cancelled() {

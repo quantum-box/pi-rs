@@ -941,7 +941,8 @@ impl Agent<'_> {
                     TurnEvent::Transformed(index, reply, duration, errors)
                 }
                 .boxed();
-                futures.push(start_turn_future(future).await);
+                let started = start_turn_future(future).await;
+                futures.push(started);
             }
             if lanes.values().all(|lane| lane.calls.is_empty()) {
                 break;
@@ -986,7 +987,8 @@ impl Agent<'_> {
                                     let result = Self::turn_finish_preparation(&registry, timeout, &invocation, normalized, &snapshot, &cancel, Some(hook_host)).await;
                                     TurnEvent::Prepared(index, result, Vec::new())
                                 }.boxed();
-                                futures.push(start_turn_future(future).await);
+                                let started = start_turn_future(future).await;
+                                futures.push(started);
                             }
                         }
                     }
@@ -1084,7 +1086,8 @@ impl Agent<'_> {
                                 let result = Self::turn_poll_normalize(&registry, timeout, &invocation, &cancel).await;
                                 TurnEvent::PollPrepared(index, result, reference, duration, errors)
                             }.boxed();
-                            futures.push(start_turn_future(future).await);
+                            let started = start_turn_future(future).await;
+                            futures.push(started);
                             continue;
                         }
                         if let Err(error) = finished { record_turn_error(&mut first_error, &mut error_origin, index, error); }
@@ -1124,7 +1127,8 @@ impl Agent<'_> {
                                     let result = Self::turn_poll_authorize_and_run(&registry, timeout, &invocation, &reference, (tool, args), &snapshot, &cancel, Some(hook_host)).await;
                                     TurnEvent::Polled(index, result, reference, duration, Vec::new())
                                 }.boxed();
-                                futures.push(start_turn_future(future).await);
+                                let started = start_turn_future(future).await;
+                                futures.push(started);
                             }
                             Err(error) => { futures.push(futures_util::future::ready(TurnEvent::Polled(index, Err(error), reference, duration, Vec::new())).boxed()); }
                         }
