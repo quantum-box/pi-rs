@@ -341,6 +341,7 @@ impl Tool for RemoteLs {
             .map_err(|error| Error::Config(error.to_string()))??;
             let mut listing = Listing::new();
             let mut count = 0;
+            let mut processed = 0usize;
             let mut reached = false;
             for entry in entries {
                 if cancellation.is_cancelled() {
@@ -350,7 +351,17 @@ impl Tool for RemoteLs {
                     reached = true;
                     break;
                 }
-                if let Ok(stat) = self.operations.stat(&path.join(&entry)).await {
+                let stat = self.operations.stat(&path.join(&entry)).await;
+                processed += 1;
+                // Immediately-ready backend futures must not monopolize a
+                // current-thread runtime, even when every stat fails.
+                if processed.is_multiple_of(64) {
+                    tokio::task::yield_now().await;
+                }
+                if cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                if let Ok(stat) = stat {
                     if count != 0 {
                         listing.append(b"\n", &cancellation).await?;
                     }

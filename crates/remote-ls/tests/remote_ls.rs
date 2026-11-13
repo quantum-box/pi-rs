@@ -301,3 +301,72 @@ async fn listing_preserves_unix_backslash_filename() {
         matches!(tool.invoke(json!({}), context()).await, Outcome::Succeeded(text) if text == "literal\\")
     );
 }
+
+struct ImmediateStats {
+    root: PathBuf,
+    started: tokio::sync::Notify,
+    count: std::sync::atomic::AtomicUsize,
+    fail: bool,
+}
+#[async_trait::async_trait]
+impl LsOperations for ImmediateStats {
+    async fn exists(&self, _: &Path) -> Result<bool> {
+        Ok(true)
+    }
+    async fn stat(&self, path: &Path) -> Result<LsStat> {
+        if path == self.root {
+            return Ok(LsStat { is_directory: true });
+        }
+        if self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.started.notify_one();
+        }
+        if self.fail {
+            Err(Error::Config("inaccessible".into()))
+        } else {
+            Ok(LsStat {
+                is_directory: false,
+            })
+        }
+    }
+    async fn readdir(&self, _: &Path) -> Result<Vec<String>> {
+        Ok((0..100_000).map(|n| format!("entry-{n:06}")).collect())
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn cancellation_interrupts_immediate_entry_stats_even_when_they_fail() {
+    for fail in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ImmediateStats {
+            root: root.path().to_owned(),
+            started: tokio::sync::Notify::new(),
+            count: std::sync::atomic::AtomicUsize::new(0),
+            fail,
+        });
+        let tool = create_ls_tool(root.path(), backend.clone()).unwrap();
+        let token = CancellationToken::new();
+        let child = token.clone();
+        let task = tokio::spawn(async move {
+            tool.invoke(
+                json!({"limit":100000}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: child,
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.started.notified(),
+        )
+        .await
+        .unwrap();
+        token.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("listing must yield for cancellation")
+            .unwrap();
+        assert!(matches!(result, Outcome::Failed(text) if text.contains("aborted")));
+        assert!(backend.count.load(std::sync::atomic::Ordering::SeqCst) < 100_000);
+    }
+}
