@@ -775,6 +775,16 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
+    async fn before_tree_with_host(
+        &self,
+        preparation: &crate::TreePreparation,
+        state: Option<&ExtensionState>,
+        cancel: &crate::CancellationToken,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<crate::TreeDecision>> {
+        self.before_tree(preparation, state, cancel).await
+    }
+
     async fn cache_warming_decision(
         &self,
         _event: &CacheWarmingDecision,

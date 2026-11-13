@@ -207,6 +207,10 @@ pub enum Event {
     CustomMessageQueued {
         input: crate::QueuedCustomMessage,
     },
+    /// Session-wide queue entry produced before switching branches.
+    TreeMessageQueued {
+        input: crate::QueuedCustomMessage,
+    },
     /// Atomically consumes a queued message and adds it to model context.
     CustomMessageDelivered {
         id: Uuid,
@@ -1239,6 +1243,16 @@ impl Session {
     pub fn queued_custom_messages(&self) -> Vec<(u64, crate::QueuedCustomMessage)> {
         let branch = self.branch();
         let mut consumed = std::collections::HashSet::new();
+        let mut globally_consumed = std::collections::HashSet::new();
+        for record in &self.records {
+            match &record.event {
+                Event::CustomMessageDelivered { id, .. } => {
+                    globally_consumed.insert(*id);
+                }
+                Event::InputQueueCleared { ids } => globally_consumed.extend(ids.iter().copied()),
+                _ => {}
+            }
+        }
         for record in &branch {
             match &record.event {
                 Event::CustomMessageDelivered { id, .. } => {
@@ -1248,7 +1262,7 @@ impl Session {
                 _ => {}
             }
         }
-        branch
+        let mut queued: Vec<_> = branch
             .into_iter()
             .filter_map(|record| match &record.event {
                 Event::CustomMessageQueued { input } if !consumed.contains(&input.id) => {
@@ -1256,24 +1270,43 @@ impl Session {
                 }
                 _ => None,
             })
-            .collect()
+            .collect();
+        queued.extend(
+            self.records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    Event::TreeMessageQueued { input }
+                        if !globally_consumed.contains(&input.id) =>
+                    {
+                        Some((record.id, input.clone()))
+                    }
+                    _ => None,
+                }),
+        );
+        queued.sort_by_key(|(id, _)| *id);
+        queued
     }
 
     /// Find a callback-triggered run that has not started or was interrupted.
     pub fn pending_custom_trigger(&self) -> Option<Uuid> {
         let branch = self.branch();
-        branch.iter().find_map(|record| {
-            let Event::CustomMessageQueued { input } = &record.event else {
-                return None;
+        let branch_ids: std::collections::HashSet<_> =
+            branch.iter().map(|record| record.id).collect();
+        self.records.iter().find_map(|record| {
+            let (input, global) = match &record.event {
+                Event::CustomMessageQueued { input } if branch_ids.contains(&record.id) => (input, false),
+                Event::TreeMessageQueued { input } => (input, true),
+                _ => return None,
             };
             if input.delivery != crate::CustomMessageDelivery::TriggerTurn {
                 return None;
             }
-            let last_state = branch.iter().rev().find_map(|entry| match entry.event {
+            let entries: Vec<_> = if global { self.records.iter().collect() } else { branch.clone() };
+            let last_state = entries.iter().rev().find_map(|entry| match entry.event {
                 Event::Run { state, .. } if entry.run_id == Some(input.id) => Some(state),
                 _ => None,
             });
-            let delivered = branch.iter().any(|entry| matches!(entry.event, Event::CustomMessageDelivered { id, .. } if id == input.id));
+            let delivered = entries.iter().any(|entry| matches!(entry.event, Event::CustomMessageDelivered { id, .. } if id == input.id));
             match last_state {
                 None | Some(RunState::Running | RunState::WaitingForOperation | RunState::WaitingForReconciliation) => Some(input.id),
                 Some(RunState::Cancelled) if !delivered => Some(input.id),
@@ -1662,6 +1695,26 @@ impl Session {
                 _ => {}
             }
             records.push(record);
+        }
+        // Tree callback queues are session-wide and may live on the branch left
+        // behind. Preserve still-pending entries when exporting another branch.
+        for (source, input) in self.queued_custom_messages() {
+            if !ids.contains_key(&source)
+                && matches!(
+                    self.records[(source - 1) as usize].event,
+                    Event::TreeMessageQueued { .. }
+                )
+            {
+                let id = records.len() as u64 + 1;
+                records.push(Record {
+                    timestamp: Some(record_timestamp()),
+                    run_id: None,
+                    version: FORMAT_VERSION,
+                    id,
+                    parent: Some(id - 1),
+                    event: Event::TreeMessageQueued { input },
+                });
+            }
         }
         validated_head(&records)?;
         Ok(records)

@@ -2392,7 +2392,7 @@ fn metadata(record: &pi_rs::Record) -> Value {
         Event::BashExecution { execution } => {
             json!({"event":"bash_execution","exitCode":execution.exit_code,"cancelled":execution.cancelled,"truncated":execution.truncated})
         }
-        Event::CustomMessageQueued { input } => {
+        Event::CustomMessageQueued { input } | Event::TreeMessageQueued { input } => {
             json!({"event":"custom_message_queued","id":input.id,"delivery":input.delivery})
         }
         Event::CustomEntry { entry } => {

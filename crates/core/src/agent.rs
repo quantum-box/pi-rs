@@ -795,12 +795,21 @@ impl Agent<'_> {
                 } if record.run_id == Some(run_id) => Some(record.id),
                 _ => None,
             });
-        if session.branch().iter().any(|record| matches!(&record.event, Event::CustomMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
+        if has_trigger_message(session, run_id)
             && let Some(started_at) = trigger_started
         {
             for (queued_at, pending) in session.queued_custom_messages() {
-                if pending.delivery == crate::CustomMessageDelivery::NextTurn && queued_at < started_at {
-                    commit(session, Event::CustomMessageDelivered { id: pending.id, message: pending.message }, observer)?;
+                if pending.delivery == crate::CustomMessageDelivery::NextTurn
+                    && queued_at < started_at
+                {
+                    commit(
+                        session,
+                        Event::CustomMessageDelivered {
+                            id: pending.id,
+                            message: pending.message,
+                        },
+                        observer,
+                    )?;
                 }
             }
         }
@@ -875,8 +884,10 @@ impl Agent<'_> {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        let trigger_unanswered = session.branch().iter().any(|record| matches!(&record.event, Event::CustomMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
-            && !session.branch().iter().any(|record| record.run_id == Some(run_id) && matches!(&record.event, Event::Assistant { .. }));
+        let trigger_unanswered = has_trigger_message(session, run_id)
+            && !session.branch().iter().any(|record| {
+                record.run_id == Some(run_id) && matches!(&record.event, Event::Assistant { .. })
+            });
         if let Some(answer) = session
             .branch()
             .iter()
@@ -2362,10 +2373,38 @@ impl Agent<'_> {
                 .iter()
                 .filter(|extension| extension.handles_tree_navigation())
             {
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = tokio::time::timeout_at(deadline, extension.before_tree(&preparation, states.get(extension.id()), cancel)) => result,
+                let (sender, mut incoming) = mpsc::channel(32);
+                let host = Arc::new(LifecycleMessageHost { sender, idle: true });
+                let result = {
+                    let future = tokio::time::timeout_at(
+                        deadline,
+                        extension.before_tree_with_host(
+                            &preparation,
+                            states.get(extension.id()),
+                            cancel,
+                            host,
+                        ),
+                    );
+                    tokio::pin!(future);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(Error::Cancelled),
+                            Some((input, reply)) = incoming.recv() => {
+                                let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                                    commit(session, Event::TreeMessageQueued { input }, observer)
+                                } else {
+                                    session.append_custom_message(input.message)
+                                        .map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
+                                };
+                                match result {
+                                    Ok(()) => { let _ = reply.send(Ok(())); }
+                                    Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                                }
+                            }
+                            result = &mut future => break result,
+                        }
+                    }
                 };
                 let message = match result {
                     Ok(Ok(Some(next))) => {
@@ -3243,6 +3282,13 @@ fn has_unfinished_turn_end(session: &Session, run_id: Uuid) -> bool {
     assistant.version >= crate::journal::TURN_END_JOURNAL_VERSION
         && !branch.iter().any(|record| matches!(record.event,
             Event::TurnEndCallbacksCompleted { assistant_record } if assistant_record == assistant.id))
+}
+
+fn has_trigger_message(session: &Session, run_id: Uuid) -> bool {
+    session.branch().iter().any(|record| matches!(&record.event,
+        Event::CustomMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
+        || session.records().iter().any(|record| matches!(&record.event,
+            Event::TreeMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
 }
 
 fn callback_turn_phase(phase: &str, turn_index: u32) -> String {

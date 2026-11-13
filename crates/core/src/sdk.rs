@@ -709,7 +709,11 @@ impl AgentSession {
             }
         }
         let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
-        result.and(final_inputs)?;
+        let result = result.and(final_inputs);
+        if let Err(error) = result {
+            let _ = self.drain_idle_triggers().await;
+            return Err(error);
+        }
         let summary_entry = self.session.records()[first_record..]
             .iter()
             .find(|record| matches!(record.event, crate::Event::BranchSummary { .. }))
@@ -1793,6 +1797,305 @@ mod tests {
     }
 
     struct TreeOptionsHook;
+    struct BeforeTreeMessages {
+        cancel: bool,
+        trigger: bool,
+    }
+    struct PausedBeforeTree {
+        ready: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl Extension for PausedBeforeTree {
+        fn id(&self) -> &str {
+            "paused-before-tree"
+        }
+        fn handles_tree_navigation(&self) -> bool {
+            true
+        }
+        async fn before_tree_with_host(
+            &self,
+            _: &crate::TreePreparation,
+            _: Option<&crate::ExtensionState>,
+            _: &CancellationToken,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::TreeDecision>> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "tree-crash".into(),
+                    content: crate::ContextContent::Text("trigger".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::TriggerTurn,
+            )
+            .await?;
+            self.ready.notify_one();
+            std::future::pending().await
+        }
+    }
+    #[tokio::test]
+    async fn before_tree_trigger_survives_interruption_after_acknowledgement() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let hook = Arc::new(PausedBeforeTree {
+            ready: tokio::sync::Notify::new(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tree-crash.jsonl");
+        let mut session =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .extension(hook.clone())
+                .unwrap()
+                .open(&path)
+                .unwrap();
+        session.prompt("first").await.unwrap();
+        let selected = session
+            .journal()
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, crate::Event::User { .. }))
+            .unwrap()
+            .id;
+        {
+            let future = session.navigate_tree(selected, crate::TreeNavigationOptions::default());
+            tokio::pin!(future);
+            tokio::select! { _ = &mut future => panic!("tree hook did not pause"), _ = hook.ready.notified() => {} }
+        }
+        drop(session);
+        let mut reopened =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .open(&path)
+                .unwrap();
+        reopened.start().await.unwrap();
+        assert!(reopened.journal().pending_custom_trigger().is_none());
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(reopened.journal().records().iter().filter(|record| matches!(&record.event,
+            crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "tree-crash")).count(), 1);
+        drop(reopened);
+        let mut reopened =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .open(&path)
+                .unwrap();
+        reopened.start().await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+    #[tokio::test]
+    async fn before_tree_trigger_survives_checkout_before_run_creation() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tree-after-checkout.jsonl");
+        let mut journal = Session::open(&path).unwrap();
+        journal
+            .append(crate::Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let id = Uuid::new_v4();
+        journal
+            .append(crate::Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id,
+                    message: crate::CustomMessage {
+                        custom_type: "tree-checkout-crash".into(),
+                        content: crate::ContextContent::Text("trigger".into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        journal.checkout(1).unwrap();
+        drop(journal);
+        let mut reopened =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .open(&path)
+                .unwrap();
+        reopened.start().await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(reopened.journal().pending_custom_trigger().is_none());
+        assert_eq!(
+            reopened
+                .journal()
+                .records()
+                .iter()
+                .filter(|record| matches!(record.event,
+            crate::Event::CustomMessageDelivered { id: delivered, .. } if delivered == id))
+                .count(),
+            1
+        );
+        drop(reopened);
+        let mut reopened =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .open(&path)
+                .unwrap();
+        reopened.start().await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+    #[async_trait::async_trait]
+    impl Extension for BeforeTreeMessages {
+        fn id(&self) -> &str {
+            "before-tree-messages"
+        }
+        fn handles_tree_navigation(&self) -> bool {
+            true
+        }
+        async fn before_tree_with_host(
+            &self,
+            _: &crate::TreePreparation,
+            _: Option<&crate::ExtensionState>,
+            _: &CancellationToken,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::TreeDecision>> {
+            for (content, delivery) in [
+                ("tree steer", crate::CustomMessageDelivery::Steer),
+                ("tree follow", crate::CustomMessageDelivery::FollowUp),
+                ("tree next", crate::CustomMessageDelivery::NextTurn),
+                ("tree trigger", crate::CustomMessageDelivery::TriggerTurn),
+            ] {
+                if delivery == crate::CustomMessageDelivery::TriggerTurn && !self.trigger {
+                    continue;
+                }
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "tree-before".into(),
+                        content: crate::ContextContent::Text(content.into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery,
+                )
+                .await?;
+            }
+            Ok(Some(crate::TreeDecision {
+                cancel: self.cancel,
+                ..Default::default()
+            }))
+        }
+    }
+    struct TreeCaptureModel(Arc<Mutex<Vec<Vec<Message>>>>);
+    #[async_trait::async_trait]
+    impl Model for TreeCaptureModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.0.lock().unwrap().push(request.messages);
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("done".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+    #[tokio::test]
+    async fn before_tree_queued_messages_survive_checkout_cancel_and_reopen() {
+        for cancel_tree in [false, true] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tree-messages.jsonl");
+            let mut session =
+                SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                    .extension(Arc::new(BeforeTreeMessages {
+                        cancel: cancel_tree,
+                        trigger: true,
+                    }))
+                    .unwrap()
+                    .open(&path)
+                    .unwrap();
+            session.prompt("first").await.unwrap();
+            let selected = session
+                .journal()
+                .records()
+                .iter()
+                .find(|record| matches!(record.event, crate::Event::User { .. }))
+                .unwrap()
+                .id;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                session.navigate_tree(selected, crate::TreeNavigationOptions::default()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(matches!(result, Err(Error::Cancelled)), cancel_tree);
+            assert!(session.journal().pending_custom_trigger().is_none());
+            assert_eq!(
+                session
+                    .journal()
+                    .records()
+                    .iter()
+                    .filter(|record| matches!(&record.event,
+                crate::Event::CustomMessage { message } if message.custom_type == "tree-before"))
+                    .count(),
+                2
+            );
+            let snapshots = requests.lock().unwrap();
+            assert_eq!(snapshots.len(), 2);
+            let texts: Vec<_> = snapshots[1]
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(texts.ends_with(&["tree trigger", "tree next"]), "{texts:?}");
+            drop(snapshots);
+            drop(session);
+            let restored = Session::open(&path).unwrap();
+            assert!(restored.pending_custom_trigger().is_none());
+            assert!(restored.queued_custom_messages().is_empty());
+            assert_eq!(restored.records().iter().filter(|record| matches!(&record.event,
+                crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "tree-before")).count(), 2);
+        }
+    }
+    #[tokio::test]
+    async fn before_tree_next_turn_survives_checkout_reopen_and_later_branch_switch() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tree-next.jsonl");
+        let mut session =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .extension(Arc::new(BeforeTreeMessages {
+                    cancel: false,
+                    trigger: false,
+                }))
+                .unwrap()
+                .open(&path)
+                .unwrap();
+        session.prompt("first").await.unwrap();
+        let selected = session
+            .journal()
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, crate::Event::User { .. }))
+            .unwrap()
+            .id;
+        session
+            .navigate_tree(selected, crate::TreeNavigationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(session.journal().queued_custom_messages().len(), 1);
+        let fork = session.fork_at(session.journal().head()).unwrap();
+        assert_eq!(fork.journal().queued_custom_messages().len(), 1);
+        drop(fork);
+        drop(session);
+        let mut reopened =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .open(&path)
+                .unwrap();
+        reopened.prompt("second").await.unwrap();
+        let snapshots = requests.lock().unwrap();
+        let texts: Vec<_> = snapshots[1]
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.ends_with(&["second", "tree next"]), "{texts:?}");
+        drop(snapshots);
+        reopened.checkout(selected).unwrap();
+        assert!(reopened.journal().queued_custom_messages().is_empty());
+    }
     struct TreeLifecycleMessage;
     #[async_trait::async_trait]
     impl Extension for TreeLifecycleMessage {

@@ -2786,8 +2786,8 @@ and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
 `agent_settled`; and SDK-owned session and model-selection notifications,
-including active control rename and post-navigation `session_tree`
-notifications. SDK and workbench transition
+including active control rename, pre-navigation `session_before_tree` and
+post-navigation `session_tree` notifications. SDK and workbench transition
 checks, workbench resource discovery, and user-bash replacement, operation
 selection, and streamed execution hooks also service messages through the
 session owner. Streamed output and message calls share the negotiated process
@@ -2799,6 +2799,9 @@ also its run ID. Reopening a session resumes an interrupted triggered run with
 that same ID and does not redeliver its message or repeat a recorded answer.
 Reentrant sends are serviced by the journal owner while the callback waits.
 Separately built extensions negotiate the individual callback capabilities.
+Messages queued by `session_before_tree` are session-wide: they survive a
+checkout, reopening, and an exported fork, and are consumed once across branch
+switches. Immediate idle messages remain on the branch where they were sent.
 
 Focused tests cover queue and tool-result ordering, callback reentrancy,
 initial and streaming input, provider-request delivery, session start and
@@ -2846,8 +2849,7 @@ order; it is covered for both user and custom starting messages. Host-aware
 `before_tool` policies can opt in with
 `handles_before_tool_host`; separately built extensions negotiate this support.
 Host calls also remain unavailable in idle `SessionControl` input hooks,
-the synchronous `before_compaction` and `after_compaction` hooks, and
-pre-navigation `session_before_tree` hooks. Async `session_compact` and
+and the synchronous `before_compaction` and `after_compaction` hooks. Async `session_compact` and
 `session_compact_failed` notifications can send through the session owner.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The

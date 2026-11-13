@@ -338,6 +338,8 @@ struct Description {
     #[serde(default)]
     transition_hook_host_calls: bool,
     #[serde(default)]
+    tree_hook_host_calls: bool,
+    #[serde(default)]
     resources_hook_host_calls: bool,
     #[serde(default)]
     user_bash_hook_host_calls: bool,
@@ -889,6 +891,28 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn before_tree_with_host(
+        &self,
+        preparation: &TreePreparation,
+        state: Option<&ExtensionState>,
+        cancel: &CancellationToken,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<TreeDecision>> {
+        if !self.description.tree_hook_host_calls {
+            return self.before_tree(preparation, state, cancel).await;
+        }
+        let request = ProtocolRequest::BeforeTree {
+            preparation: preparation.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     fn migrate(
         &self,
@@ -2368,6 +2392,7 @@ async fn dispatch_with_host(
             input_hook_host_calls: true,
             context_hook_host_calls: true,
             transition_hook_host_calls: true,
+            tree_hook_host_calls: true,
             resources_hook_host_calls: true,
             user_bash_hook_host_calls: true,
             user_bash_stream_host_calls: true,
@@ -2499,11 +2524,22 @@ async fn dispatch_with_host(
                 .cache_warming_decision(&event, state.as_ref())
                 .await,
         ),
-        ProtocolRequest::BeforeTree { preparation, state } => encode(
-            extension
-                .before_tree(&preparation, state.as_ref(), &CancellationToken::new())
-                .await,
-        ),
+        ProtocolRequest::BeforeTree { preparation, state } => {
+            let cancel = CancellationToken::new();
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .before_tree_with_host(&preparation, state.as_ref(), &cancel, host)
+                        .await,
+                )
+            } else {
+                encode(
+                    extension
+                        .before_tree(&preparation, state.as_ref(), &cancel)
+                        .await,
+                )
+            }
+        }
         ProtocolRequest::BeforeSessionTransition { event, state } => {
             if host.supports_custom_messages() {
                 encode(
@@ -3439,7 +3475,7 @@ else:
 import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     json.load(sys.stdin)
-    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
@@ -3457,6 +3493,7 @@ else:
         result=0
     elif kind=='discover_resources': result={'skillPaths':[],'promptPaths':['fixture.md'],'themePaths':[]}
     elif kind=='before_session_transition': result=False
+    elif kind=='before_tree': result=None
     elif kind=='before_tool': result={'allow':True,'reason':None}
     elif kind=='tool_call': result=[r['arguments'],{'allow':True,'reason':None}]
     elif kind=='tool_result': result=None
@@ -3515,6 +3552,27 @@ else:
                 .user_bash_operations_with_host(&bash, None, host.clone())
                 .await
                 .unwrap()
+        );
+        assert!(
+            extension
+                .before_tree_with_host(
+                    &TreePreparation {
+                        target_id: 3,
+                        old_leaf_id: 5,
+                        common_ancestor_id: Some(2),
+                        entries_to_summarize: Vec::new(),
+                        user_wants_summary: false,
+                        custom_instructions: None,
+                        replace_instructions: false,
+                        label: None,
+                    },
+                    None,
+                    &CancellationToken::new(),
+                    host.clone()
+                )
+                .await
+                .unwrap()
+                .is_none()
         );
         let (output, mut received) = tokio::sync::mpsc::channel(4);
         assert_eq!(
@@ -3597,7 +3655,7 @@ else:
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 11);
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 12);
     }
 
     #[tokio::test]
