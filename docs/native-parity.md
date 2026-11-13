@@ -2822,6 +2822,9 @@ answer or advancing the tool turn, then applies deferred context once. Journal
 version 3 identifies turns that use these boundaries. An older assistant record
 without a completion marker is treated as already observed: older journals
 cannot distinguish a completed callback from one interrupted before completion.
+Before a new run starts, unfinished earlier turn boundaries are resolved and
+their deferred messages are applied; legacy deferred messages are applied
+before the next request without replaying the legacy callback.
 
 Exactly-once recovery is not possible for unkeyed callback sends when a process
 stops between sends or the callback takes a different path. Ordinary Pi-style

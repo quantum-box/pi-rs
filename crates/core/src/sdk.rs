@@ -4413,6 +4413,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_run_finishes_cancelled_trigger_turn_end_before_deferred_delivery() {
+        let hook = Arc::new(TurnEndRecoveryHook {
+            before_first: false,
+            calls: AtomicUsize::new(0),
+            paused: tokio::sync::Notify::new(),
+        });
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let model = EchoModel(AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let old_run = Uuid::new_v4();
+        let initial = crate::CustomMessage {
+            custom_type: "trigger".into(),
+            content: crate::ContextContent::Text("start".into()),
+            display: false,
+            details: None,
+        };
+        session
+            .append(crate::Event::CustomMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: old_run,
+                    message: initial.clone(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(old_run));
+        session
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session
+            .append(crate::Event::CustomMessageDelivered {
+                id: old_run,
+                message: initial,
+            })
+            .unwrap();
+        let assistant_record = session
+            .append(crate::Event::Assistant {
+                content: "old answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap()
+            .id;
+        session.set_run_id(None);
+        let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(16);
+        let cancel = CancellationToken::new();
+        let mut observer = |_: Notification<'_>| {};
+        let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(
+                agent.run_correlated(
+                    &mut session,
+                    old_run,
+                    None,
+                    &mut inputs,
+                    &cancel,
+                    &mut observer
+                ),
+                async {
+                    hook.paused.notified().await;
+                    cancel.cancel();
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(first, Err(Error::Cancelled)));
+        assert!(session.pending_custom_trigger().is_none());
+        let mut restored = Session::from_records(session.records().to_vec()).unwrap();
+        let new_run = Uuid::new_v4();
+        agent
+            .run_correlated(
+                &mut restored,
+                new_run,
+                Some("new prompt".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let records = restored.records();
+        let completed = records.iter().position(|record| matches!(record.event, crate::Event::TurnEndCallbacksCompleted { assistant_record: id } if id == assistant_record)).unwrap();
+        let delivered = records.iter().position(|record| matches!(&record.event, crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "turn-end-recovery")).unwrap();
+        let user = records.iter().position(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "new prompt")).unwrap();
+        assert!(completed < delivered && delivered < user);
+        assert_eq!(records.iter().filter(|record| record.run_id == Some(old_run) && matches!(&record.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "turn-end-recovery")).count(), 2);
+    }
+
+    #[tokio::test]
     async fn unfinished_turn_end_runs_before_recovered_tool_turn_advances() {
         let hook = Arc::new(TurnEndRecoveryHook {
             before_first: false,
@@ -4565,6 +4666,116 @@ mod tests {
                 crate::Event::TurnEndCallbacksCompleted { .. }
             ))
         );
+    }
+
+    struct LegacyDeferredModel;
+    #[async_trait::async_trait]
+    impl Model for LegacyDeferredModel {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            let tool = request.messages.iter().position(|message| matches!(message, Message::Tool { content, .. } if content == "job result")).unwrap();
+            let deferred = request.messages.iter().position(|message| matches!(message, Message::User { content } if content == "legacy deferred")).unwrap();
+            assert!(tool < deferred);
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("done".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+    #[tokio::test]
+    async fn legacy_tool_turn_delivers_deferred_context_before_next_request() {
+        let hook = Arc::new(TurnEndRecoveryHook {
+            before_first: false,
+            calls: AtomicUsize::new(1),
+            paused: tokio::sync::Notify::new(),
+        });
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let agent = Agent {
+            model: &LegacyDeferredModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut original = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        original.set_run_id(Some(run_id));
+        original
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: Some("prompt".into()),
+            })
+            .unwrap();
+        original
+            .append(crate::Event::User {
+                content: "prompt".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        original
+            .append(crate::Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "job-call".into(),
+                        name: "job".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        original
+            .append(crate::Event::ToolStarted { operation_id })
+            .unwrap();
+        original
+            .append(crate::Event::ToolFinished {
+                operation_id,
+                outcome: crate::Outcome::Succeeded("job result".into()),
+                states: Default::default(),
+            })
+            .unwrap();
+        original
+            .append(crate::Event::CustomMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    delivery: crate::CustomMessageDelivery::AfterTurn,
+                    message: crate::CustomMessage {
+                        custom_type: "legacy".into(),
+                        content: crate::ContextContent::Text("legacy deferred".into()),
+                        display: false,
+                        details: None,
+                    },
+                },
+            })
+            .unwrap();
+        let mut records = original.records().to_vec();
+        for record in &mut records {
+            record.version = 2;
+        }
+        let mut restored = Session::from_records(records).unwrap();
+        let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
+        assert_eq!(
+            agent
+                .run_correlated(
+                    &mut restored,
+                    run_id,
+                    None,
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -232,6 +232,8 @@ impl Agent<'_> {
                 return Err(Error::DuplicateRun(run_id));
             }
         }
+        self.resolve_prior_turn_end(session, run_id, cancel, observer)
+            .await?;
         session.set_run_id(Some(run_id));
         observer(Notification::RunStarted { run_id });
         let result = self
@@ -248,6 +250,19 @@ impl Agent<'_> {
             let Some(trigger_id) = session.pending_custom_trigger() else {
                 break;
             };
+            if let Err(error) = self
+                .resolve_prior_turn_end(session, trigger_id, cancel, observer)
+                .await
+            {
+                observer(Notification::RunStarted { run_id: trigger_id });
+                let message = error.to_string();
+                observer(Notification::RunEnded {
+                    run_id: trigger_id,
+                    succeeded: false,
+                    error: Some(&message),
+                });
+                break;
+            }
             session.set_run_id(Some(trigger_id));
             observer(Notification::RunStarted { run_id: trigger_id });
             let trigger_result = self
@@ -361,9 +376,8 @@ impl Agent<'_> {
         {
             result = Err(error);
         }
-        if ensure_settled(session.operations()).is_ok() && !has_unfinished_turn_end(session, run_id)
-        {
-            apply_custom_boundary(session, crate::CustomMessageDelivery::AfterTurn, observer)?;
+        if ensure_settled(session.operations()).is_ok() {
+            apply_settled_after_turn(session, observer)?;
         }
         let state = match &result {
             Ok(_) => RunState::Completed,
@@ -529,6 +543,183 @@ impl Agent<'_> {
         Ok(())
     }
 
+    async fn resolve_prior_turn_end(
+        &self,
+        session: &mut Session,
+        incoming_run: Uuid,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let branch = session.branch();
+        let pending = session.queued_custom_messages();
+        let previous: Vec<_> = branch
+            .iter()
+            .filter_map(|record| {
+                let run_id = record.run_id.filter(|id| *id != incoming_run)?;
+                if !matches!(record.event, Event::Assistant { .. })
+                    || branch.iter().any(|entry| {
+                        matches!(entry.event,
+                Event::TurnEndBoundaryApplied { assistant_record } if assistant_record == record.id)
+                    })
+                {
+                    return None;
+                }
+                if record.version < crate::journal::TURN_END_JOURNAL_VERSION {
+                    let later = branch.iter().any(|entry| {
+                        entry.id > record.id
+                            && entry.run_id == Some(run_id)
+                            && matches!(entry.event, Event::Assistant { .. })
+                    });
+                    let has_deferred = pending.iter().any(|(id, message)| {
+                        message.delivery == crate::CustomMessageDelivery::AfterTurn
+                            && session.records()[(*id - 1) as usize].run_id == Some(run_id)
+                    });
+                    if later || !has_deferred {
+                        return None;
+                    }
+                }
+                Some((run_id, record.id, record.version))
+            })
+            .collect();
+        for (run_id, assistant_record, version) in previous {
+            session.set_run_id(Some(run_id));
+            let result = async {
+                let mut states = self.migrate(session, observer)?;
+                match recover(session, observer) {
+                    Ok(()) => {}
+                    Err(Error::PendingOperation(_)) => {
+                        if let Some((invocation, _)) =
+                            session
+                                .operations()
+                                .into_iter()
+                                .find(|(invocation, state)| {
+                                    matches!(
+                                        state,
+                                        OperationState::Finished(Outcome::Pending { .. })
+                                    ) && !self
+                                        .registry
+                                        .tools
+                                        .get(&invocation.call.name)
+                                        .is_some_and(|tool| tool.tool.can_poll())
+                                })
+                        {
+                            return Err(Error::PendingOperation(invocation.operation_id));
+                        }
+                        self.poll_pending(session, &mut states, cancel, observer, None)
+                            .await?;
+                        recover(session, observer)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+                self.finish_recovered_turn_end(
+                    session,
+                    run_id,
+                    assistant_record,
+                    version,
+                    &states,
+                    cancel,
+                    observer,
+                )
+                .await
+            }
+            .await;
+            session.set_run_id(None);
+            result?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_recovered_turn_end(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        assistant_record: u64,
+        version: u32,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let completed = session.branch().iter().any(|record| {
+            matches!(record.event,
+            Event::TurnEndCallbacksCompleted { assistant_record: id } if id == assistant_record)
+        });
+        if !completed && version >= crate::journal::TURN_END_JOURNAL_VERSION {
+            if crate::lifecycle::enabled(self.registry) {
+                let next_assistant = session.branch().iter().find_map(|record| {
+                    (record.id > assistant_record
+                        && record.run_id == Some(run_id)
+                        && matches!(record.event, Event::Assistant { .. }))
+                    .then_some(record.id)
+                });
+                let turn_index = session
+                    .branch()
+                    .iter()
+                    .filter(|record| {
+                        record.id <= assistant_record
+                            && record.run_id == Some(run_id)
+                            && matches!(record.event, Event::Assistant { .. })
+                    })
+                    .count()
+                    .saturating_sub(1) as u32;
+                let messages = crate::lifecycle::messages(session, |id| {
+                    id >= assistant_record
+                        && next_assistant.is_none_or(|end| id < end)
+                        && session
+                            .records()
+                            .get((id - 1) as usize)
+                            .is_some_and(|record| record.run_id == Some(run_id))
+                });
+                self.observe_active_lifecycle(
+                    session,
+                    crate::LifecycleEvent::TurnEnd {
+                        run_id,
+                        turn_index,
+                        messages,
+                    },
+                    states,
+                    cancel,
+                    observer,
+                )
+                .await?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+            }
+            commit(
+                session,
+                Event::TurnEndCallbacksCompleted { assistant_record },
+                observer,
+            )?;
+        }
+        let next_request = session.branch().iter().find_map(|record| {
+            (record.id > assistant_record
+                && record.run_id == Some(run_id)
+                && matches!(record.event, Event::ModelRequested { .. }))
+            .then_some(record.id)
+        });
+        for (queued_at, pending) in session.queued_custom_messages() {
+            if pending.delivery == crate::CustomMessageDelivery::AfterTurn
+                && session.records()[(queued_at - 1) as usize].run_id == Some(run_id)
+                && next_request.is_none_or(|boundary| queued_at < boundary)
+            {
+                commit(
+                    session,
+                    Event::CustomMessageDelivered {
+                        id: pending.id,
+                        message: pending.message,
+                    },
+                    observer,
+                )?;
+            }
+        }
+        commit(
+            session,
+            Event::TurnEndBoundaryApplied { assistant_record },
+            observer,
+        )
+    }
+
     async fn drive<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
@@ -570,28 +761,10 @@ impl Agent<'_> {
                 (record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. }))
                     .then_some((record.id, record.version))
             })
+            && !session.branch().iter().any(|record| matches!(record.event,
+                Event::TurnEndBoundaryApplied { assistant_record: applied } if applied == assistant_record))
         {
-            if !session.branch().iter().any(|record| matches!(record.event,
-                Event::TurnEndCallbacksCompleted { assistant_record: completed } if completed == assistant_record))
-                && version >= crate::journal::TURN_END_JOURNAL_VERSION {
-                if crate::lifecycle::enabled(self.registry) {
-                    let messages = crate::lifecycle::messages(session, |id| id >= assistant_record);
-                    self.observe_active_lifecycle(session, crate::LifecycleEvent::TurnEnd {
-                        run_id,
-                        turn_index: completed_run_turns(session, run_id).saturating_sub(1),
-                        messages,
-                    }, &states, cancel, observer).await?;
-                    if cancel.is_cancelled() { return Err(Error::Cancelled); }
-                }
-                commit(session, Event::TurnEndCallbacksCompleted { assistant_record }, observer)?;
-            }
-            if (version >= crate::journal::TURN_END_JOURNAL_VERSION || session.branch().iter().any(|record| matches!(record.event,
-                Event::TurnEndCallbacksCompleted { assistant_record: completed } if completed == assistant_record)))
-                && !session.branch().iter().any(|record| matches!(record.event,
-                Event::TurnEndBoundaryApplied { assistant_record: applied } if applied == assistant_record)) {
-                apply_custom_boundary(session, crate::CustomMessageDelivery::AfterTurn, observer)?;
-                commit(session, Event::TurnEndBoundaryApplied { assistant_record }, observer)?;
-            }
+            self.finish_recovered_turn_end(session, run_id, assistant_record, version, &states, cancel, observer).await?;
         }
         // The trigger UUID is its run ID, so a restart resumes the same run.
         if let Some((_, message)) =
@@ -634,8 +807,10 @@ impl Agent<'_> {
         // A prior interrupted run may have left deferred messages while a tool
         // needed reconciliation. Recovery above must finish before they appear.
         for (queued_at, deferred) in session.queued_custom_messages() {
+            let origin = session.records()[(queued_at - 1) as usize].run_id;
             if deferred.delivery == crate::CustomMessageDelivery::AfterTurn
-                && session.records()[(queued_at - 1) as usize].run_id != Some(run_id)
+                && origin != Some(run_id)
+                && !origin.is_some_and(|id| has_unfinished_turn_end(session, id))
             {
                 commit(
                     session,
@@ -1069,7 +1244,7 @@ impl Agent<'_> {
             )?;
             // Context-only messages must follow every tool result in the turn,
             // but do not themselves cause another model request.
-            apply_custom_boundary(session, crate::CustomMessageDelivery::AfterTurn, observer)?;
+            apply_settled_after_turn(session, observer)?;
             commit(
                 session,
                 Event::TurnEndBoundaryApplied { assistant_record },
@@ -3780,13 +3955,12 @@ pub(crate) fn queue_custom_message(
     Ok(())
 }
 
-pub(crate) fn apply_custom_boundary(
-    session: &mut Session,
-    delivery: crate::CustomMessageDelivery,
-    observer: &mut Observer<'_>,
-) -> Result<()> {
-    for (_, input) in session.queued_custom_messages() {
-        if input.delivery == delivery {
+fn apply_settled_after_turn(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
+    for (queued_at, input) in session.queued_custom_messages() {
+        let origin = session.records()[(queued_at - 1) as usize].run_id;
+        if input.delivery == crate::CustomMessageDelivery::AfterTurn
+            && !origin.is_some_and(|run_id| has_unfinished_turn_end(session, run_id))
+        {
             commit(
                 session,
                 Event::CustomMessageDelivered {

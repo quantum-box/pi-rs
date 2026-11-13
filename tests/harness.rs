@@ -2596,7 +2596,7 @@ fn project_skill_resolution_validates_version_and_scope() {
 }
 
 #[test]
-fn v1_journal_is_preserved_when_v2_appends() {
+fn v1_journal_is_preserved_when_v3_appends() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("legacy.jsonl");
     let session_id = uuid::Uuid::new_v4();
@@ -2612,7 +2612,7 @@ fn v1_journal_is_preserved_when_v2_appends() {
     let mut session = Session::open(&path).unwrap();
     assert_eq!(session.session_id(), session_id);
     session.checkout(1).unwrap();
-    assert_eq!(session.records().last().unwrap().version, 2);
+    assert_eq!(session.records().last().unwrap().version, 3);
     drop(session);
     assert!(
         std::fs::read_to_string(&path)
