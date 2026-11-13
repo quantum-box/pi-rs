@@ -4162,6 +4162,7 @@ impl ToolHost for LifecycleMessageHost {
     }
 }
 
+#[derive(Clone)]
 struct NestedHost {
     ui: Option<Arc<dyn crate::ExtensionUi>>,
     requests: mpsc::Sender<Vec<NestedRequest>>,
@@ -4172,6 +4173,7 @@ struct NestedHost {
     call_count: Arc<AtomicUsize>,
     progress: Option<ProgressReporter>,
 }
+#[derive(Clone)]
 struct ProgressReporter {
     sender: ProgressSink,
     tool_call_id: String,
@@ -4179,6 +4181,7 @@ struct ProgressReporter {
     args: serde_json::Value,
     parent_tool_call_id: Option<String>,
 }
+#[derive(Clone)]
 enum ProgressSink {
     Turn(mpsc::Sender<TurnProgress>),
 }
@@ -4290,6 +4293,18 @@ impl ToolHost for NestedHost {
         self.call_batch(vec![(name.into(), arguments)])
             .await
             .remove(0)
+    }
+    async fn call_with_cancellation(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        cancellation: CancellationToken,
+    ) -> Outcome {
+        let scoped = Self {
+            cancellation,
+            ..self.clone()
+        };
+        scoped.call(name, arguments).await
     }
     async fn call_batch(&self, calls: Vec<(String, serde_json::Value)>) -> Vec<Outcome> {
         let mut requests = Vec::new();
@@ -5464,6 +5479,54 @@ mod tree_tests {
 #[cfg(test)]
 mod nested_host_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invocation_cancellation_reaches_queued_write_behind_active_call() {
+        let (requests, mut incoming) = mpsc::channel(4);
+        let parent = CancellationToken::new();
+        let invocation = parent.child_token();
+        let host = Arc::new(NestedHost {
+            ui: None,
+            progress: None,
+            requests,
+            specs: Arc::new(vec![]),
+            parent_operation: Uuid::new_v4(),
+            cancellation: parent.clone(),
+            depth: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+        });
+        let first = tokio::spawn({
+            let host = host.clone();
+            let token = invocation.clone();
+            async move {
+                host.call_with_cancellation("hold", serde_json::json!({}), token)
+                    .await
+            }
+        });
+        let mut active = incoming.recv().await.unwrap();
+        let second = tokio::spawn({
+            let host = host.clone();
+            let token = invocation.clone();
+            async move {
+                host.call_with_cancellation("write", serde_json::json!({}), token)
+                    .await
+            }
+        });
+        let mut queued = incoming.recv().await.unwrap();
+        let active = active.remove(0);
+        let queued = queued.remove(0);
+        assert_eq!(active.name, "hold");
+        assert_eq!(queued.name, "write");
+        invocation.cancel();
+        assert!(!parent.is_cancelled());
+        assert!(active.cancellation.is_cancelled());
+        assert!(
+            queued.cancellation.is_cancelled(),
+            "queued write must be cancelled before it can dispatch"
+        );
+        first.await.unwrap();
+        second.await.unwrap();
+    }
 
     #[tokio::test]
     async fn cancellation_releases_dispatched_batch_and_preserves_ready_results() {

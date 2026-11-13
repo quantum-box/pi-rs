@@ -463,6 +463,7 @@ fn install_globals(
     let model_usage = sink.clone();
     let tool_output = sink.clone();
     let output_cancel = cancellation.clone();
+    let model_cancel = cancellation.clone();
     globals.set(
         "__emit",
         Func::from(move |kind: String, value: String| {
@@ -486,6 +487,7 @@ fn install_globals(
             let model_host = model_host.clone();
             let slots = model_slots.clone();
             let model_usage = model_usage.clone();
+            let cancellation = model_cancel.clone();
             async move {
                 let result = match serde_json::from_str::<Value>(&arguments) {
                     Ok(args) if has_operations => {
@@ -496,7 +498,9 @@ fn install_globals(
                                     .to_string(),
                             );
                         }
-                        let outcome = model_host.call(MODEL_OPERATION, args).await;
+                        let outcome = model_host
+                            .call_with_cancellation(MODEL_OPERATION, args, cancellation)
+                            .await;
                         if let Some(usage) = ModelUsage::from_outcome(&outcome) {
                             model_usage
                                 .lock()
@@ -519,6 +523,7 @@ fn install_globals(
         Func::from(Async(move |name: String, arguments: String| {
             let host = host.clone();
             let output = tool_output.clone();
+            let cancellation = cancellation.clone();
             async move {
                 if output.lock().expect("codemode output").limit_exceeded {
                     return Ok::<_, rquickjs::Error>(
@@ -534,7 +539,10 @@ fn install_globals(
                     {
                         json!({"ok":false,"error":"This tool is not callable from a script"})
                     }
-                    Ok(arguments) => tool_value(host.call(&name, arguments).await),
+                    Ok(arguments) => tool_value(
+                        host.call_with_cancellation(&name, arguments, cancellation)
+                            .await,
+                    ),
                     Err(error) => json!({"ok":false,"error":error.to_string()}),
                 };
                 Ok::<_, rquickjs::Error>(result.to_string())
@@ -1360,6 +1368,66 @@ mod tests {
             matches!(reply.outcome, Outcome::Failed(message) if message.contains("Script output limit exceeded"))
         );
         assert!(reply.state.is_none());
+    }
+    #[tokio::test]
+    async fn output_breach_cancels_tokens_of_already_queued_calls() {
+        struct QueuedHost {
+            tokens: Mutex<Vec<pi_rs_core::CancellationToken>>,
+            changed: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for QueuedHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                ["hold", "write", "ready"]
+                    .into_iter()
+                    .map(|name| ToolSpec {
+                        name: name.into(),
+                        description: String::new(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("codemode must pass its invocation cancellation token")
+            }
+            async fn call_with_cancellation(
+                &self,
+                name: &str,
+                _: Value,
+                cancellation: pi_rs_core::CancellationToken,
+            ) -> Outcome {
+                if name == "ready" {
+                    loop {
+                        let notified = self.changed.notified();
+                        if self.tokens.lock().unwrap().len() == 2 {
+                            break;
+                        }
+                        notified.await;
+                    }
+                    return Outcome::Succeeded("queued".into());
+                }
+                self.tokens.lock().unwrap().push(cancellation.clone());
+                self.changed.notify_one();
+                cancellation.cancelled().await;
+                Outcome::Skipped("cancelled".into())
+            }
+        }
+        let host = Arc::new(QueuedHost {
+            tokens: Mutex::new(vec![]),
+            changed: tokio::sync::Notify::new(),
+        });
+        let parent = pi_rs_core::CancellationToken::new();
+        let reply = tokio::time::timeout(Duration::from_secs(10), ScriptTool { timeout: None }.invoke_transaction(
+            json!({"code":"tools.hold({}); tools.write({}); await tools.ready({}); try { text('x'.repeat(16 * 1024 * 1024 + 1)); } catch (_) {}"}),
+            ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: parent.clone() }, None, host.clone(),
+        )).await.expect("script stalled before output breach");
+        assert!(
+            matches!(reply.outcome, Outcome::Failed(message) if message.contains("Script output limit exceeded"))
+        );
+        assert!(!parent.is_cancelled());
+        let tokens = host.tokens.lock().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().all(|token| token.is_cancelled()));
     }
     #[test]
     fn deadline_interrupts_busy_loops_and_unresolved_promises() {
