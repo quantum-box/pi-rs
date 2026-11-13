@@ -21,7 +21,7 @@ fn home() -> Option<std::ffi::OsString> {
     home
 }
 
-fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
+pub(super) fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
     let value: String = value
         .chars()
         .map(|ch| match ch {

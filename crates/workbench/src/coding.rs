@@ -38,6 +38,7 @@ pub struct CodingTools {
     edit_operations: Option<Arc<dyn EditOperations>>,
     edit_options: EditToolOptions,
     shell_outputs: ShellOutputStore,
+    remote_home: Option<PathBuf>,
 }
 
 impl CodingTools {
@@ -59,6 +60,7 @@ impl CodingTools {
             edit_operations: None,
             edit_options: EditToolOptions::default(),
             shell_outputs: ShellOutputStore::default(),
+            remote_home: None,
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -128,6 +130,14 @@ impl CodingTools {
             ));
         }
         self.edit_operations = Some(operations);
+        Ok(self)
+    }
+
+    /// Configure `~` for injected file operations in the backend namespace.
+    /// Local tools continue to use the host home directory.
+    pub fn with_remote_home(mut self, home: Option<PathBuf>) -> Result<Self> {
+        validate_remote_home(home.as_deref())?;
+        self.remote_home = home;
         Ok(self)
     }
 
@@ -494,6 +504,7 @@ impl Extension for CodingTools {
                         tool,
                         operations: operations.clone(),
                         shell_outputs: self.shell_outputs.clone(),
+                        remote_home: self.remote_home.clone(),
                     }) as Arc<dyn Tool>
                 } else if matches!(kind, Kind::Write)
                     && let Some(operations) = &self.write_operations
@@ -501,6 +512,7 @@ impl Extension for CodingTools {
                     Arc::new(RemoteWriteTool {
                         tool,
                         operations: operations.clone(),
+                        remote_home: self.remote_home.clone(),
                     }) as Arc<dyn Tool>
                 } else if matches!(kind, Kind::Edit)
                     && let Some(operations) = &self.edit_operations
@@ -509,6 +521,7 @@ impl Extension for CodingTools {
                         tool,
                         operations: operations.clone(),
                         options: self.edit_options,
+                        remote_home: self.remote_home.clone(),
                     }) as Arc<dyn Tool>
                 } else if matches!(kind, Kind::Bash)
                     && let Some(operations) = &self.bash_operations
@@ -611,10 +624,26 @@ impl ReadOperations for LocalReadOperations {
     }
 }
 
+/// Path configuration shared by injected read, write and edit tools.
+/// `None` rejects home-relative paths; the host home is never inferred.
+#[derive(Clone, Debug, Default)]
+pub struct RemotePathOptions {
+    pub remote_home: Option<PathBuf>,
+}
+
+fn validate_remote_home(home: Option<&Path>) -> Result<()> {
+    if home.is_some_and(|home| !home.is_absolute()) {
+        return Err(Error::Config(
+            "remote home directory must be absolute".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Construct a model-facing read tool backed by custom operations. This factory
 /// uses Pi's unrestricted path semantics; the backend owns access enforcement.
 pub fn create_read_tool(root: &Path, operations: Arc<dyn ReadOperations>) -> Result<Arc<dyn Tool>> {
-    create_read_tool_with_shell_outputs(root, operations, ShellOutputStore::default())
+    create_read_tool_with_options(root, operations, RemotePathOptions::default())
 }
 
 /// Construct a read tool with access to transcripts from shell tools sharing `outputs`.
@@ -623,6 +652,26 @@ pub fn create_read_tool_with_shell_outputs(
     operations: Arc<dyn ReadOperations>,
     outputs: ShellOutputStore,
 ) -> Result<Arc<dyn Tool>> {
+    create_read_tool_with_options_and_shell_outputs(root, operations, RemotePathOptions::default(), outputs)
+}
+
+/// Construct an injected read tool with an explicit backend home.
+pub fn create_read_tool_with_options(
+    root: &Path,
+    operations: Arc<dyn ReadOperations>,
+    options: RemotePathOptions,
+) -> Result<Arc<dyn Tool>> {
+    create_read_tool_with_options_and_shell_outputs(root, operations, options, ShellOutputStore::default())
+}
+
+/// Configure backend paths and a shared shell transcript store together.
+pub fn create_read_tool_with_options_and_shell_outputs(
+    root: &Path,
+    operations: Arc<dyn ReadOperations>,
+    options: RemotePathOptions,
+    outputs: ShellOutputStore,
+) -> Result<Arc<dyn Tool>> {
+    validate_remote_home(options.remote_home.as_deref())?;
     if !root.is_absolute() {
         return Err(Error::Config(
             "remote working directory must be absolute".into(),
@@ -641,6 +690,7 @@ pub fn create_read_tool_with_shell_outputs(
         },
         operations,
         shell_outputs: outputs,
+        remote_home: options.remote_home,
     }))
 }
 
@@ -648,6 +698,7 @@ struct RemoteReadTool {
     tool: CodingTool,
     operations: Arc<dyn ReadOperations>,
     shell_outputs: ShellOutputStore,
+    remote_home: Option<PathBuf>,
 }
 
 // A blocking read cannot be interrupted in progress, but no further backend
@@ -695,7 +746,7 @@ impl Tool for RemoteReadTool {
         let _guard = cancellation.clone().drop_guard();
         let operation = async {
             let name = string(&args, "path")?.to_owned();
-            let input = crate::coding_paths::normalize(&name)?;
+            let input = crate::coding_paths::input(&name, self.remote_home.as_deref())?;
             let requested = crate::coding_paths::resolve(&self.tool.root, &input);
             let transcript = self
                 .shell_outputs
@@ -908,6 +959,16 @@ pub fn create_write_tool(
     root: &Path,
     operations: Arc<dyn WriteOperations>,
 ) -> Result<Arc<dyn Tool>> {
+    create_write_tool_with_options(root, operations, RemotePathOptions::default())
+}
+
+/// Construct an injected write tool with an explicit backend home.
+pub fn create_write_tool_with_options(
+    root: &Path,
+    operations: Arc<dyn WriteOperations>,
+    options: RemotePathOptions,
+) -> Result<Arc<dyn Tool>> {
+    validate_remote_home(options.remote_home.as_deref())?;
     if !root.is_absolute() {
         return Err(Error::Config(
             "remote working directory must be absolute".into(),
@@ -921,12 +982,14 @@ pub fn create_write_tool(
             kind: Kind::Write,
         },
         operations,
+        remote_home: options.remote_home,
     }))
 }
 
 struct RemoteWriteTool {
     tool: CodingTool,
     operations: Arc<dyn WriteOperations>,
+    remote_home: Option<PathBuf>,
 }
 
 // Local operations participate in the existing OS-file lock shared with edits.
@@ -1060,7 +1123,7 @@ impl Tool for RemoteWriteTool {
             let content = string(&args, "content")?.to_owned();
             let path = crate::coding_paths::resolve(
                 &self.tool.root,
-                &crate::coding_paths::normalize(&display)?,
+                &crate::coding_paths::input(&display, self.remote_home.as_deref())?,
             );
             let cancellation = context.cancellation.child_token();
             let _guard = cancellation.clone().drop_guard();
@@ -1220,6 +1283,17 @@ pub fn create_edit_tool_with_options(
     operations: Arc<dyn EditOperations>,
     options: EditToolOptions,
 ) -> Result<Arc<dyn Tool>> {
+    create_edit_tool_with_path_options(root, operations, options, RemotePathOptions::default())
+}
+
+/// Construct an injected edit tool with explicit backend path configuration.
+pub fn create_edit_tool_with_path_options(
+    root: &Path,
+    operations: Arc<dyn EditOperations>,
+    options: EditToolOptions,
+    paths: RemotePathOptions,
+) -> Result<Arc<dyn Tool>> {
+    validate_remote_home(paths.remote_home.as_deref())?;
     if !root.is_absolute() {
         return Err(Error::Config(
             "remote working directory must be absolute".into(),
@@ -1234,12 +1308,14 @@ pub fn create_edit_tool_with_options(
         },
         operations,
         options,
+        remote_home: paths.remote_home,
     }))
 }
 struct RemoteEditTool {
     tool: CodingTool,
     operations: Arc<dyn EditOperations>,
     options: EditToolOptions,
+    remote_home: Option<PathBuf>,
 }
 #[async_trait::async_trait]
 impl Tool for RemoteEditTool {
@@ -1260,7 +1336,7 @@ impl Tool for RemoteEditTool {
             let display = string(&args, "path")?.to_owned();
             let path = crate::coding_paths::resolve(
                 &self.tool.root,
-                &crate::coding_paths::normalize(&display)?,
+                &crate::coding_paths::input(&display, self.remote_home.as_deref())?,
             );
             let cancellation = context.cancellation.child_token();
             let _guard = cancellation.clone().drop_guard();

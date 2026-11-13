@@ -472,6 +472,13 @@ path semantics and the backend enforces its own access policy. Scoped
 custom operations because local canonicalization cannot establish remote
 symlink boundaries. This injection does not affect attachments or other tools.
 
+Injected read, write, and edit tools resolve `~` using an explicitly configured
+absolute backend home, never the host home. Use `CodingTools::with_remote_home`
+or `RemotePathOptions` with the standalone factories. If no backend home is
+configured, home-relative paths fail before invoking backend operations. Local
+tools retain their existing host-home behavior. Backends remain responsible for
+access control and their own path namespace.
+
 
 ### Remote model write operations
 
