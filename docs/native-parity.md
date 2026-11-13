@@ -426,6 +426,10 @@ listing/reading. Configuration can reference environment variables or bounded
 credential commands. Server processes are isolated into process groups/jobs,
 and the CLI closes connections after each run.
 
+Resource and template listings omit MCP App `ui://` entries and entries with the
+`mcp-app` MIME profile, along with listing icons and `_meta`, as in Pi. Native
+resource tools remain namespaced per server and aggregate that server's pages.
+
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials
 were absent from captured CLI output.

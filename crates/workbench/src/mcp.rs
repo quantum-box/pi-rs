@@ -1243,14 +1243,16 @@ impl McpTool {
         match self.remote_name.as_str() {
             "list_resources" => {
                 let resources = service.list_all_resources().await.map_err(call_error)?;
-                Ok(json!({"resources":resources}))
+                Ok(json!({"resources": visible_resource_listing(serde_json::to_value(resources)?)}))
             }
             "list_resource_templates" => {
                 let templates = service
                     .list_all_resource_templates()
                     .await
                     .map_err(call_error)?;
-                Ok(json!({"resourceTemplates":templates}))
+                Ok(
+                    json!({"resourceTemplates": visible_resource_listing(serde_json::to_value(templates)?)}),
+                )
             }
             "list_prompts" => {
                 let prompts = service.list_all_prompts().await.map_err(call_error)?;
@@ -1281,6 +1283,33 @@ impl McpTool {
             _ => Err(Error::Config("unknown MCP resource operation".into()).into()),
         }
     }
+}
+
+/// MCP App UIs are not model-readable resources; omit their presentation metadata too.
+fn visible_resource_listing(value: Value) -> Vec<Value> {
+    static APP_PROFILE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i);\s*profile\s*=\s*"?mcp-app"?"#).expect("MCP App MIME profile")
+    });
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let mut entry = entry.as_object()?.clone();
+            let uri = entry
+                .get("uri")
+                .or_else(|| entry.get("uriTemplate"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let mime = entry.get("mimeType").and_then(Value::as_str).unwrap_or("");
+            if uri.starts_with("ui://") || APP_PROFILE.is_match(mime) {
+                return None;
+            }
+            entry.remove("_meta");
+            entry.remove("icons");
+            Some(Value::Object(entry))
+        })
+        .collect()
 }
 fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> Result<Sha256> {
     let workspace = workspace.canonicalize()?;
