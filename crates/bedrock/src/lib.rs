@@ -150,6 +150,7 @@ impl Bedrock {
     /// Rebuild from the standard SDK configuration using the credential chain,
     /// ignoring any ambient Bedrock bearer token and replacing a supplied client.
     pub fn with_credential_chain(mut self) -> Self {
+        self.profile = None;
         self.force_sigv4 = true;
         self.bearer = None;
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new());
@@ -1214,6 +1215,39 @@ mod tests {
                 .unwrap();
             assert_eq!(credentials.access_key_id(), "SELECTEDKEY");
             assert_eq!(config.region().unwrap().as_ref(), "us-west-2");
+
+            // The last selection must win in either order, even after a
+            // previously selected profile has populated its SDK config.
+            let _ = model.prepare_bedrock().await.unwrap();
+            let chain = model.with_credential_chain();
+            let chain_config = chain.load_config().await;
+            assert_eq!(chain_config.region().unwrap().as_ref(), "ap-southeast-1");
+            let credentials = chain_config
+                .credentials_provider()
+                .unwrap()
+                .provide_credentials()
+                .await
+                .unwrap();
+            assert_eq!(credentials.access_key_id(), "AMBIENTKEY");
+            let prepared = chain.prepare_bedrock().await.unwrap().unwrap();
+            let fresh = Bedrock::from_env()
+                .with_credential_chain()
+                .prepare_bedrock()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(prepared.context_identity(), fresh.context_identity());
+            assert!(prepared.context_identity().is_some());
+            let profile = chain.with_profile("selected".into());
+            let credentials = profile
+                .load_config()
+                .await
+                .credentials_provider()
+                .unwrap()
+                .provide_credentials()
+                .await
+                .unwrap();
+            assert_eq!(credentials.access_key_id(), "SELECTEDKEY");
             assert_eq!(std::env::var("AWS_PROFILE").unwrap(), before);
             assert_eq!(std::env::var("AWS_ACCESS_KEY_ID").unwrap(), "AMBIENTKEY");
             return;
@@ -1226,7 +1260,11 @@ mod tests {
             "[selected]\naws_access_key_id=SELECTEDKEY\naws_secret_access_key=SELECTEDSECRET\n",
         )
         .unwrap();
-        std::fs::write(&config, "[profile selected]\nregion=us-west-2\n").unwrap();
+        std::fs::write(
+            &config,
+            "[profile selected]\nregion=us-west-2\n[profile ambient]\nregion=ap-southeast-1\n",
+        )
+        .unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
