@@ -141,16 +141,26 @@ impl Bedrock {
     }
 
     async fn load_config(&self) -> aws_types::SdkConfig {
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        let loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(profile) = &self.profile {
+            // Load the effective region first, including the selected profile's region.
+            // The profile provider uses it for STS when assuming a role.
+            let config = loader.profile_name(profile).load().await;
+            let provider_config = aws_config::provider_config::ProviderConfig::without_region()
+                .with_region(config.region().cloned());
             let credentials = aws_config::profile::ProfileFileCredentialsProvider::builder()
+                .configure(&provider_config)
                 .profile_name(profile)
                 .build();
-            loader = loader
-                .profile_name(profile)
-                .credentials_provider(credentials);
+            config
+                .to_builder()
+                .credentials_provider(
+                    aws_credential_types::provider::SharedCredentialsProvider::new(credentials),
+                )
+                .build()
+        } else {
+            loader.load().await
         }
-        loader.load().await
     }
     /// Bind a configured model name to its ID for model-specific Converse behavior.
     pub fn with_model_name(mut self, model: &str, name: Option<&str>) -> Self {
@@ -1207,6 +1217,125 @@ mod tests {
             .env_remove("AWS_BEARER_TOKEN_BEDROCK")
             .output()
             .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn selected_assume_role_profile_uses_its_region_for_sts() {
+        use aws_credential_types::provider::ProvideCredentials;
+        if std::env::var_os("PI_RS_ASSUME_ROLE_TEST_CHILD").is_some() {
+            let config = Bedrock::from_env()
+                .with_profile("selected".into())
+                .load_config()
+                .await;
+            assert_eq!(config.region().unwrap().as_ref(), "us-west-2");
+            let credentials = config
+                .credentials_provider()
+                .unwrap()
+                .provide_credentials()
+                .await
+                .unwrap();
+            assert_eq!(credentials.access_key_id(), "ASSUMEDKEY");
+            assert_eq!(std::env::var("AWS_PROFILE").unwrap(), "ambient");
+            return;
+        }
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join("credentials");
+        let config = dir.path().join("config");
+        std::fs::write(
+            &credentials,
+            "[source]\naws_access_key_id=SOURCEKEY\naws_secret_access_key=SOURCESECRET\n",
+        )
+        .unwrap();
+        std::fs::write(&config, "[profile selected]\nregion=us-west-2\nrole_arn=arn:aws:iam::123456789012:role/test\nsource_profile=source\n").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::selected_assume_role_profile_uses_its_region_for_sts",
+            ])
+            .env("PI_RS_ASSUME_ROLE_TEST_CHILD", "1")
+            .env("AWS_PROFILE", "ambient")
+            .env("AWS_ACCESS_KEY_ID", "AMBIENTKEY")
+            .env("AWS_SECRET_ACCESS_KEY", "AMBIENTSECRET")
+            .env("AWS_SHARED_CREDENTIALS_FILE", credentials)
+            .env("AWS_CONFIG_FILE", config)
+            .env("AWS_ENDPOINT_URL_STS", endpoint)
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env_remove("AWS_REGION")
+            .env_remove("AWS_DEFAULT_REGION")
+            .env_remove("AWS_ENDPOINT_URL")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some()
+                    {
+                        let _ = child.kill();
+                        let output = child.wait_with_output().unwrap();
+                        panic!(
+                            "STS was not called: {} {}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("STS listener: {e}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut data = Vec::new();
+        let mut buffer = [0; 4096];
+        let (header_end, length) = loop {
+            let n = socket.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buffer[..n]);
+            if let Some(pos) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&data[..pos]);
+                let len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                break (pos + 4, len);
+            }
+        };
+        while data.len() < header_end + length {
+            let n = socket.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buffer[..n]);
+        }
+        let request = String::from_utf8_lossy(&data);
+        assert!(
+            request.contains("Credential=SOURCEKEY/")
+                && request.contains("/us-west-2/sts/aws4_request"),
+            "{request}"
+        );
+        assert!(request.contains("Action=AssumeRole"));
+        let body = "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><AssumeRoleResult><Credentials><AccessKeyId>ASSUMEDKEY</AccessKeyId><SecretAccessKey>ASSUMEDSECRET</SecretAccessKey><SessionToken>SESSION</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult><ResponseMetadata><RequestId>fixture</RequestId></ResponseMetadata></AssumeRoleResponse>";
+        write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: text/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "{} {}",

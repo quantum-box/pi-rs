@@ -41,7 +41,7 @@ enum AuthType {
 
 struct Resolved {
     kind: AuthType,
-    value: String,
+    value: Option<String>,
 }
 
 fn expiry(input: &str) -> std::result::Result<Duration, String> {
@@ -119,6 +119,12 @@ async fn resolve(
         .and_then(|id| args.model_profiles.model_endpoint(provider, id))
         .unwrap_or_else(|| args.model_profiles.endpoint(provider));
     if let Some(credential) = args.configured_model_credential(provider, endpoint) {
+        if matches!(credential, super::model_auth::Credential::BedrockProfile(_)) {
+            return Ok((wanted.is_none()).then_some(Resolved {
+                kind: AuthType::ApiKey,
+                value: None,
+            }));
+        }
         let kind = if args.model_keys.oauth(provider, endpoint) {
             AuthType::OAuth
         } else {
@@ -140,7 +146,18 @@ async fn resolve(
         if !super::model_auth::valid_key(&value) {
             return Err(Error::Config("invalid provider credential".into()));
         }
-        return Ok(Some(Resolved { kind, value }));
+        return Ok(Some(Resolved {
+            kind,
+            value: Some(value),
+        }));
+    }
+    // Pi checks for configured AWS sources without contacting AWS. Such sources
+    // do not expose a single API key that can safely be printed.
+    if provider == &Provider::Bedrock && wanted.is_none() && bedrock_ambient_configured() {
+        return Ok(Some(Resolved {
+            kind: AuthType::ApiKey,
+            value: None,
+        }));
     }
     if provider == &Provider::Radius && wanted != Some(AuthType::ApiKey) {
         let gateway = radius_auth::Gateway::configured_with_settings(&args.settings)?;
@@ -152,11 +169,21 @@ async fn resolve(
             };
             return Ok(access.map(|value| Resolved {
                 kind: AuthType::OAuth,
-                value,
+                value: Some(value),
             }));
         }
     }
     Ok(None)
+}
+
+fn bedrock_ambient_configured() -> bool {
+    let has = |name| std::env::var(name).is_ok_and(|value| !value.is_empty());
+    has("AWS_BEARER_TOKEN_BEDROCK")
+        || has("AWS_PROFILE")
+        || (has("AWS_ACCESS_KEY_ID") && has("AWS_SECRET_ACCESS_KEY"))
+        || has("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+        || has("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+        || has("AWS_WEB_IDENTITY_TOKEN_FILE")
 }
 
 fn emit(line: &str) -> Result<()> {
@@ -231,15 +258,20 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
             provider = candidate.provider.id();
             match resolve(&args, candidate, no_refresh, Duration::ZERO, None).await {
                 Ok(Some(value)) => {
-                    status = "ready";
-                    reason = None;
-                    auth_type = Some(if value.kind == AuthType::OAuth {
-                        "oauth"
+                    if credentials && value.value.is_none() {
+                        status = "not_ready";
+                        reason = Some("credential_not_available");
                     } else {
-                        "api_key"
-                    });
-                    if credentials {
-                        output_credential = Some(value.value);
+                        status = "ready";
+                        reason = None;
+                        auth_type = Some(if value.kind == AuthType::OAuth {
+                            "oauth"
+                        } else {
+                            "api_key"
+                        });
+                        if credentials {
+                            output_credential = value.value;
+                        }
                     }
                 }
                 Ok(None) => reason = Some("credentials_not_configured"),
@@ -285,8 +317,10 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
     };
     let mut matches = Vec::new();
     for candidate in &candidates {
-        if let Some(credential) = resolve(&args, candidate, false, minimum, Some(kind)).await? {
-            matches.push((candidate.provider.id(), credential.value));
+        if let Some(credential) = resolve(&args, candidate, false, minimum, Some(kind)).await?
+            && let Some(value) = credential.value
+        {
+            matches.push((candidate.provider.id(), value));
         }
     }
     match matches.as_slice() {

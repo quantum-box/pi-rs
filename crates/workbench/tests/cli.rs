@@ -5897,3 +5897,111 @@ fn reopened_tree_trigger_uses_origin_provider_and_restores_selected_branch() {
     assert!(session.branch().iter().any(|record| matches!(&record.event, Event::User { content, .. } if content == "selected branch B")));
     assert_eq!(session.pending_custom_trigger(), None);
 }
+
+#[test]
+fn bedrock_auth_check_handles_saved_profile_and_ambient_chain() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let auth = home.join("auth.json");
+    let check = |args: &[&str], vars: &[(&str, &str)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_CONFIG_FILE", root.path().join("missing-config"))
+            .env(
+                "AWS_SHARED_CREDENTIALS_FILE",
+                root.path().join("missing-credentials"),
+            );
+        for key in [
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        command
+            .args(["--provider", "amazon-bedrock", "auth"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    std::fs::write(
+        &auth,
+        json!({"amazon-bedrock":{"type":"api_key","env":{"AWS_PROFILE":"selected"}}}).to_string(),
+    )
+    .unwrap();
+    let profile = check(&["check", "--json"], &[]);
+    assert_eq!(profile.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&profile.stdout).unwrap(),
+        json!({"status":"ready","provider":"amazon-bedrock","authType":"api_key"})
+    );
+    let profile_secret = check(&["check", "--json", "--credentials"], &[]);
+    assert_eq!(profile_secret.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&profile_secret.stdout).unwrap()["reason"],
+        "credential_not_available"
+    );
+    assert!(!check(&["print-api-key"], &[]).status.success());
+
+    std::fs::write(
+        &auth,
+        json!({"amazon-bedrock":{"type":"api_key"}}).to_string(),
+    )
+    .unwrap();
+    let missing = check(&["check", "--json"], &[]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&missing.stdout).unwrap()["reason"],
+        "credentials_not_configured"
+    );
+    for vars in [
+        vec![("AWS_PROFILE", "ambient")],
+        vec![
+            ("AWS_ACCESS_KEY_ID", "key"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ],
+        vec![("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/fixture")],
+        vec![("AWS_BEARER_TOKEN_BEDROCK", "token")],
+    ] {
+        let ambient = check(&["check", "--json"], &vars);
+        assert_eq!(
+            ambient.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&ambient.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&ambient.stdout).unwrap()["status"],
+            "ready"
+        );
+        let secret = check(&["check", "--json", "--credentials"], &vars);
+        assert_eq!(secret.status.code(), Some(1));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&secret.stdout).unwrap()["reason"],
+            "credential_not_available"
+        );
+    }
+    std::fs::write(
+        &auth,
+        json!({"amazon-bedrock":{"type":"api_key","key":"stored-token"}}).to_string(),
+    )
+    .unwrap();
+    let bearer = check(&["check", "--json", "--credentials"], &[]);
+    assert_eq!(bearer.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bearer.stdout).unwrap()["credentials"],
+        "stored-token"
+    );
+}
