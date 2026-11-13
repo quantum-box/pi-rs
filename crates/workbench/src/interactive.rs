@@ -3357,24 +3357,27 @@ fn slash(
     Ok(None)
 }
 
-// Resolve the same theme set as the regular interactive startup. In particular,
-// ignored automatic themes must not be reopened by a separate directory scan.
+// Like Pi's startup UI, do not install missing packages or let an absent or
+// malformed theme prevent session selection. Runtime preparation happens later.
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
     let resources = super::resources::Resources::load(args)?;
-    Theme::load(
-        args.use_theme.as_deref().unwrap_or("system"),
-        &resources.themes,
-        &args.workspace,
-        args.trusted,
-        false,
-    )
-    .or_else(|error| {
-        if !resources.extensions.is_empty() {
-            Ok(Theme::system())
-        } else {
-            Err(error)
+    let name = args.use_theme.as_deref().unwrap_or("system");
+    if let Ok(theme) = Theme::load(name, &[], &args.workspace, args.trusted, false) {
+        return Ok(theme);
+    }
+    // One bad theme should not hide a valid theme later in the resolved list.
+    for path in &resources.themes {
+        if let Ok(theme) = Theme::load(
+            name,
+            std::slice::from_ref(path),
+            &args.workspace,
+            args.trusted,
+            false,
+        ) {
+            return Ok(theme);
         }
-    })
+    }
+    Ok(Theme::system())
 }
 
 /// Run the startup session picker on the controlling terminal, leaving stdout
@@ -7842,17 +7845,81 @@ mod tests {
         args.trusted = true;
         args.settings = super::super::config::Settings::default();
         args.use_theme = Some("ignored".into());
-        let error = match super::startup_picker_theme(&args) {
-            Ok(_) => panic!("ignored theme loaded"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("was not found"), "{error}");
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
         args.use_theme = Some("selected".into());
         assert_eq!(super::startup_picker_theme(&args).unwrap().name, "selected");
         args.no_themes = true;
-        assert!(super::startup_picker_theme(&args).is_err());
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
         args.themes.push(themes.join("selected.json"));
         assert_eq!(super::startup_picker_theme(&args).unwrap().name, "selected");
+    }
+
+    #[test]
+    fn resume_picker_skips_unprepared_package_and_uses_it_after_preparation() {
+        const CHILD: &str = "PI_RS_TEST_RESUME_PACKAGE_THEME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "interactive::tests::resume_picker_skips_unprepared_package_and_uses_it_after_preparation", "--nocapture"])
+                .env("PI_RS_HOME", home.path())
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use clap::Parser;
+        let home = super::super::config::agent_dir();
+        let source = home.join("local-package");
+        let themes = source.join("themes");
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut selected: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        selected["name"] = serde_json::json!("package-theme");
+        std::fs::write(themes.join("theme.json"), selected.to_string()).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
+        let mut args = super::Cli::parse_from([
+            "pi",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+        ]);
+        args.workspace = workspace;
+        args.settings = super::super::config::Settings::default();
+        args.use_theme = Some("package-theme".into());
+        let index = home.join("packages/index.json");
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        assert!(!index.exists(), "picker must not prepare packages");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert!(index.exists());
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        let broken = home.join("broken.json");
+        std::fs::write(&broken, "not JSON").unwrap();
+        args.themes.push(broken);
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
     }
 
     #[test]
