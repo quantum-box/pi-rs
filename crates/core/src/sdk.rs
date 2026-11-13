@@ -202,6 +202,88 @@ impl IdleInputScope {
     }
 }
 
+// Route callback host messages through the same lifetime-checked child lane as
+// scoped controls. The owner checks expiry under the scope gate before writing.
+struct ScopedIdleHost {
+    inner: Arc<dyn crate::ToolHost>,
+    scope: IdleInputScope,
+}
+
+#[async_trait::async_trait]
+impl crate::ToolHost for ScopedIdleHost {
+    fn tools(&self) -> Vec<crate::ToolSpec> {
+        self.inner.tools()
+    }
+    fn supports_progress(&self) -> bool {
+        self.inner.supports_progress()
+    }
+    fn has_ui(&self) -> bool {
+        self.inner.has_ui()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        self.inner.supports_custom_messages()
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        false
+    }
+    fn for_extension(&self, extension_id: &str) -> Option<Arc<dyn crate::ToolHost>> {
+        self.inner.for_extension(extension_id).map(|inner| {
+            Arc::new(Self {
+                inner,
+                scope: self.scope.clone(),
+            }) as Arc<dyn crate::ToolHost>
+        })
+    }
+    async fn call(&self, name: &str, arguments: serde_json::Value) -> crate::Outcome {
+        if self.scope.lifetime.is_cancelled() {
+            return crate::Outcome::Skipped("idle input callback has finished".into());
+        }
+        self.inner.call(name, arguments).await
+    }
+    async fn report_progress(&self, partial: serde_json::Value) -> crate::ExtensionResult<()> {
+        if self.scope.lifetime.is_cancelled() {
+            return Err("idle input callback has finished".into());
+        }
+        self.inner.report_progress(partial).await
+    }
+    async fn ui(&self, request: crate::UiRequest) -> crate::ExtensionResult<crate::UiResponse> {
+        if self.scope.lifetime.is_cancelled() {
+            return Err("idle input callback has finished".into());
+        }
+        self.inner.ui(request).await
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.scope
+            .submit(crate::AgentInput::EnqueueCustom {
+                message: crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    message,
+                    delivery,
+                },
+                reply,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        receive
+            .await
+            .map_err(|_| "custom message response lost".to_owned())?
+            .map_err(|error| error.to_string())
+    }
+}
+
+pub(crate) fn scope_callback_host(host: Arc<dyn crate::ToolHost>) -> Arc<dyn crate::ToolHost> {
+    match IDLE_INPUT_SCOPE.try_with(|scope| scope.clone()) {
+        Ok(scope) => Arc::new(ScopedIdleHost { inner: host, scope }),
+        Err(_) => host,
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionControl {
     scope: Option<IdleInputScope>,
@@ -2182,6 +2264,10 @@ pub(crate) async fn scope_extension_callback<F: std::future::Future>(future: F) 
     let parent = IDLE_INPUT_SCOPE.try_with(|scope| scope.clone()).ok();
     if let Some(mut scope) = parent {
         scope.lifetime = scope.lifetime.child_token();
+        scope.host = Arc::new(ScopedIdleHost {
+            inner: scope.host.clone(),
+            scope: scope.clone(),
+        });
         let _guard = IdleScopeGuard {
             lifetime: scope.lifetime.clone(),
             gate: scope.gate.clone(),
@@ -9596,6 +9682,136 @@ mod tests {
                     .iter()
                     .all(|input| input.input.content != "late")
             );
+        }
+    }
+
+    struct RetainedHostHook {
+        id: &'static str,
+        saved: Arc<Mutex<Option<Arc<dyn crate::ToolHost>>>>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        startup: bool,
+        capture: bool,
+    }
+    impl RetainedHostHook {
+        async fn check(&self, host: Arc<dyn crate::ToolHost>) -> crate::ExtensionResult<()> {
+            if self.capture {
+                *self.saved.lock().unwrap() = Some(host.clone());
+            }
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: self.id.into(),
+                    content: crate::ContextContent::Text("allowed".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            if !self.capture {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Extension for RetainedHostHook {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            _: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            if !self.startup {
+                self.check(host).await?;
+            }
+            Ok(crate::InputAction::Continue)
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if self.startup && matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                self.check(host).await?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn retained_host_expires_between_input_and_startup_callbacks() {
+        for startup in [false, true] {
+            let saved = Arc::new(Mutex::new(None));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let make_hook = |id, capture| {
+                Arc::new(RetainedHostHook {
+                    id,
+                    capture,
+                    startup,
+                    saved: saved.clone(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                })
+            };
+            let session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+                .extension(make_hook("host-a", true))
+                .unwrap()
+                .extension(make_hook("host-b", false))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            let control = session.controls();
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(control.steer("parent"), async {
+                    entered.notified().await;
+                    let stale = saved.lock().unwrap().clone().unwrap();
+                    let late = tokio::spawn(async move {
+                        stale
+                            .send_message(
+                                crate::CustomMessage {
+                                    custom_type: "late-host".into(),
+                                    content: crate::ContextContent::Text("late".into()),
+                                    display: false,
+                                    details: None,
+                                },
+                                crate::CustomMessageDelivery::Steer,
+                            )
+                            .await
+                    })
+                    .await
+                    .unwrap();
+                    assert!(late.is_err());
+                    release.notify_one();
+                })
+            })
+            .await
+            .expect("retained host test deadlocked");
+            result.unwrap();
+            let journal = session.journal().unwrap();
+            let kinds: Vec<_> = journal
+                .records()
+                .iter()
+                .filter_map(|record| match &record.event {
+                    crate::Event::CustomMessage { message } => Some(message.custom_type.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(kinds, ["host-a", "host-b"]);
         }
     }
 

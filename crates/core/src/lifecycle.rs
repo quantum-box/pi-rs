@@ -441,8 +441,10 @@ async fn notify_inner(
                             .lifecycle_with_host(
                                 &event,
                                 states.get(extension.id()),
-                                host.for_extension(extension.id())
-                                    .unwrap_or_else(|| host.clone()),
+                                crate::sdk::scope_callback_host(
+                                    host.for_extension(extension.id())
+                                        .unwrap_or_else(|| host.clone()),
+                                ),
                             )
                             .await
                     }

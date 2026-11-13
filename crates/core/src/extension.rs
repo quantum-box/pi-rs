@@ -2063,7 +2063,11 @@ async fn prepare_input_inner(
             match &host {
                 Some(host) => {
                     extension
-                        .input_with_host(&event, states.get(extension.id()), host.clone())
+                        .input_with_host(
+                            &event,
+                            states.get(extension.id()),
+                            crate::sdk::scope_callback_host(host.clone()),
+                        )
                         .await
                 }
                 None => extension.input(&event, states.get(extension.id())).await,
