@@ -2818,7 +2818,10 @@ changes; reusing a key with different content fails the run instead of retrying
 indefinitely. Executable extensions negotiate keyed-message support.
 The journal records completion of turn-end callbacks and application of deferred
 context. Recovery reruns an unfinished callback before returning an existing
-answer or advancing the tool turn, then applies deferred context once.
+answer or advancing the tool turn, then applies deferred context once. Journal
+version 3 identifies turns that use these boundaries. An older assistant record
+without a completion marker is treated as already observed: older journals
+cannot distinguish a completed callback from one interrupted before completion.
 
 Exactly-once recovery is not possible for unkeyed callback sends when a process
 stops between sends or the callback takes a different path. Ordinary Pi-style

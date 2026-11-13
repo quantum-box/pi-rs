@@ -361,7 +361,8 @@ impl Agent<'_> {
         {
             result = Err(error);
         }
-        if ensure_settled(session.operations()).is_ok() {
+        if ensure_settled(session.operations()).is_ok() && !has_unfinished_turn_end(session, run_id)
+        {
             apply_custom_boundary(session, crate::CustomMessageDelivery::AfterTurn, observer)?;
         }
         let state = match &result {
@@ -564,12 +565,15 @@ impl Agent<'_> {
             }
             Err(error) => return Err(error),
         };
-        if let Some(assistant_record) = session.branch().iter().rev().find_map(|record| {
-            (record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. }))
-                .then_some(record.id)
-        }) {
+        if let Some((assistant_record, version)) =
+            session.branch().iter().rev().find_map(|record| {
+                (record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. }))
+                    .then_some((record.id, record.version))
+            })
+        {
             if !session.branch().iter().any(|record| matches!(record.event,
-                Event::TurnEndCallbacksCompleted { assistant_record: completed } if completed == assistant_record)) {
+                Event::TurnEndCallbacksCompleted { assistant_record: completed } if completed == assistant_record))
+                && version >= crate::journal::TURN_END_JOURNAL_VERSION {
                 if crate::lifecycle::enabled(self.registry) {
                     let messages = crate::lifecycle::messages(session, |id| id >= assistant_record);
                     self.observe_active_lifecycle(session, crate::LifecycleEvent::TurnEnd {
@@ -581,7 +585,9 @@ impl Agent<'_> {
                 }
                 commit(session, Event::TurnEndCallbacksCompleted { assistant_record }, observer)?;
             }
-            if !session.branch().iter().any(|record| matches!(record.event,
+            if (version >= crate::journal::TURN_END_JOURNAL_VERSION || session.branch().iter().any(|record| matches!(record.event,
+                Event::TurnEndCallbacksCompleted { assistant_record: completed } if completed == assistant_record)))
+                && !session.branch().iter().any(|record| matches!(record.event,
                 Event::TurnEndBoundaryApplied { assistant_record: applied } if applied == assistant_record)) {
                 apply_custom_boundary(session, crate::CustomMessageDelivery::AfterTurn, observer)?;
                 commit(session, Event::TurnEndBoundaryApplied { assistant_record }, observer)?;
@@ -3050,6 +3056,18 @@ fn completed_run_turns(session: &Session, run_id: Uuid) -> u32 {
         .count()
         .try_into()
         .unwrap_or(u32::MAX)
+}
+
+fn has_unfinished_turn_end(session: &Session, run_id: Uuid) -> bool {
+    let branch = session.branch();
+    let Some(assistant) = branch.iter().rev().find(|record| {
+        record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. })
+    }) else {
+        return false;
+    };
+    assistant.version >= crate::journal::TURN_END_JOURNAL_VERSION
+        && !branch.iter().any(|record| matches!(record.event,
+            Event::TurnEndCallbacksCompleted { assistant_record } if assistant_record == assistant.id))
 }
 
 fn callback_turn_phase(phase: &str, turn_index: u32) -> String {

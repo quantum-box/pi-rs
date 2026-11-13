@@ -11,7 +11,8 @@ use crate::{
     Usage, UsageReport,
 };
 
-const FORMAT_VERSION: u32 = 2;
+pub(crate) const TURN_END_JOURNAL_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = TURN_END_JOURNAL_VERSION;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

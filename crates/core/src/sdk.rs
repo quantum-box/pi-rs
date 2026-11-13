@@ -4280,9 +4280,14 @@ mod tests {
             _: Option<&crate::ExtensionState>,
             host: Arc<dyn crate::ToolHost>,
         ) -> crate::ExtensionResult<()> {
-            if !matches!(event, crate::LifecycleEvent::TurnEnd { turn_index: 0, .. }) {
+            let crate::LifecycleEvent::TurnEnd {
+                turn_index: 0,
+                messages,
+                ..
+            } = event
+            else {
                 return Ok(());
-            }
+            };
             let first_attempt = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
             for (index, key) in ["one", "two"].into_iter().enumerate() {
                 if first_attempt && (index == 0) == self.before_first {
@@ -4292,11 +4297,11 @@ mod tests {
                 host.send_message_with_key(
                     crate::CustomMessage {
                         custom_type: "turn-end-recovery".into(),
-                        content: crate::ContextContent::Text(key.into()),
+                        content: crate::ContextContent::Text(format!("{key}:{}", messages.len())),
                         display: false,
                         details: None,
                     },
-                    if key == "two" {
+                    if key == "one" {
                         crate::CustomMessageDelivery::AfterTurn
                     } else {
                         crate::CustomMessageDelivery::NextTurn
@@ -4373,6 +4378,8 @@ mod tests {
             .await
             .unwrap();
             assert!(matches!(first, Err(Error::Cancelled)));
+            assert!(!session.records().iter().any(|record| matches!(&record.event,
+                crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "turn-end-recovery")));
             let mut restored = Session::from_records(session.records().to_vec()).unwrap();
             let answer = agent
                 .run_correlated(
@@ -4490,6 +4497,74 @@ mod tests {
         assert!(end < request);
         assert_eq!(records.iter().filter(|record| matches!(&record.event,
             crate::Event::CustomMessageQueued { input } if input.message.custom_type == "turn-end-recovery")).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_completed_turn_does_not_repeat_turn_end_on_resume() {
+        let hook = Arc::new(TurnEndRecoveryHook {
+            before_first: false,
+            calls: AtomicUsize::new(1),
+            paused: tokio::sync::Notify::new(),
+        });
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let model = EchoModel(AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut original = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        original.set_run_id(Some(run_id));
+        original
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: Some("prompt".into()),
+            })
+            .unwrap();
+        original
+            .append(crate::Event::User {
+                content: "prompt".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        original
+            .append(crate::Event::Assistant {
+                content: "answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let mut legacy = original.records().to_vec();
+        for record in &mut legacy {
+            record.version = 2;
+        }
+        let mut restored = Session::from_records(legacy).unwrap();
+        let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(8);
+        let answer = agent
+            .run_correlated(
+                &mut restored,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.0.load(Ordering::SeqCst), 0);
+        assert!(
+            !restored.records().iter().any(|record| matches!(
+                record.event,
+                crate::Event::TurnEndCallbacksCompleted { .. }
+            ))
+        );
     }
 
     #[tokio::test]
