@@ -201,10 +201,9 @@ pub fn resolve(
                 .cloned(),
         );
         for (root, scope) in roots {
-            let mut discovered = if kind == Kind::Prompt {
-                auto_prompts(&root, warnings)?
-            } else {
-                collect(&root, kind, false, warnings)?
+            let mut discovered = match kind {
+                Kind::Prompt | Kind::Theme => auto_resources(&root, kind, warnings)?,
+                _ => collect(&root, kind, false, warnings)?,
             };
             discovered.retain(|path| {
                 if kind == Kind::Prompt {
@@ -230,9 +229,10 @@ pub fn resolve(
     append(&mut paths, additional_prompts);
     Ok(paths)
 }
-// Pi's automatic prompt discovery scans only visible files in the prompt root,
-// applying ignore files from that directory. Configured paths use collect instead.
-fn auto_prompts(root: &Path, warnings: &mut Vec<String>) -> Result<Vec<PathBuf>> {
+// Pi's automatic prompt and theme discovery scans visible files directly in
+// the resource root, applying local ignore files. Configured paths use collect.
+fn auto_resources(root: &Path, kind: Kind, warnings: &mut Vec<String>) -> Result<Vec<PathBuf>> {
+    debug_assert!(matches!(kind, Kind::Prompt | Kind::Theme));
     if !root.is_dir() {
         return Ok(Vec::new());
     }
@@ -245,14 +245,14 @@ fn auto_prompts(root: &Path, warnings: &mut Vec<String>) -> Result<Vec<PathBuf>>
         .git_exclude(false)
         .require_git(false)
         .add_custom_ignore_filename(".fdignore")
-        .follow_links(true)
         .build()
     {
         match entry {
             Ok(entry)
                 if entry.depth() == 1
+                    && !entry.file_name().to_string_lossy().starts_with('.')
                     && entry.path().is_file()
-                    && Kind::Prompt.accepts(entry.path()) =>
+                    && kind.accepts(entry.path()) =>
             {
                 files.push(entry.into_path());
             }
@@ -463,6 +463,106 @@ pub(super) fn skill_files(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod glob_tests {
     use super::*;
+    #[test]
+    fn automatic_themes_are_visible_top_level_files_respecting_local_ignores() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let root = workspace.join(".pi/themes");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        for name in [
+            "visible.json",
+            ".hidden.json",
+            "git-ignored.json",
+            "ignore-ignored.json",
+            "fd-ignored.json",
+            "nested/child.json",
+            "not-a-theme.txt",
+        ] {
+            std::fs::write(root.join(name), "{}").unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "git-ignored.json\n").unwrap();
+        std::fs::write(root.join(".ignore"), "ignore-ignored.json\n").unwrap();
+        std::fs::write(root.join(".fdignore"), "fd-ignored.json\n").unwrap();
+        #[cfg(unix)]
+        {
+            let external = directory.path().join("external.json");
+            std::fs::write(&external, "{}").unwrap();
+            std::os::unix::fs::symlink(&external, root.join("linked.json")).unwrap();
+            std::os::unix::fs::symlink(
+                directory.path().join("missing.json"),
+                root.join("broken.json"),
+            )
+            .unwrap();
+        }
+        let mut args = Cli::try_parse_from(["pi"]).unwrap();
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = super::super::config::Settings::default();
+        let mut warnings = Vec::new();
+        let paths = resolve(&args, Kind::Theme, &[], &[], &mut warnings).unwrap();
+        let names: Vec<_> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        #[cfg(unix)]
+        assert_eq!(names, ["linked.json", "visible.json"]);
+        #[cfg(not(unix))]
+        assert_eq!(names, ["visible.json"]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("linked-themes");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            let aliased = auto_resources(&alias, Kind::Theme, &mut warnings).unwrap();
+            let names: Vec<_> = aliased
+                .iter()
+                .map(|p| p.file_name().unwrap().to_str().unwrap())
+                .collect();
+            assert_eq!(names, ["linked.json", "visible.json"]);
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+
+        // Explicit files and packaged paths remain selectable independently of
+        // the automatic discovery filter.
+        let nested = root.join("nested/child.json");
+        let ignored = root.join("fd-ignored.json");
+        let paths = resolve(
+            &args,
+            Kind::Theme,
+            std::slice::from_ref(&ignored),
+            std::slice::from_ref(&nested),
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.canonicalize().unwrap() == nested.canonicalize().unwrap())
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.canonicalize().unwrap() == ignored.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn automatic_resources_never_include_dot_names_even_when_unignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for name in [".private.json", ".private.md", "visible.json", "visible.md"] {
+            std::fs::write(root.join(name), "fixture").unwrap();
+        }
+        std::fs::write(root.join(".fdignore"), "!.private.json\n!.private.md\n").unwrap();
+        let mut warnings = Vec::new();
+        for (kind, expected) in [(Kind::Theme, "visible.json"), (Kind::Prompt, "visible.md")] {
+            let files = auto_resources(root, kind, &mut warnings).unwrap();
+            assert_eq!(files, [root.join(expected)]);
+        }
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
     #[test]
     fn resource_globs_expand_files_directories_and_literal_metacharacters() {
         let root = tempfile::tempdir().unwrap();
