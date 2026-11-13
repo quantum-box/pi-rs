@@ -323,9 +323,7 @@ async fn reaching_match_limit_drops_backend_search() {
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
 
-#[cfg(windows)]
 struct NoCalls;
-#[cfg(windows)]
 #[async_trait::async_trait]
 impl GrepOperations for NoCalls {
     async fn is_directory(&self, _: &Path) -> Result<bool> {
@@ -347,6 +345,30 @@ async fn rejects_drive_relative_path_before_backend_calls() {
     let tool = create_grep_tool(root.path(), Arc::new(NoCalls)).unwrap();
     assert!(matches!(
         tool.invoke(json!({"pattern":"x", "path":"D:logs"}), context())
+            .await,
+        Outcome::Failed(_)
+    ));
+}
+
+#[tokio::test]
+async fn rejects_rooted_home_tail_before_backend_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = create_grep_tool_with_options(
+        root.path(),
+        Arc::new(NoCalls),
+        GrepToolOptions {
+            remote_home: Some(root.path().to_owned()),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        tool.invoke(json!({"pattern":"x", "path":"~//etc"}), context())
+            .await,
+        Outcome::Failed(_)
+    ));
+    #[cfg(windows)]
+    assert!(matches!(
+        tool.invoke(json!({"pattern":"x", "path":"~/D:logs"}), context())
             .await,
         Outcome::Failed(_)
     ));
