@@ -3171,7 +3171,7 @@ mod tests {
             .append_user_with_images("branch B".into(), vec![], None)
             .unwrap();
         let journal = Session::from_records(journal.records().to_vec()).unwrap();
-        let mut session = SessionBuilder::new(model_b, "model-B")
+        let session = SessionBuilder::new(model_b, "model-B")
             .extension(Arc::new(BranchStateHook(seen.clone())))
             .unwrap()
             .build(journal)
@@ -3179,7 +3179,7 @@ mod tests {
         session
             .registry
             .register_session_provider_model(
-                session.session.session_id(),
+                session.session_id,
                 "provider-a",
                 "model-A",
                 model_a.clone(),
@@ -3196,13 +3196,15 @@ mod tests {
             system_prompt: &session.system_prompt,
             limits: session.limits.clone(),
         };
+        let mut journal = session.session.lock().await;
+        let mut input_queue = session.input.lock().await;
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
-                    &mut session.session,
+                    &mut journal,
                     Uuid::new_v4(),
                     Some("B prompt".into()),
-                    &mut session.input,
+                    &mut input_queue,
                     &active.token,
                     &mut observe
                 ),
@@ -3215,17 +3217,22 @@ mod tests {
         })
         .await
         .unwrap();
+        drop(journal);
         assert_eq!(result.unwrap(), "done");
         control.steer("after B").await.unwrap();
         active
-            .finish_inputs(&mut session.session, &mut session.input, &mut observe)
+            .finish_inputs(
+                &mut session.session.try_lock().unwrap(),
+                &mut input_queue,
+                &mut observe,
+            )
             .unwrap();
         assert_eq!(&*seen.lock().unwrap(), &["A", "B"]);
         let names = names.lock().unwrap();
         assert_eq!(names[0], "model-B");
         assert!(names[1..].iter().all(|name| name == "model-A"));
-        assert!(session.session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "B prompt")));
-        assert!(!session.session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "branch A")));
+        assert!(session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "B prompt")));
+        assert!(!session.journal().unwrap().branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "branch A")));
     }
 
     #[tokio::test]
