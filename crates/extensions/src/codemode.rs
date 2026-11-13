@@ -224,7 +224,14 @@ impl Tool for ScriptTool {
         })
         .await
         .unwrap_or_else(|error| Err(format!("Codemode worker failed: {error}")));
+        let limit_exceeded = sink.lock().expect("codemode output").limit_exceeded;
         let (success, changed, store, error) = match result {
+            _ if limit_exceeded => (
+                false,
+                false,
+                json!({}),
+                Some("Script output limit exceeded".into()),
+            ),
             Ok(result) => (result.ok, result.changed, result.store, result.error),
             Err(error) => (false, false, json!({}), Some(error)),
         };
@@ -395,9 +402,10 @@ async fn evaluate(
             .collect(),
     );
     let code = format!("__run(async () => {{\n{source}\n}})");
+    let output_cancellation = context.cancellation.clone();
     let operation = javascript.async_with(async move |ctx| {
         let result: rquickjs::Result<String> = async {
-            install_globals(&ctx, documents, host, store, sink)?;
+            install_globals(&ctx, documents, host, store, sink, output_cancellation)?;
             match ctx.eval::<Promise, _>(code) {
                 Ok(promise) => promise.into_future::<String>().await,
                 Err(error) => Err(error),
@@ -440,6 +448,7 @@ fn install_globals(
     host: Arc<dyn ToolHost>,
     store: Value,
     sink: Arc<Mutex<Output>>,
+    cancellation: pi_rs_core::CancellationToken,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     let catalogue: Vec<_> = documents
@@ -452,14 +461,17 @@ fn install_globals(
     )?;
     globals.set("__initial_store", ctx.json_parse(store.to_string())?)?;
     let model_usage = sink.clone();
+    let tool_output = sink.clone();
+    let output_cancel = cancellation.clone();
     globals.set(
         "__emit",
         Func::from(move |kind: String, value: String| {
-            sink.lock()
-                .expect("codemode output")
-                .emit(&kind, value)
-                .err()
-                .unwrap_or_default()
+            let mut output = sink.lock().expect("codemode output");
+            let error = output.emit(&kind, value).err().unwrap_or_default();
+            if output.limit_exceeded {
+                output_cancel.cancel();
+            }
+            error
         }),
     )?;
     let model_host = host.clone();
@@ -478,6 +490,12 @@ fn install_globals(
                 let result = match serde_json::from_str::<Value>(&arguments) {
                     Ok(args) if has_operations => {
                         let _permit = slots.acquire().await.expect("model operation slots");
+                        if model_usage.lock().expect("codemode output").limit_exceeded {
+                            return Ok::<_, rquickjs::Error>(
+                                json!({"ok":false,"error":"Script output limit exceeded"})
+                                    .to_string(),
+                            );
+                        }
                         let outcome = model_host.call(MODEL_OPERATION, args).await;
                         if let Some(usage) = ModelUsage::from_outcome(&outcome) {
                             model_usage
@@ -500,7 +518,13 @@ fn install_globals(
         "__call_tool",
         Func::from(Async(move |name: String, arguments: String| {
             let host = host.clone();
+            let output = tool_output.clone();
             async move {
+                if output.lock().expect("codemode output").limit_exceeded {
+                    return Ok::<_, rquickjs::Error>(
+                        json!({"ok":false,"error":"Script output limit exceeded"}).to_string(),
+                    );
+                }
                 let result = match serde_json::from_str(&arguments) {
                     Ok(_)
                         if matches!(
@@ -668,6 +692,7 @@ struct Output {
     console: Vec<String>,
     bytes: usize,
     calls: usize,
+    limit_exceeded: bool,
     model_usage: ModelUsage,
     saved_images: std::collections::BTreeMap<String, std::result::Result<String, String>>,
 }
@@ -684,6 +709,7 @@ impl Output {
         self.calls += 1;
         self.bytes = self.bytes.saturating_add(value.len());
         if self.calls > MAX_ITEMS || self.bytes > MAX_OUTPUT {
+            self.limit_exceeded = true;
             return Err("Script output limit exceeded".into());
         }
         match kind {
@@ -1255,6 +1281,85 @@ mod tests {
             matches!(&reply.outcome, Outcome::Failed(message) if message.contains("partial output") && message.contains("fixture failure"))
         );
         assert_eq!(state.data["value"], 1);
+    }
+    #[tokio::test]
+    async fn output_limits_terminate_even_when_caught() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingHost(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolHost for CountingHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                ["side_effect", MODEL_OPERATION]
+                    .into_iter()
+                    .map(|name| ToolSpec {
+                        name: name.into(),
+                        description: String::new(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded(String::new())
+            }
+        }
+        for (overflow, after, calls_before) in [
+            (
+                "text('x'.repeat(16 * 1024 * 1024 + 1))",
+                "await tools.side_effect({})",
+                0,
+            ),
+            (
+                "text('')",
+                "await models.getModelsOfType('image')",
+                MAX_ITEMS,
+            ),
+            (
+                "text('x'.repeat(16 * 1024 * 1024 + 1))",
+                "while (true) {}",
+                0,
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let code = format!(
+                "store('uncommitted', true); try {{ {overflow}; }} catch (_) {{}} {after}; store('later', true);"
+            );
+            let sink = Arc::new(Mutex::new(Output {
+                calls: calls_before,
+                ..Output::default()
+            }));
+            let result = tokio::time::timeout(
+                Duration::from_secs(15),
+                evaluate(
+                    &code,
+                    json!({}),
+                    Arc::new(CountingHost(calls.clone())),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: Default::default(),
+                    },
+                    None,
+                    sink.clone(),
+                ),
+            )
+            .await
+            .expect("output limit must stop the worker");
+            assert!(result.is_err());
+            assert!(sink.lock().unwrap().limit_exceeded);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        let reply = ScriptTool { timeout: None }
+            .invoke_transaction(
+                json!({"code":"store('uncommitted', true); try { text('x'.repeat(16 * 1024 * 1024 + 1)); } catch (_) { exit(); }"}),
+                ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: Default::default() },
+                None,
+                Arc::new(Host),
+            )
+            .await;
+        assert!(
+            matches!(reply.outcome, Outcome::Failed(message) if message.contains("Script output limit exceeded"))
+        );
+        assert!(reply.state.is_none());
     }
     #[test]
     fn deadline_interrupts_busy_loops_and_unresolved_promises() {
