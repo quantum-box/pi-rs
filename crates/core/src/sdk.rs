@@ -469,7 +469,7 @@ impl SessionBuilder {
             system_prompt: self.system_prompt,
             registry: Arc::new(self.registry),
             limits: self.limits,
-            session,
+            session: Arc::new(tokio::sync::Mutex::new(session)),
             input,
             events: Some(events),
             control: SessionControl {
@@ -497,7 +497,7 @@ pub struct AgentSession {
     system_prompt: String,
     registry: Arc<Registry>,
     limits: Limits,
-    session: Session,
+    session: Arc<tokio::sync::Mutex<Session>>,
     input: mpsc::Receiver<crate::AgentInput>,
     control: SessionControl,
     events: Option<broadcast::Sender<SessionEvent>>,
@@ -507,7 +507,11 @@ pub struct AgentSession {
 }
 impl AgentSession {
     pub fn auto_compaction_enabled(&self) -> bool {
-        self.session.auto_compaction_control().enabled()
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .auto_compaction_control()
+            .enabled()
     }
     pub fn controls(&self) -> SessionControl {
         self.control.clone()
@@ -523,15 +527,21 @@ impl AgentSession {
             }
         }
     }
-    pub fn journal(&self) -> &Session {
-        &self.session
+    pub fn journal(&self) -> tokio::sync::MutexGuard<'_, Session> {
+        self.session.try_lock().expect("session journal is in use")
     }
     pub fn messages(&self) -> Result<Vec<Message>> {
-        self.session.conversation_at(self.session.head())
+        {
+            let session = self.journal();
+            session.conversation_at(session.head())
+        }
     }
     /// Usage and message counts across the complete durable session.
     pub fn statistics(&self) -> crate::SessionStats {
-        self.session.statistics()
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .statistics()
     }
 
     /// Resolve the configured or provider-reported context window within the model timeout.
@@ -547,34 +557,78 @@ impl AgentSession {
             .ok()
             .flatten(),
         };
-        Ok(window.and_then(|window| self.session.context_usage(window)))
+        Ok(window.and_then(|window| {
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .context_usage(window)
+        }))
     }
 
     pub fn tools(&self) -> Vec<crate::ToolSpec> {
         self.registry.tool_specs()
     }
     pub fn pending_inputs(&self) -> usize {
-        self.input.len() + self.session.queued_inputs().len()
+        self.input.len()
+            + self
+                .session
+                .try_lock()
+                .expect("session journal is in use")
+                .queued_inputs()
+                .len()
     }
     /// Clear pending input while this owned session is idle, retaining each removal in the journal.
     pub fn clear_queued_inputs(&mut self) -> Result<Vec<QueuedMessage>> {
         self.ensure_open()?;
         let events = self.events.as_ref().expect("open session").clone();
-        crate::agent::queue_inputs(&mut self.session, &mut self.input, &mut |event| {
-            emit(&events, &event)
-        })?;
-        let count = self.session.records().len();
-        let pending = self.session.clear_queued_inputs()?;
-        if self.session.records().len() > count {
+        crate::agent::queue_inputs(
+            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut self.input,
+            &mut |event| emit(&events, &event),
+        )?;
+        let count = self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .records()
+            .len();
+        let pending = self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .clear_queued_inputs()?;
+        if self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .records()
+            .len()
+            > count
+        {
             self.emit_last();
         }
         Ok(pending)
     }
     pub fn set_queue_mode(&mut self, kind: InputKind, mode: crate::QueueMode) -> Result<()> {
         self.ensure_open()?;
-        let count = self.session.records().len();
-        self.session.set_queue_mode(kind, mode)?;
-        if count != self.session.records().len() {
+        let count = self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .records()
+            .len();
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .set_queue_mode(kind, mode)?;
+        if count
+            != self
+                .session
+                .try_lock()
+                .expect("session journal is in use")
+                .records()
+                .len()
+        {
             self.emit_last();
         }
         Ok(())
@@ -590,21 +644,45 @@ impl AgentSession {
         model: Arc<dyn Model>,
     ) -> Result<()> {
         self.ensure_open()?;
-        self.registry
-            .register_session_branch_model(self.session.session_id(), name.into(), model)
+        self.registry.register_session_branch_model(
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .session_id(),
+            name.into(),
+            model,
+        )
     }
 
     pub fn set_model(&mut self, model: Arc<dyn Model>, name: impl Into<String>) -> Result<()> {
         self.ensure_open()?;
         let name = name.into();
         self.registry.register_session_branch_model(
-            self.session.session_id(),
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .session_id(),
             name.clone(),
             model.clone(),
         )?;
-        let count = self.session.records().len();
-        self.session.select_model(&name, None)?;
-        if count != self.session.records().len() {
+        let count = self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .records()
+            .len();
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .select_model(&name, None)?;
+        if count
+            != self
+                .session
+                .try_lock()
+                .expect("session journal is in use")
+                .records()
+                .len()
+        {
             self.emit_last();
         }
         self.model = model;
@@ -627,6 +705,8 @@ impl AgentSession {
         let previous_name = self.model_name.clone();
         let previous_level = self
             .session
+            .try_lock()
+            .expect("session journal is in use")
             .model_selection()
             .and_then(|(_, level)| level)
             .unwrap_or_else(|| "off".into());
@@ -665,7 +745,7 @@ impl AgentSession {
             let events = self.events.as_ref().expect("open session");
             crate::lifecycle::notify_idle_with_host(
                 &self.registry,
-                &mut self.session,
+                &mut *self.session.try_lock().expect("session journal is in use"),
                 event,
                 self.limits.tool_timeout,
                 &mut |notification| emit(events, &notification),
@@ -692,10 +772,18 @@ impl AgentSession {
     }
     pub fn checkout(&mut self, record: u64) -> Result<()> {
         self.ensure_open()?;
-        self.session.checkout(record)?;
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .checkout(record)?;
         self.refresh_input_hooks();
         self.emit_last();
-        if let Some((model, _)) = self.session.model_selection() {
+        if let Some((model, _)) = self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .model_selection()
+        {
             self.model_name = model;
         }
         Ok(())
@@ -709,12 +797,27 @@ impl AgentSession {
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
         self.start().await?;
-        let first_record = self.session.records().len();
+        let first_record = self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .records()
+            .len();
         let editor_text = self
             .session
+            .try_lock()
+            .expect("session journal is in use")
             .records()
             .iter()
-            .find(|record| record.id == selected && selected != self.session.head())
+            .find(|record| {
+                record.id == selected
+                    && selected
+                        != self
+                            .session
+                            .try_lock()
+                            .expect("session journal is in use")
+                            .head()
+            })
             .and_then(|record| match &record.event {
                 crate::Event::User { content, .. }
                 | crate::Event::UserWithImages { content, .. } => Some(content.clone()),
@@ -735,7 +838,7 @@ impl AgentSession {
         };
         let result = agent
             .navigate_tree_with_options(
-                &mut self.session,
+                &mut *self.session.try_lock().expect("session journal is in use"),
                 selected,
                 options,
                 &active.token,
@@ -744,17 +847,30 @@ impl AgentSession {
             .await;
         if result.is_ok() {
             self.refresh_input_hooks();
-            if let Some((model, _)) = self.session.model_selection() {
+            if let Some((model, _)) = self
+                .session
+                .try_lock()
+                .expect("session journal is in use")
+                .model_selection()
+            {
                 self.model_name = model;
             }
         }
-        let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
+        let final_inputs = active.finish_inputs(
+            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut self.input,
+            &mut observer,
+        );
         let result = result.and(final_inputs);
         if let Err(error) = result {
             let _ = self.drain_idle_triggers().await;
             return Err(error);
         }
-        let summary_entry = self.session.records()[first_record..]
+        let summary_entry = self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .records()[first_record..]
             .iter()
             .find(|record| matches!(record.event, crate::Event::BranchSummary { .. }))
             .cloned()
@@ -767,7 +883,10 @@ impl AgentSession {
     }
     pub fn set_name(&mut self, name: &str) -> Result<()> {
         self.ensure_open()?;
-        self.session.set_name(name)?;
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .set_name(name)?;
         self.emit_last();
         Ok(())
     }
@@ -776,10 +895,9 @@ impl AgentSession {
     pub async fn set_name_with_hooks(&mut self, name: &str) -> Result<()> {
         self.start().await?;
         self.set_name(name)?;
-        self.notify_session_event(crate::LifecycleEvent::SessionInfoChanged {
-            name: self.session.name().map(str::to_owned),
-        })
-        .await?;
+        let name = self.journal().name().map(str::to_owned);
+        self.notify_session_event(crate::LifecycleEvent::SessionInfoChanged { name })
+            .await?;
         let _ = self.drain_idle_triggers().await?;
         Ok(())
     }
@@ -787,12 +905,23 @@ impl AgentSession {
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
         self.ensure_open()?;
-        if let Some(record) = self.session.recover_tree_trigger_handoff()?.cloned() {
+        if let Some(record) = self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .recover_tree_trigger_handoff()?
+            .cloned()
+        {
             if let Some(events) = &self.events {
                 emit(events, &Notification::Committed(&record));
             }
             self.refresh_input_hooks();
-            if let Some((model, _)) = self.session.model_selection() {
+            if let Some((model, _)) = self
+                .session
+                .try_lock()
+                .expect("session journal is in use")
+                .model_selection()
+            {
                 self.model_name = model;
             }
         }
@@ -808,7 +937,12 @@ impl AgentSession {
     }
 
     async fn drain_idle_triggers(&mut self) -> Result<Option<String>> {
-        let Some(trigger_id) = self.session.pending_custom_trigger() else {
+        let Some(trigger_id) = self
+            .session
+            .try_lock()
+            .expect("session journal is in use")
+            .pending_custom_trigger()
+        else {
             return Ok(None);
         };
         let active = self.begin_run();
@@ -826,7 +960,7 @@ impl AgentSession {
         };
         let result = agent
             .run_correlated(
-                &mut self.session,
+                &mut *self.session.try_lock().expect("session journal is in use"),
                 trigger_id,
                 None,
                 &mut self.input,
@@ -834,7 +968,11 @@ impl AgentSession {
                 &mut observe,
             )
             .await;
-        let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observe);
+        let final_inputs = active.finish_inputs(
+            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut self.input,
+            &mut observe,
+        );
         let answer = result?;
         final_inputs?;
         Ok(Some(answer))
@@ -845,7 +983,7 @@ impl AgentSession {
             let events = self.events.as_ref().expect("open session");
             crate::lifecycle::notify_idle_with_host(
                 &self.registry,
-                &mut self.session,
+                &mut *self.session.try_lock().expect("session journal is in use"),
                 event,
                 self.limits.tool_timeout,
                 &mut |notification| emit(events, &notification),
@@ -861,14 +999,20 @@ impl AgentSession {
         replacement: Option<crate::ContextContent>,
     ) -> Result<()> {
         self.ensure_open()?;
-        self.session.edit_context(target, replacement)?;
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .edit_context(target, replacement)?;
         self.emit_last();
         Ok(())
     }
     /// Record a user shell result and notify subscribers without requesting a model turn.
     pub fn append_bash_execution(&mut self, execution: crate::BashExecution) -> Result<()> {
         self.ensure_open()?;
-        self.session.append_bash_execution(execution)?;
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .append_bash_execution(execution)?;
         self.emit_last();
         Ok(())
     }
@@ -876,7 +1020,10 @@ impl AgentSession {
     /// Persist extension data on the active branch without changing model context.
     pub fn append_custom_entry(&mut self, entry: crate::CustomEntry) -> Result<()> {
         self.ensure_open()?;
-        self.session.append_custom_entry(entry)?;
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .append_custom_entry(entry)?;
         self.emit_last();
         Ok(())
     }
@@ -884,7 +1031,10 @@ impl AgentSession {
     /// Persist an extension message in model context without starting a turn.
     pub fn append_custom_message(&mut self, message: crate::CustomMessage) -> Result<()> {
         self.ensure_open()?;
-        self.session.append_custom_message(message)?;
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .append_custom_message(message)?;
         self.emit_last();
         Ok(())
     }
@@ -903,7 +1053,7 @@ impl AgentSession {
         if trigger_turn {
             let events = self.events.as_ref().expect("open session").clone();
             crate::agent::queue_custom_message(
-                &mut self.session,
+                &mut *self.session.try_lock().expect("session journal is in use"),
                 crate::QueuedCustomMessage {
                     id: Uuid::new_v4(),
                     delivery: crate::CustomMessageDelivery::TriggerTurn,
@@ -922,7 +1072,7 @@ impl AgentSession {
         self.ensure_open()?;
         let events = self.events.as_ref().expect("open session").clone();
         crate::agent::queue_custom_message(
-            &mut self.session,
+            &mut *self.session.try_lock().expect("session journal is in use"),
             crate::QueuedCustomMessage {
                 id: Uuid::new_v4(),
                 delivery: crate::CustomMessageDelivery::NextTurn,
@@ -933,19 +1083,32 @@ impl AgentSession {
     }
     pub fn set_label(&mut self, target: u64, label: Option<String>) -> Result<()> {
         self.ensure_open()?;
-        self.session.set_label(target, label)?;
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .set_label(target, label)?;
         self.emit_last();
         Ok(())
     }
     pub fn fork_at(&self, record: u64) -> Result<Self> {
         self.ensure_open()?;
-        let session = Session::from_records(self.session.fork_records(record)?)?;
+        let session = Session::from_records(
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .fork_records(record)?,
+        )?;
         self.fork_session(session)
     }
     pub fn fork_to(&self, record: u64, destination: impl AsRef<Path>) -> Result<Self> {
         self.ensure_open()?;
         let destination = std::path::absolute(destination)?;
-        let mut fork = self.fork_session(self.session.fork_to(record, &destination)?)?;
+        let mut fork = self.fork_session(
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .fork_to(record, &destination)?,
+        )?;
         fork.session_file = Some(destination);
         Ok(fork)
     }
@@ -957,8 +1120,8 @@ impl AgentSession {
         destination: Option<&Path>,
     ) -> Result<Self> {
         self.ensure_open()?;
-        let record = self
-            .session
+        let journal = self.journal();
+        let record = journal
             .records()
             .iter()
             .find(|record| record.id == entry_id)
@@ -967,6 +1130,7 @@ impl AgentSession {
             crate::ForkPosition::Before => record.parent.unwrap_or(1),
             crate::ForkPosition::At => record.id,
         };
+        drop(journal);
         self.start().await?;
         if self.registry.has_session_transition_hooks() {
             let events = self.events.as_ref().expect("open session");
@@ -975,7 +1139,7 @@ impl AgentSession {
                 .registry
                 .session_transition_cancelled_in_session(
                     &transition,
-                    &mut self.session,
+                    &mut *self.session.try_lock().expect("session journal is in use"),
                     self.limits.tool_timeout,
                     &mut |event| emit(events, &event),
                 )
@@ -992,12 +1156,19 @@ impl AgentSession {
     }
     pub fn export_jsonl(&self, destination: impl AsRef<Path>) -> Result<()> {
         self.ensure_open()?;
-        self.session.export_jsonl(destination)
+        self.session
+            .try_lock()
+            .expect("session journal is in use")
+            .export_jsonl(destination)
     }
     fn fork_session(&self, session: Session) -> Result<Self> {
-        session
-            .retry_control()
-            .configure(self.session.retry_control().settings());
+        session.retry_control().configure(
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .retry_control()
+                .settings(),
+        );
         let model_name = session
             .model_selection()
             .map(|selection| selection.0)
@@ -1005,15 +1176,27 @@ impl AgentSession {
         session
             .auto_compaction_control()
             .set_enabled(self.auto_compaction_enabled());
-        session
-            .auto_compaction_control()
-            .set_token_settings(self.session.auto_compaction_control().token_settings());
+        session.auto_compaction_control().set_token_settings(
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .auto_compaction_control()
+                .token_settings(),
+        );
         let mut fork = SessionBuilder::new(self.model.clone(), model_name)
             .system_prompt(self.system_prompt.clone())
             .limits(self.limits.clone())
             .build(session)?;
-        self.registry
-            .copy_session_branch_models(self.session.session_id(), fork.session.session_id());
+        self.registry.copy_session_branch_models(
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .session_id(),
+            fork.session
+                .try_lock()
+                .expect("session journal is in use")
+                .session_id(),
+        );
         fork.registry = self.registry.clone();
         fork.pending_start = Some((crate::SessionStartReason::Fork, self.session_file.clone()));
         fork.refresh_input_hooks();
@@ -1092,16 +1275,21 @@ impl AgentSession {
                 };
                 let prepared = prepare_idle_input_with_host(
                     &self.registry,
-                    &mut self.session,
+                    &mut *self.session.try_lock().expect("session journal is in use"),
                     event,
                     &active.token,
                     &mut observe,
                 )
                 .await?;
-                if let Some(trigger_id) = self.session.pending_custom_trigger() {
+                if let Some(trigger_id) = self
+                    .session
+                    .try_lock()
+                    .expect("session journal is in use")
+                    .pending_custom_trigger()
+                {
                     agent
                         .run_correlated(
-                            &mut self.session,
+                            &mut *self.session.try_lock().expect("session journal is in use"),
                             trigger_id,
                             None,
                             &mut self.input,
@@ -1118,15 +1306,25 @@ impl AgentSession {
             }
             if let Some(images) = images {
                 agent
-                    .resolve_prior_turn_end(&mut self.session, run_id, &active.token, &mut observe)
+                    .resolve_prior_turn_end(
+                        &mut *self.session.try_lock().expect("session journal is in use"),
+                        run_id,
+                        &active.token,
+                        &mut observe,
+                    )
                     .await?;
-                self.session.append_user_with_images(
-                    input.take().unwrap_or_default(),
-                    images,
-                    Some(run_id),
-                )?;
+                self.session
+                    .try_lock()
+                    .expect("session journal is in use")
+                    .append_user_with_images(
+                        input.take().unwrap_or_default(),
+                        images,
+                        Some(run_id),
+                    )?;
                 observe(Notification::Committed(
                     self.session
+                        .try_lock()
+                        .expect("session journal is in use")
                         .records()
                         .last()
                         .expect("appended user message"),
@@ -1134,7 +1332,7 @@ impl AgentSession {
             }
             agent
                 .run_correlated(
-                    &mut self.session,
+                    &mut *self.session.try_lock().expect("session journal is in use"),
                     run_id,
                     input,
                     &mut self.input,
@@ -1144,7 +1342,11 @@ impl AgentSession {
                 .await
         }
         .await;
-        let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observe);
+        let final_inputs = active.finish_inputs(
+            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut self.input,
+            &mut observe,
+        );
         if result.is_ok()
             && let Err(error) = final_inputs
         {
@@ -1168,7 +1370,7 @@ impl AgentSession {
             limits: self.limits.clone(),
         };
         agent.extension_command(
-            &mut self.session,
+            &mut *self.session.try_lock().expect("session journal is in use"),
             extension,
             command,
             arguments,
@@ -1196,7 +1398,7 @@ impl AgentSession {
             limits: self.limits.clone(),
         };
         let trigger = agent.extension_command_with_trigger(
-            &mut self.session,
+            &mut *self.session.try_lock().expect("session journal is in use"),
             extension,
             command,
             arguments,
@@ -1249,14 +1451,18 @@ impl AgentSession {
         };
         let result = agent
             .compact_with_host_and_inputs(
-                &mut self.session,
+                &mut *self.session.try_lock().expect("session journal is in use"),
                 compaction,
                 &active.token,
                 &mut observer,
                 &mut self.input,
             )
             .await;
-        let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
+        let final_inputs = active.finish_inputs(
+            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut self.input,
+            &mut observer,
+        );
         let result = result.and(final_inputs);
         let triggered = self.drain_idle_triggers().await.map(|_| ());
         result.and(triggered)
@@ -1301,7 +1507,7 @@ impl AgentSession {
             Some(keep_turns) => {
                 agent
                     .summarize_with_instructions(
-                        &mut self.session,
+                        &mut *self.session.try_lock().expect("session journal is in use"),
                         keep_turns,
                         &active.token,
                         &mut observer,
@@ -1313,7 +1519,7 @@ impl AgentSession {
             None => {
                 agent
                     .summarize_configured(
-                        &mut self.session,
+                        &mut *self.session.try_lock().expect("session journal is in use"),
                         &active.token,
                         &mut observer,
                         Some(&mut self.input),
@@ -1322,7 +1528,11 @@ impl AgentSession {
                     .await
             }
         };
-        let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
+        let final_inputs = active.finish_inputs(
+            &mut *self.session.try_lock().expect("session journal is in use"),
+            &mut self.input,
+            &mut observer,
+        );
         let result = result.and(final_inputs);
         let triggered = self.drain_idle_triggers().await.map(|_| ());
         result.and(triggered)
@@ -1357,13 +1567,22 @@ impl AgentSession {
         notification_result.and(result)
     }
     fn emit_last(&self) {
-        if let (Some(events), Some(record)) = (&self.events, self.session.records().last()) {
+        if let (Some(events), Some(record)) = (
+            &self.events,
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .records()
+                .last(),
+        ) {
             emit(events, &Notification::Committed(record));
         }
     }
     fn refresh_input_hooks(&self) {
-        *self.control.input_hooks.lock().expect("SDK input hooks") =
-            InputHooks::new(&self.registry, &self.session);
+        *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::new(
+            &self.registry,
+            &*self.session.try_lock().expect("session journal is in use"),
+        );
     }
     fn ensure_open(&self) -> Result<()> {
         if self.closed {
@@ -1384,8 +1603,12 @@ impl AgentSession {
 impl Drop for AgentSession {
     fn drop(&mut self) {
         self.control.abort();
-        self.registry
-            .remove_session_branch_models(self.session.session_id());
+        self.registry.remove_session_branch_models(
+            self.session
+                .try_lock()
+                .expect("session journal is in use")
+                .session_id(),
+        );
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
     }
 }
@@ -1591,7 +1814,7 @@ mod tests {
         session
             .extension_command("message-extension", "context", "")
             .unwrap();
-        let records = session.journal().records();
+        let records = session.journal().records().to_vec();
         assert!(matches!(
             records[records.len() - 2].event,
             crate::Event::CustomEntry { .. }
@@ -1668,6 +1891,8 @@ mod tests {
             .unwrap();
         session
             .session
+            .try_lock()
+            .unwrap()
             .append_user_with_images("hello".into(), Vec::new(), None)
             .unwrap();
         let previous = session.journal().head();
@@ -1742,7 +1967,12 @@ mod tests {
             .unwrap()
             .in_memory()
             .unwrap();
-        session.session.select_model("first", Some("high")).unwrap();
+        session
+            .session
+            .try_lock()
+            .unwrap()
+            .select_model("first", Some("high"))
+            .unwrap();
         session
             .set_model_with_hooks(
                 Arc::new(WaitingModel),
@@ -2387,10 +2617,11 @@ mod tests {
             system_prompt: &session.system_prompt,
             limits: session.limits.clone(),
         };
+        let mut journal = session.session.lock().await;
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
-                    &mut session.session,
+                    &mut journal,
                     Uuid::new_v4(),
                     Some("B prompt".into()),
                     &mut session.input,
@@ -2406,17 +2637,22 @@ mod tests {
         })
         .await
         .unwrap();
+        drop(journal);
         assert_eq!(result.unwrap(), "done");
         control.steer("after B").await.unwrap();
         active
-            .finish_inputs(&mut session.session, &mut session.input, &mut observe)
+            .finish_inputs(
+                &mut *session.session.try_lock().unwrap(),
+                &mut session.input,
+                &mut observe,
+            )
             .unwrap();
         assert_eq!(&*seen.lock().unwrap(), &["A", "B"]);
         let names = names.lock().unwrap();
         assert_eq!(names[0], "model-B");
         assert!(names[1..].iter().all(|name| name == "model-A"));
-        assert!(session.session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "B prompt")));
-        assert!(!session.session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "branch A")));
+        assert!(session.journal().branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "B prompt")));
+        assert!(!session.journal().branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "branch A")));
     }
 
     #[tokio::test]
@@ -3214,6 +3450,8 @@ mod tests {
         session.prompt("second").await.unwrap();
         session
             .session
+            .try_lock()
+            .unwrap()
             .append_bash_execution(crate::BashExecution {
                 command: "report".into(),
                 output: "x".repeat(600),
@@ -3230,7 +3468,7 @@ mod tests {
             reserve_tokens: None,
             keep_recent_tokens: Some(target),
         });
-        assert_eq!(control.retained_turns(session.journal(), 1).unwrap(), 1);
+        assert_eq!(control.retained_turns(&session.journal(), 1).unwrap(), 1);
         session.close().await.unwrap();
     }
 
@@ -3826,6 +4064,8 @@ mod tests {
         assert_eq!(session.prompt("first").await.unwrap(), "answer 1");
         let user = session
             .session
+            .try_lock()
+            .unwrap()
             .append(crate::Event::User {
                 content: "removed".into(),
                 input_id: None,
@@ -4845,7 +5085,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(count.0.load(Ordering::SeqCst), 2);
-        let records = session.journal().records();
+        let records = session.journal().records().to_vec();
         let queued = records
             .iter()
             .position(|r| matches!(r.event, crate::Event::CustomMessageQueued { .. }))
@@ -4904,7 +5144,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(model.0.load(Ordering::SeqCst), 2);
-        let records = session.journal().records();
+        let records = session.journal().records().to_vec();
         let request = records
             .iter()
             .position(|r| matches!(r.event, crate::Event::ModelRequested { .. }))
@@ -5143,7 +5383,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(model.0.load(Ordering::SeqCst), 2);
-            let records = session.journal().records();
+            let records = session.journal().records().to_vec();
             let id = records
                 .iter()
                 .find_map(|record| match &record.event {
@@ -5963,7 +6203,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let records = session.journal().records();
+        let records = session.journal().records().to_vec();
         let completed = records.iter().position(|record| matches!(record.event,
             crate::Event::TurnEndCallbacksCompleted { assistant_record: id } if id == assistant_record)).unwrap();
         let delivered = records.iter().position(|record| record.run_id == Some(previous) && matches!(&record.event,
@@ -7114,7 +7354,7 @@ mod tests {
             .unwrap();
         session.start().await.unwrap();
         assert_eq!(model.0.load(Ordering::SeqCst), 2);
-        let branch = session.journal().branch();
+        let branch: Vec<_> = session.journal().branch().into_iter().cloned().collect();
         let deliveries: Vec<_> = branch
             .iter()
             .filter_map(|r| match &r.event {
