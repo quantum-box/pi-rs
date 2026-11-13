@@ -539,3 +539,96 @@ async fn lazy_clones_keep_authentication_independent() {
         }
     }
 }
+
+#[tokio::test]
+async fn custom_headers_are_signed_and_cannot_override_authentication() {
+    use http::header::{AUTHORIZATION, HOST, HeaderMap, HeaderName, HeaderValue};
+    for bearer in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0; 4096];
+            let end = loop {
+                let count = socket.read(&mut buf).await.unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&buf[..count]);
+                if let Some(end) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break end;
+                }
+            };
+            let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+            assert!(headers.contains("x-custom: configured"), "{headers}");
+            assert!(headers.contains("x-default: fallback"), "{headers}");
+            assert!(!headers.contains("evil-value"));
+            assert!(!headers.contains("wrong-host"));
+            if bearer {
+                assert!(
+                    headers.contains("authorization: bearer real-token"),
+                    "{headers}"
+                );
+            } else {
+                assert!(
+                    headers.contains("authorization: aws4-hmac-sha256"),
+                    "{headers}"
+                );
+                let signed = headers
+                    .lines()
+                    .find(|line| line.starts_with("authorization:"))
+                    .unwrap();
+                assert!(
+                    signed.contains("x-custom"),
+                    "custom header must be signed: {signed}"
+                );
+            }
+            let frames = event("messageStop", json!({"stopReason":"end_turn"}));
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n", frames.len()).as_bytes()).await.unwrap();
+            socket.write_all(&frames).await.unwrap();
+        });
+        let config = aws_sdk_bedrockruntime::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+            .endpoint_url(format!("http://{address}"))
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "fixture", "secret", None, None, "test",
+            ))
+            .build();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-custom", HeaderValue::from_static("configured"));
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("evil-value"));
+        headers.insert(HOST, HeaderValue::from_static("wrong-host"));
+        headers.insert(
+            HeaderName::from_static("x-amz-date"),
+            HeaderValue::from_static("evil-value"),
+        );
+        let mut defaults = HeaderMap::new();
+        defaults.insert("x-custom", HeaderValue::from_static("default"));
+        defaults.insert("x-default", HeaderValue::from_static("fallback"));
+        let mut model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config))
+            .with_headers(headers)
+            .unwrap()
+            .with_default_headers(&defaults)
+            .unwrap();
+        if bearer {
+            model = model.with_bearer_token("real-token".into()).unwrap();
+        }
+        model
+            .stream(ModelRequest {
+                model: "test-model".into(),
+                messages: vec![Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 128,
+            })
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        server.await.unwrap();
+    }
+}

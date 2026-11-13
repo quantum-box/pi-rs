@@ -1,4 +1,5 @@
 //! Amazon Bedrock ConverseStream adapter.
+mod headers;
 mod options;
 use aws_sdk_bedrockruntime::{
     Client,
@@ -24,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone)]
 pub struct Bedrock {
     client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
+    headers: BTreeMap<String, String>,
     unsupported: Option<String>,
     bearer: Option<String>,
     force_sigv4: bool,
@@ -48,6 +50,7 @@ impl Bedrock {
     pub fn from_env() -> Self {
         Self {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            headers: BTreeMap::new(),
             unsupported: None,
             bearer: None,
             force_sigv4: false,
@@ -72,6 +75,7 @@ impl Bedrock {
     pub fn new(client: Client) -> Self {
         Self {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
+            headers: BTreeMap::new(),
             unsupported: None,
             bearer: None,
             force_sigv4: false,
@@ -98,6 +102,7 @@ impl Bedrock {
             client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(Client::new(
                 &config,
             )))),
+            headers: BTreeMap::new(),
             unsupported: None,
             bearer: None,
             force_sigv4: false,
@@ -119,6 +124,20 @@ impl Bedrock {
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
             summary: false,
         }
+    }
+    /// Replace custom request headers; authentication and SigV4 headers are ignored.
+    pub fn with_headers(mut self, headers: http::HeaderMap) -> Result<Self> {
+        self.headers = headers::filtered(headers)?;
+        self.prepared_identity = None;
+        Ok(self)
+    }
+    /// Add missing default headers without overriding configured request headers.
+    pub fn with_default_headers(mut self, headers: &http::HeaderMap) -> Result<Self> {
+        for (name, value) in headers::filtered(headers.clone())? {
+            self.headers.entry(name).or_insert(value);
+        }
+        self.prepared_identity = None;
+        Ok(self)
     }
     /// Prefer bearer authentication over the AWS credential chain.
     pub fn with_bearer_token(mut self, token: String) -> Result<Self> {
@@ -284,6 +303,7 @@ impl Bedrock {
             config.use_dual_stack(),
             auth_identity,
             &self.model_name,
+            &self.headers,
             format!("{:?}", self.reasoning),
             &self.mapped_effort,
             (
@@ -1096,7 +1116,17 @@ impl Model for Bedrock {
                     .map_err(build_error)?,
             );
         }
-        let mut response = command.send().await.map_err(request_error)?;
+        let headers = self.headers.clone();
+        let mut response = command
+            .customize()
+            .mutate_request(move |request| {
+                for (name, value) in &headers {
+                    request.headers_mut().insert(name.clone(), value.clone());
+                }
+            })
+            .send()
+            .await
+            .map_err(request_error)?;
         let request_id = response.request_id().map(str::to_owned);
         Ok(Box::pin(async_stream::try_stream! {
             let mut calls: BTreeMap<i32, ToolCall> = BTreeMap::new();
@@ -1199,6 +1229,43 @@ mod tests {
         );
         assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "answer"));
     }
+    #[tokio::test]
+    async fn prepared_identity_changes_with_effective_custom_headers() {
+        let config = aws_types::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_types::region::Region::new("us-east-1"))
+            .endpoint_url("https://example.invalid")
+            .credentials_provider(
+                aws_credential_types::provider::SharedCredentialsProvider::new(
+                    aws_credential_types::Credentials::new("access", "secret", None, None, "test"),
+                ),
+            )
+            .build();
+        let identity = |value: &'static str, reserved: &'static str| {
+            let config = config.clone();
+            async move {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-context", http::HeaderValue::from_static(value));
+                headers.insert("authorization", http::HeaderValue::from_static(reserved));
+                Bedrock::from_sdk_config(config)
+                    .with_headers(headers)
+                    .unwrap()
+                    .prepare_bedrock()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .context_identity()
+                    .unwrap()
+            }
+        };
+        let a = identity("private-a", "ignored-a").await;
+        let same = identity("private-a", "ignored-b").await;
+        let b = identity("private-b", "ignored-a").await;
+        assert_eq!(a, same);
+        assert_ne!(a, b);
+        assert!(!a.contains("private-a"));
+    }
+
     #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn selected_profile_wins_over_ambient_keys_without_mutating_environment() {

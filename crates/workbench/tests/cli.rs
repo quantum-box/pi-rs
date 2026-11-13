@@ -6302,3 +6302,75 @@ fn bedrock_explicit_chain_fails_without_aws_credentials_instead_of_using_bearer(
         "request was sent despite missing chain credentials"
     );
 }
+
+#[test]
+fn bedrock_uses_configured_provider_and_model_headers() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"amazon-bedrock":{
+            "headers":{"X-Route":"provider", "X-Private":"$PI_RS_TEST_BEDROCK_HEADER"},
+            "models":[{"id":"test-model", "headers":{"x-route":"model"}}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", endpoint)
+        .env("AWS_BEARER_TOKEN_BEDROCK", "test-token")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("PI_RS_TEST_BEDROCK_HEADER", "route-secret")
+        .env_remove("AWS_PROFILE")
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "amazon-bedrock",
+            "--model",
+            "test-model",
+            "--print",
+            "hello",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut socket, mut reader, request) = accept_proxy_request(listener);
+    assert!(
+        request.starts_with("POST /model/test-model/converse-stream"),
+        "{request}"
+    );
+    let mut headers = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        headers.push_str(&line.to_ascii_lowercase());
+    }
+    assert!(headers.contains("x-route: model"), "{headers}");
+    assert!(headers.contains("x-private: route-secret"), "{headers}");
+    assert!(
+        headers.contains("authorization: bearer test-token"),
+        "{headers}"
+    );
+    socket
+        .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        .unwrap();
+    drop(socket);
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("route-secret"));
+}
