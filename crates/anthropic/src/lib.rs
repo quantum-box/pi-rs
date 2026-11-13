@@ -488,7 +488,7 @@ fn encode_request(
                         replay
                             .blocks
                             .into_iter()
-                            .filter(|block| block.get("_pi_context_edit_api").is_none())
+                            .filter(|block| block.get("_pi_context_edit_api").is_none() && block["_pi_omitted_text"] != true)
                             .map(|mut block| {
                                 if block["_pi_thinking"] == true && allow_empty_signature {
                                     return json!({"type":"thinking","thinking":block["text"],"signature":""});
@@ -1264,6 +1264,37 @@ mod tests {
         assert_eq!(
             model.estimate_message_tokens(&request, &mismatch),
             pi_rs_core::estimate_message_tokens(&mismatch)
+        );
+    }
+
+    #[test]
+    fn edited_replay_skips_empty_text_without_losing_thinking() {
+        let scope = pi_rs_core::endpoint_replay_scope("anthropic", "https://one.example/messages");
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "  answer".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: scope.clone(),
+                        model: "m".into(),
+                    },
+                    blocks: vec![
+                        json!({"type":"text","text":"  ","_pi_omitted_text":true}),
+                        json!({"type":"thinking","thinking":"secret","signature":"sig"}),
+                        json!({"type":"text","text":"answer"}),
+                        json!({"_pi_context_edit_api":"anthropic-messages"}),
+                    ],
+                })),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let body = encode_request(request, "anthropic", &scope, false).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{"type":"thinking","thinking":"secret","signature":"sig"},{"type":"text","text":"answer"}])
         );
     }
 

@@ -190,7 +190,9 @@ impl Provider {
                         self.id()
                     )));
                 }
-                Ok(Client::Ollama(Ollama::new(endpoint, token)?))
+                Ok(Client::Ollama(
+                    Ollama::new(endpoint, token)?.with_provider(self.id()),
+                ))
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;

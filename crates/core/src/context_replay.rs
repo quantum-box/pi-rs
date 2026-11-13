@@ -22,7 +22,10 @@ pub(crate) fn replacement_replay(
     let api = metadata.provider_api?;
     let identity = if matches!(
         api,
-        ModelApi::AnthropicMessages | ModelApi::GoogleGenerativeAi
+        ModelApi::AnthropicMessages
+            | ModelApi::GoogleGenerativeAi
+            | ModelApi::OpenaiResponses
+            | ModelApi::OpenaiCompletions
     ) {
         let identity = metadata.replay_identity.clone()?;
         if !identity.provider.contains("+endpoint-sha256:") {
@@ -50,7 +53,11 @@ pub(crate) fn replacement_replay(
             }
             (ModelApi::PiMessages, _) => serde_json::to_value(block).ok(),
             (ModelApi::AnthropicMessages, ContentBlock::Text { text, .. }) => {
-                Some(json!({"type":"text","text":text}))
+                if text.trim().is_empty() {
+                    Some(json!({"type":"text","text":text,"_pi_omitted_text":true}))
+                } else {
+                    Some(json!({"type":"text","text":text}))
+                }
             }
             (
                 ModelApi::AnthropicMessages,
@@ -139,6 +146,9 @@ pub(crate) fn replacement_replay(
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .filter(|v| v["type"] == "reasoning"),
+            (ModelApi::OpenaiCompletions, ContentBlock::Text { text, .. }) => {
+                Some(json!({"type":"context_edit_text","text":text}))
+            }
             (
                 ModelApi::OpenaiCompletions,
                 ContentBlock::Thinking {
@@ -147,15 +157,13 @@ pub(crate) fn replacement_replay(
                     ..
                 },
             ) => {
-                if let Some(Value::Array(details)) = thinking_signature
+                let details = thinking_signature
                     .as_deref()
                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                {
-                    result.extend(details);
-                    None
-                } else if !thinking.is_empty() {
+                    .filter(Value::is_array);
+                if !thinking.is_empty() || details.is_some() {
                     Some(
-                        json!({"type":"context_edit_reasoning","text":thinking,"field":thinking_signature}),
+                        json!({"type":"context_edit_reasoning","text":thinking,"field":if details.is_some() { None } else { thinking_signature.as_deref() },"details":details}),
                     )
                 } else {
                     None
@@ -395,6 +403,60 @@ mod tests {
             json!({"type":"reasoning","text":"reason","signature":"signature"})
         );
         assert!(bedrock.blocks.iter().all(|b| b["type"] != "tool_use"));
+    }
+
+    #[test]
+    fn chat_replacement_keeps_text_thinking_and_details_in_order() {
+        let replacement: ContextContent = serde_json::from_value(json!([
+            {"type":"text","text":"before"},
+            {"type":"thinking","thinking":"signed","thinkingSignature":"[{\"type\":\"reasoning.text\",\"text\":\"signed\"}]"},
+            {"type":"text","text":"middle"},
+            {"type":"thinking","thinking":"ordinary"},
+            {"type":"text","text":"after"}
+        ])).unwrap();
+        let metadata = ModelMetadata {
+            provider_api: Some(ModelApi::OpenaiCompletions),
+            replay_identity: Some(ResolvedModelIdentity {
+                provider: endpoint_replay_scope("provider", "https://gateway/v1"),
+                model: "model".into(),
+            }),
+            ..Default::default()
+        };
+        let replay = replacement_replay(&replacement, &metadata, &[]).unwrap();
+        assert_eq!(
+            replay
+                .blocks
+                .iter()
+                .map(|b| b["type"].as_str().unwrap_or("marker"))
+                .collect::<Vec<_>>(),
+            [
+                "context_edit_text",
+                "context_edit_reasoning",
+                "context_edit_text",
+                "context_edit_reasoning",
+                "context_edit_text",
+                "marker"
+            ]
+        );
+        assert_eq!(replay.blocks[1]["details"][0]["text"], "signed");
+        assert_eq!(replay.blocks[3]["text"], "ordinary");
+    }
+
+    #[test]
+    fn anthropic_replacement_drops_empty_and_whitespace_text() {
+        let replacement: ContextContent = serde_json::from_value(json!([{"type":"text","text":""},{"type":"text","text":"  "},{"type":"text","text":"answer"}])).unwrap();
+        let metadata = ModelMetadata {
+            provider_api: Some(ModelApi::AnthropicMessages),
+            replay_identity: Some(ResolvedModelIdentity {
+                provider: endpoint_replay_scope("anthropic", "https://one"),
+                model: "m".into(),
+            }),
+            ..Default::default()
+        };
+        let replay = replacement_replay(&replacement, &metadata, &[]).unwrap();
+        assert_eq!(replay.blocks[0]["_pi_omitted_text"], true);
+        assert_eq!(replay.blocks[1]["_pi_omitted_text"], true);
+        assert_eq!(replay.blocks[2], json!({"type":"text","text":"answer"}));
     }
 
     #[test]

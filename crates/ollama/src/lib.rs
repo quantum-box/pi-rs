@@ -9,7 +9,6 @@ use reqwest::header::HeaderMap;
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 mod compatibility;
 mod reasoning_details;
@@ -27,6 +26,7 @@ pub struct Ollama {
     client: Client,
     http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
+    provider: String,
     token: Option<String>,
     headers: HeaderMap,
     cache_retention: CacheRetention,
@@ -109,6 +109,7 @@ impl Ollama {
             client,
             http_proxies: Vec::new(),
             endpoint,
+            provider: "ollama".into(),
             token,
             headers: HeaderMap::new(),
             cache_retention: CacheRetention::None,
@@ -236,12 +237,15 @@ impl Ollama {
         self
     }
 
+    /// Scope replay to the configured provider, even on shared gateways.
+    pub fn with_provider(mut self, provider: &str) -> Self {
+        self.provider = provider.to_owned();
+        self
+    }
+
     fn replay_identity(&self, model: &str) -> ResolvedModelIdentity {
         ResolvedModelIdentity {
-            provider: format!(
-                "chat-completions+sha256:{:x}",
-                Sha256::digest(self.endpoint.as_str().as_bytes())
-            ),
+            provider: pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str()),
             model: model.to_owned(),
         }
     }
@@ -250,6 +254,7 @@ impl Ollama {
         let mut reasoning = None;
         let mut details = Vec::new();
         let mut edited_reasoning = Vec::new();
+        let mut edited_order = Vec::new();
         if let Message::Assistant {
             replay: Some(replay),
             ..
@@ -260,6 +265,19 @@ impl Ollama {
             for block in &replay.blocks {
                 if block["type"] == "context_edit_reasoning" {
                     edited_reasoning.push(block.clone());
+                    edited_order.push(block.clone());
+                    if self.compatibility.preserves_reasoning_details()
+                        && let Some(items) = block["details"].as_array()
+                    {
+                        details.extend(
+                            items
+                                .iter()
+                                .filter(|item| reasoning_details::is_valid(item))
+                                .cloned(),
+                        );
+                    }
+                } else if block["type"] == "context_edit_text" {
+                    edited_order.push(block.clone());
                 } else if block["type"] == "reasoning_content" {
                     reasoning = block["text"].as_str().map(str::to_owned);
                 } else if self.compatibility.preserves_reasoning_details()
@@ -290,26 +308,49 @@ impl Ollama {
         }
         if !details.is_empty() {
             first["reasoning_details"] = Value::Array(details);
-        } else if !edited_reasoning.is_empty() && self.supports_reasoning != Some(false) {
+        }
+        if !edited_reasoning.is_empty() && self.supports_reasoning != Some(false) {
             let text = edited_reasoning
                 .iter()
                 .filter_map(|b| b["text"].as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
             if self.compatibility.requires_thinking_as_text == Some(true) {
-                let visible = first["content"].as_str().unwrap_or_default();
-                first["content"] = json!(if visible.is_empty() {
+                let ordered: String = edited_order
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .collect();
+                first["content"] = json!(if edited_order
+                    .iter()
+                    .any(|b| b["type"] == "context_edit_text")
+                {
+                    ordered
+                } else if first["content"].as_str().unwrap_or_default().is_empty() {
                     text
                 } else {
-                    format!("{text}\n\n{visible}")
+                    format!(
+                        "{text}\n\n{}",
+                        first["content"].as_str().unwrap_or_default()
+                    )
                 });
             } else {
-                let field = edited_reasoning
+                let ordinary: Vec<_> = edited_reasoning
+                    .iter()
+                    .filter(|b| b["details"].as_array().is_none())
+                    .collect();
+                let text = ordinary
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let field = ordinary
                     .first()
                     .and_then(|b| b["field"].as_str())
                     .or(self.compatibility.reasoning_field.as_deref())
                     .unwrap_or("reasoning_content");
-                if matches!(field, "reasoning_content" | "reasoning" | "reasoning_text") {
+                if !text.is_empty()
+                    && matches!(field, "reasoning_content" | "reasoning" | "reasoning_text")
+                {
                     first[field] = json!(text);
                 }
             }
@@ -630,14 +671,27 @@ impl Model for Ollama {
                 })
             });
             let visible_extra = if self.compatibility.requires_thinking_as_text == Some(true) {
-                if let Message::Assistant { content, .. } = message {
-                    encoded
-                        .first()
-                        .and_then(|v| v["content"].as_str())
-                        .and_then(|text| text.strip_suffix(content.as_str()))
-                        .filter(|s| !s.is_empty())
-                        .map(|s| pi_rs_core::estimate_replay_tokens(&[json!(s)]))
-                        .unwrap_or(0)
+                if let Message::Assistant {
+                    replay: Some(replay),
+                    ..
+                } = message
+                {
+                    if replay.identity == self.replay_identity(&request.model)
+                        && replay.supports_api(ModelApi::OpenaiCompletions)
+                    {
+                        replay
+                            .blocks
+                            .iter()
+                            .filter(|b| b["type"] == "context_edit_reasoning")
+                            .filter_map(|b| b["text"].as_str())
+                            .fold(0u64, |sum, text| {
+                                sum.saturating_add(pi_rs_core::estimate_replay_tokens(&[json!(
+                                    text
+                                )]))
+                            })
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 }
@@ -1163,6 +1217,49 @@ mod content_tests {
                 .reasoning_effort
                 .as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn shared_gateway_provider_identity_and_mixed_edited_reasoning() {
+        let compat = serde_json::from_value(json!({"thinkingFormat":"openrouter"})).unwrap();
+        let a = Ollama::new("https://gateway.example/v1/chat/completions", None)
+            .unwrap()
+            .with_provider("provider-a")
+            .with_chat_compatibility(compat, Some(true), true, true);
+        let b = Ollama::new("https://gateway.example/v1/chat/completions", None)
+            .unwrap()
+            .with_provider("provider-b");
+        let message = Message::Assistant {
+            content: "firstmiddlelast".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: a.replay_identity("m"),
+                blocks: vec![
+                    json!({"type":"context_edit_text","text":"first"}),
+                    json!({"type":"context_edit_reasoning","text":"signed","details":[{"type":"reasoning.text","text":"signed"}]}),
+                    json!({"type":"context_edit_text","text":"middle"}),
+                    json!({"type":"context_edit_reasoning","text":"ordinary","field":null}),
+                    json!({"type":"context_edit_text","text":"last"}),
+                    json!({"_pi_context_edit_api":"openai-completions"}),
+                ],
+            })),
+        };
+        let encoded = a.compatible_message(message.clone(), &a.replay_identity("m"));
+        assert_eq!(encoded[0]["reasoning_details"][0]["text"], "signed");
+        assert_eq!(encoded[0]["reasoning_content"], "ordinary");
+        let other = b.compatible_message(message.clone(), &b.replay_identity("m"));
+        assert!(other[0].get("reasoning_content").is_none());
+        assert!(other[0].get("reasoning_details").is_none());
+        let text_model = a.with_chat_compatibility(
+            serde_json::from_value(json!({"requiresThinkingAsText":true})).unwrap(),
+            Some(true),
+            true,
+            true,
+        );
+        assert_eq!(
+            text_model.compatible_message(message, &text_model.replay_identity("m"))[0]["content"],
+            "firstsignedmiddleordinarylast"
         );
     }
 

@@ -533,19 +533,23 @@ fn wire_request(
                         }
                         && replay.supports_api(ModelApi::GoogleGenerativeAi)
                 }) {
+                    let mut first_call = true;
                     replay
                         .blocks
                         .iter()
                         .filter(|part| part.get("_pi_context_edit_api").is_none())
                         .cloned()
                         .map(|mut part| {
-                            if gemini_v3
-                                && replay.is_context_edit()
-                                && part.get("functionCall").is_some()
-                                && part.get("thoughtSignature").is_none()
-                            {
-                                part["thoughtSignature"] =
-                                    json!("skip_thought_signature_validator");
+                            if part.get("functionCall").is_some() {
+                                if first_call
+                                    && gemini_v3
+                                    && replay.is_context_edit()
+                                    && part.get("thoughtSignature").is_none()
+                                {
+                                    part["thoughtSignature"] =
+                                        json!("skip_thought_signature_validator");
+                                }
+                                first_call = false;
                             }
                             if !explicit_tool_ids
                                 && let Some(call) =
@@ -561,7 +565,7 @@ fn wire_request(
                     if !content.is_empty() {
                         parts.push(json!({"text":content}));
                     }
-                    for call in invocations {
+                    for (index, call) in invocations.iter().enumerate() {
                         let arguments = serde_json::from_str::<Value>(&call.arguments)
                             .ok()
                             .filter(Value::is_object)
@@ -571,7 +575,7 @@ fn wire_request(
                             part["functionCall"]["id"] = json!(call.id);
                         }
                         // Google accepts this sentinel when a turn originated on another provider.
-                        if gemini_v3 {
+                        if gemini_v3 && index == 0 {
                             part["thoughtSignature"] = json!("skip_thought_signature_validator");
                         }
                         parts.push(part);
@@ -918,6 +922,56 @@ mod tests {
         assert_eq!(first.context_identity(), same.context_identity());
         assert_ne!(first.context_identity(), changed.context_identity());
         assert!(!first.context_identity().unwrap().contains("pin-one"));
+    }
+
+    #[test]
+    fn gemini_parallel_calls_only_add_fallback_to_first_call() {
+        let scope = pi_rs_core::endpoint_replay_scope("google", "https://example.com/v1");
+        for signed in [true, false] {
+            let mut first = json!({"functionCall":{"name":"one","args":{}}});
+            if signed {
+                first["thoughtSignature"] = json!("real-signature");
+            }
+            let request = ModelRequest {
+                model: "gemini-3-pro".into(),
+                messages: vec![Message::Assistant {
+                    content: String::new(),
+                    calls: vec![
+                        ToolCall {
+                            id: "a".into(),
+                            name: "one".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "b".into(),
+                            name: "two".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    replay: Some(Box::new(ProviderReplay {
+                        identity: identity(&scope, "gemini-3-pro"),
+                        blocks: vec![
+                            first,
+                            json!({"functionCall":{"name":"two","args":{}}}),
+                            json!({"_pi_context_edit_api":"google-generative-ai"}),
+                        ],
+                    })),
+                }],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let body = wire_request(&request, None, "google", &scope).unwrap();
+            let parts = body["contents"][0]["parts"].as_array().unwrap();
+            assert_eq!(
+                parts[0]["thoughtSignature"],
+                if signed {
+                    "real-signature"
+                } else {
+                    "skip_thought_signature_validator"
+                }
+            );
+            assert!(parts[1].get("thoughtSignature").is_none());
+        }
     }
 
     #[test]
