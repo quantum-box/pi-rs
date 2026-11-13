@@ -37,6 +37,66 @@ fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
 }
 
 #[test]
+fn typing_redraws_in_a_synchronized_frame() {
+    for mode in ["regular", "fullscreen"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 110,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(size),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let _process = Process(
+            Command::new(env!("CARGO_BIN_EXE_pi"))
+                .current_dir(root.path())
+                .env("PI_RS_HOME", root.path().join("home"))
+                .env("TERM", "xterm-256color")
+                .args(["--no-trust", "--no-mcp", "--offline", "--tui-mode", mode])
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+        output_until(&mut master, |text| text.contains("Enter to send"));
+        master.write_all(b"flicker check").unwrap();
+        output_until(&mut master, |text| {
+            text.split("\x1b[?2026h").skip(1).any(|frame| {
+                frame.split_once("\x1b[?2026l").is_some_and(|(body, _)| {
+                    body.contains("flicker check")
+                        && body.contains(if mode == "fullscreen" {
+                            "\x1b[2J"
+                        } else {
+                            "\x1b[J"
+                        })
+                })
+            })
+        });
+    }
+}
+
+#[test]
 fn settings_picker_can_be_operated_with_the_mouse() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

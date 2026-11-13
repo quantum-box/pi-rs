@@ -25,7 +25,10 @@ use crossterm::event::{
     MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::style::{Print, ResetColor};
-use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
 use crossterm::{execute, queue};
 use pi_rs::{Error, Result, Session};
 use serde_json::{Value, json};
@@ -1953,7 +1956,8 @@ impl View {
                 self.mouse.highlight(&mut lines, start..end);
             }
         }
-        let mut out = std::io::stdout().lock();
+        let mut out = Vec::new();
+        queue!(out, BeginSynchronizedUpdate)?;
         let elapsed = self
             .request_started
             .map(|start| start.elapsed())
@@ -2108,7 +2112,10 @@ impl View {
                 queue!(out, Show)?;
             }
         }
-        out.flush()?;
+        queue!(out, EndSynchronizedUpdate)?;
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&out)?;
+        stdout.flush()?;
         Ok(())
     }
     fn finish_regular(&mut self) -> Result<()> {
@@ -2364,7 +2371,8 @@ impl View {
                 && !modal
                 && rows_to_match > 0
                 && (!committing || pending().take(rows_to_match).count() < rows_to_match));
-        let mut out = std::io::stdout().lock();
+        let mut out = Vec::new();
+        queue!(out, BeginSynchronizedUpdate)?;
         if redraw {
             self.graphics.clear_placements(&mut out)?;
             queue!(
@@ -2509,7 +2517,10 @@ impl View {
             queue!(out, Hide)?;
         }
         self.regular.started = true;
-        out.flush()?;
+        queue!(out, EndSynchronizedUpdate)?;
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&out)?;
+        stdout.flush()?;
         Ok(())
     }
 }
