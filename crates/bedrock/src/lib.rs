@@ -34,6 +34,7 @@ pub struct Bedrock {
     known_config: Option<std::sync::Arc<tokio::sync::OnceCell<aws_types::SdkConfig>>>,
     prepared_identity: Option<String>,
     environment_config: bool,
+    http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
     reasoning: Option<ReasoningLevel>,
     mapped_effort: Option<String>,
     thinking_budgets: ThinkingBudgets,
@@ -59,6 +60,7 @@ impl Bedrock {
             known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new())),
             prepared_identity: None,
             environment_config: true,
+            http_client: None,
             reasoning: None,
             mapped_effort: None,
             thinking_budgets: ThinkingBudgets::default(),
@@ -84,6 +86,7 @@ impl Bedrock {
             known_config: None,
             prepared_identity: None,
             environment_config: false,
+            http_client: None,
             reasoning: None,
             mapped_effort: None,
             thinking_budgets: ThinkingBudgets::default(),
@@ -113,6 +116,7 @@ impl Bedrock {
             )))),
             prepared_identity: None,
             environment_config: false,
+            http_client: None,
             reasoning: None,
             mapped_effort: None,
             thinking_budgets: ThinkingBudgets::default(),
@@ -215,7 +219,7 @@ impl Bedrock {
     /// Freeze an inspectable SDK configuration and its effective authentication for one request.
     pub async fn prepare_bedrock(&self) -> Result<Option<Self>> {
         use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
-        if self.unsupported.is_some() {
+        if self.unsupported.is_some() || self.http_client.is_some() {
             return Ok(None);
         }
         let Some(config) = &self.known_config else {
@@ -404,6 +408,25 @@ impl Bedrock {
     /// Enable cache checkpoints for a model whose capabilities cannot be inferred from its name.
     pub fn with_force_cache(mut self, enabled: bool) -> Self {
         self.force_cache = enabled;
+        self.prepared_identity = None;
+        self
+    }
+    /// Route requests through a caller-supplied Smithy HTTP client.
+    pub fn with_http_client(
+        mut self,
+        client: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    ) -> Self {
+        let existing = self.client.get().map(|current| {
+            Client::from_conf(
+                current
+                    .config()
+                    .to_builder()
+                    .http_client(client.clone())
+                    .build(),
+            )
+        });
+        self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(existing));
+        self.http_client = Some(client);
         self.prepared_identity = None;
         self
     }
@@ -1064,6 +1087,11 @@ impl Model for Bedrock {
                             .clone()
                     } else {
                         aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
+                    };
+                    let config = if let Some(http_client) = &self.http_client {
+                        config.to_builder().http_client(http_client.clone()).build()
+                    } else {
+                        config
                     };
                     if let Some(token) = &self.bearer {
                         bearer_client(
@@ -2238,5 +2266,17 @@ mod tests {
             text,
             "Bedrock error: ValidationException: bad[31m inputnext"
         );
+    }
+    #[tokio::test]
+    async fn custom_transport_is_not_assigned_a_prepared_context_identity() {
+        use aws_smithy_runtime_api::client::http::http_client_fn;
+        let config = aws_types::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_types::region::Region::new("us-east-1"))
+            .build();
+        let http = http_client_fn(|_, _| panic!("transport must not be invoked"));
+        let model = Bedrock::from_sdk_config(config).with_http_client(http);
+        assert!(model.context_identity().is_none());
+        assert!(model.prepare_bedrock().await.unwrap().is_none());
     }
 }

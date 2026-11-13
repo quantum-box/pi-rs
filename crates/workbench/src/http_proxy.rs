@@ -62,6 +62,113 @@ fn proxies(http: Option<&str>, https: Option<&str>, excluded: &str) -> Result<Ve
     })])
 }
 
+/// Build a Smithy transport that applies the proxy decision to each request URL.
+pub(super) fn bedrock_client(
+    settings: &crate::config::Settings,
+) -> Result<Option<aws_smithy_runtime_api::client::http::SharedHttpClient>> {
+    use aws_smithy_http_client::{Connector, proxy::ProxyConfig, tls};
+    use aws_smithy_runtime_api::client::http::{SharedHttpConnector, http_client_fn};
+    let env = |lower, upper| {
+        std::env::var(lower)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var(upper).ok().filter(|v| !v.is_empty()))
+    };
+    let all = env("all_proxy", "ALL_PROXY");
+    let fallback = settings
+        .string("httpProxy")
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let http = env("http_proxy", "HTTP_PROXY")
+        .or_else(|| all.clone())
+        .or_else(|| fallback.map(str::to_owned));
+    let https = env("https_proxy", "HTTPS_PROXY")
+        .or(all)
+        .or_else(|| fallback.map(str::to_owned));
+    let excluded = env("no_proxy", "NO_PROXY").unwrap_or_default();
+    let http = parse_proxy(http.as_deref())?;
+    let https = parse_proxy(https.as_deref())?;
+    if http.is_none() && https.is_none() {
+        return Ok(None);
+    }
+    let proxy = |value: Option<Url>| -> Result<Option<ProxyConfig>> {
+        value
+            .map(|url| {
+                ProxyConfig::all(url.as_str())
+                    .map_err(|_| Error::Config("Invalid HTTP proxy URL".into()))
+            })
+            .transpose()
+    };
+    let http = proxy(http)?;
+    let https = proxy(https)?;
+    Ok(Some(http_client_fn(move |settings, _components| {
+        let connector = |config: ProxyConfig| {
+            SharedHttpConnector::new(
+                Connector::builder()
+                    .connector_settings(settings.clone())
+                    .proxy_config(config)
+                    .tls_provider(tls::Provider::Rustls(
+                        tls::rustls_provider::CryptoMode::AwsLc,
+                    ))
+                    .build(),
+            )
+        };
+        let direct = connector(ProxyConfig::disabled());
+        let http = http.clone().map(connector);
+        let https = https.clone().map(connector);
+        SharedHttpConnector::new(BedrockConnector {
+            direct,
+            http,
+            https,
+            excluded: excluded.clone(),
+        })
+    })))
+}
+
+struct BedrockConnector {
+    direct: aws_smithy_runtime_api::client::http::SharedHttpConnector,
+    http: Option<aws_smithy_runtime_api::client::http::SharedHttpConnector>,
+    https: Option<aws_smithy_runtime_api::client::http::SharedHttpConnector>,
+    excluded: String,
+}
+impl std::fmt::Debug for BedrockConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BedrockConnector")
+    }
+}
+impl aws_smithy_runtime_api::client::http::HttpConnector for BedrockConnector {
+    fn call(
+        &self,
+        request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+    ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+        let proxy = Url::parse(request.uri()).ok().and_then(|url| {
+            if bedrock_bypasses_proxy(&url, &self.excluded) {
+                return None;
+            }
+            match url.scheme() {
+                "http" => self.http.as_ref(),
+                "https" => self.https.as_ref(),
+                _ => None,
+            }
+        });
+        proxy.unwrap_or(&self.direct).call(request)
+    }
+}
+
+fn bedrock_bypasses_proxy(url: &Url, excluded: &str) -> bool {
+    // Pi treats *.example.com like .example.com, including the apex.
+    let normalized = excluded
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|entry| {
+            entry
+                .strip_prefix("*.")
+                .map_or_else(|| entry.to_owned(), |tail| format!(".{tail}"))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    bypasses_proxy(url, &normalized)
+}
+
 pub(super) fn configured_mcp(
     settings: &crate::config::Settings,
 ) -> Result<pi_rs_workbench::mcp::HttpOptionsWithProxyHosts> {
@@ -218,6 +325,15 @@ mod tests {
             "example.com"
         ));
     }
+    #[test]
+    fn bedrock_wildcard_bypass_includes_apex_like_pi() {
+        let apex = Url::parse("https://example.com").unwrap();
+        let child = Url::parse("https://api.example.com").unwrap();
+        assert!(bedrock_bypasses_proxy(&apex, "*.example.com"));
+        assert!(bedrock_bypasses_proxy(&child, "*.example.com"));
+        assert!(!bedrock_bypasses_proxy(&apex, "*.example.com:80"));
+    }
+
     #[test]
     fn invalid_proxy_does_not_expose_credentials() {
         let error = match proxies(Some("bad://user:secret@example.com"), None, "") {

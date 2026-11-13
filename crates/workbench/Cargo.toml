@@ -22,6 +22,8 @@ evaluation-fixtures = ["dep:pi-rs-fixture-tools"]
 arboard = { version = "3.7", features = ["wayland-data-control"] }
 async-trait = "0.1"
 async-stream = "0.3"
+aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = "1"
 base64 = "0.22"
 eventsource-stream = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }

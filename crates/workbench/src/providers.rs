@@ -448,9 +448,18 @@ impl Client {
     }
 
     pub fn with_http_settings(self, settings: &super::config::Settings) -> Result<Self> {
+        let this = match self {
+            Self::Bedrock(client) => {
+                return Ok(match super::http_proxy::bedrock_client(settings)? {
+                    Some(http) => Self::Bedrock(client.with_http_client(http)),
+                    None => Self::Bedrock(client),
+                });
+            }
+            other => other,
+        };
         let proxies = super::http_proxy::configured(settings)?;
         let timeout = settings.http_idle_timeout();
-        Ok(match self {
+        Ok(match this {
             Self::Ollama(client) => Self::Ollama(client.with_http_options(timeout, &proxies)?),
             Self::Anthropic(client) => {
                 Self::Anthropic(client.with_http_options(timeout, &proxies)?)
@@ -460,14 +469,7 @@ impl Client {
                 Self::PiMessages(client.with_http_options(timeout, &proxies)?)
             }
             Self::OpenAi(client) => Self::OpenAi(client.with_http_options(timeout, &proxies)?),
-            Self::Bedrock(client) => {
-                if !proxies.is_empty() {
-                    return Err(Error::Config(
-                        "workbench HTTP proxy settings are not supported for Bedrock".into(),
-                    ));
-                }
-                Self::Bedrock(client)
-            }
+            Self::Bedrock(_) => unreachable!("Bedrock handled above"),
             Self::Deferred(mut client) => {
                 client.http_settings = Some(settings.clone());
                 Self::Deferred(client)

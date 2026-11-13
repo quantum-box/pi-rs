@@ -2941,6 +2941,8 @@ dependencies = [
  "arboard",
  "async-stream",
  "async-trait",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
  "base64 0.22.1",
  "chrono",
  "clap",
