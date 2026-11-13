@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use pi_rs::{CancellationToken, Extension, Outcome, ToolContext};
 use pi_rs_workbench::mcp::{McpExtension, ServerConfig};
@@ -9,8 +12,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_pages() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+    let server_calls = calls.clone();
     let server = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
+            let calls = server_calls.clone();
             tokio::spawn(async move {
                 let mut socket = BufReader::new(socket);
                 let mut line = String::new();
@@ -35,6 +41,15 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                     return;
                 }
                 let request: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                if let Some(method) = request["method"]
+                    .as_str()
+                    .filter(|method| method.starts_with("resources/"))
+                {
+                    calls.lock().unwrap().push((
+                        method.to_owned(),
+                        request["params"]["cursor"].as_str().map(str::to_owned),
+                    ));
+                }
                 let result = match request["method"].as_str() {
                     Some("initialize") => Some(
                         json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"resources":{}},"serverInfo":{"name":"fixture","version":"1"}}),
@@ -123,6 +138,90 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                 .all(|entry| entry.get("icons").is_none() && entry.get("_meta").is_none())
         );
     }
+    for (suffix, key, first, second) in [
+        (
+            "list_resources_page",
+            "resources",
+            vec!["first", "plain"],
+            vec!["second"],
+        ),
+        (
+            "list_resource_templates_page",
+            "resourceTemplates",
+            vec![],
+            vec!["item"],
+        ),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.spec().name == format!("mcp__fixture__{suffix}"))
+            .unwrap();
+        let before = calls.lock().unwrap().len();
+        for (arguments, expected, next) in [
+            (json!({}), first, Some("next")),
+            (json!({"cursor":"next"}), second, None),
+        ] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                tool.invoke(
+                    arguments,
+                    ToolContext {
+                        operation_id: uuid::Uuid::new_v4(),
+                        cancellation: CancellationToken::new(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            let Outcome::Structured { data, .. } = result else {
+                panic!("unexpected page {result:?}")
+            };
+            assert_eq!(data["server"], "fixture");
+            assert_eq!(data["nextCursor"].as_str(), next);
+            let entries = data[key].as_array().unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(entries.iter().all(|entry| entry["server"] == "fixture"
+                && entry.get("icons").is_none()
+                && entry.get("_meta").is_none()));
+        }
+        {
+            let logged = calls.lock().unwrap();
+            assert_eq!(logged.len(), before + 2);
+            assert_eq!(logged[before].1, None);
+            assert_eq!(logged[before + 1].1.as_deref(), Some("next"));
+        }
+        let invalid = tool
+            .invoke(
+                json!({"cursor":42}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(invalid, Outcome::Failed(message) if message.contains("cursor must be a string"))
+        );
+        assert_eq!(calls.lock().unwrap().len(), before + 2);
+    }
+    let hidden_config: ServerConfig = serde_json::from_value(json!({"url":format!("http://{address}/mcp"),"oauth":false,"exposure":"direct","toolExposure":{"list_resources":"hidden"}})).unwrap();
+    let hidden = McpExtension::connect("hidden", &hidden_config, directory.path())
+        .await
+        .unwrap();
+    let names: Vec<_> = hidden.tools().iter().map(|tool| tool.spec().name).collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with("mcp__hidden__list_resources"))
+    );
+    assert!(names.contains(&"mcp__hidden__list_resource_templates_page".to_owned()));
+    hidden.close().await;
     extension.close().await;
     server.abort();
 }

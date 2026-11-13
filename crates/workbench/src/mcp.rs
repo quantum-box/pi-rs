@@ -865,34 +865,49 @@ impl McpExtension {
             .clone()
             .is_some_and(|info| info.capabilities.resources.is_some())
         {
-            for (name, description, parameters) in [
+            for (name, policy, description, parameters) in [
                 (
+                    "list_resources",
                     "list_resources",
                     "List this MCP server's available resources",
                     json!({"type":"object","properties":{},"additionalProperties":false}),
                 ),
                 (
                     "list_resource_templates",
+                    "list_resource_templates",
                     "List parameterized resource URI templates from this MCP server",
                     json!({"type":"object","properties":{},"additionalProperties":false}),
                 ),
                 (
+                    "list_resources_page",
+                    "list_resources",
+                    "List one page of this MCP server's resources; pass nextCursor as cursor to continue",
+                    json!({"type":"object","properties":{"cursor":{"type":"string"}},"additionalProperties":false}),
+                ),
+                (
+                    "list_resource_templates_page",
+                    "list_resource_templates",
+                    "List one page of this MCP server's resource templates; pass nextCursor as cursor to continue",
+                    json!({"type":"object","properties":{"cursor":{"type":"string"}},"additionalProperties":false}),
+                ),
+                (
+                    "read_resource",
                     "read_resource",
                     "Read a resource URI from this MCP server",
                     json!({"type":"object","properties":{"uri":{"type":"string"}},"required":["uri"],"additionalProperties":false}),
                 ),
             ] {
-                if !tool_enabled(&config, name) {
+                if !tool_enabled(&config, policy) {
                     continue;
                 }
                 let mut exposed = format!("{prefix}{name}");
                 while tools.iter().any(|tool| tool.spec().name == exposed) {
                     exposed.push_str("_resource");
                 }
-                if is_deferred(&config, name) {
-                    has_deferred |= exposure(&config, name) == "deferred";
+                if is_deferred(&config, policy) {
+                    has_deferred |= exposure(&config, policy) == "deferred";
                     has_codemode |=
-                        matches!(exposure(&config, name), "codemode" | "codemode-deferred");
+                        matches!(exposure(&config, policy), "codemode" | "codemode-deferred");
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -1094,6 +1109,15 @@ impl McpTool {
         context: ToolContext,
         host: Option<Arc<dyn pi_rs::ToolHost>>,
     ) -> Outcome {
+        if self.resource
+            && matches!(
+                self.remote_name.as_str(),
+                "list_resources_page" | "list_resource_templates_page"
+            )
+            && let Err(error) = resource_page_params(&arguments)
+        {
+            return Outcome::Failed(error.to_string());
+        }
         let attempt = || async {
             let dispatch_cancel = context.cancellation.child_token();
             tokio::select! {
@@ -1254,6 +1278,30 @@ impl McpTool {
                     json!({"resourceTemplates": visible_resource_listing(serde_json::to_value(templates)?)}),
                 )
             }
+            "list_resources_page" => {
+                let result = service
+                    .list_resources(Some(resource_page_params(arguments)?))
+                    .await
+                    .map_err(call_error)?;
+                Ok(resource_page(
+                    &self.connection.name,
+                    "resources",
+                    serde_json::to_value(result.resources)?,
+                    result.next_cursor,
+                ))
+            }
+            "list_resource_templates_page" => {
+                let result = service
+                    .list_resource_templates(Some(resource_page_params(arguments)?))
+                    .await
+                    .map_err(call_error)?;
+                Ok(resource_page(
+                    &self.connection.name,
+                    "resourceTemplates",
+                    serde_json::to_value(result.resource_templates)?,
+                    result.next_cursor,
+                ))
+            }
             "list_prompts" => {
                 let prompts = service.list_all_prompts().await.map_err(call_error)?;
                 Ok(json!({"prompts":prompts}))
@@ -1283,6 +1331,36 @@ impl McpTool {
             _ => Err(Error::Config("unknown MCP resource operation".into()).into()),
         }
     }
+}
+
+fn resource_page_params(arguments: &Value) -> Result<rmcp::model::PaginatedRequestParams> {
+    let cursor = match arguments.get("cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        }
+        Some(_) => return Err(Error::Config("cursor must be a string".into())),
+    };
+    let mut params = rmcp::model::PaginatedRequestParams::default();
+    params.cursor = cursor;
+    Ok(params)
+}
+
+fn resource_page(server: &str, key: &str, items: Value, cursor: Option<String>) -> Value {
+    let items: Vec<_> = visible_resource_listing(items)
+        .into_iter()
+        .map(|mut item| {
+            item["server"] = json!(server);
+            item
+        })
+        .collect();
+    let mut result = json!({"server": server});
+    result[key] = json!(items);
+    if let Some(cursor) = cursor {
+        result["nextCursor"] = json!(cursor);
+    }
+    result
 }
 
 /// Match Pi's MCP App listing filter, including its MIME-profile prefix matching.
