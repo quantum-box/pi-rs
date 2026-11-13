@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -10,6 +10,7 @@ use crate::{
 
 pub type ExtensionResult<T> = std::result::Result<T, String>;
 pub type ExtensionStates = BTreeMap<String, ExtensionState>;
+type BranchModels = BTreeMap<(Option<Uuid>, String), Arc<dyn crate::Model>>;
 
 /// Partial update to a text result. Omitted fields retain their values.
 #[derive(Clone, Debug, Default)]
@@ -1069,9 +1070,70 @@ pub struct Registry {
     pub(crate) ui: Option<Arc<dyn crate::ExtensionUi>>,
     refresher: Option<Arc<dyn RegistryRefresher>>,
     pub(crate) omit_default_tool_timeout: bool,
+    branch_models: Arc<RwLock<BranchModels>>,
 }
 
 impl Registry {
+    /// Register a model instance for recovery on a branch that selected it.
+    pub fn register_branch_model(
+        &self,
+        name: impl Into<String>,
+        model: Arc<dyn crate::Model>,
+    ) -> Result<()> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        self.branch_models
+            .write()
+            .expect("branch models")
+            .insert((None, name), model);
+        Ok(())
+    }
+
+    pub(crate) fn register_session_branch_model(
+        &self,
+        session_id: Uuid,
+        name: String,
+        model: Arc<dyn crate::Model>,
+    ) -> Result<()> {
+        if name.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        self.branch_models
+            .write()
+            .expect("branch models")
+            .insert((Some(session_id), name), model);
+        Ok(())
+    }
+    pub(crate) fn branch_model(
+        &self,
+        session_id: Uuid,
+        name: &str,
+    ) -> Option<Arc<dyn crate::Model>> {
+        let models = self.branch_models.read().expect("branch models");
+        models
+            .get(&(Some(session_id), name.to_owned()))
+            .or_else(|| models.get(&(None, name.to_owned())))
+            .cloned()
+    }
+    pub(crate) fn copy_session_branch_models(&self, source: Uuid, destination: Uuid) {
+        let mut models = self.branch_models.write().expect("branch models");
+        let copies: Vec<_> = models
+            .iter()
+            .filter(|((owner, _), _)| *owner == Some(source))
+            .map(|((_, name), model)| (name.clone(), model.clone()))
+            .collect();
+        for (name, model) in copies {
+            models.insert((Some(destination), name), model);
+        }
+    }
+    pub(crate) fn remove_session_branch_models(&self, session_id: Uuid) {
+        self.branch_models
+            .write()
+            .expect("branch models")
+            .retain(|(owner, _), _| *owner != Some(session_id));
+    }
     /// Allow tools that opt out to run without the host's default timeout.
     /// Explicitly configured host timeouts should leave this disabled.
     pub fn omit_default_tool_timeout(&mut self, omit: bool) {
@@ -1611,6 +1673,7 @@ impl Registry {
             ui: self.ui.clone(),
             refresher: None,
             omit_default_tool_timeout: self.omit_default_tool_timeout,
+            branch_models: self.branch_models.clone(),
         })
     }
 

@@ -338,6 +338,10 @@ impl SessionControl {
     }
 
     fn observe(&self, event: &Notification<'_>) {
+        if let Notification::BranchState(states) = event {
+            self.input_hooks.lock().expect("SDK input hooks").states = (*states).clone();
+            return;
+        }
         let Notification::Committed(record) = event else {
             return;
         };
@@ -379,6 +383,7 @@ pub struct SessionBuilder {
     registry: Registry,
     limits: Limits,
     tool_timeout_explicit: bool,
+    branch_models: std::collections::BTreeMap<String, Arc<dyn Model>>,
 }
 impl SessionBuilder {
     pub fn new(model: Arc<dyn Model>, model_name: impl Into<String>) -> Self {
@@ -389,6 +394,7 @@ impl SessionBuilder {
             registry: Registry::default(),
             limits: Limits::default(),
             tool_timeout_explicit: false,
+            branch_models: Default::default(),
         }
     }
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -406,6 +412,15 @@ impl SessionBuilder {
     }
     pub fn extension(mut self, extension: Arc<dyn Extension>) -> Result<Self> {
         self.registry.register(extension)?;
+        Ok(self)
+    }
+    /// Register a model needed when recovering an interrupted run on another branch.
+    pub fn branch_model(mut self, name: impl Into<String>, model: Arc<dyn Model>) -> Result<Self> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(Error::Config("model name is empty".into()));
+        }
+        self.branch_models.insert(name, model);
         Ok(self)
     }
     pub fn open(self, path: impl AsRef<Path>) -> Result<AgentSession> {
@@ -432,6 +447,15 @@ impl SessionBuilder {
         if self.model_name.trim().is_empty() {
             return Err(Error::Config("model name is empty".into()));
         }
+        for (name, model) in self.branch_models {
+            self.registry
+                .register_session_branch_model(session.session_id(), name, model)?;
+        }
+        self.registry.register_session_branch_model(
+            session.session_id(),
+            self.model_name.clone(),
+            self.model.clone(),
+        )?;
         let (sender, input) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let weak_events = events.downgrade();
@@ -559,9 +583,25 @@ impl AgentSession {
         &self.model_name
     }
 
+    /// Supply a model needed to recover an interrupted run on another branch.
+    pub fn register_branch_model(
+        &self,
+        name: impl Into<String>,
+        model: Arc<dyn Model>,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        self.registry
+            .register_session_branch_model(self.session.session_id(), name.into(), model)
+    }
+
     pub fn set_model(&mut self, model: Arc<dyn Model>, name: impl Into<String>) -> Result<()> {
         self.ensure_open()?;
         let name = name.into();
+        self.registry.register_session_branch_model(
+            self.session.session_id(),
+            name.clone(),
+            model.clone(),
+        )?;
         let count = self.session.records().len();
         self.session.select_model(&name, None)?;
         if count != self.session.records().len() {
@@ -747,6 +787,15 @@ impl AgentSession {
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
         self.ensure_open()?;
+        if let Some(record) = self.session.recover_tree_trigger_handoff()?.cloned() {
+            if let Some(events) = &self.events {
+                emit(events, &Notification::Committed(&record));
+            }
+            self.refresh_input_hooks();
+            if let Some((model, _)) = self.session.model_selection() {
+                self.model_name = model;
+            }
+        }
         if let Some((reason, previous_session_file)) = self.pending_start.take() {
             self.notify_session_event(crate::LifecycleEvent::SessionStart {
                 reason,
@@ -762,19 +811,6 @@ impl AgentSession {
         let Some(trigger_id) = self.session.pending_custom_trigger() else {
             return Ok(None);
         };
-        if let Some(record) = self
-            .session
-            .restore_tree_trigger_branch(trigger_id)?
-            .cloned()
-        {
-            if let Some(events) = &self.events {
-                emit(events, &Notification::Committed(&record));
-            }
-            self.refresh_input_hooks();
-            if let Some((model, _)) = self.session.model_selection() {
-                self.model_name = model;
-            }
-        }
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let mut observe = |event: Notification<'_>| {
@@ -976,6 +1012,8 @@ impl AgentSession {
             .system_prompt(self.system_prompt.clone())
             .limits(self.limits.clone())
             .build(session)?;
+        self.registry
+            .copy_session_branch_models(self.session.session_id(), fork.session.session_id());
         fork.registry = self.registry.clone();
         fork.pending_start = Some((crate::SessionStartReason::Fork, self.session_file.clone()));
         fork.refresh_input_hooks();
@@ -1345,6 +1383,8 @@ impl AgentSession {
 impl Drop for AgentSession {
     fn drop(&mut self) {
         self.control.abort();
+        self.registry
+            .remove_session_branch_models(self.session.session_id());
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
     }
 }
@@ -1404,7 +1444,9 @@ fn emit(events: &broadcast::Sender<SessionEvent>, notification: &Notification<'_
             message: (*message).into(),
         },
         Notification::Retry(event) => SessionEvent::Retry(event.clone()),
-        Notification::SummaryRequest | Notification::ToolProgress(_) => return,
+        Notification::SummaryRequest
+        | Notification::ToolProgress(_)
+        | Notification::BranchState(_) => return,
         Notification::QueueUpdated {
             steering,
             follow_up,
@@ -2030,6 +2072,7 @@ mod tests {
                     .unwrap();
             reopened.start().await.unwrap();
             assert!(reopened.journal().pending_custom_trigger().is_none());
+            assert_eq!(reopened.journal().head(), branch_b);
             assert_eq!(
                 reopened
                     .journal()
@@ -2058,6 +2101,14 @@ mod tests {
                     .unwrap();
             again.start().await.unwrap();
             assert_eq!(requests.lock().unwrap().len(), 1);
+            again.prompt("follow up B").await.unwrap();
+            let snapshots = requests.lock().unwrap();
+            assert!(snapshots[1].iter().any(
+                |message| matches!(message, Message::User { content } if content == "branch B")
+            ));
+            assert!(!snapshots[1].iter().any(
+                |message| matches!(message, Message::User { content } if content == "branch A")
+            ));
         }
     }
     #[tokio::test]
@@ -2140,6 +2191,543 @@ mod tests {
             )
         );
         assert_eq!(requests.lock().unwrap().len(), 2);
+        assert!(session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "new prompt")));
+        assert!(!session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "branch A")));
+    }
+
+    struct BranchStateHook(Arc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl Extension for BranchStateHook {
+        fn id(&self) -> &str {
+            "branch-state-hook"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            _: &crate::InputEvent,
+            state: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            self.0.lock().unwrap().push(
+                state
+                    .and_then(|state| state.data.as_str())
+                    .unwrap_or("missing")
+                    .into(),
+            );
+            Ok(crate::InputAction::Continue)
+        }
+    }
+    struct BranchModelProbe {
+        expected: &'static str,
+        names: Arc<Mutex<Vec<String>>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        waits: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Model for BranchModelProbe {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            assert_eq!(request.model, self.expected);
+            self.names.lock().unwrap().push(request.model.clone());
+            if request.model == "model-A" && self.waits.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Text("done".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+    #[tokio::test]
+    async fn automatic_tree_handoff_uses_branch_model_and_input_hook_state_then_restores_both() {
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let model_a = Arc::new(BranchModelProbe {
+            expected: "model-A",
+            names: names.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            waits: AtomicUsize::new(0),
+        });
+        let model_b = Arc::new(BranchModelProbe {
+            expected: "model-B",
+            names: names.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            waits: AtomicUsize::new(0),
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("provider"), "model-A", None)
+            .unwrap();
+        journal
+            .append(crate::Event::ExtensionStates {
+                states: [(
+                    "branch-state-hook".into(),
+                    crate::ExtensionState {
+                        version: 1,
+                        data: serde_json::json!("A"),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            })
+            .unwrap();
+        journal
+            .append_user_with_images("branch A".into(), vec![], None)
+            .unwrap();
+        let trigger_id = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "branch-trigger".into(),
+            content: crate::ContextContent::Text("trigger".into()),
+            display: false,
+            details: None,
+        };
+        journal
+            .append(crate::Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: trigger_id,
+                    message: message.clone(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        journal.set_run_id(Some(trigger_id));
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::CustomMessageDelivered {
+                id: trigger_id,
+                message,
+            })
+            .unwrap();
+        journal.set_run_id(None);
+        journal.checkout(1).unwrap();
+        journal
+            .select_provider_model(Some("provider"), "model-B", None)
+            .unwrap();
+        journal
+            .append(crate::Event::ExtensionStates {
+                states: [(
+                    "branch-state-hook".into(),
+                    crate::ExtensionState {
+                        version: 1,
+                        data: serde_json::json!("B"),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            })
+            .unwrap();
+        journal
+            .append_user_with_images("branch B".into(), vec![], None)
+            .unwrap();
+        let mut session = SessionBuilder::new(model_b, "model-B")
+            .branch_model("model-A", model_a.clone())
+            .unwrap()
+            .extension(Arc::new(BranchStateHook(seen.clone())))
+            .unwrap()
+            .build(journal)
+            .unwrap();
+        let active = session.begin_run();
+        let control = session.controls();
+        let observer_control = control.clone();
+        let mut observe = move |event: Notification<'_>| observer_control.observe(&event);
+        let agent = Agent {
+            model: session.model.as_ref(),
+            model_name: &session.model_name,
+            registry: &session.registry,
+            system_prompt: &session.system_prompt,
+            limits: session.limits.clone(),
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(
+                agent.run_correlated(
+                    &mut session.session,
+                    Uuid::new_v4(),
+                    Some("B prompt".into()),
+                    &mut session.input,
+                    &active.token,
+                    &mut observe
+                ),
+                async {
+                    model_a.entered.notified().await;
+                    control.steer("during A").await.unwrap();
+                    model_a.release.notify_one();
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), "done");
+        control.steer("after B").await.unwrap();
+        active
+            .finish_inputs(&mut session.session, &mut session.input, &mut observe)
+            .unwrap();
+        assert_eq!(&*seen.lock().unwrap(), &["A", "B"]);
+        let names = names.lock().unwrap();
+        assert_eq!(names[0], "model-B");
+        assert!(names[1..].iter().all(|name| name == "model-A"));
+        assert!(session.session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "B prompt")));
+        assert!(!session.session.branch().iter().any(|record| matches!(&record.event, crate::Event::User { content, .. } if content == "branch A")));
+    }
+
+    #[tokio::test]
+    async fn missing_tree_branch_model_is_reported_then_recovers_after_registration() {
+        let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("provider"), "model-A", None)
+            .unwrap();
+        journal
+            .append_user_with_images("branch A".into(), vec![], None)
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "model-handoff".into(),
+            content: crate::ContextContent::Text("trigger".into()),
+            display: false,
+            details: None,
+        };
+        journal
+            .append(crate::Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: run_id,
+                    message: message.clone(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        journal.set_run_id(Some(run_id));
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::CustomMessageDelivered {
+                id: run_id,
+                message,
+            })
+            .unwrap();
+        journal.set_run_id(None);
+        journal.checkout(1).unwrap();
+        journal
+            .select_provider_model(Some("provider"), "model-B", None)
+            .unwrap();
+        journal
+            .append_user_with_images("branch B".into(), vec![], None)
+            .unwrap();
+        let branch_b = journal.head();
+        let model_b = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let model_a = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model_b.clone(), "model-B")
+            .build(journal)
+            .unwrap();
+        assert!(
+            session
+                .start()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("requires registered model model-A")
+        );
+        assert_eq!(session.journal().head(), branch_b);
+        assert_eq!(session.journal().pending_custom_trigger(), Some(run_id));
+        session
+            .register_branch_model("model-A", model_a.clone())
+            .unwrap();
+        session.start().await.unwrap();
+        assert_eq!(session.journal().head(), branch_b);
+        assert!(session.journal().pending_custom_trigger().is_none());
+        assert_eq!(model_a.0.load(Ordering::SeqCst), 1);
+        assert_eq!(model_b.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn branch_model_instances_are_scoped_to_the_owning_session() {
+        let registry = Registry::default();
+        let first: Arc<dyn Model> = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let second: Arc<dyn Model> = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let first_session = SessionBuilder::new(first.clone(), "same-name")
+            .registry(registry.clone())
+            .in_memory()
+            .unwrap();
+        let second_session = SessionBuilder::new(second.clone(), "same-name")
+            .registry(registry.clone())
+            .in_memory()
+            .unwrap();
+        let first_id = first_session.journal().session_id();
+        let second_id = second_session.journal().session_id();
+        assert!(Arc::ptr_eq(
+            &registry.branch_model(first_id, "same-name").unwrap(),
+            &first
+        ));
+        assert!(Arc::ptr_eq(
+            &registry.branch_model(second_id, "same-name").unwrap(),
+            &second
+        ));
+        drop(first_session);
+        assert!(registry.branch_model(first_id, "same-name").is_none());
+        assert!(Arc::ptr_eq(
+            &registry.branch_model(second_id, "same-name").unwrap(),
+            &second
+        ));
+    }
+
+    struct BranchFailureModel {
+        cancel: bool,
+        entered: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl Model for BranchFailureModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            if self.cancel {
+                self.entered.notify_one();
+                std::future::pending().await
+            } else {
+                Err(Error::Model("fixture failure".into()))
+            }
+        }
+    }
+    #[tokio::test]
+    async fn tree_handoff_restores_selected_branch_on_failure_and_cancellation() {
+        for cancel_run in [false, true] {
+            let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+            journal
+                .append_user_with_images("branch A".into(), vec![], None)
+                .unwrap();
+            let run_id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "branch-failure".into(),
+                content: crate::ContextContent::Text("trigger".into()),
+                display: false,
+                details: None,
+            };
+            journal
+                .append(crate::Event::TreeMessageQueued {
+                    input: crate::QueuedCustomMessage {
+                        id: run_id,
+                        message: message.clone(),
+                        delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    },
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::CustomMessageDelivered {
+                    id: run_id,
+                    message,
+                })
+                .unwrap();
+            journal.set_run_id(None);
+            journal.checkout(1).unwrap();
+            journal
+                .append_user_with_images("branch B".into(), vec![], None)
+                .unwrap();
+            let branch_b = journal.head();
+            let model = Arc::new(BranchFailureModel {
+                cancel: cancel_run,
+                entered: tokio::sync::Notify::new(),
+            });
+            let mut session = SessionBuilder::new(model.clone(), "fixture")
+                .build(journal)
+                .unwrap();
+            let control = session.controls();
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(session.start(), async {
+                    if cancel_run {
+                        model.entered.notified().await;
+                        control.abort();
+                    }
+                })
+            })
+            .await
+            .unwrap();
+            assert!(result.is_err());
+            assert_eq!(session.journal().head(), branch_b);
+            assert!(session.messages().unwrap().iter().any(
+                |message| matches!(message, Message::User { content } if content == "branch B")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_handoff_restores_selected_branch_when_operation_remains_pending() {
+        let mut journal = Session::with_store(crate::MemoryStore::default()).unwrap();
+        journal
+            .append_user_with_images("branch A".into(), vec![], None)
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "pending-handoff".into(),
+            content: crate::ContextContent::Text("trigger".into()),
+            display: false,
+            details: None,
+        };
+        journal
+            .append(crate::Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: run_id,
+                    message: message.clone(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        journal.set_run_id(Some(run_id));
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::CustomMessageDelivered {
+                id: run_id,
+                message,
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::Assistant {
+                content: String::new(),
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "job".into(),
+                        name: "missing-job".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::ToolStarted { operation_id })
+            .unwrap();
+        journal
+            .append(crate::Event::ToolFinished {
+                operation_id,
+                outcome: crate::Outcome::Pending {
+                    reference: "pending".into(),
+                },
+                states: Default::default(),
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::WaitingForOperation,
+                initial: None,
+            })
+            .unwrap();
+        journal.set_run_id(None);
+        // Simulate a previously selected branch from a legacy checkout.
+        journal
+            .append(crate::Event::Checkout { target: 1 })
+            .unwrap();
+        journal
+            .append_user_with_images("branch B".into(), vec![], None)
+            .unwrap();
+        let branch_b = journal.head();
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .build(journal)
+            .unwrap();
+        assert!(
+            matches!(session.start().await, Err(Error::PendingOperation(id)) if id == operation_id)
+        );
+        assert_eq!(session.journal().head(), branch_b);
+        assert_eq!(session.journal().pending_custom_trigger(), Some(run_id));
+    }
+
+    #[test]
+    fn interrupted_tree_handoff_reopens_on_originally_selected_branch() {
+        for completed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("handoff-crash.jsonl");
+            let mut journal = Session::open(&path).unwrap();
+            journal
+                .append_user_with_images("branch A".into(), vec![], None)
+                .unwrap();
+            let run_id = Uuid::new_v4();
+            let message = crate::CustomMessage {
+                custom_type: "handoff-crash".into(),
+                content: crate::ContextContent::Text("trigger".into()),
+                display: false,
+                details: None,
+            };
+            journal
+                .append(crate::Event::TreeMessageQueued {
+                    input: crate::QueuedCustomMessage {
+                        id: run_id,
+                        message: message.clone(),
+                        delivery: crate::CustomMessageDelivery::TriggerTurn,
+                    },
+                })
+                .unwrap();
+            journal.set_run_id(Some(run_id));
+            journal
+                .append(crate::Event::Run {
+                    state: crate::RunState::Running,
+                    initial: None,
+                })
+                .unwrap();
+            journal
+                .append(crate::Event::CustomMessageDelivered {
+                    id: run_id,
+                    message,
+                })
+                .unwrap();
+            journal.set_run_id(None);
+            journal.checkout(1).unwrap();
+            journal
+                .append_user_with_images("branch B".into(), vec![], None)
+                .unwrap();
+            let branch_b = journal.head();
+            assert!(
+                journal
+                    .begin_tree_trigger_handoff(run_id)
+                    .unwrap()
+                    .is_some()
+            );
+            if completed {
+                journal.set_run_id(Some(run_id));
+                journal
+                    .append(crate::Event::Run {
+                        state: crate::RunState::Completed,
+                        initial: None,
+                    })
+                    .unwrap();
+            }
+            drop(journal);
+            let restored = Session::open(&path).unwrap();
+            assert_eq!(restored.head(), branch_b);
+            assert_eq!(
+                restored.pending_custom_trigger(),
+                (!completed).then_some(run_id)
+            );
+            let count = restored.records().len();
+            drop(restored);
+            let again = Session::open(&path).unwrap();
+            assert_eq!(again.head(), branch_b);
+            assert_eq!(again.records().len(), count);
+        }
     }
     #[async_trait::async_trait]
     impl Extension for BeforeTreeMessages {

@@ -2801,10 +2801,19 @@ Reentrant sends are serviced by the journal owner while the callback waits.
 Separately built extensions negotiate the individual callback capabilities.
 Messages queued by `session_before_tree` are session-wide: they survive a
 checkout, reopening, and an exported fork, and are consumed once across branch
-switches. If a tree-triggered run was started on another branch, recovery
-checks out the latest record from that run before resuming; the branch left
-behind remains available. Recovery requires the current branch's operations to
-be settled. Immediate idle messages remain on the branch where they were sent.
+switches. If a tree-triggered run was started on another branch, recovery uses
+a journaled temporary handoff to resume there, then restores the selected branch
+on success, failure, or cancellation. Reopening repairs an interrupted handoff.
+The current branch's operations must be settled before the handoff. Branch
+extension state is refreshed at both boundaries. If the originating branch
+selected a different model, the host must register its model instance with
+`SessionBuilder::branch_model`, `AgentSession::register_branch_model`, or
+`Registry::register_branch_model`; otherwise recovery reports an error without
+running the wrong model. Differently named providers require the host to switch
+the current provider before recovery. Registrations are scoped by session and
+model name; journals do not distinguish two runtime instances with the same
+provider and model name. Immediate idle messages remain on the branch where
+they were sent.
 
 Focused tests cover queue and tool-result ordering, callback reentrancy,
 initial and streaming input, provider-request delivery, session start and

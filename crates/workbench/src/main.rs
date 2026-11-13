@@ -2399,6 +2399,9 @@ fn metadata(record: &pi_rs::Record) -> Value {
         Event::CustomMessageQueued { input } | Event::TreeMessageQueued { input } => {
             json!({"event":"custom_message_queued","id":input.id,"delivery":input.delivery})
         }
+        Event::TreeTriggerHandoff { run_id, return_to } => {
+            json!({"event":"tree_trigger_handoff","run_id":run_id,"return_to":return_to})
+        }
         Event::CustomEntry { entry } => {
             json!({"event":"custom_entry","customType":entry.custom_type})
         }

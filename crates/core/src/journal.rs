@@ -211,6 +211,11 @@ pub enum Event {
     TreeMessageQueued {
         input: crate::QueuedCustomMessage,
     },
+    /// Persist the selected branch while an interrupted tree trigger resumes elsewhere.
+    TreeTriggerHandoff {
+        run_id: Uuid,
+        return_to: u64,
+    },
     /// Atomically consumes a queued message and adds it to model context.
     CustomMessageDelivered {
         id: Uuid,
@@ -501,7 +506,9 @@ impl Session {
 
     /// Hold an exclusive OS lock for the lifetime of the session.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::with_store(FileStore::open(path.as_ref())?)
+        let mut session = Self::with_store(FileStore::open(path.as_ref())?)?;
+        session.recover_tree_trigger_handoff()?;
+        Ok(session)
     }
 
     /// Read a stable, complete-record prefix without locking or repairing the source.
@@ -1318,7 +1325,10 @@ impl Session {
     /// Restore the branch that owns an interrupted session-wide tree trigger.
     /// The current branch must be settled; the destination may contain the
     /// pending operation that recovery is about to reconcile.
-    pub(crate) fn restore_tree_trigger_branch(&mut self, run_id: Uuid) -> Result<Option<&Record>> {
+    pub(crate) fn begin_tree_trigger_handoff(
+        &mut self,
+        run_id: Uuid,
+    ) -> Result<Option<(u64, Vec<Record>)>> {
         let is_tree_trigger = self.records.iter().any(|record| matches!(&record.event,
             Event::TreeMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn));
         if !is_tree_trigger || self.pending_custom_trigger() != Some(run_id) {
@@ -1335,11 +1345,65 @@ impl Session {
         else {
             return Ok(None);
         };
-        if self.branch().iter().any(|record| record.id == target) {
+        if self.head == target {
             return Ok(None);
         }
         ensure_settled(self.operations())?;
-        self.append(Event::Checkout { target }).map(Some)
+        let current_provider = self.model_provider();
+        let target_provider = self
+            .path(target)
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::ModelSelected { provider, .. } => Some(provider.as_deref()),
+                _ => None,
+            })
+            .flatten();
+        if let (Some(current), Some(target)) = (current_provider, target_provider)
+            && current != target
+        {
+            return Err(Error::Config(format!(
+                "tree trigger recovery requires provider {target}; current provider is {current}"
+            )));
+        }
+        let return_to = self.head;
+        let marker = self
+            .append(Event::TreeTriggerHandoff { run_id, return_to })?
+            .clone();
+        let checkout = self.append(Event::Checkout { target })?.clone();
+        Ok(Some((return_to, vec![marker, checkout])))
+    }
+
+    /// Restore the selected branch without abandoning the recoverable operation
+    /// on the temporary branch. The saved target was settled when handoff began.
+    pub(crate) fn finish_tree_trigger_handoff(&mut self, return_to: u64) -> Result<&Record> {
+        if return_to == 0
+            || return_to > self.records.len() as u64
+            || matches!(
+                self.records[(return_to - 1) as usize].event,
+                Event::Checkout { .. }
+            )
+        {
+            return Err(Error::Session("invalid tree trigger handoff target".into()));
+        }
+        self.append(Event::Checkout { target: return_to })
+    }
+
+    pub(crate) fn recover_tree_trigger_handoff(&mut self) -> Result<Option<&Record>> {
+        let pending = self.records.iter().rev().find_map(|record| {
+            let Event::TreeTriggerHandoff { return_to, .. } = record.event else {
+                return None;
+            };
+            let returned = self.records[record.id as usize..].iter().any(|later| {
+                matches!(later.event,
+                Event::Checkout { target } if target == return_to)
+            });
+            (!returned).then_some(return_to)
+        });
+        match pending {
+            Some(return_to) => self.finish_tree_trigger_handoff(return_to).map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn queued_inputs(&self) -> Vec<crate::QueuedMessage> {
@@ -1683,6 +1747,11 @@ impl Session {
                 }
                 Event::ModelRequested { context_head, .. } => {
                     *context_head = context_head.and_then(|id| ids.get(&id).copied());
+                }
+                Event::TreeTriggerHandoff { return_to, .. } => {
+                    *return_to = *ids
+                        .get(return_to)
+                        .ok_or_else(|| Error::Session("missing tree handoff branch".into()))?;
                 }
                 Event::TurnFinished { assistant_record }
                 | Event::TurnEndCallbacksCompleted { assistant_record }
@@ -2029,6 +2098,11 @@ fn validated_head(records: &[Record]) -> Result<u64> {
             }
             _ => (head != 0).then_some(head),
         };
+        if let Event::TreeTriggerHandoff { return_to, .. } = record.event
+            && !is_prior_position(return_to)
+        {
+            return Err(Error::Session("invalid tree trigger handoff target".into()));
+        }
         if !(version..=FORMAT_VERSION).contains(&record.version)
             || record.id != id
             || record.parent != expected_parent
@@ -2848,9 +2922,49 @@ mod session_metadata_tests {
         session.append(Event::ToolStarted { operation_id }).unwrap();
         let head = session.head();
         assert!(
-            matches!(session.restore_tree_trigger_branch(trigger), Err(Error::Reconciliation(id)) if id == operation_id)
+            matches!(session.begin_tree_trigger_handoff(trigger), Err(Error::Reconciliation(id)) if id == operation_id)
         );
         assert_eq!(session.head(), head);
+        assert_eq!(session.pending_custom_trigger(), Some(trigger));
+    }
+
+    #[test]
+    fn tree_trigger_handoff_rejects_a_different_named_provider_without_switching() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .select_provider_model(Some("provider-a"), "model-a", None)
+            .unwrap();
+        let trigger = Uuid::new_v4();
+        session
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: trigger,
+                    message: crate::CustomMessage {
+                        custom_type: "tree".into(),
+                        content: crate::ContextContent::Text("trigger".into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(trigger));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(1).unwrap();
+        session
+            .select_provider_model(Some("provider-b"), "model-b", None)
+            .unwrap();
+        let before = session.head();
+        let error = session.begin_tree_trigger_handoff(trigger).unwrap_err();
+        assert!(error.to_string().contains("requires provider provider-a"));
+        assert_eq!(session.head(), before);
         assert_eq!(session.pending_custom_trigger(), Some(trigger));
     }
 

@@ -129,6 +129,8 @@ pub enum Notification<'a> {
     },
     Retry(crate::RetryEvent),
     Committed(&'a Record),
+    /// The session switched branch; host-side hook state must be replaced.
+    BranchState(&'a ExtensionStates),
     /// The following model request generates a compaction summary.
     SummaryRequest,
     /// Current queued text after a message was added, accepted, or cleared.
@@ -155,6 +157,19 @@ pub enum Notification<'a> {
 }
 
 pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
+
+fn finish_tree_handoff(
+    session: &mut Session,
+    return_to: u64,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    observer(Notification::Committed(
+        session.finish_tree_trigger_handoff(return_to)?,
+    ));
+    let states = session.extension_states();
+    observer(Notification::BranchState(&states));
+    Ok(())
+}
 
 /// Options for a model-generated branch summary when navigating the tree.
 #[derive(Clone, Copy, Debug)]
@@ -211,13 +226,37 @@ impl Agent<'_> {
         if input.as_ref().is_some_and(|text| text.trim().is_empty()) {
             return Err(Error::Config("empty user input".into()));
         }
+        if let Some(record) = session.recover_tree_trigger_handoff()? {
+            observer(Notification::Committed(record));
+            let states = session.extension_states();
+            observer(Notification::BranchState(&states));
+        }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        if input.is_none()
-            && let Some(record) = session.restore_tree_trigger_branch(run_id)?
-        {
-            observer(Notification::Committed(record));
+        let handoff = if input.is_none() {
+            match session.begin_tree_trigger_handoff(run_id) {
+                Ok(handoff) => handoff,
+                Err(error) => {
+                    observer(Notification::RunStarted { run_id });
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if let Some((_, records)) = &handoff {
+            for record in records {
+                observer(Notification::Committed(record));
+            }
+            let states = session.extension_states();
+            observer(Notification::BranchState(&states));
         }
         let recorded = session
             .records()
@@ -225,37 +264,93 @@ impl Agent<'_> {
             .any(|record| record.run_id == Some(run_id));
         if recorded {
             let branch = session.branch();
-            if input.is_some() || !branch.iter().any(|record| record.run_id == Some(run_id)) {
-                return Err(Error::DuplicateRun(run_id));
-            }
-            if branch.iter().rev().find_map(|record| match record.event {
-                Event::Run { .. } => record.run_id,
-                _ => None,
-            }) != Some(run_id)
-                && session.pending_custom_trigger() != Some(run_id)
-            {
+            let invalid = input.is_some()
+                || !branch.iter().any(|record| record.run_id == Some(run_id))
+                || (branch.iter().rev().find_map(|record| match record.event {
+                    Event::Run { .. } => record.run_id,
+                    _ => None,
+                }) != Some(run_id)
+                    && session.pending_custom_trigger() != Some(run_id));
+            if invalid {
+                if let Some((return_to, _)) = handoff {
+                    finish_tree_handoff(session, return_to, observer)?;
+                }
                 return Err(Error::DuplicateRun(run_id));
             }
         }
+        let branch_model = handoff
+            .as_ref()
+            .and_then(|_| session.model_selection().map(|selection| selection.0));
+        let model = match branch_model
+            .as_deref()
+            .filter(|name| *name != self.model_name)
+        {
+            Some(name) => match self.registry.branch_model(session.session_id(), name) {
+                Some(model) => Some(model),
+                None => {
+                    let error = if let Some((return_to, _)) = handoff {
+                        finish_tree_handoff(session, return_to, observer)
+                            .err()
+                            .unwrap_or_else(|| {
+                                Error::Config(format!(
+                                    "tree trigger recovery requires registered model {name}"
+                                ))
+                            })
+                    } else {
+                        Error::Config(format!(
+                            "tree trigger recovery requires registered model {name}"
+                        ))
+                    };
+                    observer(Notification::RunStarted { run_id });
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         session.set_run_id(Some(run_id));
         observer(Notification::RunStarted { run_id });
-        let result = self
+        let branch_agent = Agent {
+            model: model.as_deref().unwrap_or(self.model),
+            model_name: branch_model.as_deref().unwrap_or(self.model_name),
+            registry: self.registry,
+            system_prompt: self.system_prompt,
+            limits: self.limits.clone(),
+        };
+        let mut result = branch_agent
             .run_turns(session, run_id, input, followups, cancel, observer)
             .await;
+        session.set_run_id(None);
+        if let Some((return_to, _)) = handoff
+            && let Err(error) = finish_tree_handoff(session, return_to, observer)
+        {
+            result = Err(error);
+        }
         let error = result.as_ref().err().map(ToString::to_string);
         observer(Notification::RunEnded {
             run_id,
             succeeded: result.is_ok(),
             error: error.as_deref(),
         });
-        session.set_run_id(None);
         while !cancel.is_cancelled() && ensure_settled(session.operations()).is_ok() {
             let Some(trigger_id) = session.pending_custom_trigger() else {
                 break;
             };
-            match session.restore_tree_trigger_branch(trigger_id) {
-                Ok(Some(record)) => observer(Notification::Committed(record)),
-                Ok(None) => {}
+            let handoff = match session.begin_tree_trigger_handoff(trigger_id) {
+                Ok(Some((return_to, records))) => {
+                    for record in &records {
+                        observer(Notification::Committed(record));
+                    }
+                    let states = session.extension_states();
+                    observer(Notification::BranchState(&states));
+                    Some(return_to)
+                }
+                Ok(None) => None,
                 Err(error) => {
                     observer(Notification::RunStarted { run_id: trigger_id });
                     let message = error.to_string();
@@ -266,19 +361,61 @@ impl Agent<'_> {
                     });
                     break;
                 }
-            }
+            };
             session.set_run_id(Some(trigger_id));
             observer(Notification::RunStarted { run_id: trigger_id });
-            let trigger_result = self
+            let branch_model =
+                handoff.and_then(|_| session.model_selection().map(|selection| selection.0));
+            let model = match branch_model
+                .as_deref()
+                .filter(|name| *name != self.model_name)
+            {
+                Some(name) => match self.registry.branch_model(session.session_id(), name) {
+                    Some(model) => Some(model),
+                    None => {
+                        session.set_run_id(None);
+                        let message =
+                            format!("tree trigger recovery requires registered model {name}");
+                        let error = if let Some(return_to) = handoff {
+                            finish_tree_handoff(session, return_to, observer)
+                                .err()
+                                .map(|error| error.to_string())
+                                .unwrap_or(message)
+                        } else {
+                            message
+                        };
+                        observer(Notification::RunEnded {
+                            run_id: trigger_id,
+                            succeeded: false,
+                            error: Some(&error),
+                        });
+                        break;
+                    }
+                },
+                None => None,
+            };
+            let branch_agent = Agent {
+                model: model.as_deref().unwrap_or(self.model),
+                model_name: branch_model.as_deref().unwrap_or(self.model_name),
+                registry: self.registry,
+                system_prompt: self.system_prompt,
+                limits: self.limits.clone(),
+            };
+            let mut trigger_result = branch_agent
                 .run_turns(session, trigger_id, None, followups, cancel, observer)
                 .await;
+            session.set_run_id(None);
+            if let Some(return_to) = handoff
+                && let Err(error) = finish_tree_handoff(session, return_to, observer)
+            {
+                trigger_result = Err(error);
+            }
             let trigger_error = trigger_result.as_ref().err().map(ToString::to_string);
             observer(Notification::RunEnded {
                 run_id: trigger_id,
                 succeeded: trigger_result.is_ok(),
                 error: trigger_error.as_deref(),
             });
-            session.set_run_id(None);
             if trigger_result.is_err() {
                 break;
             }
