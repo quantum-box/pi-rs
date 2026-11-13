@@ -6005,3 +6005,120 @@ fn bedrock_auth_check_handles_saved_profile_and_ambient_chain() {
         "stored-token"
     );
 }
+
+#[test]
+fn bedrock_saved_chain_overrides_models_json_api_key_for_requests_and_auth_check() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"amazon-bedrock":{"apiKey":"models-bearer"}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        json!({"amazon-bedrock":{"type":"api_key"}}).to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(first.starts_with("POST /model/"), "{first}");
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        let lower = headers.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: aws4-hmac-sha256"),
+            "{headers}"
+        );
+        assert!(headers.contains("Credential=CHAINACCESS/"), "{headers}");
+        assert!(!headers.contains("models-bearer"));
+        write!(
+            socket,
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let configure = |command: &mut Command| {
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_ACCESS_KEY_ID", "CHAINACCESS")
+            .env("AWS_SECRET_ACCESS_KEY", "chain-secret")
+            .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", &endpoint)
+            .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_CONFIG_FILE", root.path().join("missing-config"))
+            .env(
+                "AWS_SHARED_CREDENTIALS_FILE",
+                root.path().join("missing-credentials"),
+            )
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env_remove("AWS_PROFILE")
+            .env_remove("AWS_SESSION_TOKEN")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK");
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    configure(&mut command);
+    let output = command
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "amazon-bedrock",
+            "--model",
+            "amazon.nova-2-lite-v1:0",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        !output.status.success(),
+        "fixture intentionally returns an error"
+    );
+    let mut check = Command::new(env!("CARGO_BIN_EXE_pi"));
+    configure(&mut check);
+    let output = check
+        .args([
+            "--provider",
+            "amazon-bedrock",
+            "auth",
+            "check",
+            "--json",
+            "--credentials",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["reason"],
+        "credential_not_available"
+    );
+    std::fs::write(home.join("auth.json"), "{}").unwrap();
+    let mut fallback = Command::new(env!("CARGO_BIN_EXE_pi"));
+    configure(&mut fallback);
+    let output = fallback
+        .args(["--provider", "amazon-bedrock", "auth", "print-api-key"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "models-bearer"
+    );
+}

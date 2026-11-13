@@ -119,6 +119,14 @@ async fn resolve(
         .and_then(|id| args.model_profiles.model_endpoint(provider, id))
         .unwrap_or_else(|| args.model_profiles.endpoint(provider));
     if let Some(credential) = args.configured_model_credential(provider, endpoint) {
+        if matches!(credential, super::model_auth::Credential::BedrockChain) {
+            return Ok(
+                (wanted.is_none() && bedrock_ambient_configured()).then_some(Resolved {
+                    kind: AuthType::ApiKey,
+                    value: None,
+                }),
+            );
+        }
         if matches!(credential, super::model_auth::Credential::BedrockProfile(_)) {
             return Ok((wanted.is_none()).then_some(Resolved {
                 kind: AuthType::ApiKey,

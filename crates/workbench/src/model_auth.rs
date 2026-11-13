@@ -18,6 +18,7 @@ pub(super) enum Credential {
     ChatGpt,
     Kimi,
     BedrockProfile(String),
+    BedrockChain,
 }
 
 type CommandResult = std::result::Result<String, &'static str>;
@@ -51,7 +52,8 @@ impl Credential {
             | Self::Invalid
             | Self::ChatGpt
             | Self::Kimi
-            | Self::BedrockProfile(_) => None,
+            | Self::BedrockProfile(_)
+            | Self::BedrockChain => None,
         }
     }
 
@@ -74,9 +76,9 @@ impl Credential {
     pub async fn resolve(&self) -> Result<String> {
         let value = match self {
             Self::Literal(value) | Self::Bearer(value) => return Ok(value.clone()),
-            Self::BedrockProfile(_) => {
+            Self::BedrockProfile(_) | Self::BedrockChain => {
                 return Err(Error::Config(
-                    "AWS profile cannot be used as an API key".into(),
+                    "AWS credential sources cannot be used as an API key".into(),
                 ));
             }
             Self::Invalid => return Err(Error::Config("Invalid model credential".into())),
@@ -179,12 +181,14 @@ impl Keys {
                         return None;
                     }
                     if name.eq_ignore_ascii_case("amazon-bedrock") && entry.get("key").is_none() {
-                        entry["env"]["AWS_PROFILE"].as_str().map(|profile| {
-                            if valid_profile(profile) {
-                                Credential::BedrockProfile(profile.into())
-                            } else {
-                                Credential::Invalid
-                            }
+                        Some(match entry["env"].get("AWS_PROFILE") {
+                            None => Credential::BedrockChain,
+                            Some(profile) => match profile.as_str() {
+                                Some(profile) if valid_profile(profile) => {
+                                    Credential::BedrockProfile(profile.into())
+                                }
+                                _ => Credential::Invalid,
+                            },
                         })
                     } else {
                         entry.get("key").map(|key| {
@@ -481,7 +485,10 @@ mod tests {
         save_bedrock_profile_at(&path, None).unwrap();
         let keys = Keys::load_path(&path).unwrap();
         assert!(keys.has(&Provider::Bedrock));
-        assert!(keys.credential(&Provider::Bedrock, "").is_none());
+        assert!(matches!(
+            keys.credential(&Provider::Bedrock, ""),
+            Some(Credential::BedrockChain)
+        ));
         assert_eq!(
             config::read_object(&path).unwrap()["amazon-bedrock"],
             json!({"type":"api_key"})
