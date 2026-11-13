@@ -12,3 +12,6 @@ pub use pi_rs_google as google;
 
 #[cfg(feature = "openai")]
 pub use pi_rs_openai as openai;
+
+#[cfg(feature = "bedrock")]
+pub use pi_rs_bedrock as bedrock;

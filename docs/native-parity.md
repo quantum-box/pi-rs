@@ -170,8 +170,9 @@ and live acceptance with a Vercel account remain open.
 The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,
 and the six pinned Kimi chat models. Their image limits, prices, context windows,
 and per-model reasoning settings remain distinct; the high-speed coding model
-uses its DeepSeek-style thinking switch. Subscription OAuth and live Kimi
-acceptance remain open.
+uses its DeepSeek-style thinking switch. Subscription OAuth supports device
+login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
+remains open.
 
 Markdown links use the reference's non-hyperlink terminal fallback: link text
 is underlined and destinations appear in parentheses only when they differ from
@@ -1736,18 +1737,34 @@ prefix-specific character estimates rather than borrowing usage for the whole
 conversation. The compaction record and RPC response report Pi-compatible
 `tokensBefore`, independently of the native retention budget.
 
-Native budgeting remains a provider-independent heuristic, not a strict bound:
-it does not count provider-specific assistant replay blocks, it extracts tool
-images even for adapters that may serialize the original envelope, and a request
-hook can shrink the actual prompt while an older measured baseline remains in
-use. Provider-aware budgeting and reconciliation with transformed requests are
-separate work.
+Native request budgeting uses adapter-specific message estimates. Anthropic tool
+results count their original text envelope; Bedrock and other adapters that
+extract tool images use a fixed image allowance instead of counting encoded
+image bytes. Bedrock also accepts user images. Matching provider replay blocks,
+including reasoning and signatures, are included only when the adapter actually
+replays them. Bedrock freezes inspectable SDK credentials or bearer tokens,
+region and endpoint before reusing a measured baseline; opaque SDK clients or
+custom transports fall back to fresh estimates. A measured baseline is combined with provider-aware estimates of subsequent
+messages and any additional replay content. Request hooks that change the
+model, messages or tools invalidate the measured baseline; that fact is recorded
+with the request so it remains effective after reopening. A fingerprint also
+requires the effective adapter identity, image policy, model, system messages
+and tool schemas to match the measured request. Secret-bearing adapter and
+header identities use a persistent HMAC key protected by owner-only file
+permissions on Unix and user-scoped DPAPI on Windows. If protected key storage
+is unavailable, the measured baseline is not reused. Deferred workbench providers
+resolve credentials and headers before the capacity check and use the same
+resolved adapter for dispatch; the AIP budget wrapper preserves preparation and
+its budget settlement. Radius also freezes the catalog-selected route
+for that request, so replay is counted only when that route will replay it.
+Adapters that cannot prove a stable identity and older requests without the
+markers use a fresh estimate. The estimator remains a heuristic rather than a
+provider tokenizer or a strict upper bound.
 
 Tests cover trailing input, edits, compaction, model changes, checkout, reopening,
 zero usage and cached-input accounting. Loopback Ollama checks verify early
 compaction from usage, measured RPC counts and fallback counts after an edit.
-Provider-specific reasoning handling and complete native prompt checkpointing
-remain open.
+Complete native prompt checkpointing remains open.
 
 ### Directory listing limits checkpoint
 
@@ -3024,8 +3041,33 @@ hidden files and dependency directories.
 or model. It supports JSON output and a read-only `--no-refresh` check.
 `print-api-key` and `print-bearer-token` explicitly resolve their own
 credential type. Model-specific endpoints are respected. Radius bearer
-tokens use the normal refresh path and accept `--min-expiry`. The default
+tokens use the normal refresh path and accept `--min-expiry`. Kimi bearer
+exports follow the pinned Pi resolver: after refresh, an explicit minimum is
+checked with a five-minute floor, even when a shorter minimum was requested.
+The rotated credential is saved before that check. The default
 check output contains only status and metadata.
+
+pi-rs does not automatically remove stale `auth.json.lock` directories.
+To recover one safely, stop **all** Pi and pi-rs processes that can access
+that credential store, including background or waiting processes on other
+hosts sharing the filesystem. Once they have exited, either remove the stale
+directory or run a single Pi process to recover it; wait for recovery to
+finish before restarting any other process.
+
+This restriction matters even when no process currently holds the lock. Pi's
+`proper-lockfile` can observe a stale directory, pause, and later remove by
+path after another process has replaced it with a live pi-rs lock. Concurrent
+Pi stale recovery can therefore still compromise a pi-rs credential refresh
+and lose a rotated token. pi-rs cannot serialize an already-running Pi
+reclaimer with a separate lock or a path identity check; a complete fix
+must prevent Pi's delayed removal from deleting a live lock. The current
+protocol provides no such guarantee.
+
+One possible defense to investigate is publishing a prepopulated lock
+directory with an atomic no-replace operation, so a delayed `rmdir` fails while
+the directory is held. That approach would change crash recovery and depends
+on operating-system and filesystem behavior; it has not been implemented or
+validated and is not protection in the current release.
 
 Loopback checks covered expired and refreshed Radius credentials,
 model-specific key selection, OpenRouter's OAuth key type, and invalid
@@ -3458,3 +3500,68 @@ is retained for inspection, while the imported context and forks retain the
 correct post-compaction messages. A boundary at the compaction itself, or at a
 later unassigned v1 entry, retains no earlier messages. Other legacy session variants remain subject
 to the session import limitations above.
+
+### Amazon Bedrock ConverseStream
+
+The `amazon-bedrock` provider uses the AWS SDK's standard region and credential
+chain, including `AWS_PROFILE`, shared AWS configuration, temporary role
+credentials, and credential refresh. It also accepts `AWS_BEARER_TOKEN_BEDROCK`
+or a configured API key as a Bedrock bearer token. The optional library feature
+is `bedrock`.
+
+The bundled Pi 1.5.0 chat model catalog provides offline model selection and
+metadata, including pricing. It is a static snapshot, not an account-specific
+list of enabled models. The runtime uses the configured AWS region rather than
+pinning the catalog's default endpoint.
+
+Text, user images, structured tool-result images, tool calls and results,
+streamed reasoning, stop reasons, and input/output/cache usage are supported.
+Signed and redacted reasoning is replayed in its original order only when the
+provider, model, text and tool calls still match, including the journal's
+normalization of malformed arguments. For application inference profile ARNs
+without a model family in the ID, set the model `name` in `models.json` (for
+example, `Claude Sonnet`) to enable Claude-specific signature and error-image
+handling. Images from Claude error results follow the grouped tool results.
+Tool-free summary requests retain tool history as text and pass structured
+images as image blocks. The SDK chooses the endpoint and signs requests or uses the
+bearer token. No AWS resources are created.
+
+Claude and GPT-family models support the Pi reasoning levels and configured
+thinking-level mappings. Claude uses adaptive thinking on the supported newer
+families and budgeted thinking on earlier models; GPT and GPT-OSS use their
+respective effort fields, including explicit mappings such as GPT `off` to
+`none`. The output limit supplied by the host remains a hard
+ceiling. Budgeted Claude thinking reserves at least 1,024 tokens for the answer
+and requires an output limit of at least 2,048; unlike Pi's simple API, this
+adapter does not increase the host's output budget automatically. Reasoning
+options for other model families are not sent, matching Pi's Bedrock adapter.
+Claude 5 models that default to adaptive thinking receive an explicit disabled
+setting when thinking is off, where supported. Fable 5, Mythos 5 and Opus 5.5
+cannot disable thinking; unset uses the model's adaptive default, explicit off
+returns a configuration error, and summaries use adaptive thinking at low
+effort. The output limit applies to thinking and answer combined, so thinking
+can reduce the space available for a summary. Sonnet 5.5 uses `between_tools`
+for tool-free summaries; with tools, explicit off fails and summaries use low
+adaptive effort because thinking can still occur between tool calls.
+
+For supported Claude models, the provider adds default five-minute cache
+checkpoints after the system content and at the end of the final user message.
+Set `PI_CACHE_RETENTION=long` to request one-hour checkpoints on models that
+support that TTL; otherwise the provider uses five-minute checkpoints.
+Workbench model and provider compatibility can explicitly override one-hour
+support, and library callers can use `with_cache_retention` and
+`with_long_cache_support`. Set
+`AWS_BEDROCK_FORCE_CACHE=1` when the model ID and configured name cannot identify
+a supported model; forcing checkpoints alone does not enable one-hour TTL.
+Tool-free summaries disable checkpoints and optional reasoning so
+that their smaller output limit remains usable. Cache usage includes
+one-hour write details when Bedrock reports them. Model support and minimum
+cacheable lengths are determined by Bedrock.
+
+Not yet supported: Pi's interactive AWS profile login/storage, non-image
+multimodal inputs, custom thinking budgets and display controls, tool
+choice/strict sampling, guardrails, prompt management ARNs, live account-specific
+model discovery, custom request headers, and workbench proxy/idle-timeout
+settings. Custom model endpoints in workbench configuration are rejected;
+callers embedding the adapter can pass a configured AWS SDK client, including a
+test endpoint, through `Bedrock::new`.

@@ -436,8 +436,86 @@ struct PendingThinking {
 enum RemoteEvent {
     Notice(String),
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
+    ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
+}
+
+struct AuthReload {
+    revision: String,
+    receiver: std::sync::mpsc::Receiver<Result<super::model_auth::Keys>>,
+    _cancel: tokio::sync::oneshot::Sender<()>,
+}
+impl AuthReload {
+    fn start(revision: String) -> Self {
+        Self::start_path(revision, crate::config::agent_dir().join("auth.json"))
+    }
+
+    fn start_path(revision: String, path: PathBuf) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled => Ok(None),
+                        result = super::model_auth::Keys::load_path_async(&path) => result.map(Some),
+                    }
+                })
+            })();
+            match result {
+                Ok(Some(keys)) => {
+                    let _ = sender.send(Ok(keys));
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                }
+                Ok(None) => (),
+            }
+        });
+        Self {
+            revision,
+            receiver,
+            _cancel: cancel,
+        }
+    }
+}
+
+fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("pi-terminal-signal".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                super::install_ctrl_c(move || {
+                    super::process::TERMINAL_INTERRUPTED
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    notify.notify_one();
+                })
+                .await;
+                let _ = sender.send(Ok(()));
+                std::future::pending::<()>().await;
+            });
+        })?;
+    receiver
+        .recv()
+        .map_err(|_| Error::Config("terminal signal listener stopped".into()))??;
+    super::process::TERMINAL_SIGNAL_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
 }
 
 struct RemoteTask {
@@ -446,6 +524,7 @@ struct RemoteTask {
     started: Instant,
     receiver: std::sync::mpsc::Receiver<RemoteEvent>,
     _cancel: tokio::sync::oneshot::Sender<()>,
+    logout_control: Option<super::chatgpt_auth::LogoutControl>,
 }
 
 impl RemoteTask {
@@ -485,7 +564,14 @@ impl RemoteTask {
             started: Instant::now(),
             receiver,
             _cancel: cancel,
+            logout_control: None,
         }
+    }
+
+    fn cancel_before_commit(&self) -> bool {
+        self.logout_control
+            .as_ref()
+            .is_none_or(|control| control.cancel_before_commit())
     }
 }
 
@@ -2672,6 +2758,14 @@ fn slash(
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
         }
+        "/login" if rest.eq_ignore_ascii_case("kimi-coding") => {
+            start_kimi_login(view, &args.settings)
+        }
+        "/logout" if rest.eq_ignore_ascii_case("kimi-coding") => start_kimi_logout(view),
+        "/login" if rest.eq_ignore_ascii_case("kimi-coding api-key") => edit_provider_key(
+            super::Provider::named("kimi-coding").expect("Kimi provider"),
+            view,
+        ),
         "/login" if rest.eq_ignore_ascii_case("radius") => show_radius_methods(view),
         "/login" if rest.eq_ignore_ascii_case("radius browser") => {
             start_radius_login(view, &args.settings, radius_auth::Method::Browser)?;
@@ -2739,6 +2833,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "kimi-coding · Subscription OAuth".into(),
+                            selection: Selection::LoginKimi,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -3278,7 +3379,11 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     }
 }
 
-pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result<()> {
+pub(super) async fn run(
+    mut args: Cli,
+    follow_up_prompts: Vec<String>,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Config(
             "interactive mode requires a terminal; use run <prompt> for automation".into(),
@@ -3297,7 +3402,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     {
         std::fs::create_dir_all(parent)?;
     }
-    prepare_initial_session(&mut args)?;
+    args = prepare_initial_session_async(args).await?;
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
@@ -3337,10 +3442,14 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let mut keys = Keys::load()?;
     let mut _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
     let mut input = crate::ui::input::Reader::new()?;
+    let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    install_terminal_signal(terminal_signal.clone())?;
+    super::startup_ready(&mut ready);
     if view.graphics.enabled() {
         crate::ui::images::query_cell_size()?;
     }
     let mut worker: Option<Worker> = None;
+    let mut auth_reload: Option<AuthReload> = None;
     let mut startup_extensions: Option<Vec<PathBuf>> = None;
     let mut initial: VecDeque<_> = args
         .initial_prompt
@@ -3361,7 +3470,38 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
     let mut deferred_input = VecDeque::new();
-    loop {
+    let mut interrupted = false;
+    'interactive: loop {
+        if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+            interrupted = true;
+            break 'interactive;
+        }
+        if let Some(task) = &auth_reload {
+            match task.receiver.try_recv() {
+                Ok(Ok(keys)) => {
+                    if args.model_keys.revision() == task.revision {
+                        args.model_keys = keys;
+                        view.invalidate_model_catalog();
+                        view.append("Provider credentials reloaded");
+                    } else {
+                        view.append("Provider credentials changed during reload; keeping the newer selection");
+                    }
+                    auth_reload = None;
+                    dirty = true;
+                }
+                Ok(Err(error)) => {
+                    view.append(&format!("Auth reload: {error}"));
+                    auth_reload = None;
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    view.append("Auth reload stopped");
+                    auth_reload = None;
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => (),
+            }
+        }
         if let Some(receiver) = &view.pending_transition {
             let ready = match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -3727,13 +3867,15 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     ));
                     dirty = true;
                 }
+                Ok(RemoteEvent::ForgetModelKey(provider)) => {
+                    args.model_keys.forget(provider);
+                    view.invalidate_model_catalog();
+                    dirty = true;
+                }
                 Ok(RemoteEvent::RefreshModelKeys) => {
                     view.invalidate_model_catalog();
                     args.thinking_profile = None;
-                    match super::model_auth::Keys::load() {
-                        Ok(keys) => args.model_keys = keys,
-                        Err(error) => view.append(&error.to_string()),
-                    }
+                    auth_reload = Some(AuthReload::start(args.model_keys.revision().to_owned()));
                     dirty = true;
                 }
                 Ok(RemoteEvent::Finished(result)) => {
@@ -4045,12 +4187,9 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 if !mouse_activate && let Some(picker) = &mut view.picker {
                     picker.clear_mouse_press();
                 }
-                if let Some(task) = &view.remote_task {
+                if view.remote_task.is_some() {
                     if keys.action(key, true) == Some("app.interrupt") {
-                        let message = task.cancelled;
-                        view.remote_task = None;
-                        clear_openrouter_editor(&mut view);
-                        view.append(message);
+                        interrupt_remote_task(&mut view);
                         continue;
                     }
                     if view.local_editor.is_none() {
@@ -4592,6 +4731,10 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
+                    "app.interrupt" if auth_reload.is_some() && !is_busy(&worker) => {
+                        auth_reload = None;
+                        view.append("Provider credential reload cancelled");
+                    }
                     "app.interrupt" if worker.as_ref().is_some_and(|active| active.busy) => {
                         if let Err(error) =
                             Worker::control(&mut worker, &args, json!({"type":"clear_queue"}))
@@ -4827,9 +4970,14 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             view.widgets.clear();
                             args.settings =
                                 crate::config::Settings::load(&args.workspace, args.trusted)?;
-                            args.model_keys = super::model_auth::Keys::load()?;
+                            auth_reload =
+                                Some(AuthReload::start(args.model_keys.revision().to_owned()));
+                            view.append("Reloading provider credentials (Esc to cancel)");
                             args.reload_model_profiles()?;
-                            super::packages::prepare(&args).await?;
+                            tokio::select! {
+                                result = super::packages::prepare(&args) => result?,
+                                _ = terminal_signal.notified() => { interrupted = true; break 'interactive; },
+                            }
                             view.resources = super::resources::Resources::load(&args)?;
                             args.theme_paths = view.resources.themes.clone();
                             match Keys::load() {
@@ -4974,7 +5122,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         };
         println!("Resume this session with pi --session {path}");
     }
-    Ok(())
+    if interrupted || super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn show_startup_header(args: &Cli) -> bool {
@@ -5018,7 +5171,8 @@ fn edit_provider_key(provider: super::Provider, view: &mut View) {
 
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
     let removed = super::model_auth::remove(&provider)?;
-    args.model_keys = super::model_auth::Keys::load()?;
+    args.model_keys.forget(provider.id());
+    view.invalidate_model_catalog();
     view.append(&format!(
         "{} for {}",
         if removed {
@@ -5141,6 +5295,42 @@ fn show_radius_methods(view: &mut View) {
     ));
 }
 
+fn start_kimi_logout(view: &mut View) {
+    view.remote_task = Some(RemoteTask::start(
+        "Signing out of Kimi Code",
+        "Kimi Code logout cancelled",
+        move |sender| async move {
+            let removed = super::kimi_auth::logout().await?;
+            let _ = sender.send(RemoteEvent::ForgetModelKey("kimi-coding"));
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec![
+                if removed {
+                    "Signed out of Kimi Code"
+                } else {
+                    "No saved Kimi Code credential"
+                }
+                .into(),
+            ])
+        },
+    ));
+}
+
+fn start_kimi_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    view.remote_task = Some(RemoteTask::start(
+        "Signing in to Kimi Code",
+        "Kimi Code login cancelled",
+        move |sender| async move {
+            super::kimi_auth::login(&settings, |url, code| {
+                let _ = sender.send(RemoteEvent::Notice(format!("Enter code {code} at {url}")));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to Kimi Code".into()])
+        },
+    ));
+}
+
 fn start_openrouter_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     view.remote_task = Some(RemoteTask::start(
@@ -5183,13 +5373,18 @@ fn start_chatgpt_login(
     ));
 }
 
-fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
-    let settings = settings.clone();
-    view.remote_task = Some(RemoteTask::start(
+fn chatgpt_logout_task<F, Fut>(control: super::chatgpt_auth::LogoutControl, logout: F) -> RemoteTask
+where
+    F: FnOnce(super::chatgpt_auth::LogoutControl) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<bool>> + 'static,
+{
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
         "Signing out of ChatGPT",
         "ChatGPT sign-out cancelled",
         move |sender| async move {
-            let result = super::chatgpt_auth::logout(&settings).await;
+            let result = logout(task_control).await;
+            let _ = sender.send(RemoteEvent::ForgetModelKey("openai-chatgpt"));
             let _ = sender.send(RemoteEvent::RefreshModelKeys);
             result.map(|removed| {
                 vec![
@@ -5202,7 +5397,31 @@ fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
                 ]
             })
         },
+    );
+    task.logout_control = Some(control);
+    task
+}
+
+fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    view.remote_task = Some(chatgpt_logout_task(
+        super::chatgpt_auth::LogoutControl::default(),
+        move |control| async move { super::chatgpt_auth::logout_controlled(&settings, control).await },
     ));
+}
+
+fn interrupt_remote_task(view: &mut View) {
+    let Some(task) = &view.remote_task else {
+        return;
+    };
+    if task.cancel_before_commit() {
+        let message = task.cancelled;
+        view.remote_task = None;
+        clear_openrouter_editor(view);
+        view.append(message);
+    } else {
+        view.append("ChatGPT sign-out is completing; waiting for the result");
+    }
 }
 
 fn clear_openrouter_editor(view: &mut View) {
@@ -6128,6 +6347,7 @@ fn select(
         }
         Selection::Completion { range, text } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
+        Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
         Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings, false, None),
         Selection::LoginChatGptNew => start_chatgpt_login(view, &args.settings, true, None),
@@ -6135,6 +6355,9 @@ fn select(
             start_chatgpt_login(view, &args.settings, false, Some(id))
         }
         Selection::LogoutChatGpt => start_chatgpt_logout(view, &args.settings),
+        Selection::LogoutProvider(provider) if provider.id() == "kimi-coding" => {
+            start_kimi_logout(view)
+        }
         Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
         Selection::RadiusMethods => show_radius_methods(view),
         Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,
@@ -6376,6 +6599,48 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
     Ok(())
 }
 
+async fn prepare_initial_session_async(args: Cli) -> Result<Cli> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut args = args;
+        let result = restore_workspace(&mut args).map(|()| args);
+        let _ = sender.send(result);
+    });
+    let mut args = receiver
+        .await
+        .map_err(|_| Error::Config("workspace discovery stopped".into()))??;
+    initialize_session(&mut args)?;
+    Ok(args)
+}
+
+pub(super) fn restore_workspace_cancellable(
+    args: &mut Cli,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next = args.clone();
+    std::thread::spawn(move || {
+        let result = restore_workspace(&mut next).map(|()| next);
+        let _ = sender.send(result);
+    });
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(result) => {
+                *args = result?;
+                return Ok(());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Config("workspace discovery stopped".into()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn prepare_initial_session(args: &mut Cli) -> Result<()> {
     restore_workspace(args)?;
     initialize_session(args)
@@ -6628,6 +6893,177 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancelled_logout_reload_keeps_removed_key_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let held = super::super::auth_lock::acquire(&path).unwrap();
+        let endpoint = super::super::Provider::named("openrouter")
+            .unwrap()
+            .default_endpoint();
+        let mut keys = super::super::model_auth::Keys::parse(&serde_json::json!({
+            "openrouter": {"type":"oauth", "access":"old", "endpoint":endpoint}
+        }));
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_some()
+        );
+        keys.forget("openrouter");
+        let reload = super::AuthReload::start_path(keys.revision().to_owned(), path);
+        assert!(
+            reload
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err()
+        );
+        drop(reload);
+        drop(held);
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_none()
+        );
+    }
+
+    fn chatgpt_logout_fixture(directory: &std::path::Path) {
+        let credential = pi_rs::openai::oauth::Credential {
+            client_id: "client".into(),
+            subject: "subject".into(),
+            email: None,
+            id_token: "id".into(),
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: 4_000_000_000,
+            scopes: vec!["chatgpt.tokens.use.direct".into()],
+        };
+        std::fs::write(
+            directory.join("auth.json"),
+            serde_json::json!({"openai-chatgpt":{"type":"oauth","credential":credential}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("chatgpt-sessions.json"),
+            serde_json::json!({"client":credential}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn committed_chatgpt_logout_remains_observed_after_escape() {
+        for success in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            chatgpt_logout_fixture(directory.path());
+            let path = directory.path().to_owned();
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path.join("chatgpt-refresh.lock"))
+                .unwrap();
+            lock.lock().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let control = super::super::chatgpt_auth::LogoutControl::default();
+            let task = super::chatgpt_logout_task(control, move |control| async move {
+                super::super::chatgpt_auth::logout_with(path, lock, control, move |_| async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    if success {
+                        Ok(())
+                    } else {
+                        Err(pi_rs::Error::Config("fixture failure".into()))
+                    }
+                })
+                .await
+            });
+            let mut view = super::View {
+                remote_task: Some(task),
+                ..Default::default()
+            };
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            super::interrupt_remote_task(&mut view);
+            assert!(
+                view.remote_task.is_some(),
+                "committed logout must remain observed"
+            );
+            release_tx.send(()).unwrap();
+            let task = view.remote_task.take().unwrap();
+            assert!(matches!(
+                task.receiver
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap(),
+                super::RemoteEvent::ForgetModelKey("openai-chatgpt")
+            ));
+            assert!(matches!(
+                task.receiver
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap(),
+                super::RemoteEvent::RefreshModelKeys
+            ));
+            match task
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap()
+            {
+                super::RemoteEvent::Finished(Ok(lines)) if success => {
+                    assert!(lines.iter().any(|line| line.contains("Signed out")))
+                }
+                super::RemoteEvent::Finished(Err(error)) if !success => assert!(
+                    error
+                        .to_string()
+                        .contains("remote revocation was not confirmed")
+                ),
+                _ => panic!("logout did not report its final result"),
+            }
+            let auth =
+                super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
+            assert!(auth.get("openai-chatgpt").is_none());
+        }
+    }
+
+    #[test]
+    fn uncommitted_chatgpt_logout_is_cancelled_by_escape() {
+        let directory = tempfile::tempdir().unwrap();
+        chatgpt_logout_fixture(directory.path());
+        let path = directory.path().to_owned();
+        let shared = super::super::auth_lock::acquire(&path.join("auth.json")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.join("chatgpt-refresh.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let control = super::super::chatgpt_auth::LogoutControl::default();
+        let task = super::chatgpt_logout_task(control, move |control| async move {
+            super::super::chatgpt_auth::logout_with(path, lock, control, move |_| async move {
+                let _ = started_tx.send(());
+                Ok(())
+            })
+            .await
+        });
+        let mut view = super::View {
+            remote_task: Some(task),
+            ..Default::default()
+        };
+        super::interrupt_remote_task(&mut view);
+        assert!(view.remote_task.is_none());
+        drop(shared);
+        assert!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err()
+        );
+        let auth = super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
+        assert!(auth.get("openai-chatgpt").is_some());
+    }
+
     #[test]
     fn queued_escape_wins_over_ready_new_session() {
         use clap::Parser;

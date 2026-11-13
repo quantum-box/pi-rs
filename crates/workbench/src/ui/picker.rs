@@ -23,6 +23,7 @@ pub enum Selection {
     },
     LoginProvider(super::super::Provider),
     LoginOpenRouter,
+    LoginKimi,
     LoginChatGpt,
     LoginChatGptNew,
     LoginChatGptAccount(String),

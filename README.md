@@ -66,6 +66,12 @@ Use `pi login openai-chatgpt --new-account` to add another account or workspace,
 `pi login openai-chatgpt --account <client-id>` to select one. The terminal's
 `/login` menu also offers saved accounts and a new-account option.
 
+To use a Kimi Code subscription, run `pi login kimi-coding` and complete the
+device authorization, then select `--provider kimi-coding`. In the terminal,
+`/login kimi-coding` and `/logout kimi-coding` sign in and out. Tokens are
+shared with Pi through `auth.json` and refreshed automatically. To enter an
+API key instead, use `/login kimi-coding api-key` or `KIMI_API_KEY`.
+
 ## Native extensions
 
 The terminal enables notes and a TODO checklist, alongside plan mode and branch

@@ -288,6 +288,9 @@ impl Script {
 
 #[async_trait::async_trait]
 impl Model for Script {
+    fn context_identity(&self) -> Option<String> {
+        Some("test-script".into())
+    }
     async fn context_window(&self, _: &str) -> Option<u32> {
         u32::try_from(self.context_window.load(Ordering::SeqCst))
             .ok()
@@ -2141,6 +2144,633 @@ async fn zero_reported_usage_falls_back_to_visible_content() {
             .map(estimate_message_tokens)
             .sum::<u64>()
     );
+}
+
+#[tokio::test]
+async fn transformed_requests_invalidate_current_and_prior_measured_baselines() {
+    use std::sync::atomic::AtomicBool;
+    struct Shrink(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl Extension for Shrink {
+        fn id(&self) -> &str {
+            "shrink"
+        }
+        async fn before_request(
+            &self,
+            request: &mut ModelRequest,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<()> {
+            if self.0.load(Ordering::SeqCst) {
+                request
+                    .messages
+                    .retain(|m| matches!(m, Message::System { .. }));
+                request.messages.push(Message::User {
+                    content: "short".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+    for initially_transformed in [false, true] {
+        let enabled = Arc::new(AtomicBool::new(initially_transformed));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(Shrink(enabled.clone())))
+            .unwrap();
+        let mut first = answer("short");
+        if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+            *usage = Some(Usage {
+                input_tokens: 5000,
+                output_tokens: 20,
+            });
+        }
+        let model = Script::new(vec![first, answer("done")]);
+        let mut harness = agent(&model, &registry);
+        harness.limits.output_tokens_per_request = 64;
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        harness
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        enabled.store(!initially_transformed, Ordering::SeqCst);
+        harness.limits.context_window = Some(1000);
+        harness
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn measured_baseline_adds_provider_specific_trailing_tool_cost() {
+    struct CostlyToolResult(Script);
+    #[async_trait::async_trait]
+    impl Model for CostlyToolResult {
+        fn context_identity(&self) -> Option<String> {
+            self.0.context_identity()
+        }
+        fn estimate_message_tokens(&self, _: &ModelRequest, message: &Message) -> u64 {
+            estimate_message_tokens(message)
+                + if matches!(message, Message::Tool { .. }) {
+                    300
+                } else {
+                    0
+                }
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.0.stream(request).await
+        }
+    }
+    let mut first = tool_reply(&[r#"{"id":"ok"}"#]);
+    if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+        *usage = Some(Usage {
+            input_tokens: 750,
+            output_tokens: 20,
+        });
+    }
+    let model = CostlyToolResult(Script::new(vec![first]));
+    let fixture = Arc::new(Fixture {
+        called: AtomicUsize::new(0),
+        hold: false,
+        effects: Mutex::new(BTreeMap::new()),
+    });
+    let mut registry = Registry::default();
+    registry.register(Arc::new(Tools(fixture))).unwrap();
+    let mut harness = agent(&model, &registry);
+    harness.limits.context_window = Some(1000);
+    harness.limits.output_tokens_per_request = 64;
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    session.auto_compaction_control().set_enabled(false);
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let result = harness
+        .run(
+            &mut session,
+            Some("go".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Model(message)) if message.contains("automatic compaction is disabled"))
+    );
+    assert_eq!(model.0.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn measured_output_covers_replayed_reasoning_without_double_counting() {
+    struct ReplayCost(Script);
+    #[async_trait::async_trait]
+    impl Model for ReplayCost {
+        fn context_identity(&self) -> Option<String> {
+            self.0.context_identity()
+        }
+        fn estimate_message_tokens(&self, _: &ModelRequest, message: &Message) -> u64 {
+            if matches!(message, Message::Assistant { .. }) {
+                1000
+            } else {
+                estimate_message_tokens(message)
+            }
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.0.stream(request).await
+        }
+    }
+    for (output_tokens, window, should_fit) in [(1000, 1500, true), (10, 700, false)] {
+        let mut first = answer("answer");
+        if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+            *usage = Some(Usage {
+                input_tokens: 20,
+                output_tokens,
+            });
+        }
+        let model = ReplayCost(Script::new(vec![first, answer("done")]));
+        let registry = Registry::default();
+        let mut harness = agent(&model, &registry);
+        harness.limits.output_tokens_per_request = 1100;
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        harness
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        harness.limits.output_tokens_per_request = 64;
+        harness.limits.context_window = Some(window);
+        let result = harness
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await;
+        assert_eq!(result.is_ok(), should_fit);
+        if !should_fit {
+            assert!(
+                matches!(result, Err(Error::Model(message)) if message.contains("automatic compaction is disabled"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn measured_baseline_is_invalidated_by_runtime_catalog_refresh() {
+    struct DynamicTool {
+        description: String,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for DynamicTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "lookup".into(),
+                description: self.description.clone(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Outcome::Succeeded("ok".into())
+        }
+    }
+    struct DynamicExtension {
+        description: String,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Extension for DynamicExtension {
+        fn id(&self) -> &str {
+            "dynamic"
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(DynamicTool {
+                description: self.description.clone(),
+                calls: self.calls.clone(),
+            })]
+        }
+    }
+    struct Refresh {
+        calls: Arc<AtomicUsize>,
+        target: String,
+        schema: bool,
+        done: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl RegistryRefresher for Refresh {
+        async fn refresh(&self, current: &Registry) -> Result<Option<RegistryUpdate>> {
+            if self.calls.load(Ordering::SeqCst) == 0 || self.done.swap(true, Ordering::SeqCst) {
+                return Ok(None);
+            }
+            let mut registry = current.clone();
+            if self.schema {
+                registry.replace(Arc::new(DynamicExtension {
+                    description: self.target.clone(),
+                    calls: self.calls.clone(),
+                }))?;
+            }
+            Ok(Some(RegistryUpdate {
+                registry,
+                system_prompt: (!self.schema).then(|| self.target.clone()),
+            }))
+        }
+    }
+    struct DiscoverAfterTool {
+        script: Script,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Model for DiscoverAfterTool {
+        fn context_identity(&self) -> Option<String> {
+            self.script.context_identity()
+        }
+        async fn context_window(&self, _: &str) -> Option<u32> {
+            (self.calls.load(Ordering::SeqCst) > 0).then_some(1000)
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.script.stream(request).await
+        }
+    }
+    for schema in [false, true] {
+        for grows in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (initial, target) = if grows {
+                ("short".to_owned(), "x".repeat(8000))
+            } else {
+                ("x".repeat(8000), "short".to_owned())
+            };
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(DynamicExtension {
+                    description: if schema {
+                        initial.clone()
+                    } else {
+                        "short".into()
+                    },
+                    calls: calls.clone(),
+                }))
+                .unwrap();
+            registry.set_refresher(Arc::new(Refresh {
+                calls: calls.clone(),
+                target,
+                schema,
+                done: std::sync::atomic::AtomicBool::new(false),
+            }));
+            let mut first = tool_reply(&["{}"]);
+            if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+                *usage = Some(Usage {
+                    input_tokens: if grows { 20 } else { 3000 },
+                    output_tokens: 8,
+                });
+            }
+            let model = DiscoverAfterTool {
+                script: Script::new(vec![first, answer("done")]),
+                calls,
+            };
+            let mut harness = agent(&model, &registry);
+            harness.system_prompt = if schema { "short" } else { &initial };
+            harness.limits.output_tokens_per_request = 64;
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            session.auto_compaction_control().set_enabled(false);
+            let (_, mut inputs) = mpsc::channel::<String>(1);
+            let result = harness
+                .run(
+                    &mut session,
+                    Some("go".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut ignore,
+                )
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                !grows,
+                "schema={schema}, grows={grows}, result={result:?}"
+            );
+            assert_eq!(
+                model.script.requests.lock().unwrap().len(),
+                if grows { 1 } else { 2 }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn measured_baseline_requires_matching_configuration_after_reopen() {
+    for (initial_large, change) in [(false, true), (true, true), (false, false)] {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("configuration.jsonl");
+        let initial = if initial_large {
+            "x".repeat(8000)
+        } else {
+            "short".into()
+        };
+        let target = if change {
+            if initial_large {
+                "short".into()
+            } else {
+                "x".repeat(8000)
+            }
+        } else {
+            initial.clone()
+        };
+        let mut first = answer("reply");
+        if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+            *usage = Some(Usage {
+                input_tokens: if initial_large || !change { 3000 } else { 20 },
+                output_tokens: 8,
+            });
+        }
+        let model = Script::new(vec![first, answer("done")]);
+        let registry = Registry::default();
+        let mut harness = agent(&model, &registry);
+        harness.system_prompt = &initial;
+        harness.limits.output_tokens_per_request = 64;
+        let mut session = Session::open(&path).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        harness
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        harness.system_prompt = &target;
+        harness.limits.context_window = Some(1000);
+        let result = harness
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            initial_large && change,
+            "initial_large={initial_large}, change={change}, result={result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn measured_baseline_requires_stable_adapter_identity() {
+    struct Adapter<'a> {
+        script: &'a Script,
+        identity: Option<&'static str>,
+        extra: u64,
+    }
+    #[async_trait::async_trait]
+    impl Model for Adapter<'_> {
+        fn context_identity(&self) -> Option<String> {
+            self.identity.map(str::to_owned)
+        }
+        fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+            estimate_request_tokens(request).saturating_add(self.extra)
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.script.stream(request).await
+        }
+    }
+    for (first_id, second_id, first_usage, extra, should_fit) in [
+        (Some("endpoint-a"), Some("endpoint-b"), 3000, 0, true),
+        (Some("endpoint-a"), Some("endpoint-b"), 20, 1500, false),
+        (None, None, 20, 1500, false),
+        (Some("same"), Some("same"), 3000, 0, false),
+    ] {
+        let mut first = answer("reply");
+        if let Some(ModelEvent::Complete { usage, .. }) = first.last_mut() {
+            *usage = Some(Usage {
+                input_tokens: first_usage,
+                output_tokens: 8,
+            });
+        }
+        let script = Script::new(vec![first, answer("done")]);
+        let first_model = Adapter {
+            script: &script,
+            identity: first_id,
+            extra: 0,
+        };
+        let second_model = Adapter {
+            script: &script,
+            identity: second_id,
+            extra,
+        };
+        let registry = Registry::default();
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        let mut first_agent = agent(&first_model, &registry);
+        first_agent.limits.output_tokens_per_request = 64;
+        first_agent
+            .run(
+                &mut session,
+                Some("first".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await
+            .unwrap();
+        let mut second_agent = agent(&second_model, &registry);
+        second_agent.limits.output_tokens_per_request = 64;
+        second_agent.limits.context_window = Some(1000);
+        let result = second_agent
+            .run(
+                &mut session,
+                Some("next".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            should_fit,
+            "first={first_id:?}, second={second_id:?}, result={result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retryable_model_preparation_uses_session_retry_policy() {
+    struct Preparing {
+        attempts: AtomicUsize,
+        script: Script,
+    }
+    #[async_trait::async_trait]
+    impl Model for Preparing {
+        async fn prepare_context<'a>(
+            &'a self,
+            _: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Error::RetryableModel("temporary resolution failure".into()))
+            } else {
+                Ok(None)
+            }
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.script.stream(request).await
+        }
+    }
+    let model = Preparing {
+        attempts: AtomicUsize::new(0),
+        script: Script::new(vec![answer("done")]),
+    };
+    let registry = Registry::default();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    session.retry_control().configure(RetrySettings {
+        enabled: true,
+        max_retries: 1,
+        base_delay_ms: 0,
+        max_agent_delay_ms: 0,
+    });
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    let result = agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("go".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "done");
+    assert_eq!(model.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(model.script.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn prepared_model_is_used_for_capacity_and_dispatch() {
+    struct Original {
+        streams: Arc<AtomicUsize>,
+        large: bool,
+    }
+    struct Prepared {
+        streams: Arc<AtomicUsize>,
+        large: bool,
+    }
+    #[async_trait::async_trait]
+    impl Model for Original {
+        async fn prepare_context<'a>(
+            &'a self,
+            _: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
+            Ok(Some(Arc::new(Prepared {
+                streams: self.streams.clone(),
+                large: self.large,
+            })))
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            panic!("unprepared client dispatched")
+        }
+    }
+    #[async_trait::async_trait]
+    impl Model for Prepared {
+        fn context_identity(&self) -> Option<String> {
+            Some("prepared-route".into())
+        }
+        fn estimate_request_tokens(&self, _: &ModelRequest) -> u64 {
+            if self.large { 2000 } else { 10 }
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            self.streams.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(answer("done").into_iter().map(Ok))))
+        }
+    }
+    for large in [false, true] {
+        let streams = Arc::new(AtomicUsize::new(0));
+        let model = Original {
+            streams: streams.clone(),
+            large,
+        };
+        let registry = Registry::default();
+        let mut harness = agent(&model, &registry);
+        harness.limits.context_window = Some(1000);
+        harness.limits.output_tokens_per_request = 64;
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = mpsc::channel::<String>(1);
+        let result = harness
+            .run(
+                &mut session,
+                Some("go".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await;
+        assert_eq!(result.is_ok(), !large);
+        assert_eq!(streams.load(Ordering::SeqCst), usize::from(!large));
+    }
+}
+
+#[tokio::test]
+async fn unknown_capacity_skips_request_estimation() {
+    struct CountEstimates {
+        script: Script,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Model for CountEstimates {
+        fn estimate_request_tokens(&self, _: &ModelRequest) -> u64 {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.script.stream(request).await
+        }
+    }
+    let model = CountEstimates {
+        script: Script::new(vec![answer("done")]),
+        calls: AtomicUsize::new(0),
+    };
+    let registry = Registry::default();
+    let mut session = Session::with_store(MemoryStore::default()).unwrap();
+    let (_, mut inputs) = mpsc::channel::<String>(1);
+    agent(&model, &registry)
+        .run(
+            &mut session,
+            Some("go".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

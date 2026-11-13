@@ -184,6 +184,11 @@ impl Anthropic {
         self
     }
 
+    /// Return the configured request headers for protected context identity.
+    pub fn context_headers(&self) -> reqwest::header::HeaderMap {
+        self.headers.clone()
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -799,6 +804,50 @@ impl StreamUsage {
 
 #[async_trait::async_trait]
 impl Model for Anthropic {
+    fn context_identity(&self) -> Option<String> {
+        // Unconfigured thinking can consult a changing remote model catalog.
+        if !self.http_proxies.is_empty()
+            || (self.thinking_level.is_some() && self.configured_thinking.is_none())
+        {
+            return None;
+        }
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        pi_rs_core::protected_model_fingerprint(&(
+            headers,
+            "anthropic-v1",
+            self.endpoint.as_str(),
+            self.provider.as_ref(),
+            self.replay_scope.as_ref(),
+            self.auth.0.as_str(),
+            self.auth.1.as_bytes(),
+            &self.thinking_level,
+            format!("{:?}", self.configured_thinking),
+            self.allow_empty_signature,
+            self.cache_retention.anthropic_control(),
+            self.cache_tools,
+        ))
+    }
+
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        match message {
+            Message::Tool { content, .. } => content.encode_utf16().count().div_ceil(4) as u64,
+            Message::Assistant {
+                content,
+                calls,
+                replay: Some(replay),
+            } if replay_matches(replay, &self.replay_scope, &request.model, content, calls) => {
+                pi_rs_core::estimate_replay_tokens(&replay.blocks)
+                    .max(pi_rs_core::estimate_message_tokens(message))
+            }
+            _ => pi_rs_core::estimate_message_tokens(message),
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         self.model(model).await?.context_window
     }
@@ -1095,6 +1144,87 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn context_identity_tracks_static_route_and_configuration() {
+        let make = |endpoint: &str, key: &str| Anthropic::new(endpoint, key).unwrap();
+        let first = make(DEFAULT_ENDPOINT, "key-a");
+        assert!(first.context_identity().is_some());
+        assert_eq!(first.context_identity(), first.clone().context_identity());
+        assert_ne!(
+            first.context_identity(),
+            make(DEFAULT_ENDPOINT, "key-b").context_identity()
+        );
+        assert_ne!(
+            first.context_identity(),
+            make("https://example.com/v1/messages", "key-a").context_identity()
+        );
+        assert_ne!(
+            first.context_identity(),
+            first
+                .clone()
+                .with_configured_thinking("high", true, true)
+                .context_identity()
+        );
+        assert!(
+            first
+                .with_thinking(Some("high"))
+                .context_identity()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn capacity_estimate_matches_image_and_replay_serialization() {
+        let model = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let tool = |n| {
+            Message::Tool { call_id: "c".into(), content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(n)}]}}).to_string(), is_error: false, is_structured: Some(true) }
+        };
+        let small = model.estimate_message_tokens(&request, &tool(4));
+        let large = model.estimate_message_tokens(&request, &tool(20000));
+        assert!(large > small + 4000);
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "anthropic".into(),
+                model: "fixture".into(),
+            },
+            blocks: vec![
+                json!({"type":"text","text":"answer"}),
+                json!({"type":"thinking","thinking":"x".repeat(5000),"signature":"sig"}),
+            ],
+        };
+        let assistant = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(replay)),
+        };
+        assert!(model.estimate_message_tokens(&request, &assistant) > 1000);
+        let mismatch = if let Message::Assistant {
+            replay: Some(mut replay),
+            ..
+        } = assistant.clone()
+        {
+            replay.identity.model = "different".into();
+            Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(replay),
+            }
+        } else {
+            unreachable!()
+        };
+        assert_eq!(
+            model.estimate_message_tokens(&request, &mismatch),
+            pi_rs_core::estimate_message_tokens(&mismatch)
+        );
+    }
 
     #[test]
     fn tool_result_error_status_is_encoded_independently_of_text() {

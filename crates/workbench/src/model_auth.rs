@@ -16,6 +16,7 @@ pub(super) enum Credential {
     StoredCommand(String),
     Invalid,
     ChatGpt,
+    Kimi,
 }
 
 type CommandResult = std::result::Result<String, &'static str>;
@@ -44,12 +45,16 @@ impl Credential {
     pub fn literal(&self) -> Option<&str> {
         match self {
             Self::Literal(value) | Self::Bearer(value) => Some(value),
-            Self::Command(_) | Self::StoredCommand(_) | Self::Invalid | Self::ChatGpt => None,
+            Self::Command(_)
+            | Self::StoredCommand(_)
+            | Self::Invalid
+            | Self::ChatGpt
+            | Self::Kimi => None,
         }
     }
 
     pub fn is_bearer(&self) -> bool {
-        matches!(self, Self::Bearer(_) | Self::ChatGpt)
+        matches!(self, Self::Bearer(_) | Self::ChatGpt | Self::Kimi)
     }
 
     pub fn is_command(&self) -> bool {
@@ -57,7 +62,7 @@ impl Credential {
     }
 
     pub fn requires_resolution(&self) -> bool {
-        self.is_command() || matches!(self, Self::ChatGpt | Self::Invalid)
+        self.is_command() || matches!(self, Self::ChatGpt | Self::Kimi | Self::Invalid)
     }
 
     pub async fn resolve(&self) -> Result<String> {
@@ -67,6 +72,10 @@ impl Credential {
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
+            }
+            Self::Kimi => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::kimi_auth::access(&settings, None, false).await;
             }
             Self::Command(command) => resolve_command(command).await,
             Self::StoredCommand(command) => {
@@ -110,7 +119,20 @@ struct SavedKey {
 
 impl Keys {
     pub fn load() -> Result<Self> {
-        let value = config::read_object(&config::agent_dir().join("auth.json"))?;
+        Self::load_path(&config::agent_dir().join("auth.json"))
+    }
+
+    pub async fn load_async() -> Result<Self> {
+        Self::load_path_async(&config::agent_dir().join("auth.json")).await
+    }
+
+    pub(super) async fn load_path_async(path: &std::path::Path) -> Result<Self> {
+        let value = config::read_auth_object(path).await?;
+        Ok(Self::parse(&value))
+    }
+
+    pub(super) fn load_path(path: &std::path::Path) -> Result<Self> {
+        let value = config::read_object(path)?;
         Ok(Self::parse(&value))
     }
 
@@ -122,7 +144,8 @@ impl Keys {
             .filter_map(|(name, entry)| {
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
-                let oauth = (name.eq_ignore_ascii_case("openrouter") || chatgpt)
+                let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";
+                let oauth = (name.eq_ignore_ascii_case("openrouter") || chatgpt || kimi)
                     && entry["type"] == "oauth";
                 let key = if chatgpt {
                     serde_json::from_value::<pi_rs::openai::oauth::Credential>(
@@ -130,6 +153,13 @@ impl Keys {
                     )
                     .ok()?;
                     Some(Credential::ChatGpt)
+                } else if kimi {
+                    let credential: super::kimi_auth::Credential =
+                        serde_json::from_value(entry.clone()).ok()?;
+                    if !valid_key(&credential.access) || !valid_key(&credential.refresh) {
+                        return None;
+                    }
+                    Some(Credential::Kimi)
                 } else if oauth {
                     let access = entry["access"].as_str()?;
                     Some(valid_key(access).then(|| Credential::Literal(access.into()))?)
@@ -168,7 +198,7 @@ impl Keys {
                 };
                 if oauth
                     && !chatgpt
-                    && super::builtin_chat::find("openrouter")
+                    && super::builtin_chat::find(if kimi { "kimi-coding" } else { "openrouter" })
                         .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
                 {
                     return None;
@@ -193,6 +223,15 @@ impl Keys {
 
     pub fn revision(&self) -> &str {
         &self.revision
+    }
+
+    pub(super) fn forget(&mut self, provider: &str) {
+        if self.entries.remove(provider).is_some() {
+            self.revision = format!(
+                "{:x}",
+                Sha256::digest(format!("{}:{provider}", self.revision))
+            );
+        }
     }
 
     pub fn credential(&self, provider: &Provider, endpoint: &str) -> Option<&Credential> {
@@ -330,9 +369,13 @@ pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()>
     })
 }
 
-pub(super) fn save_openrouter_oauth(key: &str) -> Result<()> {
+pub(super) async fn save_openrouter_oauth(key: &str) -> Result<()> {
+    save_openrouter_oauth_at(&config::agent_dir().join("auth.json"), key).await
+}
+
+async fn save_openrouter_oauth_at(path: &std::path::Path, key: &str) -> Result<()> {
     let provider = Provider::named("openrouter").expect("built-in OpenRouter provider");
-    config::update_object(&config::agent_dir().join("auth.json"), |data| {
+    config::update_auth_object(path, |data| {
         data.insert(
             provider.id().into(),
             json!({
@@ -342,6 +385,7 @@ pub(super) fn save_openrouter_oauth(key: &str) -> Result<()> {
         );
         Ok(())
     })
+    .await
 }
 
 pub(super) fn remove(provider: &Provider) -> Result<bool> {
@@ -350,7 +394,9 @@ pub(super) fn remove(provider: &Provider) -> Result<bool> {
         let kind = data
             .get(provider.id())
             .and_then(|value| value["type"].as_str());
-        if kind == Some("api_key") || (provider.id() == "openrouter" && kind == Some("oauth")) {
+        if kind == Some("api_key")
+            || (matches!(provider.id(), "openrouter" | "kimi-coding") && kind == Some("oauth"))
+        {
             data.remove(provider.id());
             removed = true;
         }
@@ -366,6 +412,62 @@ pub(super) fn valid_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn async_key_read_and_openrouter_save_wait_for_shared_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"other":{"type":"api_key","key":"keep"}}"#).unwrap();
+        let held = super::super::auth_lock::acquire_async(&path).await.unwrap();
+        let mut writer = tokio::spawn({
+            let path = path.clone();
+            async move { save_openrouter_oauth_at(&path, "new-key").await }
+        });
+        let mut reader = tokio::spawn({
+            let path = path.clone();
+            async move { Keys::load_path_async(&path).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(120), &mut writer)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(120), &mut reader)
+                .await
+                .is_err()
+        );
+        drop(held);
+        writer.await.unwrap().unwrap();
+        reader.await.unwrap().unwrap();
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert_eq!(stored["openrouter"]["access"], "new-key");
+        assert_eq!(stored["other"]["key"], "keep");
+    }
+
+    #[test]
+    fn logout_forgets_key_before_a_reload_can_be_cancelled() {
+        let endpoint = Provider::named("openrouter").unwrap().default_endpoint();
+        let mut keys = Keys::parse(&json!({
+            "openrouter": {"type":"oauth", "access":"old", "endpoint":endpoint},
+            "other": {"type":"api_key", "key":"keep", "endpoint":"https://example.test"}
+        }));
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_some()
+        );
+        let old_revision = keys.revision().to_owned();
+        keys.forget("openrouter");
+        assert_ne!(keys.revision(), old_revision);
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_none()
+        );
+        assert!(
+            keys.operation_credential("other", "https://example.test", false)
+                .is_some()
+        );
+    }
 
     #[test]
     fn saved_operation_endpoint_ignores_trailing_slashes_only() {
@@ -513,6 +615,32 @@ mod tests {
         );
         assert!(
             keys.get(&Provider::Anthropic, "http://127.0.0.1:8001/v1/messages")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn kimi_pi_oauth_is_endpoint_bound_and_bearer() {
+        let provider = Provider::named("kimi-coding").unwrap();
+        let keys = Keys::parse(
+            &json!({"kimi-coding":{"type":"oauth","access":"access","refresh":"refresh","expires":123}}),
+        );
+        let credential = keys
+            .credential(&provider, provider.default_endpoint())
+            .unwrap();
+        assert!(matches!(credential, Credential::Kimi));
+        assert!(credential.is_bearer());
+        assert!(keys.oauth(&provider, provider.default_endpoint()));
+        assert!(
+            keys.credential(&provider, "http://localhost:1234/v1/messages")
+                .is_none()
+        );
+        let invalid = Keys::parse(
+            &json!({"kimi-coding":{"type":"oauth","access":"access","refresh":"refresh","expires":123,"endpoint":"http://localhost:1234/v1/messages"}}),
+        );
+        assert!(
+            invalid
+                .credential(&provider, provider.default_endpoint())
                 .is_none()
         );
     }

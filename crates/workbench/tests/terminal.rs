@@ -717,10 +717,6 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
         original.c_lflag & !libc::PENDIN
     );
     assert_eq!(
-        unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGINT) },
-        0
-    );
-    assert_eq!(
         unsafe { libc::kill(-(process.0.id() as libc::pid_t), libc::SIGCONT) },
         0
     );
@@ -1793,4 +1789,442 @@ fn exit_during_shell_restores_terminal_and_drains_late_key_release() {
         let _ = master.read(&mut output);
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn reload_waits_for_auth_lock_without_closing_terminal() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    let lock = home.join("auth.json.lock");
+    std::fs::create_dir(&lock).unwrap();
+    master.write_all(b"/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Reloading provider credentials")
+    });
+    master.write_all(b"reload-still-responsive").unwrap();
+    output_until(&mut master, |text| text.contains("reload-still-responsive"));
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Provider credential reload cancelled")
+    });
+    assert!(process.0.try_wait().unwrap().is_none());
+    std::fs::remove_dir(lock).unwrap();
+    master.write_all(b"\x15/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Provider credentials reloaded")
+    });
+    assert!(process.0.try_wait().unwrap().is_none());
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as i32, libc::SIGINT) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        process
+            .0
+            .try_wait()
+            .unwrap()
+            .and_then(|status| status.code()),
+        Some(130)
+    );
+}
+
+#[test]
+fn sigint_cancels_interactive_startup_model_discovery() {
+    use std::net::TcpListener;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut bytes = [0; 4096];
+        assert!(socket.read(&mut bytes).unwrap() > 0);
+        started_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let _master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env_remove("HTTP_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--provider",
+                "ollama",
+                "--endpoint",
+                &endpoint,
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    started_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as i32, libc::SIGINT) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = process.0.try_wait().unwrap();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    assert_eq!(status.and_then(|status| status.code()), Some(130));
+}
+
+#[test]
+fn external_sigint_interrupts_stalled_interactive_transition() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let extension = root.path().join("slow-transition.py");
+    let marker = home.join("transition-started");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys, time
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'slow-transition', 'dependencies':[], 'commands':[], 'tools':[], 'session_transition_hook':True}
+elif request['type'] == 'before_session_transition':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'transition-started'), 'w') as f: f.write(str(os.getpid()))
+    time.sleep(30)
+    result = False
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--tui-mode",
+                "fullscreen",
+                "--extension",
+            ])
+            .arg(extension)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/new\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        // Keep the PTY flowing while the worker starts; a full output buffer
+        // can otherwise prevent the UI from dispatching the command.
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(marker.exists(), "transition hook did not start");
+    let extension_pid: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as i32, libc::SIGINT) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        process
+            .0
+            .try_wait()
+            .unwrap()
+            .and_then(|status| status.code()),
+        Some(130)
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(extension_pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(
+        unsafe { libc::kill(extension_pid, 0) },
+        0,
+        "transition extension survived shutdown"
+    );
+}
+
+#[test]
+fn sigint_restores_terminal_before_waiting_for_refresh_barrier() {
+    use std::net::TcpListener;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let auth = home.join("auth.json");
+    std::fs::write(&auth, serde_json::json!({"kimi-coding":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host = format!("http://{}", listener.local_addr().unwrap());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut data = [0u8; 4096];
+        assert!(socket.read(&mut data).unwrap() > 0);
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    assert_eq!(
+        unsafe { libc::tcgetattr(slave.as_raw_fd(), original.as_mut_ptr()) },
+        0
+    );
+    let original = unsafe { original.assume_init() };
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env("KIMI_CODE_OAUTH_HOST", host)
+            .env_remove("KIMI_API_KEY")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--provider",
+                "kimi-coding",
+                "--model",
+                "kimi-for-coding",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"hello\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if started_rx.try_recv().is_ok() {
+            break;
+        }
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        assert!(Instant::now() < deadline, "refresh request did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        unsafe { libc::kill(process.0.id() as i32, libc::SIGINT) },
+        0
+    );
+    let signalled = Instant::now();
+    let deadline = signalled + Duration::from_secs(2);
+    let mut output = Vec::new();
+    let mut restored = false;
+    while Instant::now() < deadline {
+        let mut buffer = [0; 8192];
+        if let Ok(n) = master.read(&mut buffer) {
+            output.extend_from_slice(&buffer[..n]);
+        }
+        let mut current = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), current.as_mut_ptr()) },
+            0
+        );
+        let current = unsafe { current.assume_init() };
+        if current.c_lflag & !libc::PENDIN == original.c_lflag & !libc::PENDIN
+            && current.c_iflag == original.c_iflag
+            && current.c_oflag == original.c_oflag
+            && current.c_cflag == original.c_cflag
+            && current.c_cc == original.c_cc
+            && output
+                .windows(b"\x1b[?1049l".len())
+                .any(|chunk| chunk == b"\x1b[?1049l")
+        {
+            restored = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    while signalled.elapsed() < Duration::from_millis(2500)
+        && process.0.try_wait().unwrap().is_none()
+    {
+        let mut data = [0; 8192];
+        let _ = master.read(&mut data);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let still_waiting = process.0.try_wait().unwrap().is_none();
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        let mut data = [0; 8192];
+        let _ = master.read(&mut data);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = process.0.try_wait().unwrap();
+    assert!(
+        restored,
+        "terminal was not restored before the refresh completed"
+    );
+    assert!(still_waiting, "process did not wait for the refresh");
+    assert_eq!(status.and_then(|status| status.code()), Some(130));
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(auth).unwrap()).unwrap();
+    assert_eq!(stored["kimi-coding"]["refresh"], "rotated");
 }

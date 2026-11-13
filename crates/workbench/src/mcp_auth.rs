@@ -512,23 +512,28 @@ impl CredentialStore for FileCredentials {
         &self,
     ) -> std::result::Result<Option<CredentialRefreshGuard>, AuthError> {
         let path = self.path.with_extension("lock");
-        let file = tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(path.parent().ok_or_else(store_error)?)
-                .map_err(|_| store_error())?;
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path)
-                .map_err(|_| store_error())?;
-            file.lock().map_err(|_| store_error())?;
-            Ok::<_, AuthError>(Arc::new(file))
-        })
-        .await
-        .map_err(|_| store_error())??;
+        std::fs::create_dir_all(path.parent().ok_or_else(store_error)?)
+            .map_err(|_| store_error())?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|_| store_error())?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await
+                }
+                Err(std::fs::TryLockError::Error(_)) => return Err(store_error()),
+            }
+        }
+        let file = Arc::new(file);
         *self.lease.lock().unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&file);
-        Ok(Some(CredentialRefreshGuard::new(file)))
+        let guard = crate::mcp_refresh::guard(file).await?;
+        Ok(Some(CredentialRefreshGuard::new(guard)))
     }
 }
 
@@ -537,7 +542,7 @@ pub async fn client(
     name: &str,
     url: &str,
     client: reqwest_mcp::Client,
-) -> Result<(AuthClient<reqwest_mcp::Client>, String)> {
+) -> Result<(crate::mcp_oauth_client::SafeAuthClient, String)> {
     client_with_http_options(name, url, client, None).await
 }
 
@@ -546,7 +551,7 @@ pub async fn client_with_http_options(
     url: &str,
     client: reqwest_mcp::Client,
     options: Option<&crate::mcp::HttpOptionsWithProxyHosts>,
-) -> Result<(AuthClient<reqwest_mcp::Client>, String)> {
+) -> Result<(crate::mcp_oauth_client::SafeAuthClient, String)> {
     let mut store = FileCredentials::new(name, url)?;
     let guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
     let envelope = store
@@ -579,7 +584,10 @@ pub async fn client_with_http_options(
         manager.configure_client(config).map_err(auth_error)?;
     }
     drop(guard);
-    Ok((AuthClient::new(client, manager), identity))
+    Ok((
+        crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(client, manager), Arc::default()),
+        identity,
+    ))
 }
 
 pub(crate) fn has_credentials(name: &str, url: &str) -> Result<bool> {
@@ -1166,8 +1174,282 @@ async fn authorize(
 }
 
 #[cfg(test)]
+pub(crate) async fn test_oauth_client(
+    path: PathBuf,
+    resource: &str,
+    token_url: &str,
+) -> crate::mcp_oauth_client::SafeAuthClient {
+    let store = FileCredentials {
+        path,
+        generation: Some(Uuid::new_v4()),
+        new_login: true,
+        upgrade: None,
+        registration: Arc::default(),
+        lease: Arc::default(),
+    };
+    let creds: StoredCredentials = serde_json::from_value(serde_json::json!({
+        "client_id":"fixture", "token_response":{"access_token":"old", "token_type":"Bearer", "refresh_token":"old-refresh"}
+    })).unwrap();
+    store.write(creds).unwrap();
+    let store = FileCredentials {
+        new_login: false,
+        ..store
+    };
+    let mut manager = oauth_manager(resource, None).await.unwrap();
+    manager.set_metadata(serde_json::from_value(serde_json::json!({
+        "issuer":resource, "authorization_endpoint":resource, "token_endpoint":token_url, "response_types_supported":["code"]
+    })).unwrap());
+    manager.configure_client_id("fixture").unwrap();
+    manager.set_credential_store(store);
+    crate::mcp_oauth_client::SafeAuthClient(
+        AuthClient::new(reqwest_mcp::Client::new(), manager),
+        Arc::default(),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_saves_token_and_only_dispatches_for_live_callers() {
+        use rmcp::transport::streamable_http_client::{AuthRequiredError, StreamableHttpError};
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        for (reactive, cancel) in [(false, true), (true, true), (false, false), (true, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileCredentials {
+                path: dir.path().join("credentials.json"),
+                generation: Some(Uuid::new_v4()),
+                new_login: true,
+                upgrade: None,
+                registration: Arc::default(),
+                lease: Arc::default(),
+            };
+            let creds: StoredCredentials = serde_json::from_value(serde_json::json!({
+                "client_id":"fixture", "token_received_at":0,
+                "token_response":{"access_token":"old", "token_type":"Bearer", "refresh_token":"old-refresh", "expires_in":1}
+            })).unwrap();
+            store.write(creds).unwrap();
+            let store = FileCredentials {
+                new_login: false,
+                ..store
+            };
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).unwrap() > 0);
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let body =
+                    r#"{"access_token":"new","token_type":"Bearer","refresh_token":"rotated"}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let mut runtime = Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            let task_store = store.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let task_calls = calls.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let task = runtime.as_ref().unwrap().block_on(async move {
+                let url = format!("http://{address}");
+                let mut manager = oauth_manager(&format!("{url}/mcp"), None).await.unwrap();
+                manager.set_metadata(serde_json::from_value(serde_json::json!({
+                    "issuer":url, "authorization_endpoint":format!("http://{address}/authorize"),
+                    "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
+                })).unwrap());
+                manager.configure_client_id("fixture").unwrap();
+                manager.set_credential_store(task_store);
+                let client = crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(reqwest_mcp::Client::new(), manager), Arc::default());
+                let task = tokio::spawn(async move {
+                    let result = client.call(reactive.then(|| "old".to_owned()), |_| {
+                        let index = task_calls.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if reactive && index == 0 {
+                                Err(StreamableHttpError::AuthRequired(AuthRequiredError::new("Bearer".into())))
+                            } else { Ok(()) }
+                        }
+                    }).await;
+                    let _ = done_tx.send(result.is_ok());
+                });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while started_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(10)).await; }
+                }).await.unwrap();
+                task.abort_handle()
+            });
+            if cancel {
+                task.abort();
+                drop(runtime.take());
+            }
+            release_tx.send(()).unwrap();
+            server.join().unwrap();
+            if !cancel {
+                runtime.as_ref().unwrap().block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            if let Ok(result) = done_rx.try_recv() {
+                                assert!(result);
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                });
+            }
+            drop(runtime);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !String::from_utf8_lossy(&std::fs::read(&store.path).unwrap()).contains("rotated")
+            {
+                assert!(Instant::now() < deadline, "rotated token was not saved");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(reactive) + usize::from(!cancel),
+                "incorrect request or retry dispatch count"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_runtime_persists_rotated_mcp_refresh_token() {
+        use std::io::{Read as _, Write as _};
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileCredentials {
+            path: directory.path().join("credentials.json"),
+            generation: Some(Uuid::new_v4()),
+            new_login: true,
+            upgrade: None,
+            registration: Arc::default(),
+            lease: Arc::default(),
+        };
+        let creds: StoredCredentials = serde_json::from_value(serde_json::json!({
+            "client_id":"fixture", "token_response":{"access_token":"old", "token_type":"Bearer", "refresh_token":"old-refresh"}
+        })).unwrap();
+        store.write(creds).unwrap();
+        let store = FileCredentials {
+            new_login: false,
+            ..store
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let body = r#"{"access_token":"new","token_type":"Bearer","refresh_token":"rotated"}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let task_store = store.clone();
+        let task = runtime.block_on(async move {
+            let url = format!("http://{address}");
+            let mut manager = oauth_manager(&format!("{url}/mcp"), None).await.unwrap();
+            manager.set_metadata(serde_json::from_value(serde_json::json!({
+                "issuer":url, "authorization_endpoint":format!("http://{address}/authorize"),
+                "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
+            })).unwrap());
+            manager.configure_client_id("fixture").unwrap();
+            manager.set_credential_store(task_store);
+            let task = tokio::spawn(async move { crate::mcp_refresh::run(async move { manager.refresh_token().await }).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while started_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await.unwrap();
+            task.abort_handle()
+        });
+        task.abort();
+        drop(runtime);
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let bytes = std::fs::read(&store.path).unwrap();
+            if String::from_utf8_lossy(&bytes).contains("rotated") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "rotated refresh token was not persisted"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn cancelled_mcp_request_waiting_for_refresh_lock_does_not_commit() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileCredentials {
+            path: directory.path().join("credentials.json"),
+            generation: None,
+            new_login: false,
+            upgrade: None,
+            registration: Arc::default(),
+            lease: Arc::default(),
+        };
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(store.path.with_extension("lock"))
+            .unwrap();
+        held.lock().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let task = runtime.block_on(async move {
+            let task = tokio::spawn(async move {
+                crate::mcp_refresh::run(async move {
+                    entered_tx.send(()).unwrap();
+                    let _guard = store.acquire_refresh_guard().await.unwrap();
+                    let _ = committed_tx.send(());
+                })
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while entered_rx.try_recv().is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort_handle()
+        });
+        task.abort();
+        drop(runtime);
+        std::thread::sleep(Duration::from_millis(100));
+        held.unlock().unwrap();
+        assert!(
+            committed_rx
+                .recv_timeout(Duration::from_millis(250))
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn oauth_manager_uses_proxy_for_registration_and_refresh() {
@@ -1624,6 +1906,46 @@ mod tests {
         std::fs::write(&client.path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(client.read().unwrap().unwrap().registration.is_none());
         assert_eq!(client.load().await.unwrap().unwrap().client_id, "recovered");
+    }
+
+    #[test]
+    fn cancelled_refresh_guard_wait_does_not_delay_runtime_shutdown() {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.json");
+        std::fs::write(&path, b"unchanged").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        held.lock().unwrap();
+        let store = FileCredentials {
+            path: path.clone(),
+            generation: None,
+            new_login: false,
+            upgrade: None,
+            registration: Arc::default(),
+            lease: Arc::default(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let waiting = tokio::spawn(async move { store.acquire_refresh_guard().await });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(!waiting.is_finished());
+            waiting.abort();
+            let _ = waiting.await;
+        });
+        let started = Instant::now();
+        drop(runtime);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(std::fs::read(path).unwrap(), b"unchanged");
+        held.unlock().unwrap();
     }
 
     #[tokio::test]
