@@ -1741,17 +1741,17 @@ results count their original text envelope; Bedrock and other adapters that
 extract tool images use a fixed image allowance instead of counting encoded
 image bytes. Bedrock also accepts user images. Matching provider replay blocks,
 including reasoning and signatures, are included only when the adapter actually
-replays them. Bedrock's dynamic AWS credentials and endpoint resolver do not
-provide a provably stable identity, so measured baselines are not reused for
-Bedrock requests. A measured baseline is combined with provider-aware estimates of subsequent
+replays them. Bedrock freezes inspectable SDK credentials or bearer tokens,
+region and endpoint before reusing a measured baseline; opaque SDK clients or
+custom transports fall back to fresh estimates. A measured baseline is combined with provider-aware estimates of subsequent
 messages and any additional replay content. Request hooks that change the
 model, messages or tools invalidate the measured baseline; that fact is recorded
 with the request so it remains effective after reopening. A fingerprint also
 requires the effective adapter identity, image policy, model, system messages
 and tool schemas to match the measured request. Secret-bearing adapter and
-header identities use an owner-only persistent HMAC key on Unix. If protected
-key storage is unavailable, including on platforms without an implementation,
-the measured baseline is not reused. Deferred workbench providers
+header identities use a persistent HMAC key protected by owner-only file
+permissions on Unix and user-scoped DPAPI on Windows. If protected key storage
+is unavailable, the measured baseline is not reused. Deferred workbench providers
 resolve credentials and headers before the capacity check and use the same
 resolved adapter for dispatch; the AIP budget wrapper preserves preparation and
 its budget settlement. Radius also freezes the catalog-selected route

@@ -23,6 +23,9 @@ pub struct Bedrock {
     unsupported: Option<String>,
     bearer: Option<String>,
     model_name: Option<(String, String)>,
+    known_config: Option<std::sync::Arc<tokio::sync::OnceCell<aws_types::SdkConfig>>>,
+    prepared_identity: Option<String>,
+    environment_config: bool,
 }
 impl Bedrock {
     /// Resolve the region and standard AWS credential chain lazily.
@@ -32,6 +35,9 @@ impl Bedrock {
             unsupported: None,
             bearer: None,
             model_name: None,
+            known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new())),
+            prepared_identity: None,
+            environment_config: true,
         }
     }
     /// Use a caller-configured SDK client, including custom profile or endpoint settings.
@@ -41,6 +47,25 @@ impl Bedrock {
             unsupported: None,
             bearer: None,
             model_name: None,
+            known_config: None,
+            prepared_identity: None,
+            environment_config: false,
+        }
+    }
+    /// Construct from a shared SDK configuration whose route can be inspected.
+    pub fn from_sdk_config(config: aws_types::SdkConfig) -> Self {
+        Self {
+            client: std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(Client::new(
+                &config,
+            )))),
+            unsupported: None,
+            bearer: None,
+            model_name: None,
+            known_config: Some(std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
+                config,
+            )))),
+            prepared_identity: None,
+            environment_config: false,
         }
     }
     /// Prefer bearer authentication over the AWS credential chain.
@@ -54,11 +79,13 @@ impl Bedrock {
             .map(|client| bearer_client(client.config().to_builder(), &token));
         self.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(client));
         self.bearer = Some(token);
+        self.prepared_identity = None;
         Ok(self)
     }
     /// Bind a configured model name to its ID for model-specific Converse behavior.
     pub fn with_model_name(mut self, model: &str, name: Option<&str>) -> Self {
         self.model_name = name.map(|name| (model.to_owned(), name.to_owned()));
+        self.prepared_identity = None;
         self
     }
     fn is_claude(&self, model: &str) -> bool {
@@ -67,9 +94,125 @@ impl Bedrock {
                 id == model && name.to_ascii_lowercase().contains("claude")
             })
     }
+    /// Freeze an inspectable SDK configuration and its effective authentication for one request.
+    pub async fn prepare_bedrock(&self) -> Result<Option<Self>> {
+        use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+        if self.unsupported.is_some() {
+            return Ok(None);
+        }
+        let Some(config) = &self.known_config else {
+            return Ok(None);
+        };
+        let config = config
+            .get_or_init(|| async {
+                aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
+            })
+            .await;
+        // A caller-supplied HTTP transport can reroute requests independently
+        // of the SDK endpoint configuration.
+        if config.http_client().is_some() {
+            return Ok(None);
+        }
+        let Some(region) = config.region().map(|region| region.as_ref().to_owned()) else {
+            return Ok(None);
+        };
+        // A caller-provided bearer resolver may change independently; explicit
+        // bearer tokens and the service-specific environment token are fixed here.
+        let service_value = |service: &'static str, env: &'static str, profile: &'static str| {
+            let key = aws_types::service_config::ServiceConfigKey::builder()
+                .service_id(service)
+                .env(env)
+                .profile(profile)
+                .build()
+                .ok()?;
+            config.service_config()?.load_config(key)
+        };
+        let endpoint = if config.get_origin("endpoint_url").is_client_config() {
+            config.endpoint_url().map(str::to_owned)
+        } else {
+            service_value("Bedrock Runtime", "AWS_ENDPOINT_URL", "endpoint_url")
+                .or_else(|| config.endpoint_url().map(str::to_owned))
+        };
+        let bearer = self.bearer.clone().or_else(|| {
+            if (!self.environment_config && config.token_provider().is_some())
+                || config
+                    .get_origin("auth_scheme_preference")
+                    .is_client_config()
+            {
+                return None;
+            }
+            service_value("bedrock", "AWS_BEARER_TOKEN", "")
+        });
+        let mut frozen = config.clone();
+        let auth_identity = if let Some(token) = bearer.as_ref() {
+            if token.is_empty() || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+                return Ok(None);
+            }
+            ("bearer", token.clone(), String::new(), None, None)
+        } else {
+            if (!self.environment_config && config.token_provider().is_some())
+                || config.auth_scheme_preference().is_some()
+                || config
+                    .get_origin("auth_scheme_preference")
+                    .is_client_config()
+            {
+                return Ok(None);
+            }
+            let Some(provider) = config.credentials_provider() else {
+                return Ok(None);
+            };
+            let Ok(credentials) = provider.provide_credentials().await else {
+                return Ok(None);
+            };
+            let identity = (
+                "sigv4",
+                credentials.access_key_id().to_owned(),
+                credentials.secret_access_key().to_owned(),
+                credentials.session_token().map(str::to_owned),
+                credentials.account_id().map(|id| id.as_str().to_owned()),
+            );
+            frozen = config
+                .to_builder()
+                .credentials_provider(SharedCredentialsProvider::new(credentials))
+                .build();
+            identity
+        };
+        let identity = pi_rs_core::protected_model_fingerprint(&(
+            "bedrock-converse-v1",
+            &region,
+            &endpoint,
+            config.use_fips(),
+            config.use_dual_stack(),
+            auth_identity,
+            &self.model_name,
+        ));
+        let mut builder = aws_sdk_bedrockruntime::config::Builder::from(&frozen)
+            .identity_cache(aws_sdk_bedrockruntime::config::IdentityCache::no_cache());
+        // Freeze the endpoint selected above instead of consulting service
+        // environment settings again during dispatch.
+        builder.set_endpoint_url(endpoint);
+        let client = if let Some(token) = bearer.as_deref() {
+            bearer_client(builder, token)
+        } else {
+            use aws_smithy_runtime_api::client::auth::AuthSchemeId;
+            Client::from_conf(
+                builder
+                    .auth_scheme_preference([AuthSchemeId::new("sigv4")])
+                    .build(),
+            )
+        };
+        let mut prepared = self.clone();
+        prepared.client = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(client)));
+        prepared.bearer = bearer;
+        prepared.known_config = None;
+        prepared.prepared_identity = identity;
+        Ok(Some(prepared))
+    }
+
     /// Mark unsupported host settings so they fail explicitly when used.
     pub fn unsupported(mut self, reason: impl Into<String>) -> Self {
         self.unsupported = Some(reason.into());
+        self.prepared_identity = None;
         self
     }
 }
@@ -340,11 +483,19 @@ fn request_error(
 
 #[async_trait::async_trait]
 impl Model for Bedrock {
-    // The SDK's credential chain and endpoint resolver can change independently
-    // of the visible request. Do not reuse measured anchors without a stable
-    // account and route identity.
+    // Only a prepared, inspectable SDK configuration has a stable identity.
+    async fn prepare_context<'a>(
+        &'a self,
+        _: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(self
+            .prepare_bedrock()
+            .await?
+            .map(|model| std::sync::Arc::new(model) as std::sync::Arc<dyn Model + 'a>))
+    }
+
     fn context_identity(&self) -> Option<String> {
-        None
+        self.prepared_identity.clone()
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
@@ -625,8 +776,17 @@ impl Model for Bedrock {
             .client
             .get_or_init(|| async {
                 {
-                    let config =
-                        aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                    let config = if let Some(known) = &self.known_config {
+                        known
+                            .get_or_init(|| async {
+                                aws_config::load_defaults(aws_config::BehaviorVersion::latest())
+                                    .await
+                            })
+                            .await
+                            .clone()
+                    } else {
+                        aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
+                    };
                     if let Some(token) = &self.bearer {
                         bearer_client(
                             aws_sdk_bedrockruntime::config::Builder::from(&config),
@@ -736,6 +896,148 @@ impl Model for Bedrock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn environment_auth_produces_a_prepared_identity() {
+        if std::env::var_os("PI_RS_BEDROCK_AUTH_CHILD").is_some() {
+            let prepared = Bedrock::from_env()
+                .prepare_bedrock()
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(prepared.context_identity().is_some());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for bearer in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tests::environment_auth_produces_a_prepared_identity",
+                ])
+                .env("PI_RS_BEDROCK_AUTH_CHILD", "1")
+                .env("PI_RS_HOME", dir.path())
+                .env("AWS_REGION", "us-east-1")
+                .env("AWS_DEFAULT_REGION", "us-east-1")
+                .env("AWS_ACCESS_KEY_ID", "fixture-access")
+                .env("AWS_SECRET_ACCESS_KEY", "fixture-secret")
+                .env("AWS_EC2_METADATA_DISABLED", "true")
+                .env("AWS_CONFIG_FILE", dir.path().join("missing-config"))
+                .env(
+                    "AWS_SHARED_CREDENTIALS_FILE",
+                    dir.path().join("missing-credentials"),
+                )
+                .env_remove("AWS_PROFILE")
+                .env_remove("AWS_SESSION_TOKEN")
+                .env_remove("AWS_ENDPOINT_URL")
+                .env_remove("AWS_ENDPOINT_URL_BEDROCK_RUNTIME");
+            if bearer {
+                command.env("AWS_BEARER_TOKEN_BEDROCK", "fixture-bearer");
+            } else {
+                command.env_remove("AWS_BEARER_TOKEN_BEDROCK");
+            }
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "child failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn inspectable_sdk_config_produces_route_and_auth_bound_identity() {
+        use aws_credential_types::provider::SharedCredentialsProvider;
+        let make = |region: &str, endpoint: &str, access: &str, secret: &str| {
+            let credentials =
+                aws_credential_types::Credentials::new(access, secret, None, None, "fixture");
+            aws_types::SdkConfig::builder()
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .region(aws_types::region::Region::new(region.to_owned()))
+                .endpoint_url(endpoint)
+                .credentials_provider(SharedCredentialsProvider::new(credentials))
+                .build()
+        };
+        let prepare = |config| async move {
+            Bedrock::from_sdk_config(config)
+                .prepare_bedrock()
+                .await
+                .unwrap()
+                .unwrap()
+                .context_identity()
+                .unwrap()
+        };
+        let first = prepare(make("us-east-1", "https://one.example", "access", "secret")).await;
+        let same = prepare(make("us-east-1", "https://one.example", "access", "secret")).await;
+        let region = prepare(make("us-west-2", "https://one.example", "access", "secret")).await;
+        let endpoint = prepare(make("us-east-1", "https://two.example", "access", "secret")).await;
+        let credential = prepare(make("us-east-1", "https://one.example", "other", "secret")).await;
+        assert_eq!(first, same);
+        assert_ne!(first, region);
+        assert_ne!(first, endpoint);
+        assert_ne!(first, credential);
+        assert!(!first.contains("secret"));
+        let config = make("us-east-1", "https://one.example", "access", "secret");
+        let bearer = Bedrock::from_sdk_config(config.clone())
+            .with_bearer_token("token-a".into())
+            .unwrap()
+            .prepare_bedrock()
+            .await
+            .unwrap()
+            .unwrap();
+        let same_bearer = Bedrock::from_sdk_config(config.clone())
+            .with_bearer_token("token-a".into())
+            .unwrap()
+            .prepare_bedrock()
+            .await
+            .unwrap()
+            .unwrap();
+        let other_bearer = Bedrock::from_sdk_config(config)
+            .with_bearer_token("token-b".into())
+            .unwrap()
+            .prepare_bedrock()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bearer.context_identity().is_some());
+        assert_eq!(bearer.context_identity(), same_bearer.context_identity());
+        assert_ne!(bearer.context_identity(), other_bearer.context_identity());
+        assert_ne!(Some(first), bearer.context_identity());
+        let token_provider = aws_credential_types::provider::token::SharedTokenProvider::new(
+            aws_credential_types::Token::new("unresolved-token", None),
+        );
+        let config = make("us-east-1", "https://one.example", "access", "secret")
+            .to_builder()
+            .token_provider(token_provider)
+            .build();
+        let mut untrusted = Bedrock::from_sdk_config(config);
+        assert!(untrusted.prepare_bedrock().await.unwrap().is_none());
+        // The default environment loader always installs an SSO token provider;
+        // SDK default auth still selects SigV4 first when credentials exist.
+        untrusted.environment_config = true;
+        assert!(
+            untrusted
+                .prepare_bedrock()
+                .await
+                .unwrap()
+                .unwrap()
+                .context_identity()
+                .is_some()
+        );
+        let opaque = Bedrock::new(Client::from_conf(
+            aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version_latest()
+                .region(aws_types::region::Region::new("us-east-1"))
+                .build(),
+        ))
+        .with_bearer_token("token-a".into())
+        .unwrap();
+        assert!(opaque.prepare_bedrock().await.unwrap().is_none());
+    }
+
     #[test]
     fn capacity_estimate_matches_multimodal_tool_and_reasoning_replay() {
         let model = Bedrock::from_env();

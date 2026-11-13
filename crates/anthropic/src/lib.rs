@@ -1145,7 +1145,7 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn context_identity_tracks_static_route_and_configuration() {
         let make = |endpoint: &str, key: &str| Anthropic::new(endpoint, key).unwrap();

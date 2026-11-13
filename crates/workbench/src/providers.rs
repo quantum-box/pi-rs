@@ -426,10 +426,14 @@ impl Client {
             Self::Google(client) => (self.clone(), client.context_headers()),
             Self::OpenAi(client) => (self.clone(), client.context_headers()),
             Self::PiMessages(client) => (self.clone(), client.context_headers()),
-            Self::Bedrock(_) => return Ok(None),
+            Self::Bedrock(_) => (self.clone(), HeaderMap::new()),
         };
         let client = match client {
             Self::PiMessages(client) => Self::PiMessages(client.prepare_context(model).await?),
+            Self::Bedrock(client) => match client.prepare_bedrock().await? {
+                Some(prepared) => Self::Bedrock(prepared),
+                None => Self::Bedrock(client),
+            },
             other => other,
         };
         // The keyed fingerprint protects low-entropy headers and adapter credentials.
@@ -895,7 +899,7 @@ mod estimation_tests {
         assert!((1200..1300).contains(&client.estimate_message_tokens(&request, &message)));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn deferred_static_credentials_have_stable_route_bound_identity() {
         let client = |provider, adapter, endpoint: &str, credential| {
@@ -947,7 +951,7 @@ mod estimation_tests {
         assert_ne!(anthropic.context_identity(), google.context_identity());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn anthropic_direct_and_deferred_reuse_measured_baselines() {
         struct MeasuredFixture {
@@ -1046,7 +1050,7 @@ mod estimation_tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_command_credentials_resolve_without_persisting_identity() {
+    async fn windows_command_credentials_resolve_with_protected_identity() {
         let client = Client::deferred(
             Provider::Google,
             Adapter::Google,
@@ -1060,10 +1064,10 @@ mod estimation_tests {
             .unwrap()
             .unwrap();
         assert!(matches!(prepared, Client::Google(_)));
-        assert!(identity.is_none());
+        assert!(identity.is_some());
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[tokio::test]
     async fn unprotected_platform_does_not_persist_header_identity() {
         let mut headers = HeaderMap::new();
@@ -1084,7 +1088,7 @@ mod estimation_tests {
         assert!(identity.is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn direct_static_headers_reuse_baseline_without_unkeyed_header_fingerprint() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1227,7 +1231,7 @@ mod estimation_tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn dynamic_credentials_and_headers_reuse_measured_usage_after_dispatch() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1323,7 +1327,7 @@ mod estimation_tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn resolved_dynamic_headers_are_included_in_prepared_identity() {
         let make = |header: &str| {
@@ -1349,7 +1353,7 @@ mod estimation_tests {
         assert_ne!(a, b);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn dynamic_credentials_are_resolved_once_for_each_prepared_client() {
         let make = |command: &str| {

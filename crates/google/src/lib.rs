@@ -852,7 +852,7 @@ fn report_progress(
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn static_custom_header_has_protected_stable_identity() {
         let make = |secret: &'static str| {

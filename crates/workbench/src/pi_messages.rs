@@ -852,7 +852,7 @@ mod tool_status_tests {
             second.encode(request)["context"]["messages"][0]["content"][0]["type"],
             "text"
         );
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert_ne!(first.context_identity(), second.context_identity());
     }
 
