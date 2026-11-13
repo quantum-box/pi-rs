@@ -261,3 +261,27 @@ async fn tilde_uses_configured_remote_home_not_host_home() {
         .is_err()
     );
 }
+
+#[cfg(windows)]
+struct NoCalls;
+#[cfg(windows)]
+#[async_trait::async_trait]
+impl FindOperations for NoCalls {
+    async fn exists(&self, _: &Path) -> Result<bool> {
+        panic!("backend must not be called")
+    }
+    async fn glob(&self, _: &str, _: &Path, _: FindOptions) -> Result<Vec<PathBuf>> {
+        panic!("backend must not be called")
+    }
+}
+#[cfg(windows)]
+#[tokio::test]
+async fn rejects_drive_relative_path_before_backend_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = create_find_tool(root.path(), Arc::new(NoCalls)).unwrap();
+    assert!(matches!(
+        tool.invoke(json!({"pattern":"*", "path":"D:logs"}), context())
+            .await,
+        Outcome::Failed(_)
+    ));
+}
