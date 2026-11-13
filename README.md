@@ -46,6 +46,11 @@ data resets it. Use `/settings` to change it, or set `httpIdleTimeoutMs` in
 `settings.json` to a number of milliseconds or `"disabled"`. For example,
 `{"httpIdleTimeoutMs":"disabled"}` removes the HTTP idle deadline.
 `--model-timeout-secs` separately sets a deadline for the complete operation.
+Bedrock Runtime uses the AWS SDK's timeouts rather than `httpIdleTimeoutMs`,
+matching the pinned Pi adapter's handling of that setting. Bedrock Runtime
+requests and AWS credential-provider calls support the workbench HTTP proxy
+setting and proxy environment variables with `no_proxy` bypasses. AWS instance
+and container metadata endpoints connect directly.
 
 To use an OpenAI API key and API billing, set `OPENAI_API_KEY` and select the
 `openai` provider, for example `pi --provider openai --model gpt-4.1`.

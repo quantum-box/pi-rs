@@ -532,7 +532,7 @@ impl Cli {
         provider
             .connect(adapter, endpoint, token, bearer)?
             .with_headers(headers)
-            .with_http_settings(&self.settings)
+            .with_http_settings_and_env(&self.settings, settings.environment())
     }
 
     fn activate_provider(&mut self, provider: Provider, model: Option<&str>) -> Result<()> {
