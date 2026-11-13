@@ -1,0 +1,27 @@
+name: Remote ls
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  remote-ls:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install supported Rust toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt
+      - name: Check formatting
+        run: cargo +1.89.0 fmt --manifest-path crates/remote-ls/Cargo.toml --all -- --check
+      - name: Check lint
+        run: cargo +1.89.0 clippy --manifest-path crates/remote-ls/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo +1.89.0 test --manifest-path crates/remote-ls/Cargo.toml --locked
