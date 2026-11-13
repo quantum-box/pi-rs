@@ -14,3 +14,13 @@ all-pages tools. Existing names continue to aggregate all pages for one server.
 
 Unlike Pi's shared listing tools, native page tools are named per server and do
 not accept a `server` argument or combine results from multiple servers.
+
+Pages larger than 512 KiB are saved to a private temporary file for the lifetime
+of the connection. The response includes `outputId`, `outputBytes`, `readTool`,
+and, when reasonably sized, `nextCursor`. Call the same page tool with
+`{"outputId":"...","offset":0}` and continue with `nextOffset` to read the
+complete JSON in UTF-8 chunks, including any exceptionally large cursor. At most
+eight saved pages are retained per connection; older handles expire. This
+retrieval does not require a local filesystem read tool. Like Pi, saved pages
+contain the filtered listing; unlike Pi, they are read through the page tool
+instead of a filesystem path.

@@ -1,5 +1,6 @@
 //! Native MCP client connections exposed through the shared tool contract.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, RwLock,
@@ -312,6 +313,7 @@ struct Connection {
     provider_token: Option<TokenResolver>,
     http_options: Option<HttpOptionsWithProxyHosts>,
     closed: AtomicBool,
+    page_outputs: std::sync::Mutex<VecDeque<(Uuid, String, tempfile::NamedTempFile)>>,
 }
 impl Connection {
     fn identity(&self) -> ConnectionIdentity {
@@ -762,6 +764,7 @@ impl McpExtension {
             provider_token,
             http_options,
             closed: AtomicBool::new(false),
+            page_outputs: std::sync::Mutex::new(VecDeque::new()),
         });
         Self::discover(connection).await
     }
@@ -881,14 +884,14 @@ impl McpExtension {
                 (
                     "list_resources_page",
                     "list_resources",
-                    "List one page of this MCP server's resources; pass nextCursor as cursor to continue",
-                    json!({"type":"object","properties":{"cursor":{"type":"string"}},"additionalProperties":false}),
+                    "List one page of this MCP server's resources; pass nextCursor as cursor to continue. For saved oversized pages, pass outputId and offset to read chunks",
+                    json!({"type":"object","properties":{"cursor":{"type":"string"},"outputId":{"type":"string"},"offset":{"type":"integer","minimum":0}},"additionalProperties":false}),
                 ),
                 (
                     "list_resource_templates_page",
                     "list_resource_templates",
-                    "List one page of this MCP server's resource templates; pass nextCursor as cursor to continue",
-                    json!({"type":"object","properties":{"cursor":{"type":"string"}},"additionalProperties":false}),
+                    "List one page of this MCP server's resource templates; pass nextCursor as cursor to continue. For saved oversized pages, pass outputId and offset to read chunks",
+                    json!({"type":"object","properties":{"cursor":{"type":"string"},"outputId":{"type":"string"},"offset":{"type":"integer","minimum":0}},"additionalProperties":false}),
                 ),
                 (
                     "read_resource",
@@ -1004,6 +1007,11 @@ impl McpExtension {
     }
     pub async fn close(&self) {
         self.connection.closed.store(true, Ordering::SeqCst);
+        self.connection
+            .page_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let _ = self
             .connection
             .service
@@ -1109,13 +1117,25 @@ impl McpTool {
         context: ToolContext,
         host: Option<Arc<dyn pi_rs::ToolHost>>,
     ) -> Outcome {
-        if self.resource
+        let page_tool = self.resource
             && matches!(
                 self.remote_name.as_str(),
                 "list_resources_page" | "list_resource_templates_page"
-            )
-            && let Err(error) = resource_page_params(&arguments)
-        {
+            );
+        if page_tool && arguments.get("outputId").is_some() {
+            if context.cancellation.is_cancelled() || self.connection.closed.load(Ordering::SeqCst)
+            {
+                return Outcome::Failed("MCP page retrieval cancelled or connection closed".into());
+            }
+            return match self.read_page_output(&arguments) {
+                Ok(data) => Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                },
+                Err(error) => Outcome::Failed(error.to_string()),
+            };
+        }
+        if page_tool && let Err(error) = resource_page_params(&arguments) {
             return Outcome::Failed(error.to_string());
         }
         let attempt = || async {
@@ -1153,16 +1173,115 @@ impl McpTool {
             Ok(CallResult::Data(data)) if data["isError"] == true => {
                 Outcome::Failed(data.to_string())
             }
-            Ok(CallResult::Data(data)) => Outcome::Structured {
-                data,
-                attachments: vec![],
-            },
+            Ok(CallResult::Data(data)) => {
+                let data = if page_tool {
+                    match self.save_large_page(data) {
+                        Ok(data) => data,
+                        Err(error) => return Outcome::Failed(error.to_string()),
+                    }
+                } else {
+                    data
+                };
+                Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                }
+            }
             Ok(CallResult::Task(reference)) => Outcome::Pending { reference },
             Err(CallError::Scope(_)) => Outcome::Failed(
                 "MCP server still requires additional OAuth scopes after reauthorization".into(),
             ),
             Err(CallError::Other(error)) => Outcome::Unknown(error),
         }
+    }
+
+    // Keep the serialized page below the agent's 1 MiB tool limit. The full
+    // filtered response is stored privately and can be read in bounded chunks.
+    fn save_large_page(&self, data: Value) -> Result<Value> {
+        let text = serde_json::to_string(&data)?;
+        if text.len() <= 512 * 1024 {
+            return Ok(data);
+        }
+        let mut file = tempfile::NamedTempFile::new()
+            .map_err(|e| Error::Config(format!("cannot save MCP page: {e}")))?;
+        file.write_all(text.as_bytes())
+            .map_err(|e| Error::Config(format!("cannot save MCP page: {e}")))?;
+        let id = Uuid::new_v4();
+        let mut outputs = self
+            .connection
+            .page_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if outputs.len() >= 8 {
+            outputs.pop_front();
+        }
+        outputs.push_back((id, self.remote_name.clone(), file));
+        let mut result = json!({"server": self.connection.name, "outputId": id.to_string(),
+            "outputBytes": text.len(), "readTool": self.spec.name,
+            "message": "Full page saved; call this tool with outputId and byte offset to retrieve JSON chunks."});
+        // Unusually large cursors are still available in the saved JSON.
+        if let Some(cursor) = data
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|c| c.len() <= 16 * 1024)
+        {
+            result["nextCursor"] = json!(cursor);
+        }
+        Ok(result)
+    }
+
+    fn read_page_output(&self, arguments: &Value) -> Result<Value> {
+        if arguments.get("cursor").is_some() {
+            return Err(Error::Config(
+                "cursor cannot be combined with outputId".into(),
+            ));
+        }
+        let id = arguments
+            .get("outputId")
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(|| Error::Config("invalid outputId".into()))?;
+        let offset = match arguments.get("offset") {
+            None => 0,
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| Error::Config("offset must be a non-negative integer".into()))?,
+        };
+        let mut outputs = self
+            .connection
+            .page_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_, _, file) = outputs
+            .iter_mut()
+            .find(|(key, kind, _)| *key == id && *kind == self.remote_name)
+            .ok_or_else(|| Error::Config("MCP page output expired or unknown".into()))?;
+        let size = file
+            .as_file()
+            .metadata()
+            .map_err(|e| Error::Config(e.to_string()))?
+            .len();
+        if offset > size {
+            return Err(Error::Config("offset exceeds page output".into()));
+        }
+        let file = file.as_file_mut();
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let mut bytes = vec![0; (size - offset).min(16 * 1024) as usize];
+        file.read_exact(&mut bytes)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let valid = match std::str::from_utf8(&bytes) {
+            Ok(_) => bytes.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => return Err(Error::Config("offset is not a UTF-8 boundary".into())),
+        };
+        let chunk = std::str::from_utf8(&bytes[..valid]).expect("valid UTF-8");
+        let next = offset + valid as u64;
+        let mut result = json!({"outputId": id.to_string(), "offset": offset, "text": chunk});
+        if next < size {
+            result["nextOffset"] = json!(next);
+        }
+        Ok(result)
     }
 
     async fn authorize_scopes(
@@ -1822,6 +1941,7 @@ mod tests {
             provider_token: None,
             http_options: None,
             closed: AtomicBool::new(false),
+            page_outputs: std::sync::Mutex::new(VecDeque::new()),
         });
         let peer = connection.service.lock().await.peer().clone();
         let tool = McpTool {

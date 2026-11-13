@@ -3,10 +3,32 @@ use std::{
     time::Duration,
 };
 
+use futures_util::stream;
 use pi_rs::{CancellationToken, Extension, Outcome, ToolContext};
 use pi_rs_workbench::mcp::{McpExtension, ServerConfig};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+struct PageModel(Mutex<Vec<pi_rs::ModelRequest>>);
+#[async_trait::async_trait]
+impl pi_rs::Model for PageModel {
+    async fn stream(&self, request: pi_rs::ModelRequest) -> pi_rs::Result<pi_rs::ModelStream> {
+        let mut requests = self.0.lock().unwrap();
+        requests.push(request);
+        let calls = if requests.len() == 1 {
+            vec![pi_rs::ToolCall {
+                id: "page".into(),
+                name: "mcp__fixture__list_resources_page".into(),
+                arguments: json!({"cursor":"oversized"}).to_string(),
+            }]
+        } else {
+            vec![]
+        };
+        Ok(Box::pin(stream::iter(vec![Ok(
+            pi_rs::ModelEvent::Complete { calls, usage: None },
+        )])))
+    }
+}
 
 #[tokio::test]
 async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_pages() {
@@ -54,6 +76,9 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                     Some("initialize") => Some(
                         json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"resources":{}},"serverInfo":{"name":"fixture","version":"1"}}),
                     ),
+                    Some("resources/list") if request["params"]["cursor"] == "oversized" => Some(
+                        json!({"resources":[{"uri":"file:///large","name":"large","description":"猫\n".repeat(300_000)}],"nextCursor":"after-large"}),
+                    ),
                     Some("resources/list") if request["params"]["cursor"] == "next" => {
                         Some(json!({"resources":[
                             {"uri":"file:///second.txt","name":"second","mimeType":"text/plain","_meta":{"secret":"discard"},"icons":[{"src":"https://example.invalid/icon"}]},
@@ -93,9 +118,11 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
     let config: ServerConfig =
         serde_json::from_value(json!({"url":format!("http://{address}/mcp"),"oauth":false}))
             .unwrap();
-    let extension = McpExtension::connect("fixture", &config, directory.path())
-        .await
-        .unwrap();
+    let extension = Arc::new(
+        McpExtension::connect("fixture", &config, directory.path())
+            .await
+            .unwrap(),
+    );
     let tools = extension.tools();
     for (suffix, key, names) in [
         (
@@ -222,6 +249,79 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
     );
     assert!(names.contains(&"mcp__hidden__list_resource_templates_page".to_owned()));
     hidden.close().await;
+
+    // Exercise the actual agent output limit, then recover and decode the page.
+    let mut registry = pi_rs::Registry::default();
+    registry.register(extension.clone()).unwrap();
+    let model = PageModel(Mutex::new(Vec::new()));
+    let agent = pi_rs::Agent {
+        model: &model,
+        model_name: "fixture",
+        registry: &registry,
+        system_prompt: "fixture",
+        limits: pi_rs::Limits::default(),
+    };
+    let mut session = pi_rs::Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+    let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+    agent
+        .run(
+            &mut session,
+            Some("list".into()),
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |_: pi_rs::Notification<'_>| {},
+        )
+        .await
+        .unwrap();
+    let id = {
+        let requests = model.0.lock().unwrap();
+        let content = requests[1]
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                pi_rs::Message::Tool {
+                    call_id,
+                    content,
+                    is_error,
+                    ..
+                } if call_id == "page" && !is_error => Some(content),
+                _ => None,
+            })
+            .expect("agent must retain the page handle");
+        let result: Value = serde_json::from_str(content).unwrap();
+        let envelope = &result["data"];
+        assert_eq!(envelope["nextCursor"], "after-large");
+        assert!(content.len() < 1024 * 1024);
+        envelope["outputId"].as_str().unwrap().to_owned()
+    };
+    let page_tool = tools
+        .iter()
+        .find(|tool| tool.spec().name == "mcp__fixture__list_resources_page")
+        .unwrap();
+    let mut offset = 0;
+    let mut page = String::new();
+    loop {
+        let result = page_tool
+            .invoke(
+                json!({"outputId": id, "offset": offset}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: CancellationToken::new(),
+                },
+            )
+            .await;
+        let Outcome::Structured { data, .. } = result else {
+            panic!("bad chunk: {result:?}")
+        };
+        page.push_str(data["text"].as_str().unwrap());
+        match data["nextOffset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    let page: Value = serde_json::from_str(&page).unwrap();
+    assert_eq!(page["nextCursor"], "after-large");
+    assert_eq!(page["resources"][0]["description"], "猫\n".repeat(300_000));
     extension.close().await;
     server.abort();
 }
