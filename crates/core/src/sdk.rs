@@ -471,7 +471,7 @@ impl SessionBuilder {
             limits: self.limits,
             session_id: session.session_id(),
             session: Arc::new(tokio::sync::Mutex::new(session)),
-            input,
+            input: Arc::new(tokio::sync::Mutex::new(input)),
             events: Some(events),
             control: SessionControl {
                 input: sender,
@@ -500,7 +500,7 @@ pub struct AgentSession {
     limits: Limits,
     session_id: Uuid,
     session: Arc<tokio::sync::Mutex<Session>>,
-    input: mpsc::Receiver<crate::AgentInput>,
+    input: Arc<tokio::sync::Mutex<mpsc::Receiver<crate::AgentInput>>>,
     control: SessionControl,
     events: Option<broadcast::Sender<SessionEvent>>,
     closed: bool,
@@ -568,18 +568,26 @@ impl AgentSession {
         self.registry.tool_specs()
     }
     pub fn pending_inputs(&self) -> Result<usize> {
-        Ok(self.input.len() + self.journal()?.queued_inputs().len())
+        let input = self
+            .input
+            .try_lock()
+            .map_err(|_| Error::Session("session input is in use".into()))?;
+        Ok(input.len() + self.journal()?.queued_inputs().len())
     }
     /// Clear pending input while this owned session is idle, retaining each removal in the journal.
     pub fn clear_queued_inputs(&mut self) -> Result<Vec<QueuedMessage>> {
         self.ensure_open()?;
         let events = self.events.as_ref().expect("open session").clone();
+        let mut input = self
+            .input
+            .try_lock()
+            .map_err(|_| Error::Session("session input is in use".into()))?;
         crate::agent::queue_inputs(
             &mut *self
                 .session
                 .try_lock()
                 .map_err(|_| Error::Session("session journal is in use".into()))?,
-            &mut self.input,
+            &mut *input,
             &mut |event| emit(&events, &event),
         )?;
         let count = self
@@ -809,6 +817,7 @@ impl AgentSession {
                     _ => None,
                 })
         };
+        let mut input_queue = self.input.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let agent = Agent {
@@ -838,9 +847,10 @@ impl AgentSession {
                 self.model_name = model;
             }
         }
-        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observer);
+        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observer);
         let result = result.and(final_inputs);
         if let Err(error) = result {
+            drop(input_queue);
             drop(journal);
             let _ = self.drain_idle_triggers().await;
             return Err(error);
@@ -850,6 +860,7 @@ impl AgentSession {
             .find(|record| matches!(record.event, crate::Event::BranchSummary { .. }))
             .cloned()
             .map(Box::new);
+        drop(input_queue);
         drop(journal);
         let _ = self.drain_idle_triggers().await?;
         Ok(TreeNavigationResult {
@@ -917,6 +928,7 @@ impl AgentSession {
         let Some(trigger_id) = journal.pending_custom_trigger() else {
             return Ok(None);
         };
+        let mut input_queue = self.input.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let mut observe = |event: Notification<'_>| {
@@ -935,12 +947,12 @@ impl AgentSession {
                 &mut *journal,
                 trigger_id,
                 None,
-                &mut self.input,
+                &mut *input_queue,
                 &active.token,
                 &mut observe,
             )
             .await;
-        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observe);
+        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observe);
         let answer = result?;
         final_inputs?;
         Ok(Some(answer))
@@ -1223,6 +1235,7 @@ impl AgentSession {
     ) -> Result<String> {
         self.start().await?;
         let mut journal = self.session.lock().await;
+        let mut input_queue = self.input.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let mut observe = |event: Notification<'_>| {
@@ -1260,7 +1273,7 @@ impl AgentSession {
                             &mut *journal,
                             trigger_id,
                             None,
-                            &mut self.input,
+                            &mut *input_queue,
                             &active.token,
                             &mut observe,
                         )
@@ -1290,14 +1303,14 @@ impl AgentSession {
                     &mut *journal,
                     run_id,
                     input,
-                    &mut self.input,
+                    &mut *input_queue,
                     &active.token,
                     &mut observe,
                 )
                 .await
         }
         .await;
-        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observe);
+        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observe);
         if result.is_ok()
             && let Err(error) = final_inputs
         {
@@ -1394,6 +1407,7 @@ impl AgentSession {
     pub async fn compact_with_hooks(&mut self, compaction: Compaction) -> Result<()> {
         self.start().await?;
         let mut journal = self.session.lock().await;
+        let mut input_queue = self.input.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let agent = Agent {
@@ -1413,11 +1427,12 @@ impl AgentSession {
                 compaction,
                 &active.token,
                 &mut observer,
-                &mut self.input,
+                &mut *input_queue,
             )
             .await;
-        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observer);
+        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observer);
         let result = result.and(final_inputs);
+        drop(input_queue);
         drop(journal);
         let triggered = self.drain_idle_triggers().await.map(|_| ());
         result.and(triggered)
@@ -1446,6 +1461,7 @@ impl AgentSession {
     ) -> Result<()> {
         self.start().await?;
         let mut journal = self.session.lock().await;
+        let mut input_queue = self.input.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let agent = Agent {
@@ -1467,7 +1483,7 @@ impl AgentSession {
                         keep_turns,
                         &active.token,
                         &mut observer,
-                        Some(&mut self.input),
+                        Some(&mut *input_queue),
                         instructions,
                     )
                     .await
@@ -1478,14 +1494,15 @@ impl AgentSession {
                         &mut *journal,
                         &active.token,
                         &mut observer,
-                        Some(&mut self.input),
+                        Some(&mut *input_queue),
                         instructions,
                     )
                     .await
             }
         };
-        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observer);
+        let final_inputs = active.finish_inputs(&mut *journal, &mut *input_queue, &mut observer);
         let result = result.and(final_inputs);
+        drop(input_queue);
         drop(journal);
         let triggered = self.drain_idle_triggers().await.map(|_| ());
         result.and(triggered)
@@ -1496,9 +1513,12 @@ impl AgentSession {
         }
         self.closed = true;
         self.control.abort();
-        self.input.close();
+        {
+            let mut input = self.input.lock().await;
+            input.close();
+            while input.try_recv().is_ok() {}
+        }
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
-        while self.input.try_recv().is_ok() {}
         let notification_result = if self.pending_start.is_none() {
             self.notify_session_event(crate::LifecycleEvent::SessionShutdown {
                 reason: crate::SessionShutdownReason::Quit,
@@ -2586,7 +2606,7 @@ mod tests {
         journal
             .append_user_with_images("branch B".into(), vec![], None)
             .unwrap();
-        let mut session = SessionBuilder::new(model_b, "model-B")
+        let session = SessionBuilder::new(model_b, "model-B")
             .branch_model("model-A", model_a.clone())
             .unwrap()
             .extension(Arc::new(BranchStateHook(seen.clone())))
@@ -2605,13 +2625,14 @@ mod tests {
             limits: session.limits.clone(),
         };
         let mut journal = session.session.lock().await;
+        let mut input_queue = session.input.lock().await;
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             tokio::join!(
                 agent.run_correlated(
                     &mut journal,
                     Uuid::new_v4(),
                     Some("B prompt".into()),
-                    &mut session.input,
+                    &mut *input_queue,
                     &active.token,
                     &mut observe
                 ),
@@ -2630,7 +2651,7 @@ mod tests {
         active
             .finish_inputs(
                 &mut *session.session.try_lock().unwrap(),
-                &mut session.input,
+                &mut *input_queue,
                 &mut observe,
             )
             .unwrap();
