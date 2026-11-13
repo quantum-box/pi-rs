@@ -4172,12 +4172,11 @@ pub(super) async fn run(
                             theme = next;
                         }
                     } else if selection.contains('/') {
-                        match Theme::load(
+                        match load_resolved_theme(
                             selection,
                             &args.theme_paths,
                             &args.workspace,
                             args.trusted,
-                            false,
                         ) {
                             Ok(next) => theme = next,
                             Err(error) => view.append(&format!("Theme reload: {error}")),
@@ -4435,12 +4434,11 @@ pub(super) async fn run(
                             if let Some(mut settings) = view.theme_settings.take() {
                                 match settings.stage {
                                     ThemeSettingsStage::Single => {
-                                        theme = Theme::load(
+                                        theme = load_resolved_theme(
                                             args.use_theme.as_deref().unwrap_or("system"),
                                             &args.theme_paths,
                                             &args.workspace,
                                             args.trusted,
-                                            false,
                                         )
                                         .unwrap_or(settings.original);
                                         view.picker = Some(settings.parent);
@@ -5018,12 +5016,11 @@ pub(super) async fn run(
                                     .collect(),
                             ));
                         } else if let Some(name) = input.strip_prefix("/theme ") {
-                            match Theme::load(
+                            match load_resolved_theme(
                                 name.trim(),
                                 &args.theme_paths,
                                 &args.workspace,
                                 args.trusted,
-                                false,
                             ) {
                                 Ok(next) => {
                                     args.settings.set_user("theme", json!(name.trim()))?;
@@ -5105,12 +5102,11 @@ pub(super) async fn run(
                                 Ok(next) => keys = next,
                                 Err(error) => view.append(&error.to_string()),
                             }
-                            match Theme::load(
+                            match load_resolved_theme(
                                 args.use_theme.as_deref().unwrap_or("system"),
                                 &args.theme_paths,
                                 &args.workspace,
                                 args.trusted,
-                                false,
                             ) {
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
@@ -5882,13 +5878,7 @@ impl ThemeSettings {
             (ThemeSettingsStage::Single, _) => self.single.clone(),
             _ => format!("{}/{}", self.light, self.dark),
         };
-        Theme::load(
-            &candidate,
-            &args.theme_paths,
-            &args.workspace,
-            args.trusted,
-            false,
-        )
+        load_resolved_theme(&candidate, &args.theme_paths, &args.workspace, args.trusted)
     }
 }
 
@@ -6661,14 +6651,13 @@ fn select(
                 args.settings
                     .set_user_member("markdown", member, value.clone())?;
             } else if key == "theme" {
-                let next = Theme::load(
+                let next = load_resolved_theme(
                     value
                         .as_str()
                         .ok_or_else(|| Error::Config("theme must be a string".into()))?,
                     &args.theme_paths,
                     &args.workspace,
                     args.trusted,
-                    false,
                 )?;
                 args.settings.set_user(&key, value.clone())?;
                 args.use_theme = value.as_str().map(str::to_owned);
@@ -6707,13 +6696,8 @@ fn select(
             });
         }
         Selection::Theme(name) => {
-            let next = Theme::load(
-                &name,
-                &args.theme_paths,
-                &args.workspace,
-                args.trusted,
-                false,
-            )?;
+            let next =
+                load_resolved_theme(&name, &args.theme_paths, &args.workspace, args.trusted)?;
             args.settings.set_user("theme", json!(name))?;
             args.use_theme = Some(name);
             *theme = next;
@@ -7930,6 +7914,27 @@ mod tests {
             super::startup_picker_theme(&args).unwrap().name,
             "package-theme"
         );
+    }
+
+    #[test]
+    fn theme_settings_preview_skips_unrelated_invalid_theme() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let broken = directory.path().join("broken.json");
+        let selected = directory.path().join("selected.json");
+        std::fs::write(&broken, "not JSON").unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        value["name"] = serde_json::json!("fixture-theme");
+        std::fs::write(&selected, value.to_string()).unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.theme_paths = vec![broken, selected];
+        let original = super::Theme::system();
+        let state =
+            super::ThemeSettings::new(super::Picker::new("Settings", vec![]), &args, &original);
+        let mut picker = state.picker(&args);
+        picker.paste("fixture-theme");
+        assert_eq!(state.preview(&picker, &args).unwrap().name, "fixture-theme");
     }
 
     #[test]

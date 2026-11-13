@@ -1107,6 +1107,13 @@ fn resume_picker_and_runtime_skip_malformed_theme_before_journal_update() {
     output_until(&mut master, |text| text.contains("Resume Fixture"));
     master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/theme fixture-theme\r").unwrap();
+    output_until(&mut master, |_| {
+        std::fs::read(home.join("settings.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|settings| settings["theme"] == "fixture-theme")
+    });
     master.write_all(b"/quit\r").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while process.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
