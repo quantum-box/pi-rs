@@ -2924,6 +2924,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-rs-remote-find"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "pi-rs",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "pi-rs-review"
 version = "0.1.0"
 dependencies = [

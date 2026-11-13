@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bedrock", "crates/anthropic", "crates/fixture-tools", "crates/aip-host", "crates/core", "crates/google", "crates/ollama", "crates/openai", "crates/plan-mode", "crates/review", "crates/extensions", "crates/workbench"]
+members = ["crates/bedrock", "crates/anthropic", "crates/fixture-tools", "crates/aip-host", "crates/core", "crates/google", "crates/ollama", "crates/openai", "crates/plan-mode", "crates/review", "crates/remote-find", "crates/extensions", "crates/workbench"]
 resolver = "3"
 
 [package]

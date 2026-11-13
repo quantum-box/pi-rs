@@ -1,0 +1,7 @@
+# Injected model find operations
+
+The independent `pi-rs-remote-find` workspace crate exposes `create_find_tool` and `FindExtension` for hosts composing a tool set. The backend supplies `FindOperations` for existence checks and globbing, enforces access policy and ignore rules, honors the supplied limit, and stops work when its operation future is dropped. The host handles model argument validation, cancellation, relative path display, output limits, and truncation metadata. It rejects returned paths outside the requested search directory. The factory uses unrestricted Pi-style paths; it does not claim a scoped workspace boundary.
+
+This standalone factory does not modify `CodingTools` or #116's factory implementation. Hosts must explicitly compose a tool set and avoid registering two tools named `find`. #116 must continue rejecting read-only sets that combine remote read with local search: injecting `find` alone does not make local `grep` and `ls` coherent with a remote reader.
+
+Only `find` is implemented here. The pinned Pi `grep` operations interface supplies `isDirectory` and `readFile`, but grep still launches local ripgrep, so those hooks alone cannot search a remote workspace. Remote `grep` and `ls` operations and integration into coherent read-only tool sets remain incomplete. The backend returns its result list as a vector and must respect the provided limit; a misbehaving backend can still allocate an oversized response before host truncation.
