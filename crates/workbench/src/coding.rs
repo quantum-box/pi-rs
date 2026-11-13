@@ -28,6 +28,7 @@ pub struct CodingTools {
     image_profile: Option<crate::image_profile::ImageResizeProfile>,
     model_supports_images: Option<bool>,
     read_operations: Option<Arc<dyn ReadOperations>>,
+    write_operations: Option<Arc<dyn WriteOperations>>,
 }
 
 impl CodingTools {
@@ -44,6 +45,7 @@ impl CodingTools {
             image_profile: None,
             model_supports_images: None,
             read_operations: None,
+            write_operations: None,
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -62,6 +64,18 @@ impl CodingTools {
             ));
         }
         self.read_operations = Some(operations);
+        Ok(self)
+    }
+
+    /// Inject model-facing writes in the unrestricted profile. The backend is
+    /// responsible for its own remote access policy.
+    pub fn with_write_operations(mut self, operations: Arc<dyn WriteOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom write operations require the unrestricted profile".into(),
+            ));
+        }
+        self.write_operations = Some(operations);
         Ok(self)
     }
 
@@ -410,6 +424,13 @@ impl Extension for CodingTools {
                         tool,
                         operations: operations.clone(),
                     }) as Arc<dyn Tool>
+                } else if matches!(kind, Kind::Write)
+                    && let Some(operations) = &self.write_operations
+                {
+                    Arc::new(RemoteWriteTool {
+                        tool,
+                        operations: operations.clone(),
+                    }) as Arc<dyn Tool>
                 } else {
                     Arc::new(tool) as Arc<dyn Tool>
                 }
@@ -658,6 +679,297 @@ impl Tool for RemoteReadTool {
                 .into()
             }
             outcome => outcome.into(),
+        }
+    }
+}
+
+/// Asynchronous operations for a model-facing write tool. Paths are absolute
+/// and the backend must enforce its own access policy. Operations must not
+/// return until their externally visible effects have settled; a cancellation
+/// can be observed after an in-flight operation completes.
+#[async_trait::async_trait]
+pub trait WriteOperations: Send + Sync {
+    /// Return true only when paths address this host's local filesystem. This
+    /// makes writes share the canonicalized cross-process lock used by local edits.
+    /// This is cooperative locking, not a security boundary: path components can
+    /// be replaced by outside processes after resolution and before an operation.
+    fn uses_local_filesystem(&self) -> bool {
+        false
+    }
+    /// Stable identity for aliases of the same remote resource. Implementations
+    /// must use the same identity across their read/write/edit interfaces.
+    async fn resource_identity(&self, path: &Path) -> Result<PathBuf> {
+        Ok(path.to_owned())
+    }
+    async fn mkdir(&self, directory: &Path) -> Result<()>;
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()>;
+}
+
+/// Local filesystem implementation of Pi's write operations interface.
+pub struct LocalWriteOperations;
+
+#[async_trait::async_trait]
+impl WriteOperations for LocalWriteOperations {
+    fn uses_local_filesystem(&self) -> bool {
+        true
+    }
+    async fn mkdir(&self, directory: &Path) -> Result<()> {
+        tokio::fs::create_dir_all(directory).await?;
+        Ok(())
+    }
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        let path = path.to_owned();
+        let file = tokio::task::spawn_blocking(move || open_local_write_file(&path))
+            .await
+            .map_err(|error| Error::Config(error.to_string()))??;
+        let mut file = tokio::fs::File::from_std(file);
+        file.set_len(0).await?;
+        file.write_all(content.as_bytes()).await?;
+        file.flush().await?;
+        Ok(())
+    }
+}
+
+// Open without truncation, then verify the opened object before changing it.
+// O_NONBLOCK prevents a FIFO substituted after the metadata check from hanging.
+fn open_local_write_file(path: &Path) -> Result<std::fs::File> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(Error::Config("expected a regular file".into()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Ok(metadata) = std::fs::symlink_metadata(path)
+                && metadata.file_type().is_symlink()
+            {
+                return Err(Error::Config(
+                    "dangling symlink cannot be used as a mutation target".into(),
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(all(test, unix))]
+    pause_local_write_open(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    Ok(file)
+}
+
+#[cfg(all(test, unix))]
+struct LocalWriteOpenHook {
+    expected: PathBuf,
+    ready: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(all(test, unix))]
+static LOCAL_WRITE_OPEN_HOOK: std::sync::Mutex<Option<LocalWriteOpenHook>> =
+    std::sync::Mutex::new(None);
+#[cfg(all(test, unix))]
+fn pause_local_write_open(path: &Path) {
+    if let Some(hook) = LOCAL_WRITE_OPEN_HOOK.lock().unwrap().as_ref()
+        && hook.expected == path
+    {
+        let _ = hook.ready.send(());
+        let _ = hook.resume.recv_timeout(Duration::from_secs(5));
+    }
+}
+
+/// Create an unrestricted model-facing write tool for a remote directory.
+/// The backend is responsible for access control and filesystem semantics.
+pub fn create_write_tool(
+    root: &Path,
+    operations: Arc<dyn WriteOperations>,
+) -> Result<Arc<dyn Tool>> {
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteWriteTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        },
+        operations,
+    }))
+}
+
+struct RemoteWriteTool {
+    tool: CodingTool,
+    operations: Arc<dyn WriteOperations>,
+}
+
+// Local operations participate in the existing OS-file lock shared with edits.
+// Remote operations are serialized per backend allocation and path, rather
+// than treating identical paths in unrelated stores as the same resource.
+struct InjectedWriteGuard {
+    _local: Option<std::fs::File>,
+    _remote: Option<tokio::sync::OwnedMutexGuard<()>>,
+    local_target: Option<PathBuf>,
+}
+
+fn canonical_local_target(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(metadata) = std::fs::symlink_metadata(ancestor)
+                    && metadata.file_type().is_symlink()
+                {
+                    return Err(Error::Config(
+                        "dangling symlink cannot be used as a mutation target".into(),
+                    ));
+                }
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| Error::Config("invalid target path".into()))?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| Error::Config("invalid target path".into()))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+static LOCAL_LOCK_RESOLVED: std::sync::Mutex<Option<(PathBuf, std::sync::mpsc::Sender<()>)>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+fn notify_local_lock_resolved(path: &Path) {
+    if let Some((expected, sender)) = LOCAL_LOCK_RESOLVED.lock().unwrap().as_ref()
+        && expected == path
+    {
+        let _ = sender.send(());
+    }
+}
+
+async fn injected_write_lock(
+    operations: &Arc<dyn WriteOperations>,
+    path: &Path,
+    cancellation: &pi_rs::CancellationToken,
+) -> Result<InjectedWriteGuard> {
+    if operations.uses_local_filesystem() {
+        let path = path.to_owned();
+        let token = cancellation.clone();
+        let (file, target) = tokio::task::spawn_blocking(move || {
+            let target = canonical_local_target(&path)?;
+            #[cfg(test)]
+            notify_local_lock_resolved(&path);
+            let file = mutation_lock(&target, &token)?;
+            Ok::<_, Error>((file, target))
+        })
+        .await
+        .map_err(|error| Error::Config(error.to_string()))??;
+        Ok(InjectedWriteGuard {
+            _local: Some(file),
+            _remote: None,
+            local_target: Some(target),
+        })
+    } else {
+        type Key = (usize, PathBuf);
+        type WeakLock = std::sync::Weak<tokio::sync::Mutex<()>>;
+        static LOCKS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<Key, WeakLock>>,
+        > = std::sync::OnceLock::new();
+        let identity = Arc::as_ptr(operations) as *const () as usize;
+        let key = (identity, operations.resource_identity(path).await?);
+        check_mutation_cancelled(cancellation)?;
+        let lock = {
+            let mut locks = LOCKS
+                .get_or_init(Default::default)
+                .lock()
+                .expect("remote write locks");
+            locks.retain(|_, lock| lock.strong_count() != 0);
+            if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            guard = lock.lock_owned() => guard,
+        };
+        Ok(InjectedWriteGuard {
+            _local: None,
+            _remote: Some(guard),
+            local_target: None,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for RemoteWriteTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let result = async {
+            let display = string(&args, "path")?.to_owned();
+            let content = string(&args, "content")?.to_owned();
+            let path = crate::coding_paths::resolve(
+                &self.tool.root,
+                &crate::coding_paths::normalize(&display)?,
+            );
+            let cancellation = context.cancellation.child_token();
+            let _guard = cancellation.clone().drop_guard();
+            let operations = self.operations.clone();
+            // The detached worker owns the lock while an operation is in flight.
+            // Dropping the caller never releases it before a backend has settled.
+            let worker = tokio::spawn(async move {
+                let _lock = injected_write_lock(&operations, &path, &cancellation).await?;
+                check_mutation_cancelled(&cancellation)?;
+                let path = _lock.local_target.as_deref().unwrap_or(&path);
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| Error::Config("file needs a parent".into()))?;
+                operations.mkdir(parent).await?;
+                check_mutation_cancelled(&cancellation)?;
+                operations.write_file(path, &content).await?;
+                check_mutation_cancelled(&cancellation)?;
+                Ok::<_, Error>(format!("Successfully wrote to {display}"))
+            });
+            worker
+                .await
+                .map_err(|error| Error::Config(error.to_string()))?
+        }
+        .await;
+        match result {
+            Ok(output) => Outcome::Succeeded(output),
+            Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
+            Err(error) => Outcome::Failed(error.to_string()),
         }
     }
 }
@@ -2135,6 +2447,103 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_write_fifo_substitution_settles_after_cancellation() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("target");
+        std::fs::write(&path, "original").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *LOCAL_WRITE_OPEN_HOOK.lock().unwrap() = Some(LocalWriteOpenHook {
+            expected: path.clone(),
+            ready: ready_tx,
+            resume: resume_rx,
+        });
+        let tool = create_write_tool(&root, Arc::new(LocalWriteOperations)).unwrap();
+        let cancellation = pi_rs::CancellationToken::new();
+        let token = cancellation.clone();
+        let task = tokio::spawn(async move {
+            tool.invoke(
+                json!({"path":"target", "content":"new"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: token,
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .expect("open precheck completed");
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // A reader lets open succeed, exercising post-open fstat, not just ENXIO.
+        let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(fd >= 0);
+        let _reader = unsafe { std::fs::File::from_raw_fd(fd) };
+        cancellation.cancel();
+        resume_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("FIFO open must not block")
+            .unwrap();
+        *LOCAL_WRITE_OPEN_HOOK.lock().unwrap() = None;
+        assert!(matches!(result, Outcome::Failed(_)));
+        assert!(std::fs::metadata(&path).unwrap().file_type().is_fifo());
+        let mut byte = [0u8; 1];
+        let count = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(count, 0, "no content was written to the FIFO");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_injected_write_binds_target_before_waiting_for_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        let alias = root.join("alias");
+        std::fs::write(&a, "before").unwrap();
+        std::fs::write(&b, "before").unwrap();
+        std::os::unix::fs::symlink(&a, &alias).unwrap();
+        let held = mutation_lock(&a, &pi_rs::CancellationToken::new()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        *LOCAL_LOCK_RESOLVED.lock().unwrap() = Some((alias.clone(), tx));
+        let tool = create_write_tool(&root, Arc::new(LocalWriteOperations)).unwrap();
+        let task = tokio::spawn(async move {
+            tool.invoke(
+                json!({"path":"alias", "content":"after"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .expect("tool resolved its target");
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&b, &alias).unwrap();
+        *LOCAL_LOCK_RESOLVED.lock().unwrap() = None;
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Succeeded(_)));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "after");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "before");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
