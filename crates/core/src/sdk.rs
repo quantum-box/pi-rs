@@ -2217,6 +2217,27 @@ mod tests {
             crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "compaction-lifecycle")).count(), 1);
     }
 
+    #[tokio::test]
+    async fn failed_compaction_preserves_error_and_drains_lifecycle_trigger() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(CompactionLifecycleMessage))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
+            .await
+            .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Nothing to compact")
+        );
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        assert!(session.journal().pending_custom_trigger().is_none());
+    }
+
     struct StatisticsModel {
         slow_discovery: bool,
     }
@@ -4165,6 +4186,83 @@ mod tests {
     }
 
     struct ScopedKeyHook(&'static str);
+
+    struct RetryOnceModel(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for RetryOnceModel {
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Error::RetryableModel("retry".into()));
+            }
+            Ok(Box::pin(futures_util::stream::iter([Ok(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )])))
+        }
+    }
+    struct RetryRequestHook(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Extension for RetryRequestHook {
+        fn id(&self) -> &str {
+            "retry-request-key"
+        }
+        async fn before_request_with_host(
+            &self,
+            _: &mut ModelRequest,
+            _: crate::RequestPurpose,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            let attempt = self.0.fetch_add(1, Ordering::SeqCst);
+            host.send_message_with_key(
+                crate::CustomMessage {
+                    custom_type: "retry-key".into(),
+                    content: crate::ContextContent::Text(format!("attempt {attempt}")),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::NextTurn,
+                "same",
+            )
+            .await
+        }
+    }
+    #[tokio::test]
+    async fn request_retry_uses_a_distinct_callback_identity() {
+        let mut session =
+            SessionBuilder::new(Arc::new(RetryOnceModel(AtomicUsize::new(0))), "fixture")
+                .extension(Arc::new(RetryRequestHook(AtomicUsize::new(0))))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+        session
+            .controls()
+            .set_retry_settings(crate::RetrySettings {
+                enabled: true,
+                max_retries: 1,
+                base_delay_ms: 0,
+                max_agent_delay_ms: 0,
+            })
+            .unwrap();
+        session.prompt("prompt").await.unwrap();
+        let ids: Vec<_> = session
+            .journal()
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                crate::Event::CustomMessageQueued { input }
+                    if input.message.custom_type == "retry-key" =>
+                {
+                    Some(input.id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
 
     struct PerTurnKeyHook {
         paused: tokio::sync::Notify,
