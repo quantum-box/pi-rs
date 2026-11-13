@@ -150,6 +150,7 @@ struct RunConfig {
 type PendingStart = Arc<Mutex<Option<(crate::SessionStartReason, Option<PathBuf>)>>>;
 
 struct SessionOwner {
+    id: Uuid,
     pending_start: PendingStart,
     closed: CancellationToken,
     journal: std::sync::Weak<tokio::sync::Mutex<Session>>,
@@ -211,6 +212,9 @@ struct ScopedIdleHost {
 
 #[async_trait::async_trait]
 impl crate::ToolHost for ScopedIdleHost {
+    fn callback_scope_owner(&self) -> Option<Uuid> {
+        Some(self.scope.owner.id)
+    }
     fn tools(&self) -> Vec<crate::ToolSpec> {
         self.inner.tools()
     }
@@ -279,8 +283,72 @@ impl crate::ToolHost for ScopedIdleHost {
 
 pub(crate) fn scope_callback_host(host: Arc<dyn crate::ToolHost>) -> Arc<dyn crate::ToolHost> {
     match IDLE_INPUT_SCOPE.try_with(|scope| scope.clone()) {
-        Ok(scope) => Arc::new(ScopedIdleHost { inner: host, scope }),
-        Err(_) => host,
+        Ok(scope) if host.callback_scope_owner() == Some(scope.owner.id) => {
+            Arc::new(ScopedIdleHost { inner: host, scope })
+        }
+        _ => host,
+    }
+}
+
+// Marks the host with the owner whose journal services its messages. A nested
+// session must never inherit the caller's task-local child lane.
+struct OwnerBoundHost {
+    inner: Arc<dyn crate::ToolHost>,
+    owner_id: Uuid,
+}
+#[async_trait::async_trait]
+impl crate::ToolHost for OwnerBoundHost {
+    fn callback_scope_owner(&self) -> Option<Uuid> {
+        Some(self.owner_id)
+    }
+    fn tools(&self) -> Vec<crate::ToolSpec> {
+        self.inner.tools()
+    }
+    fn supports_progress(&self) -> bool {
+        self.inner.supports_progress()
+    }
+    fn has_ui(&self) -> bool {
+        self.inner.has_ui()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        self.inner.supports_custom_messages()
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        self.inner.supports_keyed_messages()
+    }
+    fn for_extension(&self, id: &str) -> Option<Arc<dyn crate::ToolHost>> {
+        self.inner.for_extension(id).map(|inner| {
+            Arc::new(Self {
+                inner,
+                owner_id: self.owner_id,
+            }) as Arc<dyn crate::ToolHost>
+        })
+    }
+    async fn call(&self, name: &str, args: serde_json::Value) -> crate::Outcome {
+        self.inner.call(name, args).await
+    }
+    async fn report_progress(&self, partial: serde_json::Value) -> crate::ExtensionResult<()> {
+        self.inner.report_progress(partial).await
+    }
+    async fn ui(&self, request: crate::UiRequest) -> crate::ExtensionResult<crate::UiResponse> {
+        self.inner.ui(request).await
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        self.inner.send_message(message, delivery).await
+    }
+    async fn send_message_with_key(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+        key: &str,
+    ) -> crate::ExtensionResult<()> {
+        self.inner
+            .send_message_with_key(message, delivery, key)
+            .await
     }
 }
 
@@ -644,8 +712,10 @@ impl SessionControl {
             .await?;
         }
         let (sender, mut incoming) = mpsc::channel(32);
-        let host: Arc<dyn crate::ToolHost> =
-            Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let host: Arc<dyn crate::ToolHost> = Arc::new(OwnerBoundHost {
+            inner: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
+            owner_id: self.owner.id,
+        });
         let (children, mut child_requests) = mpsc::unbounded_channel();
         let event = crate::InputEvent {
             text: std::mem::take(&mut message.input.content),
@@ -749,8 +819,10 @@ impl SessionControl {
         }
         let states = journal.extension_states();
         let (sender, mut incoming) = mpsc::channel(32);
-        let host: Arc<dyn crate::ToolHost> =
-            Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let host: Arc<dyn crate::ToolHost> = Arc::new(OwnerBoundHost {
+            inner: Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true }),
+            owner_id: self.owner.id,
+        });
         let (children, mut child_requests) = mpsc::unbounded_channel();
         let scope = IdleInputScope {
             owner: self.owner.clone(),
@@ -1062,6 +1134,7 @@ impl SessionBuilder {
         let registry = Arc::new(self.registry);
         let pending_start = Arc::new(Mutex::new(Some((crate::SessionStartReason::Startup, None))));
         let owner = Arc::new(SessionOwner {
+            id: Uuid::new_v4(),
             pending_start: pending_start.clone(),
             closed: CancellationToken::new(),
             journal: Arc::downgrade(&session),
@@ -1922,6 +1995,7 @@ impl AgentSession {
                     event,
                     &active.token,
                     &mut observe,
+                    Some(&self.control),
                 )
                 .await?;
                 let pending_trigger = journal.pending_custom_trigger();
@@ -2260,8 +2334,14 @@ impl Drop for IdleScopeGuard {
     }
 }
 
-pub(crate) async fn scope_extension_callback<F: std::future::Future>(future: F) -> F::Output {
-    let parent = IDLE_INPUT_SCOPE.try_with(|scope| scope.clone()).ok();
+pub(crate) async fn scope_extension_callback<F: std::future::Future>(
+    owner: Option<Uuid>,
+    future: F,
+) -> F::Output {
+    let parent = IDLE_INPUT_SCOPE
+        .try_with(|scope| scope.clone())
+        .ok()
+        .filter(|scope| owner == Some(scope.owner.id));
     if let Some(mut scope) = parent {
         scope.lifetime = scope.lifetime.child_token();
         scope.host = Arc::new(ScopedIdleHost {
@@ -2338,10 +2418,43 @@ async fn prepare_idle_input_with_host(
     event: crate::InputEvent,
     cancellation: &CancellationToken,
     observer: &mut Observer<'_>,
+    control: Option<&SessionControl>,
 ) -> Result<Option<crate::InputEvent>> {
     let states = session.extension_states();
     let (sender, mut incoming) = mpsc::channel(32);
-    let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+    let host: Arc<dyn crate::ToolHost> =
+        Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+    if let Some(control) = control {
+        let host: Arc<dyn crate::ToolHost> = Arc::new(OwnerBoundHost {
+            inner: host,
+            owner_id: control.owner.id,
+        });
+        let (children, mut child_requests) = mpsc::unbounded_channel();
+        let scope = IdleInputScope {
+            owner: control.owner.clone(),
+            children,
+            host: host.clone(),
+            states: states.clone(),
+            cancellation: cancellation.clone(),
+            lifetime: CancellationToken::new(),
+            gate: Arc::new(Mutex::new(())),
+            depth: 0,
+        };
+        let future = IDLE_INPUT_SCOPE.scope(
+            scope.clone(),
+            registry.prepare_input_with_host(event, &states, host),
+        );
+        return pump_idle_callback(
+            session,
+            observer,
+            &mut incoming,
+            &mut child_requests,
+            &control.owner.closed,
+            &scope,
+            future,
+        )
+        .await;
+    }
     let future = registry.prepare_input_with_host(event, &states, host);
     tokio::pin!(future);
     loop {
@@ -9815,6 +9928,125 @@ mod tests {
         }
     }
 
+    struct NestedSessionHook(Arc<tokio::sync::Mutex<AgentSession>>);
+    #[async_trait::async_trait]
+    impl Extension for NestedSessionHook {
+        fn id(&self) -> &str {
+            "nested-session-hook"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input(
+            &self,
+            event: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            if event.text == "outer" {
+                self.0
+                    .lock()
+                    .await
+                    .prompt("inner")
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(crate::InputAction::Continue)
+        }
+    }
+    #[tokio::test]
+    async fn nested_session_prompt_host_messages_stay_with_their_owner() {
+        let other = Arc::new(tokio::sync::Mutex::new(
+            SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "session-b")
+                .extension(Arc::new(InputMessageHook))
+                .unwrap()
+                .in_memory()
+                .unwrap(),
+        ));
+        let session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "session-a")
+            .extension(Arc::new(NestedSessionHook(other.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            session.controls().steer("outer"),
+        )
+        .await
+        .expect("nested session deadlocked")
+        .unwrap();
+        assert!(
+            !session
+                .journal()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|record| matches!(&record.event,
+            crate::Event::CustomMessage { message } if message.custom_type == "input"))
+        );
+        let other = other.lock().await;
+        assert!(other.journal().unwrap().records().iter().any(|record| matches!(&record.event,
+            crate::Event::CustomMessage { message } if message.custom_type == "input" && message.content == crate::ContextContent::Text("idle hook".into()))));
+    }
+    #[tokio::test]
+    async fn initial_prompt_retained_host_expires_between_input_callbacks() {
+        let saved = Arc::new(Mutex::new(None));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let make_hook = |id, capture| {
+            Arc::new(RetainedHostHook {
+                id,
+                capture,
+                startup: false,
+                saved: saved.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            })
+        };
+        let mut session = SessionBuilder::new(Arc::new(EchoModel(AtomicUsize::new(0))), "fixture")
+            .extension(make_hook("host-a", true))
+            .unwrap()
+            .extension(make_hook("host-b", false))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(session.prompt("parent"), async {
+                entered.notified().await;
+                let stale = saved.lock().unwrap().clone().unwrap();
+                let late = tokio::spawn(async move {
+                    stale
+                        .send_message(
+                            crate::CustomMessage {
+                                custom_type: "late-host".into(),
+                                content: crate::ContextContent::Text("late".into()),
+                                display: false,
+                                details: None,
+                            },
+                            crate::CustomMessageDelivery::Steer,
+                        )
+                        .await
+                })
+                .await
+                .unwrap();
+                assert!(late.is_err());
+                release.notify_one();
+            })
+        })
+        .await
+        .expect("initial prompt host test deadlocked");
+        result.unwrap();
+        let journal = session.journal().unwrap();
+        let kinds: Vec<_> = journal
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                crate::Event::CustomMessage { message } => Some(message.custom_type.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, ["host-a", "host-b"]);
+    }
+
     struct PendingIdleInputHook(Arc<tokio::sync::Notify>);
     #[async_trait::async_trait]
     impl Extension for PendingIdleInputHook {
@@ -9872,7 +10104,8 @@ mod tests {
                     &mut session,
                     event,
                     &cancellation,
-                    &mut observer
+                    &mut observer,
+                    None,
                 ),
                 cancel
             )

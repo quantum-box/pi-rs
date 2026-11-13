@@ -2833,8 +2833,10 @@ Directly awaited control calls from an idle input callback use a bounded
 callback-scoped child lane. To await a control call in a spawned task, capture
 `SessionControl::scoped()` inside the callback and move the returned control
 into that task. Scoped controls and message hosts expire when their individual
-extension callback finishes; ordinary control clones used by independently
-spawned tasks enter the normal FIFO queue.
+extension callback finishes, including initial-prompt input hooks. Host scopes
+are bound to their session owner, so nested sessions cannot write to the
+caller’s journal. Ordinary control clones used by independently spawned tasks
+enter the normal FIFO queue.
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and

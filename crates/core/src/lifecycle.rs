@@ -434,27 +434,30 @@ async fn notify_inner(
     }) {
         let error = match tokio::time::timeout_at(
             deadline,
-            crate::sdk::scope_extension_callback(async {
-                match &host {
-                    Some(host) => {
-                        extension
-                            .lifecycle_with_host(
-                                &event,
-                                states.get(extension.id()),
-                                crate::sdk::scope_callback_host(
-                                    host.for_extension(extension.id())
-                                        .unwrap_or_else(|| host.clone()),
-                                ),
-                            )
-                            .await
+            crate::sdk::scope_extension_callback(
+                host.as_ref().and_then(|host| host.callback_scope_owner()),
+                async {
+                    match &host {
+                        Some(host) => {
+                            extension
+                                .lifecycle_with_host(
+                                    &event,
+                                    states.get(extension.id()),
+                                    crate::sdk::scope_callback_host(
+                                        host.for_extension(extension.id())
+                                            .unwrap_or_else(|| host.clone()),
+                                    ),
+                                )
+                                .await
+                        }
+                        None => {
+                            extension
+                                .lifecycle(&event, states.get(extension.id()))
+                                .await
+                        }
                     }
-                    None => {
-                        extension
-                            .lifecycle(&event, states.get(extension.id()))
-                            .await
-                    }
-                }
-            }),
+                },
+            ),
         )
         .await
         {

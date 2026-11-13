@@ -265,6 +265,11 @@ pub enum ToolExecution {
 /// Mediates nested tool calls through the same journal and policies as model calls.
 #[async_trait::async_trait]
 pub trait ToolHost: Send + Sync {
+    /// Opaque owner identity for callback-scoped session hosts.
+    #[doc(hidden)]
+    fn callback_scope_owner(&self) -> Option<uuid::Uuid> {
+        None
+    }
     fn tools(&self) -> Vec<ToolSpec>;
     fn supports_progress(&self) -> bool {
         false
@@ -2059,7 +2064,8 @@ async fn prepare_input_inner(
         .iter()
         .filter(|extension| extension.handles_input())
     {
-        let response = crate::sdk::scope_extension_callback(async {
+        let owner = host.as_ref().and_then(|host| host.callback_scope_owner());
+        let response = crate::sdk::scope_extension_callback(owner, async {
             match &host {
                 Some(host) => {
                     extension
