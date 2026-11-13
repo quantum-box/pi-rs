@@ -1,7 +1,8 @@
 use futures_util::stream;
 use pi_rs::*;
 use pi_rs_workbench::coding::{
-    BashOperations, CodingTools, ShellConfig, ShellSpawnContext, create_bash_tool,
+    BashOperations, CodingTools, ReadOperations, ShellConfig, ShellOutputStore, ShellSpawnContext,
+    create_bash_tool, create_bash_tool_with_shell_outputs, create_read_tool_with_shell_outputs,
 };
 use serde_json::json;
 use std::{
@@ -13,6 +14,205 @@ use std::{
 #[derive(Default)]
 struct Remote {
     calls: Mutex<Vec<(String, PathBuf)>>,
+}
+
+#[derive(Default)]
+struct EnvironmentCapture(
+    Mutex<Vec<std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>>>,
+);
+
+#[async_trait::async_trait]
+impl BashOperations for EnvironmentCapture {
+    async fn exec(
+        &self,
+        context: ShellSpawnContext,
+        _: Option<Duration>,
+        _: CancellationToken,
+        _: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>> {
+        self.0.lock().unwrap().push(context.env);
+        Ok(Some(0))
+    }
+}
+
+#[tokio::test]
+async fn remote_environment_is_opt_in_and_hook_can_supply_variables() {
+    let capture = Arc::new(EnvironmentCapture::default());
+    let context = || ToolContext {
+        operation_id: uuid::Uuid::new_v4(),
+        cancellation: CancellationToken::new(),
+    };
+    let hook = Arc::new(|mut context: ShellSpawnContext| {
+        context
+            .env
+            .insert("EXPLICIT_REMOTE_VALUE".into(), "allowed".into());
+        Ok(context)
+    });
+    let tool = create_bash_tool(
+        Path::new("/remote"),
+        ShellConfig::default().with_spawn_hook(hook),
+        capture.clone(),
+    )
+    .unwrap();
+    tool.invoke(json!({"command":"test"}), context()).await;
+    let tool = create_bash_tool(
+        Path::new("/remote"),
+        ShellConfig::default().with_remote_environment(true),
+        capture.clone(),
+    )
+    .unwrap();
+    tool.invoke(json!({"command":"test"}), context()).await;
+    let captured = capture.0.lock().unwrap();
+    assert_eq!(captured[0].len(), 1);
+    assert_eq!(
+        captured[0]
+            .get(std::ffi::OsStr::new("EXPLICIT_REMOTE_VALUE"))
+            .unwrap(),
+        "allowed"
+    );
+    if std::env::var_os("PATH").is_some() {
+        assert!(captured[1].contains_key(std::ffi::OsStr::new("PATH")));
+    }
+}
+
+struct DenyRead;
+#[async_trait::async_trait]
+impl ReadOperations for DenyRead {
+    async fn access(&self, _: &Path) -> Result<()> {
+        Err(Error::Config("remote access denied".into()))
+    }
+    async fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
+        unreachable!()
+    }
+}
+
+struct Lines;
+#[async_trait::async_trait]
+impl BashOperations for Lines {
+    async fn exec(
+        &self,
+        _: ShellSpawnContext,
+        _: Option<Duration>,
+        _: CancellationToken,
+        out: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>> {
+        out.send("hello\n".repeat(11_000).into_bytes())
+            .await
+            .unwrap();
+        Ok(Some(0))
+    }
+}
+
+#[tokio::test]
+async fn paired_remote_read_can_page_only_its_shell_transcripts() {
+    let store = ShellOutputStore::default();
+    let bash = create_bash_tool_with_shell_outputs(
+        Path::new("/remote"),
+        ShellConfig::default(),
+        Arc::new(Lines),
+        store.clone(),
+    )
+    .unwrap();
+    let read = create_read_tool_with_shell_outputs(Path::new("/remote"), Arc::new(DenyRead), store)
+        .unwrap();
+    let unrelated = create_read_tool_with_shell_outputs(
+        Path::new("/remote"),
+        Arc::new(DenyRead),
+        ShellOutputStore::default(),
+    )
+    .unwrap();
+    let context = || ToolContext {
+        operation_id: uuid::Uuid::new_v4(),
+        cancellation: CancellationToken::new(),
+    };
+    let result = bash.invoke(json!({"command":"large"}), context()).await;
+    let path = match result {
+        Outcome::SucceededWithDetails { details, .. } => {
+            details["fullOutputPath"].as_str().unwrap().to_owned()
+        }
+        other => panic!("unexpected result: {other:?}"),
+    };
+    let page = read
+        .invoke(json!({"path":path, "offset":2, "limit":1}), context())
+        .await;
+    assert!(matches!(page, Outcome::Succeeded(text) if text.starts_with("hello\n")));
+    let denied = unrelated.invoke(json!({"path":path}), context()).await;
+    assert!(matches!(denied, Outcome::Failed(text) if text.contains("remote access denied")));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn coding_tools_share_transcripts_between_injected_backends() {
+    let root = tempfile::tempdir().unwrap();
+    let tools = CodingTools::local(root.path())
+        .unwrap()
+        .with_bash_operations(Arc::new(Lines))
+        .unwrap()
+        .with_read_operations(Arc::new(DenyRead))
+        .unwrap()
+        .tools();
+    let bash = tools
+        .iter()
+        .find(|tool| tool.spec().name == "bash")
+        .unwrap();
+    let read = tools
+        .iter()
+        .find(|tool| tool.spec().name == "read")
+        .unwrap();
+    let context = || ToolContext {
+        operation_id: uuid::Uuid::new_v4(),
+        cancellation: CancellationToken::new(),
+    };
+    let result = bash.invoke(json!({"command":"large"}), context()).await;
+    let path = match result {
+        Outcome::SucceededWithDetails { details, .. } => {
+            details["fullOutputPath"].as_str().unwrap().to_owned()
+        }
+        other => panic!("unexpected result: {other:?}"),
+    };
+    let page = read
+        .invoke(json!({"path":path, "offset":2, "limit":1}), context())
+        .await;
+    assert!(matches!(page, Outcome::Succeeded(text) if text.starts_with("hello\n")));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_after_shell_exit_kills_descendant_during_pipe_drain() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("must-not-exist");
+    let ready = root.path().join("ready");
+    let bash = create_bash_tool(
+        root.path(),
+        ShellConfig::default(),
+        pi_rs_workbench::coding::create_local_bash_operations(None),
+    )
+    .unwrap();
+    let token = CancellationToken::new();
+    let task_token = token.clone();
+    let task = tokio::spawn(async move {
+        bash.invoke(
+            json!({"command":"echo ready > ready; (sleep 0.8; touch must-not-exist) &"}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: task_token,
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    token.cancel();
+    task.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(!marker.exists(), "cancelled descendant continued running");
 }
 #[async_trait::async_trait]
 impl BashOperations for Remote {

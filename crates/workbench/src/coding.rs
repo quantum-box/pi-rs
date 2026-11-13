@@ -20,6 +20,11 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ORIGINAL_IMAGE_BYTES: usize = 6 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 
+/// Capability set for reading host-side transcripts produced by paired shell tools.
+/// Share this only between tools belonging to the same host/session.
+#[derive(Clone, Default)]
+pub struct ShellOutputStore(Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>);
+
 pub struct CodingTools {
     root: PathBuf,
     unrestricted: bool,
@@ -32,6 +37,7 @@ pub struct CodingTools {
     bash_operations: Option<Arc<dyn BashOperations>>,
     edit_operations: Option<Arc<dyn EditOperations>>,
     edit_options: EditToolOptions,
+    shell_outputs: ShellOutputStore,
 }
 
 impl CodingTools {
@@ -52,6 +58,7 @@ impl CodingTools {
             bash_operations: None,
             edit_operations: None,
             edit_options: EditToolOptions::default(),
+            shell_outputs: ShellOutputStore::default(),
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -458,6 +465,7 @@ impl Extension for CodingTools {
                     Arc::new(RemoteReadTool {
                         tool,
                         operations: operations.clone(),
+                        shell_outputs: self.shell_outputs.clone(),
                     }) as Arc<dyn Tool>
                 } else if matches!(kind, Kind::Write)
                     && let Some(operations) = &self.write_operations
@@ -480,6 +488,7 @@ impl Extension for CodingTools {
                     Arc::new(RemoteShellTool {
                         tool,
                         operations: operations.clone(),
+                        shell_outputs: self.shell_outputs.clone(),
                     }) as Arc<dyn Tool>
                 } else {
                     Arc::new(tool) as Arc<dyn Tool>
@@ -577,6 +586,15 @@ impl ReadOperations for LocalReadOperations {
 /// Construct a model-facing read tool backed by custom operations. This factory
 /// uses Pi's unrestricted path semantics; the backend owns access enforcement.
 pub fn create_read_tool(root: &Path, operations: Arc<dyn ReadOperations>) -> Result<Arc<dyn Tool>> {
+    create_read_tool_with_shell_outputs(root, operations, ShellOutputStore::default())
+}
+
+/// Construct a read tool with access to transcripts from shell tools sharing `outputs`.
+pub fn create_read_tool_with_shell_outputs(
+    root: &Path,
+    operations: Arc<dyn ReadOperations>,
+    outputs: ShellOutputStore,
+) -> Result<Arc<dyn Tool>> {
     if !root.is_absolute() {
         return Err(Error::Config(
             "remote working directory must be absolute".into(),
@@ -594,12 +612,14 @@ pub fn create_read_tool(root: &Path, operations: Arc<dyn ReadOperations>) -> Res
             },
         },
         operations,
+        shell_outputs: outputs,
     }))
 }
 
 struct RemoteReadTool {
     tool: CodingTool,
     operations: Arc<dyn ReadOperations>,
+    shell_outputs: ShellOutputStore,
 }
 
 // A blocking read cannot be interrupted in progress, but no further backend
@@ -649,6 +669,26 @@ impl Tool for RemoteReadTool {
             let name = string(&args, "path")?.to_owned();
             let input = crate::coding_paths::normalize(&name)?;
             let requested = crate::coding_paths::resolve(&self.tool.root, &input);
+            let transcript = self
+                .shell_outputs
+                .0
+                .lock()
+                .map_err(|_| Error::Config("shell output store poisoned".into()))?
+                .contains(&requested);
+            if transcript {
+                let token = cancellation.clone();
+                let offset =
+                    usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1))
+                        .unwrap_or(usize::MAX);
+                let limit = args["limit"]
+                    .as_u64()
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+                return tokio::task::spawn_blocking(move || {
+                    crate::text_page::read(&requested, &name, offset, limit, &token)
+                })
+                .await
+                .map_err(|error| Error::Config(error.to_string()))?;
+            }
             let mut candidates = crate::coding_paths::read_candidates(&requested).into_iter();
             let mut path = candidates.next().expect("exact candidate");
             loop {
@@ -1325,6 +1365,10 @@ fn edit_success(display_path: &str, original: &str, output: &str, count: usize) 
 /// or the returned future is dropped. Output must be sent before returning.
 #[async_trait::async_trait]
 pub trait BashOperations: Send + Sync {
+    /// Local adapters may opt into the host environment; remote adapters default to an empty one.
+    fn is_local(&self) -> bool {
+        false
+    }
     async fn exec(
         &self,
         context: ShellSpawnContext,
@@ -1349,6 +1393,9 @@ struct LocalBashOperations {
 
 #[async_trait::async_trait]
 impl BashOperations for LocalBashOperations {
+    fn is_local(&self) -> bool {
+        true
+    }
     async fn exec(
         &self,
         context: ShellSpawnContext,
@@ -1408,7 +1455,7 @@ impl BashOperations for LocalBashOperations {
                 _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
                 _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
                 result = process.wait(), if status.is_none() => {
-                    status = Some(result?); process.finished = true;
+                    status = Some(result?);
                     drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
                 },
                 count = stdout.read(&mut stdout_buffer), if stdout_open => {
@@ -1439,6 +1486,7 @@ impl BashOperations for LocalBashOperations {
         if let Some(task) = input_task {
             task.abort();
         }
+        process.finished = true;
         Ok(Some(exit_code(status.expect("shell status observed"))))
     }
 }
@@ -1449,6 +1497,16 @@ pub fn create_bash_tool(
     root: &Path,
     shell: ShellConfig,
     operations: Arc<dyn BashOperations>,
+) -> Result<Arc<dyn Tool>> {
+    create_bash_tool_with_shell_outputs(root, shell, operations, ShellOutputStore::default())
+}
+
+/// Construct a shell tool whose transcripts are available to paired read tools.
+pub fn create_bash_tool_with_shell_outputs(
+    root: &Path,
+    shell: ShellConfig,
+    operations: Arc<dyn BashOperations>,
+    outputs: ShellOutputStore,
 ) -> Result<Arc<dyn Tool>> {
     if !root.is_absolute() {
         return Err(Error::Config(
@@ -1463,12 +1521,14 @@ pub fn create_bash_tool(
             kind: Kind::Bash,
         },
         operations,
+        shell_outputs: outputs,
     }))
 }
 
 struct RemoteShellTool {
     tool: CodingTool,
     operations: Arc<dyn BashOperations>,
+    shell_outputs: ShellOutputStore,
 }
 struct RemoteShellResult {
     output: crate::shell_output::Output,
@@ -1488,10 +1548,13 @@ impl RemoteShellTool {
         }
         let started = std::time::Instant::now();
         let timeout = shell_timeout(args)?;
-        let context =
-            self.tool
-                .shell
-                .spawn_context(&self.tool.root, true, string(args, "command")?, true)?;
+        let context = self.tool.shell.spawn_context(
+            &self.tool.root,
+            true,
+            string(args, "command")?,
+            true,
+            self.operations.is_local(),
+        )?;
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let child = cancellation.child_token();
         let _guard = child.clone().drop_guard();
@@ -1517,21 +1580,23 @@ impl RemoteShellTool {
             }
         };
         tokio::pin!(deadline);
-        let operation = self
-            .operations
-            .exec(context, timeout, child.clone(), sender);
-        tokio::pin!(operation);
-        let mut open = true;
-        let (code, cancelled, timed_out) = loop {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => { child.cancel(); break (Ok(None), true, false); }
-                _ = &mut deadline => { child.cancel(); break (Ok(None), true, true); }
-                chunk = receiver.recv(), if open => match chunk {
-                    Some(chunk) => { output.append(&chunk)?; if let Some((sender, _)) = &progress { let _ = sender.send_replace(Some(output.partial_result())); } },
-                    None => open = false,
-                },
-                result = &mut operation => { break (result, false, false); }
+        let (code, cancelled, timed_out) = {
+            let operation = self
+                .operations
+                .exec(context, timeout, child.clone(), sender);
+            tokio::pin!(operation);
+            let mut open = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => { child.cancel(); break (Ok(None), true, false); }
+                    _ = &mut deadline => { child.cancel(); break (Ok(None), true, true); }
+                    chunk = receiver.recv(), if open => match chunk {
+                        Some(chunk) => { output.append(&chunk)?; if let Some((sender, _)) = &progress { let _ = sender.send_replace(Some(output.partial_result())); } },
+                        None => open = false,
+                    },
+                    result = &mut operation => { break (result, false, false); }
+                }
             }
         };
         while let Ok(chunk) = receiver.try_recv() {
@@ -1550,6 +1615,13 @@ impl RemoteShellTool {
             }
         }
         let output = output.finish()?;
+        if let Some(path) = &output.path {
+            self.shell_outputs
+                .0
+                .lock()
+                .map_err(|_| Error::Config("shell output store poisoned".into()))?
+                .insert(path.clone());
+        }
         if timed_out {
             return Err(Error::Config(shell_status(
                 &output.display,

@@ -525,14 +525,24 @@ enforce its own access policy, and scoped profiles reject custom operations.
 Native hosts can supply streaming `BashOperations` with
 `CodingTools::local(...).with_bash_operations(...)` or create an independent
 model-facing bash tool with `create_bash_tool`. The configured command prefix,
-spawn hook, working directory, session environment, timeout and cancellation
-reach the backend. Model output, progress, truncation, timeout handling and
+spawn hook, working directory, timeout and cancellation reach the backend.
+Injected remote backends receive an empty environment by default; the spawn hook
+can add selected values, or `ShellConfig::with_remote_environment(true)` opts
+into host environment and session metadata inheritance. The built-in local adapter
+continues to inherit the local environment. Model output, progress, truncation, timeout handling and
 programmatic output remain host-owned. Backends enforce their own access policy
 and must stop work when cancelled or dropped. Scoped `CodingTools::new` rejects
 custom operations. User-shell extension operations remain separate.
 
 `create_local_bash_operations` exposes the local execution backend for hosts
 that wrap shell operations. Backend injection and factories for grep, find and ls are still incomplete.
+
+When both operations are installed on one `CodingTools`, its read tool can page
+the host-side full-output transcripts produced by its shell tool. Independent
+factories can share a session-scoped `ShellOutputStore` via
+`create_bash_tool_with_shell_outputs` and `create_read_tool_with_shell_outputs`.
+Only paths produced by that store bypass the read backend; do not share a store
+across trust boundaries. The transcript path is not a file on the remote machine.
 
 ### Image and file-tool checkpoint
 

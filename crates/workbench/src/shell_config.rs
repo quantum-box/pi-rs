@@ -22,6 +22,7 @@ pub struct ShellConfig {
     session: Arc<RwLock<Option<ShellContext>>>,
     expose_session_environment: bool,
     spawn_hook: Option<Arc<ShellSpawnHook>>,
+    inherit_remote_environment: bool,
 }
 
 /// Inputs a model-invoked shell tool passes to its execution backend.
@@ -41,6 +42,7 @@ impl Default for ShellConfig {
             session: Arc::default(),
             expose_session_environment: true,
             spawn_hook: None,
+            inherit_remote_environment: false,
         }
     }
 }
@@ -84,6 +86,12 @@ impl ShellConfig {
         self
     }
 
+    /// Opt in to passing the host environment to an injected shell backend.
+    pub fn with_remote_environment(mut self, inherit: bool) -> Self {
+        self.inherit_remote_environment = inherit;
+        self
+    }
+
     pub(super) fn command_with_prefix(&self, script: &str) -> String {
         self.prefix
             .as_ref()
@@ -102,7 +110,7 @@ impl ShellConfig {
         script: &str,
         model_tool: bool,
     ) -> Result<Launch> {
-        let context = self.spawn_context(root, local, script, model_tool)?;
+        let context = self.spawn_context(root, local, script, model_tool, true)?;
         let script = context.command;
         let mut launch = if powershell {
             let executable = powershell_executable();
@@ -145,35 +153,43 @@ impl ShellConfig {
         local: bool,
         script: &str,
         model_tool: bool,
+        local_backend: bool,
     ) -> Result<ShellSpawnContext> {
         let mut context = ShellSpawnContext {
             command: self.command_with_prefix(script),
             cwd: root.to_path_buf(),
-            env: std::env::vars_os().collect(),
-        };
-        let path_key = context
-            .env
-            .keys()
-            .find(|key| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
-            .cloned()
-            .unwrap_or_else(|| "PATH".into());
-        let path = context.env.get(&path_key).cloned().unwrap_or_default();
-        let bin = crate::agent_dir().join("bin");
-        let paths: Vec<_> = std::env::split_paths(&path).collect();
-        if !paths.contains(&bin) {
-            let path = if path.is_empty() {
-                bin.into_os_string()
+            env: if local_backend || self.inherit_remote_environment {
+                std::env::vars_os().collect()
             } else {
-                std::env::join_paths(std::iter::once(bin).chain(paths))
-                    .map_err(|error| Error::Config(format!("invalid shell PATH: {error}")))?
-            };
-            context.env.insert(path_key, path);
+                BTreeMap::new()
+            },
+        };
+        if local_backend || self.inherit_remote_environment {
+            let path_key = context
+                .env
+                .keys()
+                .find(|key| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
+                .cloned()
+                .unwrap_or_else(|| "PATH".into());
+            let path = context.env.get(&path_key).cloned().unwrap_or_default();
+            let bin = crate::agent_dir().join("bin");
+            let paths: Vec<_> = std::env::split_paths(&path).collect();
+            if !paths.contains(&bin) {
+                let path = if path.is_empty() {
+                    bin.into_os_string()
+                } else {
+                    std::env::join_paths(std::iter::once(bin).chain(paths))
+                        .map_err(|error| Error::Config(format!("invalid shell PATH: {error}")))?
+                };
+                context.env.insert(path_key, path);
+            }
         }
         if model_tool {
             for name in SESSION_ENVIRONMENT {
                 context.env.remove(&OsString::from(name));
             }
             if local
+                && (local_backend || self.inherit_remote_environment)
                 && self.expose_session_environment
                 && let Some(session) = &*self.session.read().expect("shell session context")
             {
