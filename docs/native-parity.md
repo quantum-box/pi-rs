@@ -2926,6 +2926,11 @@ checked with a five-minute floor, even when a shorter minimum was requested.
 The rotated credential is saved before that check. The default
 check output contains only status and metadata.
 
+pi-rs does not automatically remove stale `auth.json.lock` directories:
+Pi's lock implementation does not coordinate stale recovery with a second
+lock, so removal could delete a replacement holder's directory. Pi may
+recover a stale lock, or it can be removed after confirming no holder is active.
+
 Loopback checks covered expired and refreshed Radius credentials,
 model-specific key selection, OpenRouter's OAuth key type, and invalid
 configuration.

@@ -9,7 +9,6 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 const WAIT: Duration = Duration::from_secs(30);
-const STALE: Duration = Duration::from_secs(30);
 
 #[cfg(unix)]
 type Identity = std::fs::Metadata;
@@ -151,17 +150,11 @@ fn try_lock(path: &Path) -> Result<Option<Guard>> {
                 thread: Some(thread),
             }))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if std::fs::metadata(&lock_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|time| time.elapsed().ok())
-                .is_some_and(|age| age > STALE)
-            {
-                let _ = std::fs::remove_dir(&lock_path);
-            }
-            Ok(None)
-        }
+        // Pi's proper-lockfile does not coordinate stale-lock reclamation
+        // through a second lock. Checking identity and then removing by path
+        // can therefore remove a replacement Pi already acquired. Leave stale
+        // locks in place instead of risking overlapping token rotations.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
@@ -198,6 +191,47 @@ pub(super) async fn acquire_async(path: &Path) -> Result<Guard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_lock_is_never_reclaimed_or_allowed_to_replace_a_live_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let lock = dir.path().join("auth.json.lock");
+        std::fs::create_dir(&lock).unwrap();
+        filetime::set_file_mtime(
+            &lock,
+            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(120)),
+        )
+        .unwrap();
+        {
+            let stale = identity(&lock).unwrap();
+            let waiters: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    std::thread::spawn(move || assert!(try_lock(&path).unwrap().is_none()))
+                })
+                .collect();
+            for waiter in waiters {
+                waiter.join().unwrap();
+            }
+            assert!(owns(&lock, &stale), "stale directory was removed");
+        }
+
+        // Simulate Pi reclaiming the stale directory and holding a fresh one.
+        std::fs::remove_dir(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let live = identity(&lock).unwrap();
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || assert!(try_lock(&path).unwrap().is_none()))
+            })
+            .collect();
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
+        assert!(owns(&lock, &live), "a live replacement was removed");
+    }
 
     #[test]
     fn lock_excludes_other_holders_and_preserves_replacement() {
@@ -291,6 +325,25 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         assert_eq!(line.trim(), "locked");
+        assert!(try_lock(&path).unwrap().is_none());
+        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(try_lock(&path).unwrap().is_some());
+
+        let lock = dir.path().join("auth.json.lock");
+        std::fs::create_dir(&lock).unwrap();
+        filetime::set_file_mtime(
+            &lock,
+            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(120)),
+        )
+        .unwrap();
+        assert!(try_lock(&path).unwrap().is_none());
+        let mut child = Command::new("node").arg("-e").arg("const release = require(process.argv[1]).lockSync(process.argv[2], {realpath:false, stale:30000}); console.log('recovered'); process.stdin.once('data', () => { release(); process.exit(0); });").arg(&module).arg(&path).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "recovered");
         assert!(try_lock(&path).unwrap().is_none());
         child.stdin.take().unwrap().write_all(b"release\n").unwrap();
         assert!(child.wait().unwrap().success());
