@@ -220,3 +220,44 @@ async fn cancelling_find_drops_inflight_backend_operation() {
     assert!(matches!(task.await.unwrap(),Outcome::Failed(text) if text.contains("aborted")));
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
+
+#[tokio::test]
+async fn tilde_uses_configured_remote_home_not_host_home() {
+    use pi_rs_remote_find::{FindToolOptions, create_find_tool_with_options};
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("backend-home");
+    let backend = Arc::new(Backend::default());
+    let tool = create_find_tool_with_options(
+        root.path(),
+        backend.clone(),
+        FindToolOptions {
+            remote_home: Some(home.clone()),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        tool.invoke(
+            json!({"pattern":"*.rs", "path":"~/project", "limit":2}),
+            context()
+        )
+        .await,
+        Outcome::SucceededWithDetails { .. }
+    ));
+    assert_eq!(backend.calls.lock().unwrap()[0].cwd, home.join("project"));
+    let tool = create_find_tool(root.path(), backend.clone()).unwrap();
+    let before = backend.calls.lock().unwrap().len();
+    assert!(
+        matches!(tool.invoke(json!({"pattern":"*.rs", "path":"~"}), context()).await, Outcome::Failed(text) if text.contains("remote home directory is not configured"))
+    );
+    assert_eq!(backend.calls.lock().unwrap().len(), before);
+    assert!(
+        create_find_tool_with_options(
+            root.path(),
+            backend,
+            FindToolOptions {
+                remote_home: Some(PathBuf::from("relative"))
+            }
+        )
+        .is_err()
+    );
+}

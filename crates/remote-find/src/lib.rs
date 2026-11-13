@@ -23,16 +23,42 @@ pub trait FindOperations: Send + Sync {
     async fn glob(&self, pattern: &str, cwd: &Path, options: FindOptions) -> Result<Vec<PathBuf>>;
 }
 
-/// Construct an unrestricted model-facing find tool with an absolute backend cwd.
+/// Configuration for remote path resolution.
+#[derive(Clone, Debug, Default)]
+pub struct FindToolOptions {
+    /// Absolute home directory on the backend. Required to expand `~`.
+    pub remote_home: Option<PathBuf>,
+}
+
+/// Construct an unrestricted find tool. `~` requires an explicitly configured home.
 pub fn create_find_tool(root: &Path, operations: Arc<dyn FindOperations>) -> Result<Arc<dyn Tool>> {
+    create_find_tool_with_options(root, operations, FindToolOptions::default())
+}
+
+/// Construct an unrestricted find tool with backend path configuration.
+pub fn create_find_tool_with_options(
+    root: &Path,
+    operations: Arc<dyn FindOperations>,
+    options: FindToolOptions,
+) -> Result<Arc<dyn Tool>> {
     if !root.is_absolute() {
         return Err(Error::Config(
             "remote working directory must be absolute".into(),
         ));
     }
+    if options
+        .remote_home
+        .as_ref()
+        .is_some_and(|home| !home.is_absolute())
+    {
+        return Err(Error::Config(
+            "remote home directory must be absolute".into(),
+        ));
+    }
     Ok(Arc::new(RemoteFind {
         root: resolve(root, Path::new(".")),
         operations,
+        options,
     }))
 }
 
@@ -42,11 +68,19 @@ pub struct FindExtension {
 }
 impl FindExtension {
     pub fn new(root: &Path, operations: Arc<dyn FindOperations>) -> Result<Self> {
+        Self::with_options(root, operations, FindToolOptions::default())
+    }
+    pub fn with_options(
+        root: &Path,
+        operations: Arc<dyn FindOperations>,
+        options: FindToolOptions,
+    ) -> Result<Self> {
         Ok(Self {
-            tool: create_find_tool(root, operations)?,
+            tool: create_find_tool_with_options(root, operations, options)?,
         })
     }
 }
+
 impl Extension for FindExtension {
     fn id(&self) -> &str {
         "remote-find"
@@ -58,9 +92,10 @@ impl Extension for FindExtension {
 struct RemoteFind {
     root: PathBuf,
     operations: Arc<dyn FindOperations>,
+    options: FindToolOptions,
 }
 
-fn normalize(value: &str) -> Result<PathBuf> {
+fn normalize(value: &str, remote_home: Option<&Path>) -> Result<PathBuf> {
     let value: String = value
         .chars()
         .map(|ch| match ch {
@@ -74,16 +109,12 @@ fn normalize(value: &str) -> Result<PathBuf> {
     #[cfg(windows)]
     let value = windows_value.as_str();
     if value == "~" || value.starts_with("~/") || (cfg!(windows) && value.starts_with("~\\")) {
-        let home = if cfg!(windows) {
-            std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-        } else {
-            std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-        }
-        .ok_or_else(|| Error::Config("home directory is unavailable".into()))?;
+        let home = remote_home
+            .ok_or_else(|| Error::Config("remote home directory is not configured".into()))?;
         return Ok(if value == "~" {
-            PathBuf::from(home)
+            home.to_owned()
         } else {
-            PathBuf::from(home).join(&value[2..])
+            home.join(&value[2..])
         });
     }
     if value.starts_with("file://") {
@@ -362,7 +393,10 @@ impl Tool for RemoteFind {
                         Error::Config("limit must be an integer between 1 and 100000".into())
                     })? as usize,
             };
-            let path = resolve(&self.root, &normalize(requested)?);
+            let path = resolve(
+                &self.root,
+                &normalize(requested, self.options.remote_home.as_deref())?,
+            );
             if !self.operations.exists(&path).await? {
                 return Err(Error::Config(format!("Path not found: {}", path.display())));
             }
