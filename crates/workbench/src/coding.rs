@@ -30,6 +30,7 @@ pub struct CodingTools {
     read_operations: Option<Arc<dyn ReadOperations>>,
     write_operations: Option<Arc<dyn WriteOperations>>,
     edit_operations: Option<Arc<dyn EditOperations>>,
+    edit_options: EditToolOptions,
 }
 
 impl CodingTools {
@@ -48,6 +49,7 @@ impl CodingTools {
             read_operations: None,
             write_operations: None,
             edit_operations: None,
+            edit_options: EditToolOptions::default(),
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -90,6 +92,12 @@ impl CodingTools {
         }
         self.edit_operations = Some(operations);
         Ok(self)
+    }
+
+    /// Configure injected edits, including the opt-in non-atomic compatibility fallback.
+    pub fn with_edit_options(mut self, options: EditToolOptions) -> Self {
+        self.edit_options = options;
+        self
     }
 
     pub fn with_shell_config(mut self, shell: ShellConfig) -> Self {
@@ -450,6 +458,7 @@ impl Extension for CodingTools {
                     Arc::new(RemoteEditTool {
                         tool,
                         operations: operations.clone(),
+                        options: self.edit_options,
                     }) as Arc<dyn Tool>
                 } else {
                     Arc::new(tool) as Arc<dyn Tool>
@@ -1103,8 +1112,25 @@ impl EditOperations for LocalEditOperations {
     }
 }
 
-/// Construct an unrestricted edit tool backed by host-supplied operations.
+/// Controls whether an injected edit may use a non-atomic compatibility fallback.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EditToolOptions {
+    /// Explicitly allow reread-then-write when the backend lacks compare-and-replace.
+    /// External writers can still race between that reread and the write.
+    pub allow_non_atomic_fallback: bool,
+}
+
+/// Construct an unrestricted edit tool requiring atomic backend comparison.
 pub fn create_edit_tool(root: &Path, operations: Arc<dyn EditOperations>) -> Result<Arc<dyn Tool>> {
+    create_edit_tool_with_options(root, operations, EditToolOptions::default())
+}
+
+/// Construct an edit tool with explicit compatibility options.
+pub fn create_edit_tool_with_options(
+    root: &Path,
+    operations: Arc<dyn EditOperations>,
+    options: EditToolOptions,
+) -> Result<Arc<dyn Tool>> {
     if !root.is_absolute() {
         return Err(Error::Config(
             "remote working directory must be absolute".into(),
@@ -1118,11 +1144,13 @@ pub fn create_edit_tool(root: &Path, operations: Arc<dyn EditOperations>) -> Res
             kind: Kind::Edit,
         },
         operations,
+        options,
     }))
 }
 struct RemoteEditTool {
     tool: CodingTool,
     operations: Arc<dyn EditOperations>,
+    options: EditToolOptions,
 }
 #[async_trait::async_trait]
 impl Tool for RemoteEditTool {
@@ -1148,6 +1176,7 @@ impl Tool for RemoteEditTool {
             let cancellation = context.cancellation.child_token();
             let _guard = cancellation.clone().drop_guard();
             let operations = self.operations.clone();
+            let options = self.options;
             let worker = tokio::spawn(async move {
                 let local = operations.uses_local_filesystem();
                 check_mutation_cancelled(&cancellation)?;
@@ -1210,6 +1239,9 @@ impl Tool for RemoteEditTool {
                         ));
                     }
                     ConditionalEdit::Unsupported => {
+                        if !options.allow_non_atomic_fallback {
+                            return Err(Error::Config("backend does not support atomic conditional edit; enable non-atomic fallback explicitly to use reread-then-write".into()));
+                        }
                         let current = operations.read_file(path).await?;
                         check_mutation_cancelled(&cancellation)?;
                         if current != original.as_bytes() {
@@ -1241,8 +1273,8 @@ impl Tool for RemoteEditTool {
 }
 
 fn edit_success(display_path: &str, original: &str, output: &str, count: usize) -> Outcome {
-    let original = crate::text_edit::normalized_content(&original);
-    let edited = crate::text_edit::normalized_content(&output);
+    let original = crate::text_edit::normalized_content(original);
+    let edited = crate::text_edit::normalized_content(output);
     let diff = similar::TextDiff::from_lines(&original, &edited);
     let first_changed_line = diff
         .ops()
@@ -2794,7 +2826,14 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             *LOCAL_LOCK_RESOLVED.lock().unwrap() = Some((alias.clone(), tx));
             let tool = if edit {
-                create_edit_tool(&root, Arc::new(LocalEditOperations)).unwrap()
+                create_edit_tool_with_options(
+                    &root,
+                    Arc::new(LocalEditOperations),
+                    EditToolOptions {
+                        allow_non_atomic_fallback: true,
+                    },
+                )
+                .unwrap()
             } else {
                 create_write_tool(&root, Arc::new(LocalWriteOperations)).unwrap()
             };

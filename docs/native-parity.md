@@ -505,10 +505,13 @@ Hosts can inject `EditOperations` using `with_edit_operations` or construct an
 unrestricted model-facing tool using `create_edit_tool`. The backend provides
 access, file bytes and writes; matching, validation, diffs and cancellation
 checks remain host-owned. Backend reads return the whole file in memory. An
-optional backend compare-and-replace operation can atomically reject an external
-change; when unsupported, the host rereads before writing, leaving a race with
-outside writers between that check and the write. Local edits use atomic file
-replacement and preserve permissions, but do not provide atomic comparison.
+backend compare-and-replace operation can atomically reject an external change.
+Injected edits require this capability by default. Hosts can explicitly enable
+`allow_non_atomic_fallback` for Pi-compatible reread-then-write behavior; that
+fallback leaves a race with outside writers between the check and write. The
+injected local edit adapter requires this opt-in: it uses atomic file replacement
+and preserves permissions, but cannot provide atomic comparison. The default
+built-in local edit retains its existing behavior.
 Local adapters bind operations to the canonical target used for their shared
 filesystem lock, so retargeting the original symlink while waiting cannot redirect
 the mutation. Remote edits and writes share a lock only when both trait objects use the same

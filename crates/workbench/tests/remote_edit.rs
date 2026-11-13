@@ -1,7 +1,8 @@
 use futures_util::stream;
 use pi_rs::*;
 use pi_rs_workbench::coding::{
-    CodingTools, EditOperations, WriteOperations, create_edit_tool, create_write_tool,
+    CodingTools, EditOperations, EditToolOptions, WriteOperations, create_edit_tool,
+    create_edit_tool_with_options, create_write_tool,
 };
 use serde_json::json;
 use std::{
@@ -59,6 +60,15 @@ impl WriteOperations for Store {
         Ok(())
     }
 }
+fn compatible_tool(root: &Path, operations: Arc<dyn EditOperations>) -> Result<Arc<dyn Tool>> {
+    create_edit_tool_with_options(
+        root,
+        operations,
+        EditToolOptions {
+            allow_non_atomic_fallback: true,
+        },
+    )
+}
 fn context(token: CancellationToken) -> ToolContext {
     ToolContext {
         operation_id: uuid::Uuid::new_v4(),
@@ -114,7 +124,10 @@ async fn model_edit_uses_backend_legacy_preparation_and_validation() {
     let extension = CodingTools::local(root.path())
         .unwrap()
         .with_edit_operations(store.clone())
-        .unwrap();
+        .unwrap()
+        .with_edit_options(EditToolOptions {
+            allow_non_atomic_fallback: true,
+        });
     let mut registry = Registry::default();
     registry.register(Arc::new(extension)).unwrap();
     let model = Script(Mutex::new(Vec::new()));
@@ -169,7 +182,7 @@ async fn model_edit_uses_backend_legacy_preparation_and_validation() {
 async fn edit_preserves_bom_and_endings_and_reports_diff() {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::new("\u{feff}one\r\nthree\r\n", false));
-    let tool = create_edit_tool(root.path(), store.clone()).unwrap();
+    let tool = compatible_tool(root.path(), store.clone()).unwrap();
     let result = tool
         .invoke(
             json!({"path":"file","edits":[{"oldText":"one","newText":"two"}]}),
@@ -186,7 +199,7 @@ async fn remote_write_and_edit_on_same_backend_share_lock() {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::new("old", true));
     let write = create_write_tool(root.path(), store.clone()).unwrap();
-    let edit = create_edit_tool(root.path(), store.clone()).unwrap();
+    let edit = compatible_tool(root.path(), store.clone()).unwrap();
     let first = tokio::spawn(async move {
         write
             .invoke(
@@ -246,7 +259,7 @@ async fn cancellation_during_read_prevents_mutation_after_read_settles() {
         release: tokio::sync::Notify::new(),
         writes: std::sync::atomic::AtomicUsize::new(0),
     });
-    let tool = create_edit_tool(root.path(), store.clone()).unwrap();
+    let tool = compatible_tool(root.path(), store.clone()).unwrap();
     let token = CancellationToken::new();
     let t = token.clone();
     let task = tokio::spawn(async move {
@@ -293,7 +306,7 @@ async fn edit_refuses_to_overwrite_changed_backend_content() {
         reads: std::sync::atomic::AtomicUsize::new(0),
         writes: std::sync::atomic::AtomicUsize::new(0),
     });
-    let tool = create_edit_tool(root.path(), backend.clone()).unwrap();
+    let tool = compatible_tool(root.path(), backend.clone()).unwrap();
     let result = tool
         .invoke(
             json!({"path":"file", "edits":[{"oldText":"one", "newText":"two"}]}),
@@ -355,7 +368,7 @@ async fn edit_reports_missing_file_before_reading() {
 async fn ambiguous_replacement_does_not_mutate_remote_file() {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::new("one\none", false));
-    let tool = create_edit_tool(root.path(), store.clone()).unwrap();
+    let tool = compatible_tool(root.path(), store.clone()).unwrap();
     let result = tool
         .invoke(
             json!({"path":"file", "edits":[{"oldText":"one", "newText":"two"}]}),
@@ -400,7 +413,7 @@ async fn backend_alias_identity_serializes_write_and_edit() {
     let root = tempfile::tempdir().unwrap();
     let backend = Arc::new(AliasedStore(Store::new("old", true)));
     let write = create_write_tool(root.path(), backend.clone()).unwrap();
-    let edit = create_edit_tool(root.path(), backend.clone()).unwrap();
+    let edit = compatible_tool(root.path(), backend.clone()).unwrap();
     let first = tokio::spawn(async move {
         write
             .invoke(
@@ -524,4 +537,63 @@ async fn local_edit_adapter_preserves_permissions_and_symlink() {
         std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
         0o640
     );
+}
+
+struct RacyFallback {
+    value: Mutex<String>,
+    reads: std::sync::atomic::AtomicUsize,
+    writes: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl EditOperations for RacyFallback {
+    async fn access(&self, _: &Path) -> Result<()> {
+        Ok(())
+    }
+    async fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
+        let mut value = self.value.lock().unwrap();
+        let previous = value.as_bytes().to_vec();
+        if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            *value = "external".into();
+        }
+        Ok(previous)
+    }
+    async fn write_file(&self, _: &Path, content: &str) -> Result<()> {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.value.lock().unwrap() = content.into();
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn non_atomic_fallback_requires_opt_in_and_exposes_external_race() {
+    let root = tempfile::tempdir().unwrap();
+    for opt_in in [false, true] {
+        let backend = Arc::new(RacyFallback {
+            value: Mutex::new("one".into()),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tool = if opt_in {
+            compatible_tool(root.path(), backend.clone()).unwrap()
+        } else {
+            create_edit_tool(root.path(), backend.clone()).unwrap()
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"file", "edits":[{"oldText":"one", "newText":"two"}]}),
+                context(CancellationToken::new()),
+            )
+            .await;
+        if opt_in {
+            assert!(matches!(result, Outcome::SucceededWithDetails { .. }));
+            assert_eq!(*backend.value.lock().unwrap(), "two");
+            assert_eq!(backend.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        } else {
+            assert!(
+                matches!(result, Outcome::Failed(text) if text.contains("enable non-atomic fallback explicitly"))
+            );
+            assert_eq!(*backend.value.lock().unwrap(), "one");
+            assert_eq!(backend.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
 }
