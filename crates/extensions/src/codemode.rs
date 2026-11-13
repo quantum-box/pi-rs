@@ -264,16 +264,20 @@ impl Tool for ScriptTool {
         if format_cancel.is_cancelled() {
             return Outcome::Failed("Script cancelled while formatting output".into()).into();
         }
-        let output = match output {
-            Ok(Some(output)) => output.deliver(),
+        let mut publication = match output {
+            Ok(Some(output)) => output.publish(),
             Ok(None) => {
                 return Outcome::Failed("Script cancelled while formatting output".into()).into();
             }
             Err(error) => {
                 success = false;
-                json!({"content":[{"type":"text","text":format!("Codemode output formatting failed: {error}")}],"isError":true})
+                Publication {
+                    value: json!({"content":[{"type":"text","text":format!("Codemode output formatting failed: {error}")}],"isError":true}),
+                    transcript: None,
+                }
             }
         };
+        let output = std::mem::take(&mut publication.value);
         let outcome = if success {
             Outcome::Structured {
                 data: output,
@@ -290,13 +294,20 @@ impl Tool for ScriptTool {
                     .join("\n"),
             )
         };
-        ToolReply {
+        let reply = ToolReply {
             outcome,
             state: (success && changed).then_some(ExtensionState {
                 version: 1,
                 data: store,
             }),
+        };
+        // This final cancellation observation is the publication commit point.
+        // There is no await between it and returning the reply. Until then the
+        // guard removes even a transcript that has already been persisted.
+        if !publication.commit_if_active(&format_cancel) {
+            return Outcome::Failed("Script cancelled while formatting output".into()).into();
         }
+        reply
     }
 }
 struct Options {
@@ -749,24 +760,60 @@ struct FormattedOutput {
     value: Value,
     transcript: Option<tempfile::NamedTempFile>,
 }
+struct Publication {
+    value: Value,
+    transcript: Option<std::path::PathBuf>,
+}
+impl Publication {
+    fn commit_if_active(&mut self, cancellation: &pi_rs_core::CancellationToken) -> bool {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        self.transcript.take();
+        true
+    }
+}
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if let Some(path) = self.transcript.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
 fn with_worker_permit<P, T>(permit: P, format: impl FnOnce() -> T) -> T {
     let _permit = permit;
     format()
 }
 impl FormattedOutput {
-    fn deliver(mut self) -> Value {
-        if let Some(file) = self.transcript.take()
-            && let Err(error) = file.keep()
-        {
-            let old = self.value["full_output_path"].as_str().unwrap_or_default();
-            let replacement = format!("Could not save the full output: {}", error.error);
-            if let Some(text) = self.value["content"][0]["text"].as_str() {
-                self.value["content"][0]["text"] =
-                    json!(text.replace(&format!("Full output: {old}"), &replacement));
+    #[cfg(test)]
+    fn deliver(self) -> Value {
+        let mut publication = self.publish();
+        assert!(publication.commit_if_active(&pi_rs_core::CancellationToken::new()));
+        std::mem::take(&mut publication.value)
+    }
+    fn publish(mut self) -> Publication {
+        let mut transcript = None;
+        if let Some(file) = self.transcript.take() {
+            match file.keep() {
+                Ok((file, path)) => {
+                    drop(file);
+                    transcript = Some(path);
+                }
+                Err(error) => {
+                    let old = self.value["full_output_path"].as_str().unwrap_or_default();
+                    let replacement = format!("Could not save the full output: {}", error.error);
+                    if let Some(text) = self.value["content"][0]["text"].as_str() {
+                        self.value["content"][0]["text"] =
+                            json!(text.replace(&format!("Full output: {old}"), &replacement));
+                    }
+                    self.value["full_output_path"] = Value::Null;
+                }
             }
-            self.value["full_output_path"] = Value::Null;
         }
-        self.value
+        Publication {
+            value: self.value,
+            transcript,
+        }
     }
 }
 
@@ -2053,6 +2100,40 @@ mod tests {
             cancellation.cancel();
         });
         assert_eq!(chunks, 1);
+    }
+    #[test]
+    fn cancellation_after_keep_before_commit_removes_transcript() {
+        let token = pi_rs_core::CancellationToken::new();
+        let mut output = Output::default();
+        output.emit("text", "界".repeat(1000), "").unwrap();
+        let formatted = output
+            .finish(true, Duration::ZERO, None, 1, &token)
+            .unwrap();
+        let path = formatted.value["full_output_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut publication = formatted.publish();
+        assert!(std::path::Path::new(&path).exists());
+        token.cancel();
+        assert!(!publication.commit_if_active(&token));
+        drop(publication);
+        assert!(!std::path::Path::new(&path).exists());
+
+        let token = pi_rs_core::CancellationToken::new();
+        let formatted = output
+            .finish(true, Duration::ZERO, None, 1, &token)
+            .unwrap();
+        let path = formatted.value["full_output_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut publication = formatted.publish();
+        assert!(publication.commit_if_active(&token));
+        token.cancel();
+        drop(publication);
+        assert!(std::path::Path::new(&path).exists());
+        std::fs::remove_file(path).unwrap();
     }
 
     struct DeadlineModel;
