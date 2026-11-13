@@ -124,7 +124,11 @@ pub(crate) fn replacement_replay(
                     thinking_signature
                         .as_ref()
                         .map(|s| json!({"type":"reasoning","redacted":s}))
-                } else if !thinking.is_empty() {
+                } else if !thinking.is_empty()
+                    || thinking_signature
+                        .as_deref()
+                        .is_some_and(|signature| !signature.is_empty())
+                {
                     Some(json!({"type":"reasoning","text":thinking,"signature":thinking_signature}))
                 } else {
                     None
@@ -225,6 +229,63 @@ mod tests {
     use super::*;
     use crate::{Event, MemoryStore, Message, ResolvedModelIdentity, Session, UsageReport};
     use uuid::Uuid;
+
+    #[test]
+    fn bedrock_edited_empty_thinking_signature_survives_reopen() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    provider_api: Some(ModelApi::BedrockConverseStream),
+                    replay_identity: Some(ResolvedModelIdentity {
+                        provider: "amazon-bedrock".into(),
+                        model: "anthropic.claude-opus-5-5".into(),
+                    }),
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        let target = session
+            .append(Event::Assistant {
+                content: "old".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap()
+            .id;
+        let replacement = serde_json::from_value(json!([
+            {"type":"thinking","thinking":"","thinkingSignature":"sig"},
+            {"type":"text","text":"edited"}
+        ]))
+        .unwrap();
+        session.edit_context(target, Some(replacement)).unwrap();
+        let reopened =
+            Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+        for current in [&session, &reopened] {
+            let messages = current.current_messages();
+            let Message::Assistant {
+                content,
+                replay: Some(replay),
+                ..
+            } = &messages[0]
+            else {
+                panic!("missing replay")
+            };
+            assert_eq!(content, "edited");
+            assert_eq!(
+                replay.blocks[0],
+                json!({"type":"reasoning","text":"","signature":"sig"})
+            );
+            assert_eq!(replay.blocks[1], json!({"type":"text","text":"edited"}));
+        }
+    }
 
     #[test]
     fn edited_thinking_survives_projection_and_reopen_with_order_and_signatures() {

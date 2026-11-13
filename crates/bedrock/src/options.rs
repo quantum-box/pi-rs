@@ -11,39 +11,37 @@ pub struct ThinkingBudgets {
     pub high: Option<u32>,
 }
 impl ThinkingBudgets {
-    /// Parse Pi's `thinkingBudgets` settings; Bedrock requires integer token counts.
-    pub fn from_json(value: &Value) -> Result<Self> {
+    fn configured_for_level(value: &Value, level: ReasoningLevel) -> Result<Option<u32>> {
+        let key = match level {
+            ReasoningLevel::Minimal => "minimal",
+            ReasoningLevel::Low => "low",
+            ReasoningLevel::Medium => "medium",
+            ReasoningLevel::High | ReasoningLevel::Xhigh | ReasoningLevel::Max => "high",
+            ReasoningLevel::Off => return Ok(None),
+        };
         let object = value
             .as_object()
             .ok_or_else(|| Error::Config("thinkingBudgets must be an object".into()))?;
-        let read = |key: &str| -> Result<Option<u32>> {
-            object
-                .get(key)
-                .map(|value| {
-                    let number = value
-                        .as_f64()
-                        .filter(|n| {
-                            n.is_finite()
-                                && n.fract() == 0.0
-                                && *n >= 1024.0
-                                && *n <= f64::from(u32::MAX)
-                        })
-                        .ok_or_else(|| {
-                            Error::Config(format!(
-                                "thinkingBudgets.{key} must be an integer between 1024 and {}",
-                                u32::MAX
-                            ))
-                        })?;
-                    Ok(number as u32)
-                })
-                .transpose()
-        };
-        Ok(Self {
-            minimal: read("minimal")?,
-            low: read("low")?,
-            medium: read("medium")?,
-            high: read("high")?,
-        })
+        object
+            .get(key)
+            .map(|value| {
+                let number = value
+                    .as_f64()
+                    .filter(|n| {
+                        n.is_finite()
+                            && n.fract() == 0.0
+                            && *n >= 1024.0
+                            && *n <= f64::from(u32::MAX)
+                    })
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "thinkingBudgets.{key} must be an integer between 1024 and {}",
+                            u32::MAX
+                        ))
+                    })?;
+                Ok(number as u32)
+            })
+            .transpose()
     }
     fn for_level(&self, level: ReasoningLevel) -> Option<u32> {
         match level {
@@ -68,6 +66,7 @@ pub(crate) struct ReasoningContext<'a> {
     pub region: Option<&'a str>,
     pub tool_free: bool,
     pub budgets: &'a ThinkingBudgets,
+    pub configured_budgets: Option<&'a Value>,
     pub display: ThinkingDisplay,
     pub interleaved: bool,
 }
@@ -253,10 +252,12 @@ pub(crate) fn reasoning_fields(
 ) -> Result<Option<Value>> {
     let items = candidates(model, name);
     if has_any(&items, &["claude"]) {
-        if level.is_none() && requires_thinking(model, name) {
-            return Ok(None);
-        }
-        let level = level.unwrap_or(ReasoningLevel::Off);
+        let implicit_adaptive = level.is_none() && requires_thinking(model, name);
+        let level = level.unwrap_or(if implicit_adaptive {
+            ReasoningLevel::Medium
+        } else {
+            ReasoningLevel::Off
+        });
         if level == ReasoningLevel::Off {
             if has_any(&items, &["fable-5", "mythos-5", "opus-5-5"]) {
                 return Err(Error::Config("This Bedrock Claude model cannot disable thinking; select a reasoning level or use a different model".into()));
@@ -283,10 +284,12 @@ pub(crate) fn reasoning_fields(
         let mut thinking = if adaptive {
             json!({"type":"adaptive"})
         } else {
-            let requested = context
-                .budgets
-                .for_level(level)
-                .unwrap_or_else(|| level.budget());
+            let requested = if let Some(value) = context.configured_budgets {
+                ThinkingBudgets::configured_for_level(value, level)?
+            } else {
+                context.budgets.for_level(level)
+            }
+            .unwrap_or_else(|| level.budget());
             if requested < 1024 {
                 return Err(Error::Config(
                     "Bedrock Claude thinking budget must be at least 1024 tokens".into(),
@@ -321,7 +324,9 @@ pub(crate) fn reasoning_fields(
                     _ => "high",
                 }
             };
-            fields["output_config"] = json!({"effort":effort});
+            if !implicit_adaptive {
+                fields["output_config"] = json!({"effort":effort});
+            }
             if binding {
                 fields["anthropic_beta"] = json!(["thinking-binding-controls-2026-08-01"]);
             }
@@ -360,6 +365,7 @@ mod tests {
                 medium: None,
                 high: None,
             },
+            configured_budgets: None,
             display: ThinkingDisplay::Summarized,
             interleaved: true,
         }

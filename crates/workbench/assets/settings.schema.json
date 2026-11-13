@@ -144,10 +144,10 @@
     "thinkingBudgets": {
       "type": "object",
       "properties": {
-        "minimal": {"type": "number"},
-        "low": {"type": "number"},
-        "medium": {"type": "number"},
-        "high": {"type": "number"}
+        "minimal": {},
+        "low": {},
+        "medium": {},
+        "high": {}
       }
     },
     "defaultThinkingLevel": {

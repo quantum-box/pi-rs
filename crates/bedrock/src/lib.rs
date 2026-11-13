@@ -33,6 +33,7 @@ pub struct Bedrock {
     reasoning: Option<ReasoningLevel>,
     mapped_effort: Option<String>,
     thinking_budgets: ThinkingBudgets,
+    configured_thinking_budgets: Option<Value>,
     thinking_display: ThinkingDisplay,
     interleaved_thinking: bool,
     cache_retention: CacheRetention,
@@ -54,6 +55,7 @@ impl Bedrock {
             reasoning: None,
             mapped_effort: None,
             thinking_budgets: ThinkingBudgets::default(),
+            configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             cache_retention: default_cache_retention(),
@@ -75,6 +77,7 @@ impl Bedrock {
             reasoning: None,
             mapped_effort: None,
             thinking_budgets: ThinkingBudgets::default(),
+            configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             cache_retention: default_cache_retention(),
@@ -100,6 +103,7 @@ impl Bedrock {
             reasoning: None,
             mapped_effort: None,
             thinking_budgets: ThinkingBudgets::default(),
+            configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             cache_retention: default_cache_retention(),
@@ -229,6 +233,7 @@ impl Bedrock {
             &self.mapped_effort,
             (
                 format!("{:?}", self.thinking_budgets),
+                &self.configured_thinking_budgets,
                 format!("{:?}", self.thinking_display),
                 self.interleaved_thinking,
             ),
@@ -278,6 +283,13 @@ impl Bedrock {
     /// Override per-level budgets for non-adaptive Claude thinking.
     pub fn with_thinking_budgets(mut self, budgets: ThinkingBudgets) -> Self {
         self.thinking_budgets = budgets;
+        self.configured_thinking_budgets = None;
+        self.prepared_identity = None;
+        self
+    }
+    /// Set Pi's raw budget settings; only the budget used by a request is validated.
+    pub fn with_thinking_budget_settings(mut self, settings: Value) -> Self {
+        self.configured_thinking_budgets = Some(settings);
         self.prepared_identity = None;
         self
     }
@@ -998,6 +1010,7 @@ impl Model for Bedrock {
                 region: client.config().region().map(|region| region.as_ref()),
                 tool_free,
                 budgets: &self.thinking_budgets,
+                configured_budgets: self.configured_thinking_budgets.as_ref(),
                 display: self.thinking_display,
                 interleaved: self.interleaved_thinking,
             },
@@ -1297,6 +1310,8 @@ mod tests {
                 low: Some(1500),
                 ..Default::default()
             }),
+            base.clone()
+                .with_thinking_budget_settings(serde_json::json!({"low": 1500})),
             base.clone().with_thinking_display(ThinkingDisplay::Omitted),
             base.clone().with_interleaved_thinking(false),
             base.clone().with_cache_retention(CacheRetention::None),

@@ -3581,7 +3581,8 @@ adapter does not increase the host's output budget automatically. Reasoning
 options for other model families are not sent, matching Pi's Bedrock adapter.
 For budgeted Claude models, Pi's `thinkingBudgets` settings override the
 minimal/low/medium/high defaults; xhigh and max use the high budget. Bedrock
-requires integer budgets of at least 1,024, and the adapter clamps them to
+requires integer budgets of at least 1,024; only the selected budget is
+validated. The adapter clamps it to
 leave 1,024 tokens for the answer within the host's output limit. Adaptive
 models use effort instead and ignore token budgets. Embedders can also choose
 summarized or omitted thinking display and disable interleaved thinking for
@@ -3589,7 +3590,7 @@ budgeted Claude through the Bedrock builder. GovCloud omits display; adaptive
 thinking does not use the interleaved beta toggle.
 Claude 5 models that default to adaptive thinking receive an explicit disabled
 setting when thinking is off, where supported. Fable 5, Mythos 5 and Opus 5.5
-cannot disable thinking; unset uses the model's adaptive default, explicit off
+cannot disable thinking; unset uses adaptive thinking with the model's default effort, explicit off
 returns a configuration error, and summaries use adaptive thinking at low
 effort. The output limit applies to thinking and answer combined, so thinking
 can reduce the space available for a summary. Sonnet 5.5 uses `between_tools`

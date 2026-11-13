@@ -212,22 +212,64 @@ async fn custom_budgets_display_and_interleaved_follow_claude_mode() {
     );
 }
 
-#[test]
-fn custom_budget_settings_reject_invalid_values() {
-    assert_eq!(
-        ThinkingBudgets::from_json(&json!({"low":1500.0,"high":4096}))
-            .unwrap()
-            .low,
-        Some(1500)
-    );
+#[tokio::test]
+async fn custom_budget_validation_only_applies_to_selected_level() {
+    let budgets = json!({"low":1500.0,"high":0});
+    for (model, level, summary, max) in [
+        ("anthropic.claude-sonnet-4-5", Some("low"), false, 4096),
+        ("anthropic.claude-sonnet-4-6", Some("high"), false, 512),
+        ("openai.gpt-5", Some("high"), false, 512),
+        ("anthropic.claude-sonnet-4-5", Some("off"), false, 512),
+        ("anthropic.claude-sonnet-4-5", Some("high"), true, 512),
+    ] {
+        let (body, _) = capture(
+            "us-east-1",
+            |c| {
+                c.with_thinking_budget_settings(budgets.clone())
+                    .with_reasoning(level, None)
+                    .unwrap()
+            },
+            request(model, max),
+            summary,
+        )
+        .await;
+        if level == Some("low") {
+            assert_eq!(
+                body["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+                1500
+            );
+        }
+    }
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version_latest()
+        .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+        .credentials_provider(aws_credential_types::Credentials::new(
+            "test", "secret", None, None, "test",
+        ))
+        .endpoint_url("http://127.0.0.1:1")
+        .build();
     for value in [
         json!([]),
-        json!({"low":1023}),
-        json!({"low":1024.5}),
-        json!({"low":null}),
+        json!({"high":1023}),
+        json!({"high":1024.5}),
+        json!({"high":null}),
         json!({"high":4294967296_u64}),
     ] {
-        assert!(ThinkingBudgets::from_json(&value).is_err(), "{value}");
+        let client = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config.clone()))
+            .with_thinking_budget_settings(value.clone())
+            .with_reasoning(Some("max"), None)
+            .unwrap();
+        let error = match client
+            .stream(request("anthropic.claude-sonnet-4-5", 8192))
+            .await
+        {
+            Ok(_) => panic!("accepted {value}"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(error, pi_rs_core::Error::Config(_)),
+            "{value}: {error}"
+        );
     }
 }
 
@@ -448,8 +490,18 @@ async fn required_thinking_models_keep_default_and_use_low_effort_for_summaries(
             false,
         )
         .await;
+        assert_eq!(
+            normal["additionalModelRequestFields"]["thinking"]["type"], "adaptive",
+            "{model}"
+        );
+        assert_eq!(
+            normal["additionalModelRequestFields"]["thinking"]["display"], "summarized",
+            "{model}"
+        );
         assert!(
-            normal.get("additionalModelRequestFields").is_none(),
+            normal["additionalModelRequestFields"]
+                .get("output_config")
+                .is_none(),
             "{model}"
         );
         let (summary, _) = capture(
@@ -477,6 +529,24 @@ async fn required_thinking_models_keep_default_and_use_low_effort_for_summaries(
                 .iter()
                 .any(|level| level == "off"),
             "{model}"
+        );
+    }
+    for (region, display) in [("us-east-1", Some("omitted")), ("us-gov-west-1", None)] {
+        let (body, _) = capture(
+            region,
+            |c| c.with_thinking_display(ThinkingDisplay::Omitted),
+            request("anthropic.claude-opus-5-5", 512),
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["display"].as_str(),
+            display
+        );
+        assert!(
+            body["additionalModelRequestFields"]
+                .get("output_config")
+                .is_none()
         );
     }
 }

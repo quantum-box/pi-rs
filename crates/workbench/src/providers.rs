@@ -821,22 +821,17 @@ impl Client {
                 let long_cache_override = args
                     .model_profiles
                     .bedrock_long_cache_override(&args.provider, metadata.as_ref());
-                let budgets = args
-                    .settings
-                    .value()
-                    .get("thinkingBudgets")
-                    .map(pi_rs::bedrock::ThinkingBudgets::from_json)
-                    .transpose()?
-                    .unwrap_or_default();
-                let client = client
+                let mut client = client
                     .with_model_name(
                         &args.model,
                         metadata.as_ref().and_then(|model| model.name.as_deref()),
                     )
                     .with_cache_retention(cache_retention(true))
                     .with_long_cache_support(long_cache_override)
-                    .with_thinking_budgets(budgets)
                     .with_reasoning(level, mapped.flatten())?;
+                if let Some(budgets) = args.settings.value().get("thinkingBudgets") {
+                    client = client.with_thinking_budget_settings(budgets.clone());
+                }
                 Self::Bedrock(client)
             }
             Self::Deferred(mut client) => {
@@ -1766,7 +1761,7 @@ mod bedrock_tests {
             std::fs::create_dir(workspace.path().join(".pi")).unwrap();
             std::fs::write(
                 workspace.path().join(".pi/settings.json"),
-                r#"{"thinkingBudgets":{"high":3456}}"#,
+                r#"{"thinkingBudgets":{"high":3456,"low":"invalid"}}"#,
             )
             .unwrap();
             args.settings = super::super::config::Settings::load(workspace.path(), true).unwrap();
@@ -1781,6 +1776,20 @@ mod bedrock_tests {
                 .stream_with_headers(req, &HeaderMap::new(), false)
                 .await
                 .unwrap();
+            args.thinking = Some("low".into());
+            let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                .with_model_options(&args, false)
+                .unwrap();
+            let mut req = request(&args.model);
+            req.max_output_tokens = 8192;
+            let error = match client
+                .stream_with_headers(req, &HeaderMap::new(), false)
+                .await
+            {
+                Ok(_) => panic!("invalid selected budget accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("thinkingBudgets.low"));
             return;
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1907,9 +1916,17 @@ mod bedrock_tests {
             );
         }
         for (normal, summary) in [(14, 15), (16, 17)] {
+            assert_eq!(
+                requests[normal]["additionalModelRequestFields"]["thinking"]["type"],
+                "adaptive"
+            );
+            assert_eq!(
+                requests[normal]["additionalModelRequestFields"]["thinking"]["display"],
+                "summarized"
+            );
             assert!(
-                requests[normal]
-                    .get("additionalModelRequestFields")
+                requests[normal]["additionalModelRequestFields"]
+                    .get("output_config")
                     .is_none()
             );
             assert_eq!(
