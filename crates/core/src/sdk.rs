@@ -163,6 +163,7 @@ struct IdleChildRequest {
     input: crate::AgentInput,
     reply: tokio::sync::oneshot::Sender<Result<()>>,
     lifetime: CancellationToken,
+    gate: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -173,6 +174,7 @@ struct IdleInputScope {
     states: crate::ExtensionStates,
     cancellation: CancellationToken,
     lifetime: CancellationToken,
+    gate: Arc<Mutex<()>>,
     depth: usize,
 }
 
@@ -188,6 +190,7 @@ impl IdleInputScope {
                 input,
                 reply,
                 lifetime: self.lifetime.clone(),
+                gate: self.gate.clone(),
             })
             .map_err(|_| Error::Config("idle input callback has finished".into()))?;
         tokio::select! {
@@ -292,6 +295,7 @@ impl SessionControl {
     /// Capture the current idle callback's child lane for use in a spawned task.
     /// The returned control is valid only until that callback finishes.
     pub fn scoped(&self) -> Result<Self> {
+        let _guard = self.scoped_guard()?;
         let scope = self
             .callback_scope()
             .ok_or_else(|| Error::Config("no idle input callback scope".into()))?;
@@ -303,26 +307,39 @@ impl SessionControl {
         Ok(control)
     }
 
+    fn scoped_guard(&self) -> Result<Option<std::sync::MutexGuard<'_, ()>>> {
+        let Some(scope) = &self.scope else {
+            return Ok(None);
+        };
+        let guard = scope.gate.lock().expect("idle scope gate");
+        if scope.lifetime.is_cancelled() {
+            return Err(Error::Config("idle input callback has finished".into()));
+        }
+        Ok(Some(guard))
+    }
+
     fn callback_scope(&self) -> Option<IdleInputScope> {
         let local = IDLE_INPUT_SCOPE
             .try_with(|scope| scope.clone())
             .ok()
             .filter(|scope| Arc::ptr_eq(&scope.owner, &self.owner));
-        match (local, self.scope.as_ref()) {
-            (Some(local), Some(explicit))
-                if Arc::ptr_eq(&explicit.owner, &self.owner) && explicit.depth > local.depth =>
-            {
-                Some(explicit.clone())
+        if let Some(explicit) = &self.scope {
+            if !Arc::ptr_eq(&explicit.owner, &self.owner) {
+                return None;
             }
-            (Some(local), _) => Some(local),
-            (None, Some(explicit)) if Arc::ptr_eq(&explicit.owner, &self.owner) => {
-                Some(explicit.clone())
+            // An explicit handle remains bound to its original callback even
+            // if it is used while another callback has a task-local scope.
+            let mut scope = explicit.clone();
+            if let Some(local) = local {
+                scope.depth = scope.depth.max(local.depth);
             }
-            _ => None,
+            return Some(scope);
         }
+        local
     }
 
     pub fn set_retry_settings(&self, settings: crate::RetrySettings) -> Result<()> {
+        let _guard = self.scoped_guard()?;
         if self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
         }
@@ -330,6 +347,7 @@ impl SessionControl {
         Ok(())
     }
     pub fn abort_retry(&self) -> Result<()> {
+        let _guard = self.scoped_guard()?;
         if self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
         }
@@ -337,6 +355,7 @@ impl SessionControl {
         Ok(())
     }
     pub fn set_auto_compaction_enabled(&self, enabled: bool) -> Result<()> {
+        let _guard = self.scoped_guard()?;
         if self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
         }
@@ -344,6 +363,7 @@ impl SessionControl {
         Ok(())
     }
     pub fn set_compaction_tokens(&self, settings: crate::CompactionTokens) -> Result<()> {
+        let _guard = self.scoped_guard()?;
         if self.input.is_closed() {
             return Err(Error::Config("session is closed".into()));
         }
@@ -385,6 +405,7 @@ impl SessionControl {
             images,
         };
         message.validate()?;
+        drop(self.scoped_guard()?);
         let child = self.callback_scope();
         if let Some(scope) = child {
             return self.enqueue_child(message, scope).await;
@@ -558,6 +579,7 @@ impl SessionControl {
             states: states.clone(),
             cancellation: active.token.clone(),
             lifetime: CancellationToken::new(),
+            gate: Arc::new(Mutex::new(())),
             depth: 0,
         };
         let future = IDLE_INPUT_SCOPE.scope(
@@ -655,6 +677,7 @@ impl SessionControl {
             states: states.clone(),
             cancellation: cancellation.clone(),
             lifetime: CancellationToken::new(),
+            gate: Arc::new(Mutex::new(())),
             depth: 0,
         };
         let mut errors = Vec::new();
@@ -784,6 +807,7 @@ impl SessionControl {
         &self,
         input: impl FnOnce(tokio::sync::oneshot::Sender<Result<T>>) -> crate::AgentInput,
     ) -> Result<T> {
+        drop(self.scoped_guard()?);
         let (reply, receiver) = tokio::sync::oneshot::channel();
         let child = self.callback_scope();
         if let Some(scope) = child {
@@ -816,6 +840,9 @@ impl SessionControl {
         }
     }
     pub fn abort(&self) {
+        let Ok(_guard) = self.scoped_guard() else {
+            return;
+        };
         if let Some(active) = self.active.lock().expect("session control").as_ref() {
             active.cancel();
         }
@@ -2140,10 +2167,28 @@ impl Drop for AgentSession {
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
     }
 }
-struct IdleScopeGuard(CancellationToken);
+struct IdleScopeGuard {
+    lifetime: CancellationToken,
+    gate: Arc<Mutex<()>>,
+}
 impl Drop for IdleScopeGuard {
     fn drop(&mut self) {
-        self.0.cancel();
+        let _guard = self.gate.lock().expect("idle scope gate");
+        self.lifetime.cancel();
+    }
+}
+
+pub(crate) async fn scope_extension_callback<F: std::future::Future>(future: F) -> F::Output {
+    let parent = IDLE_INPUT_SCOPE.try_with(|scope| scope.clone()).ok();
+    if let Some(mut scope) = parent {
+        scope.lifetime = scope.lifetime.child_token();
+        let _guard = IdleScopeGuard {
+            lifetime: scope.lifetime.clone(),
+            gate: scope.gate.clone(),
+        };
+        IDLE_INPUT_SCOPE.scope(scope, future).await
+    } else {
+        future.await
     }
 }
 
@@ -2162,7 +2207,10 @@ async fn pump_idle_callback<T, F>(
 where
     F: std::future::Future<Output = Result<T>>,
 {
-    let _scope_guard = IdleScopeGuard(scope.lifetime.clone());
+    let _scope_guard = IdleScopeGuard {
+        lifetime: scope.lifetime.clone(),
+        gate: scope.gate.clone(),
+    };
     tokio::pin!(future);
     loop {
         tokio::select! {
@@ -2180,6 +2228,7 @@ where
             }
             Some(child) = children.recv() => {
                 if child.reply.is_closed() { continue; }
+                let _guard = child.gate.lock().expect("idle scope gate");
                 if child.lifetime.is_cancelled() || scope.cancellation.is_cancelled() || closed.is_cancelled() {
                     let _ = child.reply.send(Err(Error::Cancelled));
                     continue;
@@ -9410,6 +9459,144 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["startup child"]
         );
+    }
+
+    struct CallbackExpiryHook {
+        id: &'static str,
+        control: Arc<Mutex<Option<SessionControl>>>,
+        saved: Arc<Mutex<Option<SessionControl>>>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        startup: bool,
+        capture: bool,
+    }
+    impl CallbackExpiryHook {
+        async fn check(&self) -> crate::ExtensionResult<()> {
+            let control = self.control.lock().unwrap().clone().unwrap();
+            if self.capture {
+                *self.saved.lock().unwrap() =
+                    Some(control.scoped().map_err(|error| error.to_string())?);
+            } else {
+                let stale = self.saved.lock().unwrap().clone().unwrap();
+                assert!(stale.scoped().is_err());
+                assert!(stale.steer("late").await.is_err());
+                assert!(
+                    stale
+                        .set_retry_settings(crate::RetrySettings::pi_defaults())
+                        .is_err()
+                );
+                assert!(stale.abort_retry().is_err());
+                assert!(stale.set_auto_compaction_enabled(false).is_err());
+                assert!(
+                    stale
+                        .set_compaction_tokens(crate::CompactionTokens::pi_defaults())
+                        .is_err()
+                );
+                stale.abort();
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Extension for CallbackExpiryHook {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn input(
+            &self,
+            _: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            if !self.startup {
+                self.check().await?;
+            }
+            Ok(crate::InputAction::Continue)
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if self.startup && matches!(event, crate::LifecycleEvent::SessionStart { .. }) {
+                self.check().await?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn scoped_handles_expire_between_input_and_startup_extension_callbacks() {
+        for startup in [false, true] {
+            let control_slot = Arc::new(Mutex::new(None));
+            let saved = Arc::new(Mutex::new(None));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let make_hook = |id, capture| {
+                Arc::new(CallbackExpiryHook {
+                    id,
+                    capture,
+                    startup,
+                    control: control_slot.clone(),
+                    saved: saved.clone(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                })
+            };
+            let session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+                .extension(make_hook("expiry-a", true))
+                .unwrap()
+                .extension(make_hook("expiry-b", false))
+                .unwrap()
+                .in_memory()
+                .unwrap();
+            let control = session.controls();
+            *control_slot.lock().unwrap() = Some(control.clone());
+            let driver = control.clone();
+            let baseline_retry = control.retry.settings();
+            let baseline_tokens = control.auto_compaction.token_settings();
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(driver.steer("parent"), async {
+                    entered.notified().await;
+                    assert!(control.auto_compaction.enabled());
+                    assert_eq!(control.auto_compaction.token_settings(), baseline_tokens);
+                    assert_eq!(control.retry.settings().enabled, baseline_retry.enabled);
+                    assert_eq!(
+                        control.retry.settings().max_retries,
+                        baseline_retry.max_retries
+                    );
+                    assert!(
+                        control
+                            .active
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|token| !token.is_cancelled())
+                    );
+                    release.notify_one();
+                })
+            })
+            .await
+            .expect("callback expiry test deadlocked");
+            result.unwrap();
+            assert!(
+                session
+                    .journal()
+                    .unwrap()
+                    .queued_inputs()
+                    .iter()
+                    .all(|input| input.input.content != "late")
+            );
+        }
     }
 
     struct PendingIdleInputHook(Arc<tokio::sync::Notify>);

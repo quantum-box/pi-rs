@@ -2059,14 +2059,17 @@ async fn prepare_input_inner(
         .iter()
         .filter(|extension| extension.handles_input())
     {
-        let response = match &host {
-            Some(host) => {
-                extension
-                    .input_with_host(&event, states.get(extension.id()), host.clone())
-                    .await
+        let response = crate::sdk::scope_extension_callback(async {
+            match &host {
+                Some(host) => {
+                    extension
+                        .input_with_host(&event, states.get(extension.id()), host.clone())
+                        .await
+                }
+                None => extension.input(&event, states.get(extension.id())).await,
             }
-            None => extension.input(&event, states.get(extension.id())).await,
-        };
+        })
+        .await;
         let action = match response {
             Ok(action) => action,
             Err(error) => {

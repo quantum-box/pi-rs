@@ -432,25 +432,28 @@ async fn notify_inner(
                 _ => true,
             }
     }) {
-        let error = match tokio::time::timeout_at(deadline, async {
-            match &host {
-                Some(host) => {
-                    extension
-                        .lifecycle_with_host(
-                            &event,
-                            states.get(extension.id()),
-                            host.for_extension(extension.id())
-                                .unwrap_or_else(|| host.clone()),
-                        )
-                        .await
+        let error = match tokio::time::timeout_at(
+            deadline,
+            crate::sdk::scope_extension_callback(async {
+                match &host {
+                    Some(host) => {
+                        extension
+                            .lifecycle_with_host(
+                                &event,
+                                states.get(extension.id()),
+                                host.for_extension(extension.id())
+                                    .unwrap_or_else(|| host.clone()),
+                            )
+                            .await
+                    }
+                    None => {
+                        extension
+                            .lifecycle(&event, states.get(extension.id()))
+                            .await
+                    }
                 }
-                None => {
-                    extension
-                        .lifecycle(&event, states.get(extension.id()))
-                        .await
-                }
-            }
-        })
+            }),
+        )
         .await
         {
             Ok(Ok(())) => continue,
