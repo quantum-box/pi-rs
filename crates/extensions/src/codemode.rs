@@ -188,6 +188,8 @@ impl Tool for ScriptTool {
         let sink = Arc::new(Mutex::new(Output::default()));
         let worker_sink = sink.clone();
         let worker_cancel = context.cancellation.child_token();
+        let format_cancel = context.cancellation.child_token();
+        let _cancel_format_on_drop = format_cancel.clone().drop_guard();
         // The caller may drop this future on timeout or cancellation. Keep the
         // permit in the worker until QuickJS has actually stopped, and wake its
         // interrupt handler even when nobody remains to await the join handle.
@@ -199,8 +201,7 @@ impl Tool for ScriptTool {
         let source = source.to_owned();
         let handle = tokio::runtime::Handle::current();
         let timeout = options.timeout;
-        let result = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+        let worker = tokio::task::spawn_blocking(move || {
             let remaining = match timeout {
                 Some(timeout) => {
                     match timeout
@@ -208,24 +209,35 @@ impl Tool for ScriptTool {
                         .filter(|time| !time.is_zero())
                     {
                         Some(remaining) => Some(remaining),
-                        None => return Err("Script deadline elapsed before execution".into()),
+                        None => {
+                            return (
+                                Err("Script deadline elapsed before execution".into()),
+                                permit,
+                            );
+                        }
                     }
                 }
                 None => None,
             };
-            handle.block_on(evaluate(
+            let result = handle.block_on(evaluate(
                 &source,
                 store,
                 host,
                 worker_context,
                 remaining,
                 worker_sink,
-            ))
+            ));
+            (result, permit)
         })
-        .await
-        .unwrap_or_else(|error| Err(format!("Codemode worker failed: {error}")));
+        .await;
+        let (result, permit) = match worker {
+            Ok(result) => result,
+            Err(error) => {
+                return Outcome::Failed(format!("Codemode worker failed: {error}")).into();
+            }
+        };
         let limit_exceeded = sink.lock().expect("codemode output").limit_exceeded;
-        let (success, changed, store, error) = match result {
+        let (mut success, changed, store, error) = match result {
             _ if limit_exceeded => (
                 false,
                 false,
@@ -235,12 +247,37 @@ impl Tool for ScriptTool {
             Ok(result) => (result.ok, result.changed, result.store, result.error),
             Err(error) => (false, false, json!({}), Some(error)),
         };
-        let output = sink.lock().expect("codemode output").finish(
-            success,
-            started.elapsed(),
-            error.as_deref(),
-            options.max_output_tokens,
-        );
+        let elapsed = started.elapsed();
+        let formatter_cancel = format_cancel.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            with_worker_permit(permit, || {
+                sink.lock().expect("codemode output").finish(
+                    success,
+                    elapsed,
+                    error.as_deref(),
+                    options.max_output_tokens,
+                    &formatter_cancel,
+                )
+            })
+        })
+        .await;
+        if format_cancel.is_cancelled() {
+            return Outcome::Failed("Script cancelled while formatting output".into()).into();
+        }
+        let mut publication = match output {
+            Ok(Some(output)) => output.publish(),
+            Ok(None) => {
+                return Outcome::Failed("Script cancelled while formatting output".into()).into();
+            }
+            Err(error) => {
+                success = false;
+                Publication {
+                    value: json!({"content":[{"type":"text","text":format!("Codemode output formatting failed: {error}")}],"isError":true}),
+                    transcript: None,
+                }
+            }
+        };
+        let output = std::mem::take(&mut publication.value);
         let outcome = if success {
             Outcome::Structured {
                 data: output,
@@ -257,13 +294,20 @@ impl Tool for ScriptTool {
                     .join("\n"),
             )
         };
-        ToolReply {
+        let reply = ToolReply {
             outcome,
             state: (success && changed).then_some(ExtensionState {
                 version: 1,
                 data: store,
             }),
+        };
+        // This final cancellation observation is the publication commit point.
+        // There is no await between it and returning the reply. Until then the
+        // guard removes even a transcript that has already been persisted.
+        if !publication.commit_if_active(&format_cancel) {
+            return Outcome::Failed("Script cancelled while formatting output".into()).into();
         }
+        reply
     }
 }
 struct Options {
@@ -466,9 +510,9 @@ fn install_globals(
     let model_cancel = cancellation.clone();
     globals.set(
         "__emit",
-        Func::from(move |kind: String, value: String| {
+        Func::from(move |kind: String, value: String, mime: String| {
             let mut output = sink.lock().expect("codemode output");
-            let error = output.emit(&kind, value).err().unwrap_or_default();
+            let error = output.emit(&kind, value, &mime).err().unwrap_or_default();
             if output.limit_exceeded {
                 output_cancel.cancel();
             }
@@ -698,7 +742,7 @@ impl ModelUsage {
 struct Output {
     items: Vec<Item>,
     console: Vec<String>,
-    bytes: usize,
+    utf16_units: usize,
     calls: usize,
     limit_exceeded: bool,
     model_usage: ModelUsage,
@@ -712,11 +756,271 @@ enum Item {
         path: std::result::Result<String, String>,
     },
 }
+struct FormattedOutput {
+    value: Value,
+    transcript: Option<tempfile::NamedTempFile>,
+}
+struct Publication {
+    value: Value,
+    transcript: Option<std::path::PathBuf>,
+}
+impl Publication {
+    fn commit_if_active(&mut self, cancellation: &pi_rs_core::CancellationToken) -> bool {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        self.transcript.take();
+        true
+    }
+}
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if let Some(path) = self.transcript.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+fn with_worker_permit<P, T>(permit: P, format: impl FnOnce() -> T) -> T {
+    let _permit = permit;
+    format()
+}
+impl FormattedOutput {
+    #[cfg(test)]
+    fn deliver(self) -> Value {
+        let mut publication = self.publish();
+        assert!(publication.commit_if_active(&pi_rs_core::CancellationToken::new()));
+        std::mem::take(&mut publication.value)
+    }
+    fn publish(mut self) -> Publication {
+        let mut transcript = None;
+        if let Some(file) = self.transcript.take() {
+            match file.keep() {
+                Ok((file, path)) => {
+                    drop(file);
+                    transcript = Some(path);
+                }
+                Err(error) => {
+                    let old = self.value["full_output_path"].as_str().unwrap_or_default();
+                    let replacement = format!("Could not save the full output: {}", error.error);
+                    if let Some(text) = self.value["content"][0]["text"].as_str() {
+                        self.value["content"][0]["text"] =
+                            json!(text.replace(&format!("Full output: {old}"), &replacement));
+                    }
+                    self.value["full_output_path"] = Value::Null;
+                }
+            }
+        }
+        Publication {
+            value: self.value,
+            transcript,
+        }
+    }
+}
+
+fn visit_chunks(
+    mut value: &str,
+    cancellation: &pi_rs_core::CancellationToken,
+    mut visit: impl FnMut(&str),
+) {
+    while !value.is_empty() && !cancellation.is_cancelled() {
+        let mut end = value.len().min(64 * 1024);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        visit(&value[..end]);
+        value = &value[end..];
+    }
+}
 impl Output {
-    fn emit(&mut self, kind: &str, value: String) -> Result<(), String> {
+    // Visit the same text that finish() merges, without copying large outputs.
+    fn visit_report(
+        &self,
+        success: bool,
+        elapsed: Duration,
+        error: Option<&str>,
+        mut visit: impl FnMut(&str),
+    ) {
+        struct State {
+            has_text: bool,
+            after_image: bool,
+            ends_newline: bool,
+        }
+        fn block(state: &mut State, visit: &mut impl FnMut(&str), parts: &[&str]) {
+            let first = parts.iter().find(|s| !s.is_empty()).copied().unwrap_or("");
+            if state.has_text
+                && (state.after_image || (!state.ends_newline && !first.starts_with('\n')))
+            {
+                visit("\n");
+                if !state.after_image {
+                    state.ends_newline = true;
+                }
+            }
+            for part in parts {
+                visit(part);
+            }
+            if let Some(last) = parts.iter().rev().find(|s| !s.is_empty()) {
+                state.ends_newline = last.ends_with('\n');
+            } else if state.after_image || !state.has_text {
+                state.ends_newline = false;
+            }
+            state.has_text = true;
+            state.after_image = false;
+        }
+        let mut state = State {
+            has_text: false,
+            after_image: false,
+            ends_newline: false,
+        };
+        let header = format!(
+            "Script {}\nWall time: {:.3}s\n",
+            if success { "completed" } else { "failed" },
+            elapsed.as_secs_f64()
+        );
+        block(&mut state, &mut visit, &[&header]);
+        let count = self
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::Text(_)))
+            .count();
+        let mut index = 0;
+        for item in &self.items {
+            match item {
+                Item::Text(text) => {
+                    index += 1;
+                    let label = if count > 1 {
+                        format!("==> text {index}/{count} <==\n")
+                    } else {
+                        String::new()
+                    };
+                    block(&mut state, &mut visit, &[&label, text]);
+                }
+                Item::Image { path, .. } => {
+                    let label = match path {
+                        Ok(path) => format!("Image saved to {path}"),
+                        Err(error) => format!("Image could not be saved: {error}"),
+                    };
+                    block(&mut state, &mut visit, &[&label]);
+                    state.after_image = true;
+                }
+            }
+        }
+        if !self.console.is_empty() {
+            let mut parts = Vec::with_capacity(self.console.len().saturating_mul(2) + 1);
+            parts.push("<console_output>\n");
+            for (index, line) in self.console.iter().enumerate() {
+                if index != 0 {
+                    parts.push("\n");
+                }
+                parts.push(line);
+            }
+            parts.push("\n</console_output>");
+            block(&mut state, &mut visit, &parts);
+        }
+        if let Some(error) = error {
+            block(&mut state, &mut visit, &["Script error: ", error]);
+        }
+    }
+
+    fn finish_truncated(
+        &self,
+        success: bool,
+        elapsed: Duration,
+        error: Option<&str>,
+        maximum: usize,
+        chars: usize,
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> Option<FormattedOutput> {
+        let mut file = tempfile::Builder::new()
+            .prefix("pi-output-")
+            .suffix(".txt")
+            .tempfile();
+        let mut head = String::new();
+        let mut tail = String::new();
+        let mut offset = 0usize;
+        let mut newlines = 0usize;
+        let mut last = None;
+        let head_limit = maximum / 2;
+        let tail_start = chars - (maximum - head_limit);
+        self.visit_report(success, elapsed, error, |part| {
+            visit_chunks(part, cancellation, |part| {
+                if let Ok(output) = &mut file
+                    && let Err(error) = output.write_all(part.as_bytes())
+                {
+                    file = Err(error);
+                }
+                let part_chars = part.chars().count();
+                if offset < head_limit {
+                    head.extend(part.chars().take(head_limit - offset));
+                }
+                if offset + part_chars > tail_start {
+                    tail.extend(part.chars().skip(tail_start.saturating_sub(offset)));
+                }
+                offset += part_chars;
+                newlines += part.bytes().filter(|byte| *byte == b'\n').count();
+                if !part.is_empty() {
+                    last = part.chars().next_back();
+                }
+            })
+        });
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let lines = newlines + usize::from(last.is_some_and(|last| last != '\n'));
+        let (location, path, transcript) = match file {
+            Ok(file) => {
+                let path = file.path().to_string_lossy().into_owned();
+                (format!("Full output: {path}"), Some(path), Some(file))
+            }
+            Err(error) => (
+                format!("Could not save the full output: {error}"),
+                None,
+                None,
+            ),
+        };
+        let report = format!(
+            "Warning: truncated output (original token count: {})\nTotal output lines: {lines}\n\n{head}…{} tokens truncated…{tail}\n\n[{location}]",
+            chars.div_ceil(4),
+            (chars - maximum).div_ceil(4)
+        );
+        let text_block = json!({"type":"text","text":report});
+        let mut budget = (7 * 1024 * 1024_usize).saturating_sub(text_block.to_string().len());
+        let mut content = vec![text_block];
+        let mut omitted = 0;
+        for item in &self.items {
+            if let Item::Image { mime, data, .. } = item {
+                // Image data is validated base64 (ASCII), so JSON adds no escaping.
+                let size = json!({"type":"image","mimeType":mime,"data":""})
+                    .to_string()
+                    .len()
+                    .saturating_add(data.len());
+                if size > budget {
+                    omitted += 1;
+                } else {
+                    budget -= size;
+                    content.push(json!({"type":"image","mimeType":mime,"data":data}));
+                }
+            }
+        }
+        if omitted != 0 {
+            content.push(json!({"type":"text","text":format!("{omitted} image(s) omitted from inline output because of the result size limit. Image locations and save errors are included in the text output.")}));
+        }
+        let mut result = json!({"content":content,"isError":!success,"full_output_path":path,"wall_time_seconds":elapsed.as_secs_f64()});
+        if self.model_usage.measured() {
+            result["usage"] = json!(self.model_usage);
+        }
+        Some(FormattedOutput {
+            value: result,
+            transcript,
+        })
+    }
+    fn emit(&mut self, kind: &str, value: String, mime: &str) -> Result<(), String> {
         self.calls += 1;
-        self.bytes = self.bytes.saturating_add(value.len());
-        if self.calls > MAX_ITEMS || self.bytes > MAX_OUTPUT {
+        // UTF-8 needs at most three bytes per UTF-16 code unit, so the
+        // character cap still bounds retained output even for non-ASCII text.
+        self.utf16_units = self
+            .utf16_units
+            .saturating_add(value.encode_utf16().count());
+        if self.calls > MAX_ITEMS || self.utf16_units > MAX_OUTPUT {
             self.limit_exceeded = true;
             return Err("Script output limit exceeded".into());
         }
@@ -724,9 +1028,6 @@ impl Output {
             "text" => self.items.push(Item::Text(value)),
             "console" => self.console.push(value),
             "image" => {
-                let block: Value =
-                    serde_json::from_str(&value).map_err(|error| error.to_string())?;
-                let mime = block["mimeType"].as_str().unwrap_or_default();
                 let suffix = match mime {
                     "image/png" => ".png",
                     "image/jpeg" => ".jpg",
@@ -734,7 +1035,7 @@ impl Output {
                     "image/webp" => ".webp",
                     _ => return Err("Unsupported image type".into()),
                 };
-                let data = block["data"].as_str().ok_or("Missing image data")?;
+                let data = value.as_str();
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .map_err(|_| "Invalid image data".to_owned())?;
@@ -771,7 +1072,21 @@ impl Output {
         elapsed: Duration,
         error: Option<&str>,
         tokens: usize,
-    ) -> Value {
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> Option<FormattedOutput> {
+        let maximum = tokens.saturating_mul(4).min(100 * 1024);
+        let mut chars = 0usize;
+        self.visit_report(success, elapsed, error, |part| {
+            visit_chunks(part, cancellation, |chunk| {
+                chars = chars.saturating_add(chunk.chars().count())
+            })
+        });
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if chars > maximum {
+            return self.finish_truncated(success, elapsed, error, maximum, chars, cancellation);
+        }
         let mut content = vec![json!({"type":"text","text":format!(
             "Script {}\nWall time: {:.3}s\n",
             if success { "completed" } else { "failed" }, elapsed.as_secs_f64()
@@ -825,35 +1140,6 @@ impl Output {
             }
         }
         let mut content = merged;
-        let report = content
-            .iter()
-            .filter_map(|block| block["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let maximum = tokens.saturating_mul(4).min(100 * 1024);
-        let characters: Vec<_> = report.chars().collect();
-        let mut full_output_path = None;
-        if characters.len() > maximum {
-            let (location, path) = match save_output("pi-output-", ".txt", report.as_bytes()) {
-                Ok(path) => (format!("Full output: {path}"), Some(path)),
-                Err(error) => (format!("Could not save the full output: {error}"), None),
-            };
-            full_output_path = path;
-            let head = maximum / 2;
-            let tail = maximum - head;
-            let report = format!(
-                "Warning: truncated output (original token count: {})\nTotal output lines: {}\n\n{}…{} tokens truncated…{}\n\n[{location}]",
-                characters.len().div_ceil(4),
-                report.lines().count(),
-                characters[..head].iter().collect::<String>(),
-                (characters.len() - maximum).div_ceil(4),
-                characters[characters.len() - tail..]
-                    .iter()
-                    .collect::<String>()
-            );
-            content.retain(|block| block["type"] == "image");
-            content.insert(0, json!({"type":"text","text":report}));
-        }
         let text_size = content
             .iter()
             .filter(|block| block["type"] == "text")
@@ -876,11 +1162,14 @@ impl Output {
         if omitted != 0 {
             content.push(json!({"type":"text","text":format!("{omitted} image(s) omitted from inline output because of the result size limit. Image locations and save errors are included in the text output.")}));
         }
-        let mut result = json!({"content":content,"isError":!success,"full_output_path":full_output_path,"wall_time_seconds":elapsed.as_secs_f64()});
+        let mut result = json!({"content":content,"isError":!success,"full_output_path":null,"wall_time_seconds":elapsed.as_secs_f64()});
         if self.model_usage.measured() {
             result["usage"] = json!(self.model_usage);
         }
-        result
+        Some(FormattedOutput {
+            value: result,
+            transcript: None,
+        })
     }
 }
 
@@ -1500,14 +1789,22 @@ mod tests {
     #[test]
     fn images_preserve_output_order_and_reuse_saved_files() {
         let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
-        let image = json!({"type":"image","mimeType":"image/png","data":data}).to_string();
         let mut output = Output::default();
-        output.emit("text", "before".into()).unwrap();
-        output.emit("image", image.clone()).unwrap();
-        output.emit("text", "between".into()).unwrap();
-        output.emit("image", image).unwrap();
-        output.emit("text", "after".into()).unwrap();
-        let value = output.finish(true, Duration::ZERO, None, 10000);
+        output.emit("text", "before".into(), "").unwrap();
+        output.emit("image", data.clone(), "image/png").unwrap();
+        output.emit("text", "between".into(), "").unwrap();
+        output.emit("image", data, "image/png").unwrap();
+        output.emit("text", "after".into(), "").unwrap();
+        let value = output
+            .finish(
+                true,
+                Duration::ZERO,
+                None,
+                10000,
+                &pi_rs_core::CancellationToken::new(),
+            )
+            .unwrap()
+            .deliver();
         let blocks = value["content"].as_array().unwrap();
         assert_eq!(
             blocks
@@ -1542,7 +1839,16 @@ mod tests {
             }],
             ..Output::default()
         };
-        let value = output.finish(true, Duration::ZERO, None, 10000);
+        let value = output
+            .finish(
+                true,
+                Duration::ZERO,
+                None,
+                10000,
+                &pi_rs_core::CancellationToken::new(),
+            )
+            .unwrap()
+            .deliver();
         assert_eq!(value["isError"], false);
         assert!(
             value["content"][0]["text"]
@@ -1551,6 +1857,283 @@ mod tests {
                 .contains("could not be saved")
         );
         assert_eq!(value["content"][1]["type"], "image");
+    }
+    #[test]
+    fn incremental_report_matches_untruncated_content() {
+        let output = Output {
+            items: vec![
+                Item::Text("first\n".into()),
+                Item::Text("".into()),
+                Item::Image {
+                    mime: "image/png".into(),
+                    data: "image".into(),
+                    path: Err("unavailable".into()),
+                },
+                Item::Text("\nlast".into()),
+            ],
+            console: vec!["界".into(), "😀\nnext".into()],
+            ..Output::default()
+        };
+        let mut streamed = String::new();
+        output.visit_report(false, Duration::ZERO, Some("failure"), |part| {
+            streamed.push_str(part)
+        });
+        let result = output
+            .finish(
+                false,
+                Duration::ZERO,
+                Some("failure"),
+                10000,
+                &pi_rs_core::CancellationToken::new(),
+            )
+            .unwrap()
+            .deliver();
+        let expected = result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(streamed, expected);
+        let truncated = output
+            .finish(
+                false,
+                Duration::ZERO,
+                Some("failure"),
+                5,
+                &pi_rs_core::CancellationToken::new(),
+            )
+            .unwrap()
+            .deliver();
+        let path = truncated["full_output_path"].as_str().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn output_counts_utf16_units_across_text_console_and_image() {
+        let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
+        let mut output = Output {
+            utf16_units: MAX_OUTPUT - data.len() - 3,
+            ..Output::default()
+        };
+        output.emit("text", "界".into(), "").unwrap();
+        output.emit("console", "😀".into(), "").unwrap();
+        output.emit("image", data, "image/png").unwrap();
+        assert_eq!(output.utf16_units, MAX_OUTPUT);
+        assert!(!output.limit_exceeded);
+        assert!(output.emit("text", "a".into(), "").is_err());
+        assert!(output.limit_exceeded);
+        for path in output.saved_images.values().flatten() {
+            std::fs::remove_file(path).unwrap();
+        }
+        let mut output = Output {
+            utf16_units: MAX_OUTPUT - 1,
+            ..Output::default()
+        };
+        assert!(output.emit("text", "😀".into(), "").is_err());
+        assert_eq!(output.utf16_units, MAX_OUTPUT + 1);
+    }
+
+    #[tokio::test]
+    async fn unicode_output_boundary_is_enforced_by_script_runtime() {
+        for (code, expected_success) in [
+            ("text('界'); console.log('😀')", true),
+            ("text('界'); console.log('😀'); text('a')", false),
+        ] {
+            let sink = Arc::new(Mutex::new(Output {
+                utf16_units: MAX_OUTPUT - 3,
+                ..Output::default()
+            }));
+            let result = evaluate(
+                code,
+                json!({}),
+                Arc::new(Host),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: Default::default(),
+                },
+                Some(Duration::from_secs(10)),
+                sink.clone(),
+            )
+            .await;
+            assert_eq!(result.is_ok(), expected_success);
+            assert_eq!(sink.lock().unwrap().limit_exceeded, !expected_success);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_limit_counts_base64_payload_not_wrapper() {
+        let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
+        let sink = Arc::new(Mutex::new(Output {
+            utf16_units: MAX_OUTPUT - data.len(),
+            ..Output::default()
+        }));
+        let code =
+            format!("image({{type:'image', mimeType:'image/png', data:'{data}', extra:'界😀'}})");
+        let result = evaluate(
+            &code,
+            json!({}),
+            Arc::new(Host),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            Some(Duration::from_secs(10)),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        let output = sink.lock().unwrap();
+        assert_eq!(output.utf16_units, MAX_OUTPUT);
+        for path in output.saved_images.values().flatten() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_size_multibyte_output_is_accepted() {
+        let sink = Arc::new(Mutex::new(Output::default()));
+        let result = evaluate(
+            "text('界'.repeat(16 * 1024 * 1024))",
+            json!({}),
+            Arc::new(Host),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            Some(Duration::from_secs(30)),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        let output = sink.lock().unwrap();
+        assert_eq!(output.utf16_units, MAX_OUTPUT);
+        assert!(matches!(&output.items[..], [Item::Text(text)] if text.len() == 3 * MAX_OUTPUT));
+    }
+
+    #[tokio::test]
+    async fn full_invocation_streams_maximum_multibyte_output() {
+        let reply = tokio::time::timeout(Duration::from_secs(30), ScriptTool { timeout: None }.invoke_transaction(
+            json!({"code":"// @options: {\"max_output_tokens\":10}\ntext('界'.repeat(16 * 1024 * 1024));"}),
+            ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: Default::default() },
+            None, Arc::new(Host),
+        )).await.expect("large output stalled");
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("expected success")
+        };
+        let report = data["content"][0]["text"].as_str().unwrap();
+        assert!(report.contains("Warning: truncated output"));
+        assert!(report.contains("界"));
+        assert!(report.len() < 4096);
+        let path = data["full_output_path"].as_str().unwrap();
+        assert!(std::fs::metadata(path).unwrap().len() >= (3 * MAX_OUTPUT) as u64);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn dropped_formatting_keeps_worker_bounded_and_removes_transcript() {
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = workers.clone().acquire_owned().await.unwrap();
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let (created, path) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                let _cancel_on_drop = cancellation.clone().drop_guard();
+                let output = tokio::task::spawn_blocking(move || {
+                    with_worker_permit(permit, || {
+                        let mut output = Output::default();
+                        output.emit("text", "界".repeat(1000), "").unwrap();
+                        let formatted = output
+                            .finish(true, Duration::ZERO, None, 1, &cancellation)
+                            .unwrap();
+                        created
+                            .send(
+                                formatted.value["full_output_path"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned(),
+                            )
+                            .unwrap();
+                        blocked.recv().unwrap();
+                        formatted
+                    })
+                })
+                .await
+                .unwrap();
+                output.deliver()
+            }
+        });
+        let path = path.await.unwrap();
+        assert!(std::path::Path::new(&path).exists());
+        assert!(workers.clone().try_acquire_owned().is_err());
+        task.abort();
+        let _ = task.await;
+        assert!(cancellation.is_cancelled());
+        assert!(workers.clone().try_acquire_owned().is_err());
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(5), workers.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::path::Path::new(&path).exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("undelivered transcript was retained");
+    }
+
+    #[test]
+    fn formatting_checks_cancellation_between_utf8_safe_chunks() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let mut chunks = 0;
+        visit_chunks(&"界".repeat(100_000), &cancellation, |chunk| {
+            assert!(chunk.len() <= 64 * 1024);
+            chunks += 1;
+            cancellation.cancel();
+        });
+        assert_eq!(chunks, 1);
+    }
+    #[test]
+    fn cancellation_after_keep_before_commit_removes_transcript() {
+        let token = pi_rs_core::CancellationToken::new();
+        let mut output = Output::default();
+        output.emit("text", "界".repeat(1000), "").unwrap();
+        let formatted = output
+            .finish(true, Duration::ZERO, None, 1, &token)
+            .unwrap();
+        let path = formatted.value["full_output_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut publication = formatted.publish();
+        assert!(std::path::Path::new(&path).exists());
+        token.cancel();
+        assert!(!publication.commit_if_active(&token));
+        drop(publication);
+        assert!(!std::path::Path::new(&path).exists());
+
+        let token = pi_rs_core::CancellationToken::new();
+        let formatted = output
+            .finish(true, Duration::ZERO, None, 1, &token)
+            .unwrap();
+        let path = formatted.value["full_output_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut publication = formatted.publish();
+        assert!(publication.commit_if_active(&token));
+        token.cancel();
+        drop(publication);
+        assert!(std::path::Path::new(&path).exists());
+        std::fs::remove_file(path).unwrap();
     }
 
     struct DeadlineModel;

@@ -1,7 +1,7 @@
 (() => {
     const stringify = value => typeof value === "string" ? value : JSON.stringify(value) ?? String(value);
-    const emit = (kind, value) => {
-        const error = __emit(kind, value);
+    const emit = (kind, value, mimeType = "") => {
+        const error = __emit(kind, value, mimeType);
         if (error) throw new Error(error);
     };
     globalThis.text = value => emit("text", stringify(value));
@@ -13,7 +13,7 @@
             value = { type: "image", mimeType: match[1], data: match[2].replace(/\s/g, "") };
         }
         if (!value || value.type !== "image" || typeof value.data !== "string") throw new Error("invalid image block");
-        emit("image", JSON.stringify(value));
+        emit("image", value.data, typeof value.mimeType === "string" ? value.mimeType : "");
     };
     globalThis.console = Object.freeze(Object.fromEntries(["log", "info", "warn", "error", "debug"].map(name => [name, (...args) => emit("console", args.map(stringify).join(" "))])));
     const values = Object.create(null);
