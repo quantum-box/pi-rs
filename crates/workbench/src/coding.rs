@@ -1,7 +1,7 @@
 //! Local coding tools. Hosted callers opt into their own execution profile.
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -422,10 +422,21 @@ impl Extension for CodingTools {
 /// and normalized relative to the configured working directory. Implementations
 /// are responsible for enforcing any remote access policy and for cancelling work
 /// when their futures are dropped.
+/// A seekable blocking reader consumed on the blocking worker pool.
+pub trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
 #[async_trait::async_trait]
 pub trait ReadOperations: Send + Sync {
     async fn access(&self, path: &Path) -> Result<()>;
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
+    /// Optionally provide a seekable reader so large files need not be buffered
+    /// in memory. Reader methods run on a blocking worker and must return in
+    /// bounded time; cancellation is observed between reads. When absent,
+    /// `read_file` is used.
+    async fn open_file(&self, _path: &Path) -> Result<Option<Box<dyn ReadSeek>>> {
+        Ok(None)
+    }
     async fn detect_image_mime_type(&self, _path: &Path) -> Result<Option<String>> {
         Ok(None)
     }
@@ -445,6 +456,10 @@ impl ReadOperations for LocalReadOperations {
     }
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
         Ok(tokio::fs::read(path).await?)
+    }
+    async fn open_file(&self, path: &Path) -> Result<Option<Box<dyn ReadSeek>>> {
+        let file = tokio::fs::File::open(path).await?.into_std().await;
+        Ok(Some(Box::new(file)))
     }
     async fn detect_image_mime_type(&self, path: &Path) -> Result<Option<String>> {
         let path = path.to_owned();
@@ -507,16 +522,21 @@ impl Tool for RemoteReadTool {
             let path = crate::coding_paths::resolve(&self.tool.root, &input);
             self.operations.access(&path).await?;
             let mime = self.operations.detect_image_mime_type(&path).await?;
-            let bytes = self.operations.read_file(&path).await?;
+            let source: Box<dyn ReadSeek> = match self.operations.open_file(&path).await? {
+                Some(reader) => reader,
+                None => Box::new(Cursor::new(self.operations.read_file(&path).await?)),
+            };
             let tool = self.tool.clone();
             let token = cancellation.clone();
             tokio::task::spawn_blocking(move || -> Result<Outcome> {
                 if token.is_cancelled() { return Err(Error::Cancelled); }
                 if let Some(mime) = mime {
-                    if bytes.len() > 20 * 1024 * 1024 { return Err(Error::Config("image exceeds 20 MiB".into())); }
+                    let mut source = source;
+                    if source.seek(SeekFrom::End(0))? > 20 * 1024 * 1024 { return Err(Error::Config("image exceeds 20 MiB".into())); }
+                    source.seek(SeekFrom::Start(0))?;
                     let format = image::ImageFormat::from_mime_type(&mime)
                         .ok_or_else(|| Error::Config(format!("unsupported image MIME type: {mime}")))?;
-                    let reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+                    let reader = image::ImageReader::with_format(std::io::BufReader::new(source), format);
                     let mut data = tool.process_image(&path, reader, format)?;
                     if matches!(tool.kind, Kind::Read { model_supports_images: Some(false), .. })
                         && let Some(note) = data["content"][0]["text"].as_str() {
@@ -526,7 +546,7 @@ impl Tool for RemoteReadTool {
                 } else {
                     let offset = usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1)).unwrap_or(usize::MAX);
                     let limit = args["limit"].as_u64().map(|n| usize::try_from(n).unwrap_or(usize::MAX));
-                    crate::text_page::read_from(std::io::BufReader::new(Cursor::new(bytes)), &name, offset, limit, &token)
+                    crate::text_page::read_from(std::io::BufReader::new(source), &name, offset, limit, &token)
                 }
             }).await.map_err(|error| Error::Config(error.to_string()))?
         };

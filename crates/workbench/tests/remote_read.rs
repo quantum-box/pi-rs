@@ -184,3 +184,75 @@ async fn remote_read_uses_shared_truncation_and_image_processing() {
         matches!(result, Outcome::Structured { data, .. } if data["content"][1]["mimeType"] == "image/png")
     );
 }
+
+struct StreamOnly;
+struct ChunkReader(std::io::Cursor<Vec<u8>>);
+impl std::io::Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        assert!(buf.len() <= 8192, "reader must use bounded buffers");
+        std::io::Read::read(&mut self.0, buf)
+    }
+}
+impl std::io::Seek for ChunkReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.0, pos)
+    }
+}
+#[async_trait::async_trait]
+impl ReadOperations for StreamOnly {
+    async fn access(&self, _: &Path) -> Result<()> {
+        Ok(())
+    }
+    async fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
+        panic!("streaming backend must not buffer whole file")
+    }
+    async fn open_file(
+        &self,
+        _: &Path,
+    ) -> Result<Option<Box<dyn pi_rs_workbench::coding::ReadSeek>>> {
+        Ok(Some(Box::new(ChunkReader(std::io::Cursor::new(
+            "line\n".repeat(30_000).into_bytes(),
+        )))))
+    }
+}
+#[tokio::test]
+async fn streaming_backend_uses_bounded_pagination_buffers() {
+    let tool = create_read_tool(Path::new("/remote"), Arc::new(StreamOnly)).unwrap();
+    let result = tool
+        .invoke(
+            json!({"path":"long", "offset":2, "limit":2}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: CancellationToken::new(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Outcome::Succeeded(text) if text.starts_with("line\nline\n\n[") && text.contains("offset=4"))
+    );
+}
+
+#[tokio::test]
+async fn injectable_local_adapter_rejects_large_image_and_pages_text() {
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("large.txt"), "line\n".repeat(100_000)).unwrap();
+    let mut image = std::fs::File::create(root.path().join("large.png")).unwrap();
+    image.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+    image.set_len(20 * 1024 * 1024 + 1).unwrap();
+    let tool = create_read_tool(
+        root.path(),
+        Arc::new(pi_rs_workbench::coding::LocalReadOperations),
+    )
+    .unwrap();
+    let context = || ToolContext {
+        operation_id: uuid::Uuid::new_v4(),
+        cancellation: CancellationToken::new(),
+    };
+    assert!(
+        matches!(tool.invoke(json!({"path":"large.txt", "offset":1000, "limit":2}), context()).await, Outcome::Succeeded(text) if text.starts_with("line\nline\n\n[") && text.contains("offset=1002"))
+    );
+    assert!(
+        matches!(tool.invoke(json!({"path":"large.png"}), context()).await, Outcome::Failed(text) if text.contains("image exceeds 20 MiB"))
+    );
+}

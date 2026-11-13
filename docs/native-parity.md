@@ -458,8 +458,12 @@ Native hosts can inject asynchronous `ReadOperations` through
 `CodingTools::local(...).with_read_operations(...)` or create an independent
 model-facing tool with `create_read_tool`. Access, optional image detection,
 and file bytes come from the backend; model read pagination, image conversion,
-output limits, and cancellation remain host-owned. Dropping an operation future
-must cancel backend work. The factory uses unrestricted Pi path semantics and
+output limits, and cancellation remain host-owned. Backends may provide a
+seekable reader through `open_file` to avoid buffering the complete file; the
+local operations adapter uses this path and checks image size before decoding.
+Backends that provide only `read_file` still return a complete in-memory buffer.
+Dropping an operation future must cancel backend work. Blocking reader methods
+must themselves return in bounded time; cancellation stops scans between reads. The factory uses unrestricted Pi path semantics and
 the backend enforces its own access policy. Scoped `CodingTools::new` rejects
 custom operations because local canonicalization cannot establish remote
 symlink boundaries. This injection does not affect attachments or other tools.
