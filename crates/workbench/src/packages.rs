@@ -372,10 +372,18 @@ fn local_startup_manifest(root: &Path) -> Result<Value> {
             .and_then(|value| value.get("pi"));
         return Ok(json!({"pi": metadata}));
     }
-    if root.join("package.json").is_file() {
-        return read_pi_package_json(&root.join("package.json"));
+    Ok(read_optional_pi_package_json(root)?.unwrap_or_else(|| json!({})))
+}
+
+// A present manifest is authoritative, even when it is unreadable, a broken
+// symlink, or not a regular file. Never treat an inspection failure as absence.
+fn read_optional_pi_package_json(root: &Path) -> Result<Option<Value>> {
+    let path = root.join("package.json");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => read_pi_package_json(&path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::Config(format!("{}: {error}", path.display()))),
     }
-    Ok(json!({}))
 }
 
 // Pi packages describe resources in package.json's `pi` object. Never run
@@ -383,14 +391,23 @@ fn local_startup_manifest(root: &Path) -> Result<Value> {
 fn read_pi_package_json(path: &Path) -> Result<Value> {
     let bytes = std::fs::read(path)?;
     let value: Value =
-        serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))?;
+        serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
+            .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
     if !value.is_object() {
         return Err(Error::Config(format!(
             "{} must contain an object",
             path.display()
         )));
     }
-    let pi = value.get("pi").filter(|pi| pi.is_object());
+    let pi = match value.get("pi") {
+        Some(pi) if !pi.is_object() => {
+            return Err(Error::Config(format!(
+                "{}: pi must contain an object",
+                path.display()
+            )));
+        }
+        pi => pi,
+    };
     let explicit = pi.is_some_and(|pi| {
         ["extensions", "skills", "prompts", "themes"]
             .iter()
@@ -935,8 +952,8 @@ async fn install(source: &str, offline: bool) -> Result<Installed> {
     }
     let mut manifest = if root.join("pi-package.json").is_file() {
         config::read_object(&root.join("pi-package.json"))?
-    } else if !root.join("Cargo.toml").is_file() && root.join("package.json").is_file() {
-        read_pi_package_json(&root.join("package.json")).unwrap_or_else(|_| json!({}))
+    } else if !root.join("Cargo.toml").is_file() {
+        read_optional_pi_package_json(&root)?.unwrap_or_else(|| json!({}))
     } else {
         json!({})
     };
@@ -1702,6 +1719,18 @@ fn scaffold(path: &Path, dev_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn broken_pi_manifest_symlink_is_not_treated_as_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            directory.path().join("missing"),
+            directory.path().join("package.json"),
+        )
+        .unwrap();
+        assert!(read_optional_pi_package_json(directory.path()).is_err());
+    }
+
     #[test]
     fn explicitly_named_theme_file_bypasses_ignore_rules() {
         let directory = tempfile::tempdir().unwrap();
@@ -1712,8 +1741,8 @@ mod tests {
         std::fs::write(root.join(".ignore"), "assets/\n").unwrap();
         let manifest = json!({"themes":["assets/ignored.json"]});
         assert_eq!(
-            collect_package_themes(root, &manifest).unwrap(),
-            [theme.clone()]
+            collect_package_themes(root, &manifest).unwrap().as_slice(),
+            std::slice::from_ref(&theme)
         );
         assert_eq!(
             collect_package_resources(root, &manifest, Vec::new())

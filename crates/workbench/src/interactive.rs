@@ -8062,6 +8062,59 @@ mod tests {
             index_text.contains("pi-package"),
             "package must actually be prepared"
         );
+
+        // Present but malformed or unreadable manifests must never be treated
+        // as absent and trigger conventional executable discovery.
+        for case in ["malformed", "unreadable", "invalid-pi", "invalid-root"] {
+            let invalid_source = home.join(format!("invalid-{case}"));
+            std::fs::create_dir_all(invalid_source.join("extensions")).unwrap();
+            let unexpected = invalid_source.join("extensions/unexpected");
+            std::fs::write(
+                &unexpected,
+                format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&unexpected, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            match case {
+                "malformed" => {
+                    std::fs::write(invalid_source.join("package.json"), "{not valid JSON").unwrap()
+                }
+                "invalid-pi" => {
+                    std::fs::write(invalid_source.join("package.json"), r#"{"pi":"invalid"}"#)
+                        .unwrap()
+                }
+                "invalid-root" => {
+                    std::fs::write(invalid_source.join("package.json"), "[]").unwrap()
+                }
+                _ => {
+                    // Reading a directory as a file fails on all supported platforms.
+                    std::fs::create_dir(invalid_source.join("package.json")).unwrap();
+                }
+            }
+            std::fs::write(
+                home.join("settings.json"),
+                serde_json::json!({"packages":[invalid_source]}).to_string(),
+            )
+            .unwrap();
+            let before = std::fs::read(&index).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::super::packages::prepare(&args))
+                .unwrap();
+            assert!(!sentinel.exists(), "{case} manifest executed an extension");
+            assert_eq!(
+                std::fs::read(&index).unwrap(),
+                before,
+                "{case} package was indexed"
+            );
+        }
     }
 
     #[test]
