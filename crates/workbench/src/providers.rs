@@ -643,6 +643,12 @@ impl Client {
             }
             Self::Bedrock(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let thinking = thinking.or_else(|| {
+                    metadata
+                        .as_ref()
+                        .filter(|model| model.reasoning == Some(true))
+                        .map(|_| "off")
+                });
                 let mapped = thinking.and_then(|level| {
                     metadata
                         .as_ref()
@@ -758,7 +764,9 @@ mod bedrock_tests {
                 {"id":"anthropic.claude-opus-4-8","name":"Claude Opus 4.8","reasoning":true,"thinkingLevelMap":{"xhigh":"high"}},
                 {"id":"anthropic.claude-sonnet-4-6","name":"Claude Sonnet 4.6","reasoning":true,"compat":{"supportsLongCacheRetention":true}},
                 {"id":"openai.gpt-5-test","reasoning":true,"thinkingLevelMap":{"off":"none"}},
-                {"id":"openai.gpt-5-null","reasoning":true,"thinkingLevelMap":{"off":null}}
+                {"id":"openai.gpt-5-null","reasoning":true,"thinkingLevelMap":{"off":null}},
+                {"id":"openai.gpt-5-unmapped","reasoning":true},
+                {"id":"openai.gpt-5-nonreason","reasoning":false,"thinkingLevelMap":{"off":"none"}}
             ]}}})).unwrap();
             args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
             let request = |model: &str| ModelRequest {
@@ -807,6 +815,22 @@ mod bedrock_tests {
                     .await
                     .unwrap();
             }
+            for model in [
+                "openai.gpt-5-test",
+                "openai.gpt-5-null",
+                "openai.gpt-5-unmapped",
+                "openai.gpt-5-nonreason",
+            ] {
+                args.model = model.into();
+                args.thinking = None;
+                let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let _stream = client
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .await
+                    .unwrap();
+            }
             args.model_profiles=super::super::model_profiles::Profiles::parse(&json!({"providers":{"amazon-bedrock":{"compat":{"supportsLongCacheRetention":true},"models":[{"id":"anthropic.claude-opus-4-8","name":"Claude Opus 4.8","reasoning":true,"compat":{"supportsLongCacheRetention":false}}]}}})).unwrap();
             args.model = "anthropic.claude-opus-4-8".into();
             args.thinking = Some("high".into());
@@ -843,7 +867,7 @@ mod bedrock_tests {
             .unwrap();
         let server = async {
             let mut requests = Vec::new();
-            for _ in 0..6 {
+            for _ in 0..10 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut buf = [0; 8192];
@@ -912,7 +936,14 @@ mod bedrock_tests {
         );
         assert!(requests[4].get("additionalModelRequestFields").is_none());
         assert_eq!(
-            requests[5]["system"][1]["cachePoint"],
+            requests[5]["additionalModelRequestFields"]["reasoning"]["effort"],
+            "none"
+        );
+        assert!(requests[6].get("additionalModelRequestFields").is_none());
+        assert!(requests[7].get("additionalModelRequestFields").is_none());
+        assert!(requests[8].get("additionalModelRequestFields").is_none());
+        assert_eq!(
+            requests[9]["system"][1]["cachePoint"],
             json!({"type":"default"})
         );
     }
