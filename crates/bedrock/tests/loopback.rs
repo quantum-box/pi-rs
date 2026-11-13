@@ -831,7 +831,7 @@ async fn configured_header_secrets_are_redacted_from_service_errors() {
             let mut buffer = [0; 8192];
             let _ = socket.read(&mut buffer).await.unwrap();
             let body =
-                br#"{"message":"rejected header confidential-route-987 and fallback-token-654"}"#;
+                br#"{"message":"rejected header confidential-route-987 and second-route-321 and fallback-token-654"}"#;
             if streaming {
                 let frame = Frame::new(bytes::Bytes::from_static(body))
                     .add_header(Header::new(
@@ -869,6 +869,10 @@ async fn configured_header_secrets_are_redacted_from_service_errors() {
                 "x-route",
                 http::HeaderValue::from_static("confidential-route-987"),
             );
+            headers.append(
+                "x-route",
+                http::HeaderValue::from_static("second-route-321"),
+            );
         }
         let mut defaults = http::HeaderMap::new();
         if protected {
@@ -899,6 +903,7 @@ async fn configured_header_secrets_are_redacted_from_service_errors() {
         if protected {
             assert!(message.contains("[REDACTED]"), "{message}");
             assert!(!message.contains("confidential-route-987"), "{message}");
+            assert!(!message.contains("second-route-321"), "{message}");
             assert!(!message.contains("fallback-token-654"), "{message}");
         } else {
             assert!(message.contains("confidential-route-987"), "{message}");
@@ -910,6 +915,10 @@ async fn configured_header_secrets_are_redacted_from_service_errors() {
             assert!(
                 !trace.contains("confidential-route-987"),
                 "secret leaked in SDK trace"
+            );
+            assert!(
+                !trace.contains("second-route-321"),
+                "second secret leaked in SDK trace"
             );
             assert!(
                 !trace.contains("fallback-token-654"),

@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone)]
 pub struct Bedrock {
     client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
-    headers: BTreeMap<String, String>,
+    headers: BTreeMap<String, Vec<String>>,
     unsupported: Option<String>,
     bearer: Option<String>,
     force_sigv4: bool,
@@ -1135,6 +1135,7 @@ impl Model for Bedrock {
         let mut secrets: Vec<_> = self
             .headers
             .values()
+            .flatten()
             .filter(|value| !value.is_empty())
             .cloned()
             .collect();
@@ -1302,6 +1303,19 @@ mod tests {
         let b = identity("private-b", "ignored-a").await;
         assert_eq!(a, same);
         assert_ne!(a, b);
+        let mut repeated = http::HeaderMap::new();
+        repeated.append("x-context", http::HeaderValue::from_static("private-a"));
+        repeated.append("x-context", http::HeaderValue::from_static("private-b"));
+        let repeated_identity = Bedrock::from_sdk_config(config)
+            .with_headers(repeated)
+            .unwrap()
+            .prepare_bedrock()
+            .await
+            .unwrap()
+            .unwrap()
+            .context_identity()
+            .unwrap();
+        assert_ne!(a, repeated_identity);
         assert!(!a.contains("private-a"));
     }
 

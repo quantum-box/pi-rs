@@ -1,8 +1,10 @@
 //! Pi-compatible Bedrock request-header filtering.
 use std::collections::BTreeMap;
 
-pub(crate) fn filtered(headers: http::HeaderMap) -> pi_rs_core::Result<BTreeMap<String, String>> {
-    let mut result = BTreeMap::new();
+pub(crate) fn filtered(
+    headers: http::HeaderMap,
+) -> pi_rs_core::Result<BTreeMap<String, Vec<String>>> {
+    let mut result: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, value) in headers.iter() {
         let name = name.as_str();
         if name == "authorization" || name == "host" || name.starts_with("x-amz-") {
@@ -11,7 +13,10 @@ pub(crate) fn filtered(headers: http::HeaderMap) -> pi_rs_core::Result<BTreeMap<
         let value = value
             .to_str()
             .map_err(|_| pi_rs_core::Error::Config("invalid Bedrock custom header value".into()))?;
-        result.insert(name.to_owned(), value.to_owned());
+        result
+            .entry(name.to_owned())
+            .or_default()
+            .push(value.to_owned());
     }
     Ok(result)
 }
@@ -19,7 +24,7 @@ pub(crate) fn filtered(headers: http::HeaderMap) -> pi_rs_core::Result<BTreeMap<
 /// Replace only the SDK header map, retaining request extensions of either HTTP version.
 pub(crate) fn apply(
     request: &mut aws_smithy_runtime_api::client::orchestrator::HttpRequest,
-    headers: &BTreeMap<String, String>,
+    headers: &BTreeMap<String, Vec<String>>,
 ) {
     if headers.is_empty() {
         return;
@@ -35,13 +40,14 @@ pub(crate) fn apply(
             value,
         );
     }
-    for (name, value) in headers {
-        let mut value = http::HeaderValue::from_str(value).expect("validated header value");
-        value.set_sensitive(true);
-        map.insert(
-            http::HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
-            value,
-        );
+    for (name, values) in headers {
+        let name = http::HeaderName::from_bytes(name.as_bytes()).expect("validated header name");
+        map.remove(&name);
+        for value in values {
+            let mut value = http::HeaderValue::from_str(value).expect("validated header value");
+            value.set_sensitive(true);
+            map.append(name.clone(), value);
+        }
     }
     *request.headers_mut() =
         aws_smithy_runtime_api::http::Headers::try_from(map).expect("validated headers");
@@ -104,6 +110,35 @@ impl tracing::Subscriber for SigningTraceGuard {
 mod tests {
     use super::*;
     #[test]
+    fn repeated_custom_values_replace_all_existing_values() {
+        let mut original = http::Request::new(aws_smithy_types::body::SdkBody::empty());
+        original
+            .headers_mut()
+            .append("x-custom", http::HeaderValue::from_static("sdk-first"));
+        original
+            .headers_mut()
+            .append("x-custom", http::HeaderValue::from_static("sdk-second"));
+        let mut request = aws_smithy_runtime_api::http::Request::try_from(original).unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-custom", http::HeaderValue::from_static("first"));
+        headers.append("x-custom", http::HeaderValue::from_static("second"));
+        headers.append("authorization", http::HeaderValue::from_static("ignored"));
+        let filtered = filtered(headers).unwrap();
+        apply(&mut request, &filtered);
+        let result = request.try_into_http1x().unwrap();
+        let values: Vec<_> = result.headers().get_all("x-custom").iter().collect();
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(values.iter().all(|value| value.is_sensitive()));
+        assert!(!result.headers().contains_key("authorization"));
+    }
+
+    #[test]
     fn preserves_http02_extensions_with_and_without_custom_headers() {
         for custom in [false, true] {
             let mut original = http02::Request::new(aws_smithy_types::body::SdkBody::empty());
@@ -118,7 +153,7 @@ mod tests {
                 .append("x-existing", http02::HeaderValue::from_static("two"));
             let mut request = aws_smithy_runtime_api::http::Request::try_from(original).unwrap();
             let headers = if custom {
-                [("x-custom".into(), "private".into())]
+                [("x-custom".into(), vec!["private".into()])]
                     .into_iter()
                     .collect()
             } else {
@@ -141,7 +176,7 @@ mod tests {
         let mut request = aws_smithy_runtime_api::http::Request::try_from(original).unwrap();
         apply(
             &mut request,
-            &[("x-custom".into(), "private".into())]
+            &[("x-custom".into(), vec!["private".into()])]
                 .into_iter()
                 .collect(),
         );

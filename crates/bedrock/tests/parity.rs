@@ -560,7 +560,9 @@ async fn custom_headers_are_signed_and_cannot_override_authentication() {
             };
             let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
             assert!(headers.contains("x-custom: configured"), "{headers}");
+            assert!(headers.contains("configured-second"), "{headers}");
             assert!(headers.contains("x-default: fallback"), "{headers}");
+            assert!(headers.contains("fallback-second"), "{headers}");
             assert!(!headers.contains("evil-value"));
             assert!(!headers.contains("wrong-host"));
             if bearer {
@@ -596,6 +598,7 @@ async fn custom_headers_are_signed_and_cannot_override_authentication() {
             .build();
         let mut headers = HeaderMap::new();
         headers.insert("x-custom", HeaderValue::from_static("configured"));
+        headers.append("x-custom", HeaderValue::from_static("configured-second"));
         headers.insert(AUTHORIZATION, HeaderValue::from_static("evil-value"));
         headers.insert(HOST, HeaderValue::from_static("wrong-host"));
         headers.insert(
@@ -605,6 +608,7 @@ async fn custom_headers_are_signed_and_cannot_override_authentication() {
         let mut defaults = HeaderMap::new();
         defaults.insert("x-custom", HeaderValue::from_static("default"));
         defaults.insert("x-default", HeaderValue::from_static("fallback"));
+        defaults.append("x-default", HeaderValue::from_static("fallback-second"));
         let mut model = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config))
             .with_headers(headers)
             .unwrap()
