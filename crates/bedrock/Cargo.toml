@@ -1,0 +1,28 @@
+[package]
+name = "pi-rs-bedrock"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Amazon Bedrock Converse streaming adapter for pi-rs"
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
+aws-smithy-runtime-api = "1"
+aws-config = { version = "=1.8.1", features = ["behavior-version-latest"] }
+aws-sdk-bedrockruntime = "=1.124.0"
+aws-smithy-types = "1"
+aws-types = "1"
+futures-util = "0.3"
+pi-rs-core = { path = "../core", version = "0.1.0" }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+uuid = "1"
+
+[dev-dependencies]
+aws-credential-types = "1"
+aws-smithy-eventstream = "0.60"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt", "net", "io-util", "time"] }

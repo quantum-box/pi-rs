@@ -3337,3 +3337,68 @@ is retained for inspection, while the imported context and forks retain the
 correct post-compaction messages. A boundary at the compaction itself, or at a
 later unassigned v1 entry, retains no earlier messages. Other legacy session variants remain subject
 to the session import limitations above.
+
+### Amazon Bedrock ConverseStream
+
+The `amazon-bedrock` provider uses the AWS SDK's standard region and credential
+chain, including `AWS_PROFILE`, shared AWS configuration, temporary role
+credentials, and credential refresh. It also accepts `AWS_BEARER_TOKEN_BEDROCK`
+or a configured API key as a Bedrock bearer token. The optional library feature
+is `bedrock`.
+
+The bundled Pi 1.5.0 chat model catalog provides offline model selection and
+metadata, including pricing. It is a static snapshot, not an account-specific
+list of enabled models. The runtime uses the configured AWS region rather than
+pinning the catalog's default endpoint.
+
+Text, user images, structured tool-result images, tool calls and results,
+streamed reasoning, stop reasons, and input/output/cache usage are supported.
+Signed and redacted reasoning is replayed in its original order only when the
+provider, model, text and tool calls still match, including the journal's
+normalization of malformed arguments. For application inference profile ARNs
+without a model family in the ID, set the model `name` in `models.json` (for
+example, `Claude Sonnet`) to enable Claude-specific signature and error-image
+handling. Images from Claude error results follow the grouped tool results.
+Tool-free summary requests retain tool history as text and pass structured
+images as image blocks. The SDK chooses the endpoint and signs requests or uses the
+bearer token. No AWS resources are created.
+
+Claude and GPT-family models support the Pi reasoning levels and configured
+thinking-level mappings. Claude uses adaptive thinking on the supported newer
+families and budgeted thinking on earlier models; GPT and GPT-OSS use their
+respective effort fields, including explicit mappings such as GPT `off` to
+`none`. The output limit supplied by the host remains a hard
+ceiling. Budgeted Claude thinking reserves at least 1,024 tokens for the answer
+and requires an output limit of at least 2,048; unlike Pi's simple API, this
+adapter does not increase the host's output budget automatically. Reasoning
+options for other model families are not sent, matching Pi's Bedrock adapter.
+Claude 5 models that default to adaptive thinking receive an explicit disabled
+setting when thinking is off, where supported. Fable 5, Mythos 5 and Opus 5.5
+cannot disable thinking; unset uses the model's adaptive default, explicit off
+returns a configuration error, and summaries use adaptive thinking at low
+effort. The output limit applies to thinking and answer combined, so thinking
+can reduce the space available for a summary. Sonnet 5.5 uses `between_tools`
+for tool-free summaries; with tools, explicit off fails and summaries use low
+adaptive effort because thinking can still occur between tool calls.
+
+For supported Claude models, the provider adds default five-minute cache
+checkpoints after the system content and at the end of the final user message.
+Set `PI_CACHE_RETENTION=long` to request one-hour checkpoints on models that
+support that TTL; otherwise the provider uses five-minute checkpoints.
+Workbench model and provider compatibility can explicitly override one-hour
+support, and library callers can use `with_cache_retention` and
+`with_long_cache_support`. Set
+`AWS_BEDROCK_FORCE_CACHE=1` when the model ID and configured name cannot identify
+a supported model; forcing checkpoints alone does not enable one-hour TTL.
+Tool-free summaries disable checkpoints and optional reasoning so
+that their smaller output limit remains usable. Cache usage includes
+one-hour write details when Bedrock reports them. Model support and minimum
+cacheable lengths are determined by Bedrock.
+
+Not yet supported: Pi's interactive AWS profile login/storage, non-image
+multimodal inputs, custom thinking budgets and display controls, tool
+choice/strict sampling, guardrails, prompt management ARNs, live account-specific
+model discovery, custom request headers, and workbench proxy/idle-timeout
+settings. Custom model endpoints in workbench configuration are rejected;
+callers embedding the adapter can pass a configured AWS SDK client, including a
+test endpoint, through `Bedrock::new`.
