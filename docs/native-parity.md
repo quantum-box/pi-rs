@@ -605,8 +605,9 @@ local profile. The corresponding `coding_tools_from` and `read_only_tools_from`
 functions select from a host-configured `CodingTools`, preserving its file-tool
 scope and options. The coding set's shell runs with the host process's permissions
 and is not sandboxed, including with a scoped file profile; hosts must apply their
-own shell policy. The read-only set rejects custom read operations because grep,
-find and ls still access the local filesystem. A set is an `Extension` and can be
+own shell policy. The coding set rejects custom read or write operations because
+edit and shell still run locally. The read-only set rejects custom read operations
+because grep, find and ls still access the local filesystem. A set is an `Extension` and can be
 registered directly with `Registry`; overlapping sets have duplicate tool names.
 
 ### Persistent runtime checkpoint

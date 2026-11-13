@@ -104,7 +104,7 @@ impl WriteOperations for Remote {
 }
 
 #[tokio::test]
-async fn configured_sets_keep_injected_operations_and_scope() {
+async fn configured_sets_reject_injected_operations_and_keep_scope() {
     let directory = tempfile::tempdir().unwrap();
     let backend = Arc::new(Remote::default());
     let configured = CodingTools::local(directory.path())
@@ -113,31 +113,13 @@ async fn configured_sets_keep_injected_operations_and_scope() {
         .unwrap()
         .with_write_operations(backend.clone())
         .unwrap();
-    let coding = coding_tools_from(&configured).unwrap().tools();
+    assert!(coding_tools_from(&configured).is_err());
     let error = match read_only_tools_from(&configured) {
         Ok(_) => panic!("mixed remote read and local search accepted"),
         Err(error) => error,
     };
     assert!(error.to_string().contains("custom read operations"));
-    let read = coding
-        .iter()
-        .find(|tool| tool.spec().name == "read")
-        .unwrap();
-    let write = coding
-        .iter()
-        .find(|tool| tool.spec().name == "write")
-        .unwrap();
-    assert!(
-        matches!(read.invoke(json!({"path":"remote"}), context()).await, Outcome::Succeeded(text) if text.contains("remote content"))
-    );
-    assert!(matches!(
-        write
-            .invoke(json!({"path":"remote","content":"hello"}), context())
-            .await,
-        Outcome::Succeeded(_)
-    ));
-    assert!(!directory.path().join("remote").exists());
-    assert_eq!(backend.calls.lock().unwrap().len(), 2);
+    assert!(backend.calls.lock().unwrap().is_empty());
     let scoped = CodingTools::new(directory.path()).unwrap();
     let read = read_only_tools_from(&scoped)
         .unwrap()
@@ -149,6 +131,45 @@ async fn configured_sets_keep_injected_operations_and_scope() {
         read.invoke(json!({"path":"../outside"}), context()).await,
         Outcome::Failed(_)
     ));
+}
+
+#[tokio::test]
+async fn remote_file_backends_cannot_expose_local_edit() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("host.txt");
+    std::fs::write(&path, "original").unwrap();
+    let backend = Arc::new(Remote::default());
+    let read_only = CodingTools::local(directory.path())
+        .unwrap()
+        .with_read_operations(backend.clone())
+        .unwrap();
+    let write_only = CodingTools::local(directory.path())
+        .unwrap()
+        .with_write_operations(backend.clone())
+        .unwrap();
+    let both = CodingTools::local(directory.path())
+        .unwrap()
+        .with_read_operations(backend.clone())
+        .unwrap()
+        .with_write_operations(backend)
+        .unwrap();
+    for source in [&read_only, &write_only, &both] {
+        if let Ok(set) = coding_tools_from(source) {
+            let edit = set
+                .tools()
+                .into_iter()
+                .find(|tool| tool.spec().name == "edit")
+                .unwrap();
+            let result = edit
+                .invoke(
+                    json!({"path":path, "edits":[{"oldText":"original","newText":"modified"}]}),
+                    context(),
+                )
+                .await;
+            panic!("mixed set exposed local edit: {result:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
 }
 
 #[test]

@@ -55,7 +55,11 @@ pub fn create_read_only_tools(cwd: &Path) -> Result<CodingToolSet> {
 
 /// Select the coding set from a host-configured profile, retaining its options.
 /// Scoped file tools do not restrict the shell, which is not sandboxed.
+/// Custom read or write operations are rejected while edit and shell are local.
 pub fn coding_tools_from(source: &CodingTools) -> Result<CodingToolSet> {
+    if source.has_custom_read_operations() || source.has_custom_write_operations() {
+        return Err(Error::Config("coding tool sets cannot combine custom read or write operations with local edit and shell tools".into()));
+    }
     let tools = source.tools();
     let shell = if tools.iter().any(|tool| tool.spec().name == "bash") {
         "bash"
