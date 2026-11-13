@@ -37,12 +37,40 @@ fn portable_request(request: &ModelRequest) -> ModelRequest {
 
 // Only used when the host-controlled wrapper never exposed mutable assistant
 // messages or the message container to the hook.
-fn retain_replay_after_safe_hook(original: &ModelRequest, updated: &mut ModelRequest) {
-    for (before, after) in original.messages.iter().zip(&mut updated.messages) {
-        if let (
-            Message::Assistant { replay: source, .. },
-            Message::Assistant { replay: target, .. },
-        ) = (before, after)
+fn retain_replay_after_safe_hook(
+    original: &ModelRequest,
+    updated: &mut ModelRequest,
+    edits: &[crate::ContextUserEdit],
+) {
+    let mut mapping: Vec<Option<usize>> = (0..original.messages.len()).map(Some).collect();
+    for edit in edits {
+        match edit {
+            crate::ContextUserEdit::Insert { index, .. } if *index <= mapping.len() => {
+                mapping.insert(*index, None)
+            }
+            crate::ContextUserEdit::Remove { index } if *index < mapping.len() => {
+                mapping.remove(*index);
+            }
+            _ => return,
+        }
+    }
+    if mapping.len() != updated.messages.len() {
+        return;
+    }
+    for (source, after) in mapping.iter().zip(&updated.messages) {
+        if let Some(index) = source
+            && let Message::Assistant { content, calls, .. } = &original.messages[*index]
+            && !matches!(after, Message::Assistant { content: other, calls: other_calls, .. } if content == other && calls == other_calls)
+        {
+            return;
+        }
+    }
+    for (source, after) in mapping.into_iter().zip(&mut updated.messages) {
+        if let Some(index) = source
+            && let (
+                Message::Assistant { replay: source, .. },
+                Message::Assistant { replay: target, .. },
+            ) = (&original.messages[index], after)
         {
             *target = source.clone();
         }
@@ -998,7 +1026,7 @@ impl Agent<'_> {
             let unsafe_access = access.assistant_accessed();
             hook(extension.as_ref(), result)?;
             if !unsafe_access {
-                retain_replay_after_safe_hook(&request, &mut portable);
+                retain_replay_after_safe_hook(&request, &mut portable, &access.user_edits());
             } else {
                 portable = portable_request(&portable);
             }
@@ -1022,7 +1050,7 @@ impl Agent<'_> {
             let unsafe_access = access.assistant_accessed();
             hook(extension.as_ref(), result)?;
             if !unsafe_access {
-                retain_replay_after_safe_hook(&request, &mut portable);
+                retain_replay_after_safe_hook(&request, &mut portable, &access.user_edits());
             } else {
                 portable = portable_request(&portable);
             }
@@ -4400,10 +4428,94 @@ mod request_privacy_tests {
         }
     }
 
+    struct SafeUserEdits {
+        after: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for SafeUserEdits {
+        fn id(&self) -> &str {
+            "safe-user-edits"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            if !self.after {
+                request.insert_user(
+                    1,
+                    Message::User {
+                        content: "inserted".into(),
+                    },
+                )?;
+                request.remove_user(2)?;
+            }
+            Ok(crate::ContextChange::Changed)
+        }
+        fn handles_context_with_system(&self) -> bool {
+            self.after
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            messages.insert_user(
+                1,
+                Message::User {
+                    content: "inserted".into(),
+                },
+            )?;
+            messages.remove_user(2)?;
+            Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    #[test]
+    fn tracked_user_operations_reject_assistant_insertion_and_removal() {
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "a".into(),
+                calls: vec![],
+                replay: None,
+            }],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let mut guarded = crate::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        assert!(guarded.remove_user(0).is_err());
+        assert!(
+            guarded
+                .insert_user(
+                    0,
+                    Message::Assistant {
+                        content: "a".into(),
+                        calls: vec![],
+                        replay: None
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            guarded
+                .insert_user(
+                    9,
+                    Message::User {
+                        content: "bad".into()
+                    }
+                )
+                .is_err()
+        );
+        assert!(access.user_edits().is_empty());
+    }
+
     #[tokio::test]
     async fn explicit_hook_status_preserves_default_noop_and_rejects_identical_replacement() {
         for text in ["same visible text", ""] {
-            for mode in [0, 1, 2, 3, 4, 5, 6, 7] {
+            for mode in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] {
                 let mut session = Session::with_store(MemoryStore::default()).unwrap();
                 session
                     .append(Event::User {
@@ -4450,6 +4562,10 @@ mod request_privacy_tests {
                     registry.register(Arc::new(SafeEdits)).unwrap();
                 } else if mode == 7 {
                     registry.register(Arc::new(SafeSystemHook)).unwrap();
+                } else if mode == 8 || mode == 9 {
+                    registry
+                        .register(Arc::new(SafeUserEdits { after: mode == 9 }))
+                        .unwrap();
                 } else {
                     registry
                         .register(Arc::new(ReplaceIdentical {
@@ -4488,8 +4604,8 @@ mod request_privacy_tests {
                     })
                     .collect();
                 assert_eq!(replay.len(), 2);
-                if mode == 0 || mode == 3 || mode == 6 || mode == 7 {
-                    assert_eq!(transformed, mode == 6 || mode == 7);
+                if mode == 0 || mode == 3 || mode == 6 || mode == 7 || mode == 8 || mode == 9 {
+                    assert_eq!(transformed, mode >= 6);
                     assert_eq!(replay[0].unwrap().blocks[0]["private"], "private-a");
                     assert_eq!(replay[1].unwrap().blocks[0]["private"], "private-b");
                 } else {

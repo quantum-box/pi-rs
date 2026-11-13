@@ -734,13 +734,20 @@ Provider replay stays private to the adapter; native and executable request
 hooks and request notifications receive portable copies. Host-tracked hook
 wrappers invalidate replay whenever a hook obtains general mutable access to
 assistant messages, irrespective of the hook's reported status or the resulting
-values. Narrow tool and system-content accessors retain replay. Executables can
+values. Narrow tool and system-content accessors, plus tracked insertion and
+removal of user messages, retain replay for untouched assistant messages.
+Executables can
 negotiate the versioned context protocol and return a payload-free unchanged
 response; the host retains its original request in that case. Executables set
-`context_provenance_v1` in their description, implement `context_v2`,
-`before_request_v2` and `context_with_system_v2`, and return either
-`{"change":"unchanged"}` or `{"change":"changed","value":...}`. An unchanged
-response cannot carry a value. Legacy protocol responses are treated as changed.
+`context_provenance_v1` for payload-free unchanged responses. Executables also
+advertising `context_safe_patch_v1` receive `context_v3`, `before_request_v3`
+and `context_with_system_v3` and can return `{"change":"safe_patch","patch":...}`.
+The v2 protocol supports unchanged or full replacement responses; full
+replacements use `{"change":"changed","value":...}`. A safe patch can replace tools or the
+leading system text and apply indexed user-message insertions or removals. The
+host validates it on a detached copy before applying tracked operations; it
+cannot replace or remove an assistant. An unchanged response cannot carry a
+value. Full replacements and legacy protocol responses are treated as changed.
 Native extension hook signatures use the tracked wrappers.
 Edited Anthropic, Google and OpenAI Responses thinking requires the recorded
 endpoint binding; chat-completions replay is also bound to the configured

@@ -148,6 +148,10 @@ enum ProtocolRequest {
         request: ModelRequest,
         state: Option<ExtensionState>,
     },
+    ContextV3 {
+        request: ModelRequest,
+        state: Option<ExtensionState>,
+    },
     Input {
         event: InputEvent,
         state: Option<ExtensionState>,
@@ -195,6 +199,15 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
     },
     ContextWithSystemV2 {
+        messages: Vec<Message>,
+        state: Option<ExtensionState>,
+    },
+    BeforeRequestV3 {
+        request: ModelRequest,
+        summary: bool,
+        state: Option<ExtensionState>,
+    },
+    ContextWithSystemV3 {
         messages: Vec<Message>,
         state: Option<ExtensionState>,
     },
@@ -326,12 +339,15 @@ struct Description {
     context_with_system_hook: bool,
     #[serde(default)]
     context_provenance_v1: bool,
+    #[serde(default)]
+    context_safe_patch_v1: bool,
 }
 #[derive(Serialize)]
 #[serde(tag = "change", rename_all = "snake_case")]
 enum ContextResponse<T> {
     Unchanged,
     Changed { value: T },
+    SafePatch { patch: ContextPatch },
 }
 impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for ContextResponse<T> {
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -348,6 +364,12 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for ContextResponse<T
             .as_deref()
         {
             Some("unchanged") if object.is_empty() => Ok(Self::Unchanged),
+            Some("safe_patch") if object.len() == 1 && object.contains_key("patch") => {
+                let patch = object.remove("patch").expect("checked patch");
+                serde_json::from_value(patch)
+                    .map(|patch| Self::SafePatch { patch })
+                    .map_err(serde::de::Error::custom)
+            }
             Some("changed") if object.len() == 1 && object.contains_key("value") => {
                 let payload = object.remove("value").expect("checked value");
                 serde_json::from_value(payload)
@@ -357,6 +379,158 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for ContextResponse<T
             _ => Err(serde::de::Error::custom("invalid context response")),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    user_edits: Vec<pi_rs_core::ContextUserEdit>,
+}
+
+fn validate_patch_limits(patch: &ContextPatch) -> ExtensionResult<()> {
+    if patch.user_edits.len() > 4096
+        || patch.tools.as_ref().is_some_and(|tools| tools.len() > 4096)
+        || serde_json::to_vec(patch)
+            .map_err(|_| "invalid context patch")?
+            .len()
+            > 8 * 1024 * 1024
+    {
+        return Err("context patch exceeds limits".into());
+    }
+    Ok(())
+}
+fn apply_request_patch(
+    request: &mut pi_rs_core::ContextRequest<'_>,
+    patch: &ContextPatch,
+) -> ExtensionResult<()> {
+    for edit in &patch.user_edits {
+        match edit {
+            pi_rs_core::ContextUserEdit::Insert { index, message } => {
+                request.insert_user(*index, message.clone())?
+            }
+            pi_rs_core::ContextUserEdit::Remove { index } => {
+                request.remove_user(*index)?;
+            }
+        }
+    }
+    if let Some(tools) = &patch.tools {
+        *request.tools_mut() = tools.clone();
+    }
+    if let Some(system) = &patch.system {
+        *request
+            .system_content_mut()
+            .ok_or("context patch requires leading system message")? = system.clone();
+    }
+    Ok(())
+}
+fn apply_messages_patch(
+    messages: &mut pi_rs_core::ContextMessages<'_>,
+    patch: &ContextPatch,
+) -> ExtensionResult<()> {
+    if patch.tools.is_some() {
+        return Err("message context patch cannot change tools".into());
+    }
+    for edit in &patch.user_edits {
+        match edit {
+            pi_rs_core::ContextUserEdit::Insert { index, message } => {
+                messages.insert_user(*index, message.clone())?
+            }
+            pi_rs_core::ContextUserEdit::Remove { index } => {
+                messages.remove_user(*index)?;
+            }
+        }
+    }
+    if let Some(system) = &patch.system {
+        *messages
+            .system_content_mut()
+            .ok_or("context patch requires leading system message")? = system.clone();
+    }
+    Ok(())
+}
+// Validate against a detached copy before touching the live tracked wrapper.
+fn commit_request_patch(
+    request: &mut pi_rs_core::ContextRequest<'_>,
+    patch: &ContextPatch,
+) -> ExtensionResult<()> {
+    validate_patch_limits(patch)?;
+    if request
+        .access()
+        .user_edits()
+        .len()
+        .saturating_add(patch.user_edits.len())
+        > 4096
+    {
+        return Err("too many context user edits".into());
+    }
+    let mut trial = (**request).clone();
+    apply_request_patch(&mut pi_rs_core::ContextRequest::new(&mut trial), patch)?;
+    apply_request_patch(request, patch)
+}
+fn commit_messages_patch(
+    messages: &mut pi_rs_core::ContextMessages<'_>,
+    patch: &ContextPatch,
+) -> ExtensionResult<()> {
+    validate_patch_limits(patch)?;
+    if messages
+        .access()
+        .user_edits()
+        .len()
+        .saturating_add(patch.user_edits.len())
+        > 4096
+    {
+        return Err("too many context user edits".into());
+    }
+    let mut trial = (**messages).clone();
+    apply_messages_patch(&mut pi_rs_core::ContextMessages::new(&mut trial), patch)?;
+    apply_messages_patch(messages, patch)
+}
+fn request_patch(
+    original: &ModelRequest,
+    updated: &ModelRequest,
+    user_edits: Vec<pi_rs_core::ContextUserEdit>,
+) -> Option<ContextPatch> {
+    let mut patch = ContextPatch {
+        tools: (original.tools != updated.tools).then(|| updated.tools.clone()),
+        user_edits,
+        ..Default::default()
+    };
+    let mut trial = original.clone();
+    apply_request_patch(&mut pi_rs_core::ContextRequest::new(&mut trial), &patch).ok()?;
+    if let (Some(Message::System { content: before }), Some(Message::System { content: after })) =
+        (trial.messages.first(), updated.messages.first())
+        && before != after
+    {
+        patch.system = Some(after.clone());
+    }
+    let mut trial = original.clone();
+    commit_request_patch(&mut pi_rs_core::ContextRequest::new(&mut trial), &patch).ok()?;
+    (trial == *updated).then_some(patch)
+}
+fn messages_patch(
+    original: &[Message],
+    updated: &[Message],
+    user_edits: Vec<pi_rs_core::ContextUserEdit>,
+) -> Option<ContextPatch> {
+    let mut patch = ContextPatch {
+        user_edits,
+        ..Default::default()
+    };
+    let mut trial = original.to_vec();
+    apply_messages_patch(&mut pi_rs_core::ContextMessages::new(&mut trial), &patch).ok()?;
+    if let (Some(Message::System { content: before }), Some(Message::System { content: after })) =
+        (trial.first(), updated.first())
+        && before != after
+    {
+        patch.system = Some(after.clone());
+    }
+    let mut trial = original.to_vec();
+    commit_messages_patch(&mut pi_rs_core::ContextMessages::new(&mut trial), &patch).ok()?;
+    (trial == updated).then_some(patch)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -735,11 +909,27 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let mut updated = if self.description.context_provenance_v1 {
-            match self.request(ProtocolRequest::ContextV2 {
-                request: extension_context(request),
-                state: state.cloned(),
-            })? {
+            let payload = extension_context(request);
+            let message = if self.description.context_safe_patch_v1 {
+                ProtocolRequest::ContextV3 {
+                    request: payload,
+                    state: state.cloned(),
+                }
+            } else {
+                ProtocolRequest::ContextV2 {
+                    request: payload,
+                    state: state.cloned(),
+                }
+            };
+            match self.request(message)? {
                 ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_request_patch(request, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
                 ContextResponse::Changed { value } => value,
             }
         } else {
@@ -765,14 +955,29 @@ impl Extension for ExecutableExtension {
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let mut updated = if self.description.context_provenance_v1 {
             match self
-                .request_async(ProtocolRequest::BeforeRequestV2 {
-                    request: extension_context(request),
-                    summary: purpose == RequestPurpose::Summary,
-                    state: state.cloned(),
+                .request_async(if self.description.context_safe_patch_v1 {
+                    ProtocolRequest::BeforeRequestV3 {
+                        request: extension_context(request),
+                        summary: purpose == RequestPurpose::Summary,
+                        state: state.cloned(),
+                    }
+                } else {
+                    ProtocolRequest::BeforeRequestV2 {
+                        request: extension_context(request),
+                        summary: purpose == RequestPurpose::Summary,
+                        state: state.cloned(),
+                    }
                 })
                 .await?
             {
                 ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_request_patch(request, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
                 ContextResponse::Changed { value } => value,
             }
         } else {
@@ -808,13 +1013,27 @@ impl Extension for ExecutableExtension {
         };
         let updated = if self.description.context_provenance_v1 {
             match self
-                .request_async(ProtocolRequest::ContextWithSystemV2 {
-                    messages: extension_context(&original).messages,
-                    state: state.cloned(),
+                .request_async(if self.description.context_safe_patch_v1 {
+                    ProtocolRequest::ContextWithSystemV3 {
+                        messages: extension_context(&original).messages,
+                        state: state.cloned(),
+                    }
+                } else {
+                    ProtocolRequest::ContextWithSystemV2 {
+                        messages: extension_context(&original).messages,
+                        state: state.cloned(),
+                    }
                 })
                 .await?
             {
                 ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_messages_patch(messages, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
                 ContextResponse::Changed { value } => value,
             }
         } else {
@@ -1924,6 +2143,7 @@ async fn dispatch_with_host(
             resource_discovery_hook: extension.handles_resource_discovery(),
             context_with_system_hook: extension.handles_context_with_system(),
             context_provenance_v1: true,
+            context_safe_patch_v1: true,
             tools: extension
                 .tools()
                 .into_iter()
@@ -1960,6 +2180,22 @@ async fn dispatch_with_host(
             let unsafe_access = access.assistant_accessed();
             encode(Ok(if !unsafe_access && request == original {
                 ContextResponse::Unchanged
+            } else {
+                ContextResponse::Changed { value: request }
+            }))
+        }
+        ProtocolRequest::ContextV3 { mut request, state } => {
+            let original = request.clone();
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            extension.context(&mut guarded, state.as_ref())?;
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && request == original {
+                ContextResponse::Unchanged
+            } else if !unsafe_access
+                && let Some(patch) = request_patch(&original, &request, access.user_edits())
+            {
+                ContextResponse::SafePatch { patch }
             } else {
                 ContextResponse::Changed { value: request }
             }))
@@ -2048,6 +2284,33 @@ async fn dispatch_with_host(
                 ContextResponse::Changed { value: request }
             }))
         }
+        ProtocolRequest::BeforeRequestV3 {
+            mut request,
+            summary,
+            state,
+        } => {
+            let purpose = if summary {
+                RequestPurpose::Summary
+            } else {
+                RequestPurpose::Turn
+            };
+            let original = request.clone();
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            extension
+                .before_request(&mut guarded, purpose, state.as_ref())
+                .await?;
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && request == original {
+                ContextResponse::Unchanged
+            } else if !unsafe_access
+                && let Some(patch) = request_patch(&original, &request, access.user_edits())
+            {
+                ContextResponse::SafePatch { patch }
+            } else {
+                ContextResponse::Changed { value: request }
+            }))
+        }
         ProtocolRequest::ContextWithSystemV2 {
             mut messages,
             state,
@@ -2061,6 +2324,27 @@ async fn dispatch_with_host(
             let unsafe_access = access.assistant_accessed();
             encode(Ok(if !unsafe_access && messages == original {
                 ContextResponse::Unchanged
+            } else {
+                ContextResponse::Changed { value: messages }
+            }))
+        }
+        ProtocolRequest::ContextWithSystemV3 {
+            mut messages,
+            state,
+        } => {
+            let original = messages.clone();
+            let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
+            let access = guarded.access();
+            extension
+                .context_with_system(&mut guarded, state.as_ref())
+                .await?;
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && messages == original {
+                ContextResponse::Unchanged
+            } else if !unsafe_access
+                && let Some(patch) = messages_patch(&original, &messages, access.user_edits())
+            {
+                ContextResponse::SafePatch { patch }
             } else {
                 ContextResponse::Changed { value: messages }
             }))
@@ -2602,8 +2886,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executable_notes_emits_tracked_user_patch() {
+        let notes = crate::Notes;
+        let state = notes.command("set", "remember", None).unwrap();
+        let extension: Arc<dyn Extension> = Arc::new(notes);
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![
+                Message::System {
+                    content: "system".into(),
+                },
+                Message::Assistant {
+                    content: "visible".into(),
+                    calls: vec![],
+                    replay: None,
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let result = dispatch(
+            extension,
+            ProtocolRequest::BeforeRequestV3 {
+                request,
+                summary: false,
+                state: Some(state),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["change"], "safe_patch");
+        assert_eq!(result["patch"]["user_edits"][0]["op"], "insert");
+        assert!(
+            result["patch"]["user_edits"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("remember")
+        );
+    }
+
+    #[test]
+    fn safe_patch_preserves_private_replay_and_rejects_invalid_edits_atomically() {
+        let mut original = ModelRequest {
+            model: "m".into(),
+            messages: vec![
+                Message::System {
+                    content: "system".into(),
+                },
+                Message::User {
+                    content: "old".into(),
+                },
+                Message::Assistant {
+                    content: "same".into(),
+                    calls: vec![],
+                    replay: None,
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let mut changed = original.clone();
+        let mut tracked = pi_rs_core::ContextRequest::new(&mut changed);
+        let access = tracked.access();
+        tracked
+            .insert_user(
+                1,
+                Message::User {
+                    content: "new".into(),
+                },
+            )
+            .unwrap();
+        tracked.remove_user(2).unwrap();
+        tracked.system_content_mut().unwrap().push_str(" updated");
+        tracked.tools_mut().push(ToolSpec {
+            name: "search".into(),
+            description: "safe".into(),
+            parameters: serde_json::json!({}),
+        });
+        let patch = request_patch(&original, &changed, access.user_edits()).unwrap();
+        if let Message::Assistant { replay, .. } = &mut original.messages[2] {
+            *replay = Some(Box::new(pi_rs_core::ProviderReplay {
+                identity: pi_rs_core::ResolvedModelIdentity {
+                    provider: "p".into(),
+                    model: "m".into(),
+                },
+                blocks: vec![serde_json::json!({"private":"signature"})],
+            }));
+        }
+        let mut host = pi_rs_core::ContextRequest::new(&mut original);
+        let access = host.access();
+        commit_request_patch(&mut host, &patch).unwrap();
+        assert!(!access.assistant_accessed());
+        assert_eq!(access.user_edits().len(), 2);
+        assert!(matches!(
+            &host.messages[2],
+            Message::Assistant {
+                replay: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            host.messages[0],
+            Message::System {
+                content: "system updated".into()
+            }
+        );
+        let snapshot = (*host).clone();
+        let invalid = ContextPatch {
+            user_edits: vec![
+                pi_rs_core::ContextUserEdit::Insert {
+                    index: 1,
+                    message: Message::User {
+                        content: "temporary".into(),
+                    },
+                },
+                pi_rs_core::ContextUserEdit::Remove { index: 3 },
+            ],
+            ..Default::default()
+        };
+        assert!(commit_request_patch(&mut host, &invalid).is_err());
+        assert_eq!(*host, snapshot);
+        let invalid = ContextPatch {
+            user_edits: vec![pi_rs_core::ContextUserEdit::Insert {
+                index: 0,
+                message: Message::Assistant {
+                    content: "forged".into(),
+                    calls: vec![],
+                    replay: None,
+                },
+            }],
+            ..Default::default()
+        };
+        assert!(commit_request_patch(&mut host, &invalid).is_err());
+        assert_eq!(*host, snapshot);
+        assert!(
+            serde_json::from_value::<ContextResponse<ModelRequest>>(
+                serde_json::json!({"change":"safe_patch","patch":{"model":"other"}})
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn versioned_protocol_uses_tracked_access_not_hook_claims() {
-        struct Hook(bool);
+        struct Hook(u8);
         #[async_trait::async_trait]
         impl Extension for Hook {
             fn id(&self) -> &str {
@@ -2615,22 +3041,36 @@ mod tests {
                 _: RequestPurpose,
                 _: Option<&ExtensionState>,
             ) -> ExtensionResult<pi_rs_core::ContextChange> {
-                if self.0 {
+                if self.0 == 1 {
                     let removed = request.messages.remove(0);
                     request.messages.insert(0, removed);
                     Ok(pi_rs_core::ContextChange::Unchanged)
+                } else if self.0 == 2 {
+                    request.tools_mut().push(ToolSpec {
+                        name: "new".into(),
+                        description: "safe".into(),
+                        parameters: serde_json::json!({}),
+                    });
+                    request.insert_user(
+                        0,
+                        Message::User {
+                            content: "inserted".into(),
+                        },
+                    )?;
+                    Ok(pi_rs_core::ContextChange::Changed)
                 } else {
                     request.tools_mut().clear();
                     Ok(pi_rs_core::ContextChange::Changed)
                 }
             }
         }
-        for unsafe_access in [false, true] {
-            let extension: Arc<dyn Extension> = Arc::new(Hook(unsafe_access));
+        for mode in [0, 1, 2] {
+            let extension: Arc<dyn Extension> = Arc::new(Hook(mode));
             let description = dispatch(extension.clone(), ProtocolRequest::Describe)
                 .await
                 .unwrap();
             assert_eq!(description["context_provenance_v1"], true);
+            assert_eq!(description["context_safe_patch_v1"], true);
             let request = ModelRequest {
                 model: "m".into(),
                 messages: vec![Message::User {
@@ -2639,9 +3079,23 @@ mod tests {
                 tools: vec![],
                 max_output_tokens: 8,
             };
+            if mode == 2 {
+                let previous = dispatch(
+                    extension.clone(),
+                    ProtocolRequest::BeforeRequestV2 {
+                        request: request.clone(),
+                        summary: false,
+                        state: None,
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(previous["change"], "changed");
+                assert!(previous.get("value").is_some());
+            }
             let result = dispatch(
                 extension,
-                ProtocolRequest::BeforeRequestV2 {
+                ProtocolRequest::BeforeRequestV3 {
                     request,
                     summary: false,
                     state: None,
@@ -2651,13 +3105,14 @@ mod tests {
             .unwrap();
             assert_eq!(
                 result["change"],
-                if unsafe_access {
-                    "changed"
-                } else {
-                    "unchanged"
+                match mode {
+                    1 => "changed",
+                    2 => "safe_patch",
+                    _ => "unchanged",
                 }
             );
-            assert_eq!(result.get("value").is_some(), unsafe_access);
+            assert_eq!(result.get("value").is_some(), mode == 1);
+            assert_eq!(result.get("patch").is_some(), mode == 2);
         }
     }
 
@@ -2670,7 +3125,8 @@ import json,sys,os
 r=json.load(sys.stdin)
 name=os.path.basename(sys.argv[0])
 if r['type']=='describe':
-    v={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'context_provenance_v1':name!='legacy'}
+    v={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'context_provenance_v1':name!='legacy','context_safe_patch_v1':name=='patch'}
+elif r['type']=='migrate': v=None
 else:
     x=r.get('request',r.get('messages'))
     messages=x['messages'] if isinstance(x,dict) else x
@@ -2678,11 +3134,22 @@ else:
     if name=='legacy': v=x
     elif name=='invalid': v={'change':'unchanged','value':x}
     elif name=='changed': v={'change':'changed','value':x}
+    elif name in ('patch','unnegotiated'):
+        patch={'user_edits':[{'op':'insert','index':0,'message':{'role':'user','content':'injected'}}]}
+        if isinstance(x,dict): patch['tools']=[{'name':'tool','description':'safe','parameters':{}}]
+        v={'change':'safe_patch','patch':patch}
     else: v={'change':'unchanged'}
 print(json.dumps({'version':1,'response':{'Ok':v}}))
 "##;
         let dir = tempfile::tempdir().unwrap();
-        for name in ["legacy", "unchanged", "changed", "invalid"] {
+        for name in [
+            "legacy",
+            "unchanged",
+            "changed",
+            "invalid",
+            "patch",
+            "unnegotiated",
+        ] {
             let path = dir.path().join(name);
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2708,21 +3175,24 @@ print(json.dumps({'version':1,'response':{'Ok':v}}))
             let result = extension
                 .before_request(&mut guarded, RequestPurpose::Turn, None)
                 .await;
-            if name == "invalid" {
+            if name == "invalid" || name == "unnegotiated" {
                 assert!(result.is_err());
                 continue;
             }
             assert!(result.is_ok());
-            assert_eq!(access.assistant_accessed(), name != "unchanged");
+            assert_eq!(
+                access.assistant_accessed(),
+                name == "legacy" || name == "changed"
+            );
             assert_eq!(
                 matches!(
-                    &request.messages[0],
+                    &request.messages[if name == "patch" { 1 } else { 0 }],
                     Message::Assistant {
                         replay: Some(_),
                         ..
                     }
                 ),
-                name == "unchanged"
+                name == "unchanged" || name == "patch"
             );
             let mut sync_request = ModelRequest {
                 model: "m".into(),
@@ -2735,7 +3205,10 @@ print(json.dumps({'version':1,'response':{'Ok':v}}))
             let mut sync_guard = pi_rs_core::ContextRequest::new(&mut sync_request);
             let sync_access = sync_guard.access();
             extension.context(&mut sync_guard, None).unwrap();
-            assert_eq!(sync_access.assistant_accessed(), name != "unchanged");
+            assert_eq!(
+                sync_access.assistant_accessed(),
+                name == "legacy" || name == "changed"
+            );
             let mut messages = vec![Message::User {
                 content: "visible".into(),
             }];
@@ -2745,7 +3218,105 @@ print(json.dumps({'version':1,'response':{'Ok':v}}))
                 .context_with_system(&mut guarded, None)
                 .await
                 .unwrap();
-            assert_eq!(access.assistant_accessed(), name != "unchanged");
+            assert_eq!(
+                access.assistant_accessed(),
+                name == "legacy" || name == "changed"
+            );
+            if name == "patch" || name == "changed" {
+                struct Capture(std::sync::Mutex<Vec<ModelRequest>>);
+                #[async_trait::async_trait]
+                impl pi_rs_core::Model for Capture {
+                    async fn stream(
+                        &self,
+                        request: ModelRequest,
+                    ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                        self.0.lock().unwrap().push(request);
+                        Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                            pi_rs_core::ModelEvent::Complete {
+                                calls: vec![],
+                                usage: None,
+                            },
+                        )])))
+                    }
+                }
+                let initial =
+                    pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+                let mut records = initial.records().to_vec();
+                let version = records[0].version;
+                let id = Default::default();
+                let events = vec![
+                    pi_rs_core::Event::User {
+                        content: "initial".into(),
+                        input_id: None,
+                    },
+                    pi_rs_core::Event::ModelFinished {
+                        request_id: id,
+                        metadata: pi_rs_core::ModelMetadata {
+                            replay: Some(Box::new(pi_rs_core::ProviderReplay {
+                                identity: pi_rs_core::ResolvedModelIdentity {
+                                    provider: "p".into(),
+                                    model: "m".into(),
+                                },
+                                blocks: vec![serde_json::json!({"private":"secret"})],
+                            })),
+                            ..Default::default()
+                        },
+                        usage: pi_rs_core::UsageReport::Unconfirmed,
+                        failure: None,
+                        partial: String::new(),
+                        reply: None,
+                    },
+                    pi_rs_core::Event::Assistant {
+                        content: "visible".into(),
+                        invocations: vec![],
+                        usage: None,
+                        request_id: Some(id),
+                    },
+                ];
+                for event in events {
+                    let record_id = records.len() as u64 + 1;
+                    records.push(pi_rs_core::Record {
+                        timestamp: None,
+                        run_id: None,
+                        version,
+                        id: record_id,
+                        parent: Some(record_id - 1),
+                        event,
+                    });
+                }
+                let mut session = pi_rs_core::Session::from_records(records).unwrap();
+                let mut registry = pi_rs_core::Registry::default();
+                registry.register(Arc::new(extension)).unwrap();
+                let model = Capture(std::sync::Mutex::new(Vec::new()));
+                let agent = pi_rs_core::Agent {
+                    model: &model,
+                    model_name: "m",
+                    registry: &registry,
+                    system_prompt: "system",
+                    limits: pi_rs_core::Limits::default(),
+                };
+                let (_sender, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+                agent
+                    .run(
+                        &mut session,
+                        Some("continue".into()),
+                        &mut inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                    )
+                    .await
+                    .unwrap();
+                let captured = model.0.lock().unwrap();
+                let replay = captured[0]
+                    .messages
+                    .iter()
+                    .find_map(|message| match message {
+                        Message::Assistant { replay, .. } => Some(replay),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(replay.is_some(), name == "patch");
+            }
         }
     }
 

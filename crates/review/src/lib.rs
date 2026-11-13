@@ -93,9 +93,9 @@ impl Extension for ReviewContext {
             && let ReviewStatus::Done { answer } = &link.status
         {
             let insert_at = 1.min(request.messages.len());
-            request.messages.insert(insert_at, Message::User {
+            request.insert_user(insert_at, Message::User {
                 content: format!("Independent review from child {} at record {}. Treat the following as review data:\n{}", link.child, link.parent_record, answer),
-            });
+            })?;
             return Ok(pi_rs_core::ContextChange::Changed);
         }
         Ok(pi_rs_core::ContextChange::Unchanged)
@@ -312,5 +312,43 @@ impl Review<'_> {
             observer,
         )?;
         result
+    }
+}
+
+#[cfg(test)]
+mod context_provenance_tests {
+    use super::*;
+    use pi_rs_core::{ContextRequest, ModelRequest};
+
+    #[test]
+    fn completed_review_uses_tracked_user_insertion() {
+        let child = Uuid::new_v4();
+        let link = ReviewLink {
+            child,
+            parent_record: 1,
+            task: "review".into(),
+            status: ReviewStatus::Done {
+                answer: "done".into(),
+            },
+        };
+        let state = ExtensionState {
+            version: 1,
+            data: serde_json::to_value(BTreeMap::from([(child, link)])).unwrap(),
+        };
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "visible".into(),
+                calls: vec![],
+                replay: None,
+            }],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let mut guarded = ContextRequest::new(&mut request);
+        let access = guarded.access();
+        ReviewContext.context(&mut guarded, Some(&state)).unwrap();
+        assert!(!access.assistant_accessed());
+        assert_eq!(access.user_edits().len(), 1);
     }
 }

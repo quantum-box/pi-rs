@@ -89,7 +89,7 @@ impl Extension for PlanMode {
             PlanState::Normal => return Ok(pi_rs_core::ContextChange::Unchanged),
             PlanState::Planning { plan } => {
                 request
-                    .tools
+                    .tools_mut()
                     .retain(|tool| self.read_only.contains(&tool.name));
                 format!(
                     "Planning mode. Investigate with the approved read-only tools. Current plan:\n{plan}"
@@ -100,9 +100,7 @@ impl Extension for PlanMode {
             ),
         };
         let insert_at = 1.min(request.messages.len());
-        request
-            .messages
-            .insert(insert_at, Message::User { content: plan });
+        request.insert_user(insert_at, Message::User { content: plan })?;
         Ok(pi_rs_core::ContextChange::Changed)
     }
 
@@ -149,12 +147,11 @@ mod tests {
                 .collect(),
             max_output_tokens: 32,
         };
-        extension
-            .context(
-                &mut pi_rs_core::ContextRequest::new(&mut request),
-                Some(&state),
-            )
-            .unwrap();
+        let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        extension.context(&mut guarded, Some(&state)).unwrap();
+        assert!(!access.assistant_accessed());
+        assert_eq!(access.user_edits().len(), 1);
         assert_eq!(request.tools.len(), 1);
         assert_eq!(request.tools[0].name, "read");
         let context = ToolContext {

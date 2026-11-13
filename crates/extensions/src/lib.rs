@@ -55,12 +55,12 @@ impl Extension for Notes {
             return Ok(pi_rs_core::ContextChange::Unchanged);
         }
         let insert_at = 1.min(request.messages.len());
-        request.messages.insert(
+        request.insert_user(
             insert_at,
             Message::User {
                 content: format!("Saved session notes (reference data):\n{text}"),
             },
-        );
+        )?;
         Ok(pi_rs_core::ContextChange::Changed)
     }
 }
@@ -126,7 +126,7 @@ impl Extension for TodoList {
             return Ok(pi_rs_core::ContextChange::Unchanged);
         }
         let insert_at = 1.min(request.messages.len());
-        request.messages.insert(
+        request.insert_user(
             insert_at,
             Message::User {
                 content: format!(
@@ -134,7 +134,7 @@ impl Extension for TodoList {
                     serde_json::to_string(&items).map_err(|error| error.to_string())?
                 ),
             },
-        );
+        )?;
         Ok(pi_rs_core::ContextChange::Changed)
     }
     fn after_tool(
@@ -240,6 +240,26 @@ mod tests {
 mod request_access_tests {
     use super::*;
     use pi_rs_core::{ContextRequest, ModelRequest, RequestPurpose};
+
+    #[test]
+    fn notes_insertions_use_host_tracked_user_provenance() {
+        let state = Notes.command("set", "remember", None).unwrap();
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: None,
+            }],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let mut guarded = ContextRequest::new(&mut request);
+        let access = guarded.access();
+        Notes.context(&mut guarded, Some(&state)).unwrap();
+        assert!(!access.assistant_accessed());
+        assert_eq!(access.user_edits().len(), 1);
+    }
 
     #[tokio::test]
     async fn tool_search_and_codemode_change_tools_without_accessing_assistants() {

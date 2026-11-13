@@ -121,9 +121,7 @@ impl Extension for ReferenceMemory {
         }
         if !context.is_empty() {
             let insert_at = 1.min(request.messages.len());
-            request
-                .messages
-                .insert(insert_at, Message::User { content: context });
+            request.insert_user(insert_at, Message::User { content: context })?;
         }
         Ok(pi_rs_core::ContextChange::Changed)
     }
@@ -144,4 +142,72 @@ fn valid_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+}
+
+#[cfg(test)]
+mod context_provenance_tests {
+    use super::*;
+    use pi_rs_core::{ContextRequest, ModelRequest};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    struct Source;
+    #[async_trait::async_trait]
+    impl ReferencePort for Source {
+        async fn load(
+            &self,
+            scope: &RunScope,
+            key: &ReferenceKey,
+        ) -> Result<Option<AuthorizedReference>> {
+            Ok(Some(AuthorizedReference {
+                key: key.clone(),
+                tenant: scope.tenant.clone(),
+                workspace: scope.workspace.clone(),
+                fresh_until: SystemTime::now() + Duration::from_secs(60),
+                text: "reference".into(),
+            }))
+        }
+    }
+    #[tokio::test]
+    async fn selected_reference_uses_tracked_user_insertion() {
+        let memory = ReferenceMemory {
+            scope: RunScope {
+                tenant: "tenant".into(),
+                actor: "actor".into(),
+                workspace: "workspace".into(),
+                journal_run_id: Uuid::new_v4(),
+                aip_run: "run".into(),
+                parent_run: None,
+                audit_id: "audit".into(),
+            },
+            source: Arc::new(Source),
+            keep_turns: 1,
+        };
+        let state = ExtensionState {
+            version: 1,
+            data: serde_json::to_value(vec![ReferenceKey {
+                id: "id".into(),
+                version: "v1".into(),
+            }])
+            .unwrap(),
+        };
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "visible".into(),
+                calls: vec![],
+                replay: None,
+            }],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let mut guarded = ContextRequest::new(&mut request);
+        let access = guarded.access();
+        memory
+            .before_request(&mut guarded, RequestPurpose::Turn, Some(&state))
+            .await
+            .unwrap();
+        assert!(!access.assistant_accessed());
+        assert_eq!(access.user_edits().len(), 1);
+    }
 }

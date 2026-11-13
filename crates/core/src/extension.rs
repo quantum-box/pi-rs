@@ -370,11 +370,25 @@ pub enum ContextChange {
     Changed,
 }
 
+/// An index-relative edit that can only insert or remove user messages.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContextUserEdit {
+    Insert {
+        index: usize,
+        message: crate::Message,
+    },
+    Remove {
+        index: usize,
+    },
+}
+
 /// A host-owned record of mutable access, retained independently of the wrapper.
 #[derive(Clone, Default)]
 pub struct ContextAccess {
     assistant_accessed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     touched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    user_edits: std::sync::Arc<std::sync::Mutex<Vec<ContextUserEdit>>>,
 }
 impl ContextAccess {
     pub fn assistant_accessed(&self) -> bool {
@@ -383,6 +397,21 @@ impl ContextAccess {
     }
     pub fn touched(&self) -> bool {
         self.touched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn user_edits(&self) -> Vec<ContextUserEdit> {
+        self.user_edits.lock().expect("context edits").clone()
+    }
+    fn record_user_edit(&self, edit: ContextUserEdit) -> ExtensionResult<()> {
+        let mut edits = self
+            .user_edits
+            .lock()
+            .map_err(|_| "context edit tracker failed".to_owned())?;
+        if edits.len() >= 4096 {
+            return Err("too many context user edits".into());
+        }
+        edits.push(edit);
+        self.mark_safe();
+        Ok(())
     }
     fn mark_safe(&self) {
         self.touched
@@ -393,6 +422,42 @@ impl ContextAccess {
         self.assistant_accessed
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+fn insert_context_user(
+    messages: &mut Vec<crate::Message>,
+    access: &ContextAccess,
+    index: usize,
+    message: crate::Message,
+) -> ExtensionResult<()> {
+    if index > messages.len()
+        || !matches!(
+            message,
+            crate::Message::User { .. } | crate::Message::UserWithImages { .. }
+        )
+    {
+        return Err("context insertion must be a user message at a valid index".into());
+    }
+    access.record_user_edit(ContextUserEdit::Insert {
+        index,
+        message: message.clone(),
+    })?;
+    messages.insert(index, message);
+    Ok(())
+}
+fn remove_context_user(
+    messages: &mut Vec<crate::Message>,
+    access: &ContextAccess,
+    index: usize,
+) -> ExtensionResult<crate::Message> {
+    if !matches!(
+        messages.get(index),
+        Some(crate::Message::User { .. } | crate::Message::UserWithImages { .. })
+    ) {
+        return Err("context removal must target a user message".into());
+    }
+    access.record_user_edit(ContextUserEdit::Remove { index })?;
+    Ok(messages.remove(index))
 }
 
 /// A portable request with host-tracked mutable access. General mutable access
@@ -410,6 +475,12 @@ impl<'a> ContextRequest<'a> {
     }
     pub fn access(&self) -> ContextAccess {
         self.access.clone()
+    }
+    pub fn insert_user(&mut self, index: usize, message: crate::Message) -> ExtensionResult<()> {
+        insert_context_user(&mut self.request.messages, &self.access, index, message)
+    }
+    pub fn remove_user(&mut self, index: usize) -> ExtensionResult<crate::Message> {
+        remove_context_user(&mut self.request.messages, &self.access, index)
     }
     pub fn tools_mut(&mut self) -> &mut Vec<crate::ToolSpec> {
         self.access.mark_safe();
@@ -450,6 +521,12 @@ impl<'a> ContextMessages<'a> {
     }
     pub fn access(&self) -> ContextAccess {
         self.access.clone()
+    }
+    pub fn insert_user(&mut self, index: usize, message: crate::Message) -> ExtensionResult<()> {
+        insert_context_user(self.messages, &self.access, index, message)
+    }
+    pub fn remove_user(&mut self, index: usize) -> ExtensionResult<crate::Message> {
+        remove_context_user(self.messages, &self.access, index)
     }
     pub fn system_content_mut(&mut self) -> Option<&mut String> {
         self.access.mark_safe();
