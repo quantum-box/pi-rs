@@ -296,14 +296,14 @@ async fn access_at(
     minimum: Option<Duration>,
     no_refresh: bool,
 ) -> Result<String> {
-    let required = minimum.unwrap_or_default().max(NORMAL_MINIMUM);
+    let refresh_window = minimum.unwrap_or_default().max(NORMAL_MINIMUM);
     let guard = match super::auth_lock::acquire_async(&path).await {
         Ok(guard) => guard,
         Err(err) => {
             let stored = super::config::read_readonly_auth(&path, err)?;
             let value =
                 parse_credential(&stored)?.ok_or_else(|| error("credentials not configured"))?;
-            if no_refresh || !expires_soon(&value, required) {
+            if no_refresh || !expires_soon(&value, refresh_window) {
                 return Ok(value.access);
             }
             return Err(error("cannot refresh credentials in a read-only store"));
@@ -311,7 +311,7 @@ async fn access_at(
     };
     let value = load(&path)?.ok_or_else(|| error("credentials not configured"))?;
     guard.check()?;
-    if no_refresh || !expires_soon(&value, required) {
+    if no_refresh || !expires_soon(&value, refresh_window) {
         return Ok(value.access);
     }
     // Tokio waits for started blocking tasks on runtime shutdown. The separate
@@ -336,7 +336,7 @@ async fn access_at(
             data.insert("kimi-coding".into(), serde_json::to_value(&value)?);
             Ok(())
         })?;
-        if minimum.is_some() && expires_soon(&value, required) {
+        if minimum.is_some_and(|minimum| expires_soon(&value, minimum)) {
             return Err(error("refreshed token expires too soon"));
         }
         Ok(value.access)

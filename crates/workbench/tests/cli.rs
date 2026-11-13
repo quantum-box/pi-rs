@@ -4492,6 +4492,70 @@ fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
     }
 }
 
+#[test]
+fn kimi_bearer_minimum_checks_requested_lifetime_after_persisting_refresh() {
+    for (minimum, succeeds) in [("30s", true), ("3m", false)] {
+        let root = tempfile::tempdir().unwrap();
+        let auth = root.path().join("auth.json");
+        std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0},"other":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("token request not received: {error}"),
+                }
+            };
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":120}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("KIMI_CODE_OAUTH_HOST", host)
+            .env_remove("KIMI_API_KEY")
+            .args([
+                "--provider",
+                "kimi-coding",
+                "auth",
+                "print-bearer-token",
+                "--min-expiry",
+                minimum,
+            ])
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if succeeds {
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "new");
+        }
+        let stored: Value = serde_json::from_slice(&std::fs::read(auth).unwrap()).unwrap();
+        assert_eq!(stored["kimi-coding"]["refresh"], "rotated");
+        assert_eq!(stored["other"]["key"], "keep");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn kimi_auth_commands_wait_for_refresh_after_sigint() {
