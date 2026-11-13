@@ -12,16 +12,49 @@ use rmcp::{
     },
 };
 use sse_stream::Sse;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 type HttpError = StreamableHttpError<reqwest_mcp::Error>;
 type Headers = HashMap<HeaderName, HeaderValue>;
 type EventStream = BoxStream<'static, std::result::Result<Sse, SseError>>;
 
 #[derive(Clone)]
-pub struct SafeAuthClient(pub(crate) AuthClient<reqwest_mcp::Client>);
+pub struct SafeAuthClient(
+    pub(crate) AuthClient<reqwest_mcp::Client>,
+    pub(crate) Arc<Mutex<DispatchState>>,
+);
+
+#[derive(Default)]
+pub(crate) struct DispatchState {
+    pub(crate) closed: bool,
+    pub(crate) cancellation: Option<pi_rs::CancellationToken>,
+}
 
 impl SafeAuthClient {
+    async fn dispatch<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, HttpError>>,
+    ) -> Result<T, HttpError> {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| {
+            let closed = self.1.lock().unwrap_or_else(|error| error.into_inner());
+            if closed.closed
+                || closed
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(pi_rs::CancellationToken::is_cancelled)
+            {
+                return std::task::Poll::Ready(Err(HttpError::UnexpectedServerResponse(
+                    "MCP request cancelled before dispatch".into(),
+                )));
+            }
+            future.as_mut().poll(cx)
+        })
+        .await
+    }
     async fn token(&self, force: bool) -> Result<String, AuthError> {
         let client = self.0.clone();
         crate::mcp_refresh::run(async move {
@@ -60,13 +93,13 @@ impl SafeAuthClient {
         };
         // Only the token transaction outlives this future. The actual call and
         // retry stay on the caller's task, so dropping it cannot dispatch them.
-        match call(token.clone()).await {
+        match self.dispatch(call(token.clone())).await {
             Err(HttpError::AuthRequired(challenge)) => {
                 let Some(sent) = token else {
                     return Err(HttpError::AuthRequired(challenge));
                 };
                 match self.token(true).await {
-                    Ok(fresh) if fresh != sent => call(Some(fresh)).await,
+                    Ok(fresh) if fresh != sent => self.dispatch(call(Some(fresh))).await,
                     Ok(_) | Err(AuthError::AuthorizationRequired) => {
                         Err(HttpError::AuthRequired(challenge))
                     }

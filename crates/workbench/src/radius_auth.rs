@@ -182,7 +182,7 @@ impl Gateway {
         self.cached_access_at(&auth_path()).await
     }
 
-    async fn cached_access_at(&self, path: &std::path::Path) -> Result<Option<String>> {
+    pub(super) async fn cached_access_at(&self, path: &std::path::Path) -> Result<Option<String>> {
         let value = super::config::read_auth_object(path).await?;
         Ok(self
             .credential_from_value(&value)?

@@ -85,6 +85,26 @@ impl ServerConfig {
 struct NativeClient {
     interaction: Arc<std::sync::Mutex<Option<Interaction>>>,
     catalog: Arc<CatalogSignal>,
+    dispatch_closed: Arc<std::sync::Mutex<crate::mcp_oauth_client::DispatchState>>,
+}
+
+struct AbandonedCall {
+    closed: Arc<std::sync::Mutex<crate::mcp_oauth_client::DispatchState>>,
+    service: Option<rmcp::service::RunningServiceCancellationToken>,
+}
+impl Drop for AbandonedCall {
+    fn drop(&mut self) {
+        if let Some(service) = self.service.take() {
+            // Close the gate before stopping rmcp: its best-effort cancellation
+            // notification can be lost when the peer queue is full. A POST
+            // already started remains ambiguous and is reported as such.
+            self.closed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .closed = true;
+            service.cancel();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -668,12 +688,15 @@ impl McpExtension {
                         Some(Uuid::parse_str(&generation).map_err(|_| {
                             Error::Config("invalid MCP credential generation".into())
                         })?);
-                    NativeClient::default()
-                        .serve_with_lifecycle(
-                            StreamableHttpClientTransport::with_client(client, transport_config),
-                            lifecycle,
-                        )
-                        .await
+                    NativeClient {
+                        dispatch_closed: client.1.clone(),
+                        ..Default::default()
+                    }
+                    .serve_with_lifecycle(
+                        StreamableHttpClientTransport::with_client(client, transport_config),
+                        lifecycle,
+                    )
+                    .await
                 } else if let Some(resolver) = provider_token.clone() {
                     let client = ProviderClient {
                         client,
@@ -1071,15 +1094,18 @@ impl McpTool {
         host: Option<Arc<dyn pi_rs::ToolHost>>,
     ) -> Outcome {
         let attempt = || async {
+            let dispatch_cancel = context.cancellation.child_token();
             tokio::select! {
                 _ = context.cancellation.cancelled() => {
                     Err(CallError::Other("MCP request cancelled after dispatch".into()))
                 }
-                result = tokio::time::timeout(
-                    self.connection.timeout, self.call_once(&arguments, &context, host.as_ref()),
-                ) => result.unwrap_or_else(|_| {
+                _ = async {
+                    tokio::time::sleep(self.connection.timeout).await;
+                    dispatch_cancel.cancel();
+                } => {
                     Err(CallError::Other("MCP request timed out after dispatch".into()))
-                }),
+                }
+                result = self.call_once(&arguments, &context, host.as_ref(), &dispatch_cancel) => result,
             }
         };
         let mut result = attempt().await;
@@ -1162,6 +1188,7 @@ impl McpTool {
         arguments: &Value,
         context: &ToolContext,
         host: Option<&Arc<dyn pi_rs::ToolHost>>,
+        dispatch_cancel: &pi_rs::CancellationToken,
     ) -> std::result::Result<CallResult, CallError> {
         if self.resource {
             return self.invoke_resource(arguments).await.map(CallResult::Data);
@@ -1178,7 +1205,25 @@ impl McpTool {
             cancellation: context.cancellation.clone(),
         });
         let _interaction = InteractionGuard(interaction);
-        let result = service.call_tool_once(params).await.map_err(call_error)?;
+        service
+            .service()
+            .dispatch_closed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancellation = Some(dispatch_cancel.clone());
+        let mut abandoned = AbandonedCall {
+            closed: service.service().dispatch_closed.clone(),
+            service: Some(service.cancellation_token()),
+        };
+        let result = service.call_tool_once(params).await;
+        service
+            .service()
+            .dispatch_closed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancellation = None;
+        abandoned.service = None;
+        let result = result.map_err(call_error)?;
         match result {
             CallToolResponse::Complete(result) => {
                 Ok(CallResult::Data(serde_json::to_value(result)?))
@@ -1471,6 +1516,244 @@ pub async fn resolve_value(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_tool_refresh_never_dispatches_with_full_notification_queue() {
+        use rmcp::{
+            model::{ClientJsonRpcMessage, ClientNotification, ServerJsonRpcMessage},
+            transport::Transport,
+        };
+        use std::sync::{Condvar, Mutex, atomic::AtomicUsize};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        struct Freeze<T> {
+            inner: T,
+            armed: Arc<AtomicBool>,
+            blocked: std::sync::mpsc::Sender<()>,
+            latch: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl<T: Transport<RoleClient>> Transport<RoleClient> for Freeze<T> {
+            type Error = T::Error;
+            fn send(
+                &mut self,
+                message: ClientJsonRpcMessage,
+            ) -> impl std::future::Future<Output = std::result::Result<(), Self::Error>> + Send + 'static
+            {
+                if matches!(message, ClientJsonRpcMessage::Notification(_))
+                    && self.armed.swap(false, Ordering::SeqCst)
+                {
+                    self.blocked.send(()).unwrap();
+                    let (lock, wake) = &*self.latch;
+                    let mut release = lock.lock().unwrap();
+                    while !*release {
+                        release = wake.wait(release).unwrap();
+                    }
+                }
+                self.inner.send(message)
+            }
+            fn receive(
+                &mut self,
+            ) -> impl std::future::Future<Output = Option<ServerJsonRpcMessage>> + Send
+            {
+                self.inner.receive()
+            }
+            fn close(
+                &mut self,
+            ) -> impl std::future::Future<Output = std::result::Result<(), Self::Error>> + Send
+            {
+                self.inner.close()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let resource = format!("{base}/mcp");
+        let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_count = calls.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let refresh_tx = refresh_tx.clone();
+                let release = release.clone();
+                let count = call_count.clone();
+                tokio::spawn(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut first = String::new();
+                    if socket.read_line(&mut first).await.is_err() {
+                        return;
+                    }
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if socket.read_line(&mut line).await.is_err()
+                            || line == "\r\n"
+                            || line.is_empty()
+                        {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut bytes = vec![0; length];
+                    if socket.read_exact(&mut bytes).await.is_err() {
+                        return;
+                    }
+                    let body = if first.starts_with("POST /token ") {
+                        let _ = refresh_tx.send(()).await;
+                        if let Some(receiver) = release.lock().await.take() {
+                            let _ = receiver.await;
+                        }
+                        r#"{"access_token":"new","token_type":"Bearer","refresh_token":"rotated"}"#
+                            .to_owned()
+                    } else {
+                        let request: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                        match request["method"].as_str() {
+                            Some("initialize") => json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":request["params"]["protocolVersion"],"capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}).to_string(),
+                            Some("tools/call") => { count.fetch_add(1, Ordering::SeqCst); json!({"jsonrpc":"2.0","id":request["id"],"result":{"content":[]}}).to_string() },
+                            _ => String::new(),
+                        }
+                    };
+                    let status = if body.is_empty() {
+                        "202 Accepted"
+                    } else {
+                        "200 OK"
+                    };
+                    let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                });
+            }
+        });
+        let client =
+            crate::mcp_auth::test_oauth_client(path.clone(), &resource, &format!("{base}/token"))
+                .await;
+        let native = NativeClient {
+            dispatch_closed: client.1.clone(),
+            ..Default::default()
+        };
+        let transport = StreamableHttpClientTransport::with_client(
+            client,
+            StreamableHttpClientTransportConfig::with_uri(resource.clone()),
+        );
+        let armed = Arc::new(AtomicBool::new(false));
+        let latch = Arc::new((Mutex::new(false), Condvar::new()));
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let service = native
+            .serve_with_lifecycle(
+                Freeze {
+                    inner: transport,
+                    armed: armed.clone(),
+                    blocked: blocked_tx,
+                    latch: latch.clone(),
+                },
+                ClientLifecycleMode::Initialize,
+            )
+            .await
+            .unwrap();
+        let mut envelope: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope["credentials"]["token_response"]["expires_in"] = json!(1);
+        envelope["credentials"]["token_received_at"] = json!(0);
+        std::fs::write(&path, envelope.to_string()).unwrap();
+        let config: ServerConfig = serde_json::from_value(json!({"url":resource})).unwrap();
+        let connection = Arc::new(Connection {
+            identity: RwLock::new(ConnectionIdentity {
+                digest: "fixture".into(),
+                oauth_generation: None,
+            }),
+            service: tokio::sync::Mutex::new(service),
+            timeout: Duration::from_secs(30),
+            name: "fixture".into(),
+            config,
+            workspace: dir.path().to_owned(),
+            provider_token: None,
+            http_options: None,
+            closed: AtomicBool::new(false),
+        });
+        let peer = connection.service.lock().await.peer().clone();
+        let tool = McpTool {
+            connection,
+            remote_name: "mutate".into(),
+            spec: ToolSpec {
+                name: "mutate".into(),
+                description: "fixture".into(),
+                parameters: json!({"type":"object"}),
+            },
+            resource: false,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let context = ToolContext {
+            operation_id: Uuid::new_v4(),
+            cancellation: cancellation.clone(),
+        };
+        let call = tokio::spawn(async move { tool.invoke_call(json!({}), context, None).await });
+        tokio::time::timeout(Duration::from_secs(5), refresh_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        armed.store(true, Ordering::SeqCst);
+        let notification: ClientNotification = serde_json::from_value(json!({"method":"notifications/progress","params":{"progressToken":"fixture","progress":1}})).unwrap();
+        let first = {
+            let peer = peer.clone();
+            let notification = notification.clone();
+            tokio::spawn(async move { peer.send_notification(notification).await })
+        };
+        tokio::task::spawn_blocking(move || {
+            blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let mut flood = Vec::new();
+        // The service loop is held in send(), so these exceed rmcp's
+        // 1,024-entry peer queue before the tool's drop guard runs.
+        for _ in 0..1200 {
+            let peer = peer.clone();
+            let notification = notification.clone();
+            let submitted = submitted.clone();
+            flood.push(tokio::spawn(async move {
+                submitted.fetch_add(1, Ordering::SeqCst);
+                peer.send_notification(notification).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while submitted.load(Ordering::SeqCst) < 1200 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .unwrap()
+                .unwrap(),
+            Outcome::Unknown(_)
+        ));
+        {
+            let (lock, wake) = &*latch;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains("rotated") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        first.abort();
+        for task in flood {
+            task.abort();
+        }
+        server.abort();
+    }
     #[tokio::test]
     async fn http_proxy_is_preserved_when_transport_reconnects() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};

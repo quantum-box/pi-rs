@@ -585,7 +585,7 @@ pub async fn client_with_http_options(
     }
     drop(guard);
     Ok((
-        crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(client, manager)),
+        crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(client, manager), Arc::default()),
         identity,
     ))
 }
@@ -1174,6 +1174,40 @@ async fn authorize(
 }
 
 #[cfg(test)]
+pub(crate) async fn test_oauth_client(
+    path: PathBuf,
+    resource: &str,
+    token_url: &str,
+) -> crate::mcp_oauth_client::SafeAuthClient {
+    let store = FileCredentials {
+        path,
+        generation: Some(Uuid::new_v4()),
+        new_login: true,
+        upgrade: None,
+        registration: Arc::default(),
+        lease: Arc::default(),
+    };
+    let creds: StoredCredentials = serde_json::from_value(serde_json::json!({
+        "client_id":"fixture", "token_response":{"access_token":"old", "token_type":"Bearer", "refresh_token":"old-refresh"}
+    })).unwrap();
+    store.write(creds).unwrap();
+    let store = FileCredentials {
+        new_login: false,
+        ..store
+    };
+    let mut manager = oauth_manager(resource, None).await.unwrap();
+    manager.set_metadata(serde_json::from_value(serde_json::json!({
+        "issuer":resource, "authorization_endpoint":resource, "token_endpoint":token_url, "response_types_supported":["code"]
+    })).unwrap());
+    manager.configure_client_id("fixture").unwrap();
+    manager.set_credential_store(store);
+    crate::mcp_oauth_client::SafeAuthClient(
+        AuthClient::new(reqwest_mcp::Client::new(), manager),
+        Arc::default(),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1236,7 +1270,7 @@ mod tests {
                 })).unwrap());
                 manager.configure_client_id("fixture").unwrap();
                 manager.set_credential_store(task_store);
-                let client = crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(reqwest_mcp::Client::new(), manager));
+                let client = crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(reqwest_mcp::Client::new(), manager), Arc::default());
                 let task = tokio::spawn(async move {
                     let result = client.call(reactive.then(|| "old".to_owned()), |_| {
                         let index = task_calls.fetch_add(1, Ordering::SeqCst);
