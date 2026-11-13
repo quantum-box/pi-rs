@@ -462,12 +462,22 @@ impl Agent<'_> {
             crate::LifecycleEvent::AgentStart { run_id, .. } => {
                 callback_root_host(session, sender, *run_id, "agent_start")
             }
-            crate::LifecycleEvent::TurnStart { run_id, .. } => {
-                callback_root_host(session, sender, *run_id, "turn_start")
-            }
-            crate::LifecycleEvent::TurnEnd { run_id, .. } => {
-                callback_root_host(session, sender, *run_id, "turn_end")
-            }
+            crate::LifecycleEvent::TurnStart {
+                run_id, turn_index, ..
+            } => callback_root_host(
+                session,
+                sender,
+                *run_id,
+                callback_turn_phase("turn_start", *turn_index),
+            ),
+            crate::LifecycleEvent::TurnEnd {
+                run_id, turn_index, ..
+            } => callback_root_host(
+                session,
+                sender,
+                *run_id,
+                callback_turn_phase("turn_end", *turn_index),
+            ),
             _ => Arc::new(LifecycleMessageHost {
                 sender,
                 idle: false,
@@ -707,7 +717,7 @@ impl Agent<'_> {
         let mut compacted = false;
         let mut retry_attempt = 0;
         let lifecycle = crate::lifecycle::enabled(self.registry);
-        let mut turn_index = 0;
+        let mut turn_index = completed_run_turns(session, run_id);
         for request_index in 0..self.limits.model_requests {
             let update = tokio::select! {
                 biased;
@@ -1132,9 +1142,14 @@ impl Agent<'_> {
         for extension in &self.registry.extensions {
             let (sender, mut incoming) = mpsc::channel(32);
             let host: Arc<dyn ToolHost> = match session.current_run_id() {
-                Some(run_id) => callback_root_host(session, sender, run_id, "before_request")
-                    .for_extension(extension.id())
-                    .expect("callback host scope"),
+                Some(run_id) => callback_root_host(
+                    session,
+                    sender,
+                    run_id,
+                    request_callback_phase(session, run_id, purpose, "before_request"),
+                )
+                .for_extension(extension.id())
+                .expect("callback host scope"),
                 None => Arc::new(LifecycleMessageHost {
                     sender,
                     idle: false,
@@ -1175,9 +1190,14 @@ impl Agent<'_> {
                 matches!(request.messages.first(), Some(Message::System { .. }));
             let (sender, mut incoming) = mpsc::channel(32);
             let host: Arc<dyn ToolHost> = match session.current_run_id() {
-                Some(run_id) => callback_root_host(session, sender, run_id, "context_with_system")
-                    .for_extension(extension.id())
-                    .expect("callback host scope"),
+                Some(run_id) => callback_root_host(
+                    session,
+                    sender,
+                    run_id,
+                    request_callback_phase(session, run_id, purpose, "context_with_system"),
+                )
+                .for_extension(extension.id())
+                .expect("callback host scope"),
                 None => Arc::new(LifecycleMessageHost {
                     sender,
                     idle: false,
@@ -1495,9 +1515,15 @@ impl Agent<'_> {
             .await?;
             let (sender, mut incoming) = mpsc::channel(32);
             let host = Arc::new(LifecycleMessageHost {
-                sender,
+                sender: sender.clone(),
                 idle: false,
             });
+            let result_host = callback_root_host(
+                session,
+                sender,
+                invocation.operation_id,
+                "recovered_tool_result",
+            );
             let mut errors = Vec::new();
             let mut collect = |event: Notification<'_>| {
                 if let Notification::ExtensionLifecycleError {
@@ -1531,7 +1557,7 @@ impl Agent<'_> {
                         states,
                         cancel,
                         &mut collect,
-                        Some(host),
+                        Some(result_host),
                     )
                     .await;
                     Ok::<_, Error>(reply)
@@ -2475,8 +2501,16 @@ impl Agent<'_> {
                 from_extension: false,
             },
         };
-        self.observe_lifecycle(event, &session.extension_states(), None, observer)
-            .await;
+        let idle = session.current_run_id().is_none();
+        crate::lifecycle::notify_session_with_host(
+            self.registry,
+            session,
+            event,
+            self.limits.model_timeout,
+            observer,
+            idle,
+        )
+        .await?;
         result.map(|(spent, _)| spent)
     }
 
@@ -2936,40 +2970,75 @@ type CallbackMessageSender = mpsc::Sender<(
     oneshot::Sender<std::result::Result<(), String>>,
 )>;
 
-fn callback_root_host(
-    session: &Session,
-    sender: CallbackMessageSender,
-    run_id: Uuid,
-    phase: &'static str,
-) -> Arc<dyn ToolHost> {
-    let replay = session
+fn completed_run_turns(session: &Session, run_id: Uuid) -> u32 {
+    session
         .branch()
         .iter()
         .filter(|record| {
-            record.run_id == Some(run_id)
-                && matches!(
-                    record.event,
-                    Event::Run {
-                        state: RunState::Running,
-                        ..
-                    }
-                )
+            record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. })
         })
         .count()
-        > 1;
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+fn callback_turn_phase(phase: &str, turn_index: u32) -> String {
+    if turn_index == 0 {
+        phase.to_owned()
+    } else {
+        format!("{phase}:turn:{turn_index}")
+    }
+}
+
+fn request_callback_phase(
+    session: &Session,
+    run_id: Uuid,
+    purpose: RequestPurpose,
+    phase: &str,
+) -> String {
+    let mut phase = callback_turn_phase(phase, completed_run_turns(session, run_id));
+    if purpose == RequestPurpose::Summary {
+        phase.push_str(":summary");
+    }
+    let attempts = session
+        .branch()
+        .iter()
+        .rev()
+        .filter(|record| record.run_id == Some(run_id))
+        .take_while(|record| !matches!(record.event, Event::Assistant { .. }))
+        .filter(|record| {
+            matches!(
+                record.event,
+                Event::ModelFinished {
+                    failure: None | Some(ModelFailure::Retryable),
+                    ..
+                }
+            )
+        })
+        .count();
+    if attempts > 0 {
+        phase.push_str(&format!(":request:{attempts}"));
+    }
+    phase
+}
+
+fn callback_root_host(
+    _session: &Session,
+    sender: CallbackMessageSender,
+    run_id: Uuid,
+    phase: impl Into<String>,
+) -> Arc<dyn ToolHost> {
     Arc::new(CallbackRootHost {
         sender,
         run_id,
-        phase,
-        replay,
+        phase: phase.into(),
     })
 }
 
 struct CallbackRootHost {
     sender: CallbackMessageSender,
     run_id: Uuid,
-    phase: &'static str,
-    replay: bool,
+    phase: String,
 }
 #[async_trait::async_trait]
 impl ToolHost for CallbackRootHost {
@@ -2980,9 +3049,8 @@ impl ToolHost for CallbackRootHost {
         Some(Arc::new(ScopedCallbackHost {
             sender: self.sender.clone(),
             run_id: self.run_id,
-            phase: self.phase,
+            phase: self.phase.clone(),
             extension_id: extension_id.to_owned(),
-            replay: self.replay,
         }))
     }
     async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
@@ -2993,9 +3061,8 @@ impl ToolHost for CallbackRootHost {
 struct ScopedCallbackHost {
     sender: CallbackMessageSender,
     run_id: Uuid,
-    phase: &'static str,
+    phase: String,
     extension_id: String,
-    replay: bool,
 }
 impl ScopedCallbackHost {
     async fn submit(
@@ -3046,9 +3113,6 @@ impl ToolHost for ScopedCallbackHost {
         message: crate::CustomMessage,
         delivery: crate::CustomMessageDelivery,
     ) -> crate::ExtensionResult<()> {
-        if self.replay {
-            return Err("unkeyed callback messages are unavailable during recovery; use a stable message key".into());
-        }
         self.submit(message, delivery, Uuid::new_v4()).await
     }
     async fn send_message_with_key(
@@ -3064,7 +3128,7 @@ impl ToolHost for ScopedCallbackHost {
         let mut digest = Sha256::new();
         digest.update(b"pi-rs:callback-message:v2");
         digest.update(self.run_id.as_bytes());
-        for value in [self.phase, self.extension_id.as_str(), key] {
+        for value in [self.phase.as_str(), self.extension_id.as_str(), key] {
             digest.update((value.len() as u64).to_be_bytes());
             digest.update(value.as_bytes());
         }

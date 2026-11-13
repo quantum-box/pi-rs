@@ -345,9 +345,20 @@ pub(crate) async fn notify_idle_with_host(
     timeout: Duration,
     observer: &mut Observer<'_>,
 ) -> crate::Result<()> {
+    notify_session_with_host(registry, session, event, timeout, observer, true).await
+}
+
+pub(crate) async fn notify_session_with_host(
+    registry: &Registry,
+    session: &mut Session,
+    event: LifecycleEvent,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    idle: bool,
+) -> crate::Result<()> {
     let states = session.extension_states();
     let (sender, mut incoming) = tokio::sync::mpsc::channel(32);
-    let host = std::sync::Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+    let host = std::sync::Arc::new(crate::agent::LifecycleMessageHost { sender, idle });
     let mut errors = Vec::new();
     let mut collect = |event: Notification<'_>| {
         if let Notification::ExtensionLifecycleError {
@@ -366,7 +377,7 @@ pub(crate) async fn notify_idle_with_host(
             tokio::select! {
                 biased;
                 Some((input, reply)) = incoming.recv() => {
-                    let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                    let result = if !idle || matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
                         crate::agent::queue_custom_message(session, input, observer)
                     } else {
                         session.append_custom_message(input.message).map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))

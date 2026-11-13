@@ -1237,7 +1237,9 @@ impl AgentSession {
             }
         };
         let final_inputs = active.finish_inputs(&mut self.session, &mut self.input, &mut observer);
-        result.and(final_inputs)
+        let result = result.and(final_inputs);
+        let triggered = self.drain_idle_triggers().await.map(|_| ());
+        result.and(triggered)
     }
     pub async fn close(&mut self) -> Result<()> {
         if self.closed {
@@ -2154,6 +2156,67 @@ mod tests {
         session.close().await.unwrap();
     }
 
+    struct CompactionLifecycleMessage;
+    #[async_trait::async_trait]
+    impl Extension for CompactionLifecycleMessage {
+        fn id(&self) -> &str {
+            "compaction-lifecycle-message"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(
+                event,
+                crate::LifecycleEvent::SessionCompact { .. }
+                    | crate::LifecycleEvent::SessionCompactFailed { .. }
+            ) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "compaction-lifecycle".into(),
+                        content: crate::ContextContent::Text("after compact".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::TriggerTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn compaction_lifecycle_trigger_is_journaled_and_runs_after_summary() {
+        let model = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact.jsonl");
+        let mut session = SessionBuilder::new(model.clone(), "fixture")
+            .extension(Arc::new(CompactionLifecycleMessage))
+            .unwrap()
+            .open(&path)
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.0.load(Ordering::SeqCst), 3);
+        assert!(session.journal().pending_custom_trigger().is_none());
+        drop(session);
+        let restored = Session::open(&path).unwrap();
+        assert!(restored.pending_custom_trigger().is_none());
+        assert_eq!(restored.records().iter().filter(|record| matches!(&record.event,
+            crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "compaction-lifecycle")).count(), 1);
+    }
+
     struct StatisticsModel {
         slow_discovery: bool,
     }
@@ -2691,6 +2754,126 @@ mod tests {
         }
     }
     struct PendingMessageHook;
+    struct PendingKeyedResultHook {
+        paused: tokio::sync::Notify,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Extension for PendingKeyedResultHook {
+        fn id(&self) -> &str {
+            "pending-keyed-result"
+        }
+        fn handles_tool_result(&self) -> bool {
+            true
+        }
+        async fn tool_result_update_with_host(
+            &self,
+            _: &crate::ToolCall,
+            _: &crate::Outcome,
+            _: &crate::ToolContext,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::Outcome>> {
+            assert!(host.supports_keyed_messages());
+            host.send_message_with_key(
+                crate::CustomMessage {
+                    custom_type: "poll-keyed".into(),
+                    content: crate::ContextContent::Text("once".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+                "result",
+            )
+            .await?;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.paused.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_poll_result_key_survives_crash_before_finish_tool() {
+        let job = Arc::new(PollingJob {
+            dispatched: AtomicUsize::new(0),
+            polls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+        });
+        let mut original = SessionBuilder::new(Arc::new(TaskModel), "task")
+            .extension(Arc::new(JobExtension(job.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let control = original.controls();
+        let (result, ()) = tokio::join!(original.prompt("start job"), async {
+            job.started.notified().await;
+            control.abort();
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        let run_id = original
+            .journal()
+            .records()
+            .iter()
+            .find_map(|record| match record.event {
+                crate::Event::Run {
+                    state: crate::RunState::Running,
+                    ..
+                } => record.run_id,
+                _ => None,
+            })
+            .unwrap();
+        let mut journal = Session::from_records(original.journal().records().to_vec()).unwrap();
+        let hook = Arc::new(PendingKeyedResultHook {
+            paused: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let mut registry = Registry::default();
+        registry.register(Arc::new(JobExtension(job))).unwrap();
+        registry.register(hook.clone()).unwrap();
+        let agent = Agent {
+            model: &TaskModel,
+            model_name: "task",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(16);
+        {
+            let cancel = CancellationToken::new();
+            let mut observer = |_: Notification<'_>| {};
+            let future = agent.run_correlated(
+                &mut journal,
+                run_id,
+                None,
+                &mut inputs,
+                &cancel,
+                &mut observer,
+            );
+            tokio::pin!(future);
+            tokio::select! { _ = &mut future => panic!("callback did not pause"), _ = hook.paused.notified() => {} }
+        }
+        let mut restored = Session::from_records(journal.records().to_vec()).unwrap();
+        assert_eq!(
+            agent
+                .run_correlated(
+                    &mut restored,
+                    run_id,
+                    None,
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(restored.records().iter().filter(|record| matches!(&record.event,
+            crate::Event::CustomMessageQueued { input } if input.message.custom_type == "poll-keyed")).count(), 1);
+    }
+
     #[async_trait::async_trait]
     impl Extension for PendingMessageHook {
         fn id(&self) -> &str {
@@ -3763,18 +3946,15 @@ mod tests {
                     self.ready.notify_one();
                     std::future::pending::<()>().await;
                 } else {
-                    assert!(
-                        host.send_message(message, crate::CustomMessageDelivery::Steer)
-                            .await
-                            .is_err()
-                    );
+                    host.send_message(message, crate::CustomMessageDelivery::Steer)
+                        .await?;
                 }
             }
             Ok(())
         }
     }
     #[tokio::test]
-    async fn unkeyed_agent_start_replay_rejects_changed_paths_without_duplicating() {
+    async fn unkeyed_agent_start_replay_accepts_changed_paths() {
         let ready = Arc::new(tokio::sync::Notify::new());
         let hook = Arc::new(ReplayStartHook {
             ready: ready.clone(),
@@ -3834,8 +4014,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "start")).count(), 1);
-            assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "start")).count(), 1);
+            assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "start")).count(), 2);
+            assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "start")).count(), 2);
         }
         assert_eq!(hook.calls.load(Ordering::SeqCst), 3);
     }
@@ -3985,6 +4165,153 @@ mod tests {
     }
 
     struct ScopedKeyHook(&'static str);
+
+    struct PerTurnKeyHook {
+        paused: tokio::sync::Notify,
+        second_starts: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Extension for PerTurnKeyHook {
+        fn id(&self) -> &str {
+            "per-turn-key"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(LifecycleMessageTool)]
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        async fn before_request_with_host(
+            &self,
+            _: &mut ModelRequest,
+            _: crate::RequestPurpose,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            host.send_message_with_key(
+                crate::CustomMessage {
+                    custom_type: "turn-request".into(),
+                    content: crate::ContextContent::Text("request".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::NextTurn,
+                "same",
+            )
+            .await
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if let crate::LifecycleEvent::TurnStart { turn_index, .. } = event {
+                host.send_message_with_key(
+                    crate::CustomMessage {
+                        custom_type: "turn-start".into(),
+                        content: crate::ContextContent::Text(format!("turn {turn_index}")),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                    "same",
+                )
+                .await?;
+                if *turn_index == 1 && self.second_starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.paused.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                if *turn_index == 1 {
+                    host.send_message(
+                        crate::CustomMessage {
+                            custom_type: "new-after-recovery".into(),
+                            content: crate::ContextContent::Text("new".into()),
+                            display: false,
+                            details: None,
+                        },
+                        crate::CustomMessageDelivery::NextTurn,
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn per_turn_keys_and_indices_survive_second_turn_restart() {
+        let hook = Arc::new(PerTurnKeyHook {
+            paused: tokio::sync::Notify::new(),
+            second_starts: AtomicUsize::new(0),
+        });
+        let mut registry = Registry::default();
+        registry.register(hook.clone()).unwrap();
+        let model = MessageDeliveryModel(Arc::new(Mutex::new(Vec::new())));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "test",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        let (_sender, mut inputs) = mpsc::channel::<crate::AgentInput>(32);
+        let mut observer = |_: Notification<'_>| {};
+        let (first, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(
+                agent.run_correlated(
+                    &mut session,
+                    run_id,
+                    Some("prompt".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut observer
+                ),
+                async {
+                    hook.paused.notified().await;
+                    cancel.cancel();
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(first, Err(Error::Cancelled)));
+        let mut restored = Session::from_records(session.records().to_vec()).unwrap();
+        agent
+            .run_correlated(
+                &mut restored,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(hook.second_starts.load(Ordering::SeqCst), 2);
+        assert_eq!(restored.records().iter().filter(|record| matches!(&record.event,
+            crate::Event::CustomMessageQueued { input } if input.message.custom_type == "new-after-recovery")).count(), 1);
+        for kind in ["turn-request", "turn-start"] {
+            let entries: Vec<_> = restored
+                .records()
+                .iter()
+                .filter_map(|record| match &record.event {
+                    crate::Event::CustomMessageQueued { input }
+                        if input.message.custom_type == kind =>
+                    {
+                        Some(input.id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(entries.len(), 2, "{kind}");
+            assert_ne!(entries[0], entries[1]);
+        }
+    }
+
     #[async_trait::async_trait]
     impl Extension for ScopedKeyHook {
         fn id(&self) -> &str {
@@ -4028,7 +4355,7 @@ mod tests {
                     display: false,
                     details: None,
                 },
-                crate::CustomMessageDelivery::Steer,
+                crate::CustomMessageDelivery::NextTurn,
                 "same",
             )
             .await
@@ -4072,6 +4399,9 @@ mod tests {
     impl UnkeyedReplayHook {
         async fn send(&self, host: Arc<dyn crate::ToolHost>) -> crate::ExtensionResult<()> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            if attempt >= 2 {
+                return Ok(());
+            }
             host.send_message(
                 crate::CustomMessage {
                     custom_type: "unkeyed".into(),
@@ -4145,7 +4475,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn unkeyed_callback_replay_rejects_changed_path_without_duplicate_or_retry_loop() {
+    async fn unkeyed_callback_replay_accepts_changed_path() {
         for phase in ["before_request", "context", "turn_start"] {
             let ready = Arc::new(tokio::sync::Notify::new());
             let hook = Arc::new(UnkeyedReplayHook {
@@ -4198,16 +4528,9 @@ mod tests {
                     &mut |_| {},
                 )
                 .await;
-            if phase == "turn_start" {
-                assert!(resumed.is_ok(), "{phase}: {resumed:?}");
-            } else {
-                assert!(
-                    matches!(resumed, Err(Error::Extension { .. })),
-                    "{phase}: {resumed:?}"
-                );
-            }
-            assert_eq!(hook.calls.load(Ordering::SeqCst), 2, "{phase}");
-            assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "unkeyed")).count(), 1, "{phase}");
+            assert!(resumed.is_ok(), "{phase}: {resumed:?}");
+            assert!(hook.calls.load(Ordering::SeqCst) >= 2, "{phase}");
+            assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "unkeyed")).count(), 2, "{phase}");
             assert!(
                 session
                     .records()

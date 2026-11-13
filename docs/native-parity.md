@@ -2808,18 +2808,18 @@ undelivered cancelled runs, replayed `agent_start` callbacks, separate SDK run
 brackets, and restarts before run creation, before and after message delivery,
 and after the answer was recorded. During a run, `agent_start`, `turn_start`,
 `turn_end`, `before_request`, and `context_with_system` callbacks can call
-`send_message_with_key`. The extension must supply a stable key unique within
-that run, extension, and callback phase, including distinct keys for distinct
-turns. Identical keyed replays reuse the journal entry even when callback order
+`send_message_with_key`. Keys are scoped by run, extension, callback phase and
+turn; request hooks also distinguish recorded request attempts. Recovered
+pending tool-result hooks scope keys by operation and extension. The extension
+must supply a stable key unique for each logical send within that callback.
+Identical keyed replays reuse the journal entry even when callback order
 changes; reusing a key with different content fails the run instead of retrying
 indefinitely. Executable extensions negotiate keyed-message support.
 
 Exactly-once recovery is not possible for unkeyed callback sends when a process
-stops between sends or the callback takes a different path. On a resumed run,
-unkeyed sends from these callbacks return an error and do not append anything;
-this avoids duplicates but may omit sends that had not completed before the
-interruption. Unkeyed sends can also repeat if the callback is invoked again
-within the same uninterrupted run. Extensions should use stable keys for
+stops between sends or the callback takes a different path. Ordinary Pi-style
+unkeyed sends remain accepted on recovery; re-executing a callback can append a
+message again. Extensions that can supply stable keys may use them for
 recovery-safe delivery and must not switch an interrupted run's sends from
 unkeyed to keyed: older journals
 do not contain enough information to match those identities. Automatic trigger
@@ -2833,7 +2833,10 @@ order; it is covered for both user and custom starting messages. Host-aware
 `before_tool` policies can opt in with
 `handles_before_tool_host`; separately built extensions negotiate this support.
 Host calls also remain unavailable in idle `SessionControl` input hooks,
-compaction, and pre-navigation `session_before_tree` hooks. For host-bound workbench sessions, resource discovery
+the synchronous `before_compaction` and `after_compaction` hooks, and
+pre-navigation `session_before_tree` hooks. Async `session_compact` and
+`session_compact_failed` notifications can send through the session owner.
+For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The
 state-only `Registry::discover_resources` and `session_transition_cancelled`
 APIs do not have a session owner; hosts that need message delivery use their

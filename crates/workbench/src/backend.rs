@@ -598,7 +598,10 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             request => request,
         };
         continue_queue = false;
-        let tree_navigation = matches!(&request, Request::BranchSummary { .. });
+        let idle_callback_operation = matches!(
+            &request,
+            Request::BranchSummary { .. } | Request::Compact { .. }
+        );
         let resume_queued = matches!(
             &request,
             Request::Prompt { .. }
@@ -997,7 +1000,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                 );
             }
         }
-        if tree_navigation {
+        if idle_callback_operation {
             pending_discovery_trigger = run_session
                 .as_ref()
                 .and_then(Session::pending_custom_trigger);

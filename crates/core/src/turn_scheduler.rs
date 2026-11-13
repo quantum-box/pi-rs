@@ -337,7 +337,7 @@ impl Agent<'_> {
                 _ = cancel.cancelled() => break,
                 result = tokio::time::timeout(tool_timeout, async {
                     match &host {
-                        Some(host) => extension.tool_result_update_with_host(&invocation.call, &reply.outcome, &context, states.get(extension.id()), host.clone()).await,
+                        Some(host) => extension.tool_result_update_with_host(&invocation.call, &reply.outcome, &context, states.get(extension.id()), host.for_extension(extension.id()).unwrap_or_else(|| host.clone())).await,
                         None => extension.tool_result_update(&invocation.call, &reply.outcome, &context, states.get(extension.id())).await,
                     }
                 }) => result,
