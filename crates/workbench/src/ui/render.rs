@@ -717,6 +717,7 @@ impl Table {
             )
         };
         let mut lines = vec![border("┌", "┬", "┐")];
+        let row_count = self.rows.len();
         for (index, row) in self.rows.into_iter().enumerate() {
             let cells: Vec<_> = widths
                 .iter()
@@ -753,7 +754,7 @@ impl Table {
                 }
                 lines.push(line);
             }
-            if index == 0 {
+            if index == 0 || index + 1 < row_count {
                 lines.push(border("├", "┼", "┤"));
             }
         }
@@ -1632,6 +1633,55 @@ mod tests {
                 .flat_map(|line| &line.spans)
                 .any(|span| span.text.contains("https://example.com"))
         );
+    }
+
+    #[test]
+    fn markdown_tables_separate_data_rows_after_wrapped_cells() {
+        let source = "| Name | Count |\n| :--- | ---: |\n| long description | 12 |\n| 日本語 | 3 |\n| last | 40 |";
+        let lines = markdown(source, &Theme::system(), 20);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        let dividers: Vec<_> = text
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with('├'))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(dividers.len(), 3, "{text:#?}");
+        assert!(
+            text[dividers[0] + 1..dividers[1]].len() > 1,
+            "first row should wrap: {text:#?}"
+        );
+        assert!(
+            text[dividers[1] + 1..dividers[2]]
+                .iter()
+                .any(|line| line.contains("日本")),
+            "{text:#?}"
+        );
+        assert!(text[dividers[2] + 1].contains("last"), "{text:#?}");
+        assert!(text.last().unwrap().starts_with('└'), "{text:#?}");
+        assert!(
+            text.iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 20)
+        );
+        for source in ["| H |\n| - |", "| H |\n| - |\n| one |"] {
+            let lines = markdown(source, &Theme::system(), 30);
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line
+                        .spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                        .starts_with('├'))
+                    .count(),
+                1,
+                "{source}"
+            );
+        }
     }
 
     #[test]
