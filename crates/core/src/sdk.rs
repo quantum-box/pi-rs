@@ -1090,32 +1090,25 @@ impl AgentSession {
                     source: crate::InputSource::Extension,
                     streaming_behavior: None,
                 };
-                let states = self.session.extension_states();
-                let (sender, mut incoming) = mpsc::channel(32);
-                let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
-                let prepared = {
-                    let future = self.registry.prepare_input_with_host(event, &states, host);
-                    tokio::pin!(future);
-                    loop {
-                        tokio::select! {
-                            biased;
-                            Some((input, reply)) = incoming.recv() => {
-                                let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
-                                    crate::agent::queue_custom_message(&mut self.session, input, &mut observe)
-                                } else {
-                                    self.session.append_custom_message(input.message).map(|()| {
-                                        observe(Notification::Committed(self.session.records().last().expect("appended custom message")));
-                                    })
-                                };
-                                match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
-                            }
-                            _ = active.token.cancelled() => return Err(Error::Cancelled),
-                            result = &mut future => break result?,
-                        }
-                    }
-                };
+                let prepared = prepare_idle_input_with_host(
+                    &self.registry,
+                    &mut self.session,
+                    event,
+                    &active.token,
+                    &mut observe,
+                )
+                .await?;
                 if let Some(trigger_id) = self.session.pending_custom_trigger() {
-                    agent.run_correlated(&mut self.session, trigger_id, None, &mut self.input, &active.token, &mut observe).await?;
+                    agent
+                        .run_correlated(
+                            &mut self.session,
+                            trigger_id,
+                            None,
+                            &mut self.input,
+                            &active.token,
+                            &mut observe,
+                        )
+                        .await?;
                 }
                 let Some(prepared) = prepared else {
                     return Ok(String::new());
@@ -1124,7 +1117,9 @@ impl AgentSession {
                 images = (!prepared.images.is_empty()).then_some(prepared.images);
             }
             if let Some(images) = images {
-                agent.resolve_prior_turn_end(&mut self.session, run_id, &active.token, &mut observe).await?;
+                agent
+                    .resolve_prior_turn_end(&mut self.session, run_id, &active.token, &mut observe)
+                    .await?;
                 self.session.append_user_with_images(
                     input.take().unwrap_or_default(),
                     images,
@@ -1392,6 +1387,42 @@ impl Drop for AgentSession {
         self.registry
             .remove_session_branch_models(self.session.session_id());
         *self.control.input_hooks.lock().expect("SDK input hooks") = InputHooks::default();
+    }
+}
+/// Prepare an input while the session owner services durable extension messages.
+/// The owner must continue polling this future until completion or cancellation;
+/// acknowledging a host call before its journal write would lose messages on restart.
+async fn prepare_idle_input_with_host(
+    registry: &Registry,
+    session: &mut Session,
+    event: crate::InputEvent,
+    cancellation: &CancellationToken,
+    observer: &mut Observer<'_>,
+) -> Result<Option<crate::InputEvent>> {
+    let states = session.extension_states();
+    let (sender, mut incoming) = mpsc::channel(32);
+    let host = Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+    let future = registry.prepare_input_with_host(event, &states, host);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            Some((input, reply)) = incoming.recv() => {
+                let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                    crate::agent::queue_custom_message(session, input, observer)
+                } else {
+                    session.append_custom_message(input.message).map(|()| {
+                        observer(Notification::Committed(session.records().last().expect("appended custom message")));
+                    })
+                };
+                match result {
+                    Ok(()) => { let _ = reply.send(Ok(())); }
+                    Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                }
+            }
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            result = &mut future => return result,
+        }
     }
 }
 struct ActiveRun {
@@ -7173,6 +7204,86 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["trigger", "next", "user"]);
+    }
+
+    struct PendingIdleInputHook(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl Extension for PendingIdleInputHook {
+        fn id(&self) -> &str {
+            "pending-idle-input"
+        }
+        fn handles_input(&self) -> bool {
+            true
+        }
+        async fn input_with_host(
+            &self,
+            _: &crate::InputEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::InputAction> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "idle-input".into(),
+                    content: crate::ContextContent::Text("durable before cancellation".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::TriggerTurn,
+            )
+            .await?;
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_input_host_ack_survives_cancellation_and_reopen() {
+        let notified = Arc::new(tokio::sync::Notify::new());
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PendingIdleInputHook(notified.clone())))
+            .unwrap();
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let cancellation = CancellationToken::new();
+        let cancel = async {
+            notified.notified().await;
+            cancellation.cancel();
+        };
+        let event = crate::InputEvent {
+            text: "input".into(),
+            images: vec![],
+            source: crate::InputSource::Extension,
+            streaming_behavior: None,
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut observer = |_: Notification<'_>| {};
+            tokio::join!(
+                prepare_idle_input_with_host(
+                    &registry,
+                    &mut session,
+                    event,
+                    &cancellation,
+                    &mut observer
+                ),
+                cancel
+            )
+            .0
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+        let reopened = Session::from_records(session.records().to_vec()).unwrap();
+        let queued = reopened.queued_custom_messages();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].1.delivery,
+            crate::CustomMessageDelivery::TriggerTurn
+        );
+        assert_eq!(
+            queued[0].1.message.content,
+            crate::ContextContent::Text("durable before cancellation".into())
+        );
+        assert!(reopened.pending_custom_trigger().is_some());
     }
 
     struct TransitionMessageHook(crate::CustomMessageDelivery);
