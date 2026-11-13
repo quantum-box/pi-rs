@@ -2090,17 +2090,19 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             keep_turns,
             ..
         } => {
-            return match keep_turns {
-                Some(keep_turns) => agent.compact(
-                    &mut session, Compaction { summary, keep_turns }, &mut observer,
-                ),
-                None => agent.compact_configured(&mut session, summary, &mut observer),
+            let compacted = match keep_turns {
+                Some(keep_turns) => agent.compact_with_host(
+                    &mut session, Compaction { summary, keep_turns }, &cancel, &mut observer,
+                ).await,
+                None => agent.compact_configured_with_host(&mut session, summary, &cancel, &mut observer).await,
             };
+            let triggered = run_pending_custom_trigger(&args, &runtime, &mut session).await;
+            return compacted.and(triggered);
         }
         Command::Compact {
             summary: None, keep_turns, instructions,
         } => {
-            return match keep_turns {
+            let compacted = match keep_turns {
                 Some(keep_turns) => agent.summarize_with_instructions::<pi_rs::AgentInput>(
                     &mut session, keep_turns, &cancel, &mut observer, None, instructions.as_deref(),
                 ).await,
@@ -2108,6 +2110,8 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                     &mut session, &cancel, &mut observer, None, instructions.as_deref(),
                 ).await,
             };
+            let triggered = run_pending_custom_trigger(&args, &runtime, &mut session).await;
+            return compacted.and(triggered);
         }
         Command::Run { prompt } => Some(prompt),
         Command::Resume => None,

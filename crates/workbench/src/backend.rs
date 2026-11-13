@@ -822,14 +822,19 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     summary: Some(summary),
                     keep_turns,
                     ..
-                } => agent.compact(
-                    session,
-                    Compaction {
-                        summary,
-                        keep_turns,
-                    },
-                    &mut observer,
-                )?,
+                } => {
+                    agent
+                        .compact_with_host(
+                            session,
+                            Compaction {
+                                summary,
+                                keep_turns,
+                            },
+                            &cancel,
+                            &mut observer,
+                        )
+                        .await?
+                }
                 Request::Compact {
                     summary: None,
                     keep_turns,

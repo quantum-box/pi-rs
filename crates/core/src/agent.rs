@@ -232,8 +232,6 @@ impl Agent<'_> {
                 return Err(Error::DuplicateRun(run_id));
             }
         }
-        self.resolve_prior_turn_end(session, run_id, cancel, observer)
-            .await?;
         session.set_run_id(Some(run_id));
         observer(Notification::RunStarted { run_id });
         let result = self
@@ -250,19 +248,6 @@ impl Agent<'_> {
             let Some(trigger_id) = session.pending_custom_trigger() else {
                 break;
             };
-            if let Err(error) = self
-                .resolve_prior_turn_end(session, trigger_id, cancel, observer)
-                .await
-            {
-                observer(Notification::RunStarted { run_id: trigger_id });
-                let message = error.to_string();
-                observer(Notification::RunEnded {
-                    run_id: trigger_id,
-                    succeeded: false,
-                    error: Some(&message),
-                });
-                break;
-            }
             session.set_run_id(Some(trigger_id));
             observer(Notification::RunStarted { run_id: trigger_id });
             let trigger_result = self
@@ -315,8 +300,14 @@ impl Agent<'_> {
             },
             observer,
         )?;
+        let prior_result = self
+            .resolve_prior_turn_end(session, run_id, cancel, observer)
+            .await;
+        session.set_run_id(Some(run_id));
         let lifecycle = crate::lifecycle::enabled(self.registry);
-        let start_result = if lifecycle {
+        let start_result = if prior_result.is_err() {
+            prior_result
+        } else if lifecycle {
             let states = session.extension_states();
             self.observe_active_lifecycle(
                 session,
@@ -2223,6 +2214,40 @@ impl Agent<'_> {
             Some(retention),
             observer,
         )
+        .map(|_| ())
+    }
+
+    /// Compact a supplied summary with configured retention and host-aware hooks.
+    pub async fn compact_configured_with_host(
+        &self,
+        session: &mut Session,
+        summary: String,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        let retention = configured_retention(
+            session,
+            session
+                .auto_compaction_control()
+                .token_settings()
+                .keep_recent_tokens,
+            1,
+        )?;
+        self.commit_compaction_with_host(
+            session,
+            Compaction {
+                summary,
+                keep_turns: retention.keep_turns,
+            },
+            &states,
+            None,
+            Some(retention),
+            cancel,
+            observer,
+        )
+        .await
         .map(|_| ())
     }
 

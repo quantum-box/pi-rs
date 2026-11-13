@@ -4494,6 +4494,65 @@ fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
 
 #[cfg(unix)]
 #[test]
+fn supplied_compaction_hooks_trigger_durable_turns_in_print_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("compact-hooks.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline()); request=frame['request']; kind=request['type']
+    assert kind in ('before_compaction','after_compaction')
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','message':{'customType':'compact-hook','content':'same input','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    result=[request['summary'],request['keep_turns'],{'allow':True,'reason':None}] if kind=='before_compaction' else None
+    print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    if request['type']=='describe': result={'id':'compact-hook','dependencies':[],'commands':[],'tools':[],'compaction_hook_host_calls':True}
+    elif request['type']=='before_request': result=request['request']
+    else: result=None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = root.path().join("session.jsonl");
+    let mut session = Session::open(&path).unwrap();
+    session
+        .append_user_with_images("old".into(), vec![], None)
+        .unwrap();
+    drop(session);
+    let (endpoint, server) = model_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["compact", "--summary", "summary", "--keep-turns", "0"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let session = Session::open(path).unwrap();
+    assert!(session.pending_custom_trigger().is_none());
+    assert_eq!(session.records().iter().filter(|record| matches!(&record.event,
+        pi_rs::Event::CustomMessageDelivered { message, .. } if message.custom_type == "compact-hook")).count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
 fn resource_discovery_trigger_runs_before_print_prompt() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
