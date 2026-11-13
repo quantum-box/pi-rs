@@ -42,7 +42,8 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                     Some("resources/list") if request["params"]["cursor"] == "next" => {
                         Some(json!({"resources":[
                             {"uri":"file:///second.txt","name":"second","mimeType":"text/plain","_meta":{"secret":"discard"},"icons":[{"src":"https://example.invalid/icon"}]},
-                            {"uri":"file:///panel.html","name":"panel","mimeType":"text/html; PROFILE = \"mcp-app\""}
+                        {"uri":"file:///panel.html","name":"panel","mimeType":"text/html; PROFILE = \"mcp-app\""},
+                        {"uri":"file:///extension.html","name":"prefix-match","mimeType":"text/html;profile=mcp-app-extra"}
                         ]}))
                     }
                     Some("resources/list") => Some(json!({"resources":[
@@ -53,7 +54,8 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                     Some("resources/templates/list") if request["params"]["cursor"] == "next" => {
                         Some(json!({"resourceTemplates":[
                             {"uriTemplate":"file:///items/{id}","name":"item","mimeType":"text/plain","_meta":{"private":true},"icons":[{"src":"https://example.invalid/icon"}]},
-                            {"uriTemplate":"file:///app/{id}","name":"app","mimeType":"text/html;profile=mcp-app"}
+                        {"uriTemplate":"file:///app/{id}","name":"app","mimeType":"text/html;profile=mcp-app"},
+                        {"uriTemplate":"file:///extension/{id}","name":"prefix-match","mimeType":"text/html;profile=mcp-app-extra"}
                         ]}))
                     }
                     Some("resources/templates/list") => Some(

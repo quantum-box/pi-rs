@@ -426,8 +426,11 @@ listing/reading. Configuration can reference environment variables or bounded
 credential commands. Server processes are isolated into process groups/jobs,
 and the CLI closes connections after each run.
 
-Resource and template listings omit MCP App `ui://` entries and entries with the
-`mcp-app` MIME profile, along with listing icons and `_meta`, as in Pi. Native
+Resource and template listings omit MCP App `ui://` entries and entries whose
+MIME profile starts with `mcp-app`, along with listing icons and `_meta`, matching
+pinned Pi's prefix regex. This also hides non-App profiles such as
+`mcp-app-extra`; the MCP Apps specification identifies `mcp-app` itself, so this
+is a known Pi-fidelity limitation rather than exact profile matching. Native
 resource tools remain namespaced per server and aggregate that server's pages.
 
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer

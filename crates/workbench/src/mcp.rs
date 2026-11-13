@@ -1285,7 +1285,7 @@ impl McpTool {
     }
 }
 
-/// MCP App UIs are not model-readable resources; omit their presentation metadata too.
+/// Match Pi's MCP App listing filter, including its MIME-profile prefix matching.
 fn visible_resource_listing(value: Value) -> Vec<Value> {
     static APP_PROFILE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"(?i);\s*profile\s*=\s*"?mcp-app"?"#).expect("MCP App MIME profile")
