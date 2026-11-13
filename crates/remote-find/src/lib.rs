@@ -134,55 +134,72 @@ fn resolve(root: &Path, input: &Path) -> PathBuf {
     }
     resolved
 }
-fn display_path(path: &Path, base: &Path) -> Result<String> {
-    let trailing = path.to_string_lossy().ends_with(['/', '\\']);
-    let relative = if path.is_absolute() {
-        path.strip_prefix(base).map_err(|_| {
-            Error::Config("find backend returned a path outside the search directory".into())
-        })?
-    } else {
-        path
-    };
-    if relative.components().any(|c| {
-        matches!(
-            c,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return Err(Error::Config(
-            "find backend returned a path outside the search directory".into(),
-        ));
-    }
-    let mut display = relative
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/");
-    if display.is_empty() {
-        return Err(Error::Config("find backend returned an empty path".into()));
-    }
-    if trailing && !display.ends_with('/') {
-        display.push('/');
-    }
-    Ok(display)
+// Keep only the display prefix while counting the complete output for Pi's
+// truncation metadata. Conversion and accounting proceed in bounded chunks.
+struct Listing {
+    prefix: Vec<u8>,
+    total_bytes: usize,
+    newlines: usize,
+    ends_in_newline: bool,
 }
-fn listing(
-    mut output: String,
-    mut details: Map<String, Value>,
-    mut notices: Vec<String>,
-) -> Outcome {
-    if output.len() > MAX_BYTES {
-        let total_lines = output.split_terminator('\n').count();
-        let total_bytes = output.len();
-        let end = output.as_bytes()[..=MAX_BYTES]
-            .iter()
-            .rposition(|byte| *byte == b'\n');
-        let first_line_exceeds_limit = end.is_none();
-        output.truncate(end.unwrap_or(0));
-        let output_lines = end.map_or(0, |_| {
-            output.bytes().filter(|byte| *byte == b'\n').count() + 1
-        });
-        details.insert("truncation".into(), json!({"content":output, "truncated":true,"truncatedBy":"bytes", "totalLines":total_lines,"totalBytes":total_bytes,"outputLines":output_lines,"outputBytes":output.len(),"lastLinePartial":false,"firstLineExceedsLimit":first_line_exceeds_limit,"maxLines":UNLIMITED_LINES,"maxBytes":MAX_BYTES}));
-        notices.push("50.0KB limit reached".into());
+impl Listing {
+    fn new() -> Self {
+        Self {
+            prefix: Vec::with_capacity(MAX_BYTES + 1),
+            total_bytes: 0,
+            newlines: 0,
+            ends_in_newline: false,
+        }
     }
+    fn append(&mut self, bytes: &[u8], cancellation: &pi_rs::CancellationToken) -> Result<()> {
+        for chunk in bytes.chunks(8192) {
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+            self.newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
+            self.ends_in_newline = chunk.last() == Some(&b'\n');
+            let keep = (MAX_BYTES + 1)
+                .saturating_sub(self.prefix.len())
+                .min(chunk.len());
+            #[cfg(windows)]
+            self.prefix.extend(
+                chunk[..keep]
+                    .iter()
+                    .map(|byte| if *byte == b'\\' { b'/' } else { *byte }),
+            );
+            #[cfg(not(windows))]
+            self.prefix.extend_from_slice(&chunk[..keep]);
+        }
+        Ok(())
+    }
+    fn finish(mut self, reached: bool, limit: usize) -> Outcome {
+        let mut details = Map::new();
+        let mut notices = Vec::new();
+        if reached {
+            details.insert("resultLimitReached".into(), json!(limit));
+            notices.push(format!("{limit} results limit reached"));
+        }
+        if self.total_bytes > MAX_BYTES {
+            let end = self.prefix.iter().rposition(|byte| *byte == b'\n');
+            self.prefix.truncate(end.unwrap_or(0));
+            let output_lines = end.map_or(0, |_| {
+                self.prefix.iter().filter(|byte| **byte == b'\n').count() + 1
+            });
+            let content = String::from_utf8(self.prefix).expect("truncated at a newline");
+            let total_lines = self.newlines + usize::from(!self.ends_in_newline);
+            details.insert("truncation".into(), json!({"content":content, "truncated":true,"truncatedBy":"bytes", "totalLines":total_lines,"totalBytes":self.total_bytes,"outputLines":output_lines,"outputBytes":content.len(),"lastLinePartial":false,"firstLineExceedsLimit":end.is_none(),"maxLines":UNLIMITED_LINES,"maxBytes":MAX_BYTES}));
+            notices.push("50.0KB limit reached".into());
+            return finish(content, details, notices);
+        }
+        finish(
+            String::from_utf8(self.prefix).expect("complete UTF-8 output"),
+            details,
+            notices,
+        )
+    }
+}
+fn finish(mut output: String, details: Map<String, Value>, notices: Vec<String>) -> Outcome {
     if !notices.is_empty() {
         output.push_str(&format!("\n\n[{}]", notices.join(". ")));
     }
@@ -194,6 +211,125 @@ fn listing(
             details: Value::Object(details),
         }
     }
+}
+
+#[cfg(unix)]
+fn append_os_path(
+    listing: &mut Listing,
+    value: &std::ffi::OsStr,
+    token: &pi_rs::CancellationToken,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut bytes = value.as_bytes();
+    while !bytes.is_empty() {
+        if token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let mut end = bytes.len().min(8192);
+        // Extend a chunk by at most three bytes to avoid splitting UTF-8.
+        while end < bytes.len()
+            && matches!(std::str::from_utf8(&bytes[..end]), Err(error) if error.error_len().is_none())
+        {
+            end += 1;
+        }
+        match std::str::from_utf8(&bytes[..end]) {
+            Ok(_) => {
+                listing.append(&bytes[..end], token)?;
+                bytes = &bytes[end..];
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                listing.append(&bytes[..valid], token)?;
+                listing.append("�".as_bytes(), token)?;
+                let invalid = error.error_len().unwrap_or(bytes.len() - valid);
+                bytes = &bytes[valid + invalid..];
+            }
+        }
+    }
+    Ok(())
+}
+#[cfg(windows)]
+fn append_os_path(
+    listing: &mut Listing,
+    value: &std::ffi::OsStr,
+    token: &pi_rs::CancellationToken,
+) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut chunk = String::with_capacity(8192);
+    for ch in std::char::decode_utf16(value.encode_wide()) {
+        if token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        chunk.push(ch.unwrap_or('�'));
+        if chunk.len() >= 8192 {
+            listing.append(chunk.as_bytes(), token)?;
+            chunk.clear();
+        }
+    }
+    listing.append(chunk.as_bytes(), token)
+}
+#[cfg(not(any(unix, windows)))]
+fn append_os_path(
+    listing: &mut Listing,
+    value: &std::ffi::OsStr,
+    token: &pi_rs::CancellationToken,
+) -> Result<()> {
+    listing.append(value.to_string_lossy().as_bytes(), token)
+}
+fn format_results(
+    results: Vec<PathBuf>,
+    base: &Path,
+    limit: usize,
+    cancellation: &pi_rs::CancellationToken,
+) -> Result<Outcome> {
+    let reached = results.len() >= limit;
+    let mut listing = Listing::new();
+    for (index, path) in results.iter().take(limit).enumerate() {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let raw = path.as_os_str().as_encoded_bytes();
+        let trailing = raw.last() == Some(&b'/') || (cfg!(windows) && raw.last() == Some(&b'\\'));
+        let relative = if path.is_absolute() {
+            path.strip_prefix(base).map_err(|_| {
+                Error::Config("find backend returned a path outside the search directory".into())
+            })?
+        } else {
+            path
+        };
+        if relative.as_os_str().is_empty() {
+            return Err(Error::Config("find backend returned an empty path".into()));
+        }
+        for part in relative.components() {
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if matches!(
+                part,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            ) {
+                return Err(Error::Config(
+                    "find backend returned a path outside the search directory".into(),
+                ));
+            }
+        }
+        if index != 0 {
+            listing.append(b"\n", cancellation)?;
+        }
+        append_os_path(&mut listing, relative.as_os_str(), cancellation)?;
+        // Separators are already present in the relative path; Path can drop a
+        // trailing slash during stripping, so restore it if needed.
+        if trailing
+            && !relative
+                .as_os_str()
+                .as_encoded_bytes()
+                .last()
+                .is_some_and(|byte| *byte == b'/' || (cfg!(windows) && *byte == b'\\'))
+        {
+            listing.append(b"/", cancellation)?;
+        }
+    }
+    Ok(listing.finish(reached, limit))
 }
 #[async_trait::async_trait]
 impl Tool for RemoteFind {
@@ -244,21 +380,12 @@ impl Tool for RemoteFind {
             if results.is_empty() {
                 return Ok(Outcome::Succeeded("No files found matching pattern".into()));
             }
-            let reached = results.len() >= limit;
-            let mut output = Vec::with_capacity(results.len().min(limit));
-            for result in results.iter().take(limit) {
-                if cancellation.is_cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                output.push(display_path(result, &path)?);
-            }
-            let mut details = Map::new();
-            let mut notices = Vec::new();
-            if reached {
-                details.insert("resultLimitReached".into(), json!(limit));
-                notices.push(format!("{limit} results limit reached"));
-            }
-            Ok(listing(output.join("\n"), details, notices))
+            let worker_token = cancellation.clone();
+            tokio::task::spawn_blocking(move || {
+                format_results(results, &path, limit, &worker_token)
+            })
+            .await
+            .map_err(|error| Error::Config(error.to_string()))?
         };
         let result = tokio::select! { biased; _ = cancellation.cancelled() => Err(Error::Cancelled), result = operation => result };
         match result {
@@ -273,6 +400,64 @@ impl Tool for RemoteFind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_listing_counts_full_output_and_observes_cancellation() {
+        let token = pi_rs::CancellationToken::new();
+        let mut listing = Listing::new();
+        let chunk = "entry\n".repeat(2000);
+        for _ in 0..100 {
+            listing.append(chunk.as_bytes(), &token).unwrap();
+        }
+        assert!(listing.prefix.len() <= MAX_BYTES + 1);
+        assert_eq!(listing.total_bytes, chunk.len() * 100);
+        let outcome = listing.finish(false, 1000);
+        assert!(
+            matches!(outcome, Outcome::SucceededWithDetails { ref output, ref details } if output.len() <= MAX_BYTES + 100 && details["truncation"]["totalBytes"] == chunk.len() * 100 && details["truncation"]["totalLines"] == 200000)
+        );
+        let mut cancelled = Listing::new();
+        cancelled.append(b"first", &token).unwrap();
+        token.cancel();
+        assert!(matches!(
+            cancelled.append(b"second", &token),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            format_results(vec![PathBuf::from("entry")], Path::new("/"), 1000, &token),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_backslash_is_filename_and_invalid_utf8_is_lossy() {
+        use std::os::unix::ffi::OsStringExt;
+        let paths = vec![
+            PathBuf::from("literal\\"),
+            PathBuf::from(std::ffi::OsString::from_vec(vec![b'x', 0xff, b'y'])),
+        ];
+        let result = format_results(
+            paths,
+            Path::new("/"),
+            1000,
+            &pi_rs::CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(matches!(result, Outcome::Succeeded(text) if text == "literal\\\nx�y"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backslash_is_directory_separator() {
+        let result = format_results(
+            vec![PathBuf::from("folder\\")],
+            Path::new("C:\\"),
+            1000,
+            &pi_rs::CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(matches!(result, Outcome::Succeeded(text) if text == "folder/"));
+    }
+
     #[test]
     fn windows_shell_paths_support_drive_prefixes_and_preserve_unc() {
         assert_eq!(windows_shell_path("/mnt/c/a"), "C:\\a");
