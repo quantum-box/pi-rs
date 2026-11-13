@@ -3769,21 +3769,46 @@ mod tests {
             }
         );
         assert!(matches!(first, Err(Error::Cancelled)));
-        let mut session = Session::from_records(session.records().to_vec()).unwrap();
-        agent
-            .run_correlated(
-                &mut session,
-                run_id,
-                None,
-                &mut inputs,
-                &CancellationToken::new(),
-                &mut |_| {},
-            )
-            .await
-            .unwrap();
-        assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "start")).count(), 1);
-        assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "start")).count(), 1);
+        let original = session.records().to_vec();
+        for (legacy, before_delivery) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut records = original.clone();
+            if before_delivery {
+                let index = records
+                    .iter()
+                    .position(|record| {
+                        matches!(record.event, crate::Event::CustomMessageQueued { .. })
+                    })
+                    .unwrap();
+                records.truncate(index + 1);
+            }
+            if legacy {
+                let legacy_id = Uuid::new_v4();
+                for record in &mut records {
+                    match &mut record.event {
+                        crate::Event::CustomMessageQueued { input } => input.id = legacy_id,
+                        crate::Event::CustomMessageDelivered { id, .. } => *id = legacy_id,
+                        _ => {}
+                    }
+                }
+            }
+            let mut session = Session::from_records(records).unwrap();
+            agent
+                .run_correlated(
+                    &mut session,
+                    run_id,
+                    None,
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageQueued { input } if input.message.custom_type == "start")).count(), 1, "legacy={legacy}");
+            assert_eq!(session.records().iter().filter(|r| matches!(&r.event, crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "start")).count(), 1, "legacy={legacy}");
+        }
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 5);
     }
 
     struct TwoRunModel {

@@ -454,9 +454,38 @@ impl Agent<'_> {
         let (sender, mut incoming) = mpsc::channel(32);
         let host: Arc<dyn ToolHost> = match &event {
             crate::LifecycleEvent::AgentStart { run_id, .. } => {
+                let branch = session.branch();
+                let prior_ids = branch
+                    .iter()
+                    .position(|record| {
+                        record.run_id == Some(*run_id)
+                            && matches!(
+                                record.event,
+                                Event::Run {
+                                    state: RunState::Running,
+                                    ..
+                                }
+                            )
+                    })
+                    .map(|start| {
+                        branch
+                            .iter()
+                            .skip(start + 1)
+                            .take_while(|record| {
+                                record.run_id == Some(*run_id)
+                                    && matches!(record.event, Event::CustomMessageQueued { .. })
+                            })
+                            .filter_map(|record| match &record.event {
+                                Event::CustomMessageQueued { input } => Some(input.id),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Arc::new(ReplayLifecycleMessageHost {
                     sender,
                     run_id: *run_id,
+                    prior_ids,
                     ordinal: AtomicUsize::new(0),
                 })
             }
@@ -2918,6 +2947,7 @@ struct ReplayLifecycleMessageHost {
         oneshot::Sender<std::result::Result<(), String>>,
     )>,
     run_id: Uuid,
+    prior_ids: Vec<Uuid>,
     ordinal: AtomicUsize,
 }
 #[async_trait::async_trait]
@@ -2938,13 +2968,16 @@ impl ToolHost for ReplayLifecycleMessageHost {
     ) -> crate::ExtensionResult<()> {
         use sha2::{Digest, Sha256};
         crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
-        let ordinal = self.ordinal.fetch_add(1, Ordering::SeqCst) as u64;
+        let ordinal = self.ordinal.fetch_add(1, Ordering::SeqCst);
         let mut digest = Sha256::new();
         digest.update(b"pi-rs:agent-start-message:v1");
         digest.update(self.run_id.as_bytes());
-        digest.update(ordinal.to_be_bytes());
+        digest.update((ordinal as u64).to_be_bytes());
         let bytes = digest.finalize();
-        let id = Uuid::from_bytes(bytes[..16].try_into().expect("digest length"));
+        let id =
+            self.prior_ids.get(ordinal).copied().unwrap_or_else(|| {
+                Uuid::from_bytes(bytes[..16].try_into().expect("digest length"))
+            });
         let delivery = if delivery == crate::CustomMessageDelivery::TriggerTurn {
             crate::CustomMessageDelivery::Steer
         } else {

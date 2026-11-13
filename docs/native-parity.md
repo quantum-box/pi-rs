@@ -2802,7 +2802,9 @@ undelivered cancelled runs, replayed `agent_start` callbacks, separate SDK run
 brackets, and restarts before run creation, before and after message delivery,
 and after the answer was recorded. `agent_start` message IDs derive from the
 run ID and send ordinal; an acknowledged replay with different content is
-rejected rather than duplicated. Automatic trigger runs retain their own SDK
+rejected rather than duplicated. For journals written before stable IDs, replay
+reuses the contiguous queued messages recorded immediately after the first run
+start, preserving those earlier IDs. Automatic trigger runs retain their own SDK
 run events and do not replace the initiating run's result.
 
 The pinned Pi [`_prepareRun` implementation](https://github.com/badlogic/pi-mono/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/coding-agent/src/core/agent-session.ts#L1941-L1982)
