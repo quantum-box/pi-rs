@@ -127,7 +127,7 @@ pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Valu
         .model
         .compat
         .send_image_opt_in_header
-        .unwrap_or(matches!(mode, ImageInput::Assets));
+        .unwrap_or(!entry.openrouter_compat());
     Ok((body, opt_in))
 }
 

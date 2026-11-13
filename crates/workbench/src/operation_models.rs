@@ -445,14 +445,17 @@ impl Entry {
             .is_some_and(|input| input.iter().any(|kind| kind == "image"))
     }
 
+    fn openrouter_compat(&self) -> bool {
+        self.provider == "openrouter"
+            || self
+                .base
+                .host_str()
+                .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+    }
+
     fn image_input(&self) -> ImageInput {
         self.model.compat.image_input.unwrap_or_else(|| {
-            if self.provider == "openrouter"
-                || self
-                    .base
-                    .host_str()
-                    .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
-            {
+            if self.openrouter_compat() {
                 ImageInput::StateImageUrls
             } else {
                 ImageInput::Assets
@@ -777,6 +780,133 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn classifier_image_header_defaults_are_independent_of_wire_format() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (provider, mode, override_header, with_image, expected) in [
+            ("typesafe", "state-image-urls", None, true, true),
+            ("openrouter", "assets", None, true, false),
+            ("openrouter", "assets", Some(true), true, true),
+            ("typesafe", "images", Some(false), true, false),
+            ("typesafe", "state-image-urls", None, false, false),
+            ("openrouter", "assets", Some(true), false, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (header_end, content_length) = loop {
+                    let mut chunk = [0u8; 2048];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, length);
+                    }
+                };
+                while request.len() < header_end + content_length {
+                    let mut chunk = [0u8; 2048];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let response = b"{\"answers\":{\"ok\":{\"type\":\"noul\",\"noul\":0.6}}}";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).as_bytes()).await.unwrap();
+                stream.write_all(response).await.unwrap();
+                request
+            });
+            let mut compat = json!({"imageInput":mode});
+            if let Some(value) = override_header {
+                compat["sendImageOptInHeader"] = json!(value);
+            }
+            let config = json!({provider:{"baseUrl":format!("http://{address}/v1"), "apiKey":"test-key", "models":[{
+                "type":"classifier", "id":"parity-fixture", "api":"typesafe-system-one", "input":["text","image"], "compat":compat
+            }]}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider && entry.model.id == "parity-fixture")
+                .unwrap();
+            let context = json!({"state":"test", "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
+                "images":if with_image { json!([{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]) } else { json!([]) }});
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            let mut data = json!({});
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.perform(entry, &context, &Keys::parse(&json!({})), &mut data),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request[..end])
+                .unwrap()
+                .to_ascii_lowercase();
+            assert_eq!(
+                headers.contains("typesafe-danger-zone-images: true"),
+                expected,
+                "{provider} {mode} {override_header:?}"
+            );
+            let body: Value = serde_json::from_slice(&request[end..]).unwrap();
+            assert_eq!(body["questions"]["ok"]["type"], "noul");
+            if with_image {
+                match mode {
+                    "assets" => assert!(body["assets"]["<image-1>"].is_object()),
+                    "state-image-urls" => assert_eq!(body["state"][0]["type"], "image_url"),
+                    "images" => assert!(
+                        body["images"][0]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("data:image/png;base64,")
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(data["answers"]["ok"]["probability"], 0.6);
+        }
+    }
+
+    #[test]
+    fn classifier_header_default_detects_openrouter_host_independently() {
+        let config = json!({"relay":{"baseUrl":"https://eu.openrouter.ai/api/v1", "models":[{
+            "type":"classifier", "id":"fixture", "api":"typesafe-system-one", "input":["text","image"], "compat":{"imageInput":"assets"}
+        }]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let context = json!({"state":"test", "questions":{"ok":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}}, "images":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="}]});
+        let (body, opt_in) = classifier_payload(entry, &context).unwrap();
+        assert!(body["assets"]["<image-1>"].is_object());
+        assert!(!opt_in);
+    }
 
     #[tokio::test]
     async fn operation_credentials_prefer_stored_then_configured_then_environment() {
