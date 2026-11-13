@@ -277,7 +277,10 @@ impl Runtime {
                     provider,
                     model,
                     Arc::new(client),
-                    Some(effective_limits(&branch_args)),
+                    Some(Limits {
+                        compaction_tokens: Some(args.settings.compaction_tokens(provider, model)),
+                        ..effective_limits(&branch_args)
+                    }),
                 );
             }
         }
@@ -761,6 +764,7 @@ fn effective_limits(args: &Cli) -> Limits {
         model_timeout: Duration::from_secs(args.model_timeout_secs),
         tool_timeout: args.tool_timeout(),
         context_window: args.effective_context_window(),
+        compaction_tokens: None,
     }
 }
 

@@ -2863,9 +2863,11 @@ selected a different model, the host must register its model instance with
 `Registry::register_branch_model`; otherwise recovery reports an error without
 running the wrong model. The workbench resolves recorded provider/model selections
 from its current configuration and registers them per session for recovery,
-including each model's effective output and context limits. Hosts that register
-provider models can supply their limits alongside the client; otherwise the
-current agent limits apply. Cross-provider recovery requires an exact provider/model registration; absent
+including each model's effective output and context limits and per-model
+compaction tokens. Hosts that register provider models can supply their limits
+and compaction tokens alongside the client; otherwise the current agent limits
+and live session compaction settings apply. Handoff-specific tokens do not alter
+the selected branch's live compaction settings. Cross-provider recovery requires an exact provider/model registration; absent
 credentials or configuration leave the trigger pending with an error. Journals
 do not distinguish two runtime instances with the same provider and model name. Immediate idle messages remain on the branch where
 they were sent.

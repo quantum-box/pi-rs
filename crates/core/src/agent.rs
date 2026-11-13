@@ -149,6 +149,9 @@ pub struct Limits {
     pub tool_timeout: Duration,
     /// Explicit input/output context capacity. Otherwise use provider discovery when available.
     pub context_window: Option<u32>,
+    /// Per-run compaction settings, used for a recovered model handoff.
+    /// None follows the session's live compaction control.
+    pub compaction_tokens: Option<CompactionTokens>,
 }
 
 impl Default for Limits {
@@ -160,6 +163,7 @@ impl Default for Limits {
             model_timeout: Duration::from_secs(120),
             tool_timeout: Duration::from_secs(30),
             context_window: None,
+            compaction_tokens: None,
         }
     }
 }
@@ -241,6 +245,12 @@ pub struct TreeNavigationOptions<'a> {
 }
 
 impl Agent<'_> {
+    fn compaction_tokens(&self, session: &Session) -> CompactionTokens {
+        self.limits
+            .compaction_tokens
+            .unwrap_or_else(|| session.auto_compaction_control().token_settings())
+    }
+
     /// A fresh prompt appends a user message. Resume starts from the existing branch.
     /// Follow-ups are consumed at safe boundaries, in FIFO order. The sender owns
     /// any input left in the receiver when this call returns.
@@ -1364,7 +1374,7 @@ impl Agent<'_> {
                         > u64::from(window)
                 });
                 let control = session.auto_compaction_control();
-                let tokens = control.token_settings();
+                let tokens = active.compaction_tokens(session);
                 let retention = configured_retention(session, tokens.keep_recent_tokens, 1)?;
                 let reserve_reached =
                     capacity
@@ -2650,10 +2660,7 @@ impl Agent<'_> {
         let states = self.migrate(session, observer)?;
         let retention = configured_retention(
             session,
-            session
-                .auto_compaction_control()
-                .token_settings()
-                .keep_recent_tokens,
+            self.compaction_tokens(session).keep_recent_tokens,
             1,
         )?;
         self.commit_compaction(
@@ -2682,10 +2689,7 @@ impl Agent<'_> {
         let states = self.migrate(session, observer)?;
         let retention = configured_retention(
             session,
-            session
-                .auto_compaction_control()
-                .token_settings()
-                .keep_recent_tokens,
+            self.compaction_tokens(session).keep_recent_tokens,
             1,
         )?;
         self.commit_compaction_with_host::<AgentInput>(
@@ -3237,10 +3241,7 @@ impl Agent<'_> {
             Some(turns) => RetentionPlan::turns(session, turns),
             None => configured_retention(
                 session,
-                session
-                    .auto_compaction_control()
-                    .token_settings()
-                    .keep_recent_tokens,
+                self.compaction_tokens(session).keep_recent_tokens,
                 1,
             )?,
         };

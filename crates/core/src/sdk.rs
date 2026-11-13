@@ -524,11 +524,6 @@ impl SessionControl {
                 self.owner.config.lock().expect("run config").model_name = model;
             }
         }
-        let (sender, mut incoming) = mpsc::channel(32);
-        let host: Arc<dyn crate::ToolHost> =
-            Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
-        let (children, mut child_requests) = mpsc::unbounded_channel();
-        let states = journal.extension_states();
         let startup = self
             .owner
             .pending_start
@@ -536,66 +531,19 @@ impl SessionControl {
             .expect("session startup")
             .take();
         if let Some((reason, previous_session_file)) = startup {
-            let config = self.owner.config.lock().expect("run config").clone();
-            let registry = config
-                .registry
-                .upgrade()
-                .ok_or_else(|| Error::Config("session is closed".into()))?;
-            if registry.has_session_lifecycle_hooks() {
-                let scope = IdleInputScope {
-                    owner: self.owner.clone(),
-                    children: children.clone(),
-                    host: host.clone(),
-                    states: states.clone(),
-                    cancellation: active.token.clone(),
-                    lifetime: CancellationToken::new(),
-                    depth: 0,
-                };
-                let mut errors = Vec::new();
-                let mut collect = |event: Notification<'_>| {
-                    if let Notification::ExtensionLifecycleError {
-                        extension,
-                        event,
-                        message,
-                    } = event
-                    {
-                        errors.push((extension.to_owned(), event, message.to_owned()));
-                    }
-                };
-                let future = IDLE_INPUT_SCOPE.scope(scope.clone(), async {
-                    crate::lifecycle::notify_with_host(
-                        &registry,
-                        crate::LifecycleEvent::SessionStart {
-                            reason,
-                            previous_session_file,
-                        },
-                        &states,
-                        config.limits.tool_timeout,
-                        &mut collect,
-                        host.clone(),
-                    )
-                    .await;
-                    Ok(())
-                });
-                pump_idle_callback(
-                    &mut journal,
-                    &mut observe,
-                    &mut incoming,
-                    &mut child_requests,
-                    closed,
-                    &scope,
-                    future,
-                )
-                .await?;
-                for (extension, event, message) in &errors {
-                    observe(Notification::ExtensionLifecycleError {
-                        extension,
-                        event,
-                        message,
-                    });
-                }
-            }
+            self.notify_scoped_start(
+                &mut journal,
+                reason,
+                previous_session_file,
+                &active.token,
+                &mut observe,
+            )
+            .await?;
         }
+        let (sender, mut incoming) = mpsc::channel(32);
+        let host: Arc<dyn crate::ToolHost> =
+            Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let (children, mut child_requests) = mpsc::unbounded_channel();
         let event = crate::InputEvent {
             text: std::mem::take(&mut message.input.content),
             images: std::mem::take(&mut message.images),
@@ -679,6 +627,82 @@ impl SessionControl {
         Ok(id)
     }
 
+    async fn notify_scoped_start(
+        &self,
+        journal: &mut Session,
+        reason: crate::SessionStartReason,
+        previous_session_file: Option<PathBuf>,
+        cancellation: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let config = self.owner.config.lock().expect("run config").clone();
+        let registry = config
+            .registry
+            .upgrade()
+            .ok_or_else(|| Error::Config("session is closed".into()))?;
+        if !registry.has_session_lifecycle_hooks() {
+            return Ok(());
+        }
+        let states = journal.extension_states();
+        let (sender, mut incoming) = mpsc::channel(32);
+        let host: Arc<dyn crate::ToolHost> =
+            Arc::new(crate::agent::LifecycleMessageHost { sender, idle: true });
+        let (children, mut child_requests) = mpsc::unbounded_channel();
+        let scope = IdleInputScope {
+            owner: self.owner.clone(),
+            children,
+            host: host.clone(),
+            states: states.clone(),
+            cancellation: cancellation.clone(),
+            lifetime: CancellationToken::new(),
+            depth: 0,
+        };
+        let mut errors = Vec::new();
+        let mut collect = |event: Notification<'_>| {
+            if let Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            } = event
+            {
+                errors.push((extension.to_owned(), event, message.to_owned()));
+            }
+        };
+        let future = IDLE_INPUT_SCOPE.scope(scope.clone(), async {
+            crate::lifecycle::notify_with_host(
+                &registry,
+                crate::LifecycleEvent::SessionStart {
+                    reason,
+                    previous_session_file,
+                },
+                &states,
+                config.limits.tool_timeout,
+                &mut collect,
+                host,
+            )
+            .await;
+            Ok(())
+        });
+        pump_idle_callback(
+            journal,
+            observer,
+            &mut incoming,
+            &mut child_requests,
+            &self.owner.closed,
+            &scope,
+            future,
+        )
+        .await?;
+        for (extension, event, message) in &errors {
+            observer(Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            });
+        }
+        Ok(())
+    }
+
     /// Send custom context during an active operation, acknowledged after journaling.
     pub async fn send_custom_message(
         &self,
@@ -708,6 +732,15 @@ impl SessionControl {
     /// Save a display name and notify lifecycle extensions during an active operation.
     /// Use the owned session while idle.
     pub async fn set_session_name(&self, name: impl Into<String>) -> Result<()> {
+        let scope = self.callback_scope();
+        if scope
+            .as_ref()
+            .is_some_and(|scope| scope.depth >= MAX_IDLE_INPUT_DEPTH)
+        {
+            return Err(Error::Config(
+                "idle input callback nesting limit exceeded".into(),
+            ));
+        }
         let name = crate::sanitize_session_name(&name.into());
         self.queue_control(|reply| crate::AgentInput::SetSessionName {
             name: name.clone(),
@@ -717,25 +750,33 @@ impl SessionControl {
         let hooks = self.input_hooks.lock().expect("SDK input hooks").clone();
         if let Some(registry) = hooks.lifecycle {
             let events = self.events.upgrade();
-            crate::lifecycle::notify_with_host(
+            let mut observe = |notification: Notification<'_>| {
+                if let Some(events) = &events {
+                    emit(events, &notification);
+                }
+            };
+            let host = scope
+                .as_ref()
+                .map(|scope| scope.host.clone())
+                .unwrap_or_else(|| {
+                    Arc::new(InputMessageHost {
+                        input: self.input.clone(),
+                    })
+                });
+            let future = crate::lifecycle::notify_with_host(
                 &registry,
                 crate::LifecycleEvent::SessionInfoChanged { name: Some(name) },
                 &hooks.states,
                 self.tool_timeout,
-                &mut |notification| {
-                    if let Some(events) = &events {
-                        emit(events, &notification);
-                    }
-                },
-                self.callback_scope()
-                    .map(|scope| scope.host)
-                    .unwrap_or_else(|| {
-                        Arc::new(InputMessageHost {
-                            input: self.input.clone(),
-                        })
-                    }),
-            )
-            .await;
+                &mut observe,
+                host,
+            );
+            if let Some(mut scope) = scope {
+                scope.depth += 1;
+                IDLE_INPUT_SCOPE.scope(scope, future).await;
+            } else {
+                future.await;
+            }
         }
         Ok(())
     }
@@ -1362,6 +1403,7 @@ impl AgentSession {
     /// Deliver the session start hook once. Model, tree, and hook-aware rename operations also start it.
     pub async fn start(&mut self) -> Result<()> {
         self.ensure_open()?;
+        let order = self.control.input_order.acquire().await?;
         let mut journal = self.session.lock().await;
         let recovered = journal.recover_tree_trigger_handoff()?.cloned();
         if let Some(record) = recovered {
@@ -1378,23 +1420,25 @@ impl AgentSession {
             self.refresh_run_config();
         }
         let startup = self.pending_start.lock().expect("session startup").take();
-        if let Some((reason, previous_session_file)) = startup
-            && self.registry.has_session_lifecycle_hooks()
-        {
-            let events = self.events.as_ref().expect("open session");
-            crate::lifecycle::notify_idle_with_host(
-                &self.registry,
-                &mut journal,
-                crate::LifecycleEvent::SessionStart {
+        if let Some((reason, previous_session_file)) = startup {
+            let active = self.begin_run();
+            let events = self.events.as_ref().expect("open session").clone();
+            let mut observe = |event: Notification<'_>| {
+                self.control.observe(&event);
+                emit(&events, &event);
+            };
+            self.control
+                .notify_scoped_start(
+                    &mut journal,
                     reason,
                     previous_session_file,
-                },
-                self.limits.tool_timeout,
-                &mut |event| emit(events, &event),
-            )
-            .await?;
+                    &active.token,
+                    &mut observe,
+                )
+                .await?;
         }
         drop(journal);
+        drop(order);
         let _ = self.drain_idle_triggers().await?;
         Ok(())
     }
@@ -3551,6 +3595,109 @@ mod tests {
         );
         assert_eq!(model_a.0.load(Ordering::SeqCst), 1);
         assert_eq!(model_b.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn tree_handoff_uses_origin_compaction_tokens_without_changing_selected_settings() {
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        journal
+            .select_provider_model(Some("origin"), "origin-model", None)
+            .unwrap();
+        for index in 0..3 {
+            journal
+                .append_user_with_images(format!("old user {index}"), vec![], None)
+                .unwrap();
+            journal
+                .append(crate::Event::Assistant {
+                    content: format!("old assistant {index}"),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+        }
+        let trigger = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "handoff-compaction".into(),
+            content: crate::ContextContent::Text("origin trigger".into()),
+            display: false,
+            details: None,
+        };
+        journal
+            .append(crate::Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: trigger,
+                    message: message.clone(),
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        journal.set_run_id(Some(trigger));
+        journal
+            .append(crate::Event::Run {
+                state: crate::RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        journal
+            .append(crate::Event::CustomMessageDelivered {
+                id: trigger,
+                message,
+            })
+            .unwrap();
+        journal.set_run_id(None);
+        journal.checkout(1).unwrap();
+        journal
+            .select_provider_model(Some("selected"), "selected-model", None)
+            .unwrap();
+        journal
+            .append_user_with_images("selected branch".into(), vec![], None)
+            .unwrap();
+        let selected_tokens = crate::CompactionTokens {
+            reserve_tokens: Some(0),
+            keep_recent_tokens: Some(100_000),
+        };
+        journal
+            .auto_compaction_control()
+            .set_token_settings(selected_tokens);
+        let origin = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let selected = Arc::new(EchoModel(AtomicUsize::new(0)));
+        let mut session = SessionBuilder::new(selected, "selected-model")
+            .build(journal)
+            .unwrap();
+        session
+            .registry
+            .register_session_provider_model_with_limits(
+                session.session_id,
+                "origin",
+                "origin-model",
+                origin.clone(),
+                Some(Limits {
+                    context_window: Some(1_000),
+                    output_tokens_per_request: 16,
+                    output_tokens_per_run: 1_024,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(1_000),
+                        keep_recent_tokens: Some(0),
+                    }),
+                    ..Limits::default()
+                }),
+            )
+            .unwrap();
+        session.start().await.unwrap();
+        let journal = session.journal().unwrap();
+        assert!(
+            journal
+                .records()
+                .iter()
+                .any(|record| record.run_id == Some(trigger)
+                    && matches!(record.event, crate::Event::Compacted { .. }))
+        );
+        assert_eq!(
+            journal.auto_compaction_control().token_settings(),
+            selected_tokens
+        );
+        assert!(origin.0.load(Ordering::SeqCst) >= 2);
     }
 
     #[test]
@@ -9137,10 +9284,13 @@ mod tests {
                     .scoped()
                     .map_err(|error| error.to_string())?;
                 *self.saved.lock().unwrap() = Some(control.clone());
-                tokio::spawn(async move { control.steer("spawned child").await })
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
+                tokio::spawn(async move {
+                    control.set_session_name("scoped").await?;
+                    control.steer("spawned child").await
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
             }
             Ok(crate::InputAction::Continue)
         }
@@ -9191,6 +9341,7 @@ mod tests {
             .await
             .expect("spawned child deadlocked")
             .unwrap();
+        assert_eq!(session.journal().unwrap().name(), Some("scoped"));
         let queued = session.clear_queued_inputs().unwrap();
         assert_eq!(
             queued
@@ -9231,6 +9382,34 @@ mod tests {
         );
         let stale = saved.lock().unwrap().clone().unwrap();
         assert!(stale.follow_up("late").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_session_start_services_spawned_scoped_controls() {
+        let slot = Arc::new(Mutex::new(None));
+        let saved = Arc::new(Mutex::new(None));
+        let mut session = SessionBuilder::new(Arc::new(WaitingModel), "fixture")
+            .extension(Arc::new(SpawnScopedHook {
+                control: slot.clone(),
+                saved,
+                startup: true,
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        *slot.lock().unwrap() = Some(session.controls());
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.start())
+            .await
+            .expect("explicit startup deadlocked")
+            .unwrap();
+        let queued = session.clear_queued_inputs().unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.input.content.as_str())
+                .collect::<Vec<_>>(),
+            ["startup child"]
+        );
     }
 
     struct PendingIdleInputHook(Arc<tokio::sync::Notify>);
