@@ -534,7 +534,10 @@ impl ModelMetadata {
         }
         if !matches!(
             adapter,
-            Adapter::ChatCompletions | Adapter::Anthropic | Adapter::OpenAiResponses
+            Adapter::ChatCompletions
+                | Adapter::Anthropic
+                | Adapter::OpenAiResponses
+                | Adapter::Bedrock
         ) || self.thinking_level_map.is_empty()
         {
             return None;
@@ -1003,6 +1006,15 @@ impl Profiles {
             Some(model) => base.overlay(model.compat.clone()),
             None => base,
         }
+    }
+
+    pub fn bedrock_long_cache_override(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> Option<bool> {
+        self.cache_compatibility(provider, model)
+            .supports_long_cache_retention
     }
 
     pub fn messages_cache_support(

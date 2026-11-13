@@ -1,4 +1,5 @@
 //! Amazon Bedrock ConverseStream adapter.
+mod options;
 use aws_sdk_bedrockruntime::{
     Client,
     types::{
@@ -9,9 +10,10 @@ use aws_sdk_bedrockruntime::{
 use aws_smithy_types::{Blob, Document, Number};
 use aws_types::request_id::RequestId;
 use base64::Engine;
+pub use options::{ReasoningLevel, requires_thinking, thinking_levels};
 use pi_rs_core::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
+    CacheRetention, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +25,12 @@ pub struct Bedrock {
     unsupported: Option<String>,
     bearer: Option<String>,
     model_name: Option<(String, String)>,
+    reasoning: Option<ReasoningLevel>,
+    mapped_effort: Option<String>,
+    cache_retention: CacheRetention,
+    long_cache_support: Option<bool>,
+    force_cache: bool,
+    summary: bool,
 }
 impl Bedrock {
     /// Resolve the region and standard AWS credential chain lazily.
@@ -32,6 +40,12 @@ impl Bedrock {
             unsupported: None,
             bearer: None,
             model_name: None,
+            reasoning: None,
+            mapped_effort: None,
+            cache_retention: default_cache_retention(),
+            long_cache_support: None,
+            force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
+            summary: false,
         }
     }
     /// Use a caller-configured SDK client, including custom profile or endpoint settings.
@@ -41,6 +55,12 @@ impl Bedrock {
             unsupported: None,
             bearer: None,
             model_name: None,
+            reasoning: None,
+            mapped_effort: None,
+            cache_retention: default_cache_retention(),
+            long_cache_support: None,
+            force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
+            summary: false,
         }
     }
     /// Prefer bearer authentication over the AWS credential chain.
@@ -67,10 +87,50 @@ impl Bedrock {
                 id == model && name.to_ascii_lowercase().contains("claude")
             })
     }
+    /// Configure Pi's reasoning level and an optional model-specific effort mapping.
+    pub fn with_reasoning(
+        mut self,
+        level: Option<&str>,
+        mapped_effort: Option<&str>,
+    ) -> Result<Self> {
+        self.reasoning = level.map(ReasoningLevel::parse).transpose()?;
+        self.mapped_effort = mapped_effort.map(str::to_owned);
+        Ok(self)
+    }
+    /// Set explicit cache retention. Use `None` for compaction and other one-off requests.
+    pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
+        self.cache_retention = retention;
+        self
+    }
+    /// Override model-based one-hour cache support; `None` uses known model capabilities.
+    pub fn with_long_cache_support(mut self, supported: Option<bool>) -> Self {
+        self.long_cache_support = supported;
+        self
+    }
+    /// Prepare a one-off summary without cache checkpoints or optional thinking.
+    pub fn for_summary(mut self) -> Self {
+        self.cache_retention = CacheRetention::None;
+        self.reasoning = Some(ReasoningLevel::Off);
+        self.mapped_effort = None;
+        self.summary = true;
+        self
+    }
+    /// Enable cache checkpoints for a model whose capabilities cannot be inferred from its name.
+    pub fn with_force_cache(mut self, enabled: bool) -> Self {
+        self.force_cache = enabled;
+        self
+    }
     /// Mark unsupported host settings so they fail explicitly when used.
     pub fn unsupported(mut self, reason: impl Into<String>) -> Self {
         self.unsupported = Some(reason.into());
         self
+    }
+}
+fn default_cache_retention() -> CacheRetention {
+    if std::env::var("PI_CACHE_RETENTION").is_ok_and(|v| v == "long") {
+        CacheRetention::Long
+    } else {
+        CacheRetention::Short
     }
 }
 #[derive(Default)]
@@ -340,6 +400,14 @@ fn request_error(
 
 #[async_trait::async_trait]
 impl Model for Bedrock {
+    async fn stream_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.clone().for_summary().stream(request).await
+    }
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         if let Some(reason) = &self.unsupported {
             return Err(Error::Config(reason.clone()));
@@ -349,6 +417,25 @@ impl Model for Bedrock {
         }
         let tool_free = request.tools.is_empty();
         let is_claude = self.is_claude(&request.model);
+        let model_name = self
+            .model_name
+            .as_ref()
+            .filter(|(id, _)| id == &request.model)
+            .map(|(_, name)| name.as_str());
+        let checkpoint = if options::supports_cache(&request.model, model_name, self.force_cache) {
+            let retention = if self.cache_retention == CacheRetention::Long
+                && !self
+                    .long_cache_support
+                    .unwrap_or_else(|| options::supports_long_cache(&request.model, model_name))
+            {
+                CacheRetention::Short
+            } else {
+                self.cache_retention
+            };
+            options::cache_point(retention)?
+        } else {
+            None
+        };
         let mut ids = ToolIds::default();
         let mut system = Vec::new();
         let mut messages: Vec<types::Message> = Vec::new();
@@ -502,6 +589,16 @@ impl Model for Bedrock {
         if let Some(last) = messages.last_mut() {
             last.content.append(&mut pending_error_images);
         }
+        if let Some(point) = &checkpoint {
+            if !system.is_empty() {
+                system.push(types::SystemContentBlock::CachePoint(point.clone()));
+            }
+            if let Some(last) = messages.last_mut()
+                && last.role == ConversationRole::User
+            {
+                last.content.push(ContentBlock::CachePoint(point.clone()));
+            }
+        }
         let tools: Vec<_> = request
             .tools
             .into_iter()
@@ -536,6 +633,23 @@ impl Model for Bedrock {
         if client.config().region().is_none() {
             return Err(Error::Config("Bedrock requires an AWS region; set AWS_REGION or configure a region in the selected AWS profile".into()));
         }
+        let reasoning = if self.summary
+            && options::requires_thinking(&request.model, model_name)
+            && !(tool_free && options::sonnet_55(&request.model, model_name))
+        {
+            Some(ReasoningLevel::Low)
+        } else {
+            self.reasoning
+        };
+        let fields = options::reasoning_fields(
+            &request.model,
+            model_name,
+            reasoning,
+            self.mapped_effort.as_deref(),
+            request.max_output_tokens,
+            client.config().region().map(|region| region.as_ref()),
+            tool_free,
+        )?;
         let requested_model = request.model.clone();
         let mut command = client
             .converse_stream()
@@ -547,6 +661,9 @@ impl Model for Bedrock {
                     .max_tokens(i32::try_from(request.max_output_tokens).map_err(build_error)?)
                     .build(),
             );
+        if let Some(fields) = fields {
+            command = command.additional_model_request_fields(doc(fields));
+        }
         if !tools.is_empty() {
             command = command.tool_config(
                 types::ToolConfiguration::builder()
@@ -559,7 +676,7 @@ impl Model for Bedrock {
         let request_id = response.request_id().map(str::to_owned);
         Ok(Box::pin(async_stream::try_stream! {
             let mut calls: BTreeMap<i32, ToolCall> = BTreeMap::new();
-            let mut usage=None; let mut stop=None; let mut cache_read=None; let mut cache_write=None; let mut received=0usize;
+            let mut usage=None; let mut stop=None; let mut cache_read=None; let mut cache_write=None; let mut cache_write_1h=None; let mut received=0usize;
             let mut open_tools = std::collections::BTreeSet::new();
             let mut text_blocks: BTreeMap<i32, String> = BTreeMap::new();
             let mut reasoning: BTreeMap<i32, ReasoningBlock> = BTreeMap::new();
@@ -602,6 +719,7 @@ impl Model for Bedrock {
                     ConverseStreamOutput::MessageStop(event) => { let reason=event.stop_reason().as_str().to_owned(); if !matches!(reason.as_str(),"end_turn"|"stop_sequence"|"tool_use"|"max_tokens"|"model_context_window_exceeded") { Err(Error::Model(format!("Bedrock stopped with: {reason}")))?; } stop=Some(reason); },
                     ConverseStreamOutput::Metadata(event) => if let Some(u)=event.usage {
                         cache_read=u.cache_read_input_tokens().map(|n| n.max(0) as u64); cache_write=u.cache_write_input_tokens().map(|n| n.max(0) as u64);
+                        cache_write_1h = u.cache_details.as_ref().map(|details| details.iter().filter(|d| d.ttl().as_str()=="1h").fold(0u64, |sum,d|sum.saturating_add(d.input_tokens().max(0) as u64)));
                         usage=Some(Usage {input_tokens:(u.input_tokens().max(0) as u64).saturating_add(cache_read.unwrap_or(0)).saturating_add(cache_write.unwrap_or(0)),output_tokens:u.output_tokens().max(0) as u64});
                     },
                     ConverseStreamOutput::ContentBlockStop(event) => { open_tools.remove(&event.content_block_index); stopped_blocks.insert(event.content_block_index); },
@@ -622,7 +740,7 @@ impl Model for Bedrock {
             }
             let replay=(!reasoning.is_empty() && reason != "max_tokens" && reason != "model_context_window_exceeded").then(|| Box::new(ProviderReplay { identity:ResolvedModelIdentity {provider:"amazon-bedrock".into(),model:requested_model},blocks:ordered.into_values().collect() }));
             let finish_reason = match reason.as_str() { "end_turn" | "stop_sequence" => "stop", "tool_use" => "tool_calls", "max_tokens" | "model_context_window_exceeded" => "length", _ => unreachable!() };
-            yield ModelEvent::Metadata(ModelMetadata {finish_reason:Some(finish_reason.into()), cached_input_tokens:cache_read, cache_creation_input_tokens:cache_write, provider_api:Some(pi_rs_core::ModelApi::BedrockConverseStream), reasoning:(!reasoning_text.is_empty()).then_some(reasoning_text), replay, ..Default::default()});
+            yield ModelEvent::Metadata(ModelMetadata {finish_reason:Some(finish_reason.into()), cached_input_tokens:cache_read, cache_creation_input_tokens:cache_write, cache_write_1h_tokens:cache_write_1h, provider_api:Some(pi_rs_core::ModelApi::BedrockConverseStream), reasoning:(!reasoning_text.is_empty()).then_some(reasoning_text), replay, ..Default::default()});
             yield ModelEvent::Complete { calls:calls.into_values().collect(), usage };
         }))
     }

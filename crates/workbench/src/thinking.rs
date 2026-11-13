@@ -13,17 +13,33 @@ pub(super) fn reported(args: &Cli) -> Option<&[String]> {
 }
 
 pub(super) fn available(args: &mut Cli) -> Vec<String> {
-    if let Some(levels) = reported(args) {
-        return levels.to_vec();
-    }
     let adapter = args
         .model_profiles
         .model_adapter(&args.provider, &args.model);
+    let metadata = args.model_profiles.model(&args.provider, &args.model);
+    let required = adapter == super::providers::Adapter::Bedrock
+        && pi_rs::bedrock::requires_thinking(
+            &args.model,
+            metadata.as_ref().and_then(|model| model.name.as_deref()),
+        );
+    let filter_levels = |mut levels: Vec<String>| {
+        if required {
+            levels.retain(|level| level != "off");
+            if levels.is_empty() {
+                levels.push("low".into());
+            }
+        }
+        levels
+    };
+    if let Some(levels) = reported(args) {
+        return filter_levels(levels.to_vec());
+    }
     if let Some(levels) = args
         .model_profiles
         .model(&args.provider, &args.model)
         .and_then(|model| model.levels(adapter))
     {
+        let levels = filter_levels(levels);
         args.thinking_profile = Some((args.model.clone(), levels.clone()));
         return levels;
     }
@@ -43,13 +59,25 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
         {
             ["off", "low", "medium", "high"].map(str::to_owned).to_vec()
         }
-        super::providers::Adapter::Anthropic | super::providers::Adapter::Bedrock => {
-            vec!["off".into()]
+        super::providers::Adapter::Anthropic => vec!["off".into()],
+        super::providers::Adapter::Bedrock => {
+            let metadata = args.model_profiles.model(&args.provider, &args.model);
+            if metadata
+                .as_ref()
+                .is_some_and(|model| model.reasoning == Some(false))
+            {
+                vec!["off".into()]
+            } else {
+                pi_rs::bedrock::thinking_levels(
+                    &args.model,
+                    metadata.as_ref().and_then(|model| model.name.as_deref()),
+                )
+            }
         }
         super::providers::Adapter::Google => pi_rs::google::model_thinking_levels(&args.model),
     };
     if !args.allow_model_probes() {
-        return fallback();
+        return filter_levels(fallback());
     }
     let connection = args.clone();
     let discovered = std::thread::spawn(move || {
@@ -68,10 +96,11 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
     .ok()
     .flatten();
     if let Some(levels) = discovered {
+        let levels = filter_levels(levels);
         args.thinking_profile = Some((args.model.clone(), levels.clone()));
         levels
     } else {
-        fallback()
+        filter_levels(fallback())
     }
 }
 
@@ -159,6 +188,33 @@ mod tests {
         args.thinking = Some("high".into());
         adjust(&mut args);
         assert_eq!(args.thinking.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn bedrock_thinking_levels_follow_offline_model_capabilities() {
+        use clap::Parser;
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&serde_json::json!({})).unwrap();
+        args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
+        args.model = "anthropic.claude-sonnet-4-5-20250929-v1:0".into();
+        args.thinking = Some("high".into());
+        adjust(&mut args);
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        assert!(available(&mut args).contains(&"medium".into()));
+        args.model = "global.anthropic.claude-opus-4-8".into();
+        assert!(available(&mut args).contains(&"xhigh".into()));
+        args.model = "amazon.nova-lite-v1:0".into();
+        assert_eq!(available(&mut args), vec!["off".to_owned()]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"amazon-bedrock":{"models":[{"id":"opaque", "name":"Claude Fable 5", "reasoning":true, "thinkingLevelMap":{"high":"high"}}]}}})).unwrap();
+        args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
+        args.model = "opaque".into();
+        let levels = available(&mut args);
+        assert!(!levels.contains(&"off".into()));
+        assert!(levels.contains(&"low".into()));
+        args.thinking = Some("off".into());
+        adjust(&mut args);
+        assert_ne!(args.thinking.as_deref(), Some("off"));
     }
 
     #[test]
