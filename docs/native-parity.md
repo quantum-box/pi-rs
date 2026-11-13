@@ -3376,10 +3376,13 @@ options for other model families are not sent, matching Pi's Bedrock adapter.
 For supported Claude models, the provider adds default five-minute cache
 checkpoints after the system content and at the end of the final user message.
 Set `PI_CACHE_RETENTION=long` to request one-hour checkpoints on models that
-support that TTL; workbench model and provider compatibility can opt out of
-one-hour retention. Library callers can use `with_cache_retention`. Set
+support that TTL; otherwise the provider uses five-minute checkpoints.
+Workbench model and provider compatibility can explicitly override one-hour
+support, and library callers can use `with_cache_retention` and
+`with_long_cache_support`. Set
 `AWS_BEDROCK_FORCE_CACHE=1` when the model ID and configured name cannot identify
-a supported model. Tool-free summaries disable checkpoints and reasoning so
+a supported model; forcing checkpoints alone does not enable one-hour TTL.
+Tool-free summaries disable checkpoints and reasoning so
 that their smaller output limit remains usable. Cache usage includes
 one-hour write details when Bedrock reports them. Model support and minimum
 cacheable lengths are determined by Bedrock.

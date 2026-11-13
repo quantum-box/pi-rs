@@ -93,9 +93,33 @@ pub fn thinking_levels(model: &str, name: Option<&str>) -> Vec<String> {
     if has_any(&items, NEW_ADAPTIVE)
         || (has_any(&items, &["gpt-"]) && !has_any(&items, &["gpt-oss"]))
     {
-        levels.extend(["xhigh", "max"]);
+        levels.push("xhigh");
+    }
+    if has_any(&items, ADAPTIVE) || (has_any(&items, &["gpt-"]) && !has_any(&items, &["gpt-oss"])) {
+        levels.push("max");
     }
     levels.into_iter().map(str::to_owned).collect()
+}
+
+pub(crate) fn supports_long_cache(model: &str, name: Option<&str>) -> bool {
+    let items = candidates(model, name);
+    has_any(&items, &["claude"])
+        && has_any(
+            &items,
+            &[
+                "opus-4-5",
+                "opus-4-6",
+                "opus-4-7",
+                "opus-4-8",
+                "opus-5",
+                "sonnet-4-5",
+                "sonnet-4-6",
+                "sonnet-5",
+                "haiku-4-5",
+                "haiku-5",
+                "fable-5",
+            ],
+        )
 }
 
 pub(crate) fn supports_cache(model: &str, name: Option<&str>, force: bool) -> bool {
@@ -177,6 +201,7 @@ pub(crate) fn reasoning_fields(
                 match level {
                     ReasoningLevel::Off | ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
                     ReasoningLevel::Medium => "medium",
+                    ReasoningLevel::Max => "max",
                     _ => "high",
                 }
             };

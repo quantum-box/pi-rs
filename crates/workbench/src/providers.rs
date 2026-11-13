@@ -655,15 +655,16 @@ impl Client {
                         .and_then(|model| model.mapped_effort(level))
                 });
                 let level = if mapped == Some(None) { None } else { thinking };
-                let (supports_long, _) = args
+                let long_cache_override = args
                     .model_profiles
-                    .messages_cache_support(&args.provider, metadata.as_ref());
+                    .bedrock_long_cache_override(&args.provider, metadata.as_ref());
                 let client = client
                     .with_model_name(
                         &args.model,
                         metadata.as_ref().and_then(|model| model.name.as_deref()),
                     )
-                    .with_cache_retention(cache_retention(supports_long))
+                    .with_cache_retention(cache_retention(true))
+                    .with_long_cache_support(long_cache_override)
                     .with_reasoning(level, mapped.flatten())?;
                 Self::Bedrock(client)
             }
@@ -841,6 +842,27 @@ mod bedrock_tests {
                 .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
                 .await
                 .unwrap();
+            args.model_profiles = super::super::model_profiles::Profiles::parse(
+                &json!({"providers":{"amazon-bedrock":{"models":[
+                    {"id":"anthropic.claude-opus-4-1","name":"Claude Opus 4.1"},
+                    {"id":"anthropic.claude-opus-4-6","name":"Claude Opus 4.6","reasoning":true}
+                ]}}}),
+            )
+            .unwrap();
+            for (model, thinking) in [
+                ("anthropic.claude-opus-4-1", None),
+                ("anthropic.claude-opus-4-6", Some("max")),
+            ] {
+                args.model = model.into();
+                args.thinking = thinking.map(str::to_owned);
+                let client = Client::Bedrock(pi_rs::bedrock::Bedrock::from_env())
+                    .with_model_options(&args, false)
+                    .unwrap();
+                let _stream = client
+                    .stream_with_headers(request(&args.model), &HeaderMap::new(), false)
+                    .await
+                    .unwrap();
+            }
             return;
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -867,7 +889,7 @@ mod bedrock_tests {
             .unwrap();
         let server = async {
             let mut requests = Vec::new();
-            for _ in 0..10 {
+            for _ in 0..12 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut buf = [0; 8192];
@@ -945,6 +967,18 @@ mod bedrock_tests {
         assert_eq!(
             requests[9]["system"][1]["cachePoint"],
             json!({"type":"default"})
+        );
+        assert_eq!(
+            requests[10]["system"][1]["cachePoint"],
+            json!({"type":"default"})
+        );
+        assert_eq!(
+            requests[11]["system"][1]["cachePoint"],
+            json!({"type":"default","ttl":"1h"})
+        );
+        assert_eq!(
+            requests[11]["additionalModelRequestFields"]["output_config"]["effort"],
+            "max"
         );
     }
 }

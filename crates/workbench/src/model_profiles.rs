@@ -1008,6 +1008,15 @@ impl Profiles {
         }
     }
 
+    pub fn bedrock_long_cache_override(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> Option<bool> {
+        self.cache_compatibility(provider, model)
+            .supports_long_cache_retention
+    }
+
     pub fn messages_cache_support(
         &self,
         provider: &Provider,

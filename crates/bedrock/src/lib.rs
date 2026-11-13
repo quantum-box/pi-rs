@@ -28,6 +28,7 @@ pub struct Bedrock {
     reasoning: Option<ReasoningLevel>,
     mapped_effort: Option<String>,
     cache_retention: CacheRetention,
+    long_cache_support: Option<bool>,
     force_cache: bool,
 }
 impl Bedrock {
@@ -41,6 +42,7 @@ impl Bedrock {
             reasoning: None,
             mapped_effort: None,
             cache_retention: default_cache_retention(),
+            long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
         }
     }
@@ -54,6 +56,7 @@ impl Bedrock {
             reasoning: None,
             mapped_effort: None,
             cache_retention: default_cache_retention(),
+            long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
         }
     }
@@ -97,6 +100,11 @@ impl Bedrock {
     /// Set explicit cache retention. Use `None` for compaction and other one-off requests.
     pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
         self.cache_retention = retention;
+        self
+    }
+    /// Override model-based one-hour cache support; `None` uses known model capabilities.
+    pub fn with_long_cache_support(mut self, supported: Option<bool>) -> Self {
+        self.long_cache_support = supported;
         self
     }
     /// Prepare a one-off summary without cache checkpoints or model thinking.
@@ -414,7 +422,16 @@ impl Model for Bedrock {
             .filter(|(id, _)| id == &request.model)
             .map(|(_, name)| name.as_str());
         let checkpoint = if options::supports_cache(&request.model, model_name, self.force_cache) {
-            options::cache_point(self.cache_retention)?
+            let retention = if self.cache_retention == CacheRetention::Long
+                && !self
+                    .long_cache_support
+                    .unwrap_or_else(|| options::supports_long_cache(&request.model, model_name))
+            {
+                CacheRetention::Short
+            } else {
+                self.cache_retention
+            };
+            options::cache_point(retention)?
         } else {
             None
         };

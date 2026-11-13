@@ -205,6 +205,71 @@ async fn adaptive_profile_long_cache_and_govcloud_rules() {
 }
 
 #[tokio::test]
+async fn long_cache_requires_model_support_or_explicit_override() {
+    for (model, name, force, override_support, long) in [
+        ("anthropic.claude-opus-4-1", None, false, None, false),
+        ("anthropic.claude-3-7-sonnet", None, false, None, false),
+        ("anthropic.claude-opus-4-5", None, false, None, true),
+        ("opaque", Some("Claude Sonnet 4.6"), false, None, true),
+        ("opaque", None, true, None, false),
+        ("anthropic.claude-opus-4-1", None, false, Some(true), true),
+        ("anthropic.claude-opus-4-5", None, false, Some(false), false),
+    ] {
+        let (body, _) = capture(
+            "us-east-1",
+            |c| {
+                c.with_model_name(model, name)
+                    .with_force_cache(force)
+                    .with_long_cache_support(override_support)
+                    .with_cache_retention(CacheRetention::Long)
+            },
+            request(model, 512),
+            false,
+        )
+        .await;
+        let expected = if long {
+            json!({"type":"default","ttl":"1h"})
+        } else {
+            json!({"type":"default"})
+        };
+        assert_eq!(body["system"][1]["cachePoint"], expected, "{model}");
+        assert_eq!(
+            body["messages"][0]["content"][1]["cachePoint"], expected,
+            "{model}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn adaptive_max_defaults_to_max_and_honors_mapping() {
+    for (model, name, mapped, expected) in [
+        ("anthropic.claude-opus-4-6", None, None, "max"),
+        ("anthropic.claude-sonnet-4-6", None, None, "max"),
+        ("opaque", Some("Claude Opus 4.8"), None, "max"),
+        ("anthropic.claude-opus-4-6", None, Some("high"), "high"),
+    ] {
+        let (body, _) = capture(
+            "us-east-1",
+            |c| {
+                c.with_model_name(model, name)
+                    .with_reasoning(Some("max"), mapped)
+                    .unwrap()
+            },
+            request(model, 512),
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"], expected,
+            "{model}"
+        );
+    }
+    let levels = pi_rs_bedrock::thinking_levels("anthropic.claude-opus-4-6", None);
+    assert!(levels.iter().any(|level| level == "max"));
+    assert!(!levels.iter().any(|level| level == "xhigh"));
+}
+
+#[tokio::test]
 async fn gpt_mapping_summary_and_unsupported_cache_models() {
     let (oss, _) = capture(
         "us-east-1",
