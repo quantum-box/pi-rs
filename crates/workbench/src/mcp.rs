@@ -1516,6 +1516,43 @@ pub async fn resolve_value(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReleaseTestLatch(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for ReleaseTestLatch {
+        fn drop(&mut self) {
+            let (lock, wake) = &*self.0;
+            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wake.notify_all();
+        }
+    }
+
+    #[test]
+    fn frozen_transport_is_released_during_panic_unwind() {
+        let latch = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let latch = latch.clone();
+            move || {
+                let (lock, wake) = &*latch;
+                let held = lock.lock().unwrap();
+                waiting_tx.send(()).unwrap();
+                let (_guard, result) = wake
+                    .wait_timeout_while(held, Duration::from_secs(5), |released| !*released)
+                    .unwrap();
+                finished_tx.send(!result.timed_out()).unwrap();
+            }
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let _release = ReleaseTestLatch(latch);
+            panic!("fixture early failure");
+        });
+        assert!(result.is_err());
+        assert!(finished_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled_tool_refresh_never_dispatches_with_full_notification_queue() {
         use rmcp::{
@@ -1530,6 +1567,7 @@ mod tests {
             armed: Arc<AtomicBool>,
             blocked: std::sync::mpsc::Sender<()>,
             latch: Arc<(Mutex<bool>, Condvar)>,
+            latch_expired: Arc<AtomicBool>,
         }
         impl<T: Transport<RoleClient>> Transport<RoleClient> for Freeze<T> {
             type Error = T::Error;
@@ -1543,10 +1581,12 @@ mod tests {
                 {
                     self.blocked.send(()).unwrap();
                     let (lock, wake) = &*self.latch;
-                    let mut release = lock.lock().unwrap();
-                    while !*release {
-                        release = wake.wait(release).unwrap();
-                    }
+                    let release = lock.lock().unwrap();
+                    let (_guard, timeout) = wake
+                        .wait_timeout_while(release, Duration::from_secs(30), |release| !*release)
+                        .unwrap();
+                    self.latch_expired
+                        .store(timeout.timed_out(), Ordering::SeqCst);
                 }
                 self.inner.send(message)
             }
@@ -1640,6 +1680,8 @@ mod tests {
         );
         let armed = Arc::new(AtomicBool::new(false));
         let latch = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_on_drop = ReleaseTestLatch(latch.clone());
+        let latch_expired = Arc::new(AtomicBool::new(false));
         let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
         let service = native
             .serve_with_lifecycle(
@@ -1648,6 +1690,7 @@ mod tests {
                     armed: armed.clone(),
                     blocked: blocked_tx,
                     latch: latch.clone(),
+                    latch_expired: latch_expired.clone(),
                 },
                 ClientLifecycleMode::Initialize,
             )
@@ -1748,6 +1791,10 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !latch_expired.load(Ordering::SeqCst),
+            "transport latch expired before release"
+        );
         first.abort();
         for task in flood {
             task.abort();
