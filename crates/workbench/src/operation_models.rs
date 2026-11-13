@@ -236,12 +236,15 @@ impl Catalogue {
                         Error::Config(format!("invalid operation provider headers for {name}"))
                     })?
                 };
-                let mut headers = inherited;
-                headers.append(&mut configured.headers);
-                for header in headers.keys() {
-                    HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+                let mut headers = BTreeMap::new();
+                for (header, value) in inherited
+                    .into_iter()
+                    .chain(std::mem::take(&mut configured.headers))
+                {
+                    let header = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
                         Error::Config(format!("invalid operation provider header name for {name}"))
                     })?;
+                    headers.insert(header.as_str().to_owned(), value);
                 }
                 configured.headers = headers;
                 let inherited: Compat = if provider["compat"].is_null() {
@@ -445,14 +448,17 @@ impl Entry {
             .is_some_and(|input| input.iter().any(|kind| kind == "image"))
     }
 
+    fn openrouter_compat(&self) -> bool {
+        self.provider == "openrouter"
+            || self
+                .base
+                .host_str()
+                .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+    }
+
     fn image_input(&self) -> ImageInput {
         self.model.compat.image_input.unwrap_or_else(|| {
-            if self.provider == "openrouter"
-                || self
-                    .base
-                    .host_str()
-                    .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
-            {
+            if self.openrouter_compat() {
                 ImageInput::StateImageUrls
             } else {
                 ImageInput::Assets
@@ -684,12 +690,6 @@ impl Operations {
             .map_err(|_| Error::Config("invalid model operation credential".into()))?;
         authorization.set_sensitive(true);
         headers.insert(reqwest::header::AUTHORIZATION, authorization);
-        if image_opt_in {
-            headers.insert(
-                "typesafe-danger-zone-images",
-                HeaderValue::from_static("true"),
-            );
-        }
         for (name, value) in &entry.model.headers {
             let value = resolve_header(value, credential_env).await.ok_or_else(|| {
                 Error::Config(format!("could not resolve operation model header {name}"))
@@ -700,6 +700,14 @@ impl Operations {
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
                 value,
+            );
+        }
+        // Pi adds the automatic classifier image opt-in as request options,
+        // after provider and model headers have been combined.
+        if image_opt_in {
+            headers.insert(
+                "typesafe-danger-zone-images",
+                HeaderValue::from_static("true"),
             );
         }
         let mut response = self
@@ -777,6 +785,250 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn classifier_image_header_defaults_are_independent_of_wire_format() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (
+            provider,
+            mode,
+            override_header,
+            with_image,
+            expected,
+            provider_header,
+            model_header,
+            expected_custom,
+        ) in [
+            (
+                "typesafe",
+                "state-image-urls",
+                None,
+                true,
+                Some("true"),
+                None,
+                None,
+                None,
+            ),
+            ("openrouter", "assets", None, true, None, None, None, None),
+            (
+                "openrouter",
+                "assets",
+                Some(true),
+                true,
+                Some("true"),
+                None,
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "images",
+                Some(false),
+                true,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "state-image-urls",
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "openrouter",
+                "assets",
+                Some(true),
+                false,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                true,
+                Some("true"),
+                Some(("TypeSafe-Danger-Zone-Images", "false")),
+                Some(("typesafe-danger-zone-images", "false")),
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                Some(false),
+                true,
+                Some("false"),
+                Some(("typesafe-danger-zone-images", "false")),
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                false,
+                Some("false"),
+                None,
+                Some(("TypeSafe-Danger-Zone-Images", "false")),
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                true,
+                Some("true"),
+                Some(("x-fixture", "provider")),
+                Some(("X-Fixture", "model")),
+                Some("model"),
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                true,
+                Some("true"),
+                Some(("X-Fixture", "provider")),
+                Some(("x-fixture", "model")),
+                Some("model"),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (header_end, content_length) = loop {
+                    let mut chunk = [0u8; 2048];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, length);
+                    }
+                };
+                while request.len() < header_end + content_length {
+                    let mut chunk = [0u8; 2048];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let response = b"{\"answers\":{\"ok\":{\"type\":\"noul\",\"noul\":0.6}}}";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).as_bytes()).await.unwrap();
+                stream.write_all(response).await.unwrap();
+                request
+            });
+            let mut compat = json!({"imageInput":mode});
+            if let Some(value) = override_header {
+                compat["sendImageOptInHeader"] = json!(value);
+            }
+            let provider_headers: BTreeMap<_, _> = provider_header.into_iter().collect();
+            let model_headers: BTreeMap<_, _> = model_header.into_iter().collect();
+            let config = json!({provider:{"baseUrl":format!("http://{address}/v1"), "apiKey":"test-key", "headers":provider_headers, "models":[{
+                "type":"classifier", "id":"parity-fixture", "api":"typesafe-system-one", "input":["text","image"], "compat":compat, "headers":model_headers
+            }]}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider && entry.model.id == "parity-fixture")
+                .unwrap();
+            let context = json!({"state":"test", "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
+                "images":if with_image { json!([{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]) } else { json!([]) }});
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            let mut data = json!({});
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.perform(entry, &context, &Keys::parse(&json!({})), &mut data),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request[..end]).unwrap();
+            let header_values = |wanted: &str| {
+                headers
+                    .lines()
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case(wanted).then(|| value.trim())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                header_values("typesafe-danger-zone-images"),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{provider} {mode} {override_header:?}"
+            );
+            assert_eq!(
+                header_values("x-fixture"),
+                expected_custom.into_iter().collect::<Vec<_>>()
+            );
+            let body: Value = serde_json::from_slice(&request[end..]).unwrap();
+            assert_eq!(body["questions"]["ok"]["type"], "noul");
+            if with_image {
+                match mode {
+                    "assets" => assert!(body["assets"]["<image-1>"].is_object()),
+                    "state-image-urls" => assert_eq!(body["state"][0]["type"], "image_url"),
+                    "images" => assert!(
+                        body["images"][0]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("data:image/png;base64,")
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(data["answers"]["ok"]["probability"], 0.6);
+        }
+    }
+
+    #[test]
+    fn classifier_header_default_detects_openrouter_host_independently() {
+        let config = json!({"relay":{"baseUrl":"https://eu.openrouter.ai/api/v1", "models":[{
+            "type":"classifier", "id":"fixture", "api":"typesafe-system-one", "input":["text","image"], "compat":{"imageInput":"assets"}
+        }]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let context = json!({"state":"test", "questions":{"ok":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}}, "images":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="}]});
+        let (body, opt_in) = classifier_payload(entry, &context).unwrap();
+        assert!(body["assets"]["<image-1>"].is_object());
+        assert!(!opt_in);
+    }
 
     #[tokio::test]
     async fn operation_credentials_prefer_stored_then_configured_then_environment() {
