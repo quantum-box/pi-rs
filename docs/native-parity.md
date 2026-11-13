@@ -2926,10 +2926,27 @@ checked with a five-minute floor, even when a shorter minimum was requested.
 The rotated credential is saved before that check. The default
 check output contains only status and metadata.
 
-pi-rs does not automatically remove stale `auth.json.lock` directories:
-Pi's lock implementation does not coordinate stale recovery with a second
-lock, so removal could delete a replacement holder's directory. Pi may
-recover a stale lock, or it can be removed after confirming no holder is active.
+pi-rs does not automatically remove stale `auth.json.lock` directories.
+To recover one safely, stop **all** Pi and pi-rs processes that can access
+that credential store, including background or waiting processes on other
+hosts sharing the filesystem. Once they have exited, either remove the stale
+directory or run a single Pi process to recover it; wait for recovery to
+finish before restarting any other process.
+
+This restriction matters even when no process currently holds the lock. Pi's
+`proper-lockfile` can observe a stale directory, pause, and later remove by
+path after another process has replaced it with a live pi-rs lock. Concurrent
+Pi stale recovery can therefore still compromise a pi-rs credential refresh
+and lose a rotated token. pi-rs cannot serialize an already-running Pi
+reclaimer with a separate lock or a path identity check; a complete fix
+must prevent Pi's delayed removal from deleting a live lock. The current
+protocol provides no such guarantee.
+
+One possible defense to investigate is publishing a prepopulated lock
+directory with an atomic no-replace operation, so a delayed `rmdir` fails while
+the directory is held. That approach would change crash recovery and depends
+on operating-system and filesystem behavior; it has not been implemented or
+validated and is not protection in the current release.
 
 Loopback checks covered expired and refreshed Radius credentials,
 model-specific key selection, OpenRouter's OAuth key type, and invalid

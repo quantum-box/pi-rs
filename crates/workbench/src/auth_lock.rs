@@ -153,7 +153,9 @@ fn try_lock(path: &Path) -> Result<Option<Guard>> {
         // Pi's proper-lockfile does not coordinate stale-lock reclamation
         // through a second lock. Checking identity and then removing by path
         // can therefore remove a replacement Pi already acquired. Leave stale
-        // locks in place instead of risking overlapping token rotations.
+        // locks in place rather than initiating that race. A delayed Pi
+        // reclaimer can still remove a replacement; safe recovery requires
+        // all Pi and pi-rs processes using this store to be stopped first.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -193,7 +195,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stale_lock_is_never_reclaimed_or_allowed_to_replace_a_live_lock() {
+    fn pi_rs_does_not_reclaim_stale_or_remove_live_locks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let lock = dir.path().join("auth.json.lock");
@@ -231,6 +233,48 @@ mod tests {
             waiter.join().unwrap();
         }
         assert!(owns(&lock, &live), "a live replacement was removed");
+    }
+
+    // Model proper-lockfile's stat-then-rmdir sequence: an old observation can
+    // outlive the directory it described and remove a later pi-rs holder.
+    #[cfg(unix)]
+    #[test]
+    fn delayed_pi_stale_observer_can_remove_a_fresh_pi_rs_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let lock = dir.path().join("auth.json.lock");
+        std::fs::create_dir(&lock).unwrap();
+        filetime::set_file_mtime(
+            &lock,
+            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(120)),
+        )
+        .unwrap();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let delayed = std::thread::spawn({
+            let lock = lock.clone();
+            move || {
+                let age = std::fs::metadata(&lock)
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    .elapsed()
+                    .unwrap();
+                assert!(age > Duration::from_secs(30));
+                observed_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                std::fs::remove_dir(&lock).unwrap();
+            }
+        });
+        observed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Another actor clears the old directory before the delayed Pi resumes.
+        std::fs::remove_dir(&lock).unwrap();
+        let guard = try_lock(&path).unwrap().unwrap();
+        guard.check().unwrap();
+        release_tx.send(()).unwrap();
+        delayed.join().unwrap();
+        assert!(guard.check().is_err(), "the replacement was compromised");
+        assert!(!lock.exists(), "the delayed Pi rmdir removed the new lock");
     }
 
     #[test]
