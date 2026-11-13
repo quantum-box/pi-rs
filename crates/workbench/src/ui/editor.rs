@@ -133,12 +133,16 @@ impl Editor {
     pub fn backspace(&mut self) {
         let end = self.cursor;
         self.left();
-        self.remove(self.cursor..end, None);
+        let start = self.cursor;
+        self.cursor = end;
+        self.remove(start..end, None);
     }
     pub fn delete(&mut self) {
         let start = self.cursor;
         self.right();
-        self.remove(start..self.cursor, None);
+        let end = self.cursor;
+        self.cursor = start;
+        self.remove(start..end, None);
     }
     pub fn take(&mut self) -> String {
         self.remember();
@@ -292,7 +296,9 @@ impl Editor {
                     self.word_left();
                     self.cursor = self.cursor.max(line_start);
                 }
-                self.remove(self.cursor..end, Some(true));
+                let start = self.cursor;
+                self.cursor = end;
+                self.remove(start..end, Some(true));
             }
             "tui.editor.deleteWordForward" => {
                 let start = self.cursor;
@@ -303,7 +309,9 @@ impl Editor {
                     self.word_right();
                     self.cursor = self.cursor.min(line_end);
                 }
-                self.remove(start..self.cursor, Some(false));
+                let end = self.cursor;
+                self.cursor = start;
+                self.remove(start..end, Some(false));
             }
             "tui.editor.deleteToLineStart" => {
                 let start = self.line_start();
@@ -387,6 +395,49 @@ mod tests {
         editor.action("tui.editor.deleteToLineEnd");
         editor.action("tui.editor.yank");
         assert_eq!(editor.text, "one two\n三 four");
+    }
+
+    #[test]
+    fn undo_word_deletion_restores_original_cursor_in_both_directions() {
+        for (action, cursor, result) in [
+            (
+                "tui.editor.deleteWordBackward",
+                "first\n".len(),
+                "firstsecond",
+            ),
+            ("tui.editor.deleteWordForward", "first".len(), "firstsecond"),
+            (
+                "tui.editor.deleteWordBackward",
+                "first\nsecond".len(),
+                "first\n",
+            ),
+            ("tui.editor.deleteWordForward", 0, "\nsecond"),
+        ] {
+            let mut editor = Editor::default();
+            editor.insert("first\nsecond");
+            editor.cursor = cursor;
+            editor.action(action);
+            assert_eq!(editor.text, result, "{action}");
+            editor.action("tui.editor.undo");
+            assert_eq!(editor.text, "first\nsecond", "{action}");
+            assert_eq!(editor.cursor, cursor, "{action}");
+        }
+    }
+
+    #[test]
+    fn undo_character_deletion_restores_original_cursor() {
+        for (action, cursor) in [
+            ("tui.editor.deleteCharBackward", 1),
+            ("tui.editor.deleteCharForward", 0),
+        ] {
+            let mut editor = Editor::default();
+            editor.insert("ab");
+            editor.cursor = cursor;
+            editor.action(action);
+            editor.action("tui.editor.undo");
+            assert_eq!(editor.text, "ab");
+            assert_eq!(editor.cursor, cursor, "{action}");
+        }
     }
 
     #[test]
