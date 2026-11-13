@@ -7,6 +7,47 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+// A socket accepted from a nonblocking listener can itself be nonblocking on
+// macOS. Normalize it before using timeouts for the fixture's gate protocol.
+fn prepare_gate(socket: &std::net::TcpStream) {
+    socket.set_nonblocking(false).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn gate_waits_for_delayed_bytes_even_if_accepted_socket_was_nonblocking() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut socket, _) = listener.accept().unwrap();
+    // Simulate platforms where accept inherits the listener's O_NONBLOCK.
+    socket.set_nonblocking(true).unwrap();
+    prepare_gate(&socket);
+    let (sent, received) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut byte = [0];
+        let result = socket.read_exact(&mut byte).map(|()| byte);
+        sent.send(result).unwrap();
+    });
+    assert!(matches!(
+        received.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    client.write_all(b"S").unwrap();
+    assert_eq!(
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        *b"S"
+    );
+    reader.join().unwrap();
+}
+
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
@@ -360,7 +401,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
             Err(error) => panic!("first selection callback did not start: {error}"),
         }
     };
-    gate.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    prepare_gate(&gate);
     let mut started = [0];
     gate.read_exact(&mut started).unwrap();
     assert_eq!(&started, b"S");
@@ -1568,7 +1609,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
                 Err(error) => panic!("first per-model callback did not start: {error}"),
             }
         };
-        gate.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        prepare_gate(&gate);
         let mut started = [0];
         gate.read_exact(&mut started).unwrap();
         assert_eq!(&started, b"S");
@@ -1977,9 +2018,7 @@ fn exit_during_shell_restores_terminal_and_drains_late_key_release() {
     };
     #[cfg(debug_assertions)]
     {
-        barrier
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        prepare_gate(&barrier);
         let mut ready = [0];
         barrier.read_exact(&mut ready).unwrap();
         assert_eq!(&ready, b"D");
