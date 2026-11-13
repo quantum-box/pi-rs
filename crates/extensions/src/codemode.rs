@@ -466,9 +466,9 @@ fn install_globals(
     let model_cancel = cancellation.clone();
     globals.set(
         "__emit",
-        Func::from(move |kind: String, value: String| {
+        Func::from(move |kind: String, value: String, mime: String| {
             let mut output = sink.lock().expect("codemode output");
-            let error = output.emit(&kind, value).err().unwrap_or_default();
+            let error = output.emit(&kind, value, &mime).err().unwrap_or_default();
             if output.limit_exceeded {
                 output_cancel.cancel();
             }
@@ -698,7 +698,7 @@ impl ModelUsage {
 struct Output {
     items: Vec<Item>,
     console: Vec<String>,
-    bytes: usize,
+    utf16_units: usize,
     calls: usize,
     limit_exceeded: bool,
     model_usage: ModelUsage,
@@ -713,10 +713,14 @@ enum Item {
     },
 }
 impl Output {
-    fn emit(&mut self, kind: &str, value: String) -> Result<(), String> {
+    fn emit(&mut self, kind: &str, value: String, mime: &str) -> Result<(), String> {
         self.calls += 1;
-        self.bytes = self.bytes.saturating_add(value.len());
-        if self.calls > MAX_ITEMS || self.bytes > MAX_OUTPUT {
+        // UTF-8 needs at most three bytes per UTF-16 code unit, so the
+        // character cap still bounds retained output even for non-ASCII text.
+        self.utf16_units = self
+            .utf16_units
+            .saturating_add(value.encode_utf16().count());
+        if self.calls > MAX_ITEMS || self.utf16_units > MAX_OUTPUT {
             self.limit_exceeded = true;
             return Err("Script output limit exceeded".into());
         }
@@ -724,9 +728,6 @@ impl Output {
             "text" => self.items.push(Item::Text(value)),
             "console" => self.console.push(value),
             "image" => {
-                let block: Value =
-                    serde_json::from_str(&value).map_err(|error| error.to_string())?;
-                let mime = block["mimeType"].as_str().unwrap_or_default();
                 let suffix = match mime {
                     "image/png" => ".png",
                     "image/jpeg" => ".jpg",
@@ -734,7 +735,7 @@ impl Output {
                     "image/webp" => ".webp",
                     _ => return Err("Unsupported image type".into()),
                 };
-                let data = block["data"].as_str().ok_or("Missing image data")?;
+                let data = value.as_str();
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .map_err(|_| "Invalid image data".to_owned())?;
@@ -1500,13 +1501,12 @@ mod tests {
     #[test]
     fn images_preserve_output_order_and_reuse_saved_files() {
         let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
-        let image = json!({"type":"image","mimeType":"image/png","data":data}).to_string();
         let mut output = Output::default();
-        output.emit("text", "before".into()).unwrap();
-        output.emit("image", image.clone()).unwrap();
-        output.emit("text", "between".into()).unwrap();
-        output.emit("image", image).unwrap();
-        output.emit("text", "after".into()).unwrap();
+        output.emit("text", "before".into(), "").unwrap();
+        output.emit("image", data.clone(), "image/png").unwrap();
+        output.emit("text", "between".into(), "").unwrap();
+        output.emit("image", data, "image/png").unwrap();
+        output.emit("text", "after".into(), "").unwrap();
         let value = output.finish(true, Duration::ZERO, None, 10000);
         let blocks = value["content"].as_array().unwrap();
         assert_eq!(
@@ -1551,6 +1551,110 @@ mod tests {
                 .contains("could not be saved")
         );
         assert_eq!(value["content"][1]["type"], "image");
+    }
+
+    #[test]
+    fn output_counts_utf16_units_across_text_console_and_image() {
+        let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
+        let mut output = Output {
+            utf16_units: MAX_OUTPUT - data.len() - 3,
+            ..Output::default()
+        };
+        output.emit("text", "界".into(), "").unwrap();
+        output.emit("console", "😀".into(), "").unwrap();
+        output.emit("image", data, "image/png").unwrap();
+        assert_eq!(output.utf16_units, MAX_OUTPUT);
+        assert!(!output.limit_exceeded);
+        assert!(output.emit("text", "a".into(), "").is_err());
+        assert!(output.limit_exceeded);
+        for path in output.saved_images.values().flatten() {
+            std::fs::remove_file(path).unwrap();
+        }
+        let mut output = Output {
+            utf16_units: MAX_OUTPUT - 1,
+            ..Output::default()
+        };
+        assert!(output.emit("text", "😀".into(), "").is_err());
+        assert_eq!(output.utf16_units, MAX_OUTPUT + 1);
+    }
+
+    #[tokio::test]
+    async fn unicode_output_boundary_is_enforced_by_script_runtime() {
+        for (code, expected_success) in [
+            ("text('界'); console.log('😀')", true),
+            ("text('界'); console.log('😀'); text('a')", false),
+        ] {
+            let sink = Arc::new(Mutex::new(Output {
+                utf16_units: MAX_OUTPUT - 3,
+                ..Output::default()
+            }));
+            let result = evaluate(
+                code,
+                json!({}),
+                Arc::new(Host),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: Default::default(),
+                },
+                Some(Duration::from_secs(10)),
+                sink.clone(),
+            )
+            .await;
+            assert_eq!(result.is_ok(), expected_success);
+            assert_eq!(sink.lock().unwrap().limit_exceeded, !expected_success);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_limit_counts_base64_payload_not_wrapper() {
+        let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
+        let sink = Arc::new(Mutex::new(Output {
+            utf16_units: MAX_OUTPUT - data.len(),
+            ..Output::default()
+        }));
+        let code =
+            format!("image({{type:'image', mimeType:'image/png', data:'{data}', extra:'界😀'}})");
+        let result = evaluate(
+            &code,
+            json!({}),
+            Arc::new(Host),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            Some(Duration::from_secs(10)),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        let output = sink.lock().unwrap();
+        assert_eq!(output.utf16_units, MAX_OUTPUT);
+        for path in output.saved_images.values().flatten() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_size_multibyte_output_is_accepted() {
+        let sink = Arc::new(Mutex::new(Output::default()));
+        let result = evaluate(
+            "text('界'.repeat(16 * 1024 * 1024))",
+            json!({}),
+            Arc::new(Host),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            Some(Duration::from_secs(30)),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        let output = sink.lock().unwrap();
+        assert_eq!(output.utf16_units, MAX_OUTPUT);
+        assert!(matches!(&output.items[..], [Item::Text(text)] if text.len() == 3 * MAX_OUTPUT));
     }
 
     struct DeadlineModel;
