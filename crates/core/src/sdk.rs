@@ -2459,6 +2459,92 @@ mod tests {
         session.close().await.unwrap();
     }
 
+    struct CompactionHookMessages;
+    #[async_trait::async_trait]
+    impl Extension for CompactionHookMessages {
+        fn id(&self) -> &str {
+            "compaction-hook-messages"
+        }
+        async fn before_compaction_with_host(
+            &self,
+            _: &mut Compaction,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<crate::Decision> {
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "compact-hook".into(),
+                    content: crate::ContextContent::Text("before".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::Steer,
+            )
+            .await?;
+            Ok(crate::Decision::Allow)
+        }
+        async fn after_compaction_with_host(
+            &self,
+            _: &Compaction,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::ExtensionState>> {
+            for (content, delivery) in [
+                ("compact next", crate::CustomMessageDelivery::NextTurn),
+                ("compact trigger", crate::CustomMessageDelivery::TriggerTurn),
+            ] {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "compact-hook".into(),
+                        content: crate::ContextContent::Text(content.into()),
+                        display: false,
+                        details: None,
+                    },
+                    delivery,
+                )
+                .await?;
+            }
+            Ok(None)
+        }
+    }
+    #[tokio::test]
+    async fn summary_compaction_hooks_journal_reentrant_messages_and_trigger() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compaction-hooks.jsonl");
+        let mut session =
+            SessionBuilder::new(Arc::new(TreeCaptureModel(requests.clone())), "fixture")
+                .extension(Arc::new(CompactionHookMessages))
+                .unwrap()
+                .open(&path)
+                .unwrap();
+        session.prompt("first").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.summarize(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.journal().pending_custom_trigger().is_none());
+        let snapshots = requests.lock().unwrap();
+        assert_eq!(snapshots.len(), 3);
+        let texts: Vec<_> = snapshots[2]
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.ends_with(&["compact trigger", "compact next"]),
+            "{texts:?}"
+        );
+        drop(snapshots);
+        drop(session);
+        let restored = Session::open(&path).unwrap();
+        assert!(restored.pending_custom_trigger().is_none());
+        assert_eq!(restored.records().iter().filter(|record| matches!(&record.event,
+            crate::Event::CustomMessageDelivered { message, .. } if message.custom_type == "compact-hook")).count(), 2);
+    }
+
     struct CompactionLifecycleMessage;
     #[async_trait::async_trait]
     impl Extension for CompactionLifecycleMessage {

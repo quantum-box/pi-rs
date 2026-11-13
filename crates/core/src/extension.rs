@@ -1007,12 +1007,30 @@ pub trait Extension: Send + Sync {
         Ok(Decision::Allow)
     }
 
+    async fn before_compaction_with_host(
+        &self,
+        compaction: &mut Compaction,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        self.before_compaction(compaction, state)
+    }
+
     fn after_compaction(
         &self,
         _compaction: &Compaction,
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<ExtensionState>> {
         Ok(None)
+    }
+
+    async fn after_compaction_with_host(
+        &self,
+        compaction: &Compaction,
+        state: Option<&ExtensionState>,
+        _host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<ExtensionState>> {
+        self.after_compaction(compaction, state)
     }
 }
 

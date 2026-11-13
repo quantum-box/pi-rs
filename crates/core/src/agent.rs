@@ -2888,17 +2888,20 @@ impl Agent<'_> {
         let billing = reply
             .usage
             .map(|usage| (usage, summary_usage_metadata(session, &reply)));
-        let from_extension = self.commit_compaction(
-            session,
-            Compaction {
-                summary: reply.content,
-                keep_turns: retention.keep_turns,
-            },
-            states,
-            billing,
-            Some(retention),
-            observer,
-        )?;
+        let from_extension = self
+            .commit_compaction_with_host(
+                session,
+                Compaction {
+                    summary: reply.content,
+                    keep_turns: retention.keep_turns,
+                },
+                states,
+                billing,
+                Some(retention),
+                cancel,
+                observer,
+            )
+            .await?;
         Ok((output as u32, from_extension))
     }
 
@@ -2929,6 +2932,96 @@ impl Agent<'_> {
         Ok(crate::estimate_request_tokens(request)
             .saturating_add(u64::from(request.max_output_tokens))
             > u64::from(window))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_compaction_with_host(
+        &self,
+        session: &mut Session,
+        mut compaction: Compaction,
+        states: &ExtensionStates,
+        billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
+        minimum_retention: Option<RetentionPlan>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<bool> {
+        let original_summary = compaction.summary.clone();
+        for extension in &self.registry.extensions {
+            let (sender, incoming) = mpsc::channel(32);
+            let idle = session.current_run_id().is_none();
+            let host = Arc::new(LifecycleMessageHost { sender, idle });
+            let result = serve_compaction_hook(
+                session,
+                incoming,
+                extension.before_compaction_with_host(
+                    &mut compaction,
+                    states.get(extension.id()),
+                    host,
+                ),
+                idle,
+                cancel,
+                self.limits.tool_timeout,
+                observer,
+            )
+            .await?;
+            if let Decision::Deny(reason) = hook(extension.as_ref(), result)? {
+                return Err(Error::Extension {
+                    id: extension.id().into(),
+                    message: reason,
+                });
+            }
+        }
+        if compaction.summary.trim().is_empty() || compaction.summary.len() > 64 * 1024 {
+            return Err(Error::Config(
+                "summary must contain between 1 and 65536 bytes".into(),
+            ));
+        }
+        if minimum_retention.is_some_and(|minimum| compaction.keep_turns < minimum.keep_turns) {
+            return Err(Error::Config(
+                "compaction would drop turns absent from the summary".into(),
+            ));
+        }
+        let retain_from = match minimum_retention {
+            Some(retention) if retention.keep_turns == compaction.keep_turns => retention.boundary,
+            _ => retain_from(&session.branch(), compaction.keep_turns),
+        };
+        let mut changes = ExtensionStates::new();
+        for extension in &self.registry.extensions {
+            let (sender, incoming) = mpsc::channel(32);
+            let idle = session.current_run_id().is_none();
+            let host = Arc::new(LifecycleMessageHost { sender, idle });
+            let result = serve_compaction_hook(
+                session,
+                incoming,
+                extension.after_compaction_with_host(&compaction, states.get(extension.id()), host),
+                idle,
+                cancel,
+                self.limits.tool_timeout,
+                observer,
+            )
+            .await?;
+            if let Some(state) = hook(extension.as_ref(), result)? {
+                changes.insert(extension.id().into(), state);
+            }
+        }
+        let (usage, usage_metadata) =
+            billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
+        let tokens_before = session.context_usage_estimate().tokens;
+        let from_extension = original_summary != compaction.summary;
+        commit(
+            session,
+            Event::Compacted {
+                summary: compaction.summary,
+                system_prompt: None,
+                retain_from,
+                tokens_before: Some(tokens_before),
+                states: changes,
+                usage,
+                usage_metadata,
+            },
+            observer,
+        )?;
+        Ok(from_extension)
     }
 
     fn commit_compaction(
@@ -3259,6 +3352,37 @@ type CallbackMessageSender = mpsc::Sender<(
     crate::QueuedCustomMessage,
     oneshot::Sender<std::result::Result<(), String>>,
 )>;
+
+async fn serve_compaction_hook<T>(
+    session: &mut Session,
+    mut incoming: mpsc::Receiver<(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    )>,
+    future: impl std::future::Future<Output = crate::ExtensionResult<T>>,
+    idle: bool,
+    cancel: &CancellationToken,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+) -> Result<crate::ExtensionResult<T>> {
+    let future = tokio::time::timeout(timeout, future);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            Some((input, reply)) = incoming.recv() => {
+                let result = if !idle || matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                    queue_custom_message(session, input, observer)
+                } else {
+                    session.append_custom_message(input.message).map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
+                };
+                match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+            }
+            result = &mut future => return result.map_err(|_| Error::Config("compaction hook timed out".into())),
+        }
+    }
+}
 
 fn completed_run_turns(session: &Session, run_id: Uuid) -> u32 {
     session

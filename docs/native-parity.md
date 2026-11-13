@@ -2848,8 +2848,9 @@ even when the latter were queued earlier. The native scheduler follows that
 order; it is covered for both user and custom starting messages. Host-aware
 `before_tool` policies can opt in with
 `handles_before_tool_host`; separately built extensions negotiate this support.
-Host calls also remain unavailable in idle `SessionControl` input hooks,
-and the synchronous `before_compaction` and `after_compaction` hooks. Async `session_compact` and
+Host calls also remain unavailable in idle `SessionControl` input hooks and
+caller-supplied synchronous `compact()` operations. Model-generated summary
+compaction runs host-aware before/after hooks, and async `session_compact` and
 `session_compact_failed` notifications can send through the session owner.
 For host-bound workbench sessions, resource discovery
 uses the state-only API and session transitions require the owning host. The

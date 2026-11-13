@@ -340,6 +340,8 @@ struct Description {
     #[serde(default)]
     tree_hook_host_calls: bool,
     #[serde(default)]
+    compaction_hook_host_calls: bool,
+    #[serde(default)]
     resources_hook_host_calls: bool,
     #[serde(default)]
     user_bash_hook_host_calls: bool,
@@ -1368,6 +1370,34 @@ impl Extension for ExecutableExtension {
         compaction.keep_turns = keep_turns;
         Ok(decision.into())
     }
+    async fn before_compaction_with_host(
+        &self,
+        compaction: &mut Compaction,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.compaction_hook_host_calls {
+            return self.before_compaction(compaction, state);
+        }
+        let request = ProtocolRequest::BeforeCompaction {
+            summary: compaction.summary.clone(),
+            keep_turns: compaction.keep_turns,
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (summary, keep_turns, decision): (String, usize, DecisionValue) =
+            tokio::task::spawn_blocking(move || {
+                call_duplex(&path, request, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+        compaction.summary = summary;
+        compaction.keep_turns = keep_turns;
+        Ok(decision.into())
+    }
     fn after_compaction(
         &self,
         compaction: &Compaction,
@@ -1378,6 +1408,28 @@ impl Extension for ExecutableExtension {
             keep_turns: compaction.keep_turns,
             state: state.cloned(),
         })
+    }
+    async fn after_compaction_with_host(
+        &self,
+        compaction: &Compaction,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<ExtensionState>> {
+        if !self.description.compaction_hook_host_calls {
+            return self.after_compaction(compaction, state);
+        }
+        let request = ProtocolRequest::AfterCompaction {
+            summary: compaction.summary.clone(),
+            keep_turns: compaction.keep_turns,
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
 }
 
@@ -2393,6 +2445,7 @@ async fn dispatch_with_host(
             context_hook_host_calls: true,
             transition_hook_host_calls: true,
             tree_hook_host_calls: true,
+            compaction_hook_host_calls: true,
             resources_hook_host_calls: true,
             user_bash_hook_host_calls: true,
             user_bash_stream_host_calls: true,
@@ -2737,7 +2790,13 @@ async fn dispatch_with_host(
                 summary,
                 keep_turns,
             };
-            let decision = extension.before_compaction(&mut compaction, state.as_ref())?;
+            let decision = if host.supports_custom_messages() {
+                extension
+                    .before_compaction_with_host(&mut compaction, state.as_ref(), host)
+                    .await?
+            } else {
+                extension.before_compaction(&mut compaction, state.as_ref())?
+            };
             encode(Ok((
                 compaction.summary,
                 compaction.keep_turns,
@@ -2748,13 +2807,21 @@ async fn dispatch_with_host(
             summary,
             keep_turns,
             state,
-        } => encode(extension.after_compaction(
-            &Compaction {
+        } => {
+            let compaction = Compaction {
                 summary,
                 keep_turns,
-            },
-            state.as_ref(),
-        )),
+            };
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .after_compaction_with_host(&compaction, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.after_compaction(&compaction, state.as_ref()))
+            }
+        }
     }
 }
 fn context(operation_id: &str) -> ExtensionResult<ToolContext> {
@@ -3475,7 +3542,7 @@ else:
 import json, sys
 if '--pi-rs-extension-v1' in sys.argv:
     json.load(sys.stdin)
-    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'compaction_hook_host_calls':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
     print(json.dumps({'version':1,'response':{'Ok':d}}))
 else:
     frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
@@ -3494,6 +3561,8 @@ else:
     elif kind=='discover_resources': result={'skillPaths':[],'promptPaths':['fixture.md'],'themePaths':[]}
     elif kind=='before_session_transition': result=False
     elif kind=='before_tree': result=None
+    elif kind=='before_compaction': result=[r['summary'],r['keep_turns'],{'allow':True,'reason':None}]
+    elif kind=='after_compaction': result=None
     elif kind=='before_tool': result={'allow':True,'reason':None}
     elif kind=='tool_call': result=[r['arguments'],{'allow':True,'reason':None}]
     elif kind=='tool_result': result=None
@@ -3655,7 +3724,25 @@ else:
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 12);
+        let mut compaction = Compaction {
+            summary: "summary".into(),
+            keep_turns: 1,
+        };
+        assert_eq!(
+            extension
+                .before_compaction_with_host(&mut compaction, None, host.clone())
+                .await
+                .unwrap(),
+            Decision::Allow
+        );
+        assert!(
+            extension
+                .after_compaction_with_host(&compaction, None, host.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 14);
     }
 
     #[tokio::test]
