@@ -654,9 +654,14 @@ without a configured home, home-relative file paths fail. Its read and shell
 tools share a host-side transcript capability, as in the standalone factories.
 `coding_tools_from_with_local_shell` explicitly adds a host-local, unsandboxed
 shell to injected file tools and rejects a separately injected shell. Partial or
-independently allocated injected backends are rejected. The read-only set rejects custom read operations because
-grep, find and ls still access the local filesystem. A set is an `Extension` and
-can be registered directly with `Registry`; overlapping sets have duplicate tool names.
+independently allocated injected backends are rejected. The read-only set rejects
+custom read operations because grep, find and ls still access the local filesystem.
+To use all four tools on one remote workspace, `create_remote_read_only_tools`
+accepts one `Arc` whose backend implements read, grep, find, and ls operations.
+Its working directory and optional backend home are absolute paths in that
+backend's namespace. The backend enforces access controls and search semantics,
+including matching, ignore rules, and ordering. A set is an `Extension` and can
+be registered directly with `Registry`; overlapping sets have duplicate tool names.
 
 ### Persistent runtime checkpoint
 

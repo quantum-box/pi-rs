@@ -1,5 +1,8 @@
 //! Pi-style tool-set factories for embedded hosts.
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use pi_rs::{Error, Extension, Result, Tool};
 
@@ -180,4 +183,53 @@ pub fn read_only_tools_from(source: &CodingTools) -> Result<CodingToolSet> {
         "pi-read-only-tools",
         &["read", "grep", "find", "ls"],
     )
+}
+
+/// Build all read-only tools from the same remote backend allocation and path namespace.
+/// The backend enforces access control and implements search semantics. `remote_home`
+/// must be absolute when set; without it, home-relative paths are rejected.
+pub fn create_remote_read_only_tools<B>(
+    cwd: &Path,
+    backend: Arc<B>,
+    remote_home: Option<PathBuf>,
+) -> Result<CodingToolSet>
+where
+    B: crate::coding::ReadOperations
+        + pi_rs_remote_find::FindOperations
+        + pi_rs_remote_grep::GrepOperations
+        + pi_rs_remote_ls::LsOperations
+        + 'static,
+{
+    let tools = vec![
+        crate::coding::create_read_tool_with_options(
+            cwd,
+            backend.clone(),
+            crate::coding::RemotePathOptions {
+                remote_home: remote_home.clone(),
+            },
+        )?,
+        pi_rs_remote_grep::create_grep_tool_with_options(
+            cwd,
+            backend.clone(),
+            pi_rs_remote_grep::GrepToolOptions {
+                remote_home: remote_home.clone(),
+            },
+        )?,
+        pi_rs_remote_find::create_find_tool_with_options(
+            cwd,
+            backend.clone(),
+            pi_rs_remote_find::FindToolOptions {
+                remote_home: remote_home.clone(),
+            },
+        )?,
+        pi_rs_remote_ls::create_ls_tool_with_options(
+            cwd,
+            backend,
+            pi_rs_remote_ls::LsToolOptions { remote_home },
+        )?,
+    ];
+    Ok(CodingToolSet {
+        id: "pi-remote-read-only-tools",
+        tools,
+    })
 }
