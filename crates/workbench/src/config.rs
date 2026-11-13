@@ -611,7 +611,13 @@ pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
 pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     match std::fs::read(path) {
         Ok(bytes) => {
-            let value: Value = serde_json::from_slice(&bytes)
+            // Pi accepts a UTF-8 BOM in MCP configuration when loading and editing it.
+            let input = if path.file_name().is_some_and(|name| name == "mcp.json") {
+                bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)
+            } else {
+                &bytes
+            };
+            let value: Value = serde_json::from_slice(input)
                 .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
             if !value.is_object() {
                 return Err(Error::Config(format!(
@@ -684,6 +690,17 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bom_handling_is_limited_to_mcp_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let mcp = directory.path().join("mcp.json");
+        let other = directory.path().join("settings.json");
+        for path in [&mcp, &other] {
+            std::fs::write(path, "\u{feff}{\"keep\":true}").unwrap();
+        }
+        assert_eq!(super::read_object(&mcp).unwrap()["keep"], true);
+        assert!(super::read_object(&other).is_err());
+    }
     #[tokio::test]
     async fn auth_read_waits_asynchronously_until_lock_is_released() {
         let dir = tempfile::tempdir().unwrap();
