@@ -513,7 +513,9 @@ impl Session {
     /// Hold an exclusive OS lock for the lifetime of the session.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut session = Self::with_store(FileStore::open(path.as_ref())?)?;
-        session.recover_tree_trigger_handoff()?;
+        if session.host_binding().is_none() {
+            session.recover_tree_trigger_handoff()?;
+        }
         Ok(session)
     }
 
@@ -2972,6 +2974,55 @@ mod session_metadata_tests {
         assert!(error.to_string().contains("requires provider provider-a"));
         assert_eq!(session.head(), before);
         assert_eq!(session.pending_custom_trigger(), Some(trigger));
+    }
+
+    #[test]
+    fn opening_a_host_bound_journal_does_not_repair_its_handoff_without_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed-handoff.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session.bind_host("tenant").unwrap();
+        session
+            .append_user_with_images("A".into(), vec![], None)
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        let message = crate::CustomMessage {
+            custom_type: "tree".into(),
+            content: crate::ContextContent::Text("trigger".into()),
+            display: false,
+            details: None,
+        };
+        session
+            .append(Event::TreeMessageQueued {
+                input: crate::QueuedCustomMessage {
+                    id: run_id,
+                    message,
+                    delivery: crate::CustomMessageDelivery::TriggerTurn,
+                },
+            })
+            .unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: None,
+            })
+            .unwrap();
+        session.set_run_id(None);
+        session.checkout(2).unwrap();
+        session
+            .append_user_with_images("B".into(), vec![], None)
+            .unwrap();
+        let branch_b = session.head();
+        session.begin_tree_trigger_handoff(run_id).unwrap().unwrap();
+        let temporary_head = session.head();
+        let count = session.records().len();
+        drop(session);
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.head(), temporary_head);
+        assert_eq!(reopened.records().len(), count);
+        reopened.recover_tree_trigger_handoff().unwrap().unwrap();
+        assert_eq!(reopened.head(), branch_b);
     }
 
     #[test]
