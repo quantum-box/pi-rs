@@ -638,16 +638,23 @@ Embedded hosts can use `coding_factories::create_coding_tools` and
 without registering every built-in tool. The factories use the unrestricted
 local profile. The corresponding `coding_tools_from` and `read_only_tools_from`
 functions select from a host-configured `CodingTools`, preserving its file-tool
-scope and options. The coding set's shell runs with the host process's permissions
-and is not sandboxed, including with a scoped file profile; hosts must apply their
-own shell policy. For injected file operations, `injected_file_tools_from` yields
+scope and options. A local coding set's shell runs with the host process's
+permissions and is not sandboxed, including with a scoped file profile; hosts must
+apply their own shell policy. For injected file operations, `injected_file_tools_from` yields
 read, edit and write without a shell. It requires all three operations to use
 the same backend `Arc`, which also lets injected edit and write share their
 mutation lock. Hosts must ensure the backend enforces the intended access policy.
+`coding_tools_from` accepts an injected shell only when read, write, edit and
+non-local bash use the same backend `Arc`; hosts must ensure that all four
+operations actually target the same environment and enforce its access policy.
+For a working directory that exists only on the backend,
+`create_remote_coding_tools` builds the set without looking up or canonicalizing
+the directory on the host. Its path options configure the backend home for `~`;
+without a configured home, home-relative file paths fail. Its read and shell
+tools share a host-side transcript capability, as in the standalone factories.
 `coding_tools_from_with_local_shell` explicitly adds a host-local, unsandboxed
-shell to that set; `coding_tools_from` rejects custom file operations so this
-choice cannot happen implicitly. Partial or independently allocated injected
-backends are rejected. The read-only set rejects custom read operations because
+shell to injected file tools and rejects a separately injected shell. Partial or
+independently allocated injected backends are rejected. The read-only set rejects custom read operations because
 grep, find and ls still access the local filesystem. A set is an `Extension` and
 can be registered directly with `Registry`; overlapping sets have duplicate tool names.
 
