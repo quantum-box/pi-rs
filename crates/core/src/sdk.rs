@@ -799,14 +799,9 @@ impl AgentSession {
         options: crate::TreeNavigationOptions<'_>,
     ) -> Result<TreeNavigationResult> {
         self.start().await?;
-        let first_record = self
-            .session
-            .try_lock()
-            .expect("session journal is in use")
-            .records()
-            .len();
+        let mut journal = self.session.lock().await;
+        let first_record = journal.records().len();
         let editor_text = {
-            let journal = self.journal();
             journal
                 .records()
                 .iter()
@@ -832,7 +827,7 @@ impl AgentSession {
         };
         let result = agent
             .navigate_tree_with_options(
-                &mut *self.session.try_lock().expect("session journal is in use"),
+                &mut *journal,
                 selected,
                 options,
                 &active.token,
@@ -840,35 +835,25 @@ impl AgentSession {
             )
             .await;
         if result.is_ok() {
-            self.refresh_input_hooks();
-            if let Some((model, _)) = self
-                .session
-                .try_lock()
-                .expect("session journal is in use")
-                .model_selection()
-            {
+            *self.control.input_hooks.lock().expect("SDK input hooks") =
+                InputHooks::new(&self.registry, &journal);
+            if let Some((model, _)) = journal.model_selection() {
                 self.model_name = model;
             }
         }
-        let final_inputs = active.finish_inputs(
-            &mut *self.session.try_lock().expect("session journal is in use"),
-            &mut self.input,
-            &mut observer,
-        );
+        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observer);
         let result = result.and(final_inputs);
         if let Err(error) = result {
+            drop(journal);
             let _ = self.drain_idle_triggers().await;
             return Err(error);
         }
-        let summary_entry = self
-            .session
-            .try_lock()
-            .expect("session journal is in use")
-            .records()[first_record..]
+        let summary_entry = journal.records()[first_record..]
             .iter()
             .find(|record| matches!(record.event, crate::Event::BranchSummary { .. }))
             .cloned()
             .map(Box::new);
+        drop(journal);
         let _ = self.drain_idle_triggers().await?;
         Ok(TreeNavigationResult {
             editor_text,
@@ -931,12 +916,8 @@ impl AgentSession {
     }
 
     async fn drain_idle_triggers(&mut self) -> Result<Option<String>> {
-        let Some(trigger_id) = self
-            .session
-            .try_lock()
-            .expect("session journal is in use")
-            .pending_custom_trigger()
-        else {
+        let mut journal = self.session.lock().await;
+        let Some(trigger_id) = journal.pending_custom_trigger() else {
             return Ok(None);
         };
         let active = self.begin_run();
@@ -954,7 +935,7 @@ impl AgentSession {
         };
         let result = agent
             .run_correlated(
-                &mut *self.session.try_lock().expect("session journal is in use"),
+                &mut *journal,
                 trigger_id,
                 None,
                 &mut self.input,
@@ -962,11 +943,7 @@ impl AgentSession {
                 &mut observe,
             )
             .await;
-        let final_inputs = active.finish_inputs(
-            &mut *self.session.try_lock().expect("session journal is in use"),
-            &mut self.input,
-            &mut observe,
-        );
+        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observe);
         let answer = result?;
         final_inputs?;
         Ok(Some(answer))
@@ -1406,6 +1383,7 @@ impl AgentSession {
     /// Compact a supplied summary while servicing asynchronous extension host calls.
     pub async fn compact_with_hooks(&mut self, compaction: Compaction) -> Result<()> {
         self.start().await?;
+        let mut journal = self.session.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let agent = Agent {
@@ -1421,19 +1399,16 @@ impl AgentSession {
         };
         let result = agent
             .compact_with_host_and_inputs(
-                &mut *self.session.try_lock().expect("session journal is in use"),
+                &mut *journal,
                 compaction,
                 &active.token,
                 &mut observer,
                 &mut self.input,
             )
             .await;
-        let final_inputs = active.finish_inputs(
-            &mut *self.session.try_lock().expect("session journal is in use"),
-            &mut self.input,
-            &mut observer,
-        );
+        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observer);
         let result = result.and(final_inputs);
+        drop(journal);
         let triggered = self.drain_idle_triggers().await.map(|_| ());
         result.and(triggered)
     }
@@ -1460,6 +1435,7 @@ impl AgentSession {
         instructions: Option<&str>,
     ) -> Result<()> {
         self.start().await?;
+        let mut journal = self.session.lock().await;
         let active = self.begin_run();
         let events = self.events.as_ref().expect("open session").clone();
         let agent = Agent {
@@ -1477,7 +1453,7 @@ impl AgentSession {
             Some(keep_turns) => {
                 agent
                     .summarize_with_instructions(
-                        &mut *self.session.try_lock().expect("session journal is in use"),
+                        &mut *journal,
                         keep_turns,
                         &active.token,
                         &mut observer,
@@ -1489,7 +1465,7 @@ impl AgentSession {
             None => {
                 agent
                     .summarize_configured(
-                        &mut *self.session.try_lock().expect("session journal is in use"),
+                        &mut *journal,
                         &active.token,
                         &mut observer,
                         Some(&mut self.input),
@@ -1498,12 +1474,9 @@ impl AgentSession {
                     .await
             }
         };
-        let final_inputs = active.finish_inputs(
-            &mut *self.session.try_lock().expect("session journal is in use"),
-            &mut self.input,
-            &mut observer,
-        );
+        let final_inputs = active.finish_inputs(&mut *journal, &mut self.input, &mut observer);
         let result = result.and(final_inputs);
+        drop(journal);
         let triggered = self.drain_idle_triggers().await.map(|_| ());
         result.and(triggered)
     }
