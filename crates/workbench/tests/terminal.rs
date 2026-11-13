@@ -1567,15 +1567,16 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         let mut started = [0];
         gate.read_exact(&mut started).unwrap();
         assert_eq!(&started, b"S");
-        // Request the second model selection while the first callback is held.
-        master.write_all(b"\r").unwrap();
+        // Queue the complete second selection while the first callback is held.
+        master.write_all(b"\rClear\r").unwrap();
         assert!(!home.join("events.jsonl").exists());
+        assert_eq!(
+            read_settings()["modelThinkingLevels"]["ollama/fixture-model"],
+            "high"
+        );
         gate.write_all(b"G").unwrap();
-        output_until(&mut master, |text| {
-            text.contains("Clear override · use default")
-        });
     }
-    let notifications = wait_notifications(&mut master, 1);
+    let notifications = wait_notifications(&mut master, if delayed { 2 } else { 1 });
     assert_eq!(
         notifications[0],
         serde_json::json!({"type":"thinking_level_select", "level":"high", "previousLevel":"low"})
@@ -1601,9 +1602,9 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         output_until(&mut master, |text| {
             text.contains("Clear override · use default")
         });
+        master.write_all(b"Clear\r").unwrap();
+        output_until(&mut master, |text| text.contains("Thinking: select model"));
     }
-    master.write_all(b"Clear\r").unwrap();
-    output_until(&mut master, |text| text.contains("Thinking: select model"));
     if model_fallback {
         assert_eq!(
             read_settings()["modelThinkingLevels"],
