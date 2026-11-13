@@ -428,6 +428,8 @@ impl<T: Read + Seek + Send> ReadSeek for T {}
 
 #[async_trait::async_trait]
 pub trait ReadOperations: Send + Sync {
+    /// Return `Error::Io` with `NotFound` to allow filename fallback probing.
+    /// Other errors stop resolution immediately.
     async fn access(&self, path: &Path) -> Result<()>;
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
     /// Optionally provide a seekable reader so large files need not be buffered
@@ -445,26 +447,53 @@ pub trait ReadOperations: Send + Sync {
 /// Local implementation of the read operations interface.
 pub struct LocalReadOperations;
 
+// Inspect before and after opening, and use nonblocking open on Unix so a
+// replacement with a FIFO cannot strand a worker between those checks.
+fn open_regular_file(path: &Path) -> Result<std::fs::File> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    Ok(file)
+}
+async fn open_local_read_file(path: &Path) -> Result<std::fs::File> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || open_regular_file(&path))
+        .await
+        .map_err(|error| Error::Config(error.to_string()))?
+}
 #[async_trait::async_trait]
 impl ReadOperations for LocalReadOperations {
     async fn access(&self, path: &Path) -> Result<()> {
-        let file = tokio::fs::File::open(path).await?;
-        if !file.metadata().await?.is_file() {
-            return Err(Error::Config("expected a regular file".into()));
-        }
+        open_local_read_file(path).await?;
         Ok(())
     }
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
-        Ok(tokio::fs::read(path).await?)
+        let file = open_local_read_file(path).await?;
+        let mut file = tokio::fs::File::from_std(file);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await?;
+        Ok(bytes)
     }
     async fn open_file(&self, path: &Path) -> Result<Option<Box<dyn ReadSeek>>> {
-        let file = tokio::fs::File::open(path).await?.into_std().await;
-        Ok(Some(Box::new(file)))
+        Ok(Some(Box::new(open_local_read_file(path).await?)))
     }
     async fn detect_image_mime_type(&self, path: &Path) -> Result<Option<String>> {
         let path = path.to_owned();
         tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-            let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+            let file = open_regular_file(&path)?;
+            let reader =
+                image::ImageReader::new(std::io::BufReader::new(file)).with_guessed_format()?;
             Ok(reader
                 .format()
                 .map(|format| format.to_mime_type().to_owned()))
@@ -548,8 +577,22 @@ impl Tool for RemoteReadTool {
         let operation = async {
             let name = string(&args, "path")?.to_owned();
             let input = crate::coding_paths::normalize(&name)?;
-            let path = crate::coding_paths::resolve(&self.tool.root, &input);
-            self.operations.access(&path).await?;
+            let requested = crate::coding_paths::resolve(&self.tool.root, &input);
+            let mut candidates = crate::coding_paths::read_candidates(&requested).into_iter();
+            let mut path = candidates.next().expect("exact candidate");
+            loop {
+                match self.operations.access(&path).await {
+                    Ok(()) => break,
+                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(next) = candidates.next() {
+                            path = next;
+                        } else {
+                            return Err(Error::Io(error));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let mime = self.operations.detect_image_mime_type(&path).await?;
             let source: Box<dyn ReadSeek> = match self.operations.open_file(&path).await? {
                 Some(reader) => reader,
@@ -566,7 +609,7 @@ impl Tool for RemoteReadTool {
                     let format = image::ImageFormat::from_mime_type(&mime)
                         .ok_or_else(|| Error::Config(format!("unsupported image MIME type: {mime}")))?;
                     let reader = image::ImageReader::with_format(std::io::BufReader::new(source), format);
-                    let mut data = tool.process_image(&path, reader, format)?;
+                    let mut data = tool.process_image(&path, reader, format, Some(&token))?;
                     if matches!(tool.kind, Kind::Read { model_supports_images: Some(false), .. })
                         && let Some(note) = data["content"][0]["text"].as_str() {
                         data["content"][0]["text"] = json!(format!("{note}\n[Current model does not support images. The image will be omitted from this request.]"));
@@ -948,7 +991,7 @@ impl CodingTool {
         if path.metadata()?.len() > 20 * 1024 * 1024 {
             return Err(Error::Config("image exceeds 20 MiB".into()));
         }
-        self.process_image(path, reader, format).map(Some)
+        self.process_image(path, reader, format, None).map(Some)
     }
 
     fn process_image<R: std::io::BufRead + std::io::Seek>(
@@ -956,7 +999,9 @@ impl CodingTool {
         path: &Path,
         reader: image::ImageReader<R>,
         format: image::ImageFormat,
+        cancellation: Option<&pi_rs::CancellationToken>,
     ) -> Result<Value> {
+        crate::image_profile::check_cancelled(cancellation)?;
         if self.unrestricted
             && let Kind::Read {
                 auto_resize: true,
@@ -965,7 +1010,12 @@ impl CodingTool {
             } = self.kind
         {
             let original_mime = format.to_mime_type();
-            let prepared = crate::image_profile::normalize(reader, profile.unwrap_or_default())?;
+            let prepared = crate::image_profile::normalize_cancellable(
+                reader,
+                profile.unwrap_or_default(),
+                cancellation,
+            )?;
+            crate::image_profile::check_cancelled(cancellation)?;
             let mut note = format!("Read image file [{}]", prepared.mime_type);
             if !matches!(
                 original_mime,
@@ -1013,6 +1063,7 @@ impl CodingTool {
                 .into_inner()
                 .take((MAX_ORIGINAL_IMAGE_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)?;
+            crate::image_profile::check_cancelled(cancellation)?;
             if bytes.len() > MAX_ORIGINAL_IMAGE_BYTES {
                 return Err(Error::Config(
                     "image exceeds the 6 MiB original image limit".into(),
@@ -1021,13 +1072,15 @@ impl CodingTool {
             let dimensions = image::ImageReader::with_format(Cursor::new(&bytes), format)
                 .into_dimensions()
                 .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
+            crate::image_profile::check_cancelled(cancellation)?;
             (bytes, mime_type, dimensions, dimensions)
         } else if let Kind::Read {
             profile: Some(profile),
             ..
         } = self.kind
         {
-            let prepared = crate::image_profile::normalize(reader, profile)?;
+            let prepared =
+                crate::image_profile::normalize_cancellable(reader, profile, cancellation)?;
             (
                 prepared.bytes,
                 prepared.mime_type,
@@ -1043,6 +1096,7 @@ impl CodingTool {
                 (prepared.width, prepared.height),
             )
         };
+        crate::image_profile::check_cancelled(cancellation)?;
         let note = if self.unrestricted {
             format!("Read image file [{mime_type}]")
         } else {

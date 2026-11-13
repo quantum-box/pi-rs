@@ -350,3 +350,118 @@ async fn cancelling_image_stops_subsequent_stream_reads() {
         .expect("blocking reader must be dropped after its current read");
     assert_eq!(state.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_adapter_rejects_fifo_and_file_replaced_by_fifo() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("pipe");
+    std::fs::write(&path, "regular").unwrap();
+    let ops = pi_rs_workbench::coding::LocalReadOperations;
+    ops.access(&path).await.unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let check = async {
+        assert!(ops.access(&path).await.is_err());
+        assert!(ops.open_file(&path).await.is_err());
+        assert!(ops.detect_image_mime_type(&path).await.is_err());
+        assert!(ops.read_file(&path).await.is_err());
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), check)
+        .await
+        .expect("FIFO must not block adapter");
+}
+
+struct VariantBackend {
+    files: Vec<PathBuf>,
+    calls: Mutex<Vec<PathBuf>>,
+    deny: bool,
+}
+#[async_trait::async_trait]
+impl ReadOperations for VariantBackend {
+    async fn access(&self, path: &Path) -> Result<()> {
+        self.calls.lock().unwrap().push(path.into());
+        if self.deny {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into());
+        }
+        if self.files.iter().any(|file| file == path) {
+            Ok(())
+        } else {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+        }
+    }
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        Ok(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes()
+            .to_vec())
+    }
+}
+#[tokio::test]
+async fn backend_filename_variants_use_exact_priority_and_stop_on_denial() {
+    let root = tempfile::tempdir().unwrap();
+    for (requested, actual) in [
+        ("Capture d'écran.txt", "Capture d’e\u{301}cran.txt"),
+        ("Screen 12.00 PM.png", "Screen 12.00\u{202f}PM.png"),
+    ] {
+        let backend = Arc::new(VariantBackend {
+            files: vec![root.path().join(actual)],
+            calls: Mutex::new(vec![]),
+            deny: false,
+        });
+        let tool = create_read_tool(root.path(), backend.clone()).unwrap();
+        let result = tool
+            .invoke(
+                json!({"path":requested}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Outcome::Succeeded(text) if text == actual));
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.first().unwrap(), &root.path().join(requested));
+        assert_eq!(calls.last().unwrap(), &root.path().join(actual));
+    }
+    let requested = "d'ecran.txt";
+    let backend = Arc::new(VariantBackend {
+        files: vec![root.path().join(requested), root.path().join("d’ecran.txt")],
+        calls: Mutex::new(vec![]),
+        deny: false,
+    });
+    let tool = create_read_tool(root.path(), backend.clone()).unwrap();
+    let result = tool
+        .invoke(
+            json!({"path":requested}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: CancellationToken::new(),
+            },
+        )
+        .await;
+    assert!(matches!(result, Outcome::Succeeded(text) if text == requested));
+    assert_eq!(backend.calls.lock().unwrap().len(), 1);
+    let denied = Arc::new(VariantBackend {
+        files: vec![],
+        calls: Mutex::new(vec![]),
+        deny: true,
+    });
+    let tool = create_read_tool(root.path(), denied.clone()).unwrap();
+    assert!(matches!(
+        tool.invoke(
+            json!({"path":requested}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: CancellationToken::new()
+            }
+        )
+        .await,
+        Outcome::Failed(_)
+    ));
+    assert_eq!(denied.calls.lock().unwrap().len(), 1);
+}

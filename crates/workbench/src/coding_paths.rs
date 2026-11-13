@@ -73,14 +73,12 @@ pub(super) fn resolve(root: &Path, input: &Path) -> PathBuf {
     resolved
 }
 
-pub(super) fn read_variant(path: PathBuf) -> PathBuf {
-    if path.exists() {
-        return path;
-    }
+pub(super) fn read_candidates(path: &Path) -> Vec<PathBuf> {
     let value = path.to_string_lossy();
     static AM_PM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let am_pm = AM_PM.get_or_init(|| regex::Regex::new(r" (?i:(AM|PM))\.").expect("AM/PM pattern"));
     let decomposed: String = value.nfd().collect();
+    let mut candidates = vec![path.to_owned()];
     for candidate in [
         am_pm.replace_all(&value, "\u{202f}$1.").into_owned(),
         decomposed.clone(),
@@ -88,11 +86,18 @@ pub(super) fn read_variant(path: PathBuf) -> PathBuf {
         decomposed.replace('\'', "\u{2019}"),
     ] {
         let candidate = PathBuf::from(candidate);
-        if candidate.exists() {
-            return candidate;
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
         }
     }
-    path
+    candidates
+}
+
+pub(super) fn read_variant(path: PathBuf) -> PathBuf {
+    read_candidates(&path)
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .unwrap_or(path)
 }
 
 #[cfg(any(windows, test))]
