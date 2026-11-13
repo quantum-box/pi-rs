@@ -1,7 +1,7 @@
 use aws_smithy_eventstream::frame::write_message_to;
 use aws_smithy_types::event_stream::{Header, HeaderValue, Message as Frame};
 use futures_util::StreamExt;
-use pi_rs_bedrock::Bedrock;
+use pi_rs_bedrock::{Bedrock, ThinkingBudgets, ThinkingDisplay};
 use pi_rs_core::{CacheRetention, Message, Model, ModelEvent, ModelRequest, ToolSpec};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -144,6 +144,133 @@ async fn budgeted_claude_fits_host_limit_and_adds_short_checkpoints() {
     );
     assert_eq!(body["toolConfig"]["tools"].as_array().unwrap().len(), 1);
     assert!(events.iter().any(|e|matches!(e,ModelEvent::Metadata(m) if m.cache_write_1h_tokens==Some(3) && m.cache_creation_input_tokens==Some(5))));
+}
+
+#[tokio::test]
+async fn custom_budgets_display_and_interleaved_follow_claude_mode() {
+    let budgets = ThinkingBudgets {
+        low: Some(1500),
+        high: Some(6000),
+        ..Default::default()
+    };
+    for (level, max, expected) in [
+        ("low", 4096, 1500),
+        ("xhigh", 4096, 3072),
+        ("max", 10000, 6000),
+    ] {
+        let (body, _) = capture(
+            "us-east-1",
+            |c| {
+                c.with_thinking_budgets(budgets.clone())
+                    .with_thinking_display(ThinkingDisplay::Omitted)
+                    .with_interleaved_thinking(false)
+                    .with_reasoning(Some(level), None)
+                    .unwrap()
+            },
+            request("anthropic.claude-sonnet-4-5", max),
+            false,
+        )
+        .await;
+        assert_eq!(body["inferenceConfig"]["maxTokens"], max);
+        assert_eq!(
+            body["additionalModelRequestFields"],
+            json!({"thinking":{"type":"enabled","budget_tokens":expected,"display":"omitted"}})
+        );
+    }
+    let (adaptive, _) = capture(
+        "us-east-1",
+        |c| {
+            c.with_thinking_budgets(budgets)
+                .with_thinking_display(ThinkingDisplay::Omitted)
+                .with_interleaved_thinking(false)
+                .with_reasoning(Some("medium"), None)
+                .unwrap()
+        },
+        request("anthropic.claude-sonnet-4-6", 512),
+        false,
+    )
+    .await;
+    assert_eq!(
+        adaptive["additionalModelRequestFields"],
+        json!({"thinking":{"type":"adaptive","display":"omitted"},"output_config":{"effort":"medium"}})
+    );
+    let (gov, _) = capture(
+        "us-gov-west-1",
+        |c| {
+            c.with_thinking_display(ThinkingDisplay::Omitted)
+                .with_interleaved_thinking(false)
+                .with_reasoning(Some("low"), None)
+                .unwrap()
+        },
+        request("anthropic.claude-sonnet-4-5", 4096),
+        false,
+    )
+    .await;
+    assert_eq!(
+        gov["additionalModelRequestFields"],
+        json!({"thinking":{"type":"enabled","budget_tokens":2048}})
+    );
+}
+
+#[tokio::test]
+async fn custom_budget_validation_only_applies_to_selected_level() {
+    let budgets = json!({"low":1500.0,"high":0});
+    for (model, level, summary, max) in [
+        ("anthropic.claude-sonnet-4-5", Some("low"), false, 4096),
+        ("anthropic.claude-sonnet-4-6", Some("high"), false, 512),
+        ("openai.gpt-5", Some("high"), false, 512),
+        ("anthropic.claude-sonnet-4-5", Some("off"), false, 512),
+        ("anthropic.claude-sonnet-4-5", Some("high"), true, 512),
+    ] {
+        let (body, _) = capture(
+            "us-east-1",
+            |c| {
+                c.with_thinking_budget_settings(budgets.clone())
+                    .with_reasoning(level, None)
+                    .unwrap()
+            },
+            request(model, max),
+            summary,
+        )
+        .await;
+        if level == Some("low") {
+            assert_eq!(
+                body["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+                1500
+            );
+        }
+    }
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version_latest()
+        .region(aws_sdk_bedrockruntime::config::Region::new("us-east-1"))
+        .credentials_provider(aws_credential_types::Credentials::new(
+            "test", "secret", None, None, "test",
+        ))
+        .endpoint_url("http://127.0.0.1:1")
+        .build();
+    for value in [
+        json!([]),
+        json!({"high":1023}),
+        json!({"high":1024.5}),
+        json!({"high":null}),
+        json!({"high":4294967296_u64}),
+    ] {
+        let client = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config.clone()))
+            .with_thinking_budget_settings(value.clone())
+            .with_reasoning(Some("max"), None)
+            .unwrap();
+        let error = match client
+            .stream(request("anthropic.claude-sonnet-4-5", 8192))
+            .await
+        {
+            Ok(_) => panic!("accepted {value}"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(error, pi_rs_core::Error::Config(_)),
+            "{value}: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -363,8 +490,18 @@ async fn required_thinking_models_keep_default_and_use_low_effort_for_summaries(
             false,
         )
         .await;
+        assert_eq!(
+            normal["additionalModelRequestFields"]["thinking"]["type"], "adaptive",
+            "{model}"
+        );
+        assert_eq!(
+            normal["additionalModelRequestFields"]["thinking"]["display"], "summarized",
+            "{model}"
+        );
         assert!(
-            normal.get("additionalModelRequestFields").is_none(),
+            normal["additionalModelRequestFields"]
+                .get("output_config")
+                .is_none(),
             "{model}"
         );
         let (summary, _) = capture(
@@ -392,6 +529,24 @@ async fn required_thinking_models_keep_default_and_use_low_effort_for_summaries(
                 .iter()
                 .any(|level| level == "off"),
             "{model}"
+        );
+    }
+    for (region, display) in [("us-east-1", Some("omitted")), ("us-gov-west-1", None)] {
+        let (body, _) = capture(
+            region,
+            |c| c.with_thinking_display(ThinkingDisplay::Omitted),
+            request("anthropic.claude-opus-5-5", 512),
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["display"].as_str(),
+            display
+        );
+        assert!(
+            body["additionalModelRequestFields"]
+                .get("output_config")
+                .is_none()
         );
     }
 }

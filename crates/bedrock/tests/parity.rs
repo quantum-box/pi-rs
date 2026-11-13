@@ -3,7 +3,10 @@ use aws_smithy_types::event_stream::{Header, HeaderValue, Message as Frame};
 use base64::Engine;
 use futures_util::StreamExt;
 use pi_rs_bedrock::Bedrock;
-use pi_rs_core::{ImageContent, Message, Model, ModelEvent, ModelRequest};
+use pi_rs_core::{
+    Event, ImageContent, MemoryStore, Message, Model, ModelEvent, ModelRequest, Record, Session,
+    UsageReport,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const PROFILE_ARN: &str =
@@ -80,6 +83,10 @@ async fn bearer_images_and_reasoning_replay_round_trip() {
                 );
                 assert_eq!(blocks[1]["text"], "answer");
                 assert_eq!(blocks[2]["reasoningContent"]["redactedContent"], "AQIDBA==");
+                assert_eq!(
+                    blocks[3]["reasoningContent"]["reasoningText"],
+                    json!({"text":"", "signature":"omitted-sig"})
+                );
             }
             let frames=if round==0 { vec![
                 event("messageStart",json!({"role":"assistant"})),
@@ -92,6 +99,8 @@ async fn bearer_images_and_reasoning_replay_round_trip() {
                 event("contentBlockDelta",json!({"contentBlockIndex":2,"delta":{"reasoningContent":{"redactedContent":"AQI="}}})),
                 event("contentBlockDelta",json!({"contentBlockIndex":2,"delta":{"reasoningContent":{"redactedContent":"AwQ="}}})),
                 event("contentBlockStop",json!({"contentBlockIndex":2})),
+                event("contentBlockDelta",json!({"contentBlockIndex":3,"delta":{"reasoningContent":{"signature":"omitted-sig"}}})),
+                event("contentBlockStop",json!({"contentBlockIndex":3})),
                 event("messageStop",json!({"stopReason":"end_turn"})),
             ] } else {vec![event("messageStop",json!({"stopReason":"end_turn"}))]}.concat();
             socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/vnd.amazon.eventstream\r\ncontent-length: {}\r\n\r\n",frames.len()).as_bytes()).await.unwrap();
@@ -142,18 +151,56 @@ async fn bearer_images_and_reasoning_replay_round_trip() {
             .iter()
             .any(|e| matches!(e,ModelEvent::Reasoning(text) if text=="think"))
     );
-    let replay = events
+    let metadata = events
         .into_iter()
         .find_map(|event| match event {
-            ModelEvent::Metadata(m) => m.replay,
+            ModelEvent::Metadata(m) => Some(m),
             _ => None,
         })
         .unwrap();
-    let assistant = Message::Assistant {
-        content: "answer".into(),
-        calls: vec![],
-        replay: Some(replay),
-    };
+    let session = Session::with_store(MemoryStore::default()).unwrap();
+    let request_id = uuid::Uuid::new_v4();
+    let mut records = session.records().to_vec();
+    let version = records[0].version;
+    records.push(Record {
+        version,
+        id: 2,
+        parent: Some(1),
+        timestamp: None,
+        run_id: None,
+        event: Event::ModelFinished {
+            request_id,
+            metadata,
+            usage: UsageReport::Unconfirmed,
+            failure: None,
+            partial: String::new(),
+            reply: None,
+        },
+    });
+    records.push(Record {
+        version,
+        id: 3,
+        parent: Some(2),
+        timestamp: None,
+        run_id: None,
+        event: Event::Assistant {
+            content: "answer".into(),
+            invocations: vec![],
+            usage: None,
+            request_id: Some(request_id),
+        },
+    });
+    let mut session = Session::from_records(records).unwrap();
+    let edited = serde_json::from_value(json!([
+        {"type":"thinking","thinking":"think","thinkingSignature":"sig-nature"},
+        {"type":"text","text":"answer"},
+        {"type":"thinking","thinking":"","thinkingSignature":"AQIDBA==","redacted":true},
+        {"type":"thinking","thinking":"","thinkingSignature":"omitted-sig"}
+    ]))
+    .unwrap();
+    session.edit_context(3, Some(edited)).unwrap();
+    let reopened = Session::from_records(session.fork_records(session.head()).unwrap()).unwrap();
+    let assistant = reopened.current_messages().into_iter().next().unwrap();
     let events = model
         .stream(request(vec![
             user,

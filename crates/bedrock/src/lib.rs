@@ -10,7 +10,9 @@ use aws_sdk_bedrockruntime::{
 use aws_smithy_types::{Blob, Document, Number};
 use aws_types::request_id::RequestId;
 use base64::Engine;
-pub use options::{ReasoningLevel, requires_thinking, thinking_levels};
+pub use options::{
+    ReasoningLevel, ThinkingBudgets, ThinkingDisplay, requires_thinking, thinking_levels,
+};
 use pi_rs_core::{
     CacheRetention, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
     ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
@@ -30,6 +32,10 @@ pub struct Bedrock {
     environment_config: bool,
     reasoning: Option<ReasoningLevel>,
     mapped_effort: Option<String>,
+    thinking_budgets: ThinkingBudgets,
+    configured_thinking_budgets: Option<Value>,
+    thinking_display: ThinkingDisplay,
+    interleaved_thinking: bool,
     cache_retention: CacheRetention,
     long_cache_support: Option<bool>,
     force_cache: bool,
@@ -48,6 +54,10 @@ impl Bedrock {
             environment_config: true,
             reasoning: None,
             mapped_effort: None,
+            thinking_budgets: ThinkingBudgets::default(),
+            configured_thinking_budgets: None,
+            thinking_display: ThinkingDisplay::default(),
+            interleaved_thinking: true,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -66,6 +76,10 @@ impl Bedrock {
             environment_config: false,
             reasoning: None,
             mapped_effort: None,
+            thinking_budgets: ThinkingBudgets::default(),
+            configured_thinking_budgets: None,
+            thinking_display: ThinkingDisplay::default(),
+            interleaved_thinking: true,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -88,6 +102,10 @@ impl Bedrock {
             environment_config: false,
             reasoning: None,
             mapped_effort: None,
+            thinking_budgets: ThinkingBudgets::default(),
+            configured_thinking_budgets: None,
+            thinking_display: ThinkingDisplay::default(),
+            interleaved_thinking: true,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -213,6 +231,12 @@ impl Bedrock {
             &self.model_name,
             format!("{:?}", self.reasoning),
             &self.mapped_effort,
+            (
+                format!("{:?}", self.thinking_budgets),
+                &self.configured_thinking_budgets,
+                format!("{:?}", self.thinking_display),
+                self.interleaved_thinking,
+            ),
             match self.cache_retention {
                 CacheRetention::None => "none",
                 CacheRetention::Short => "short",
@@ -255,6 +279,31 @@ impl Bedrock {
         self.mapped_effort = mapped_effort.map(str::to_owned);
         self.prepared_identity = None;
         Ok(self)
+    }
+    /// Override per-level budgets for non-adaptive Claude thinking.
+    pub fn with_thinking_budgets(mut self, budgets: ThinkingBudgets) -> Self {
+        self.thinking_budgets = budgets;
+        self.configured_thinking_budgets = None;
+        self.prepared_identity = None;
+        self
+    }
+    /// Set Pi's raw budget settings; only the budget used by a request is validated.
+    pub fn with_thinking_budget_settings(mut self, settings: Value) -> Self {
+        self.configured_thinking_budgets = Some(settings);
+        self.prepared_identity = None;
+        self
+    }
+    /// Control whether Claude returns readable reasoning text.
+    pub fn with_thinking_display(mut self, display: ThinkingDisplay) -> Self {
+        self.thinking_display = display;
+        self.prepared_identity = None;
+        self
+    }
+    /// Control Pi's interleaved-thinking beta for budgeted Claude requests.
+    pub fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
+        self.interleaved_thinking = enabled;
+        self.prepared_identity = None;
+        self
     }
     /// Set explicit cache retention. Use `None` for compaction and other one-off requests.
     pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
@@ -494,7 +543,7 @@ fn replay_blocks(
                 } else {
                     let text = b["text"].as_str()?;
                     let signature = b["signature"].as_str().filter(|s| !s.is_empty());
-                    if text.is_empty() {
+                    if text.is_empty() && (!is_claude || signature.is_none()) {
                         return None;
                     }
                     if is_claude && signature.is_none() {
@@ -957,8 +1006,14 @@ impl Model for Bedrock {
             reasoning,
             self.mapped_effort.as_deref(),
             request.max_output_tokens,
-            client.config().region().map(|region| region.as_ref()),
-            tool_free,
+            options::ReasoningContext {
+                region: client.config().region().map(|region| region.as_ref()),
+                tool_free,
+                budgets: &self.thinking_budgets,
+                configured_budgets: self.configured_thinking_budgets.as_ref(),
+                display: self.thinking_display,
+                interleaved: self.interleaved_thinking,
+            },
         )?;
         let requested_model = request.model.clone();
         let mut command = client
@@ -1059,6 +1114,32 @@ impl Model for Bedrock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn omitted_thinking_replays_empty_text_with_signature() {
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "amazon-bedrock".into(),
+                model: "anthropic.claude-opus-4-8".into(),
+            },
+            blocks: vec![
+                serde_json::json!({"type":"reasoning", "text":"", "signature":"signed"}),
+                serde_json::json!({"type":"text", "text":"answer"}),
+            ],
+        };
+        let blocks = replay_blocks(
+            &replay,
+            "anthropic.claude-opus-4-8",
+            true,
+            "answer",
+            &[],
+            &mut ToolIds::default(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&blocks[0], ContentBlock::ReasoningContent(types::ReasoningContentBlock::ReasoningText(block)) if block.text() == "" && block.signature() == Some("signed"))
+        );
+        assert!(matches!(&blocks[1], ContentBlock::Text(text) if text == "answer"));
+    }
     #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn environment_auth_produces_a_prepared_identity() {
@@ -1225,6 +1306,14 @@ mod tests {
         let options = [
             base.clone().with_reasoning(Some("high"), None).unwrap(),
             base.clone().with_reasoning(None, Some("high")).unwrap(),
+            base.clone().with_thinking_budgets(ThinkingBudgets {
+                low: Some(1500),
+                ..Default::default()
+            }),
+            base.clone()
+                .with_thinking_budget_settings(serde_json::json!({"low": 1500})),
+            base.clone().with_thinking_display(ThinkingDisplay::Omitted),
+            base.clone().with_interleaved_thinking(false),
             base.clone().with_cache_retention(CacheRetention::None),
             base.clone().with_long_cache_support(Some(false)),
             base.clone().with_force_cache(true),
