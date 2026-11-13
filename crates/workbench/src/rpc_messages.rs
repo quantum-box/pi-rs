@@ -791,10 +791,11 @@ mod tests {
             },
         ] {
             let parent = records.last().unwrap().id;
+            let version = records.last().unwrap().version;
             records.push(Record {
                 id: parent + 1,
                 parent: Some(parent),
-                version: 2,
+                version,
                 timestamp: None,
                 run_id: None,
                 event,
