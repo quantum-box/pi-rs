@@ -12,6 +12,7 @@ async-trait = "0.1"
 base64 = "0.22"
 aws-smithy-runtime-api = "1"
 aws-config = { version = "=1.8.1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
 aws-sdk-bedrockruntime = "=1.124.0"
 aws-smithy-types = "1"
 aws-types = "1"
@@ -22,7 +23,7 @@ tokio = { version = "1", features = ["sync"] }
 uuid = "1"
 
 [dev-dependencies]
-aws-credential-types = "1"
+tempfile = "3"
 aws-smithy-eventstream = "0.60"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt", "net", "io-util", "time"] }

@@ -21,6 +21,59 @@ pub(super) struct WorkbenchModel {
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    async fn prepare_context<'a>(
+        &'a self,
+        request: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        let Some((client, identity)) = self.client.prepare_for_context(&request.model).await?
+        else {
+            return Ok(None);
+        };
+        let identity = identity.and_then(|identity| {
+            pi_rs::fingerprint_model_context(&(
+                "workbench-policy-v2",
+                identity,
+                self.block_images,
+                self.supports_images,
+                self.session_affinity,
+            ))
+        });
+        Ok(Some(std::sync::Arc::new(PreparedWorkbenchModel {
+            inner: WorkbenchModel {
+                client,
+                block_images: self.block_images,
+                supports_images: self.supports_images,
+                session_affinity: self.session_affinity,
+                price: self.price.clone(),
+            },
+            identity,
+        })))
+    }
+    fn context_identity(&self) -> Option<String> {
+        pi_rs::fingerprint_model_context(&(
+            "workbench-policy-v2",
+            self.client.context_identity()?,
+            self.block_images,
+            self.supports_images,
+            self.session_affinity,
+        ))
+    }
+
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        self.client
+            .estimate_request_tokens(&self.filtered(request.clone()))
+    }
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        let mut one = request.clone();
+        one.messages = vec![message.clone()];
+        let filtered = self.filtered(one);
+        filtered
+            .messages
+            .iter()
+            .map(|m| self.client.estimate_message_tokens(&filtered, m))
+            .fold(0_u64, u64::saturating_add)
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         self.client.context_window(model).await
     }
@@ -60,6 +113,50 @@ impl Model for WorkbenchModel {
             .stream_with_headers(self.filtered(request), &HeaderMap::new(), true)
             .await?;
         Ok(self.estimate_usage(stream))
+    }
+}
+
+struct PreparedWorkbenchModel {
+    inner: WorkbenchModel,
+    identity: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl Model for PreparedWorkbenchModel {
+    fn context_identity(&self) -> Option<String> {
+        self.identity.clone()
+    }
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        self.inner.estimate_request_tokens(request)
+    }
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        self.inner.estimate_message_tokens(request, message)
+    }
+    async fn context_window(&self, model: &str) -> Option<u32> {
+        self.inner.context_window(model).await
+    }
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        self.inner.stream(request).await
+    }
+    async fn stream_in_session(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.inner
+            .stream_in_session(request_id, session_id, request)
+            .await
+    }
+    async fn stream_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.inner
+            .stream_for_summary(request_id, session_id, request)
+            .await
     }
 }
 
@@ -155,6 +252,42 @@ fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn effective_context_identity_includes_image_policy_and_adapter() {
+        let make = |endpoint: &str, block_images, supports_images| WorkbenchModel {
+            client: Client::Google(pi_rs::google::Google::new(endpoint, "fixture-key").unwrap()),
+            block_images,
+            supports_images,
+            session_affinity: &[],
+            price: None,
+        };
+        let original = make("https://example.com/v1", false, Some(true));
+        let blocked = make("https://example.com/v1", true, Some(true));
+        let nonvision = make("https://example.com/v1", false, Some(false));
+        let other = make("https://other.example.com/v1", false, Some(true));
+        assert!(original.context_identity().is_some());
+        assert_ne!(original.context_identity(), blocked.context_identity());
+        assert_ne!(original.context_identity(), nonvision.context_identity());
+        assert_ne!(original.context_identity(), other.context_identity());
+        let request = ModelRequest {
+            model: "fixture".into(),
+            tools: vec![],
+            max_output_tokens: 1,
+            messages: vec![Message::UserWithImages {
+                content: "look".into(),
+                images: vec![pi_rs::ImageContent {
+                    mime_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+            }],
+        };
+        assert_ne!(
+            original.filtered(request.clone()).messages,
+            blocked.filtered(request).messages
+        );
+    }
 
     #[test]
     fn image_policy_replaces_only_model_visible_image_blocks() {

@@ -1736,18 +1736,34 @@ prefix-specific character estimates rather than borrowing usage for the whole
 conversation. The compaction record and RPC response report Pi-compatible
 `tokensBefore`, independently of the native retention budget.
 
-Native budgeting remains a provider-independent heuristic, not a strict bound:
-it does not count provider-specific assistant replay blocks, it extracts tool
-images even for adapters that may serialize the original envelope, and a request
-hook can shrink the actual prompt while an older measured baseline remains in
-use. Provider-aware budgeting and reconciliation with transformed requests are
-separate work.
+Native request budgeting uses adapter-specific message estimates. Anthropic tool
+results count their original text envelope; Bedrock and other adapters that
+extract tool images use a fixed image allowance instead of counting encoded
+image bytes. Bedrock also accepts user images. Matching provider replay blocks,
+including reasoning and signatures, are included only when the adapter actually
+replays them. Bedrock freezes inspectable SDK credentials or bearer tokens,
+region and endpoint before reusing a measured baseline; opaque SDK clients or
+custom transports fall back to fresh estimates. A measured baseline is combined with provider-aware estimates of subsequent
+messages and any additional replay content. Request hooks that change the
+model, messages or tools invalidate the measured baseline; that fact is recorded
+with the request so it remains effective after reopening. A fingerprint also
+requires the effective adapter identity, image policy, model, system messages
+and tool schemas to match the measured request. Secret-bearing adapter and
+header identities use a persistent HMAC key protected by owner-only file
+permissions on Unix and user-scoped DPAPI on Windows. If protected key storage
+is unavailable, the measured baseline is not reused. Deferred workbench providers
+resolve credentials and headers before the capacity check and use the same
+resolved adapter for dispatch; the AIP budget wrapper preserves preparation and
+its budget settlement. Radius also freezes the catalog-selected route
+for that request, so replay is counted only when that route will replay it.
+Adapters that cannot prove a stable identity and older requests without the
+markers use a fresh estimate. The estimator remains a heuristic rather than a
+provider tokenizer or a strict upper bound.
 
 Tests cover trailing input, edits, compaction, model changes, checkout, reopening,
 zero usage and cached-input accounting. Loopback Ollama checks verify early
 compaction from usage, measured RPC counts and fallback counts after an edit.
-Provider-specific reasoning handling and complete native prompt checkpointing
-remain open.
+Complete native prompt checkpointing remains open.
 
 ### Directory listing limits checkpoint
 

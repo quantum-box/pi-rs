@@ -134,6 +134,11 @@ impl Google {
         self
     }
 
+    /// Return the configured request headers for protected context identity.
+    pub fn context_headers(&self) -> reqwest::header::HeaderMap {
+        self.headers.clone()
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -610,6 +615,40 @@ fn wire_request(
 
 #[async_trait::async_trait]
 impl Model for Google {
+    fn context_identity(&self) -> Option<String> {
+        if !self.http_proxies.is_empty() {
+            return None;
+        }
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        pi_rs_core::protected_model_fingerprint(&(
+            headers,
+            "google-v1",
+            self.endpoint.as_str(),
+            self.provider.as_ref(),
+            self.replay_scope.as_ref(),
+            self.api_key.as_bytes(),
+            &self.thinking,
+        ))
+    }
+
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        match message {
+            Message::Assistant {
+                replay: Some(replay),
+                ..
+            } if replay.identity == identity(&self.replay_scope, model_id(&request.model)) => {
+                pi_rs_core::estimate_replay_tokens(&replay.blocks)
+                    .max(pi_rs_core::estimate_message_tokens(message))
+            }
+            _ => pi_rs_core::estimate_message_tokens(message),
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         if self.probe_context {
             self.model(model).await?.context_window
@@ -812,6 +851,75 @@ fn report_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn static_custom_header_has_protected_stable_identity() {
+        let make = |secret: &'static str| {
+            let mut headers = HeaderMap::new();
+            let mut value = reqwest::header::HeaderValue::from_static(secret);
+            value.set_sensitive(true);
+            headers.insert("x-route-secret", value);
+            Google::new("https://example.com/v1", "key")
+                .unwrap()
+                .with_headers(headers)
+        };
+        let first = make("pin-one");
+        let same = make("pin-one");
+        let changed = make("pin-two");
+        assert!(first.context_identity().is_some());
+        assert_eq!(first.context_identity(), same.context_identity());
+        assert_ne!(first.context_identity(), changed.context_identity());
+        assert!(!first.context_identity().unwrap().contains("pin-one"));
+    }
+
+    #[test]
+    fn capacity_estimate_matches_image_and_replay_serialization() {
+        let model = Google::new("https://example.com", "key").unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let tool = |n| {
+            Message::Tool { call_id: "c".into(), content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(n)}]}}).to_string(), is_error: false, is_structured: Some(true) }
+        };
+        let small = model.estimate_message_tokens(&request, &tool(4));
+        let large = model.estimate_message_tokens(&request, &tool(20000));
+        assert_eq!(small, large);
+        let replay = ProviderReplay {
+            identity: identity("google", "fixture"),
+            blocks: vec![
+                json!({"text":"answer"}),
+                json!({"text":"x".repeat(5000),"thought":true}),
+            ],
+        };
+        let assistant = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(replay)),
+        };
+        assert!(model.estimate_message_tokens(&request, &assistant) > 1000);
+        let mismatch = if let Message::Assistant {
+            replay: Some(mut replay),
+            ..
+        } = assistant.clone()
+        {
+            replay.identity.model = "different".into();
+            Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(replay),
+            }
+        } else {
+            unreachable!()
+        };
+        assert_eq!(
+            model.estimate_message_tokens(&request, &mismatch),
+            pi_rs_core::estimate_message_tokens(&mismatch)
+        );
+    }
 
     #[test]
     fn plain_json_tool_output_is_not_extracted_as_an_image() {
