@@ -1,10 +1,11 @@
-//! Preserve rmcp's refresh transaction when a transport request is cancelled.
+//! Preserve OAuth refreshes while keeping MCP requests cancellable.
 use futures_util::stream::BoxStream;
+use oauth2::TokenResponse;
 use reqwest_mcp::header::{HeaderName, HeaderValue};
 use rmcp::{
     model::ClientJsonRpcMessage,
     transport::{
-        auth::AuthClient,
+        auth::{AuthClient, AuthError},
         streamable_http_client::{
             SseError, StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
         },
@@ -21,13 +22,59 @@ type EventStream = BoxStream<'static, std::result::Result<Sse, SseError>>;
 pub struct SafeAuthClient(pub(crate) AuthClient<reqwest_mcp::Client>);
 
 impl SafeAuthClient {
-    async fn run<T: Send + 'static>(
+    async fn token(&self, force: bool) -> Result<String, AuthError> {
+        let client = self.0.clone();
+        crate::mcp_refresh::run(async move {
+            if !force {
+                return client.get_access_token().await;
+            }
+            let manager = client.auth_manager.lock().await;
+            match manager.refresh_token().await {
+                Ok(token) => Ok(token.access_token().secret().to_owned()),
+                Err(AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_)) => {
+                    Err(AuthError::AuthorizationRequired)
+                }
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .map_err(|()| AuthError::InternalError("MCP OAuth operation stopped".into()))?
+    }
+
+    pub(crate) async fn call<T, F, Fut>(
         &self,
-        f: impl std::future::Future<Output = Result<T, HttpError>> + Send + 'static,
-    ) -> Result<T, HttpError> {
-        crate::mcp_refresh::run(f).await.map_err(|()| {
-            HttpError::UnexpectedServerResponse("MCP OAuth operation stopped".into())
-        })?
+        token: Option<String>,
+        call: F,
+    ) -> Result<T, HttpError>
+    where
+        F: Fn(Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, HttpError>>,
+    {
+        let token = match token {
+            Some(token) => Some(token),
+            None => match self.token(false).await {
+                Ok(token) => Some(token),
+                Err(AuthError::AuthorizationRequired) => None,
+                Err(error) => return Err(error.into()),
+            },
+        };
+        // Only the token transaction outlives this future. The actual call and
+        // retry stay on the caller's task, so dropping it cannot dispatch them.
+        match call(token.clone()).await {
+            Err(HttpError::AuthRequired(challenge)) => {
+                let Some(sent) = token else {
+                    return Err(HttpError::AuthRequired(challenge));
+                };
+                match self.token(true).await {
+                    Ok(fresh) if fresh != sent => call(Some(fresh)).await,
+                    Ok(_) | Err(AuthError::AuthorizationRequired) => {
+                        Err(HttpError::AuthRequired(challenge))
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            result => result,
+        }
     }
 }
 impl StreamableHttpClient for SafeAuthClient {
@@ -40,11 +87,14 @@ impl StreamableHttpClient for SafeAuthClient {
         token: Option<String>,
         headers: Headers,
     ) -> Result<StreamableHttpPostResponse, HttpError> {
-        let client = self.0.clone();
-        self.run(async move {
-            client
-                .post_message(uri, message, session_id, token, headers)
-                .await
+        self.call(token, |token| {
+            self.0.http_client.post_message(
+                uri.clone(),
+                message.clone(),
+                session_id.clone(),
+                token,
+                headers.clone(),
+            )
         })
         .await
     }
@@ -57,11 +107,15 @@ impl StreamableHttpClient for SafeAuthClient {
         headers: Headers,
         max: usize,
     ) -> Result<StreamableHttpPostResponse, HttpError> {
-        let client = self.0.clone();
-        self.run(async move {
-            client
-                .post_message_with_max_sse_event_size(uri, message, session_id, token, headers, max)
-                .await
+        self.call(token, |token| {
+            self.0.http_client.post_message_with_max_sse_event_size(
+                uri.clone(),
+                message.clone(),
+                session_id.clone(),
+                token,
+                headers.clone(),
+                max,
+            )
         })
         .await
     }
@@ -73,11 +127,14 @@ impl StreamableHttpClient for SafeAuthClient {
         token: Option<String>,
         headers: Headers,
     ) -> Result<EventStream, HttpError> {
-        let client = self.0.clone();
-        self.run(async move {
-            client
-                .get_stream(uri, session_id, last, token, headers)
-                .await
+        self.call(token, |token| {
+            self.0.http_client.get_stream(
+                uri.clone(),
+                session_id.clone(),
+                last.clone(),
+                token,
+                headers.clone(),
+            )
         })
         .await
     }
@@ -90,11 +147,15 @@ impl StreamableHttpClient for SafeAuthClient {
         headers: Headers,
         max: usize,
     ) -> Result<EventStream, HttpError> {
-        let client = self.0.clone();
-        self.run(async move {
-            client
-                .get_stream_with_max_sse_event_size(uri, session_id, last, token, headers, max)
-                .await
+        self.call(token, |token| {
+            self.0.http_client.get_stream_with_max_sse_event_size(
+                uri.clone(),
+                session_id.clone(),
+                last.clone(),
+                token,
+                headers.clone(),
+                max,
+            )
         })
         .await
     }
@@ -105,8 +166,14 @@ impl StreamableHttpClient for SafeAuthClient {
         token: Option<String>,
         headers: Headers,
     ) -> Result<(), HttpError> {
-        let client = self.0.clone();
-        self.run(async move { client.delete_session(uri, session_id, token, headers).await })
-            .await
+        self.call(token, |token| {
+            self.0.http_client.delete_session(
+                uri.clone(),
+                session_id.clone(),
+                token,
+                headers.clone(),
+            )
+        })
+        .await
     }
 }

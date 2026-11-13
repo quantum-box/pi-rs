@@ -178,8 +178,15 @@ impl Gateway {
         Ok(self.credential()?.is_some())
     }
 
-    pub(super) fn cached_access(&self) -> Result<Option<String>> {
-        Ok(self.credential()?.map(|credential| credential.access))
+    pub(super) async fn cached_access(&self) -> Result<Option<String>> {
+        self.cached_access_at(&auth_path()).await
+    }
+
+    async fn cached_access_at(&self, path: &std::path::Path) -> Result<Option<String>> {
+        let value = super::config::read_auth_object(path).await?;
+        Ok(self
+            .credential_from_value(&value)?
+            .map(|credential| credential.access))
     }
 
     pub(super) fn cached_login_id(&self) -> Result<Option<String>> {
@@ -577,6 +584,28 @@ fn request_error() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cached_access_waits_cancellably_without_refreshing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let origin = Url::parse("http://127.0.0.1:1/").unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{
+            "type":"oauth", "gateway":origin.as_str(), "access":"old", "refresh":"old-refresh", "expires":0
+        }}).to_string()).unwrap();
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let held = super::super::auth_lock::acquire_async(&path).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), gateway.cached_access_at(&path))
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert_eq!(
+            gateway.cached_access_at(&path).await.unwrap().as_deref(),
+            Some("old")
+        );
+    }
 
     #[tokio::test]
     async fn login_save_waits_for_shared_auth_lock() {

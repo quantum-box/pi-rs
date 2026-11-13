@@ -146,7 +146,7 @@ async fn resolve(
         let gateway = radius_auth::Gateway::configured_with_settings(&args.settings)?;
         if gateway.model_endpoint().as_str() == endpoint {
             let access = if no_refresh {
-                gateway.cached_access()?
+                gateway.cached_access().await?
             } else {
                 gateway.access(minimum).await?
             };

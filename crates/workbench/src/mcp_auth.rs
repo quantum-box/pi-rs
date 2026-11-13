@@ -1178,6 +1178,119 @@ mod tests {
     use super::*;
 
     #[test]
+    fn refresh_saves_token_and_only_dispatches_for_live_callers() {
+        use rmcp::transport::streamable_http_client::{AuthRequiredError, StreamableHttpError};
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        for (reactive, cancel) in [(false, true), (true, true), (false, false), (true, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileCredentials {
+                path: dir.path().join("credentials.json"),
+                generation: Some(Uuid::new_v4()),
+                new_login: true,
+                upgrade: None,
+                registration: Arc::default(),
+                lease: Arc::default(),
+            };
+            let creds: StoredCredentials = serde_json::from_value(serde_json::json!({
+                "client_id":"fixture", "token_received_at":0,
+                "token_response":{"access_token":"old", "token_type":"Bearer", "refresh_token":"old-refresh", "expires_in":1}
+            })).unwrap();
+            store.write(creds).unwrap();
+            let store = FileCredentials {
+                new_login: false,
+                ..store
+            };
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).unwrap() > 0);
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let body =
+                    r#"{"access_token":"new","token_type":"Bearer","refresh_token":"rotated"}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let mut runtime = Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            let task_store = store.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let task_calls = calls.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let task = runtime.as_ref().unwrap().block_on(async move {
+                let url = format!("http://{address}");
+                let mut manager = oauth_manager(&format!("{url}/mcp"), None).await.unwrap();
+                manager.set_metadata(serde_json::from_value(serde_json::json!({
+                    "issuer":url, "authorization_endpoint":format!("http://{address}/authorize"),
+                    "token_endpoint":format!("http://{address}/token"), "response_types_supported":["code"]
+                })).unwrap());
+                manager.configure_client_id("fixture").unwrap();
+                manager.set_credential_store(task_store);
+                let client = crate::mcp_oauth_client::SafeAuthClient(AuthClient::new(reqwest_mcp::Client::new(), manager));
+                let task = tokio::spawn(async move {
+                    let result = client.call(reactive.then(|| "old".to_owned()), |_| {
+                        let index = task_calls.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if reactive && index == 0 {
+                                Err(StreamableHttpError::AuthRequired(AuthRequiredError::new("Bearer".into())))
+                            } else { Ok(()) }
+                        }
+                    }).await;
+                    let _ = done_tx.send(result.is_ok());
+                });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while started_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(10)).await; }
+                }).await.unwrap();
+                task.abort_handle()
+            });
+            if cancel {
+                task.abort();
+                drop(runtime.take());
+            }
+            release_tx.send(()).unwrap();
+            server.join().unwrap();
+            if !cancel {
+                runtime.as_ref().unwrap().block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            if let Ok(result) = done_rx.try_recv() {
+                                assert!(result);
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                });
+            }
+            drop(runtime);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !String::from_utf8_lossy(&std::fs::read(&store.path).unwrap()).contains("rotated")
+            {
+                assert!(Instant::now() < deadline, "rotated token was not saved");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(reactive) + usize::from(!cancel),
+                "incorrect request or retry dispatch count"
+            );
+        }
+    }
+
+    #[test]
     fn cancelled_runtime_persists_rotated_mcp_refresh_token() {
         use std::io::{Read as _, Write as _};
         use std::time::{Duration, Instant};
