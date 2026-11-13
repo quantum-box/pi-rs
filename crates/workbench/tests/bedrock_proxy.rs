@@ -658,8 +658,7 @@ fn https_connect_validates_tls_and_keeps_proxy_auth_out_of_origin_request() {
                         "/tests/fixtures/bedrock-proxy-tls/untrusted-ca.pem"
                     )
                 },
-            )
-            .env("https_proxy", proxy_url);
+            );
         for key in [
             "SSL_CERT_DIR",
             "http_proxy",
@@ -677,6 +676,9 @@ fn https_connect_validates_tls_and_keeps_proxy_auth_out_of_origin_request() {
         ] {
             command.env_remove(key);
         }
+        // Windows environment names are case-insensitive: set the proxy only
+        // after removing both spellings above.
+        command.env("https_proxy", proxy_url);
         let output = command
             .args([
                 "--no-session",
@@ -695,7 +697,7 @@ fn https_connect_validates_tls_and_keeps_proxy_auth_out_of_origin_request() {
             .unwrap();
         server.join().unwrap_or_else(|_| {
             panic!(
-                "TLS fixture failed: {}",
+                "TLS fixture failed (valid_name={valid_name}, trusted_ca={trusted_ca}): {}",
                 String::from_utf8_lossy(&output.stderr)
             )
         });
