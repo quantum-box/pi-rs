@@ -10,6 +10,30 @@ use pi_rs::{
 use serde_json::{Value, json};
 
 #[test]
+fn missing_session_id_does_not_create_a_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--session",
+            "missing-id",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No session found matching 'missing-id'")
+    );
+    assert!(!root.path().join("missing-id").exists());
+}
+
+#[test]
 fn uninstall_alias_removes_packages_in_the_selected_scope() {
     for command in ["remove", "uninstall"] {
         let root = tempfile::tempdir().unwrap();
