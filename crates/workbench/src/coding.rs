@@ -29,6 +29,8 @@ pub struct CodingTools {
     model_supports_images: Option<bool>,
     read_operations: Option<Arc<dyn ReadOperations>>,
     write_operations: Option<Arc<dyn WriteOperations>>,
+    edit_operations: Option<Arc<dyn EditOperations>>,
+    edit_options: EditToolOptions,
 }
 
 impl CodingTools {
@@ -46,6 +48,8 @@ impl CodingTools {
             model_supports_images: None,
             read_operations: None,
             write_operations: None,
+            edit_operations: None,
+            edit_options: EditToolOptions::default(),
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -77,6 +81,23 @@ impl CodingTools {
         }
         self.write_operations = Some(operations);
         Ok(self)
+    }
+
+    /// Inject model edits in the unrestricted profile; the backend enforces its access policy.
+    pub fn with_edit_operations(mut self, operations: Arc<dyn EditOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom edit operations require the unrestricted profile".into(),
+            ));
+        }
+        self.edit_operations = Some(operations);
+        Ok(self)
+    }
+
+    /// Configure injected edits, including the opt-in non-atomic compatibility fallback.
+    pub fn with_edit_options(mut self, options: EditToolOptions) -> Self {
+        self.edit_options = options;
+        self
     }
 
     pub fn with_shell_config(mut self, shell: ShellConfig) -> Self {
@@ -430,6 +451,14 @@ impl Extension for CodingTools {
                     Arc::new(RemoteWriteTool {
                         tool,
                         operations: operations.clone(),
+                    }) as Arc<dyn Tool>
+                } else if matches!(kind, Kind::Edit)
+                    && let Some(operations) = &self.edit_operations
+                {
+                    Arc::new(RemoteEditTool {
+                        tool,
+                        operations: operations.clone(),
+                        options: self.edit_options,
                     }) as Arc<dyn Tool>
                 } else {
                     Arc::new(tool) as Arc<dyn Tool>
@@ -857,6 +886,7 @@ fn canonical_local_target(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 static LOCAL_LOCK_RESOLVED: std::sync::Mutex<Option<(PathBuf, std::sync::mpsc::Sender<()>)>> =
     std::sync::Mutex::new(None);
+
 #[cfg(test)]
 fn notify_local_lock_resolved(path: &Path) {
     if let Some((expected, sender)) = LOCAL_LOCK_RESOLVED.lock().unwrap().as_ref()
@@ -866,12 +896,14 @@ fn notify_local_lock_resolved(path: &Path) {
     }
 }
 
-async fn injected_write_lock(
-    operations: &Arc<dyn WriteOperations>,
+async fn injected_mutation_lock(
+    identity: usize,
+    uses_local_filesystem: bool,
     path: &Path,
+    resource_identity: PathBuf,
     cancellation: &pi_rs::CancellationToken,
 ) -> Result<InjectedWriteGuard> {
-    if operations.uses_local_filesystem() {
+    if uses_local_filesystem {
         let path = path.to_owned();
         let token = cancellation.clone();
         let (file, target) = tokio::task::spawn_blocking(move || {
@@ -894,9 +926,7 @@ async fn injected_write_lock(
         static LOCKS: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<Key, WeakLock>>,
         > = std::sync::OnceLock::new();
-        let identity = Arc::as_ptr(operations) as *const () as usize;
-        let key = (identity, operations.resource_identity(path).await?);
-        check_mutation_cancelled(cancellation)?;
+        let key = (identity, resource_identity);
         let lock = {
             let mut locks = LOCKS
                 .get_or_init(Default::default)
@@ -949,7 +979,22 @@ impl Tool for RemoteWriteTool {
             // The detached worker owns the lock while an operation is in flight.
             // Dropping the caller never releases it before a backend has settled.
             let worker = tokio::spawn(async move {
-                let _lock = injected_write_lock(&operations, &path, &cancellation).await?;
+                let local = operations.uses_local_filesystem();
+                check_mutation_cancelled(&cancellation)?;
+                let resource = if local {
+                    path.clone()
+                } else {
+                    operations.resource_identity(&path).await?
+                };
+                check_mutation_cancelled(&cancellation)?;
+                let _lock = injected_mutation_lock(
+                    Arc::as_ptr(&operations) as *const () as usize,
+                    local,
+                    &path,
+                    resource,
+                    &cancellation,
+                )
+                .await?;
                 check_mutation_cancelled(&cancellation)?;
                 let path = _lock.local_target.as_deref().unwrap_or(&path);
                 let parent = path
@@ -971,6 +1016,286 @@ impl Tool for RemoteWriteTool {
             Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
             Err(error) => Outcome::Failed(error.to_string()),
         }
+    }
+}
+
+/// Operations for a model-facing edit. A backend shared with WriteOperations
+/// must use the same Arc allocation for both interfaces to share remote locks.
+/// Operations must not return until any effects have settled.
+/// Result of an atomic backend compare-and-replace attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditionalEdit {
+    Applied,
+    Conflict,
+    Unsupported,
+}
+
+#[async_trait::async_trait]
+pub trait EditOperations: Send + Sync {
+    /// Return the same stable identity for all aliases of one backend resource.
+    async fn resource_identity(&self, path: &Path) -> Result<PathBuf> {
+        Ok(path.to_owned())
+    }
+    /// Return true only for paths in this host's local filesystem.
+    fn uses_local_filesystem(&self) -> bool {
+        false
+    }
+    async fn access(&self, path: &Path) -> Result<()>;
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()>;
+    /// Atomically compare current bytes and write when equal. Return Unsupported
+    /// without mutating if the backend cannot provide this operation.
+    async fn write_if_unchanged(
+        &self,
+        _path: &Path,
+        _expected: &[u8],
+        _content: &str,
+    ) -> Result<ConditionalEdit> {
+        Ok(ConditionalEdit::Unsupported)
+    }
+}
+
+/// Local Pi-style edit operations; the default local tool retains atomic writes.
+pub struct LocalEditOperations;
+
+fn open_local_edit_file(path: &Path) -> Result<std::fs::File> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    Ok(file)
+}
+async fn local_edit_file(path: &Path) -> Result<tokio::fs::File> {
+    let path = path.to_owned();
+    let file = tokio::task::spawn_blocking(move || open_local_edit_file(&path))
+        .await
+        .map_err(|error| Error::Config(error.to_string()))??;
+    Ok(tokio::fs::File::from_std(file))
+}
+#[async_trait::async_trait]
+impl EditOperations for LocalEditOperations {
+    fn uses_local_filesystem(&self) -> bool {
+        true
+    }
+    async fn access(&self, path: &Path) -> Result<()> {
+        local_edit_file(path).await?;
+        Ok(())
+    }
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        let mut file = local_edit_file(path).await?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        let path = path.to_owned();
+        let content = content.as_bytes().to_vec();
+        tokio::task::spawn_blocking(move || {
+            // Resolve a symlink before replacement: the symlink itself remains intact.
+            let _file = open_local_edit_file(&path)?;
+            let target = path.canonicalize()?;
+            open_local_edit_file(&target)?;
+            atomic_write(&target, &content, &pi_rs::CancellationToken::new())
+        })
+        .await
+        .map_err(|error| Error::Config(error.to_string()))?
+    }
+}
+
+/// Controls whether an injected edit may use a non-atomic compatibility fallback.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EditToolOptions {
+    /// Explicitly allow reread-then-write when the backend lacks compare-and-replace.
+    /// External writers can still race between that reread and the write.
+    pub allow_non_atomic_fallback: bool,
+}
+
+/// Construct an unrestricted edit tool requiring atomic backend comparison.
+pub fn create_edit_tool(root: &Path, operations: Arc<dyn EditOperations>) -> Result<Arc<dyn Tool>> {
+    create_edit_tool_with_options(root, operations, EditToolOptions::default())
+}
+
+/// Construct an edit tool with explicit compatibility options.
+pub fn create_edit_tool_with_options(
+    root: &Path,
+    operations: Arc<dyn EditOperations>,
+    options: EditToolOptions,
+) -> Result<Arc<dyn Tool>> {
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteEditTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        },
+        operations,
+        options,
+    }))
+}
+struct RemoteEditTool {
+    tool: CodingTool,
+    operations: Arc<dyn EditOperations>,
+    options: EditToolOptions,
+}
+#[async_trait::async_trait]
+impl Tool for RemoteEditTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
+        self.tool.prepare_arguments(arguments).await
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let result = async {
+            let display = string(&args, "path")?.to_owned();
+            let path = crate::coding_paths::resolve(
+                &self.tool.root,
+                &crate::coding_paths::normalize(&display)?,
+            );
+            let cancellation = context.cancellation.child_token();
+            let _guard = cancellation.clone().drop_guard();
+            let operations = self.operations.clone();
+            let options = self.options;
+            let worker = tokio::spawn(async move {
+                let local = operations.uses_local_filesystem();
+                check_mutation_cancelled(&cancellation)?;
+                let resource = if local {
+                    path.clone()
+                } else {
+                    operations.resource_identity(&path).await?
+                };
+                check_mutation_cancelled(&cancellation)?;
+                let _lock = injected_mutation_lock(
+                    Arc::as_ptr(&operations) as *const () as usize,
+                    local,
+                    &path,
+                    resource,
+                    &cancellation,
+                )
+                .await?;
+                check_mutation_cancelled(&cancellation)?;
+                let path = _lock.local_target.as_deref().unwrap_or(&path);
+                if let Err(error) = operations.access(path).await {
+                    check_mutation_cancelled(&cancellation)?;
+                    let message = match &error {
+                        Error::Io(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+                            "Error code: ENOENT".to_owned()
+                        }
+                        Error::Io(cause)
+                            if cause.kind() == std::io::ErrorKind::PermissionDenied =>
+                        {
+                            "Error code: EACCES".to_owned()
+                        }
+                        _ => error.to_string(),
+                    };
+                    return Err(Error::Config(format!(
+                        "Could not edit file: {display}. {message}."
+                    )));
+                }
+                check_mutation_cancelled(&cancellation)?;
+                let bytes = operations.read_file(path).await?;
+                check_mutation_cancelled(&cancellation)?;
+                let original =
+                    String::from_utf8(bytes).map_err(|error| Error::Config(error.to_string()))?;
+                let before = original.clone();
+                let edit_token = cancellation.clone();
+                let (output, count) = tokio::task::spawn_blocking(move || {
+                    check_mutation_cancelled(&edit_token)?;
+                    crate::text_edit::apply(&before, &args)
+                })
+                .await
+                .map_err(|error| Error::Config(error.to_string()))??;
+                check_mutation_cancelled(&cancellation)?;
+                let conditional = operations
+                    .write_if_unchanged(path, original.as_bytes(), &output)
+                    .await?;
+                check_mutation_cancelled(&cancellation)?;
+                match conditional {
+                    ConditionalEdit::Applied => {}
+                    ConditionalEdit::Conflict => {
+                        return Err(Error::Config(
+                            "file changed while preparing edits; read it again".into(),
+                        ));
+                    }
+                    ConditionalEdit::Unsupported => {
+                        if !options.allow_non_atomic_fallback {
+                            return Err(Error::Config("backend does not support atomic conditional edit; enable non-atomic fallback explicitly to use reread-then-write".into()));
+                        }
+                        let current = operations.read_file(path).await?;
+                        check_mutation_cancelled(&cancellation)?;
+                        if current != original.as_bytes() {
+                            return Err(Error::Config(
+                                "file changed while preparing edits; read it again".into(),
+                            ));
+                        }
+                        operations.write_file(path, &output).await?;
+                        check_mutation_cancelled(&cancellation)?;
+                    }
+                }
+                tokio::task::spawn_blocking(move || {
+                    edit_success(&display, &original, &output, count)
+                })
+                .await
+                .map_err(|error| Error::Config(error.to_string()))
+            });
+            worker
+                .await
+                .map_err(|error| Error::Config(error.to_string()))?
+        }
+        .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
+            Err(error) => Outcome::Failed(edit_error_text(error)),
+        }
+    }
+}
+
+fn edit_success(display_path: &str, original: &str, output: &str, count: usize) -> Outcome {
+    let original = crate::text_edit::normalized_content(original);
+    let edited = crate::text_edit::normalized_content(output);
+    let diff = similar::TextDiff::from_lines(&original, &edited);
+    let first_changed_line = diff
+        .ops()
+        .iter()
+        .find(|op| !matches!(op, similar::DiffOp::Equal { .. }))
+        .map(|op| op.new_range().start + 1);
+    let digits = original
+        .split('\n')
+        .count()
+        .max(edited.split('\n').count())
+        .to_string()
+        .len();
+    let display = crate::text_edit::numbered_diff(&diff, digits);
+    let patch = diff
+        .unified_diff()
+        .context_radius(4)
+        .header(display_path, display_path)
+        .to_string();
+    Outcome::SucceededWithDetails {
+        output: format!("Successfully replaced {count} block(s) in {display_path}."),
+        details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
     }
 }
 
@@ -1557,31 +1882,12 @@ impl CodingTool {
         check_mutation_cancelled(cancellation)?;
         atomic_write(&path, output.as_bytes(), cancellation)?;
         check_mutation_cancelled(cancellation)?;
-        let display_path = args["path"].as_str().unwrap_or_default();
-        let original = crate::text_edit::normalized_content(&original);
-        let edited = crate::text_edit::normalized_content(&output);
-        let diff = similar::TextDiff::from_lines(&original, &edited);
-        let first_changed_line = diff
-            .ops()
-            .iter()
-            .find(|op| !matches!(op, similar::DiffOp::Equal { .. }))
-            .map(|op| op.new_range().start + 1);
-        let digits = original
-            .split('\n')
-            .count()
-            .max(edited.split('\n').count())
-            .to_string()
-            .len();
-        let display = crate::text_edit::numbered_diff(&diff, digits);
-        let patch = diff
-            .unified_diff()
-            .context_radius(4)
-            .header(display_path, display_path)
-            .to_string();
-        Ok(Outcome::SucceededWithDetails {
-            output: format!("Successfully replaced {count} block(s) in {display_path}."),
-            details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
-        })
+        Ok(edit_success(
+            args["path"].as_str().unwrap_or_default(),
+            &original,
+            &output,
+            count,
+        ))
     }
 
     fn list(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
@@ -2505,44 +2811,80 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn local_injected_write_binds_target_before_waiting_for_lock() {
+    async fn local_injected_mutations_bind_target_before_waiting_for_lock() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let a = root.join("a");
         let b = root.join("b");
         let alias = root.join("alias");
-        std::fs::write(&a, "before").unwrap();
-        std::fs::write(&b, "before").unwrap();
-        std::os::unix::fs::symlink(&a, &alias).unwrap();
-        let held = mutation_lock(&a, &pi_rs::CancellationToken::new()).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        *LOCAL_LOCK_RESOLVED.lock().unwrap() = Some((alias.clone(), tx));
-        let tool = create_write_tool(&root, Arc::new(LocalWriteOperations)).unwrap();
-        let task = tokio::spawn(async move {
-            tool.invoke(
-                json!({"path":"alias", "content":"after"}),
-                ToolContext {
-                    operation_id: uuid::Uuid::new_v4(),
-                    cancellation: pi_rs::CancellationToken::new(),
-                },
-            )
-            .await
-        });
-        tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(2)))
-            .await
-            .unwrap()
-            .expect("tool resolved its target");
-        std::fs::remove_file(&alias).unwrap();
-        std::os::unix::fs::symlink(&b, &alias).unwrap();
-        *LOCAL_LOCK_RESOLVED.lock().unwrap() = None;
-        drop(held);
-        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(outcome, Outcome::Succeeded(_)));
-        assert_eq!(std::fs::read_to_string(&a).unwrap(), "after");
-        assert_eq!(std::fs::read_to_string(&b).unwrap(), "before");
+        for edit in [true, false] {
+            std::fs::write(&a, "before").unwrap();
+            std::fs::write(&b, "before").unwrap();
+            let _ = std::fs::remove_file(&alias);
+            std::os::unix::fs::symlink(&a, &alias).unwrap();
+            let held = mutation_lock(&a, &pi_rs::CancellationToken::new()).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            *LOCAL_LOCK_RESOLVED.lock().unwrap() = Some((alias.clone(), tx));
+            let tool = if edit {
+                create_edit_tool_with_options(
+                    &root,
+                    Arc::new(LocalEditOperations),
+                    EditToolOptions {
+                        allow_non_atomic_fallback: true,
+                    },
+                )
+                .unwrap()
+            } else {
+                create_write_tool(&root, Arc::new(LocalWriteOperations)).unwrap()
+            };
+            let args = if edit {
+                json!({"path":"alias", "edits":[{"oldText":"before", "newText":"after"}]})
+            } else {
+                json!({"path":"alias", "content":"after"})
+            };
+            let task = tokio::spawn(async move {
+                tool.invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::new_v4(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await
+            });
+            tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(2)))
+                .await
+                .unwrap()
+                .expect("tool resolved its target");
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&b, &alias).unwrap();
+            *LOCAL_LOCK_RESOLVED.lock().unwrap() = None;
+            drop(held);
+            let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. }
+            ));
+            assert_eq!(std::fs::read_to_string(&a).unwrap(), "after");
+            assert_eq!(std::fs::read_to_string(&b).unwrap(), "before");
+        }
+    }
+
+    #[test]
+    fn atomic_edit_failure_before_replace_preserves_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, "original").unwrap();
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            atomic_write(&path, b"replacement", &cancellation),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
     }
 
     #[cfg(unix)]
