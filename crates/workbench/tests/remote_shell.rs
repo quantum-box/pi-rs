@@ -208,3 +208,65 @@ async fn local_shell_operations_factory_streams_and_applies_exit_status() {
         matches!(result, Outcome::Failed(text) if text.contains("ok") && text.contains("err") && text.contains("code 4"))
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_operations_stop_when_output_channel_is_full() {
+    use std::collections::BTreeMap;
+    for timed in [false, true] {
+        let ops = pi_rs_workbench::coding::create_local_bash_operations(None);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let token = CancellationToken::new();
+        let child_token = token.clone();
+        let task = tokio::spawn(async move {
+            ops.exec(
+                ShellSpawnContext {
+                    command: "while :; do printf 1234567890; done".into(),
+                    cwd: std::env::current_dir().unwrap(),
+                    env: std::env::vars_os().collect::<BTreeMap<_, _>>(),
+                },
+                timed.then_some(Duration::from_millis(200)),
+                child_token,
+                sender,
+            )
+            .await
+        });
+        receiver.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if !timed {
+            token.cancel();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("blocked output must not prevent termination")
+            .unwrap();
+        assert!(result.is_err());
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_injection_does_not_replace_powershell() {
+    let root = tempfile::tempdir().unwrap();
+    let remote = Arc::new(Remote::default());
+    let extension = CodingTools::local(root.path())
+        .unwrap()
+        .with_bash_operations(remote.clone())
+        .unwrap();
+    let powershell = extension
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == "powershell")
+        .unwrap();
+    let result = powershell
+        .invoke(
+            json!({"command":"Write-Output 'powershell-only'"}),
+            ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: CancellationToken::new(),
+            },
+        )
+        .await;
+    assert!(matches!(result, Outcome::Succeeded(text) if text.contains("powershell-only")));
+    assert!(remote.calls.lock().unwrap().is_empty());
+}

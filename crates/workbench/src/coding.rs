@@ -474,7 +474,7 @@ impl Extension for CodingTools {
                         operations: operations.clone(),
                         options: self.edit_options,
                     }) as Arc<dyn Tool>
-                } else if matches!(kind, Kind::Bash | Kind::PowerShell)
+                } else if matches!(kind, Kind::Bash)
                     && let Some(operations) = &self.bash_operations
                 {
                     Arc::new(RemoteShellTool {
@@ -1413,11 +1413,25 @@ impl BashOperations for LocalBashOperations {
                 },
                 count = stdout.read(&mut stdout_buffer), if stdout_open => {
                     let count = count?; stdout_open = count != 0;
-                    if count != 0 && output.send(stdout_buffer[..count].to_vec()).await.is_err() { return Err(Error::Cancelled); }
+                    if count != 0 {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                            _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
+                            result = output.send(stdout_buffer[..count].to_vec()) => if result.is_err() { return Err(Error::Cancelled); },
+                        }
+                    }
                 },
                 count = stderr.read(&mut stderr_buffer), if stderr_open => {
                     let count = count?; stderr_open = count != 0;
-                    if count != 0 && output.send(stderr_buffer[..count].to_vec()).await.is_err() { return Err(Error::Cancelled); }
+                    if count != 0 {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                            _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
+                            result = output.send(stderr_buffer[..count].to_vec()) => if result.is_err() { return Err(Error::Cancelled); },
+                        }
+                    }
                 },
                 _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
             }
