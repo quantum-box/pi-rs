@@ -6,9 +6,10 @@ use std::{
 use futures_util::stream;
 use pi_rs::{CancellationToken, Extension, Outcome, Registry, Result, ToolContext};
 use pi_rs_workbench::{
-    coding::{CodingTools, ReadOperations, WriteOperations},
+    coding::{CodingTools, ConditionalEdit, EditOperations, ReadOperations, WriteOperations},
     coding_factories::{
-        coding_tools_from, create_coding_tools, create_read_only_tools, read_only_tools_from,
+        coding_tools_from, coding_tools_from_with_local_shell, create_coding_tools,
+        create_read_only_tools, injected_file_tools_from, read_only_tools_from,
     },
 };
 use serde_json::json;
@@ -102,6 +103,36 @@ impl WriteOperations for Remote {
         Ok(())
     }
 }
+#[async_trait::async_trait]
+impl EditOperations for Remote {
+    async fn access(&self, _: &Path) -> Result<()> {
+        Ok(())
+    }
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("edit-read".into(), path.into()));
+        Ok(b"remote content".to_vec())
+    }
+    async fn write_file(&self, _: &Path, _: &str) -> Result<()> {
+        panic!("conditional edit required")
+    }
+    async fn write_if_unchanged(
+        &self,
+        path: &Path,
+        expected: &[u8],
+        content: &str,
+    ) -> Result<ConditionalEdit> {
+        assert_eq!(expected, b"remote content");
+        assert_eq!(content, "updated content");
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("edit".into(), path.into()));
+        Ok(ConditionalEdit::Applied)
+    }
+}
 
 #[tokio::test]
 async fn configured_sets_reject_injected_operations_and_keep_scope() {
@@ -170,6 +201,108 @@ async fn remote_file_backends_cannot_expose_local_edit() {
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
     }
+}
+
+#[tokio::test]
+async fn fully_injected_file_tools_work_without_local_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Remote::default());
+    let source = CodingTools::local(directory.path())
+        .unwrap()
+        .with_read_operations(backend.clone())
+        .unwrap()
+        .with_write_operations(backend.clone())
+        .unwrap()
+        .with_edit_operations(backend.clone())
+        .unwrap();
+    assert!(coding_tools_from(&source).is_err());
+    let set = injected_file_tools_from(&source).unwrap();
+    assert_eq!(names(&set), ["read", "edit", "write"]);
+    let tools = set.tools();
+    let tool = |name| tools.iter().find(|tool| tool.spec().name == name).unwrap();
+    assert!(
+        matches!(tool("read").invoke(json!({"path":"file"}), context()).await, Outcome::Succeeded(text) if text.contains("remote content"))
+    );
+    assert!(matches!(
+        tool("write")
+            .invoke(json!({"path":"file","content":"written"}), context())
+            .await,
+        Outcome::Succeeded(_)
+    ));
+    assert!(matches!(
+        tool("edit")
+            .invoke(
+                json!({"path":"file","edits":[{"oldText":"remote","newText":"updated"}]}),
+                context()
+            )
+            .await,
+        Outcome::SucceededWithDetails { .. }
+    ));
+    assert!(!directory.path().join("file").exists());
+    {
+        let calls = backend.calls.lock().unwrap();
+        assert!(calls.iter().any(|(name, _)| name == "read"));
+        assert!(calls.iter().any(|(name, _)| name == "write"));
+        assert!(calls.iter().any(|(name, _)| name == "edit"));
+    }
+    let set = coding_tools_from_with_local_shell(&source).unwrap();
+    assert_eq!(names(&set), ["read", "bash", "edit", "write"]);
+    #[cfg(unix)]
+    {
+        std::fs::write(directory.path().join("host-only"), "host shell fixture").unwrap();
+        let tools = set.tools();
+        let shell = tools
+            .iter()
+            .find(|tool| tool.spec().name == "bash")
+            .unwrap();
+        assert!(
+            matches!(shell.invoke(json!({"command":"cat host-only"}), context()).await, Outcome::Succeeded(output) if output.contains("host shell fixture"))
+        );
+    }
+}
+
+#[test]
+fn injected_factories_reject_partial_or_distinct_backends() {
+    let directory = tempfile::tempdir().unwrap();
+    for mask in 1..7 {
+        let backend = Arc::new(Remote::default());
+        let mut source = CodingTools::local(directory.path()).unwrap();
+        if mask & 1 != 0 {
+            source = source.with_read_operations(backend.clone()).unwrap();
+        }
+        if mask & 2 != 0 {
+            source = source.with_write_operations(backend.clone()).unwrap();
+        }
+        if mask & 4 != 0 {
+            source = source.with_edit_operations(backend).unwrap();
+        }
+        assert!(coding_tools_from(&source).is_err());
+        assert!(injected_file_tools_from(&source).is_err());
+        assert!(coding_tools_from_with_local_shell(&source).is_err());
+    }
+    let read = Arc::new(Remote::default());
+    let other = Arc::new(Remote::default());
+    let source = CodingTools::local(directory.path())
+        .unwrap()
+        .with_read_operations(read)
+        .unwrap()
+        .with_write_operations(other.clone())
+        .unwrap()
+        .with_edit_operations(other)
+        .unwrap();
+    assert!(injected_file_tools_from(&source).is_err());
+    assert!(coding_tools_from_with_local_shell(&source).is_err());
+    let read_write = Arc::new(Remote::default());
+    let edit = Arc::new(Remote::default());
+    let source = CodingTools::local(directory.path())
+        .unwrap()
+        .with_read_operations(read_write.clone())
+        .unwrap()
+        .with_write_operations(read_write)
+        .unwrap()
+        .with_edit_operations(edit)
+        .unwrap();
+    assert!(injected_file_tools_from(&source).is_err());
 }
 
 #[test]

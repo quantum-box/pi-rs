@@ -55,11 +55,43 @@ pub fn create_read_only_tools(cwd: &Path) -> Result<CodingToolSet> {
 
 /// Select the coding set from a host-configured profile, retaining its options.
 /// Scoped file tools do not restrict the shell, which is not sandboxed.
-/// Custom read or write operations are rejected while edit and shell are local.
+/// Custom file operations require the shell-free factory or explicit local-shell opt-in.
 pub fn coding_tools_from(source: &CodingTools) -> Result<CodingToolSet> {
-    if source.has_custom_read_operations() || source.has_custom_write_operations() {
-        return Err(Error::Config("coding tool sets cannot combine custom read or write operations with local edit and shell tools".into()));
+    if source.has_custom_read_operations()
+        || source.has_custom_write_operations()
+        || source.has_custom_edit_operations()
+    {
+        return Err(Error::Config("custom file operations require injected_file_tools_from or explicit local-shell opt-in".into()));
     }
+    select_coding_with_shell(source)
+}
+
+fn require_shared_file_backend(source: &CodingTools) -> Result<()> {
+    if !source.file_operations_share_backend() {
+        return Err(Error::Config(
+            "custom read, write and edit operations must all share the same backend Arc".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Select injected read, edit and write only, without a local shell.
+/// All three operations must share one backend Arc; the host is responsible for
+/// ensuring that backend enforces the intended access policy.
+pub fn injected_file_tools_from(source: &CodingTools) -> Result<CodingToolSet> {
+    require_shared_file_backend(source)?;
+    select(source, "pi-injected-file-tools", &["read", "edit", "write"])
+}
+
+/// Select all coding tools with injected file operations and an explicitly
+/// accepted local shell. The shell is not sandboxed and runs on the host, not
+/// on the injected backend. All file operations must share one backend Arc.
+pub fn coding_tools_from_with_local_shell(source: &CodingTools) -> Result<CodingToolSet> {
+    require_shared_file_backend(source)?;
+    select_coding_with_shell(source)
+}
+
+fn select_coding_with_shell(source: &CodingTools) -> Result<CodingToolSet> {
     let tools = source.tools();
     let shell = if tools.iter().any(|tool| tool.spec().name == "bash") {
         "bash"

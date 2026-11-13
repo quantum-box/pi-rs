@@ -79,6 +79,26 @@ impl CodingTools {
         self.write_operations.is_some()
     }
 
+    pub(crate) fn has_custom_edit_operations(&self) -> bool {
+        self.edit_operations.is_some()
+    }
+
+    pub(crate) fn file_operations_share_backend(&self) -> bool {
+        match (
+            &self.read_operations,
+            &self.write_operations,
+            &self.edit_operations,
+        ) {
+            (Some(read), Some(write), Some(edit)) => {
+                let read = Arc::as_ptr(read) as *const ();
+                let write = Arc::as_ptr(write) as *const ();
+                let edit = Arc::as_ptr(edit) as *const ();
+                read == write && write == edit
+            }
+            _ => false,
+        }
+    }
+
     /// Inject model-facing writes in the unrestricted profile. The backend is
     /// responsible for its own remote access policy.
     pub fn with_write_operations(mut self, operations: Arc<dyn WriteOperations>) -> Result<Self> {
