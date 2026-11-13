@@ -5099,6 +5099,8 @@ pub(super) async fn run(
     if let Some(terminal) = &mut _terminal {
         terminal.disable_keyboard_protocol();
     }
+    #[cfg(all(unix, debug_assertions))]
+    test_input_drain_barrier();
     let _ = input.drain(Duration::from_secs(1), Duration::from_millis(50));
     let finish = if args.tui_mode == Some(TuiMode::Regular) {
         view.finish_regular()
@@ -5145,6 +5147,31 @@ pub(super) async fn run(
         Err(Error::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+// Let the PTY integration test deliver a release after protocol disable and
+// before the drain starts, regardless of process scheduling.
+#[cfg(all(unix, debug_assertions))]
+fn test_input_drain_barrier() {
+    use std::io::{Read, Write};
+    let Some(address) = std::env::var_os("PI_RS_TEST_INPUT_DRAIN_BARRIER") else {
+        return;
+    };
+    let Ok(address) = address.to_string_lossy().parse::<std::net::SocketAddr>() else {
+        return;
+    };
+    if !address.ip().is_loopback() {
+        return;
+    }
+    let Ok(mut socket) = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
+    else {
+        return;
+    };
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = socket.set_write_timeout(Some(Duration::from_secs(5)));
+    if socket.write_all(b"D").is_ok() {
+        let _ = socket.read_exact(&mut [0]);
     }
 }
 

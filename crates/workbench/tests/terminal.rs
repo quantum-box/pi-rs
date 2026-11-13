@@ -258,6 +258,157 @@ fn debug_command_writes_session_snapshot() {
 }
 
 #[test]
+fn delayed_thinking_callback_preserves_the_next_selection() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let session_path = root.path().join("session.jsonl");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        br#"{"providers":{"ollama":{"models":[{"id":"fixture","reasoning":true,"thinkingLevelMap":{"xhigh":"xhigh"}}]}}}"#,
+    ).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let extension = root.path().join("selection.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, socket, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'selection', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'model_selection_hook':True}
+elif request['type'] == 'lifecycle':
+    event = request['event']
+    if event.get('type') == 'thinking_level_select' and event.get('level') == 'low':
+        host, port = os.environ['PI_RS_TEST_SELECTION_GATE'].rsplit(':', 1)
+        with socket.create_connection((host, int(port)), timeout=10) as gate:
+            gate.sendall(b'S')
+            if gate.recv(1) != b'G':
+                raise RuntimeError('selection gate was not released')
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'events.jsonl'), 'a') as log:
+        log.write(json.dumps(event) + '\n')
+    result = None
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env(
+                "PI_RS_TEST_SELECTION_GATE",
+                listener.local_addr().unwrap().to_string(),
+            )
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--thinking",
+                "off",
+                "--session",
+            ])
+            .arg(&session_path)
+            .arg("--extension")
+            .arg(&extension)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/thinking low\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut gate = loop {
+        match listener.accept() {
+            Ok((socket, _)) => break socket,
+            Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                let mut output = [0; 8192];
+                let _ = master.read(&mut output);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("first selection callback did not start: {error}"),
+        }
+    };
+    gate.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut started = [0];
+    gate.read_exact(&mut started).unwrap();
+    assert_eq!(&started, b"S");
+    // Queue the second selection while the first callback is still held.
+    master.write_all(b"/thinking high\r").unwrap();
+    assert!(!home.join("events.jsonl").exists());
+    let session = pi_rs::Session::snapshot(&session_path).unwrap();
+    assert!(
+        session
+            .model_selection()
+            .is_some_and(|(_, level)| level.as_deref() == Some("low")),
+        "the UI must not apply the queued selection before the callback completes"
+    );
+    gate.write_all(b"G").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let events = loop {
+        let mut output = [0; 8192];
+        let _ = master.read(&mut output);
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(home.join("events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if events.len() >= 2 {
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "selection callbacks did not complete: {events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        events,
+        vec![
+            serde_json::json!({"type":"thinking_level_select", "level":"low", "previousLevel":"off"}),
+            serde_json::json!({"type":"thinking_level_select", "level":"high", "previousLevel":"low"}),
+        ]
+    );
+    let session = pi_rs::Session::snapshot(&session_path).unwrap();
+    assert!(
+        session
+            .model_selection()
+            .is_some_and(|(_, level)| level.as_deref() == Some("high"))
+    );
+}
+
+#[test]
 fn thinking_command_notifies_native_extension_from_terminal() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
@@ -1206,34 +1357,52 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
 
 #[test]
 fn settings_choose_and_clear_per_model_thinking() {
-    check_per_model_thinking_settings(false, false);
+    check_per_model_thinking_settings(false, false, false);
 }
 
 #[test]
 fn project_per_model_thinking_preserves_live_edits_and_disk_precedence() {
-    check_per_model_thinking_settings(true, false);
+    check_per_model_thinking_settings(true, false, false);
 }
 
 #[test]
 fn clearing_per_model_thinking_uses_unqualified_model_fallback() {
-    check_per_model_thinking_settings(false, true);
+    check_per_model_thinking_settings(false, true, false);
 }
 
-fn check_per_model_thinking_settings(project_override: bool, model_fallback: bool) {
+#[test]
+fn delayed_per_model_thinking_callback_preserves_next_selection() {
+    check_per_model_thinking_settings(false, true, true);
+}
+
+fn check_per_model_thinking_settings(project_override: bool, model_fallback: bool, delayed: bool) {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let session_path = root.path().join("session.jsonl");
     std::fs::create_dir_all(&home).unwrap();
+    let listener = delayed.then(|| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        listener
+    });
     let extension = root.path().join("selection.py");
     std::fs::write(&extension, r##"#!/usr/bin/env python3
-import json, os, sys
+import json, os, socket, sys
 request = json.load(sys.stdin)
 if request['type'] == 'describe':
     result = {'id':'selection', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'model_selection_hook':True}
 elif request['type'] == 'lifecycle':
+    event = request['event']
+    address = os.environ.get('PI_RS_TEST_SELECTION_GATE')
+    if address and event.get('type') == 'thinking_level_select' and event.get('level') == 'high':
+        host, port = address.rsplit(':', 1)
+        with socket.create_connection((host, int(port)), timeout=10) as gate:
+            gate.sendall(b'S')
+            if gate.recv(1) != b'G':
+                raise RuntimeError('selection gate was not released')
     with open(os.path.join(os.environ['PI_RS_HOME'], 'events.jsonl'), 'a') as log:
-        log.write(json.dumps(request['event']) + '\n')
+        log.write(json.dumps(event) + '\n')
     result = None
 else:
     result = None
@@ -1282,8 +1451,15 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
         0
     );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    if let Some(listener) = &listener {
+        command.env(
+            "PI_RS_TEST_SELECTION_GATE",
+            listener.local_addr().unwrap().to_string(),
+        );
+    }
     let _process = Process(
-        Command::new(env!("CARGO_BIN_EXE_pi"))
+        command
             .args([
                 "--workspace",
                 root.path().to_str().unwrap(),
@@ -1322,17 +1498,15 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     });
     master.write_all(b"high\r").unwrap();
     let displayed = "high";
-    output_until(&mut master, |text| {
-        text.contains(&format!("ollama/fixture-model · {displayed}"))
-    });
+    if !delayed {
+        output_until(&mut master, |text| {
+            text.contains(&format!("ollama/fixture-model · {displayed}"))
+        });
+    }
     let read_settings = || -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap()
     };
-    assert_eq!(
-        read_settings()["modelThinkingLevels"]["ollama/fixture-model"],
-        "high"
-    );
-    let wait_level = |expected: &str| {
+    let wait_level = |master: &mut File, expected: &str| {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(session) = pi_rs::Session::snapshot(&session_path)
@@ -1346,32 +1520,96 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
                 Instant::now() < deadline,
                 "thinking level was not applied to the session"
             );
+            // A full PTY can block the UI before it persists the selection.
+            let mut output = [0; 8192];
+            let _ = master.read(&mut output);
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    wait_level(displayed);
-    master.write_all(b"\x03").unwrap();
-    output_until(&mut master, |text| {
-        text.contains("Default thinking level per model")
-            && text.contains(if model_fallback {
-                "2 configured"
-            } else {
-                "1 configured"
-            })
-    });
-    master.write_all(b"\r").unwrap();
-    output_until(&mut master, |text| text.contains("Thinking: select model"));
-    master.write_all(b"ollama/fixture-model").unwrap();
-    let reopened = if project_override { "low" } else { "high" };
-    output_until(&mut master, |text| {
-        text.contains(&format!("ollama/fixture-model · {reopened}"))
-    });
-    master.write_all(b"\r").unwrap();
-    output_until(&mut master, |text| {
-        text.contains("Clear override · use default")
-    });
-    master.write_all(b"Clear\r").unwrap();
-    output_until(&mut master, |text| text.contains("Thinking: select model"));
+    wait_level(&mut master, displayed);
+    assert_eq!(
+        read_settings()["modelThinkingLevels"]["ollama/fixture-model"],
+        "high"
+    );
+    let wait_notifications = |master: &mut File, count: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // A full PTY output buffer can prevent the UI dispatching events.
+            let mut output = [0; 8192];
+            let _ = master.read(&mut output);
+            let entries: Vec<serde_json::Value> =
+                std::fs::read_to_string(home.join("events.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+            if entries.len() >= count {
+                return entries;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "selection events were not delivered: {entries:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    if let Some(listener) = listener {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut gate = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    let mut output = [0; 8192];
+                    let _ = master.read(&mut output);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("first per-model callback did not start: {error}"),
+            }
+        };
+        gate.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut started = [0];
+        gate.read_exact(&mut started).unwrap();
+        assert_eq!(&started, b"S");
+        // Queue the complete second selection while the first callback is held.
+        master.write_all(b"\rClear\r").unwrap();
+        assert!(!home.join("events.jsonl").exists());
+        assert_eq!(
+            read_settings()["modelThinkingLevels"]["ollama/fixture-model"],
+            "high"
+        );
+        gate.write_all(b"G").unwrap();
+    }
+    let notifications = wait_notifications(&mut master, if delayed { 2 } else { 1 });
+    assert_eq!(
+        notifications[0],
+        serde_json::json!({"type":"thinking_level_select", "level":"high", "previousLevel":"low"})
+    );
+    if !delayed {
+        master.write_all(b"\x03").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Default thinking level per model")
+                && text.contains(if model_fallback {
+                    "2 configured"
+                } else {
+                    "1 configured"
+                })
+        });
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| text.contains("Thinking: select model"));
+        master.write_all(b"ollama/fixture-model").unwrap();
+        let reopened = if project_override { "low" } else { "high" };
+        output_until(&mut master, |text| {
+            text.contains(&format!("ollama/fixture-model · {reopened}"))
+        });
+        master.write_all(b"\r").unwrap();
+        output_until(&mut master, |text| {
+            text.contains("Clear override · use default")
+        });
+        master.write_all(b"Clear\r").unwrap();
+        output_until(&mut master, |text| text.contains("Thinking: select model"));
+    }
     if model_fallback {
         assert_eq!(
             read_settings()["modelThinkingLevels"],
@@ -1380,27 +1618,8 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     } else {
         assert!(read_settings().get("modelThinkingLevels").is_none());
     }
-    wait_level("low");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let notifications = loop {
-        // Keep draining the PTY while waiting: fullscreen redraws can fill its
-        // output buffer and block the UI before it dispatches the notification.
-        let mut output = [0; 8192];
-        let _ = master.read(&mut output);
-        let entries: Vec<serde_json::Value> = std::fs::read_to_string(home.join("events.jsonl"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-        if entries.len() >= 2 {
-            break entries;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "selection events were not delivered: {entries:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    wait_level(&mut master, "low");
+    let notifications = wait_notifications(&mut master, 2);
     assert_eq!(
         notifications[0],
         serde_json::json!({"type":"thinking_level_select", "level":"high", "previousLevel":"low"})
@@ -1424,7 +1643,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         read_settings()["modelThinkingLevels"]["ollama/plain-model"],
         "off"
     );
-    wait_level("low");
+    wait_level(&mut master, "low");
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
         text.contains("Default thinking level per model")
@@ -1705,8 +1924,18 @@ fn exit_during_shell_restores_terminal_and_drains_late_key_release() {
         0
     );
     let original = unsafe { original.assume_init() };
+    #[cfg(debug_assertions)]
+    let barrier_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    #[cfg(debug_assertions)]
+    barrier_listener.set_nonblocking(true).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    #[cfg(debug_assertions)]
+    command.env(
+        "PI_RS_TEST_INPUT_DRAIN_BARRIER",
+        barrier_listener.local_addr().unwrap().to_string(),
+    );
     let mut process = Process(
-        Command::new(env!("CARGO_BIN_EXE_pi"))
+        command
             .current_dir(root.path())
             .env("PI_RS_HOME", root.path().join("home"))
             .env("TERM", "xterm-256color")
@@ -1731,7 +1960,33 @@ fn exit_during_shell_restores_terminal_and_drains_late_key_release() {
     output_until(&mut master, |text| text.contains("shell-running"));
     master.write_all(b"\x03\x03").unwrap();
     output_until(&mut master, |text| text.contains("\x1b[<u"));
+    #[cfg(debug_assertions)]
+    let mut barrier = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match barrier_listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("terminal drain barrier: {error}"),
+            }
+        }
+    };
+    #[cfg(debug_assertions)]
+    {
+        barrier
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut ready = [0];
+        barrier.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"D");
+    }
     master.write_all(b"\x1b[99;5:3u").unwrap();
+    #[cfg(debug_assertions)]
+    barrier.write_all(b"C").unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let mut state = std::mem::MaybeUninit::<libc::termios>::uninit();
