@@ -167,7 +167,19 @@ fn dpapi_transform(input: &[u8], protect: bool) -> Option<Vec<u8>> {
 fn load_or_create_windows_key(path: &std::path::Path) -> Option<[u8; 32]> {
     use std::io::{Read, Write};
     std::fs::create_dir_all(path.parent()?).ok()?;
-    let read_key = || {
+    // All readers and creators hold the same persistent lock. The OS releases
+    // it on process exit, including crashes; never unlink the lock file.
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    lock.lock().ok()?;
+    let read_key = |path: &std::path::Path| {
         let file = std::fs::File::open(path).ok()?;
         if !file.metadata().ok()?.is_file() {
             return None;
@@ -179,26 +191,49 @@ fn load_or_create_windows_key(path: &std::path::Path) -> Option<[u8; 32]> {
         }
         dpapi_transform(&encrypted, false)?.try_into().ok()
     };
-    if path.exists() {
-        return read_key();
+    // Never overwrite a published key: a DPAPI error may mean this process
+    // lacks access to another user's key, rather than a damaged file.
+    let mut published_path = path.as_os_str().to_os_string();
+    published_path.push(".v2");
+    let published_path = std::path::PathBuf::from(published_path);
+    match std::fs::metadata(&published_path) {
+        Ok(_) => return read_key(&published_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => return None,
     }
-    let mut key = [0_u8; 32];
-    key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    // Migrate a readable old key so existing journal fingerprints stay valid.
+    // An old partial file is left untouched and a fresh key is published.
+    let key = read_key(path).unwrap_or_else(|| {
+        let mut key = [0_u8; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key
+    });
     let encrypted = dpapi_transform(&key, true)?;
-    match std::fs::OpenOptions::new()
+    // Do not replace an unreadable legacy file if DPAPI is unavailable.
+    if dpapi_transform(&encrypted, false)?.as_slice() != key {
+        return None;
+    }
+    let mut temp_path = path.as_os_str().to_os_string();
+    temp_path.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let temp_path = std::path::PathBuf::from(temp_path);
+    struct RemoveTemp(std::path::PathBuf);
+    impl Drop for RemoveTemp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = RemoveTemp(temp_path.clone());
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            file.write_all(&encrypted).ok()?;
-            file.sync_all().ok()?;
-            Some(key)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_key(),
-        Err(_) => None,
-    }
+        .open(&temp_path)
+        .ok()?;
+    file.write_all(&encrypted).ok()?;
+    file.sync_all().ok()?;
+    drop(file);
+    std::fs::rename(&temp_path, &published_path).ok()?;
+    Some(key)
 }
 
 #[cfg(test)]
@@ -246,10 +281,71 @@ mod tests {
             first,
             protected_model_fingerprint(&("authorization", "pin"))
         );
-        let encrypted = std::fs::read(&path).unwrap();
+        let published_path = path.with_extension("v2");
+        let encrypted = std::fs::read(&published_path).unwrap();
         assert!(!encrypted.windows(key.len()).any(|window| window == key));
-        std::fs::write(&path, b"tampered").unwrap();
+        std::fs::write(&published_path, b"tampered").unwrap();
         assert_eq!(load_or_create_windows_key(&path), None);
+        assert_eq!(std::fs::read(&published_path).unwrap(), b"tampered");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_key_concurrent_creators_recover_incomplete_files() {
+        if let Some(path) = std::env::var_os("PI_RS_DPAPI_RACE_PATH") {
+            let key = load_or_create_windows_key(std::path::Path::new(&path)).unwrap();
+            std::fs::write(
+                std::env::var_os("PI_RS_DPAPI_RACE_RESULT").unwrap(),
+                fingerprint_with_key(&key, &"race").unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let encrypted = dpapi_transform(&[7; 32], true).unwrap();
+        for length in [0, 1, encrypted.len() / 2, encrypted.len() - 1] {
+            let _ = std::fs::remove_file(path.with_extension("v2"));
+            std::fs::write(&path, &encrypted[..length]).unwrap();
+            let mut children = Vec::new();
+            for index in 0..8 {
+                let result = dir.path().join(format!("result-{index}"));
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "context_fingerprint::tests::windows_key_concurrent_creators_recover_incomplete_files",
+                    ])
+                    .env("PI_RS_DPAPI_RACE_PATH", &path)
+                    .env("PI_RS_DPAPI_RACE_RESULT", &result)
+                    .spawn()
+                    .unwrap();
+                children.push((child, result));
+            }
+            let mut results = Vec::new();
+            for (mut child, result) in children {
+                assert!(child.wait().unwrap().success());
+                results.push(std::fs::read_to_string(result).unwrap());
+            }
+            assert!(results.iter().all(|result| result == &results[0]));
+            let key = load_or_create_windows_key(&path).unwrap();
+            assert_eq!(fingerprint_with_key(&key, &"race").unwrap(), results[0]);
+            assert_eq!(std::fs::read(&path).unwrap(), encrypted[..length]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_key_migrates_readable_legacy_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        let key = [42; 32];
+        std::fs::write(&path, dpapi_transform(&key, true).unwrap()).unwrap();
+        assert_eq!(load_or_create_windows_key(&path), Some(key));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            load_or_create_windows_key(&dir.path().join("key")),
+            Some(key)
+        );
     }
 
     #[cfg(unix)]
