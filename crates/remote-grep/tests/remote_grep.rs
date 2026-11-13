@@ -322,3 +322,32 @@ async fn reaching_match_limit_drops_backend_search() {
     );
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
+
+#[cfg(windows)]
+struct NoCalls;
+#[cfg(windows)]
+#[async_trait::async_trait]
+impl GrepOperations for NoCalls {
+    async fn is_directory(&self, _: &Path) -> Result<bool> {
+        panic!("backend must not be called")
+    }
+    async fn search(
+        &self,
+        _: GrepRequest,
+        _: CancellationToken,
+        _: tokio::sync::mpsc::Sender<GrepMatch>,
+    ) -> Result<()> {
+        panic!("backend must not be called")
+    }
+}
+#[cfg(windows)]
+#[tokio::test]
+async fn rejects_drive_relative_path_before_backend_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = create_grep_tool(root.path(), Arc::new(NoCalls)).unwrap();
+    assert!(matches!(
+        tool.invoke(json!({"pattern":"x", "path":"D:logs"}), context())
+            .await,
+        Outcome::Failed(_)
+    ));
+}
