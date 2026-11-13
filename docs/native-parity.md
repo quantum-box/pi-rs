@@ -482,7 +482,8 @@ directories and writes content; the host validates model arguments and keeps a
 mutation lock until each in-flight backend operation settles, even when the
 caller drops its future. Local filesystem adapters use the canonical path and
 share the local edit lock; remote locks are scoped to the backend instance and
-path within this process. Cancellation is observed between operations.
+backend-supplied resource identity within this process. Backends must map all
+aliases to the same identity to serialize them. Cancellation is observed between operations.
 The backend is responsible for its access policy and must not return before its
 write has settled. Scoped profiles reject custom operations because local path
 checks cannot verify remote symlinks. `LocalWriteOperations` is a basic Pi-style

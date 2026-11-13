@@ -694,6 +694,11 @@ pub trait WriteOperations: Send + Sync {
     fn uses_local_filesystem(&self) -> bool {
         false
     }
+    /// Stable identity for aliases of the same remote resource. Implementations
+    /// must use the same identity across their read/write/edit interfaces.
+    async fn resource_identity(&self, path: &Path) -> Result<PathBuf> {
+        Ok(path.to_owned())
+    }
     async fn mkdir(&self, directory: &Path) -> Result<()>;
     async fn write_file(&self, path: &Path, content: &str) -> Result<()>;
 }
@@ -763,6 +768,13 @@ fn canonical_local_target(path: &Path) -> Result<PathBuf> {
                 return Ok(resolved);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(metadata) = std::fs::symlink_metadata(ancestor)
+                    && metadata.file_type().is_symlink()
+                {
+                    return Err(Error::Config(
+                        "dangling symlink cannot be used as a mutation target".into(),
+                    ));
+                }
                 missing.push(
                     ancestor
                         .file_name()
@@ -803,7 +815,8 @@ async fn injected_write_lock(
             std::sync::Mutex<std::collections::HashMap<Key, WeakLock>>,
         > = std::sync::OnceLock::new();
         let identity = Arc::as_ptr(operations) as *const () as usize;
-        let key = (identity, path.to_owned());
+        let key = (identity, operations.resource_identity(path).await?);
+        check_mutation_cancelled(cancellation)?;
         let lock = {
             let mut locks = LOCKS
                 .get_or_init(Default::default)

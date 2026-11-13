@@ -342,3 +342,82 @@ async fn local_alias_write_serializes_with_real_path_edit() {
     ));
     assert_eq!(std::fs::read_to_string(target).unwrap(), "edited");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_write_rejects_dangling_symlink_without_mutating_target() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("missing");
+    std::os::unix::fs::symlink(&target, root.path().join("alias")).unwrap();
+    let tool = create_write_tool(
+        root.path(),
+        Arc::new(pi_rs_workbench::coding::LocalWriteOperations),
+    )
+    .unwrap();
+    let result = tool
+        .invoke(
+            json!({"path":"alias", "content":"no"}),
+            context(CancellationToken::new()),
+        )
+        .await;
+    assert!(matches!(result, Outcome::Failed(text) if text.contains("dangling symlink")));
+    assert!(!target.exists());
+}
+
+struct AliasBackend {
+    inner: Blocking,
+}
+#[async_trait::async_trait]
+impl WriteOperations for AliasBackend {
+    async fn resource_identity(&self, path: &Path) -> Result<PathBuf> {
+        Ok(path.parent().unwrap().join("canonical"))
+    }
+    async fn mkdir(&self, path: &Path) -> Result<()> {
+        self.inner.mkdir(path).await
+    }
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        self.inner.write_file(path, content).await
+    }
+}
+#[tokio::test]
+async fn backend_alias_identity_serializes_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Arc::new(AliasBackend {
+        inner: Blocking {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: Mutex::new(vec![]),
+        },
+    });
+    let first_tool = create_write_tool(root.path(), backend.clone()).unwrap();
+    let second_tool = create_write_tool(root.path(), backend.clone()).unwrap();
+    let first = tokio::spawn(async move {
+        first_tool
+            .invoke(
+                json!({"path":"alias", "content":"first"}),
+                context(CancellationToken::new()),
+            )
+            .await
+    });
+    backend.inner.started.notified().await;
+    let second = tokio::spawn(async move {
+        second_tool
+            .invoke(
+                json!({"path":"canonical", "content":"second"}),
+                context(CancellationToken::new()),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let finished = second.is_finished();
+    backend.inner.release.notify_one();
+    assert!(!finished, "aliases must share a lock");
+    assert!(matches!(first.await.unwrap(), Outcome::Succeeded(_)));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap(),
+        Outcome::Succeeded(_)
+    ));
+}
